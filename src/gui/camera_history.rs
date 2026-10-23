@@ -320,7 +320,7 @@ mod tests {
             last_changed_at_us: 5,
             feature: feature.map(Into::into),
             kind: kind.into(),
-            setting_changes: Some(2),
+            setting_changes: 2,
         };
         let change = Change::from_status("sim:0", &entry("set_many", None)).unwrap();
         assert_eq!(change.job, Job::SetMany);

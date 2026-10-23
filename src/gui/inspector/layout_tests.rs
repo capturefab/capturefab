@@ -106,6 +106,20 @@ fn compact_video_keeps_its_start_action_visible_before_encoding_details() {
                 Layout::new(&node),
                 &renderer,
             );
+            for removed in [
+                "Data",
+                "Live signals",
+                "Add data source",
+                "Protected source profiles",
+            ] {
+                assert!(
+                    snapshot
+                        .nodes
+                        .iter()
+                        .all(|(_, control)| control.label() != Some(removed)),
+                    "The capture sidebar must not expose {removed}."
+                );
+            }
             let label = if Output::of(output).recording() {
                 "Start recording"
             } else {

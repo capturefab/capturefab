@@ -79,17 +79,18 @@
         })
         .then((data) => {
           if (data.schema_version !== 1 || !Array.isArray(data.documents) || !data.documents.length) throw new Error('invalid search index');
-          if (!data.documents.every((item) => item && ['id', 'title', 'summary', 'category', 'body', 'url'].every((key) => typeof item[key] === 'string') && Array.isArray(item.tags) && item.tags.every((tag) => typeof tag === 'string') && /^docs\.html#[a-z][a-z0-9-]*$/.test(item.url))) throw new Error('invalid search document');
+          if (!data.documents.every((item) => item && ['id', 'title', 'summary', 'category', 'body', 'url'].every((key) => typeof item[key] === 'string') && Array.isArray(item.tags) && item.tags.every((tag) => typeof tag === 'string') && /^[a-z][a-z0-9-]*\.html#[a-z][a-z0-9-]*$/.test(item.url))) throw new Error('invalid search document');
           return { documents: prepareDocuments(data.documents), local: false };
         })
         .catch(() => {
           // File previews and interrupted requests can still search the rendered documentation.
+          const page = window.location?.pathname.split('/').pop() || 'docs.html';
           const documents = sections.map((section) => ({
             id: section.id, title: section.dataset.docTitle,
             category: section.dataset.docCategory || 'Documentation',
             tags: (section.dataset.docTags || '').split(',').map((tag) => tag.trim()),
             summary: section.querySelector('.doc-summary')?.textContent.trim() || '',
-            body: section.textContent.replace(/\s+/g, ' ').trim(), url: `docs.html#${section.id}`
+            body: section.textContent.replace(/\s+/g, ' ').trim(), url: `${page}#${section.id}`
           }));
           return { documents: prepareDocuments(documents), local: true };
         });
@@ -168,7 +169,7 @@
       input.setAttribute('aria-expanded', String(links.length > 0));
       status.textContent = !query ? 'Start typing to search, or open a guide below.' : matches.length
         ? `${matches.length} result${matches.length === 1 ? '' : 's'}${matches.length > visible.length ? ` · Showing the first ${visible.length}` : ''}.`
-        : 'No results. Try a feature name, command or shorter search, such as “exposure”, “S3” or “session”.';
+        : 'No results. Try a feature name, command or shorter search, such as “exposure”, “folder” or “session”.';
       if (data.local) status.textContent += ' Searching this page.';
     };
 
@@ -224,7 +225,7 @@
       label.append(element('span', 'search-label', 'Feature, task or command'));
       searchInput = element('input', 'search-input');
       searchInput.id = 'site-search-query'; searchInput.type = 'search';
-      searchInput.placeholder = 'Search exposure, S3, --destination…';
+      searchInput.placeholder = 'Search exposure, folders, --destination…';
       searchInput.autocomplete = 'off'; searchInput.spellcheck = false;
       label.append(searchInput);
       const status = element('p', 'search-status');

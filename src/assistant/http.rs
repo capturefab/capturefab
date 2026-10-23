@@ -41,6 +41,8 @@ pub struct ProviderError {
     pub retry_after_s: Option<u64>,
     /// Only a scrubbed, bounded provider message; never part of Display.
     pub excerpt: Option<String>,
+    /// Native helper diagnostics are fixed application text, safe to display.
+    pub(crate) local: bool,
 }
 
 impl ProviderError {
@@ -50,6 +52,14 @@ impl ProviderError {
             status: None,
             retry_after_s: None,
             excerpt: None,
+            local: false,
+        }
+    }
+    pub(crate) fn local(kind: ProviderErrorKind, message: &str) -> Self {
+        Self {
+            excerpt: Some(message.to_owned()),
+            local: true,
+            ..Self::new(kind)
         }
     }
     pub fn details(&self) -> Value {
@@ -77,6 +87,11 @@ impl fmt::Debug for ProviderError {
 }
 impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.local
+            && let Some(message) = &self.excerpt
+        {
+            return f.write_str(message);
+        }
         f.write_str(match self.kind {
             ProviderErrorKind::Auth=>"The provider refused the credentials. Check the API key or cloud sign-in.",
             ProviderErrorKind::Rejected=>"The provider rejected the request. Check the model and provider settings.",

@@ -25,14 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const BASE_TABLES: [&str; 6] = [
-    "dataset_info",
-    "captures",
-    "recordings",
-    "signals",
-    "samples",
-    "events",
-];
+const BASE_TABLES: [&str; 4] = ["dataset_info", "captures", "recordings", "events"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

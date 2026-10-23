@@ -27,13 +27,13 @@ fn raw_and_structured_activity_rows_wrap_before_the_overlay_at_every_interface_s
     let mut app = Workbench::new(SessionHandle::new(), "raw-log-wrap".into(), true, None);
     app.snapshot.logs = vec![
         crate::session::LogEntry {
-            timestamp: None,
-            time: "12:34:56".into(), level: "warn".into(),
+            timestamp: crate::session::LogTimestamp::new(1_792_017_000_123, 0).unwrap(),
+            level: "warn".into(),
             message: "Scanner discovery: timeout waiting for scanner helper. Check the device connection and retry discovery after the helper becomes available. ".repeat(4),
         },
         crate::session::LogEntry {
-            timestamp: None,
-            time: String::new(), level: "error".into(),
+            timestamp: crate::session::LogTimestamp::new(1_792_017_001_123, 0).unwrap(),
+            level: "error".into(),
             message: format!("Could not open /isolated/{}/capture.png", "unbroken".repeat(64)),
         },
     ];
@@ -189,19 +189,19 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
     let first = 1_792_017_000_123;
     let next = first + 86_400_000;
     let raw = |name: &str, instant| LogEntry {
-        timestamp: LogTimestamp::new(instant, 14 * 3600),
-        ..LogEntry::legacy("00:30:00", "info", name)
+        timestamp: LogTimestamp::new(instant, 14 * 3600).unwrap(),
+        level: "info".into(),
+        message: name.into(),
     };
     app.snapshot.logs = vec![
         raw("First diagnostic", first),
         raw("Retained diagnostic", first + 1),
         raw("Next-day diagnostic", next),
-        LogEntry::legacy("01:23:45", "warn", "Legacy diagnostic"),
         raw("Earlier-day arrival", first + 2),
     ];
     let command = |id, submitted, finished| -> SessionActivity {
         serde_json::from_value(serde_json::json!({
-            "id":id,"origin":"client","operation":"capture","camera":null,"feature":null,
+            "id":id,"origin":"client","actor":{"id":"test-client","name":"Test client","kind":"human"},"operation":"capture","camera":null,"feature":null,
             "label":format!("Command label {id}"),"state":"running","submitted_at_ms":submitted,
             "started_at_ms":submitted,"finished_at_ms":finished,"detail":null,"file_count":0,"files":[]
         })).unwrap()
@@ -258,20 +258,18 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
             "Diagnostics",
             "Diagnostics",
             "Diagnostics",
-            "Diagnostics",
             "Command updates",
             "Command updates",
             "Command updates"
         ]
     );
-    assert_eq!(initial_headings[2], "Diagnostics · Date unavailable");
-    assert_eq!(initial_headings[6], "Command updates · Date unavailable");
+    assert_eq!(initial_headings[5], "Command updates · Date unavailable");
     assert_eq!(
         initial_headings
             .iter()
             .filter(|label| label.ends_with("Date unavailable"))
             .count(),
-        2
+        1
     );
     let named = |snapshot: &accesskit::TreeUpdate, name: &str| {
         snapshot
@@ -284,7 +282,7 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
     let copy = named(&initial, "Copy activity log");
     assert_eq!(initial.focus, copy);
     let command_id = named(&initial, "Command 10");
-    let command_heading = named(&initial, &initial_headings[4]);
+    let command_heading = named(&initial, &initial_headings[3]);
     let initial_time = initial
         .nodes
         .iter()
@@ -295,10 +293,7 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
     let retained_times: Vec<_> = app.snapshot.logs[1..]
         .iter()
         .map(|entry| {
-            let signature = entry
-                .timestamp
-                .map(|stamp| format!(" · Recorded {}", stamp.rfc3339()))
-                .unwrap_or_else(|| time_format::log(entry).full);
+            let signature = format!(" · Recorded {}", entry.timestamp.rfc3339());
             let id = initial
                 .nodes
                 .iter()
@@ -338,7 +333,7 @@ fn local_date_boundaries_preserve_source_order_row_identity_and_the_pinned_copy_
         .label()
         .unwrap();
     assert!(updated_heading.starts_with("Command updates · "));
-    assert_ne!(updated_heading, initial_headings[4]);
+    assert_ne!(updated_heading, initial_headings[3]);
     let updated_command = updated
         .nodes
         .iter()

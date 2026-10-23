@@ -4,16 +4,12 @@ use super::{
     DatasetStatus, SCHEMA_VERSION, SavedCamera, SavedFile, SavedItem,
     write::{self, context_json},
 };
-use crate::{
-    context::Context,
-    signals::{Sample, SignalInfo, TagInfo},
-    storage::FREE_SPACE_FLOOR,
-};
+use crate::{context::Context, storage::FREE_SPACE_FLOOR};
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use duckdb::{AccessMode, Config, Connection, OptionalExt, params};
 use fs2::FileExt;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
@@ -22,8 +18,6 @@ use std::{
 
 /// Default cap on the dataset file plus its write-ahead log.
 pub const DEFAULT_MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
-/// Rows accepted by one `append_samples` call.
-pub const MAX_SAMPLES_PER_CALL: usize = 10_000;
 
 pub(super) const DDL: &str = "
 CREATE TABLE dataset_info (singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -43,19 +37,8 @@ CREATE TABLE recordings (id UBIGINT PRIMARY KEY DEFAULT nextval('recording_ids')
   transport VARCHAR, source VARCHAR, path VARCHAR NOT NULL, file_name VARCHAR NOT NULL, bytes UBIGINT NOT NULL,
   sha256 VARCHAR, codec VARCHAR, encoder VARCHAR, fps DOUBLE, destination VARCHAR, object_key VARCHAR,
   upload_id VARCHAR, remote_url VARCHAR, uploaded_ms UBIGINT, context VARCHAR, UNIQUE (path, start_ms));
-CREATE TABLE signals (source_id VARCHAR NOT NULL, protocol VARCHAR, uri VARCHAR NOT NULL, tag VARCHAR NOT NULL,
-  unit VARCHAR, kind VARCHAR, description VARCHAR, first_ms UBIGINT, last_ms UBIGINT,
-  PRIMARY KEY (source_id, tag));
-CREATE TABLE samples (ts_ms UBIGINT NOT NULL, source_ts_ms UBIGINT, source_id VARCHAR NOT NULL,
-  tag VARCHAR NOT NULL, value_double DOUBLE, value_text VARCHAR, quality VARCHAR);
 CREATE TABLE events (id UBIGINT PRIMARY KEY DEFAULT nextval('event_ids'), wall_ms UBIGINT NOT NULL,
   kind VARCHAR NOT NULL, camera_id VARCHAR, source_id VARCHAR, text VARCHAR NOT NULL, context VARCHAR);
-CREATE VIEW captures_with_signals AS
-  SELECT c.id AS capture_id, c.wall_ms, c.camera_id, c.path, c.object_key, c.context, t.source_id, t.tag, g.unit,
-         s.ts_ms AS sample_ms, c.wall_ms - s.ts_ms AS sample_age_ms, s.value_double, s.value_text, s.quality
-  FROM captures c CROSS JOIN (SELECT DISTINCT source_id, tag FROM samples) t
-  ASOF LEFT JOIN samples s ON s.source_id = t.source_id AND s.tag = t.tag AND c.wall_ms >= s.ts_ms
-  LEFT JOIN signals g ON g.source_id = t.source_id AND g.tag = t.tag;
 ";
 
 /// New captures, new recordings, and the newest new file with its time.
@@ -288,9 +271,6 @@ pub struct Dataset {
     pub(crate) staging: Arc<Staging>,
     pub(crate) status: DatasetStatus,
     pub(crate) read_only: bool,
-    since_size_check: usize,
-    /// Last registered description per signal source, for tags first seen in samples.
-    sources: BTreeMap<String, (String, String)>,
     _claim: PathClaim,
 }
 
@@ -415,8 +395,6 @@ impl Dataset {
             path,
             staging,
             read_only,
-            since_size_check: 0,
-            sources: BTreeMap::new(),
             _claim: claim,
         };
         dataset.load_counts()?;
@@ -434,13 +412,10 @@ impl Dataset {
         };
         self.status.captures = count("captures")?;
         self.status.recordings = count("recordings")?;
-        self.status.signals = count("signals")?;
-        self.status.samples = count("samples")?;
         self.status.events = count("events")?;
         let (first, last): (Option<u64>, Option<u64>) = conn.query_row(
             "SELECT min(t), max(t) FROM (SELECT wall_ms AS t FROM captures UNION ALL
-             SELECT start_ms FROM recordings UNION ALL SELECT end_ms FROM recordings UNION ALL
-             SELECT min(ts_ms) FROM samples UNION ALL SELECT max(ts_ms) FROM samples)",
+             SELECT start_ms FROM recordings UNION ALL SELECT end_ms FROM recordings)",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -536,15 +511,14 @@ impl Dataset {
                         let n = conn.execute(
                             "INSERT INTO captures (wall_ms, camera_id, vendor, model, serial, transport, source,
                                frame_id, timestamp_ns, width, height, pixel_format, pixel_format_code, format, bytes,
-                               path, file_name, sha256, origin, job_id, destination, object_key, upload_id, remote_url, context)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               path, file_name, sha256, origin, job_id, destination, context)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                              ON CONFLICT DO NOTHING",
                             params![
                                 item.wall_ms, camera.id, camera.vendor, camera.model, camera.serial,
                                 camera.transport, camera.source, frame_id, timestamp_ns, width, height,
                                 crate::frame::pixel_format_name(*pixel_format), pixel_format, format,
-                                item.bytes, item.path, name, item.sha256, origin, job_id, item.destination,
-                                item.object_key, item.upload_id, item.remote_url, context
+                                item.bytes, item.path, name, item.sha256, origin, job_id, item.destination, context
                             ],
                         )?;
                         captures += n;
@@ -559,15 +533,13 @@ impl Dataset {
                     } => {
                         let n = conn.execute(
                             "INSERT INTO recordings (start_ms, end_ms, camera_id, vendor, model, serial, transport,
-                               source, path, file_name, bytes, sha256, codec, encoder, fps, destination, object_key,
-                               upload_id, remote_url, context)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               source, path, file_name, bytes, sha256, codec, encoder, fps, destination, context)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                              ON CONFLICT DO NOTHING",
                             params![
                                 started_ms, ended_ms, camera.id, camera.vendor, camera.model, camera.serial,
                                 camera.transport, camera.source, item.path, name, item.bytes, item.sha256,
-                                codec, encoder, fps, item.destination, item.object_key, item.upload_id,
-                                item.remote_url, context
+                                codec, encoder, fps, item.destination, context
                             ],
                         )?;
                         recordings += n;
@@ -603,76 +575,6 @@ impl Dataset {
                 Err(e.context(format!("catalog saved files in {}", file_label(&path))))
             }
         }
-    }
-
-    /// Insert or update a source's tags.
-    pub fn register(&mut self, source: &SignalInfo, tags: &[TagInfo]) -> Result<()> {
-        let protocol = write::protocol(source)?;
-        self.sources
-            .insert(source.id.clone(), (source.uri.clone(), protocol.clone()));
-        let path = self.path.clone();
-        let conn = &self.conn;
-        conn.execute_batch("BEGIN TRANSACTION")
-            .map_err(|e| explain(e, &path, "insert"))?;
-        let result = write::register(conn, source, tags, &protocol);
-        self.finish_txn(result)?;
-        self.status.signals = self
-            .conn
-            .query_row("SELECT count(*) FROM signals", [], |r| r.get(0))?;
-        Ok(())
-    }
-
-    fn finish_txn(&self, result: Result<()>) -> Result<()> {
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT")
-                .map_err(|e| explain(e, &self.path, "insert")),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
-            }
-        }
-    }
-
-    /// Append one source's samples. Tags not registered yet are added.
-    pub fn append_samples(&mut self, source_id: &str, batch: &[Sample]) -> Result<usize> {
-        ensure!(
-            batch.len() <= MAX_SAMPLES_PER_CALL,
-            "at most {MAX_SAMPLES_PER_CALL} samples per write"
-        );
-        if batch.is_empty() {
-            return Ok(0);
-        }
-        self.since_size_check += batch.len();
-        if self.since_size_check >= 1000 || self.status.samples == 0 {
-            self.since_size_check = 0;
-            self.check_room()?;
-        }
-        let (uri, protocol) = self
-            .sources
-            .get(source_id)
-            .cloned()
-            .unwrap_or_else(|| (source_id.to_owned(), String::new()));
-        let range = write::sample_ranges(batch);
-        let path = self.path.clone();
-        let conn = &self.conn;
-        conn.execute_batch("BEGIN TRANSACTION")
-            .map_err(|e| explain(e, &path, "insert"))?;
-        let result = write::append_samples(conn, source_id, &uri, &protocol, batch, &range);
-        self.finish_txn(result)?;
-        self.status.samples += batch.len() as u64;
-        if let (Some(first), Some(last)) = (
-            range.values().map(|r| r.0).min(),
-            range.values().map(|r| r.1).max(),
-        ) {
-            self.touch(first);
-            self.touch(last);
-        }
-        self.status.signals = self
-            .conn
-            .query_row("SELECT count(*) FROM signals", [], |r| r.get(0))?;
-        Ok(batch.len())
     }
 
     pub fn record_event(

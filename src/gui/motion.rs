@@ -461,6 +461,7 @@ impl Workbench {
             || self.assistant.quick.open
             || self.network_open
             || self.analytics.open
+            || self.resources.open
             || (self.settings_open && self.settings_window.is_none())
             || self.capture_to.manager_open
             || self.record_to.manager_open

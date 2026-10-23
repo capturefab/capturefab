@@ -128,6 +128,7 @@ impl Workbench {
             interface,
             rule::horizontal(1).style(style::line),
             self.performance_section(p),
+            self.resources_settings_link(p),
             rule::horizontal(1).style(style::line),
             discovery,
             rule::horizontal(1).style(style::line),

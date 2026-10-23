@@ -13,11 +13,7 @@ use crate::{
         conversation::Conversation,
     },
     gui::*,
-    tools::{
-        self, Checked, StepId, ToolCall,
-        context::{Context, DataSourceRef},
-        exec::ProgressState,
-    },
+    tools::{self, Checked, StepId, ToolCall, context::Context, exec::ProgressState},
 };
 use serde_json::{Value, json};
 use std::{
@@ -45,11 +41,6 @@ pub(in crate::gui) enum Input {
     ExportPlan,
     SeeImages(bool),
     SeeData(bool),
-    DataSources(bool),
-    DataSourceDraft(String),
-    AddDataSource,
-    RemoveDataSource(String),
-    SourceProfile(crate::gui::source_setup::Input),
     Field {
         step: StepId,
         key: String,
@@ -86,7 +77,6 @@ pub(in crate::gui) enum Input {
     Remove(StepId),
     FocusStep(StepId),
     NewDestination,
-    TestS3(StepId),
     Details(StepId, bool),
     Options(StepId, bool),
     Copy(String),
@@ -109,12 +99,6 @@ impl fmt::Debug for Input {
             Self::ExportPlan => f.write_str("ExportPlan"),
             Self::SeeImages(value) => f.debug_tuple("SeeImages").field(value).finish(),
             Self::SeeData(value) => f.debug_tuple("SeeData").field(value).finish(),
-            Self::DataSources(value) => f.debug_tuple("DataSources").field(value).finish(),
-            Self::DataSourceDraft(_) | Self::RemoveDataSource(_) => {
-                f.write_str("DataSource([redacted])")
-            }
-            Self::AddDataSource => f.write_str("AddDataSource"),
-            Self::SourceProfile(input) => f.debug_tuple("SourceProfile").field(input).finish(),
             Self::Field { step, .. } => f
                 .debug_tuple("Field")
                 .field(step)
@@ -137,7 +121,6 @@ impl fmt::Debug for Input {
             Self::Remove(step) => f.debug_tuple("Remove").field(step).finish(),
             Self::FocusStep(step) => f.debug_tuple("FocusStep").field(step).finish(),
             Self::NewDestination => f.write_str("NewDestination"),
-            Self::TestS3(step) => f.debug_tuple("TestS3").field(step).finish(),
             Self::Details(step, value) => {
                 f.debug_tuple("Details").field(step).field(value).finish()
             }
@@ -188,6 +171,7 @@ pub(in crate::gui) struct StepStatus {
 }
 
 struct PendingTurn {
+    prompt: String,
     generation: u64,
     cancel: Arc<AtomicBool>,
     receive: Receiver<runner::TurnEvent>,
@@ -200,12 +184,6 @@ struct PendingApply {
     receive: Receiver<runner::ApplyEvent>,
     calls: Vec<(StepId, ToolCall)>,
 }
-struct PendingS3 {
-    step: StepId,
-    call: ToolCall,
-    receive: Receiver<Result<String, String>>,
-}
-
 pub(in crate::gui) struct State {
     pub open: bool,
     pub scrolled: bool,
@@ -219,10 +197,6 @@ pub(in crate::gui) struct State {
     pub exported_plan: Option<PathBuf>,
     pub allow_images: bool,
     pub allow_data: bool,
-    pub data_sources: Vec<DataSourceRef>,
-    pub data_source_draft: String,
-    pub data_sources_open: bool,
-    pub source_setup: crate::gui::source_setup::State,
     pub generation: u64,
     pub usage: Usage,
     pub step_outcomes: BTreeMap<StepId, StepStatus>,
@@ -240,9 +214,8 @@ pub(in crate::gui) struct State {
     applying: Option<PendingApply>,
     gathering: Option<Receiver<Result<Context, runner::Failure>>>,
     exporting: Option<Receiver<Result<Option<PathBuf>, String>>>,
-    testing_s3: Option<PendingS3>,
     refreshed: Option<Instant>,
-    last_prompt: Option<String>,
+    pub(super) last_prompt: Option<String>,
     remaining: bool,
     notice: Option<(String, Option<String>, Level)>,
 }
@@ -266,10 +239,6 @@ impl State {
             exported_plan: None,
             allow_images: false,
             allow_data: false,
-            data_sources: Vec::new(),
-            data_source_draft: String::new(),
-            data_sources_open: false,
-            source_setup: crate::gui::source_setup::State::default(),
             generation: 0,
             usage: Usage::default(),
             step_outcomes: BTreeMap::new(),
@@ -287,7 +256,6 @@ impl State {
             applying: None,
             gathering: None,
             exporting: None,
-            testing_s3: None,
             refreshed: None,
             last_prompt: None,
             remaining: false,
@@ -317,26 +285,16 @@ impl State {
         self.scene_running || self.applying.is_some()
     }
     pub(in crate::gui) fn busy(&self) -> bool {
-        self.thinking()
-            || self.running()
-            || self.gathering.is_some()
-            || self.exporting.is_some()
-            || self.testing_s3.is_some()
+        self.thinking() || self.running() || self.gathering.is_some() || self.exporting.is_some()
     }
     pub(in crate::gui) fn editable(&self) -> bool {
-        !self.thinking()
-            && !self.running()
-            && self.testing_s3.is_none()
-            && !self.source_setup.pending
+        !self.thinking() && !self.running()
+    }
+    pub(super) fn retry_available(&self) -> bool {
+        self.error.is_some() && self.last_prompt.is_some()
     }
     pub(in crate::gui) fn has_provider(&self) -> bool {
         self.settings.provider.is_some()
-    }
-    pub(in crate::gui) fn source_draft_error(&self) -> Option<String> {
-        (!self.data_source_draft.trim().is_empty())
-            .then(|| DataSourceRef::approved(&self.data_source_draft).err())
-            .flatten()
-            .map(|error| tools::redact::for_output_text(&error.to_string()))
     }
     pub(in crate::gui) fn provider_label(&self) -> String {
         self.settings
@@ -430,10 +388,7 @@ impl State {
     pub(in crate::gui) fn ready_to_run(&self) -> bool {
         !self.thinking()
             && !self.running()
-            && self.testing_s3.is_none()
-            && !self.source_setup.pending
             && self.context.is_some()
-            && !self.source_setup.has_uncommitted_draft()
             && !self.plan.steps.is_empty()
             && self
                 .plan
@@ -445,7 +400,6 @@ impl State {
         self.notice.take()
     }
     pub(in crate::gui) fn clear_secrets(&mut self) {
-        self.source_setup.clear_secret();
         let had_secret = self.plan.steps.iter().any(|step| {
             tools::spec(&step.call.tool).is_some_and(|spec| {
                 spec.fields.iter().any(|field| {
@@ -463,6 +417,7 @@ impl State {
     fn set_error(&mut self, message: impl Into<String>) {
         self.error = Some(tools::redact::for_output_text(&message.into()));
         self.provider_excerpt = None;
+        self.last_prompt = None;
     }
     fn changed_refusal(&mut self) {
         self.set_error("The plan changed since you reviewed it. Check it and run again.");
@@ -478,22 +433,11 @@ impl State {
             Err(error) => self.set_error(error),
         }
     }
-    pub(super) fn refresh_context(&mut self, now: Instant) {
-        // An earlier gather may predate an explicit credential binding.
-        self.gathering = None;
-        self.context = None;
-        self.refresh(now);
-    }
     fn recheck(&mut self) {
         let Some(ctx) = &mut self.context else {
             return;
         };
-        if let Err(error) =
-            ai::agent::authorize_plan_data_with_sources(ctx, self.allow_data, &self.data_sources)
-        {
-            self.error = Some(tools::redact::for_output_text(&error.to_string()));
-            ai::agent::authorize_plan_data(ctx, false);
-        }
+        ai::agent::authorize_plan_data(ctx, self.allow_data);
         let checked = self.plan.steps.iter().any(|step| step.checked.is_some());
         let before = approval_view(&self.plan);
         self.drafts
@@ -509,42 +453,6 @@ impl State {
         self.recheck();
         if revision == self.plan.revision {
             self.plan.revision = self.plan.revision.saturating_add(1);
-        }
-    }
-    fn source_effects(&mut self, effects: Vec<crate::gui::source_setup::Effect>) {
-        let mut changed = false;
-        let mut refresh = false;
-        for effect in effects {
-            match effect {
-                crate::gui::source_setup::Effect::Bound(binding) => {
-                    if !self.data_sources.contains(&binding) {
-                        refresh |= binding.auth.is_some();
-                        self.data_sources.retain(|source| {
-                            source.reference != binding.reference
-                                && (binding.profile_id().is_none()
-                                    || source.profile_id() != binding.profile_id())
-                        });
-                        self.data_sources.push(binding);
-                        changed = true;
-                    }
-                }
-                crate::gui::source_setup::Effect::Invalidate(profile) => {
-                    let count = self.data_sources.len();
-                    self.data_sources
-                        .retain(|source| source.profile_id() != Some(profile.as_str()));
-                    changed |= count != self.data_sources.len();
-                }
-            }
-        }
-        if changed {
-            if refresh {
-                self.context = None;
-                self.gathering = None;
-            }
-            self.data_scope_changed();
-            if refresh {
-                self.refresh(Instant::now());
-            }
         }
     }
     fn append(&mut self, entry: TranscriptEntry) {
@@ -615,13 +523,6 @@ impl State {
                 return Effect::NewDestination;
             }
             Input::FocusStep(id) => return Effect::FocusStep(id),
-            Input::SourceProfile(input) => {
-                self.source_setup.set_synthetic(self.synthetic);
-                let enabled = self.editable();
-                let effects = self.source_setup.input(input, enabled);
-                self.source_effects(effects);
-                return Effect::None;
-            }
             _ => {}
         }
         if !self.editable() {
@@ -637,49 +538,9 @@ impl State {
                     self.data_scope_changed();
                 }
             }
-            Input::DataSources(open) => {
-                self.data_sources_open = open;
-                if !open {
-                    self.source_setup
-                        .input(crate::gui::source_setup::Input::Open(false), true);
-                }
-                if open {
-                    return Effect::FocusField("quick-command-data-source".into());
-                }
-            }
-            Input::DataSourceDraft(value) => self.data_source_draft = value,
-            Input::AddDataSource => {
-                if self.data_source_draft.trim().is_empty() {
-                    return Effect::None;
-                }
-                match DataSourceRef::approved(&self.data_source_draft) {
-                    Ok(source) => {
-                        if !self.data_sources.iter().any(|existing| existing == &source) {
-                            self.data_sources
-                                .retain(|existing| existing.reference != source.reference);
-                            self.data_sources.push(source);
-                            self.data_scope_changed();
-                        }
-                        self.data_source_draft.clear();
-                        self.error = None;
-                        return Effect::FocusField("quick-command-data-source".into());
-                    }
-                    Err(error) => {
-                        self.set_error(tools::redact::for_output_text(&error.to_string()))
-                    }
-                }
-            }
-            Input::RemoveDataSource(reference) => {
-                let count = self.data_sources.len();
-                self.data_sources
-                    .retain(|source| source.reference != reference);
-                if self.data_sources.len() != count {
-                    self.data_scope_changed();
-                }
-            }
             Input::Send => self.send(now),
             Input::Retry => {
-                if let Some(prompt) = self.last_prompt.clone() {
+                if let Some(prompt) = self.last_prompt.clone().filter(|_| self.retry_available()) {
                     self.prompt = prompt;
                     self.send(now);
                 }
@@ -702,10 +563,6 @@ impl State {
                 self.usage = Usage::default();
                 self.allow_images = false;
                 self.allow_data = false;
-                self.data_sources.clear();
-                self.data_source_draft.clear();
-                self.data_sources_open = false;
-                self.source_setup.reset();
                 self.generation = self.generation.saturating_add(1);
                 self.recheck();
                 return Effect::FocusPrompt;
@@ -763,7 +620,6 @@ impl State {
             }
             Input::Run(revision) => self.run(revision),
             Input::ExportPlan => self.export(),
-            Input::TestS3(id) => self.test_s3(id),
             _ => {}
         }
         Effect::None
@@ -849,10 +705,6 @@ impl State {
         if self.synthetic {
             return;
         }
-        if self.source_setup.has_uncommitted_draft() {
-            self.set_error(crate::gui::source_setup::UNCOMMITTED_DRAFT);
-            return;
-        }
         if let Err(error) = ai::prompt::validate_prompt(&self.prompt) {
             self.set_error(error.to_string());
             return;
@@ -866,7 +718,7 @@ impl State {
         self.error = None;
         self.provider_excerpt = None;
         let prompt = std::mem::take(&mut self.prompt);
-        self.last_prompt = Some(prompt.clone());
+        self.last_prompt = None;
         let request = PlanRequest {
             prompt: prompt.clone(),
             provider: None,
@@ -875,7 +727,6 @@ impl State {
             conversation: self.conversation.clone(),
             allow_images: self.allow_images,
             allow_data: self.allow_data,
-            data_sources: self.data_sources.clone(),
         };
         let cancel = Arc::new(AtomicBool::new(false));
         match runner::turn(
@@ -886,9 +737,10 @@ impl State {
             cancel.clone(),
         ) {
             Ok(receive) => {
-                self.append(TranscriptEntry::User(prompt));
+                self.append(TranscriptEntry::User(prompt.clone()));
                 self.status = format!("Asking {}…", self.provider_label());
                 self.turn = Some(PendingTurn {
+                    prompt,
                     generation: self.generation,
                     cancel,
                     receive,
@@ -907,6 +759,7 @@ impl State {
         }
     }
     fn stop(&mut self) {
+        self.last_prompt = None;
         if let Some(turn) = &mut self.turn
             && !turn.cancelled
         {
@@ -972,49 +825,9 @@ impl State {
         if self.synthetic || self.exporting.is_some() {
             return;
         }
-        let document =
-            match tools::plan::for_local_export(&self.plan.document(), &self.data_sources) {
-                Ok(document) => document,
-                Err(error) => {
-                    self.set_error(error.to_string());
-                    return;
-                }
-            };
+        let document = self.plan.document();
         match runner::export(self.services.clone(), document) {
             Ok(receive) => self.exporting = Some(receive),
-            Err(error) => self.set_error(error),
-        }
-    }
-    fn test_s3(&mut self, id: StepId) {
-        if self.synthetic || self.testing_s3.is_some() {
-            return;
-        }
-        let Some(step) = self.plan.steps.iter().find(|step| step.id == id) else {
-            return;
-        };
-        let Some(checked) = step.checked.as_ref().filter(|checked| checked.ready()) else {
-            self.set_error("Complete the destination fields before testing.");
-            return;
-        };
-        match runner::test_s3(
-            self.services.clone(),
-            checked.clone(),
-            self.drafts.snapshot(),
-        ) {
-            Ok(receive) => {
-                self.testing_s3 = Some(PendingS3 {
-                    step: id,
-                    call: step.call.clone(),
-                    receive,
-                });
-                self.step_outcomes.insert(
-                    id,
-                    StepStatus {
-                        state: StepPhase::Running,
-                        message: "Checking the bucket…".into(),
-                    },
-                );
-            }
             Err(error) => self.set_error(error),
         }
     }
@@ -1022,8 +835,6 @@ impl State {
         if self.synthetic {
             return;
         }
-        let effects = self.source_setup.tick();
-        self.source_effects(effects);
         if let Some(result) = self
             .gathering
             .as_ref()
@@ -1054,8 +865,11 @@ impl State {
             match next {
                 Some(Ok(event)) => self.turn_event(event),
                 Some(Err(TryRecvError::Disconnected)) => {
-                    self.turn.take();
+                    let pending = self.turn.take().expect("disconnected turn");
                     self.set_error("The assistant worker stopped. Try the request again.");
+                    if !pending.cancelled {
+                        self.last_prompt = Some(pending.prompt);
+                    }
                     break;
                 }
                 _ => break,
@@ -1115,39 +929,6 @@ impl State {
                 Err(error) => self.set_error(error),
             }
         }
-        if let Some(result) =
-            self.testing_s3
-                .as_ref()
-                .and_then(|pending| match pending.receive.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(TryRecvError::Disconnected) => {
-                        Some(Err("The bucket test worker stopped.".into()))
-                    }
-                    Err(TryRecvError::Empty) => None,
-                })
-        {
-            let pending = self.testing_s3.take().expect("pending bucket test");
-            if self
-                .plan
-                .steps
-                .iter()
-                .any(|step| step.id == pending.step && step.call == pending.call)
-            {
-                self.step_outcomes.insert(
-                    pending.step,
-                    match result {
-                        Ok(message) => StepStatus {
-                            state: StepPhase::Done,
-                            message,
-                        },
-                        Err(message) => StepStatus {
-                            state: StepPhase::Failed,
-                            message,
-                        },
-                    },
-                );
-            }
-        }
         if self.open
             && self.applying.is_none()
             && self
@@ -1182,6 +963,7 @@ impl State {
             match result {
                 Ok(outcome) => {
                     if outcome.cancelled {
+                        self.last_prompt = None;
                         let before = self.plan.clone();
                         self.plan.restore_from(&pending.before);
                         self.drafts.reconcile(&before, &self.plan);
@@ -1196,6 +978,7 @@ impl State {
                         self.usage = pending.usage_before;
                         self.usage += outcome.usage;
                         self.error = outcome.error;
+                        self.last_prompt = self.error.is_some().then_some(pending.prompt);
                         self.status = if self.error.is_some() {
                             "Needs attention"
                         } else {
@@ -1227,6 +1010,7 @@ impl State {
                     ));
                 }
                 Err(error) => {
+                    self.last_prompt = Some(pending.prompt);
                     self.error = Some(error.message.clone());
                     self.provider_excerpt = error.excerpt;
                     self.status = "Failed".into();
@@ -1376,6 +1160,7 @@ impl State {
                 }
                 self.remaining = error.is_some() && !self.plan.steps.is_empty();
                 self.error = error;
+                self.last_prompt = None;
                 self.recheck();
                 let stopped = applying.cancel.load(Ordering::SeqCst);
                 self.status = if stopped {

@@ -321,7 +321,6 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
             resolved: crate::destination::Resolved {
                 output: output.into(),
                 destination: None,
-                upload: None,
                 root: None,
             },
             timeout_ms: 1000,

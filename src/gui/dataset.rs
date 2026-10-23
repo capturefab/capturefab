@@ -77,46 +77,19 @@ fn summary(status: Option<&DatasetStatus>, auto: &Auto) -> String {
             Auto::Failed(_) => "Automatic dataset unavailable".into(),
         },
         Some(s) => {
-            let mut parts = vec![
+            format!(
+                "{} · {} captures · {} recordings",
                 file_name(&s.path),
-                format!("{} captures", short(s.captures)),
-            ];
-            if s.samples > 0 {
-                parts.push(format!("{} samples", short(s.samples)));
-            }
-            parts.join(" · ")
+                short(s.captures),
+                short(s.recordings)
+            )
         }
     }
 }
 
-/// Start or stop cataloging into the automatic dataset, for captures and
-/// signal samples alike, while no dataset is open. The signal sink waits for
-/// the hub's writer (which may be writing or checkpointing), so it is
-/// swapped on a background thread, never on the GUI's update thread.
+/// Start or stop cataloging camera captures into the automatic dataset.
 fn auto_catalog(handle: &SessionHandle, on: bool) {
-    static SWAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
     handle.dataset().set_auto_path(on.then(auto_path));
-    let handle = handle.clone();
-    let swap = move || {
-        let _turn = SWAP.lock().unwrap_or_else(|e| e.into_inner());
-        let slot = handle.dataset();
-        // Act on the latest choice, however toggles were ordered.
-        let on = slot.auto_path().is_some() && slot.status_cached().is_none();
-        let sink: Option<Arc<dyn crate::signals::SampleSink>> = on.then(|| slot.clone() as _);
-        if on != handle.signals().has_sink()
-            && (on || slot.status_cached().is_none())
-            && let Err(error) = handle.signals().set_sink(sink, Duration::from_secs(10))
-        {
-            eprintln!("capturefab: signal samples will not reach the automatic dataset: {error:#}");
-        }
-    };
-    if std::thread::Builder::new()
-        .name("capturefab-dataset-auto".into())
-        .spawn(swap)
-        .is_err()
-    {
-        eprintln!("capturefab: could not start the automatic dataset");
-    }
 }
 
 impl DatasetUi {
@@ -140,7 +113,6 @@ impl DatasetUi {
         {
             let open = crate::dataset::coordinator::run(
                 handle.dataset(),
-                handle.signals(),
                 SessionCommand::DatasetOpen {
                     path: path.to_string_lossy().into_owned(),
                     mode: OpenMode::Open,
@@ -375,8 +347,13 @@ pub(super) fn view<'a>(
         || bench.pending(Job::DatasetExport);
     let row_of = |label: &'a str, value: String| -> Element<'a, Message> {
         row![
-            container(text(label).size(style::BODY).color(p.secondary)).width(Fill),
-            text(value).size(style::BODY),
+            container(text(label).size(style::BODY).color(p.secondary))
+                .width(Length::FillPortion(1)),
+            text(value)
+                .size(style::BODY)
+                .width(Length::FillPortion(2))
+                .align_x(Alignment::End)
+                .wrapping(text::Wrapping::WordOrGlyph),
         ]
         .spacing(6)
         .into()
@@ -401,10 +378,6 @@ pub(super) fn view<'a>(
                 .push(row_of("File", file_name(&s.path)))
                 .push(row_of("Captures", s.captures.to_string()))
                 .push(row_of("Recordings", s.recordings.to_string()))
-                .push(row_of(
-                    "Signals",
-                    format!("{} tags · {} samples", s.signals, short(s.samples)),
-                ))
                 .push(row_of(
                     "Last saved",
                     s.last_saved
@@ -435,14 +408,16 @@ pub(super) fn view<'a>(
                     action(Icon::Folder, reveal::label(), Msg::Reveal),
                     action(Icon::Close, "Close", Msg::Close),
                 ]
-                .spacing(6),
+                .spacing(6)
+                .wrap()
+                .vertical_spacing(6),
             );
         }
         None => {
             section = section
                 .push(
                     text(
-                        "A dataset records every capture, recording and signal sample in one \
+                        "A dataset records every capture and recording in one \
                          .duckdb file, ready to export for analysis.",
                     )
                     .size(style::SMALL)
@@ -501,6 +476,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dataset_values_and_actions_fit_the_compact_inspector() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let mut renderer = destinations::layout_tests::renderer();
+        for dark in [false, true] {
+            let mut bench =
+                Workbench::new(SessionHandle::new(), "dataset-layout".into(), true, None);
+            let name = format!("{}.duckdb", "production-line-capture-history-".repeat(5));
+            bench.snapshot.dataset = Some(DatasetStatus {
+                path: format!("/captures/{name}"),
+                captures: u64::MAX,
+                recordings: u64::MAX,
+                last_saved: Some(format!("/captures/{}-00001.png", "camera".repeat(20))),
+                ..Default::default()
+            });
+            let size = Size::new(INSPECTOR - 32.0, 1200.0);
+            // The real sidebar's panel_body supplies the inherited text color.
+            // Keep that ancestor when rendering this section in isolation.
+            let mut view: Element<'_, Message> =
+                container(super::view(&bench, true, Palette::of(dark)).unwrap())
+                    .style(style::base)
+                    .into();
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, size),
+            );
+            let (snapshot, _, _) = accessibility::snapshot_widget(
+                view.as_widget_mut(),
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+            );
+            for label in [
+                "File",
+                "Captures",
+                "Recordings",
+                "Last saved",
+                "Export…",
+                reveal::label(),
+                "Close",
+            ] {
+                let control = snapshot
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.label() == Some(label))
+                    .unwrap_or_else(|| panic!("missing {label}"));
+                let bounds = control.1.bounds().unwrap();
+                assert!(
+                    bounds.width() > 0.0
+                        && bounds.height() > 0.0
+                        && bounds.x0 >= 0.0
+                        && bounds.x1 <= f64::from(size.width) + 0.5,
+                    "{label} must remain readable inside the inspector: {bounds:?}"
+                );
+            }
+            destinations::layout_tests::render_artifact_themed(
+                if dark {
+                    "dataset-compact-dark"
+                } else {
+                    "dataset-compact-light"
+                },
+                &view,
+                &tree,
+                &node,
+                &mut renderer,
+                size,
+                (dark, 1.3),
+            );
+        }
+    }
+
+    #[test]
     fn summary_reads_short() {
         assert_eq!(summary(None, &Auto::Off), "Not cataloging captures");
         assert_eq!(
@@ -514,12 +562,12 @@ mod tests {
         let status = DatasetStatus {
             path: "/d/plant.duckdb".into(),
             captures: 120,
-            samples: 86_400,
+            recordings: 12,
             ..Default::default()
         };
         assert_eq!(
             summary(Some(&status), &Auto::Armed),
-            "plant.duckdb · 120 captures · 86k samples"
+            "plant.duckdb · 120 captures · 12 recordings"
         );
         assert_eq!(short(1_500_000), "1.5M");
     }

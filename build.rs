@@ -1,5 +1,68 @@
 use std::{env, fs, path::PathBuf, process::Command};
 
+/// The OS model is accessed through a bundled helper, so running the desktop
+/// app never needs Xcode or a Swift compiler. Older SDKs keep building the app
+/// and report this provider as unavailable instead of raising its OS baseline.
+fn build_foundation_models(out: &std::path::Path, target: &str) {
+    println!("cargo:rustc-check-cfg=cfg(foundation_models_native)");
+    println!("cargo:rerun-if-changed=src/assistant/foundation_models.swift");
+    println!("cargo:rerun-if-env-changed=SDKROOT");
+    if !target.contains("apple-darwin") || env::var_os("CARGO_FEATURE_AI").is_none() {
+        return;
+    }
+    let sdk = env::var_os("SDKROOT").map(PathBuf::from).or_else(|| {
+        let result = Command::new("xcrun")
+            .args(["--sdk", "macosx", "--show-sdk-path"])
+            .output()
+            .ok()?;
+        result
+            .status
+            .success()
+            .then(|| PathBuf::from(String::from_utf8_lossy(&result.stdout).trim().to_owned()))
+    });
+    let Some(sdk) = sdk.filter(|sdk| {
+        sdk.join("System/Library/Frameworks/FoundationModels.framework")
+            .is_dir()
+    }) else {
+        println!(
+            "cargo:warning=Apple Foundation Models requires a macOS 26 or newer SDK; this provider will be unavailable in this build"
+        );
+        return;
+    };
+    let arch = if target.starts_with("aarch64-") {
+        "arm64"
+    } else if target.starts_with("x86_64-") {
+        "x86_64"
+    } else {
+        panic!("unsupported Foundation Models target: {target}");
+    };
+    let status = Command::new("xcrun")
+        .args(["--sdk", "macosx", "swiftc", "-parse-as-library", "-O"])
+        // Only the helper has this baseline; Rust checks the running OS before
+        // launching it. The main application keeps its existing deployment target.
+        .args(["-target", &format!("{arch}-apple-macosx26.0")])
+        .arg("-sdk")
+        .arg(sdk)
+        .arg("-module-cache-path")
+        .arg(out.join("foundation-models-module-cache"))
+        .args([
+            "-Xlinker",
+            "-weak_framework",
+            "-Xlinker",
+            "FoundationModels",
+        ])
+        .arg("src/assistant/foundation_models.swift")
+        .arg("-o")
+        .arg(out.join("capturefab-foundation-models.bin"))
+        .status()
+        .expect("run xcrun swiftc to build the Foundation Models helper");
+    assert!(
+        status.success(),
+        "cannot build the Foundation Models helper"
+    );
+    println!("cargo:rustc-cfg=foundation_models_native");
+}
+
 fn build_macos_scanner(out: &std::path::Path, target: &str) {
     println!("cargo:rerun-if-changed=src/scanner/macos.m");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
@@ -140,6 +203,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_LICENSE");
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
     let target = env::var("TARGET").expect("Cargo TARGET");
+    build_foundation_models(&out, &target);
     build_task_filesystem();
     if target.ends_with("windows-msvc") {
         // Pre-exported, architecture-independent icon resources. LINK accepts

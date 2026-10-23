@@ -34,11 +34,11 @@ SCENES = {
 CROPS = {
     "quick-command": ("quick-command", (0, 0, 1100, 700), "Quick command plan with checked, editable camera tools and an explicit Run plan action. Provider and camera observations are synthetic display fixtures."),
     "workspace": ("workspace", (0, 0, 1100, 700), "A simulator camera in its own workbench window, with scopes and its Features inspector."),
-    "cameras": ("picker", (300, 40, 800, 660), "The camera picker in a window without a camera: found simulator cameras, the address field beside Search again, and data sources, Settings, Help and session controls."),
+    "cameras": ("picker", (300, 40, 800, 660), "The camera picker in a window without a camera: found simulator cameras, the address field beside Search again, Settings, Help and session controls."),
     "features": ("features", (816, 0, 1100, 652), "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."),
     "capture": ("capture", (0, 0, 284, 700), "Ordinary capture controls first, followed by the Capture options (timeout and scheduling), Storage and retention, and Shell and agents disclosures."),
     "schedule": ("schedule", (16, 404, 272, 586), "The capture scheduling form in Capture options, with start delay and frame interval."),
-    "destinations": ("destinations", (264, 150, 836, 550), "Destination manager showing example folder and S3-compatible bucket destinations."),
+    "destinations": ("destinations", (264, 150, 836, 550), "Destination manager showing saved folder destinations."),
     "scopes": ("scopes", (438, 40, 1096, 442), "Live focus score with its focus measure chooser and exposure histogram alongside the focus region on a simulator image."),
     "forwarding": ("forwarding", (0, 0, 284, 420), "Video panel with the Record to file or Forward to URL choice, the folded Location and name section, a start action and the next file name, followed by the Video settings disclosure summing up codec, frame rate and bitrate."),
     "history": ("destinations", (288, 218, 456, 255), "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."),

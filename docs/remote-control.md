@@ -1,6 +1,6 @@
 # Remote control over a tailnet
 
-Capturefab's WebAssembly client runs in a laptop's browser and controls a native, headless Capturefab session on another computer. Camera connections, acquisition, scheduled jobs, files and uploads run on that server. The laptop needs a browser and access to the server; it does not need camera drivers or a native Capturefab installation.
+Capturefab's WebAssembly client runs in a laptop's browser and controls a native, headless Capturefab session on another computer. Camera connections, acquisition, scheduled jobs and saved files run on that server. The laptop needs a browser and access to the server; it does not need camera drivers or a native Capturefab installation.
 
 The HTTP listener is opt-in. Ordinary `capturefab serve --name bench` keeps its private local IPC interface. With a remote listener, the local CLI and the browser control the same session and cameras.
 
@@ -19,7 +19,7 @@ Then build from the repository root:
 
 ```sh
 ./web-client/build.sh
-cargo build --release --no-default-features --features usb,scanner,jpeg,s3,ftp,sftp,embedded-web
+cargo build --release --no-default-features --features usb,scanner,jpeg,embedded-web
 ```
 
 The native build needs the usual [Capturefab build dependencies](../README.md#build-test-and-release) and produces `target/release/capturefab`. The browser build produces `web-client/dist`; the `embedded-web` feature builds it into the executable (`CAPTUREFAB_WEB_DIST` names another built folder). Without that feature, copy `dist` next to the executable as a folder named `web`, or pass `--web-dir`. Without `--web-dir`, `serve` uses the built-in client, then a `web` folder beside the executable, then `web-client/dist` in the working directory. The server does not compile the client at startup. The pinned `wasm-bindgen-cli` version must match the client's Rust dependency; no Node.js or npm is required.
@@ -46,7 +46,7 @@ On the laptop, open `http://100.101.102.103:8787/` to control the session direct
 
 Connect a discovered camera, or expand **More connection options** to enter a camera ID, IP address or supported stream URL. Use `sim:0` to try the workflow without hardware. Select the camera and start its stream to see a live preview. Expand **Camera settings** to inspect or edit its advertised controls.
 
-Capture output paths refer to the server's filesystem. A relative path resolves from the server's working directory. A saved destination refers to a folder or bucket configured on the server, and its output is a name inside that destination. The server enforces the same file ownership, never-overwrite, quota and retention rules as native Capturefab.
+Capture output paths refer to the server's filesystem. A relative path resolves from the server's working directory. A saved destination refers to a folder configured on the server, and its output is a name inside that destination. The server enforces the same file ownership, never-overwrite, quota and retention rules as native Capturefab.
 
 Use **Save frame** beside the live preview for an immediate capture. Expand **Capture options** to choose a format, frame count and storage limits; **Save frames** starts a background job when the count exceeds one. Expand **Timelapse schedule** to set an interval and optional start time. **Capture jobs** opens when you schedule a sequence. Jobs continue when the browser tab closes or the laptop disconnects. Reopen the page to inspect progress or cancel a job. Stopping the server ends its camera connections and jobs; schedules do not survive a server restart.
 
@@ -83,13 +83,13 @@ The client uses same-origin HTTP endpoints without authentication headers. Reque
 | `GET /api/activity?after=REV&timeout_ms=20000` | Wait for an activity change; all watchers wake when commands or jobs change |
 | `POST /api/command` | A native session command result |
 | `GET /api/preview?camera=ID&format=png\|jpeg` | Latest camera preview, scaled to fit 1280×720: PNG by default, JPEG with `format=jpeg`; HTTP 204 while no frame is available, 304 for the frame named in `If-None-Match` |
-| `GET /api/destinations` | Saved server destinations without credentials; each row has `kind` (`folder`, `s3`, `ftp` or `sftp`) |
+| `GET /api/destinations` | Saved folder destinations on the server; each row has `kind: "folder"` |
 | `GET /api/storage` | Server storage usage and policy |
+| `GET /api/resources` | Read-only CPU, camera-buffer and storage limits/headroom |
 | `GET`, `HEAD /health` | JSON readiness, uptime, camera counts and analytics health; HTTP 503 when stopping or analytics is unavailable |
 | `GET`, `HEAD /metrics` | Prometheus text metrics for session and camera acquisition |
 | `GET`, `HEAD /api/analytics` | Current session totals, camera summaries and bounded time series |
 | `GET`, `HEAD /api/analytics.svg` | Rust Plotters dashboard with frame rate, throughput, missed frames and camera data volume comparisons; optional `width=<logical pixels>` adapts charts to an interface |
-| `GET`, `HEAD /api/signals?history=0\|1` | Sensor and PLC sources with latest values: `{sources, persisting, dropped, sink_error}`; `history=1` adds up to 120 recent points per tag |
 
 Command requests wrap an existing `SessionCommand`:
 
@@ -106,7 +106,7 @@ Previews are display images. A gray image is a Gray PNG and anything else an RGB
 
 Omit `camera` for session-wide operations such as `{"op":"connect","camera":"sim:0","timeout_ms":2000}`. JSON responses use `{ "version": 1, "ok": true, "result": ... }`, or `ok: false` with an error message. Run `capturefab schema` for the session command contract. Captures write files on the server; the preview endpoint supplies a bounded display image rather than the original measurement data.
 
-`actor` is optional display attribution, not authentication. Supply a stable `id` (1–128 ASCII letters, digits, `-`, `_`, `.`, `:`), a nonempty `name` of up to 128 UTF-8 bytes without control characters, and `kind` (`human` or `agent`). Legacy HTTP calls without it appear as **HTTP client**. The activity history retains 200 completed entries plus active commands and schedules across camera selection and disconnect. Read-only observations do not create entries. A schedule's command state becomes `succeeded` when accepted; its `job` object carries `id`, `worker_pid`, `status`, `count`, `captured`, `last_file` and `error` as acquisition continues.
+`actor` is optional display attribution, not authentication. Supply a stable `id` (1–128 ASCII letters, digits, `-`, `_`, `.`, `:`), a nonempty `name` of up to 128 UTF-8 bytes without control characters, and `kind` (`human` or `agent`). HTTP calls without it appear as **HTTP client**. The activity history retains 200 completed entries plus active commands and schedules across camera selection and disconnect. Read-only observations do not create entries. A schedule's command state becomes `succeeded` when accepted; its `job` object carries `id`, `worker_pid`, `status`, `count`, `captured`, `last_file` and `error` as acquisition continues.
 
 Fetch `/api/activity` once, then repeat the waiting request with the returned revision. The server returns immediately when that revision differs from the current one; otherwise it waits up to `timeout_ms` (0–25000, default 20000). After timeout, use the returned revision and wait again. A reconnect can resume with the last revision, including after a server restart; the response always includes the current retained history. Keep watching while your own command runs so other participants' queued work stays visible. `/api/session` also includes `activity` and `activity_revision`; targeted local `status` includes global activity without waiting behind a capture.
 
@@ -115,15 +115,12 @@ Local agents can observe the same immediate changes without enabling HTTP: `capt
 ## Analytics and monitoring
 
 Session snapshots hold the newest 200 `logs` lines from every camera (tagged
-`[camera-id]`), the session and signal sources, oldest first.
-Raw `logs` in session snapshots retain `time`, `level` and `message` and may add
-`timestamp:{unix_ms,utc_offset_seconds}`. Signed Unix milliseconds identify the
-absolute event, while the offset describes the producer clock's seconds east of
-UTC. The legacy `time` string has no recoverable date/zone. Older entries omit
-metadata, and malformed optional metadata leaves the diagnostic readable.
-Desktop/browser displays use the viewer's local zone; browser log labels also
-include ISO UTC, and copied desktop logs include a dated numeric offset. This
-additive metadata preserves the version-1 envelope and original fields.
+`[camera-id]`), and the session, oldest first.
+Raw `logs` in session snapshots contain `level`, `message` and a required,
+validated `timestamp:{unix_ms,utc_offset_seconds}`. Signed Unix milliseconds
+identify the absolute event, while the offset records the producer's seconds east
+of UTC. Desktop/browser displays use the viewer's local zone; browser log labels
+also include ISO UTC, and copied desktop logs include a dated numeric offset.
 
 Analytics collection runs with the session, including when no browser is open and no metrics scraper is connected. DuckDB stores the time series in memory, one sample per second of all cameras together, so it retains 24 hours whatever the camera count, within a limit of 250,000 rows; `samples` in the report counts those one-second samples. The database starts with the first connected camera, and `/health` reports ready before that. Seconds without a connected camera store nothing and chart as idle; expired samples are deleted once a minute and left out of reports at once. Its engine memory limit is 128 MB, with disk spilling and external access disabled. Camera metadata is capped at 256 entries, and inactive entries expire within 24 hours. Session counters accumulate across stop/start and camera disconnects as constant-size lifetime totals; time-series history expires independently. A new server process starts with fresh analytics. Frame and received-byte totals describe acquisition. Missed-frame charts and percentages count `lost`: frames lost on the camera link or in the worker. Totals and camera summaries add `lost` and `preview_skipped` (preview frames a viewer missed because a newer one was ready; with no viewer there are none), camera summaries and points add `lost` and `lost_percent`, and `dropped` and `drop_percent` keep the `status --json` meaning, worker receive errors plus `preview_skipped`. None of them count files written by capture jobs.
 

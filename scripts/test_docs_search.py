@@ -45,6 +45,24 @@ class SearchIndexTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "data-doc-title must match its h2.*missing .doc-summary"):
                 search.index(web)
 
+    def test_indexes_all_reference_pages_with_their_own_urls(self):
+        with tempfile.TemporaryDirectory() as temp:
+            web = Path(temp)
+            article = '<article data-doc-section id="capture" data-doc-title="Capture"><h2>Capture</h2><p class="doc-summary">Save frames.</p></article>'
+            self.write(web, article)
+            (web / "reference.html").write_text(article, encoding="utf-8")
+            (web / "index.html").write_text('<main>Product page without articles</main>', encoding="utf-8")
+            documents = search.index(web)["documents"]
+            self.assertEqual([item["url"] for item in documents], ["docs.html#capture", "reference.html#capture"])
+
+    def test_rejects_invalid_sections_on_reference_pages(self):
+        with tempfile.TemporaryDirectory() as temp:
+            web = Path(temp)
+            self.write(web, '<main>Task guides</main>')
+            (web / "reference.html").write_text('<article data-doc-section id="cli" data-doc-title="CLI"><h2>CLI</h2></article>', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "reference.html: cli: missing .doc-summary"):
+                search.index(web)
+
     def test_rejects_duplicate_and_unsafe_document_anchors(self):
         with tempfile.TemporaryDirectory() as temp:
             web = Path(temp)

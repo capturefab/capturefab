@@ -23,16 +23,16 @@ pub const VERSION: u32 = 1;
 pub const MAX_BYTES: u64 = 64 * 1024;
 const LOCK_WAIT: Duration = Duration::from_secs(if cfg!(test) { 60 } else { 5 });
 static NEXT_WRITE: AtomicU64 = AtomicU64::new(1);
+static REVISION: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
-    what: "assistant settings",
-    names: &["assistant.json"],
-    lock: Some("assistant.lock"),
-};
+/// A cheap invalidation token for settings cached by sibling desktop windows.
+/// All successful writes, including shared measurement credential hints, count.
+#[cfg(feature = "gui")]
+pub(crate) fn revision() -> u64 {
+    REVISION.load(Ordering::Acquire)
+}
 
 fn dir() -> PathBuf {
-    static ADOPTED: std::sync::Once = std::sync::Once::new();
-    ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
     crate::ipc::state_dir()
 }
 
@@ -73,6 +73,20 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn model_prices(&self, id: ProviderId, model: &str) -> Option<&Prices> {
+        const ON_DEVICE: Prices = Prices {
+            input: 0.0,
+            output: 0.0,
+            cache_read: 0.0,
+            cache_write: 0.0,
+        };
+        if id.is_on_device() {
+            Some(&ON_DEVICE)
+        } else {
+            self.prices.get(&format!("{}/{model}", id.id()))
+        }
+    }
+
     pub fn selected(&self) -> Option<(ProviderId, ProviderSettings)> {
         self.provider.map(|id| (id, self.provider_settings(id)))
     }
@@ -365,6 +379,8 @@ fn persist(locked: &Locked, settings: &Settings) -> Result<()> {
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temp);
+        } else {
+            REVISION.fetch_add(1, Ordering::Release);
         }
         return result;
     }
@@ -629,7 +645,7 @@ mod tests {
                 let root = root.clone();
                 thread::spawn(move || {
                     update_in(&root, |store| {
-                        store.providers.entry(id).or_default().saved_key = true;
+                        store.providers.entry(id).or_default().saved_key = !id.is_on_device();
                         Ok(())
                     })
                     .unwrap()
@@ -641,13 +657,13 @@ mod tests {
         }
         let loaded = load_in(&root);
         assert!(loaded.warnings.is_empty());
-        assert_eq!(loaded.settings.providers.len(), 22);
+        assert_eq!(loaded.settings.providers.len(), ProviderId::ALL.len());
         assert!(
             loaded
                 .settings
                 .providers
-                .values()
-                .all(|entry| entry.saved_key)
+                .iter()
+                .all(|(id, entry)| entry.saved_key != id.is_on_device())
         );
         fs::remove_dir_all(root).unwrap();
     }

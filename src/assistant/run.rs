@@ -16,12 +16,12 @@ use crate::{
     session::{ActivityState, ActorKind, SessionActor, SessionCommand, SessionSnapshot},
     tools::{
         self, Checked, Executor, Origin, PlanState, Risk, RunFacts, StepId, ToolCall, ToolKind,
-        context::{Context, DataSourceRef, ToolHost},
+        context::{Context, ToolHost},
         read::{ReadOptions, TurnCache},
         redact,
     },
 };
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest as _;
@@ -42,37 +42,14 @@ use std::{
 pub struct RunScope {
     pub cameras: Vec<String>,
     pub destinations: Vec<String>,
-    /// Exact source URIs chosen locally by a person, pinned to opaque references
-    /// before any model request. The model cannot add new source endpoints.
-    #[serde(serialize_with = "serialize_source_scope")]
-    pub data_sources: Vec<String>,
-    /// Locally bound profile epochs. Only opaque selected source references
-    /// are serialized; an endpoint or credential binding cannot enter a prompt.
-    #[serde(skip)]
-    pub source_bindings: Vec<DataSourceRef>,
-    /// Cached-only account identities selected in a local setup UI. They
-    /// never grant a fresh connection and are checked again before model setup.
-    #[serde(skip)]
-    pub cached_source_bindings: Vec<DataSourceRef>,
     /// The approved dataset slot lifetime, not merely its reusable dataset ID.
     pub dataset: Option<String>,
     pub allow_images: bool,
-    /// Consent to send source values, tags, query rows and annotations to the model.
+    /// Consent to send capture catalog rows, tags and annotations to the model.
     pub allow_data: bool,
     pub allow_recordings: bool,
     pub allow_schedules: bool,
     pub effects_may_outlive_run: bool,
-}
-
-fn serialize_source_scope<S: serde::Serializer>(
-    sources: &[String],
-    serializer: S,
-) -> std::result::Result<S::Ok, S::Error> {
-    sources
-        .iter()
-        .map(|source| redact::for_output_text(source))
-        .collect::<Vec<_>>()
-        .serialize(serializer)
 }
 
 impl std::fmt::Debug for RunScope {
@@ -81,17 +58,7 @@ impl std::fmt::Debug for RunScope {
             .debug_struct("RunScope")
             .field("cameras", &self.cameras)
             .field("destinations", &self.destinations)
-            .field(
-                "data_sources",
-                &self
-                    .data_sources
-                    .iter()
-                    .map(|source| redact::for_model_text(source))
-                    .collect::<Vec<_>>(),
-            )
             .field("dataset", &self.dataset)
-            .field("source_bindings", &self.source_bindings)
-            .field("cached_source_bindings", &self.cached_source_bindings)
             .field("allow_images", &self.allow_images)
             .field("allow_data", &self.allow_data)
             .field("allow_recordings", &self.allow_recordings)
@@ -118,70 +85,8 @@ impl RunScope {
             "Choose saved destinations by name."
         );
         ensure!(
-            !self.cameras.is_empty() || !self.data_sources.is_empty() || self.dataset.is_some(),
-            "Choose a camera, data source or open dataset for this task."
-        );
-        ensure!(
-            self.data_sources.len() <= 32
-                && self
-                    .data_sources
-                    .iter()
-                    .all(|source| !source.trim().is_empty())
-                && self.data_sources.iter().collect::<BTreeSet<_>>().len()
-                    == self.data_sources.len(),
-            "Choose each data source only once, up to 32 sources."
-        );
-        ensure!(
-            self.source_bindings.len() <= 32
-                && self.source_bindings.iter().all(|binding| {
-                    self.data_sources.contains(&binding.reference)
-                        && binding.auth.is_some()
-                        && binding.validate_local().is_ok()
-                })
-                && self
-                    .source_bindings
-                    .iter()
-                    .map(|binding| &binding.reference)
-                    .collect::<BTreeSet<_>>()
-                    .len()
-                    == self.source_bindings.len(),
-            "Choose each saved source once using its current local binding."
-        );
-        ensure!(
-            self.cached_source_bindings.len() <= 32
-                && self.cached_source_bindings.iter().all(|binding| {
-                    self.data_sources.contains(&binding.reference)
-                        && binding.uri.is_empty()
-                        && binding.reference != "all"
-                        && crate::signals::validate_id(&binding.reference).is_ok()
-                        && binding
-                            .auth
-                            .as_ref()
-                            .is_none_or(|auth| auth.validate().is_ok())
-                        && !self
-                            .source_bindings
-                            .iter()
-                            .any(|fresh| fresh.reference == binding.reference)
-                        && !self.data_sources.iter().any(|selected| {
-                            selected != &binding.reference
-                                && DataSourceRef::from_uri(selected)
-                                    .is_ok_and(|fresh| fresh.reference == binding.reference)
-                        })
-                })
-                && self
-                    .cached_source_bindings
-                    .iter()
-                    .map(|binding| &binding.reference)
-                    .collect::<BTreeSet<_>>()
-                    .len()
-                    == self.cached_source_bindings.len(),
-            "Choose each cached source once using its selected account binding."
-        );
-        ensure!(
-            self.data_sources
-                .iter()
-                .all(|source| !prompt::contains_secret(source)),
-            "Choose credential-free source endpoints. Keep source credentials in local source settings."
+            !self.cameras.is_empty() || self.dataset.is_some(),
+            "Choose a camera or open capture catalog for this task."
         );
         ensure!(
             self.dataset
@@ -190,8 +95,8 @@ impl RunScope {
             "Choose the current open dataset."
         );
         ensure!(
-            self.allow_data || self.data_sources.is_empty() && self.dataset.is_none(),
-            "Allow source values, tags, query results and annotations to reach the AI provider before starting a data task."
+            self.allow_data || self.dataset.is_none(),
+            "Allow capture catalog rows, tags and annotations to reach the AI provider before starting a data task."
         );
         Ok(())
     }
@@ -207,12 +112,6 @@ pub enum OnHumanChange {
 }
 
 #[derive(Clone, Debug)]
-pub struct TaskDataRequest {
-    /// Reserved logical database/WAL/spill growth, retained after completion.
-    pub max_bytes: u64,
-}
-
-#[derive(Clone, Debug)]
 pub struct RunRequest {
     pub goal: String,
     pub mode: RunMode,
@@ -224,8 +123,6 @@ pub struct RunRequest {
     /// Desktop tasks can wait for a follow-up; a noninteractive CLI returns
     /// a needs_user outcome instead of waiting without an input channel.
     pub wait_for_answer: bool,
-    /// Local workflow choice. The returned native capability never enters JSON.
-    pub task_data: Option<TaskDataRequest>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,8 +181,6 @@ pub struct RunRecord {
     pub worker_pids: BTreeMap<String, u32>,
     /// Opaque worker identity for recordings this task actually started.
     pub forwarders: BTreeMap<String, String>,
-    /// Exact acknowledged signal instances. This never authorizes a plain stop.
-    pub signal_captures: BTreeMap<String, String>,
     /// Dataset opened by this task; it remains open for review after completion.
     pub opened_dataset: Option<String>,
 }
@@ -302,57 +197,14 @@ pub struct Leftover {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct SignalReport {
-    pub source: String,
-    pub capture_id: String,
-    pub state: crate::signals::SourceState,
-    pub samples: u64,
-    pub written: u64,
-    pub payload_bytes: u64,
-    pub written_bytes: u64,
-    pub dropped: u64,
-    pub helper_dropped: u64,
-    pub completed_ms: Option<u64>,
-    pub persistence_complete: bool,
-    pub error: Option<String>,
-}
-impl SignalReport {
-    pub fn from_status(status: &crate::signals::SourceStatus) -> Self {
-        Self {
-            source: status.id.clone(),
-            capture_id: status.capture_id.clone(),
-            state: status.state,
-            samples: status.samples,
-            written: status.written,
-            payload_bytes: status.payload_bytes,
-            written_bytes: status.written_bytes,
-            dropped: status.dropped,
-            helper_dropped: status.helper_dropped,
-            completed_ms: status.completed_ms,
-            persistence_complete: status.persistence_complete,
-            error: status
-                .persistence_error
-                .as_ref()
-                .or(status.error.as_ref())
-                .map(|error| redact::for_model_text(error)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
 pub struct RunOutcome {
     pub run_id: String,
     pub outcome: Outcome,
     pub summary: String,
     pub totals: Totals,
-    /// Final acknowledged source accounting; excludes endpoints, tags and values.
-    pub signal_reports: Vec<SignalReport>,
     pub leftovers: Vec<Leftover>,
     pub log: PathBuf,
     pub restore: RunRecord,
-    /// Trusted local artifact receipt; never sent to the provider as context.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_data: Option<crate::session::task_data::TaskDataStatus>,
 }
 
 #[derive(Clone, Debug)]
@@ -372,7 +224,6 @@ struct Shared {
     status: Mutex<RunSnapshot>,
     completion: Mutex<Option<std::result::Result<RunOutcome, String>>>,
     log: Mutex<Option<Arc<Mutex<ActionLog>>>>,
-    task_host: Mutex<Option<Arc<dyn ToolHost>>>,
     end_fields: Mutex<Value>,
     ended: AtomicBool,
 }
@@ -387,7 +238,6 @@ impl Default for Shared {
             status: Mutex::new(RunSnapshot::default()),
             completion: Mutex::new(None),
             log: Mutex::new(None),
-            task_host: Mutex::new(None),
             end_fields: Mutex::new(json!({})),
             ended: AtomicBool::new(false),
         }
@@ -405,15 +255,6 @@ impl RunControl {
             return;
         }
         let already = self.shared.cancel.swap(true, Ordering::SeqCst);
-        let task_host = self
-            .shared
-            .task_host
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(host) = task_host {
-            host.request_close_task_data();
-        }
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
         if !already
             && let Some(log) = self
@@ -504,16 +345,6 @@ impl RunControl {
             return;
         }
         let already = self.shared.cancel.swap(true, Ordering::SeqCst);
-        let task_host = self
-            .shared
-            .task_host
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let task_data = task_host.and_then(|host| {
-            host.request_close_task_data();
-            host.task_data_status()
-        });
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
         let mut fields = self
             .shared
@@ -521,25 +352,6 @@ impl RunControl {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
-        if let Some(status) = task_data {
-            let reserved = status.catalog.extents.limit;
-            if !fields["totals"].is_object() {
-                fields["totals"] = json!(Totals {
-                    bytes: reserved,
-                    ..Totals::default()
-                });
-            } else {
-                fields["totals"]["bytes"] = json!(
-                    fields["totals"]["bytes"]
-                        .as_u64()
-                        .unwrap_or(0)
-                        .max(reserved)
-                );
-            }
-            // This is a local shutdown snapshot, which can still be Closing.
-            // Quit never waits for a provider or claims an unacknowledged close.
-            fields["task_data"] = json!(status);
-        }
         fields["outcome"] = json!("app_quit");
         fields["summary"] = json!("The assistant stopped because Capturefab quit.");
         if let Some(log) = self
@@ -708,17 +520,7 @@ struct HumanTracker {
     activities: BTreeMap<u64, String>,
     values: BTreeMap<(String, String), String>,
     workers: BTreeMap<String, u32>,
-    source_instances: BTreeMap<String, String>,
-    source_access: BTreeMap<String, String>,
     dataset: Option<String>,
-    sink: Option<(bool, Option<String>, u64)>,
-}
-
-fn source_access(ctx: &Context) -> BTreeMap<String, String> {
-    ctx.data_sources
-        .iter()
-        .map(|source| (source.reference.clone(), source.identity()))
-        .collect()
 }
 
 fn value_text(value: &Value) -> String {
@@ -832,23 +634,11 @@ impl HumanTracker {
                 .filter(|camera| scope.contains(&camera.info.id))
                 .map(|camera| (camera.info.id.clone(), camera.worker_pid))
                 .collect(),
-            source_instances: ctx
-                .snapshot
-                .signals
-                .iter()
-                .map(|source| (source.id.clone(), source.capture_id.clone()))
-                .collect(),
-            source_access: source_access(ctx),
             dataset: ctx
                 .snapshot
                 .dataset
                 .as_ref()
                 .and_then(|dataset| dataset.slot_id.clone()),
-            sink: ctx
-                .snapshot
-                .signal_sink
-                .as_ref()
-                .map(|sink| (sink.attached, sink.dataset_slot_id.clone(), sink.generation)),
         }
     }
 
@@ -881,7 +671,7 @@ impl HumanTracker {
             if activity.state == ActivityState::Failed
                 || self.activities.get(&activity.id) == Some(&activity_signature(activity))
                 || !human_operation(&activity.operation)
-                || activity.actor.as_ref().is_some_and(|by| by.id == actor)
+                || activity.actor.id == actor
             {
                 continue;
             }
@@ -940,32 +730,14 @@ impl HumanTracker {
     }
 
     fn accept_data(&mut self, ctx: &Context) {
-        self.source_access = source_access(ctx);
-        self.source_instances = ctx
-            .snapshot
-            .signals
-            .iter()
-            .map(|source| (source.id.clone(), source.capture_id.clone()))
-            .collect();
         self.dataset = ctx
             .snapshot
             .dataset
             .as_ref()
             .and_then(|dataset| dataset.slot_id.clone());
-        self.sink = ctx
-            .snapshot
-            .signal_sink
-            .as_ref()
-            .map(|sink| (sink.attached, sink.dataset_slot_id.clone(), sink.generation));
     }
 
-    fn data_changes(
-        &self,
-        ctx: &Context,
-        sources: &BTreeSet<String>,
-        data_task: bool,
-        actor: &str,
-    ) -> Vec<(String, String)> {
+    fn data_changes(&self, ctx: &Context, data_task: bool) -> Vec<(String, String)> {
         if !data_task {
             return Vec::new();
         }
@@ -978,60 +750,6 @@ impl HumanTracker {
         if self.dataset != dataset {
             changes.push((format!("dataset:{}",self.dataset.as_deref().unwrap_or("empty")),
                 "The shared dataset was opened, closed or replaced. Stop this task and start a new task to approve the current dataset.".into()));
-        }
-        let sink = ctx
-            .snapshot
-            .signal_sink
-            .as_ref()
-            .map(|sink| (sink.attached, sink.dataset_slot_id.clone(), sink.generation));
-        if self.sink != sink {
-            changes.push((self.sink.as_ref().map(|(_,_,generation)|format!("sink:{generation}")).unwrap_or_else(||"sink:empty".into()),
-                "The shared signal persistence sink changed. Previous data approvals expired; review source persistence before continuing.".into()));
-        }
-        for source in sources {
-            if self.source_access.get(source) != source_access(ctx).get(source) {
-                changes.push((
-                    format!("source:{source}"),
-                    format!("The approved local binding for {source} changed or expired. Select the source locally and start a new task to approve it again."),
-                ));
-            }
-            let current = ctx
-                .snapshot
-                .signals
-                .iter()
-                .find(|status| status.id == *source)
-                .map(|status| &status.capture_id);
-            if self.source_instances.get(source) != current {
-                changes.push((
-                    format!("source:{source}"),
-                    format!("The capture instance for {source} changed."),
-                ));
-            }
-        }
-        for activity in &ctx.snapshot.activity {
-            if activity.state == ActivityState::Failed
-                || self.activities.get(&activity.id) == Some(&activity_signature(activity))
-                || activity.actor.as_ref().is_some_and(|by| by.id == actor)
-            {
-                continue;
-            }
-            if matches!(
-                activity.operation.as_str(),
-                "signal_stop" | "signal_stop_if"
-            ) {
-                for source in sources {
-                    if (activity.label.contains(source) || activity.label.ends_with(" all"))
-                        && !changes
-                            .iter()
-                            .any(|(resource, _)| resource == &format!("source:{source}"))
-                    {
-                        changes.push((
-                            format!("source:{source}"),
-                            format!("Another participant stopped signal capture {source}."),
-                        ));
-                    }
-                }
-            }
         }
         changes
     }
@@ -1051,11 +769,6 @@ struct Runtime<'a> {
     facts: RunFacts,
     record: RunRecord,
     context: Context,
-    /// Exact local source endpoints selected by the caller. Never serialized.
-    source_bindings: Vec<DataSourceRef>,
-    /// Keyed by capture token so restarting one URI cannot overwrite an earlier
-    /// attempt's final persistence report when the live registry replaces it.
-    signal_reports: BTreeMap<String, crate::signals::SourceStatus>,
     humans: HumanTracker,
     owned_forwarders: BTreeMap<String, String>,
     uncertain_forwarders: BTreeSet<String>,
@@ -1145,22 +858,6 @@ fn pin_scope(scope: &RunScope, ctx: &Context) -> Result<RunScope> {
         names.push(destination.name.clone());
     }
     pinned.destinations = names;
-    pinned.data_sources = scope
-        .data_sources
-        .iter()
-        .map(|source| {
-            let matches = ctx
-                .data_sources
-                .iter()
-                .filter(|known| known.reference == *source || known.uri == *source)
-                .collect::<Vec<_>>();
-            ensure!(
-                matches.len() == 1,
-                "Choose an unambiguous data source from the approved local source list."
-            );
-            Ok(matches[0].reference.clone())
-        })
-        .collect::<Result<_>>()?;
     if let Some(slot) = &scope.dataset {
         ensure!(
             ctx.snapshot
@@ -1174,80 +871,9 @@ fn pin_scope(scope: &RunScope, ctx: &Context) -> Result<RunScope> {
     Ok(pinned)
 }
 
-/// Supplying an exact endpoint is a caller action. A tool/model can only use
-/// the opaque references produced here, even after refreshing session state.
-fn initial_data_scope(ctx: &mut Context, scope: &RunScope) -> Result<Vec<DataSourceRef>> {
+fn apply_data_scope(ctx: &mut Context, scope: &RunScope) {
     ctx.allow_data = scope.allow_data;
     ctx.data_dataset = scope.dataset.clone();
-    for binding in &scope.source_bindings {
-        binding.validate_in(ctx)?;
-        ctx.data_sources
-            .retain(|known| known.reference != binding.reference);
-        ctx.data_sources.push(binding.clone());
-    }
-    for binding in &scope.cached_source_bindings {
-        ensure!(
-            ctx.snapshot
-                .signals
-                .iter()
-                .any(|source| binding.permits_cached(source)),
-            "A selected cached source was removed or its account changed. Select the current source again before starting this task."
-        );
-        ctx.data_sources
-            .retain(|known| known.reference != binding.reference);
-        ctx.data_sources.push(binding.clone());
-    }
-    for source in &scope.data_sources {
-        if source.starts_with("signal:") {
-            continue;
-        }
-        let binding = DataSourceRef::approved(source)?;
-        // The explicit local endpoint supplied by the person replaces a
-        // cached-only handle, whose redacted display cannot be executable.
-        ctx.data_sources
-            .retain(|known| known.reference != binding.reference || !known.uri.is_empty());
-        if !ctx.data_sources.iter().any(|known| known == &binding) {
-            ctx.data_sources.push(binding);
-        }
-    }
-    let mut bindings = Vec::new();
-    for source in &scope.data_sources {
-        let matches = ctx
-            .data_sources
-            .iter()
-            .filter(|known| known.reference == *source || known.uri == *source)
-            .collect::<Vec<_>>();
-        ensure!(
-            matches.len() == 1,
-            "Choose an unambiguous data source from the approved local source list."
-        );
-        let binding = matches[0];
-        ensure!(
-            !ctx.data_sources
-                .iter()
-                .any(|known| known.reference == binding.reference && known != binding),
-            "Two endpoints have the same source reference. Remove the conflicting source before starting this task."
-        );
-        bindings.push(binding.clone());
-    }
-    // Scope is also the data disclosure boundary: a camera-only run cannot
-    // accidentally transmit unrelated source values through get_overview.
-    ctx.data_sources = bindings.clone();
-    Ok(bindings)
-}
-
-fn apply_data_scope(ctx: &mut Context, scope: &RunScope, bindings: &[DataSourceRef]) {
-    ctx.allow_data = scope.allow_data;
-    ctx.data_dataset = scope.dataset.clone();
-    ctx.data_sources = bindings
-        .iter()
-        .filter(|binding| {
-            // Cached-only selections retain their original account identity.
-            // Executable profile bindings expire instead of adopting a new epoch.
-            binding.uri.is_empty() || binding.auth.is_none() || binding.validate_in(ctx).is_ok()
-        })
-        .cloned()
-        .collect();
 }
 
 const MAX_INITIALIZATIONS: usize = 16;
@@ -1344,7 +970,6 @@ struct InitializationLog<'a> {
     deps: &'a Deps,
     control: &'a RunControl,
     start_ms: u64,
-    task_host: Option<&'a dyn ToolHost>,
 }
 impl InitializationLog<'_> {
     fn finish(
@@ -1360,44 +985,23 @@ impl InitializationLog<'_> {
             deps,
             control,
             start_ms,
-            task_host,
         } = self;
         let outcome = if control.shared.ended.load(Ordering::SeqCst) {
             Outcome::AppQuit
         } else {
             outcome
         };
-        let mut summary = if outcome == Outcome::AppQuit {
+        let summary = if outcome == Outcome::AppQuit {
             "The assistant stopped because Capturefab quit.".into()
         } else {
             summary
         };
-        let task_data = if let Some(host) = task_host {
-            match host.close_task_data(Duration::from_secs(10)) {
-                Ok(status) => status,
-                Err(error) => {
-                    summary.push_str(&format!(
-                        " Task data remains reserved: {}",
-                        redact::for_output_text(&error.to_string())
-                    ));
-                    host.task_data_status()
-                }
-            }
-        } else {
-            None
-        };
-        let totals = Totals {
-            bytes: task_data
-                .as_ref()
-                .map_or(0, |status| status.catalog.extents.limit),
-            ..Totals::default()
-        };
+        let totals = Totals::default();
         let report = RunOutcome {
             run_id: run_id.into(),
             outcome,
             summary: summary.clone(),
             totals,
-            signal_reports: Vec::new(),
             leftovers: Vec::new(),
             log: log
                 .lock()
@@ -1409,10 +1013,9 @@ impl InitializationLog<'_> {
                 actor_id: actor.id.clone(),
                 ..RunRecord::default()
             },
-            task_data,
         };
         if !control.shared.ended.swap(true, Ordering::SeqCst) {
-            log.lock().map_err(|_|anyhow!("The assistant action log is unavailable."))?.finish(json!({"outcome":outcome,"summary":summary,"totals":report.totals,"leftovers":report.leftovers,"task_data":report.task_data}),deps.clock.now_ms())?;
+            log.lock().map_err(|_|anyhow!("The assistant action log is unavailable."))?.finish(json!({"outcome":outcome,"summary":summary,"totals":report.totals,"leftovers":report.leftovers}),deps.clock.now_ms())?;
         }
         let snapshot = RunSnapshot {
             run_id: run_id.into(),
@@ -1456,7 +1059,7 @@ pub fn run_blocking(
         initial.session,
         "An assistant task needs a running session."
     );
-    let source_bindings = initial_data_scope(&mut initial, &request.scope)?;
+    apply_data_scope(&mut initial, &request.scope);
     request.scope = pin_scope(&request.scope, &initial)?;
     let provider = request
         .provider
@@ -1468,41 +1071,13 @@ pub fn run_blocking(
     }
     let prices = deps
         .settings
-        .prices
-        .get(&format!("{}/{}", provider.id(), settings.model(provider)))
+        .model_prices(provider, settings.model(provider))
         .copied();
     let ceiling = initial
         .storage
         .free_budget()
         .min(initial.storage.free_disk.unwrap_or(u64::MAX));
-    let mut limiter = Limiter::new(request.limits.clone(), start_ms, ceiling, prices)?;
-    if let Some(storage) = &request.task_data {
-        ensure!(
-            deps.host.supports_task_data(),
-            "Separate task datasets are unavailable on this session host."
-        );
-        ensure!(
-            request.scope.allow_data,
-            "Allow data access before creating a separate task dataset."
-        );
-        ensure!(
-            request.scope.cameras.is_empty() && request.scope.dataset.is_none(),
-            "Separate task datasets currently require a sensor-only scope without a shared dataset."
-        );
-        ensure!(
-            !request.scope.data_sources.is_empty(),
-            "Choose a data source for a separate task dataset."
-        );
-        ensure!(
-            !request.scope.effects_may_outlive_run,
-            "A separate task dataset must finish with its task."
-        );
-        ensure!(
-            storage.max_bytes > 0,
-            "The task dataset storage cap must be positive."
-        );
-        limiter.reserve_task_storage(storage.max_bytes)?;
-    }
+    let limiter = Limiter::new(request.limits.clone(), start_ms, ceiling, prices)?;
     limiter.check_wall(deps.clock.now_ms())?;
     // Quit takes this same lock before writing its final record. Either no
     // journal starts after cancellation, or quit sees the attached journal and
@@ -1547,41 +1122,17 @@ pub fn run_blocking(
     struct EndGuard<'a> {
         log: Arc<Mutex<ActionLog>>,
         deps: &'a Deps,
-        control: &'a RunControl,
-        host: Option<Arc<dyn ToolHost>>,
     }
     impl Drop for EndGuard<'_> {
         fn drop(&mut self) {
-            let task_data = if let Some(host) = &self.host {
-                let status = host
-                    .close_task_data(Duration::from_secs(10))
-                    .unwrap_or_else(|_| host.task_data_status());
-                let mut slot = self
-                    .control
-                    .shared
-                    .task_host
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                if slot
-                    .as_ref()
-                    .is_some_and(|current| Arc::ptr_eq(current, host))
-                {
-                    slot.take();
-                }
-                status
-            } else {
-                None
-            };
             if let Ok(mut log) = self.log.lock() {
-                let _ = log.finish(json!({"outcome":"failed","summary":"The assistant task ended before initialization completed.","task_data":task_data}), self.deps.clock.now_ms());
+                let _ = log.finish(json!({"outcome":"failed","summary":"The assistant task ended before initialization completed."}), self.deps.clock.now_ms());
             }
         }
     }
-    let mut end_guard = EndGuard {
+    let _end_guard = EndGuard {
         log: log.clone(),
         deps,
-        control,
-        host: None,
     };
     let initialization = InitializationLog {
         run_id: &run_id,
@@ -1590,7 +1141,6 @@ pub fn run_blocking(
         deps,
         control,
         start_ms,
-        task_host: None,
     };
     if control.cancel().load(Ordering::SeqCst) {
         return initialization.finish(
@@ -1610,70 +1160,12 @@ pub fn run_blocking(
             return Err(error);
         }
     };
-    let host = if let Some(storage) = &request.task_data {
-        let policy = crate::session::task_data::TaskDataPolicy {
-            parent: initial.capture_root.clone(),
-            storage: initial.storage.effective.clone(),
-            max_bytes: storage.max_bytes,
-            lifetime: Duration::from_millis(limiter.remaining_wall_ms(deps.clock.now_ms())),
-            name: "Assistant task dataset".into(),
-        };
-        match host.with_task_data(policy) {
-            Ok(host) => host,
-            Err(error) => {
-                initialization.finish(
-                    Outcome::Failed,
-                    redact::for_output_text(&error.to_string()),
-                    events,
-                )?;
-                return Err(error);
-            }
-        }
-    } else {
-        host
-    };
-    end_guard.host = Some(host.clone());
-    *control
-        .shared
-        .task_host
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(host.clone());
-    if control.cancel().load(Ordering::Acquire) {
-        host.request_close_task_data();
-    }
-    let initialization = InitializationLog {
-        task_host: Some(host.as_ref()),
-        ..initialization
-    };
     if control.cancel().load(Ordering::Acquire) || control.shared.ended.load(Ordering::Acquire) {
         return initialization.finish(
             Outcome::Stopped,
             "The assistant task was stopped.".into(),
             events,
         );
-    }
-    if request.task_data.is_some() {
-        let status = host
-            .task_data_status()
-            .context("The session did not acknowledge its task dataset.")?;
-        request.scope.dataset = Some(status.catalog.identity.slot_id.clone());
-        let recorded = log.lock().unwrap_or_else(|e| e.into_inner()).record(
-            "task_data",
-            serde_json::to_value(&status)?,
-            deps.clock.now_ms(),
-        );
-        if let Err(error) = recorded {
-            if control.cancel().load(Ordering::Acquire)
-                || control.shared.ended.load(Ordering::Acquire)
-            {
-                return initialization.finish(
-                    Outcome::Stopped,
-                    "The assistant task was stopped.".into(),
-                    events,
-                );
-            }
-            return Err(error);
-        }
     }
     events(RunEvent::State(control.status()));
     let initialized = initialize_model(
@@ -1722,14 +1214,13 @@ pub fn run_blocking(
         }
     };
     let mut ctx = deps.gather(host.as_ref())?;
-    apply_data_scope(&mut ctx, &request.scope, &source_bindings);
+    apply_data_scope(&mut ctx, &request.scope);
     // Credential resolution may take long enough for another participant to
     // replace the shared dataset while initialization is in flight.
     pin_scope(&request.scope, &ctx)?;
     let facts = RunFacts {
         actor_id: actor.id.clone(),
         scope: request.scope.cameras.iter().cloned().collect(),
-        data_sources: request.scope.data_sources.iter().cloned().collect(),
         dataset: request.scope.dataset.clone(),
         worker_pids: ctx
             .snapshot
@@ -1759,13 +1250,6 @@ pub fn run_blocking(
             json!({"scope":request.scope,"limits":request.limits,"limits_remaining":limiter.remaining(deps.clock.now_ms())})
         )
     );
-    let goal = if request.task_data.is_some() {
-        format!(
-            "{goal}\nA fresh separate task dataset is already open for this sensor-only task. Use it directly; do not open or replace a dataset. Its reserved logical growth cap is separate from serialized sample limits. Signal payload writes use that prepaid workspace; exported files still require available shared storage."
-        )
-    } else {
-        goal
-    };
     conversation.append_user(&prompt::user_prefix(&goal, &ctx), model.wire.as_ref())?;
     let humans = HumanTracker::new(&ctx, &facts.scope);
     let policy = ApprovalPolicy::new(request.mode);
@@ -1783,8 +1267,6 @@ pub fn run_blocking(
         facts,
         record,
         context: ctx,
-        source_bindings,
-        signal_reports: BTreeMap::new(),
         humans,
         owned_forwarders: BTreeMap::new(),
         uncertain_forwarders: BTreeSet::new(),
@@ -1857,18 +1339,16 @@ impl Runtime<'_> {
             .shared
             .end_fields
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = json!({"totals":self.limiter.totals,"leftovers":self.leftovers(),"signal_reports":self.signal_reports.values().map(SignalReport::from_status).collect::<Vec<_>>()});
+            .unwrap_or_else(|error| error.into_inner()) =
+            json!({"totals":self.limiter.totals,"leftovers":self.leftovers()});
     }
 
     fn refresh(&mut self) -> Result<()> {
         let mut ctx = self.deps.gather(self.host.as_ref())?;
-        apply_data_scope(&mut ctx, &self.request.scope, &self.source_bindings);
+        apply_data_scope(&mut ctx, &self.request.scope);
         for activity in &ctx.snapshot.activity {
             if activity.state == ActivityState::Failed
-                || activity
-                    .actor
-                    .as_ref()
-                    .is_some_and(|actor| actor.id == self.facts.actor_id)
+                || activity.actor.id == self.facts.actor_id
                 || self.humans.activities.get(&activity.id) == Some(&activity_signature(activity))
             {
                 continue;
@@ -1914,20 +1394,12 @@ impl Runtime<'_> {
                 OnHumanChange::Stop => self.control.stop(),
             }
         }
-        let data_changes = self.humans.data_changes(
-            &ctx,
-            &self.facts.data_sources,
-            !self.facts.data_sources.is_empty() || self.facts.dataset.is_some(),
-            &self.facts.actor_id,
-        );
+        let data_changes = self.humans.data_changes(&ctx, self.facts.dataset.is_some());
         for (resource, note) in data_changes {
             if resource.starts_with("dataset:") {
                 self.dataset_replaced = true;
             }
             self.policy.invalidate_data_resource(&resource);
-            if let Some(source) = resource.strip_prefix("source:") {
-                self.facts.signal_captures.remove(source);
-            }
             self.log("human_change", json!({"resource":resource,"label":note}))?;
             self.human_notes.push(note.clone());
             self.pending_human_notes.push(note.clone());
@@ -1952,18 +1424,6 @@ impl Runtime<'_> {
                     && state.forwarding.is_some()
             })
         });
-        self.facts.signal_captures.retain(|source, token| {
-            ctx.snapshot
-                .signals
-                .iter()
-                .any(|state| state.id == *source && state.capture_id == *token)
-        });
-        for source in &ctx.snapshot.signals {
-            if self.record.signal_captures.get(&source.id) == Some(&source.capture_id) {
-                self.signal_reports
-                    .insert(source.capture_id.clone(), source.clone());
-            }
-        }
         self.context = ctx;
         Ok(())
     }
@@ -2389,14 +1849,8 @@ impl Runtime<'_> {
         if call.tool == "open_dataset" {
             ensure!(
                 self.request.scope.allow_data
-                    && (!self.facts.data_sources.is_empty() || self.facts.dataset.is_some()),
-                "Choose a data source or dataset in task setup before opening a dataset."
-            );
-        }
-        if let Some(source) = call.args.get("source").and_then(Value::as_str) {
-            ensure!(
-                self.request.scope.allow_data && self.facts.data_sources.contains(source),
-                "That data source is not part of this task. Ask the user to add it locally."
+                    && (!self.facts.scope.is_empty() || self.facts.dataset.is_some()),
+                "Choose a camera or capture catalog in task setup before opening a dataset."
             );
         }
         if let Some(slot) = call.args.get("slot_id").and_then(Value::as_str) {
@@ -2469,54 +1923,26 @@ impl Runtime<'_> {
     }
 
     fn checked(&self, id: StepId, call: &ToolCall) -> (Checked, ToolImpact) {
-        self.checked_with_secret_preview(id, call, false)
-    }
-    fn checked_with_secret_preview(
-        &self,
-        id: StepId,
-        call: &ToolCall,
-        preview: bool,
-    ) -> (Checked, ToolImpact) {
         let mut plan = PlanState::assistant(&self.context);
         plan.actor_id = Some(self.facts.actor_id.clone());
         plan.run = Some(self.facts.clone());
         let mut checked = tools::check(&self.context, &mut plan, id, call, &|step, field| {
             self.deps.secrets.secret(step, field).is_some()
-                || preview
-                    && call.tool == "create_s3_destination"
-                    && call.args["credentials"] == "keychain"
-                    && field == "secret"
         });
         for resource in checked.data_resources.clone() {
             let allowed = self.request.scope.allow_data
-                && (if let Some(source) = resource.strip_prefix("source:") {
-                    self.facts.data_sources.contains(source)
-                } else if let Some(dataset) = resource.strip_prefix("dataset:") {
+                && (if let Some(dataset) = resource.strip_prefix("dataset:") {
                     self.facts.dataset.as_deref() == Some(dataset)
                         || dataset == "empty"
                             && self.facts.dataset.is_none()
                             && call.tool == "open_dataset"
-                } else if let Some(endpoint) = resource.strip_prefix("endpoint:") {
-                    self.source_bindings
-                        .iter()
-                        .any(|binding| binding.identity() == endpoint)
-                } else if let Some(token) = resource.strip_prefix("signal:") {
-                    self.context.snapshot.signals.iter().any(|source| {
-                        self.facts.data_sources.contains(&source.id) && source.capture_id == token
-                    })
-                } else if let Some(generation) = resource.strip_prefix("sink:") {
-                    self.context
-                        .snapshot
-                        .signal_sink
-                        .as_ref()
-                        .is_some_and(|sink| generation.parse::<u64>().ok() == Some(sink.generation))
                 } else {
                     false
                 });
             if !allowed {
                 checked.error(
                     "scope",
-                    "This data resource is outside the task's approved source or dataset scope.",
+                    "This data resource is outside the task's approved capture catalog scope.",
                 );
             }
         }
@@ -2610,19 +2036,6 @@ impl Runtime<'_> {
         let id = StepId(self.next_step);
         self.next_step = self.next_step.saturating_add(1);
         let (mut checked, _) = self.checked(id, &scoped);
-        if !checked.ready()
-            && checked.call.tool == "create_s3_destination"
-            && checked
-                .issues
-                .iter()
-                .filter(|issue| issue.is_error())
-                .all(|issue| issue.field.as_deref() == Some("secret"))
-        {
-            let (preview, _) = self.checked_with_secret_preview(id, &scoped, true);
-            if preview.ready() {
-                checked = preview;
-            }
-        }
         self.limiter.record_call(&checked.call)?;
         if !checked.ready() {
             self.log("tool",json!({"call_id":call.id,"name":call.name,"risk":checked.risk,"args":checked.call.args,"outcome":"refused","issues":checked.issues,"summary":checked.summary}))?;
@@ -2758,14 +2171,14 @@ impl Runtime<'_> {
                     .history
                     .entries
                     .iter()
-                    .find(|entry| entry.token == token)?
-                    .setting_changes
+                    .find(|entry| entry.token == token)
+                    .map(|entry| entry.setting_changes)
             });
             let Some(count) = count else {
                 return Ok((
                     ResultRecord::error(
                         call,
-                        "The undo entry has no bounded settings count. Inspect the camera history and ask the user to restore it.",
+                        "The undo entry is no longer in the camera history. Inspect the current history and propose it again.",
                     ),
                     None,
                 ));
@@ -2775,7 +2188,7 @@ impl Runtime<'_> {
         if !self.request.scope.effects_may_outlive_run
             && (matches!(
                 checked.call.tool.as_str(),
-                "start_recording" | "stream_to_url" | "schedule_captures" | "start_signal_capture"
+                "start_recording" | "stream_to_url" | "schedule_captures"
             ))
             && (impact.ends_at_ms.is_none()
                 || impact
@@ -2993,8 +2406,7 @@ impl Runtime<'_> {
         let baseline = self.context.clone();
         let scope = self.facts.scope.clone();
         let actor = self.facts.actor_id.clone();
-        let data_sources = self.facts.data_sources.clone();
-        let data_task = !data_sources.is_empty() || self.facts.dataset.is_some();
+        let data_task = self.facts.dataset.is_some();
         let tracker = &self.humans;
         let interrupt = || {
             if self.now() >= self.limiter.deadline_ms() {
@@ -3012,7 +2424,7 @@ impl Runtime<'_> {
                     .map(|(_, _, note)| note.clone())
                     .or_else(|| {
                         tracker
-                            .data_changes(&ctx, &data_sources, data_task, &actor)
+                            .data_changes(&ctx, data_task)
                             .first()
                             .map(|(_, note)| note.clone())
                     })
@@ -3153,27 +2565,6 @@ impl Runtime<'_> {
                     .or_insert(state.worker_pid);
             }
         }
-        // An acknowledged token survives loss of the following status read.
-        // Cleanup must remain conditional even when the helper/session stops
-        // answering immediately after accepting the capture.
-        if checked.call.tool == "start_signal_capture" {
-            for result in &outcome.results {
-                if let (Some(source), Some(token)) =
-                    (result["id"].as_str(), result["capture_id"].as_str())
-                    && self.facts.data_sources.contains(source)
-                    && crate::signals::validate_capture_id(token).is_ok()
-                {
-                    self.record
-                        .signal_captures
-                        .insert(source.into(), token.into());
-                    if let Ok(status) =
-                        serde_json::from_value::<crate::signals::SourceStatus>(result.clone())
-                    {
-                        self.signal_reports.insert(token.into(), status);
-                    }
-                }
-            }
-        }
         if checked.call.tool == "open_dataset"
             && let Some(slot) = outcome
                 .results
@@ -3184,51 +2575,12 @@ impl Runtime<'_> {
             self.record.opened_dataset = Some(slot.into());
             self.dataset_replaced = false;
         }
-        if matches!(
-            checked.call.tool.as_str(),
-            "start_signal_capture" | "stop_signal_capture" | "wait_for_data"
-        ) {
-            fn remember_reports(
-                value: &Value,
-                owned: &BTreeMap<String, String>,
-                reports: &mut BTreeMap<String, crate::signals::SourceStatus>,
-            ) {
-                if let (Some(source), Some(token)) =
-                    (value["id"].as_str(), value["capture_id"].as_str())
-                    && owned.get(source).is_some_and(|owned| owned == token)
-                    && let Ok(status) =
-                        serde_json::from_value::<crate::signals::SourceStatus>(value.clone())
-                {
-                    reports.insert(token.into(), status);
-                }
-                match value {
-                    Value::Array(values) => {
-                        for value in values {
-                            remember_reports(value, owned, reports)
-                        }
-                    }
-                    Value::Object(values) => {
-                        for value in values.values() {
-                            remember_reports(value, owned, reports)
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for result in &outcome.results {
-                remember_reports(
-                    result,
-                    &self.record.signal_captures,
-                    &mut self.signal_reports,
-                );
-            }
-        }
         let mut fresh = self.deps.gather(self.host.as_ref()).or_else(|error| {
             let mut fallback = before.clone();
             fallback.snapshot = self.host.snapshot().map_err(|_| error)?;
             Ok::<Context, anyhow::Error>(fallback)
         })?;
-        apply_data_scope(&mut fresh, &self.request.scope, &self.source_bindings);
+        apply_data_scope(&mut fresh, &self.request.scope);
         if checked.call.tool == "open_dataset"
             && let Some(slot) = outcome
                 .results
@@ -3251,17 +2603,6 @@ impl Runtime<'_> {
             self.record.opened_dataset = Some(slot.into());
             fresh.data_dataset = Some(slot.into());
             self.humans.accept_data(&fresh);
-            // The open receipt was sampled while its lifecycle lock
-            // was held. A later snapshot must not silently adopt a
-            // person's detach/reattach of the same dataset sink.
-            if let Some(generation) = outcome
-                .results
-                .iter()
-                .filter_map(|value| value["sink_generation"].as_u64())
-                .next_back()
-            {
-                self.humans.sink = Some((true, Some(slot.into()), generation));
-            }
         }
         if checked.call.tool == "close_dataset" && fresh.snapshot.dataset.is_none() {
             if let Some(previous) = self.facts.dataset.take() {
@@ -3272,35 +2613,6 @@ impl Runtime<'_> {
             self.dataset_replaced = false;
             fresh.data_dataset = None;
             self.humans.accept_data(&fresh);
-            if let Some(generation) = outcome
-                .results
-                .iter()
-                .filter_map(|value| value["sink_generation"].as_u64())
-                .next_back()
-            {
-                self.humans.sink = Some((false, None, generation));
-            }
-        }
-        if checked.call.tool == "start_signal_capture" {
-            for result in &outcome.results {
-                if let (Some(source), Some(token)) =
-                    (result["id"].as_str(), result["capture_id"].as_str())
-                    && self.facts.data_sources.contains(source)
-                    && crate::signals::validate_capture_id(token).is_ok()
-                    && fresh
-                        .snapshot
-                        .signals
-                        .iter()
-                        .any(|status| status.id == source && status.capture_id == token)
-                {
-                    self.facts
-                        .signal_captures
-                        .insert(source.into(), token.into());
-                    self.humans
-                        .source_instances
-                        .insert(source.into(), token.into());
-                }
-            }
         }
         self.settle_forwarders(&fresh);
         if let Some(camera) = &camera {
@@ -3543,23 +2855,6 @@ impl Runtime<'_> {
                     redact::for_model(serde_json::to_value(camera).unwrap_or(Value::Null))
                 })
                 .collect(),
-            data_sources: self
-                .context
-                .snapshot
-                .signals
-                .iter()
-                .filter(|source| {
-                    self.request.scope.allow_data
-                        && self
-                            .context
-                            .data_sources
-                            .iter()
-                            .any(|approved| approved.permits_cached(source))
-                })
-                .map(|source| {
-                    redact::for_model(serde_json::to_value(source).unwrap_or(Value::Null))
-                })
-                .collect(),
             dataset: self
                 .context
                 .snapshot
@@ -3703,163 +2998,14 @@ impl Runtime<'_> {
         for camera in &self.uncertain_forwarders {
             leftovers.push(Leftover {kind:"recording".into(),camera:camera.clone(),summary:format!("A recording or stream was accepted on {}. Its current state is unavailable; review the camera before starting more work.",redact::for_output_text(camera)),job_id:None,until_ms:None});
         }
-        for (source, token) in &self.record.signal_captures {
-            let current = self
-                .context
-                .snapshot
-                .signals
-                .iter()
-                .find(|status| status.id == *source && status.capture_id == *token);
-            let replacement = self
-                .context
-                .snapshot
-                .signals
-                .iter()
-                .any(|status| status.id == *source && status.capture_id != *token);
-            if let Some(status) =
-                current.or_else(|| self.signal_reports.get(token).filter(|_| !replacement))
-            {
-                if status.completed_ms.is_none() {
-                    leftovers.push(Leftover {
-                        kind: "signal_capture".into(),
-                        camera: source.clone(),
-                        summary: if current.is_some() {format!("Signal capture {source} remains active within its coordinator limits.")} else {format!("Signal capture {source} was acknowledged, but its final flush is unverified. Review its saved data and source status.")},
-                        job_id: None,
-                        until_ms: status.deadline_ms,
-                    });
-                } else if !status.persistence_complete {
-                    let error = status
-                        .persistence_error
-                        .as_ref()
-                        .or(status.error.as_ref())
-                        .map(|error| format!(" {}", redact::for_output_text(error)))
-                        .unwrap_or_default();
-                    leftovers.push(Leftover {kind:"signal_persistence".into(),camera:source.clone(),summary:format!("Signal capture {source}: {} of {} samples persisted, {} dropped, {} helper drops. Final persistence is incomplete.{error}",status.written,status.samples,status.dropped,status.helper_dropped),job_id:None,until_ms:None});
-                }
-            }
-        }
         leftovers
     }
 
-    fn finish(&mut self, mut outcome: Outcome, mut summary: String) -> Result<RunOutcome> {
+    fn finish(&mut self, outcome: Outcome, summary: String) -> Result<RunOutcome> {
         if let Ok(mut ctx) = self.deps.gather(self.host.as_ref()) {
-            apply_data_scope(&mut ctx, &self.request.scope, &self.source_bindings);
-            for source in &ctx.snapshot.signals {
-                if self.record.signal_captures.get(&source.id) == Some(&source.capture_id) {
-                    self.signal_reports
-                        .insert(source.capture_id.clone(), source.clone());
-                }
-            }
-            self.context = ctx;
-        }
-        if outcome != Outcome::Finished || !self.request.scope.effects_may_outlive_run {
-            for (source, token) in self.record.signal_captures.clone() {
-                if self
-                    .signal_reports
-                    .get(&token)
-                    .is_some_and(|status| status.completed_ms.is_some())
-                    || self
-                        .context
-                        .snapshot
-                        .signals
-                        .iter()
-                        .any(|status| status.id == source && status.capture_id != token)
-                {
-                    continue;
-                }
-                // The token is the ownership proof. A replacement source,
-                // including one with the same ID/PID, refuses this command.
-                match self.host.execute(
-                    None,
-                    SessionCommand::SignalStopIf {
-                        id: source.clone(),
-                        capture_id: token,
-                    },
-                ) {
-                    Ok(result) => {
-                        if let Some(stopped) = result["stopped"].as_array() {
-                            for value in stopped {
-                                if let Ok(status) = serde_json::from_value::<
-                                    crate::signals::SourceStatus,
-                                >(value.clone())
-                                    && status.id == source
-                                    && self.record.signal_captures.get(&source)
-                                        == Some(&status.capture_id)
-                                {
-                                    self.signal_reports
-                                        .insert(status.capture_id.clone(), status);
-                                }
-                            }
-                        }
-                    }
-                    Err(error) => self.emit(Event::Notice(format!(
-                        "Review signal capture {source}: {}",
-                        redact::for_output_text(&error.to_string())
-                    ))),
-                }
-            }
-        }
-        if let Ok(mut ctx) = self.deps.gather(self.host.as_ref()) {
-            apply_data_scope(&mut ctx, &self.request.scope, &self.source_bindings);
+            apply_data_scope(&mut ctx, &self.request.scope);
             self.settle_forwarders(&ctx);
             self.context = ctx;
-        }
-        let task_data = match self.host.close_task_data(Duration::from_secs(10)) {
-            Ok(status) => status,
-            Err(error) => {
-                let message = format!(
-                    "Task data could not finish cleanly and remains reserved: {}",
-                    redact::for_output_text(&error.to_string())
-                );
-                self.emit(Event::Notice(message.clone()));
-                if outcome == Outcome::Finished {
-                    outcome = Outcome::Failed;
-                    summary = message;
-                }
-                self.host.task_data_status()
-            }
-        };
-        if outcome == Outcome::Finished
-            && task_data.as_ref().is_some_and(|status| {
-                status.phase != crate::session::task_data::TaskDataPhase::Retained
-                    || !status.catalog.closed
-                    || status.catalog.quarantined
-                    || status.error.is_some()
-                    || status.catalog.dataset.last_error.is_some()
-                    || status.sink.dropped_total > 0
-                    || status.sink.error.is_some()
-            })
-        {
-            outcome = Outcome::Failed;
-            summary = "The task dataset needs review. Its capture, storage or shutdown did not finish cleanly; the dataset reservation is retained.".into();
-        }
-        if outcome == Outcome::Finished
-            && self
-                .signal_reports
-                .values()
-                .any(|status| status.completed_ms.is_some() && !status.persistence_complete)
-        {
-            outcome = Outcome::Failed;
-            summary = "The signal capture ended with incomplete persistence. Review written counts, dropped samples and sink errors before using the dataset.".into();
-        }
-        if outcome == Outcome::Finished
-            && self.signal_reports.values().any(|status| {
-                status.completed_ms.is_some() && status.state == crate::signals::SourceState::Failed
-            })
-        {
-            outcome = Outcome::Failed;
-            summary = "Signal acquisition stopped after a source failure. Review the saved samples and source error before continuing.".into();
-        }
-        if outcome == Outcome::Finished
-            && !self.request.scope.effects_may_outlive_run
-            && self.record.signal_captures.iter().any(|(_, token)| {
-                self.signal_reports
-                    .get(token)
-                    .is_none_or(|status| status.completed_ms.is_none())
-            })
-        {
-            outcome = Outcome::NeedsUser;
-            summary = "The task ended before its final signal persistence could be verified. Review the source status and saved dataset before using the capture.".into();
         }
         let summary = redact::for_output_text(&summary);
         let report = RunOutcome {
@@ -3867,11 +3013,6 @@ impl Runtime<'_> {
             outcome,
             summary: summary.clone(),
             totals: self.limiter.totals.clone(),
-            signal_reports: self
-                .signal_reports
-                .values()
-                .map(SignalReport::from_status)
-                .collect(),
             leftovers: self.leftovers(),
             log: self
                 .log
@@ -3880,10 +3021,9 @@ impl Runtime<'_> {
                 .path()
                 .to_owned(),
             restore: self.record.clone(),
-            task_data,
         };
         if !self.control.shared.ended.swap(true, Ordering::SeqCst) {
-            self.log.lock().map_err(|_|anyhow!("The assistant action log is unavailable."))?.finish(json!({"outcome":outcome,"summary":summary,"totals":report.totals,"leftovers":report.leftovers,"signal_reports":report.signal_reports,"task_data":report.task_data}),self.now())?;
+            self.log.lock().map_err(|_|anyhow!("The assistant action log is unavailable."))?.finish(json!({"outcome":outcome,"summary":summary,"totals":report.totals,"leftovers":report.leftovers}),self.now())?;
         }
         self.state(
             match outcome {
@@ -3917,16 +3057,12 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     type SentCommand = (Option<SessionActor>, Option<String>, SessionCommand);
-    fn signal_status(uri: &str, token: &str) -> crate::signals::SourceStatus {
-        serde_json::from_value(json!({"id":crate::signals::source_id(uri),"capture_id":token,"protocol":"sim-signal","uri":uri,"interval_ms":100,"state":"running","started_ms":NOW})).unwrap()
-    }
     #[derive(Clone)]
     struct Host {
         snapshot: Arc<Mutex<SessionSnapshot>>,
         sent: Arc<Mutex<Vec<SentCommand>>>,
         actor: Option<SessionActor>,
         fail_start: Arc<AtomicBool>,
-        fail_signal_flush: Arc<AtomicBool>,
     }
     impl Host {
         fn new() -> Self {
@@ -3958,7 +3094,6 @@ mod tests {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 actor: None,
                 fail_start: Arc::new(AtomicBool::new(false)),
-                fail_signal_flush: Arc::new(AtomicBool::new(false)),
             }
         }
         fn gain(&self, value: u32) {
@@ -4027,19 +3162,8 @@ mod tests {
                         max_bytes: max_bytes.unwrap_or(0),
                         ..Default::default()
                     };
-                    let mut result = serde_json::to_value(&dataset)?;
-                    snapshot.signal_sink = Some(crate::signals::SignalSinkStatus {
-                        attached: true,
-                        dataset_slot_id: dataset.slot_id.clone(),
-                        generation: snapshot
-                            .signal_sink
-                            .as_ref()
-                            .map_or(1, |sink| sink.generation + 1),
-                        ..Default::default()
-                    });
+                    let result = serde_json::to_value(&dataset)?;
                     snapshot.dataset = Some(dataset);
-                    result["sink_generation"] =
-                        json!(snapshot.signal_sink.as_ref().unwrap().generation);
                     Ok(result)
                 }
                 SessionCommand::DatasetCloseIf { slot_id, .. } => {
@@ -4052,76 +3176,7 @@ mod tests {
                         "dataset changed"
                     );
                     snapshot.dataset = None;
-                    snapshot.signal_sink = Some(crate::signals::SignalSinkStatus {
-                        generation: snapshot
-                            .signal_sink
-                            .as_ref()
-                            .map_or(1, |sink| sink.generation + 1),
-                        ..Default::default()
-                    });
                     Ok(json!({"closed":true}))
-                }
-                SessionCommand::SignalCapture {
-                    slot_id,
-                    uri,
-                    duration_ms,
-                    max_samples,
-                    max_bytes,
-                    sink_generation,
-                    ..
-                } => {
-                    ensure!(
-                        snapshot
-                            .dataset
-                            .as_ref()
-                            .and_then(|dataset| dataset.slot_id.as_deref())
-                            == Some(slot_id.as_str()),
-                        "dataset changed"
-                    );
-                    ensure!(
-                        sink_generation.is_none()
-                            || snapshot
-                                .signal_sink
-                                .as_ref()
-                                .is_some_and(|sink| Some(sink.generation) == sink_generation),
-                        "sink changed"
-                    );
-                    let token = if self.count("signal_capture") == 1 {
-                        "b".repeat(32)
-                    } else {
-                        format!("{:032x}", self.count("signal_capture"))
-                    };
-                    let mut source = signal_status(&uri, &token);
-                    source.capture_limits = Some(crate::signals::CaptureLimits {
-                        duration_ms,
-                        max_samples,
-                        max_bytes,
-                    });
-                    source.deadline_ms = Some(NOW + duration_ms);
-                    let result = serde_json::to_value(&source)?;
-                    snapshot.signals.retain(|known| known.id != source.id);
-                    snapshot.signals.push(source);
-                    Ok(result)
-                }
-                SessionCommand::SignalStopIf { id, capture_id } => {
-                    let source = snapshot
-                        .signals
-                        .iter_mut()
-                        .find(|source| source.id == id && source.capture_id == capture_id)
-                        .ok_or_else(|| anyhow!("capture was replaced"))?;
-                    source.state = crate::signals::SourceState::Stopped;
-                    source.completed_ms = Some(NOW);
-                    source.persistence_complete = true;
-                    if self.fail_signal_flush.load(Ordering::SeqCst) {
-                        source.state = crate::signals::SourceState::Failed;
-                        source.persistence_complete = false;
-                        source.persistence_error = Some("fixture sink failure".into());
-                        let report = serde_json::to_value(source)?;
-                        snapshot.signals.retain(|source| source.id != id);
-                        Ok(json!({"stopped":[report]}))
-                    } else {
-                        Ok(json!({"stopped":[source]}))
-                    }
                 }
                 SessionCommand::SetMany { values } => {
                     let state = snapshot
@@ -4222,7 +3277,6 @@ mod tests {
             provider: None,
             model: None,
             wait_for_answer: false,
-            task_data: None,
         }
     }
     fn set_args(value: u32) -> Value {
@@ -4274,35 +3328,6 @@ mod tests {
         let path = deps.log_directory.clone();
         drop(deps);
         std::fs::remove_dir_all(path).unwrap();
-    }
-
-    #[test]
-    fn separate_dataset_on_an_unsupported_host_refuses_before_provider_or_session_effects() {
-        let (deps, script, host) = fixture(vec![finished()]);
-        let mut req = request();
-        req.scope.cameras.clear();
-        req.scope.allow_data = true;
-        req.scope.data_sources = vec!["sim-signal://temperature".into()];
-        req.task_data = Some(TaskDataRequest {
-            max_bytes: 16 << 20,
-        });
-        let error = run_blocking(
-            req,
-            &deps,
-            Arc::new(DenyApprover::default()),
-            &RunControl::default(),
-            &mut |_| {},
-        )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unavailable on this session host"),
-            "{error:#}"
-        );
-        assert!(script.requests.lock().unwrap().is_empty());
-        assert!(host.sent.lock().unwrap().is_empty());
-        cleanup(deps);
     }
 
     #[test]
@@ -4530,844 +3555,6 @@ mod tests {
     }
 
     #[test]
-    fn data_scope_requires_consent_and_supports_data_only_and_mixed_tasks() {
-        assert!(RunScope::default().validate().is_err());
-        let mut scope = RunScope {
-            data_sources: vec!["sim-signal://line1".into()],
-            ..Default::default()
-        };
-        assert!(
-            scope
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("AI provider")
-        );
-        scope.allow_data = true;
-        assert!(scope.validate().is_ok());
-        scope.cameras.push("sim:0".into());
-        assert!(scope.validate().is_ok());
-        scope.data_sources.push("sim-signal://line1".into());
-        assert!(scope.validate().is_err());
-        let dataset = RunScope {
-            dataset: Some("a".repeat(32)),
-            allow_data: true,
-            ..Default::default()
-        };
-        assert!(dataset.validate().is_ok());
-        let credentials = RunScope {
-            data_sources: vec!["mqtt://alice:private-password@broker/topic".into()],
-            allow_data: true,
-            ..Default::default()
-        };
-        assert!(credentials.validate().is_err());
-        assert!(!format!("{credentials:?}").contains("private-password"));
-        assert!(
-            !serde_json::to_string(&credentials)
-                .unwrap()
-                .contains("private-password")
-        );
-    }
-
-    #[test]
-    fn source_endpoints_are_pinned_locally_and_dataset_scope_is_exact() {
-        let mut ctx = fixture_context(fixture_snapshot());
-        let mut scope = RunScope {
-            data_sources: vec!["sim-signal://line1".into()],
-            allow_data: true,
-            ..Default::default()
-        };
-        let bindings = initial_data_scope(&mut ctx, &scope).unwrap();
-        let pinned = pin_scope(&scope, &ctx).unwrap();
-        assert_eq!(
-            pinned.data_sources,
-            vec![crate::signals::source_id("sim-signal://line1")]
-        );
-        assert_eq!(bindings[0].uri, "sim-signal://line1");
-        assert!(
-            !serde_json::to_string(&pinned)
-                .unwrap()
-                .contains("sim-signal://")
-        );
-        scope.dataset = Some("a".repeat(32));
-        assert!(pin_scope(&scope, &ctx).is_err());
-        ctx.snapshot.dataset = Some(crate::dataset::DatasetStatus {
-            slot_id: scope.dataset.clone(),
-            ..Default::default()
-        });
-        assert!(pin_scope(&scope, &ctx).is_ok());
-        ctx.snapshot.dataset.as_mut().unwrap().slot_id = Some("c".repeat(32));
-        assert!(pin_scope(&scope, &ctx).is_err());
-    }
-
-    #[test]
-    fn profile_scope_expires_without_adopting_a_new_account_and_reports_human_change() {
-        let mut ctx = fixture_context(fixture_snapshot());
-        let binding = crate::tools::tests::fixture_bound_source(&mut ctx, "mqtts://host/topic");
-        let scope = RunScope {
-            allow_data: true,
-            data_sources: vec![binding.reference.clone()],
-            source_bindings: vec![binding.clone()],
-            ..Default::default()
-        };
-        scope.validate().unwrap();
-        let bindings = initial_data_scope(&mut ctx, &scope).unwrap();
-        let mut tracker = HumanTracker::new(&ctx, &BTreeSet::new());
-        let public = serde_json::to_value(&scope).unwrap().to_string();
-        assert!(!public.contains("source_bindings"));
-        assert!(!public.contains("mqtts://"));
-        assert!(!public.contains(&"c".repeat(32)));
-        let forged = json!({"data_sources":[binding.reference],"allow_data":true,"source_bindings":[{"uri":"mqtts://host/topic","auth":binding.auth}]});
-        assert!(serde_json::from_value::<RunScope>(forged).is_err());
-        ctx.snapshot.signal_bindings[0].auth.epoch = "d".repeat(32);
-        apply_data_scope(&mut ctx, &scope, &bindings);
-        assert!(ctx.data_sources.is_empty());
-        let refs = scope.data_sources.iter().cloned().collect();
-        let changes = tracker.data_changes(&ctx, &refs, true, "agent");
-        assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].0, format!("source:{}", binding.reference));
-        tracker.accept_data(&ctx);
-        assert!(tracker.data_changes(&ctx, &refs, true, "agent").is_empty());
-        assert!(initial_data_scope(&mut ctx, &scope).is_err());
-        let mut fresh = binding;
-        fresh.auth = Some(ctx.snapshot.signal_bindings[0].auth.clone());
-        assert_ne!(fresh.identity(), bindings[0].identity());
-    }
-
-    #[test]
-    fn cached_scope_keeps_the_selected_account_without_granting_a_connection() {
-        let mut ctx = fixture_context(fixture_snapshot());
-        let fresh = crate::tools::tests::fixture_bound_source(&mut ctx, "mqtts://host/topic");
-        let mut source = signal_status("mqtts://host/topic", &"e".repeat(32));
-        source.auth = fresh.auth.clone();
-        let cached = DataSourceRef::cached_source(&source);
-        ctx.snapshot.signals = vec![source.clone()];
-        let scope = RunScope {
-            allow_data: true,
-            data_sources: vec![cached.reference.clone()],
-            cached_source_bindings: vec![cached.clone()],
-            ..Default::default()
-        };
-        scope.validate().unwrap();
-        let bindings = initial_data_scope(&mut ctx, &scope).unwrap();
-        assert_eq!(bindings, vec![cached.clone()]);
-        assert!(bindings[0].uri.is_empty());
-        let public = serde_json::to_value(&scope).unwrap();
-        assert!(public.get("cached_source_bindings").is_none());
-        assert!(!public.to_string().contains(&"c".repeat(32)));
-        assert!(serde_json::from_value::<RunScope>(json!({
-            "allow_data":true,"data_sources":[cached.reference],
-            "cached_source_bindings":[{"reference":cached.reference,"uri":"","auth":cached.auth}]
-        })).is_err());
-        let checked = tools::check(
-            &ctx,
-            &mut tools::PlanState::assistant(&ctx),
-            StepId(1),
-            &ToolCall {
-                tool: "read_data_source".into(),
-                args: json!({"source":cached.reference,"timeout":"1s"}),
-            },
-            &|_, _| false,
-        );
-        assert!(
-            !checked.ready(),
-            "a cache selection cannot authorize a fresh read"
-        );
-        assert!(checked.ops.is_empty());
-
-        for changed in [
-            vec![],
-            vec![crate::signals::SourceStatus {
-                auth: None,
-                ..source.clone()
-            }],
-            vec![crate::signals::SourceStatus {
-                auth: Some(crate::signals::auth::AuthBinding {
-                    epoch: "d".repeat(32),
-                    ..fresh.auth.clone().unwrap()
-                }),
-                ..source
-            }],
-        ] {
-            ctx.snapshot.signals = changed;
-            assert!(initial_data_scope(&mut ctx, &scope).is_err());
-        }
-        let mut widened = scope.clone();
-        widened.data_sources.push(fresh.uri.clone());
-        assert!(widened.validate().is_err());
-        widened = scope.clone();
-        widened.cached_source_bindings[0].uri = fresh.uri;
-        assert!(widened.validate().is_err());
-        widened = scope.clone();
-        widened.cached_source_bindings.push(cached);
-        assert!(widened.validate().is_err());
-    }
-
-    #[test]
-    fn cached_account_replacement_is_rejected_before_provider_setup_or_actions() {
-        let (deps, script, host) = fixture(vec![finished()]);
-        let mut source = signal_status("sim-signal://cached-account", &"e".repeat(32));
-        let cached = DataSourceRef::cached_source(&source);
-        source.auth = Some(crate::signals::auth::AuthBinding {
-            profile: crate::signals::auth::ProfileRef {
-                id: "a".repeat(32),
-                revision: "b".repeat(32),
-            },
-            epoch: "c".repeat(32),
-        });
-        host.snapshot.lock().unwrap().signals = vec![source];
-        let mut request = request();
-        request.scope = RunScope {
-            allow_data: true,
-            data_sources: vec![cached.reference.clone()],
-            cached_source_bindings: vec![cached],
-            ..Default::default()
-        };
-        let error = run_blocking(
-            request,
-            &deps,
-            Arc::new(DenyApprover::default()),
-            &RunControl::default(),
-            &mut |_| {},
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("account changed"), "{error:#}");
-        assert!(script.requests.lock().unwrap().is_empty());
-        assert!(host.sent.lock().unwrap().is_empty());
-        cleanup(deps);
-    }
-
-    #[test]
-    fn dataset_replacement_and_source_instance_replacement_are_human_changes() {
-        let mut ctx = fixture_context(fixture_snapshot());
-        let source = signal_status("sim-signal://line1", &"b".repeat(32));
-        let sources = BTreeSet::from([source.id.clone()]);
-        ctx.snapshot.signals = vec![source];
-        ctx.snapshot.dataset = Some(crate::dataset::DatasetStatus {
-            slot_id: Some("a".repeat(32)),
-            ..Default::default()
-        });
-        let mut tracker = HumanTracker::new(&ctx, &BTreeSet::new());
-        ctx.snapshot.signals[0].restarts = 4;
-        ctx.snapshot.signals[0].helper_pid = Some(9000);
-        assert!(
-            tracker
-                .data_changes(&ctx, &sources, true, "assistant")
-                .is_empty()
-        );
-        ctx.snapshot.signal_sink = Some(crate::signals::SignalSinkStatus {
-            attached: true,
-            dataset_slot_id: Some("a".repeat(32)),
-            generation: 1,
-            ..Default::default()
-        });
-        tracker.accept_data(&ctx);
-        ctx.snapshot.signal_sink.as_mut().unwrap().generation = 2;
-        assert_eq!(
-            tracker.data_changes(&ctx, &sources, true, "assistant")[0].0,
-            "sink:1"
-        );
-        tracker.accept_data(&ctx);
-        ctx.snapshot.signals[0].capture_id = "c".repeat(32);
-        assert_eq!(
-            tracker.data_changes(&ctx, &sources, true, "assistant")[0].0,
-            format!("source:{}", ctx.snapshot.signals[0].id)
-        );
-        tracker.accept_data(&ctx);
-        ctx.snapshot.dataset.as_mut().unwrap().slot_id = Some("d".repeat(32));
-        assert_eq!(
-            tracker.data_changes(&ctx, &sources, true, "assistant")[0].0,
-            format!("dataset:{}", "a".repeat(32))
-        );
-        assert!(
-            tracker
-                .data_changes(&ctx, &sources, false, "assistant")
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn data_human_changes_during_approval_refuse_pending_capture_for_every_policy() {
-        #[derive(Clone, Copy, Debug)]
-        enum Resource {
-            Source,
-            Sink,
-            Dataset,
-        }
-        struct ChangingApproval {
-            host: Host,
-            resource: Resource,
-            requests: Mutex<Vec<ApprovalRequest>>,
-        }
-        impl Approver for ChangingApproval {
-            fn request(
-                &self,
-                request: ApprovalRequest,
-                _: &AtomicBool,
-                _: Duration,
-            ) -> ApprovalDecision {
-                self.requests.lock().unwrap().push(request);
-                let mut snapshot = self.host.snapshot.lock().unwrap();
-                match self.resource {
-                    Resource::Source => {
-                        let source = &mut snapshot.signals[0];
-                        source.capture_id = "c".repeat(32);
-                        source.state = crate::signals::SourceState::Running;
-                        // A reused helper PID must not make a replacement ours.
-                        assert_eq!(source.helper_pid, Some(7));
-                    }
-                    Resource::Sink => {
-                        snapshot.signal_sink.as_mut().unwrap().generation = 2;
-                    }
-                    Resource::Dataset => {
-                        snapshot.dataset.as_mut().unwrap().slot_id = Some("e".repeat(32));
-                        let sink = snapshot.signal_sink.as_mut().unwrap();
-                        sink.dataset_slot_id = Some("e".repeat(32));
-                        sink.generation = 2;
-                    }
-                }
-                ApprovalDecision::Approved {
-                    scope: ApprovalScope::ForRun,
-                    by: SessionActor::new("desktop:test", "Desktop", ActorKind::Human).unwrap(),
-                }
-            }
-        }
-
-        let uri = "sim-signal://line1";
-        let source_id = crate::signals::source_id(uri);
-        let slot_id = "a".repeat(32);
-        for resource in [Resource::Source, Resource::Sink, Resource::Dataset] {
-            for policy in [
-                OnHumanChange::Pause,
-                OnHumanChange::Inform,
-                OnHumanChange::Stop,
-            ] {
-                let (deps, script, host) = fixture(vec![
-                    reply(
-                        "pending-data-capture",
-                        "start_signal_capture",
-                        json!({"source":source_id,"every":"100ms","duration":"5s","max_samples":100,"max_bytes":4096,"tags":null}),
-                    ),
-                    finished(),
-                ]);
-                let mut source = signal_status(uri, &"b".repeat(32));
-                source.state = crate::signals::SourceState::Stopped;
-                source.helper_pid = Some(7);
-                let unrelated = signal_status("sim-signal://other-line", &"d".repeat(32));
-                {
-                    let mut snapshot = host.snapshot.lock().unwrap();
-                    snapshot.signals = vec![source, unrelated.clone()];
-                    snapshot.dataset = Some(crate::dataset::DatasetStatus {
-                        slot_id: Some(slot_id.clone()),
-                        ..Default::default()
-                    });
-                    snapshot.signal_sink = Some(crate::signals::SignalSinkStatus {
-                        attached: true,
-                        generation: 1,
-                        dataset_slot_id: Some(slot_id.clone()),
-                        ..Default::default()
-                    });
-                }
-                let mut req = request();
-                req.mode = RunMode::Supervised;
-                req.on_human_change = policy;
-                req.scope = RunScope {
-                    allow_data: true,
-                    data_sources: vec![uri.into()],
-                    dataset: Some(slot_id.clone()),
-                    ..Default::default()
-                };
-                let approver = Arc::new(ChangingApproval {
-                    host: host.clone(),
-                    resource,
-                    requests: Mutex::new(Vec::new()),
-                });
-                let control = RunControl::default();
-                let mut pauses = 0;
-                let mut notices = Vec::new();
-                let report =
-                    run_blocking(
-                        req,
-                        &deps,
-                        approver.clone(),
-                        &control,
-                        &mut |event| match event {
-                            RunEvent::State(RunSnapshot {
-                                state: RunState::Paused,
-                                ..
-                            }) => {
-                                assert_eq!(host.count("signal_capture"), 0);
-                                pauses += 1;
-                                control.resume();
-                            }
-                            RunEvent::Agent(Event::Notice(note)) => notices.push(note),
-                            _ => {}
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(
-                    report.outcome,
-                    if policy == OnHumanChange::Stop {
-                        Outcome::Stopped
-                    } else {
-                        Outcome::Finished
-                    },
-                    "{resource:?} / {policy:?}"
-                );
-                assert_eq!(pauses, usize::from(policy == OnHumanChange::Pause));
-                assert_eq!(host.count("signal_capture"), 0, "{resource:?} / {policy:?}");
-                assert_eq!(host.count("signal_stop_if"), 0);
-                assert!(report.restore.signal_captures.is_empty());
-                let requests = approver.requests.lock().unwrap();
-                assert_eq!(requests.len(), 1);
-                assert_eq!(requests[0].tool, "start_signal_capture");
-                assert!(
-                    requests[0]
-                        .facts
-                        .contains(&("Source reference".into(), source_id.clone()))
-                );
-                drop(requests);
-                let snapshot = host.snapshot.lock().unwrap();
-                let current = &snapshot.signals[0];
-                if matches!(resource, Resource::Source) {
-                    assert_eq!(current.capture_id, "c".repeat(32));
-                    assert_eq!(current.state, crate::signals::SourceState::Running);
-                    assert_eq!(current.helper_pid, Some(7));
-                }
-                assert!(
-                    snapshot
-                        .signals
-                        .iter()
-                        .any(|source| source.id == unrelated.id
-                            && source.capture_id == unrelated.capture_id
-                            && source.state == crate::signals::SourceState::Running)
-                );
-                drop(snapshot);
-                let resource_key = match resource {
-                    Resource::Source => format!("source:{source_id}"),
-                    Resource::Sink => "sink:1".into(),
-                    Resource::Dataset => format!("dataset:{slot_id}"),
-                };
-                let journal =
-                    super::super::log::read_log_in(&deps.log_directory, &report.run_id).unwrap();
-                let change = journal.iter().find(|event| {
-                    event["kind"] == "human_change" && event["resource"] == resource_key
-                });
-                assert!(change.is_some(), "{resource:?} / {policy:?}: {journal:?}");
-                assert!(notices.iter().any(|note| match resource {
-                    Resource::Source => note.contains("capture instance"),
-                    Resource::Sink => note.contains("persistence sink changed"),
-                    Resource::Dataset => note.contains("dataset was opened, closed or replaced"),
-                }));
-                if policy != OnHumanChange::Stop {
-                    let requests = script.requests.lock().unwrap();
-                    let refusal = requests[1].1["messages"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .filter_map(|message| message["content"].as_array())
-                        .flatten()
-                        .find(|block| {
-                            block["type"] == "tool_result"
-                                && block["tool_use_id"] == "pending-data-capture"
-                        })
-                        .expect("the provider receives the refused pending capture result");
-                    assert_eq!(refusal["is_error"], true);
-                }
-                cleanup(deps);
-            }
-        }
-    }
-
-    #[test]
-    fn data_human_changes_invalidate_a_source_run_grant_before_another_read() {
-        let uri = "sim-signal://line1";
-        let source_id = crate::signals::source_id(uri);
-        let read = json!({"source":source_id,"timeout":"1s"});
-        let (deps, _, host) = fixture(vec![
-            reply("first-read", "read_data_source", read.clone()),
-            reply("second-read", "read_data_source", read),
-            finished(),
-        ]);
-        host.snapshot.lock().unwrap().signals = vec![signal_status(uri, &"a".repeat(32))];
-        let mut req = request();
-        req.mode = RunMode::Supervised;
-        req.on_human_change = OnHumanChange::Inform;
-        req.scope = RunScope {
-            allow_data: true,
-            data_sources: vec![uri.into()],
-            ..Default::default()
-        };
-        let approver = Arc::new(Approvals::new(ApprovalScope::ForRun));
-        let mut reads = 0;
-        let mut changes = 0;
-        let report = run_blocking(
-            req,
-            &deps,
-            approver.clone(),
-            &RunControl::default(),
-            &mut |event| match event {
-                RunEvent::Agent(Event::ToolRan { call, .. }) if call.tool == "read_data_source" => {
-                    reads += 1;
-                    if reads == 1 {
-                        host.snapshot.lock().unwrap().signals[0].capture_id = "b".repeat(32);
-                    }
-                }
-                RunEvent::Agent(Event::Notice(note)) if note.contains("capture instance") => {
-                    changes += 1
-                }
-                _ => {}
-            },
-        )
-        .unwrap();
-        assert_eq!(report.outcome, Outcome::Finished);
-        assert_eq!(reads, 2);
-        assert_eq!(host.count("signal_read"), 2);
-        // The tool, source, endpoint and risk match: only explicit resource
-        // invalidation can make this otherwise reusable task grant expire.
-        assert_eq!(approver.count.load(Ordering::SeqCst), 2);
-        assert_eq!(changes, 1);
-        assert_eq!(host.count("signal_stop_if"), 0);
-        let snapshot = host.snapshot.lock().unwrap();
-        assert_eq!(snapshot.signals[0].capture_id, "b".repeat(32));
-        assert_eq!(
-            snapshot.signals[0].state,
-            crate::signals::SourceState::Running
-        );
-        drop(snapshot);
-        cleanup(deps);
-    }
-
-    #[test]
-    fn natural_language_data_only_run_owns_exact_capture_and_cleans_it_up() {
-        let source = crate::signals::source_id("sim-signal://line1");
-        let (deps, script, host) = fixture(vec![
-            reply(
-                "open",
-                "open_dataset",
-                json!({"file_name":"run.duckdb","mode":"create","max_bytes":16_777_216}),
-            ),
-            reply(
-                "capture",
-                "start_signal_capture",
-                json!({"source":source,"every":"100ms","duration":"5s","max_samples":100,"max_bytes":4096,"tags":null}),
-            ),
-            finished(),
-        ]);
-        let mut req = request();
-        req.goal = "Capture five seconds of the approved line data.".into();
-        req.scope = RunScope {
-            data_sources: vec!["sim-signal://line1".into()],
-            allow_data: true,
-            ..Default::default()
-        };
-        let report = run(&deps, req, Arc::new(DenyApprover::default()));
-        assert_eq!(report.outcome, Outcome::Finished);
-        assert_eq!(report.totals.sources, 1);
-        assert_eq!(report.totals.samples, 100);
-        assert_eq!(report.totals.data_bytes, 4096);
-        assert_eq!(report.totals.signal_ms, 5000);
-        assert_eq!(host.count("signal_capture"), 1);
-        assert_eq!(host.count("signal_stop_if"), 1);
-        assert_eq!(host.count("connect"), 0);
-        assert_eq!(
-            report.restore.signal_captures.get(&source),
-            Some(&"b".repeat(32))
-        );
-        assert!(report.leftovers.is_empty());
-        assert_eq!(report.signal_reports.len(), 1);
-        assert!(report.signal_reports[0].persistence_complete);
-        assert_eq!(report.signal_reports[0].source, source);
-        assert!(
-            !serde_json::to_string(&report.signal_reports)
-                .unwrap()
-                .contains("sim-signal://")
-        );
-        let requests = script.requests.lock().unwrap();
-        assert!(!requests[0].1.to_string().contains("sim-signal://line1"));
-        drop(requests);
-        cleanup(deps);
-    }
-
-    #[test]
-    fn repeated_source_captures_keep_each_acknowledged_instance_report() {
-        let source = crate::signals::source_id("sim-signal://line1");
-        let args = json!({"source":source,"every":"100ms","duration":"5s","max_samples":100,"max_bytes":4096,"tags":null});
-        let (deps, _, host) = fixture(vec![
-            reply(
-                "open",
-                "open_dataset",
-                json!({"file_name":"run.duckdb","mode":"create","max_bytes":16_777_216}),
-            ),
-            reply("first", "start_signal_capture", args.clone()),
-            reply("stop", "stop_signal_capture", json!({"source":source})),
-            reply("second", "start_signal_capture", args),
-            finished(),
-        ]);
-        let mut req = request();
-        req.scope = RunScope {
-            data_sources: vec!["sim-signal://line1".into()],
-            allow_data: true,
-            ..Default::default()
-        };
-        let report = run(&deps, req, Arc::new(DenyApprover::default()));
-        assert_eq!(report.outcome, Outcome::Finished);
-        assert_eq!(host.count("signal_capture"), 2);
-        assert_eq!(report.signal_reports.len(), 2);
-        assert!(
-            report
-                .signal_reports
-                .iter()
-                .all(|status| status.persistence_complete)
-        );
-        assert_eq!(report.totals.sources, 2);
-        assert_ne!(
-            report.signal_reports[0].capture_id,
-            report.signal_reports[1].capture_id
-        );
-        let records = super::super::log::read_log_in(&deps.log_directory, &report.run_id).unwrap();
-        assert_eq!(
-            records.last().unwrap()["signal_reports"]
-                .as_array()
-                .unwrap()
-                .len(),
-            2
-        );
-        cleanup(deps);
-    }
-
-    #[test]
-    fn source_acknowledgement_and_cleanup_survive_post_start_snapshot_loss() {
-        #[derive(Clone)]
-        struct Offline {
-            base: Host,
-            accepted: Arc<AtomicBool>,
-        }
-        impl ToolHost for Offline {
-            fn snapshot(&self) -> Result<SessionSnapshot> {
-                ensure!(
-                    !self.accepted.load(Ordering::SeqCst),
-                    "fixture snapshot unavailable"
-                );
-                self.base.snapshot()
-            }
-            fn has_session(&self) -> bool {
-                true
-            }
-            fn actor_id(&self) -> Option<String> {
-                self.base.actor_id()
-            }
-            fn with_actor(&self, actor: SessionActor) -> Result<Arc<dyn ToolHost>> {
-                let mut host = self.clone();
-                host.base.actor = Some(actor);
-                Ok(Arc::new(host))
-            }
-            fn execute(&self, camera: Option<&str>, command: SessionCommand) -> Result<Value> {
-                let capture = matches!(command, SessionCommand::SignalCapture { .. });
-                let result = self.base.execute(camera, command)?;
-                if capture {
-                    self.accepted.store(true, Ordering::SeqCst);
-                }
-                Ok(result)
-            }
-        }
-        let source = crate::signals::source_id("sim-signal://line1");
-        let (mut deps, _, host) = fixture(vec![
-            reply(
-                "open",
-                "open_dataset",
-                json!({"file_name":"run.duckdb","mode":"create","max_bytes":16_777_216}),
-            ),
-            reply(
-                "capture",
-                "start_signal_capture",
-                json!({"source":source,"every":"100ms","duration":"5s","max_samples":100,"max_bytes":4096,"tags":null}),
-            ),
-        ]);
-        deps.host = Arc::new(Offline {
-            base: host.clone(),
-            accepted: Arc::new(AtomicBool::new(false)),
-        });
-        let mut req = request();
-        req.scope = RunScope {
-            data_sources: vec!["sim-signal://line1".into()],
-            allow_data: true,
-            ..Default::default()
-        };
-        let mut report = None;
-        let result = run_blocking(
-            req,
-            &deps,
-            Arc::new(DenyApprover::default()),
-            &RunControl::default(),
-            &mut |event| {
-                if let RunEvent::Finished(value) = event {
-                    report = Some(value)
-                }
-            },
-        );
-        assert!(result.is_err());
-        let report = report.unwrap();
-        assert_eq!(
-            report.restore.signal_captures.get(&source),
-            Some(&"b".repeat(32))
-        );
-        assert_eq!(host.count("signal_stop_if"), 1);
-        assert!(report.signal_reports[0].persistence_complete);
-        assert!(report.leftovers.is_empty());
-        cleanup(deps);
-    }
-
-    #[test]
-    fn final_signal_reports_exclude_raw_endpoints_tags_and_values() {
-        let mut status = signal_status(
-            "mqtt://alice:private-password@broker/private/topic",
-            &"a".repeat(32),
-        );
-        status.error =
-            Some("read mqtt://alice:private-password@broker/private/topic failed".into());
-        status.tags = vec![crate::signals::TagStatus {
-            tag: "private-tag".into(),
-            unit: None,
-            value: crate::signals::Value::Text("private-value".into()),
-            quality: crate::signals::Quality::Good,
-            ts_ms: NOW,
-            source_ts_ms: None,
-            recent: None,
-        }];
-        let report = SignalReport::from_status(&status);
-        let value = serde_json::to_string(&report).unwrap();
-        for secret in [
-            "private-password",
-            "/private/topic",
-            "private-tag",
-            "private-value",
-        ] {
-            assert!(!value.contains(secret), "{secret}");
-        }
-    }
-
-    #[test]
-    fn cleanup_cannot_stop_a_human_replacement_with_the_same_source_and_helper_pid() {
-        let source = crate::signals::source_id("sim-signal://line1");
-        let (deps, _, host) = fixture(vec![
-            reply(
-                "open",
-                "open_dataset",
-                json!({"file_name":"run.duckdb","mode":"create","max_bytes":16_777_216}),
-            ),
-            reply(
-                "capture",
-                "start_signal_capture",
-                json!({"source":source,"every":"100ms","duration":"5s","max_samples":100,"max_bytes":4096,"tags":null}),
-            ),
-            finished(),
-        ]);
-        let mut req = request();
-        req.scope = RunScope {
-            data_sources: vec!["sim-signal://line1".into()],
-            allow_data: true,
-            ..Default::default()
-        };
-        let report = run_blocking(req,&deps,Arc::new(DenyApprover::default()),&RunControl::default(),&mut |event| {
-            if matches!(event,RunEvent::Agent(Event::ToolRan {ref call,..}) if call.tool == "start_signal_capture") {
-                let mut snapshot = host.snapshot.lock().unwrap();
-                snapshot.signals[0].capture_id = "c".repeat(32);
-                snapshot.signals[0].helper_pid = Some(42);
-            }
-        }).unwrap();
-        assert_eq!(report.outcome, Outcome::NeedsUser);
-        let snapshot = host.snapshot.lock().unwrap();
-        assert_eq!(snapshot.signals[0].capture_id, "c".repeat(32));
-        assert_eq!(
-            snapshot.signals[0].state,
-            crate::signals::SourceState::Running
-        );
-        drop(snapshot);
-        assert_eq!(host.count("signal_stop"), 0);
-        assert!(host.sent.lock().unwrap().iter().all(|(_,_,command)| !matches!(command,SessionCommand::SignalStopIf {capture_id,..} if capture_id != &"b".repeat(32))));
-        cleanup(deps);
-    }
-
-    #[test]
-    fn cleanup_preserves_failed_flush_reports_after_the_source_is_removed() {
-        let source = crate::signals::source_id("sim-signal://line1");
-        let (deps, _, host) = fixture(vec![
-            reply(
-                "open",
-                "open_dataset",
-                json!({"file_name":"run.duckdb","mode":"create","max_bytes":16_777_216}),
-            ),
-            reply(
-                "capture",
-                "start_signal_capture",
-                json!({"source":source,"every":"100ms","duration":"5s","max_samples":100,"max_bytes":4096,"tags":null}),
-            ),
-            finished(),
-        ]);
-        host.fail_signal_flush.store(true, Ordering::SeqCst);
-        let mut req = request();
-        req.scope = RunScope {
-            data_sources: vec!["sim-signal://line1".into()],
-            allow_data: true,
-            ..Default::default()
-        };
-        let report = run(&deps, req, Arc::new(DenyApprover::default()));
-        assert_eq!(host.count("signal_stop_if"), 1);
-        assert!(host.snapshot.lock().unwrap().signals.is_empty());
-        assert_eq!(report.outcome, Outcome::Failed);
-        assert!(report.summary.contains("incomplete persistence"));
-        assert!(
-            report
-                .leftovers
-                .iter()
-                .any(|left| left.kind == "signal_persistence" && left.camera == source)
-        );
-        cleanup(deps);
-    }
-
-    #[test]
-    fn already_completed_failed_signal_captures_are_reported_without_another_stop() {
-        let source = crate::signals::source_id("sim-signal://line1");
-        let (deps, _, host) = fixture(vec![
-            reply(
-                "open",
-                "open_dataset",
-                json!({"file_name":"run.duckdb","mode":"create","max_bytes":16_777_216}),
-            ),
-            reply(
-                "capture",
-                "start_signal_capture",
-                json!({"source":source,"every":"100ms","duration":"5s","max_samples":100,"max_bytes":4096,"tags":null}),
-            ),
-            finished(),
-        ]);
-        let mut req = request();
-        req.scope = RunScope {
-            data_sources: vec!["sim-signal://line1".into()],
-            allow_data: true,
-            ..Default::default()
-        };
-        let report = run_blocking(req,&deps,Arc::new(DenyApprover::default()),&RunControl::default(),&mut |event| {
-            if matches!(event,RunEvent::Agent(Event::ToolRan {ref call,..}) if call.tool == "start_signal_capture") {
-                let mut snapshot = host.snapshot.lock().unwrap();
-                snapshot.signals[0].completed_ms = Some(NOW);
-                snapshot.signals[0].state = crate::signals::SourceState::Failed;
-                snapshot.signals[0].persistence_error = Some("fixture storage failure".into());
-            }
-        }).unwrap();
-        assert_eq!(host.count("signal_stop_if"), 0);
-        assert_eq!(report.outcome, Outcome::Failed);
-        assert!(
-            report
-                .leftovers
-                .iter()
-                .any(|left| left.kind == "signal_persistence")
-        );
-        cleanup(deps);
-    }
-
-    #[test]
     fn projected_and_actual_usage_stop_before_an_action() {
         for projected in [true, false] {
             let mut response = reply("set", "set_camera_features", set_args(2));
@@ -5504,8 +3691,8 @@ mod tests {
     }
 
     #[test]
-    fn undo_reserves_the_exact_history_count_and_refuses_unknown_counts() {
-        for count in [Some(3), None] {
+    fn undo_reserves_the_exact_history_count() {
+        for limit in [2, 3] {
             let (deps, _, host) = fixture(vec![
                 reply(
                     "undo",
@@ -5530,20 +3717,23 @@ mod tests {
                 last_changed_at_us: 0,
                 feature: None,
                 kind: "configuration".into(),
-                setting_changes: count,
+                setting_changes: 3,
             }];
             let mut req = request();
-            req.limits.max_setting_changes = 2;
+            req.limits.max_setting_changes = limit;
             let report = run(&deps, req, Arc::new(Approvals::new(ApprovalScope::Once)));
             assert_eq!(
                 report.outcome,
-                if count.is_some() {
+                if limit < 3 {
                     Outcome::Limit
                 } else {
                     Outcome::Finished
                 }
             );
-            assert_eq!(host.count("replay_camera_change"), 0);
+            assert_eq!(host.count("replay_camera_change"), usize::from(limit >= 3));
+            if limit >= 3 {
+                assert_eq!(report.totals.setting_changes, 3);
+            }
             cleanup(deps);
         }
     }
@@ -5668,47 +3858,6 @@ mod tests {
                 .iter()
                 .any(|row| row.feature == "Gain" && row.last == "2")
         );
-        cleanup(deps);
-    }
-
-    #[test]
-    #[cfg(feature = "s3")]
-    fn a_missing_human_secret_reaches_approval_but_never_executes_without_it() {
-        struct SecretApproval(Mutex<Vec<ApprovalRequest>>);
-        impl Approver for SecretApproval {
-            fn request(
-                &self,
-                req: ApprovalRequest,
-                _: &AtomicBool,
-                _: Duration,
-            ) -> ApprovalDecision {
-                self.0.lock().unwrap().push(req);
-                ApprovalDecision::Approved {
-                    scope: ApprovalScope::Once,
-                    by: SessionActor::new("desktop:secret-test", "Desktop", ActorKind::Human)
-                        .unwrap(),
-                }
-            }
-        }
-        let args = json!({"name":"new-archive","bucket":"camera-archive","region":"us-east-1","endpoint":null,"prefix":null,"path_style":null,"credentials":"keychain","profile":null,"access_key_id":"AKIAIOSFODNN7EXAMPLE","keep_local":null});
-        let (deps, script, host) = fixture(vec![
-            reply("destination", "create_s3_destination", args),
-            finished(),
-        ]);
-        let approver = Arc::new(SecretApproval(Mutex::new(Vec::new())));
-        let report = run(&deps, request(), approver.clone());
-        assert_eq!(report.outcome, Outcome::Finished);
-        let approvals = approver.0.lock().unwrap();
-        assert_eq!(approvals.len(), 1);
-        assert!(approvals[0].needs_secret);
-        assert!(!approvals[0].allow_run_scope);
-        assert_eq!(approvals[0].step, StepId(1));
-        assert!(host.sent.lock().unwrap().is_empty());
-        let bodies = script.requests.lock().unwrap();
-        let text = serde_json::to_string(&bodies[1].1).unwrap();
-        assert!(text.contains("changed while it was being reviewed"));
-        drop(bodies);
-        drop(approvals);
         cleanup(deps);
     }
 

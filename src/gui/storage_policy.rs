@@ -336,7 +336,7 @@ impl State {
         }, if effective.on_full == OnFull::DeleteOldest { Tone::Warning } else { Tone::Normal }));
         if let Some(age) = effective.max_age_seconds {
             captions.push(caption(match effective.on_full {
-                OnFull::DeleteOldest => format!("When saving, permanently deletes Capturefab managed files that are at least {} old. Active recordings and files awaiting upload are protected.", age_label(age)),
+                OnFull::DeleteOldest => format!("When saving, permanently deletes Capturefab managed files that are at least {} old. Active recordings are protected.", age_label(age)),
                 OnFull::Stop => format!("Saving stops when a Capturefab managed file is at least {} old.", age_label(age)),
             }, if effective.on_full == OnFull::DeleteOldest { Tone::Warning } else { Tone::Normal }));
         }

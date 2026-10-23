@@ -331,7 +331,7 @@ pub fn folder_path(
     text: &str,
     home: &Path,
     session: &Path,
-    staging: &Path,
+    state: &Path,
 ) -> Result<PathBuf, Issue> {
     let text = text.trim();
     let path = match text.strip_prefix("~/") {
@@ -351,7 +351,7 @@ pub fn folder_path(
         || hidden_component
         || path == home
         || path.starts_with(session)
-        || path.starts_with(staging)
+        || path.starts_with(state)
         || (cfg!(target_os = "macos") && path.starts_with(home.join("Library")))
     {
         return Err(Issue::usage(Some("path"), FOLDER_HELP));
@@ -379,21 +379,21 @@ pub fn canonical_root(root: &Path) -> Result<PathBuf, Issue> {
 }
 
 /// Repeat destination refusals on the physical location just before creating
-/// the folder. This closes aliases into protected session and staging roots.
+/// the folder. This closes aliases into protected session and state roots.
 pub fn folder_path_live(
     path: &Path,
     home: &Path,
     session: &Path,
-    staging: &Path,
+    state: &Path,
 ) -> Result<(), Issue> {
     let path = existing_ancestor(path).map_err(path_problem)?;
     let home = existing_ancestor(home).map_err(path_problem)?;
     let session = existing_ancestor(session).map_err(path_problem)?;
-    let staging = existing_ancestor(staging).map_err(path_problem)?;
+    let state = existing_ancestor(state).map_err(path_problem)?;
     let text = path
         .to_str()
         .ok_or_else(|| Issue::usage(Some("path"), FOLDER_HELP))?;
-    folder_path(text, &home, &session, &staging).map(|_| ())
+    folder_path(text, &home, &session, &state).map(|_| ())
 }
 
 fn path_problem(error: std::io::Error) -> Issue {
@@ -632,9 +632,9 @@ mod tests {
         let base = std::env::temp_dir().join("capturefab-values-shape");
         let home = base.join("home");
         let session = base.join("session");
-        let staging = base.join("uploads");
+        let state = base.join("state");
         assert_eq!(
-            folder_path("~/Captures/line-1", &home, &session, &staging).unwrap(),
+            folder_path("~/Captures/line-1", &home, &session, &state).unwrap(),
             home.join("Captures/line-1")
         );
         for invalid in [
@@ -645,11 +645,11 @@ mod tests {
             base.join("safe/../etc").to_string_lossy().into_owned(),
             base.join("safe/./shots").to_string_lossy().into_owned(),
             session.join("shots").to_string_lossy().into_owned(),
-            staging.join("shots").to_string_lossy().into_owned(),
+            state.join("shots").to_string_lossy().into_owned(),
             "relative/shots".to_owned(),
         ] {
             assert_eq!(
-                folder_path(&invalid, &home, &session, &staging)
+                folder_path(&invalid, &home, &session, &state)
                     .unwrap_err()
                     .message,
                 FOLDER_HELP,
@@ -657,7 +657,7 @@ mod tests {
             );
         }
         #[cfg(target_os = "macos")]
-        assert!(folder_path("~/Library/LaunchAgents", &home, &session, &staging).is_err());
+        assert!(folder_path("~/Library/LaunchAgents", &home, &session, &state).is_err());
         let captures = base.join("captures");
         assert_eq!(
             capture_path(&captures, "shot.png").unwrap(),
@@ -694,7 +694,7 @@ mod tests {
                 &captures.join("alias/new"),
                 &home,
                 &session,
-                &root.join("uploads")
+                &root.join("state")
             )
             .is_err()
         );

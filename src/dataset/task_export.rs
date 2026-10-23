@@ -34,10 +34,6 @@ pub(crate) struct RetainedExportStage {
     path: PathBuf,
 }
 impl RetainedExportStage {
-    #[cfg(test)]
-    pub(crate) fn at(namespace_id: Option<String>, path: PathBuf) -> Self {
-        Self { namespace_id, path }
-    }
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -647,10 +643,7 @@ fn copy_file(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::{
-        dataset::task::TaskExtentBudget,
-        signals::{Protocol, Quality, Sample, SignalInfo, TagInfo, Value as SignalValue},
-    };
+    use crate::dataset::task::TaskExtentBudget;
     use std::{path::PathBuf, sync::atomic::AtomicUsize};
 
     type StagedHook = Box<dyn FnOnce(&duckdb::Connection) -> Result<()>>;
@@ -692,7 +685,7 @@ mod tests {
             ExportRequest {
                 output: self.0.join("bundle"),
                 formats: vec![ExportFormat::Csv],
-                tables: vec!["samples".into()],
+                tables: vec!["events".into()],
                 since_ms: None,
                 until_ms: None,
                 storage: crate::storage::StoragePolicy::default(),
@@ -743,42 +736,22 @@ mod tests {
         )
         .unwrap();
         dataset.initialize_catalog("private export").unwrap();
-        let uri = "sim-signal://private-export";
-        let info = SignalInfo {
-            id: crate::signals::source_id(uri),
-            protocol: Protocol::SimSignal,
-            uri: uri.into(),
-            interval_ms: 10,
-        };
         dataset
-            .register(
-                &info,
-                &[TagInfo {
-                    tag: "state".into(),
-                    unit: None,
-                    kind: Some("text".into()),
-                }],
+            .record_event(
+                "note",
+                Some("sim:0"),
+                None,
+                "two,\"quoted\"\nrows",
+                &crate::context::Context::new(),
             )
             .unwrap();
         dataset
-            .append_samples(
-                &info.id,
-                &[
-                    Sample {
-                        ts_ms: 10,
-                        source_ts_ms: None,
-                        tag: "state".into(),
-                        value: SignalValue::Text("two,\"quoted\"\nrows".into()),
-                        quality: Quality::Good,
-                    },
-                    Sample {
-                        ts_ms: 20,
-                        source_ts_ms: Some(19),
-                        tag: "state".into(),
-                        value: SignalValue::Text("ready".into()),
-                        quality: Quality::Good,
-                    },
-                ],
+            .record_event(
+                "note",
+                Some("sim:0"),
+                None,
+                "ready",
+                &crate::context::Context::new(),
             )
             .unwrap();
         (dataset, lease)
@@ -801,7 +774,7 @@ mod tests {
         if cfg!(feature = "parquet") {
             request.formats.push(ExportFormat::Parquet);
         }
-        request.tables = vec!["signals".into(), "samples".into()];
+        request.tables = vec!["events".into()];
         let value = dataset
             .export_bounded(
                 &request,
@@ -813,7 +786,7 @@ mod tests {
             .unwrap();
         assert_eq!(value["dataset_id"], identity.dataset_id);
         assert_eq!(value["slot_id"], identity.slot_id);
-        assert_eq!(value["tables"]["samples"], 2);
+        assert_eq!(value["tables"]["events"], 2);
         let mut total = 0;
         for file in value["files"].as_array().unwrap() {
             let bytes = fs::read(request.output.join(file["path"].as_str().unwrap())).unwrap();
@@ -823,21 +796,21 @@ mod tests {
         }
         assert_eq!(value["bytes"], total);
         assert!(total <= 128 * 1024);
-        let csv = fs::read_to_string(request.output.join("samples.csv")).unwrap();
+        let csv = fs::read_to_string(request.output.join("events.csv")).unwrap();
         assert!(csv.contains("\"two,\"\"quoted\"\"\nrows\""));
-        let jsonl = fs::read_to_string(request.output.join("samples.jsonl")).unwrap();
+        let jsonl = fs::read_to_string(request.output.join("events.jsonl")).unwrap();
         let jsonl_rows = jsonl
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(jsonl_rows.len(), 2);
-        assert_eq!(jsonl_rows[0]["value_text"], "two,\"quoted\"\nrows");
-        assert_eq!(jsonl_rows[1]["value_text"], "ready");
+        assert_eq!(jsonl_rows[0]["text"], "two,\"quoted\"\nrows");
+        assert_eq!(jsonl_rows[1]["text"], "ready");
         let manifest: Value =
             serde_json::from_slice(&fs::read(request.output.join("manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(manifest["dataset_id"], identity.dataset_id);
-        assert_eq!(manifest["counts"]["samples"], 2);
+        assert_eq!(manifest["counts"]["events"], 2);
         assert_eq!(stages(&temp.0), 1, "only native task reservation remains");
         assert_eq!(dataset.usage().unwrap().limit, lease.cap());
         assert!(dataset.usage().unwrap().peak <= lease.cap());
@@ -845,7 +818,7 @@ mod tests {
             dataset
                 .connection()
                 .unwrap()
-                .query_row("SELECT count(*) FROM samples", [], |row| row
+                .query_row("SELECT count(*) FROM events", [], |row| row
                     .get::<_, u64>(0))
                 .unwrap(),
             2
@@ -963,28 +936,21 @@ mod tests {
             );
             assert!(!dataset.catalog_status().unwrap().quarantined);
             cancel.store(false, Ordering::Release);
-            let source = crate::signals::source_id("sim-signal://private-export");
-            assert_eq!(
-                dataset
-                    .append_samples(
-                        &source,
-                        &[Sample {
-                            ts_ms: 30,
-                            source_ts_ms: None,
-                            tag: "state".into(),
-                            value: SignalValue::Text("after interrupt".into()),
-                            quality: Quality::Good,
-                        }]
-                    )
-                    .unwrap(),
-                1
-            );
+            dataset
+                .record_event(
+                    "note",
+                    Some("sim:0"),
+                    None,
+                    "after interrupt",
+                    &crate::context::Context::new(),
+                )
+                .unwrap();
             dataset.checkpoint_catalog().unwrap();
             assert_eq!(
                 dataset
                     .connection()
                     .unwrap()
-                    .query_row("SELECT count(*) FROM samples", [], |row| row
+                    .query_row("SELECT count(*) FROM events", [], |row| row
                         .get::<_, u64>(0))
                     .unwrap(),
                 3

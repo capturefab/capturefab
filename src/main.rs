@@ -5,13 +5,6 @@ use clap::Parser;
 use serde_json::json;
 
 fn main() {
-    if std::env::args().nth(1).as_deref() == Some("__signal") {
-        if let Err(e) = capturefab::signals::helper::run_helper() {
-            eprintln!("capturefab signal helper: {e:#}");
-            std::process::exit(1)
-        }
-        return;
-    }
     if std::env::args().nth(1).as_deref() == Some("__worker") {
         let result = std::env::args_os()
             .nth(2)

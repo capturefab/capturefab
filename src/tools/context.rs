@@ -1,13 +1,13 @@
 //! What tools know when they check or run a call: the session (through a
 //! `ToolHost`), saved destinations, the storage budget, FFmpeg's encoders
-//! and the uploads queue, gathered into one plain `Context`.
+//! gathered into one plain `Context`.
 //!
 //! `Context::gather` does file and process I/O (FFmpeg runs once per
 //! process), so callers run it on a worker thread, never the GUI's. Checks
 //! then read the `Context` alone. It never holds the storage ledger's path,
 //! access key IDs or absolute home paths.
 use crate::{
-    destination::{Destination, Remote},
+    destination::Destination,
     session::{
         ActivityOrigin, SessionActor, SessionCommand, SessionHandle, SessionSnapshot,
         default_request_timeout,
@@ -24,8 +24,6 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-
-mod task_data;
 
 /// The session a tool reads and commands.
 pub trait ToolHost: Send + Sync {
@@ -44,32 +42,6 @@ pub trait ToolHost: Send + Sync {
     /// the identity reported to risk classification. Unknown hosts refuse.
     fn with_actor(&self, _actor: SessionActor) -> Result<Arc<dyn ToolHost>> {
         anyhow::bail!("This tool host cannot attribute assistant task commands.")
-    }
-    /// Create a coordinator-local private data capability. Serialized actor,
-    /// task or dataset identifiers cannot select or adopt one.
-    fn with_task_data(
-        &self,
-        _policy: crate::session::task_data::TaskDataPolicy,
-    ) -> Result<Arc<dyn ToolHost>> {
-        anyhow::bail!(
-            "This tool host cannot create private task data; use a local workbench session."
-        )
-    }
-    fn supports_task_data(&self) -> bool {
-        false
-    }
-    fn task_data_reserved_bytes(&self) -> u64 {
-        0
-    }
-    fn task_data_status(&self) -> Option<crate::session::task_data::TaskDataStatus> {
-        None
-    }
-    fn request_close_task_data(&self) {}
-    fn close_task_data(
-        &self,
-        _wait: Duration,
-    ) -> Result<Option<crate::session::task_data::TaskDataStatus>> {
-        Ok(None)
     }
 }
 
@@ -117,23 +89,6 @@ impl ToolHost for SessionHost {
     }
     fn with_actor(&self, actor: SessionActor) -> Result<Arc<dyn ToolHost>> {
         Ok(Arc::new(Self::new(self.handle.clone(), self.origin, actor)))
-    }
-    fn with_task_data(
-        &self,
-        policy: crate::session::task_data::TaskDataPolicy,
-    ) -> Result<Arc<dyn ToolHost>> {
-        anyhow::ensure!(
-            self.supports_task_data(),
-            "Private task data requires a supported local build with Parquet support."
-        );
-        let data = self.handle.begin_task_data(policy)?;
-        Ok(Arc::new(task_data::NativeTaskHost::new(
-            Self::new(self.handle.clone(), self.origin, self.actor.clone()),
-            data,
-        )))
-    }
-    fn supports_task_data(&self) -> bool {
-        cfg!(all(unix, feature = "parquet"))
     }
 }
 
@@ -272,148 +227,18 @@ pub struct Context {
     /// A session is running; without one `snapshot` is empty.
     pub session: bool,
     pub snapshot: SessionSnapshot,
-    /// Human-approved source endpoints. Raw locators remain local and are
-    /// never serialized in model context; tools use their opaque references.
-    pub data_sources: Vec<DataSourceRef>,
-    /// Current nonsecret profile metadata, read on the gathering worker. It
-    /// never includes usernames, password values or environment names.
-    pub(crate) data_profiles: Vec<crate::signals::auth::ProfileInfo>,
-    /// Consent to send source values, dataset rows and notes to the model.
+    /// Consent to send camera dataset rows and notes to the model.
     pub allow_data: bool,
     pub data_dataset: Option<String>,
-    /// Local host capabilities and promises; model text/IDs cannot create them.
-    pub task_data_available: bool,
-    pub task_data_reserved_bytes: u64,
     pub destinations: Vec<DestinationInfo>,
     pub storage: StorageInfo,
     pub media: MediaInfo,
-    /// The uploads queue, in builds with network destinations.
-    pub uploads: Option<UploadInfo>,
     /// Where captures without a destination go.
     pub capture_root: PathBuf,
     pub compiled: Compiled,
     pub defaults: RecordingDefaults,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-pub struct DataSourceRef {
-    pub reference: String,
-    pub uri: String,
-    /// A coordinator-issued credential epoch. No credential value is held here.
-    pub auth: Option<crate::signals::auth::AuthBinding>,
-}
-impl DataSourceRef {
-    pub fn cached(reference: impl Into<String>) -> Self {
-        Self {
-            reference: reference.into(),
-            uri: String::new(),
-            auth: None,
-        }
-    }
-    pub fn cached_source(source: &crate::signals::SourceStatus) -> Self {
-        Self {
-            reference: source.id.clone(),
-            uri: String::new(),
-            auth: source.auth.clone(),
-        }
-    }
-    pub fn permits_cached(&self, source: &crate::signals::SourceStatus) -> bool {
-        self.reference == source.id && self.auth == source.auth
-    }
-    pub fn from_uri(uri: &str) -> Result<Self> {
-        crate::signals::parse(uri)?;
-        Ok(Self {
-            reference: crate::signals::source_id(uri),
-            uri: uri.into(),
-            auth: None,
-        })
-    }
-    /// A local human entry for an assistant binding. Raw CLI tools retain
-    /// `from_uri`; assistant forms never accept credentials in their locators.
-    pub fn approved(uri: &str) -> Result<Self> {
-        let uri = uri.trim();
-        let authority = uri.split_once("://").map_or("", |(_, tail)| {
-            tail.split(['/', '?', '#']).next().unwrap_or("")
-        });
-        anyhow::ensure!(
-            !authority.contains('@') && super::redact::for_output_text(uri) == uri,
-            "Enter a source without passwords or tokens. Start authenticated sources in the workbench first."
-        );
-        #[cfg(feature = "ai")]
-        anyhow::ensure!(
-            !crate::assistant::prompt::contains_secret(uri),
-            "Enter a source without passwords or tokens. Start authenticated sources in the workbench first."
-        );
-        Self::from_uri(uri)
-            .map_err(|error| anyhow::anyhow!(super::redact::for_output_text(&error.to_string())))
-    }
-    pub fn from_binding(receipt: &crate::signals::auth::BindingReceipt) -> Result<Self> {
-        let mut source = Self::approved(&receipt.endpoint)?;
-        anyhow::ensure!(
-            source.reference == receipt.reference && source.uri == receipt.endpoint,
-            "The saved source binding does not match its endpoint. Use the source again."
-        );
-        receipt.auth.validate()?;
-        source.auth = Some(receipt.auth.clone());
-        Ok(source)
-    }
-    pub fn profile_id(&self) -> Option<&str> {
-        self.auth.as_ref().map(|auth| auth.profile.id.as_str())
-    }
-    pub fn validate_local(&self) -> Result<()> {
-        let endpoint = Self::approved(&self.uri)?;
-        anyhow::ensure!(
-            endpoint.reference == self.reference && endpoint.uri == self.uri,
-            "The approved source reference does not match its local endpoint. Add it again."
-        );
-        if let Some(auth) = &self.auth {
-            auth.validate()?;
-        }
-        Ok(())
-    }
-    pub fn validate_in(&self, context: &Context) -> Result<()> {
-        self.validate_local()?;
-        if let Some(auth) = &self.auth {
-            anyhow::ensure!(
-                context.data_profiles.iter().any(|profile| {
-                    profile.profile == auth.profile
-                        && profile.endpoint == self.uri
-                        && profile.reference == self.reference
-                }) && context.snapshot.signal_bindings.iter().any(|receipt| {
-                    receipt.auth == *auth
-                        && receipt.endpoint == self.uri
-                        && receipt.reference == self.reference
-                }),
-                "The saved source changed or its workbench restarted. Choose Use source again before running it."
-            );
-        }
-        Ok(())
-    }
-    pub fn identity(&self) -> String {
-        use sha2::Digest;
-        let mut hash = sha2::Sha256::new();
-        hash.update(self.uri.as_bytes());
-        if let Some(auth) = &self.auth {
-            for value in [&auth.profile.id, &auth.profile.revision, &auth.epoch] {
-                hash.update([0]);
-                hash.update(value.as_bytes());
-            }
-        }
-        format!("{:x}", hash.finalize())
-    }
-}
-impl std::fmt::Debug for DataSourceRef {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("DataSourceRef")
-            .field("reference", &self.reference)
-            .field("uri", &super::redact::for_model_text(&self.uri))
-            .field("auth", &self.auth)
-            .finish()
-    }
-}
-
-/// The storage budget and its use.
 #[derive(Clone, Debug, Serialize)]
 pub struct StorageInfo {
     /// The policy commands send: the desktop's storage settings, or the
@@ -501,7 +326,7 @@ impl Default for RecordingDefaults {
 }
 
 /// A saved destination as tools show it: never credentials, access key IDs
-/// or the home folder's path.
+/// or the home folder's absolute path.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DestinationInfo {
     /// Private approval identity for the complete saved target, including
@@ -509,9 +334,9 @@ pub struct DestinationInfo {
     #[serde(skip)]
     pub(crate) approval_identity: Option<String>,
     pub name: String,
-    /// `folder`, `s3`, `ftp` or `sftp`.
+    /// The destination kind, always `folder`.
     pub kind: String,
-    /// Where files go: a folder written from `~`, or the bucket or server.
+    /// Where files go: a folder written from `~`.
     pub location: String,
     /// The server files are sent to, for network destinations.
     pub host: Option<String>,
@@ -519,8 +344,7 @@ pub struct DestinationInfo {
     pub insecure: bool,
     /// Why saving there would fail now, such as an unmounted drive.
     pub problem: Option<String>,
-    /// Free space where files are written first (the staging folder for
-    /// network destinations).
+    /// Free space on the destination volume.
     pub free_bytes: Option<u64>,
     /// Files leave this computer.
     pub remote: bool,
@@ -532,29 +356,18 @@ impl DestinationInfo {
         compiled: &Compiled,
         sources: &dyn Sources,
     ) -> Self {
-        let remote = destination.target.remote();
         let root = destination.local_root();
-        let problem = match &remote {
-            Some(remote) if !compiled.supports(remote.kind()) => Some(format!(
-                "{} destinations need a build with --features {}",
-                remote.kind().to_ascii_uppercase(),
-                remote.kind()
-            )),
-            _ => sources.volume_problem(&root),
-        };
+        let _ = compiled;
         Self {
             approval_identity: Self::identity(destination),
             name: destination.name.clone(),
-            kind: destination.target.kind().into(),
-            location: match &remote {
-                Some(remote) => remote.location(),
-                None => super::redact::home_path(&root),
-            },
-            host: remote.as_ref().map(remote_host),
-            insecure: remote.as_ref().is_some_and(Remote::insecure),
+            kind: "folder".into(),
+            location: super::redact::home_path(&root),
+            host: None,
+            insecure: false,
             free_bytes: sources.free_space(&root),
-            problem,
-            remote: remote.is_some(),
+            problem: sources.volume_problem(&root),
+            remote: false,
         }
     }
 
@@ -566,91 +379,20 @@ impl DestinationInfo {
     }
 }
 
-fn remote_host(remote: &Remote) -> String {
-    match remote {
-        Remote::S3(bucket) => {
-            let url = bucket.service_url();
-            let authority = url.split_once("://").map_or(url.as_str(), |(_, rest)| rest);
-            let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
-            authority
-                .rsplit_once('@')
-                .map_or(authority, |(_, host)| host)
-                .to_owned()
-        }
-        Remote::Ftp(server) => server.host.clone(),
-        Remote::Sftp(server) => server.host.clone(),
-    }
-}
-
-/// The uploads queue in brief.
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
-pub struct UploadInfo {
-    pub pending: u64,
-    pub uploading: u64,
-    pub failed: u64,
-    pub waiting_bytes: u64,
-    pub uploaded: u64,
-    pub last_error: Option<String>,
-    /// A process (the desktop app, `serve` or a CLI capture) is uploading.
-    pub uploader_running: bool,
-    /// Why the queue could not be read, when it could not.
-    pub problem: Option<String>,
-}
-
-impl UploadInfo {
-    fn from_status(status: Result<Value>) -> Self {
-        match status {
-            Ok(status) => {
-                let count = |key: &str| status[key].as_u64().unwrap_or(0);
-                Self {
-                    pending: count("pending"),
-                    uploading: count("uploading"),
-                    failed: count("failed"),
-                    waiting_bytes: count("waiting_bytes"),
-                    uploaded: count("uploaded"),
-                    last_error: status["last_error"].as_str().map(str::to_owned),
-                    uploader_running: status["uploader_running"].as_bool().unwrap_or(false),
-                    problem: None,
-                }
-            }
-            Err(error) => Self {
-                problem: Some(format!("{error:#}")),
-                ..Self::default()
-            },
-        }
-    }
-}
-
 /// Optional features this build has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Compiled {
-    pub s3: bool,
-    pub ftp: bool,
-    pub sftp: bool,
-    pub uploads: bool,
     pub jpeg: bool,
 }
 
 impl Compiled {
     pub fn current() -> Self {
         Self {
-            s3: cfg!(feature = "s3"),
-            ftp: cfg!(feature = "ftp"),
-            sftp: cfg!(feature = "sftp"),
-            uploads: cfg!(feature = "uploads"),
             jpeg: cfg!(feature = "jpeg"),
         }
     }
-
-    /// Destinations of `kind` work in this build.
     pub fn supports(&self, kind: &str) -> bool {
-        match kind {
-            "folder" => true,
-            "s3" => self.s3,
-            "ftp" => self.ftp,
-            "sftp" => self.sftp,
-            _ => false,
-        }
+        kind == "folder"
     }
 }
 
@@ -671,16 +413,11 @@ impl Context {
 /// Where `Context::gather` reads what the session snapshot does not hold.
 /// Tests substitute fixed values.
 pub(crate) trait Sources {
-    fn signal_profiles(&self) -> Result<Vec<crate::signals::auth::ProfileInfo>> {
-        Ok(Vec::new())
-    }
     fn destinations(&self) -> Result<Vec<Destination>>;
     fn configured_policy(&self) -> Result<StoragePolicy>;
     /// `storage::quota_status()`.
     fn quota(&self) -> Result<Value>;
     fn encoders(&self) -> Result<Arc<Vec<String>>>;
-    /// `upload::status()`, or None in builds without uploads.
-    fn uploads(&self) -> Option<Result<Value>>;
     /// Free space at `path`, or at its nearest existing parent.
     fn free_space(&self, path: &Path) -> Option<u64>;
     /// Why `path` cannot be written now: an external volume that is not
@@ -692,9 +429,6 @@ pub(crate) trait Sources {
 struct System;
 
 impl Sources for System {
-    fn signal_profiles(&self) -> Result<Vec<crate::signals::auth::ProfileInfo>> {
-        crate::signals::auth::Store::session().list()
-    }
     fn destinations(&self) -> Result<Vec<Destination>> {
         crate::destination::list()
     }
@@ -709,16 +443,6 @@ impl Sources for System {
 
     fn encoders(&self) -> Result<Arc<Vec<String>>> {
         crate::media::encoder_names()
-    }
-
-    #[cfg(feature = "uploads")]
-    fn uploads(&self) -> Option<Result<Value>> {
-        Some(crate::upload::status())
-    }
-
-    #[cfg(not(feature = "uploads"))]
-    fn uploads(&self) -> Option<Result<Value>> {
-        None
     }
 
     fn free_space(&self, path: &Path) -> Option<u64> {
@@ -750,14 +474,6 @@ pub(crate) fn gather_with(
         SessionSnapshot::default()
     };
     let compiled = Compiled::current();
-    let data_profiles = sources
-        .signal_profiles()
-        .context("read saved data sources")?;
-    let data_sources = snapshot
-        .signals
-        .iter()
-        .map(DataSourceRef::cached_source)
-        .collect();
     let destinations = sources
         .destinations()
         .context("read saved destinations")?
@@ -786,16 +502,11 @@ pub(crate) fn gather_with(
         zone: Zone::Local,
         session,
         snapshot,
-        data_sources,
-        data_profiles,
         allow_data: false,
         data_dataset: None,
-        task_data_available: host.supports_task_data(),
-        task_data_reserved_bytes: host.task_data_reserved_bytes(),
         destinations,
         storage,
         media,
-        uploads: sources.uploads().map(UploadInfo::from_status),
         capture_root,
         compiled,
         defaults,
@@ -805,49 +516,19 @@ pub(crate) fn gather_with(
 #[cfg(test)]
 mod approval_identity_tests {
     use super::*;
-    use crate::destination::{FtpServer, SecretSource, Target};
-
+    use crate::destination::Target;
     #[test]
-    fn signal_bindings_pin_profile_revision_epoch_and_coordinator() {
-        let mut context =
-            crate::tools::tests::fixture_context(crate::tools::tests::fixture_snapshot());
-        let source = crate::tools::tests::fixture_bound_source(&mut context, "mqtts://host/topic");
-        source.validate_in(&context).unwrap();
-        let identity = source.identity();
-        let mut rotated = source.clone();
-        rotated.auth.as_mut().unwrap().epoch = "d".repeat(32);
-        assert_ne!(identity, rotated.identity());
-        assert!(rotated.validate_in(&context).is_err());
-        context.data_profiles[0].profile.revision = "e".repeat(32);
-        assert!(source.validate_in(&context).is_err());
-        context.data_profiles[0].profile = source.auth.as_ref().unwrap().profile.clone();
-        source.validate_in(&context).unwrap();
-        context.snapshot.signal_bindings.clear();
-        assert!(source.validate_in(&context).is_err());
-    }
-
-    #[test]
-    fn identity_binds_the_login_and_credential_selection_omitted_from_location() {
-        let mut destination: Destination = serde_json::from_value(serde_json::json!({
-            "name":"server", "kind":"ftp", "host":"files.example.test", "user":"alice"
-        }))
-        .unwrap();
-        let Target::Ftp(server) = &destination.target else {
-            panic!("FTP fixture");
+    fn identity_binds_the_complete_folder_destination() {
+        let mut destination = Destination {
+            name: "capture".into(),
+            target: Target::Folder {
+                path: std::env::temp_dir().join("first"),
+            },
         };
-        let location = Remote::Ftp(server.clone()).location();
-        let first = DestinationInfo::identity(&destination).unwrap();
-        let Target::Ftp(server) = &mut destination.target else {
-            unreachable!()
+        let before = DestinationInfo::identity(&destination).unwrap();
+        destination.target = Target::Folder {
+            path: std::env::temp_dir().join("second"),
         };
-        server.user = "bob".into();
-        assert_eq!(Remote::Ftp(server.clone()).location(), location);
-        let second = DestinationInfo::identity(&destination).unwrap();
-        assert_ne!(first, second);
-        let Target::Ftp(FtpServer { password, .. }) = &mut destination.target else {
-            unreachable!()
-        };
-        *password = SecretSource::Environment;
-        assert_ne!(second, DestinationInfo::identity(&destination).unwrap());
+        assert_ne!(before, DestinationInfo::identity(&destination).unwrap());
     }
 }

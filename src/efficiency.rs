@@ -68,6 +68,11 @@ impl std::str::FromStr for Mode {
     }
 }
 
+/// Current physical memory readings for the live resource safeguards.
+pub(crate) fn live_memory() -> (Option<u64>, Option<u64>) {
+    memory()
+}
+
 /// What this computer offers, read once per process.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct HostFacts {

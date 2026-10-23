@@ -1,5 +1,5 @@
 //! The OS credential store (macOS Keychain, Windows Credential Manager, the
-//! Secret Service on Linux), shared by network destinations and camera hubs.
+//! Secret Service on Linux), shared by AI providers and camera hubs.
 //! Only secrets go here; the settings that name them live in the state
 //! directory.
 use anyhow::{Result, anyhow, bail, ensure};
@@ -15,7 +15,7 @@ pub fn validate_secret(secret: &str) -> Result<()> {
 /// A server without a desktop login may have no Secret Service (D-Bus session).
 fn store_failed(action: &str, error: keyring::Error) -> anyhow::Error {
     anyhow!(
-        "cannot {action} the OS credential store: {error}; without one, as on a server with no desktop login, use --password-env (CAPTUREFAB_FTP_PASSWORD or CAPTUREFAB_SFTP_PASSWORD), an SFTP --key-file, S3 --env or --profile (the AWS credential chain), or hub --secret-env (CAPTUREFAB_HUB_* variables)"
+        "cannot {action} the OS credential store: {error}; without one, as on a server with no desktop login, use provider environment credentials or hub --secret-env (CAPTUREFAB_HUB_* variables)"
     )
 }
 
@@ -58,13 +58,7 @@ mod tests {
     fn a_failed_credential_store_names_what_works_without_one() {
         let error = store_failed("save the secret in", keyring::Error::NoDefaultStore);
         let message = format!("{error:#}");
-        for alternative in [
-            "CAPTUREFAB_FTP_PASSWORD",
-            "CAPTUREFAB_SFTP_PASSWORD",
-            "--key-file",
-            "--env or --profile",
-            "CAPTUREFAB_HUB_*",
-        ] {
+        for alternative in ["environment credentials", "CAPTUREFAB_HUB_*"] {
             assert!(message.contains(alternative), "{message}");
         }
         assert_eq!(

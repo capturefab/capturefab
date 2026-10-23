@@ -94,12 +94,7 @@ pub(in crate::gui) enum Input {
     Camera(String, bool),
     Destination(String, bool),
     SeeImages(bool),
-    DataSourceDraft(String),
-    AddDataSource,
-    DataSource(String, bool),
-    SourceProfile(crate::gui::source_setup::Input),
     UseDataset(bool),
-    SeparateDataset(bool),
     AllowData(bool),
     Preset(Preset),
     Limits(bool),
@@ -123,12 +118,6 @@ pub(in crate::gui) enum Input {
     CancelRestore,
     Cleanup(usize),
     ExportLog,
-    RetainedDatasets,
-    RevealRetained(u64),
-    CopyRetained(u64),
-    RemoveRetained(u64),
-    ConfirmRemoveRetained(u64, u64),
-    CancelRemoveRetained,
     ViewLog,
     CloseLog,
     NewTask,
@@ -150,10 +139,6 @@ impl fmt::Debug for Input {
                 .finish(),
             Self::Message(_) => f.write_str("Message([redacted])"),
             Self::ApprovalNote(_) => f.write_str("ApprovalNote([redacted])"),
-            Self::DataSourceDraft(_) | Self::DataSource(_, _) => {
-                f.write_str("DataSource([redacted])")
-            }
-            Self::SourceProfile(input) => f.debug_tuple("SourceProfile").field(input).finish(),
             _ => f.write_str("TaskInput"),
         }
     }
@@ -169,13 +154,7 @@ pub(in crate::gui) struct State {
     pub cameras: BTreeSet<String>,
     pub destinations: BTreeSet<String>,
     pub allow_images: bool,
-    pub data_sources: BTreeSet<String>,
-    pub data_source_draft: String,
-    pub profile_sources: Vec<tools::context::DataSourceRef>,
-    pub cached_sources: BTreeMap<String, tools::context::DataSourceRef>,
-    pub source_setup: crate::gui::source_setup::State,
     pub dataset: Option<String>,
-    pub separate_dataset: bool,
     pub allow_data: bool,
     pub limits: ai::Limits,
     pub limit_drafts: BTreeMap<String, String>,
@@ -205,9 +184,6 @@ pub(in crate::gui) struct State {
     pub now_ms: u64,
     pub log_text: Option<String>,
     pub scrolled: bool,
-    pub retained_open: bool,
-    pub retained: Vec<worker::RetainedDataset>,
-    pub remove_retained: Option<(u64, u64)>,
     services: Arc<dyn worker::Services>,
     run_services: Option<Arc<dyn worker::Services>>,
     recovery_guard: Option<worker::RecoveryGuard>,
@@ -216,7 +192,6 @@ pub(in crate::gui) struct State {
     job: Option<Receiver<worker::Reply>>,
     scope_initialized: bool,
     current_selection: Option<String>,
-    dataset_baseline: Option<String>,
     limits_initialized: bool,
     limits_edited: bool,
     seen_crashes: BTreeSet<String>,
@@ -225,7 +200,6 @@ pub(in crate::gui) struct State {
     notice: Option<(String, Option<String>, Level)>,
     in_flight: bool,
     elapsed_anchor: Option<(Instant, u64, u64)>,
-    context_refresh_requested: bool,
     #[cfg(test)]
     test_handle: Option<run::RunHandle>,
 }
@@ -243,13 +217,7 @@ impl State {
             cameras: BTreeSet::new(),
             destinations: BTreeSet::new(),
             allow_images: false,
-            data_sources: BTreeSet::new(),
-            data_source_draft: String::new(),
-            profile_sources: Vec::new(),
-            cached_sources: BTreeMap::new(),
-            source_setup: crate::gui::source_setup::State::default(),
             dataset: None,
-            separate_dataset: false,
             allow_data: false,
             limit_drafts: limit_fields(&limits),
             limits,
@@ -279,9 +247,6 @@ impl State {
             now_ms: 0,
             log_text: None,
             scrolled: false,
-            retained_open: false,
-            retained: Vec::new(),
-            remove_retained: None,
             services,
             run_services: None,
             recovery_guard: None,
@@ -290,7 +255,6 @@ impl State {
             job: None,
             scope_initialized: false,
             current_selection: None,
-            dataset_baseline: None,
             limits_initialized: false,
             limits_edited: false,
             seen_crashes: BTreeSet::new(),
@@ -299,7 +263,6 @@ impl State {
             notice: None,
             in_flight: false,
             elapsed_anchor: None,
-            context_refresh_requested: false,
             #[cfg(test)]
             test_handle: None,
         }
@@ -356,7 +319,6 @@ impl State {
             && self.outcome.is_none()
             && self.job.is_none()
             && self.snapshot.run_id.is_empty()
-            && !self.source_setup.pending
     }
     pub(in crate::gui) fn actor_id(&self) -> Option<String> {
         if !self.snapshot.actor_id.is_empty() {
@@ -374,9 +336,6 @@ impl State {
             .next()
             .cloned()
             .map_or(TakeoverTarget::Data, TakeoverTarget::Camera)
-    }
-    pub(super) fn take_context_refresh(&mut self) -> bool {
-        std::mem::take(&mut self.context_refresh_requested)
     }
     pub(in crate::gui) fn take_notice(&mut self) -> Option<(String, Option<String>, Level)> {
         self.notice.take()
@@ -425,8 +384,7 @@ impl State {
             && self.data_scope_issue().is_none()
     }
     pub(in crate::gui) fn data_scope_issue(&self) -> Option<String> {
-        if self.separate_dataset
-            || !self.allow_data
+        if !self.allow_data
             || !matches!(self.snapshot.state, RunState::Paused | RunState::NeedsUser)
         {
             return None;
@@ -437,19 +395,12 @@ impl State {
             .dataset
             .as_ref()
             .and_then(|dataset| dataset.slot_id.as_ref());
-        let changed = if self.dataset.is_some() {
-            current != self.dataset.as_ref()
-        } else {
-            (!self.data_sources.is_empty() || !self.profile_sources.is_empty())
-                && current != self.dataset_baseline.as_ref()
-        };
+        let changed = self.dataset.is_some() && current != self.dataset.as_ref();
         changed.then(||"The approved dataset was closed or replaced. Stop this task, then start a new task to approve the current dataset.".into())
     }
     fn prices(&self) -> Option<&ai::usage::Prices> {
         let id = self.settings.provider?;
-        self.settings
-            .prices
-            .get(&format!("{id}/{}", self.model_label()))
+        self.settings.model_prices(id, &self.model_label())
     }
     pub(in crate::gui) fn estimated_cost(&self) -> Option<(f64, f64)> {
         let p = self.prices()?;
@@ -507,41 +458,10 @@ impl State {
     pub(in crate::gui) fn valid_to_start(&self) -> bool {
         self.start_reason().is_none()
     }
-    pub(in crate::gui) fn source_selected(&self, reference: &str) -> bool {
-        self.profile_sources
-            .iter()
-            .any(|source| source.reference == reference)
-            || self.data_sources.iter().any(|source| {
-                source == reference
-                    || tools::context::DataSourceRef::from_uri(source)
-                        .is_ok_and(|source| source.reference == reference)
-            })
-    }
-    pub(in crate::gui) fn source_draft_error(&self) -> Option<String> {
-        let source = self.data_source_draft.trim();
-        if source.is_empty() {
-            return None;
-        }
-        tools::context::DataSourceRef::approved(source)
-            .err()
-            .map(|error| tools::redact::for_output_text(&error.to_string()))
-    }
     fn task_scope(&self) -> run::RunScope {
         run::RunScope {
             cameras: self.cameras.iter().cloned().collect(),
             destinations: self.destinations.iter().cloned().collect(),
-            data_sources: self
-                .data_sources
-                .iter()
-                .cloned()
-                .chain(
-                    self.profile_sources
-                        .iter()
-                        .map(|source| source.reference.clone()),
-                )
-                .collect(),
-            source_bindings: self.profile_sources.clone(),
-            cached_source_bindings: self.cached_sources.values().cloned().collect(),
             dataset: self.dataset.clone(),
             allow_images: self.allow_images,
             allow_data: self.allow_data,
@@ -550,56 +470,9 @@ impl State {
             effects_may_outlive_run: false,
         }
     }
-    fn remove_source(&mut self, source: &str) {
-        let reference = tools::context::DataSourceRef::from_uri(source)
-            .map(|binding| binding.reference)
-            .unwrap_or_else(|_| source.into());
-        self.cached_sources.remove(&reference);
-        self.profile_sources
-            .retain(|binding| binding.reference != reference);
-        self.data_sources.retain(|selected| {
-            selected != source
-                && selected != &reference
-                && !tools::context::DataSourceRef::from_uri(selected)
-                    .is_ok_and(|binding| binding.reference == reference)
-        });
-    }
-    fn source_effects(&mut self, effects: Vec<crate::gui::source_setup::Effect>) {
-        for effect in effects {
-            match effect {
-                crate::gui::source_setup::Effect::Bound(binding) => {
-                    self.context = None;
-                    self.context_refresh_requested = true;
-                    self.remove_source(&binding.reference);
-                    self.profile_sources.retain(|source| {
-                        source.reference != binding.reference
-                            && (binding.profile_id().is_none()
-                                || source.profile_id() != binding.profile_id())
-                    });
-                    self.profile_sources.push(binding);
-                }
-                crate::gui::source_setup::Effect::Invalidate(profile) => {
-                    self.profile_sources
-                        .retain(|source| source.profile_id() != Some(profile.as_str()));
-                    let removed = self
-                        .cached_sources
-                        .iter()
-                        .filter(|(_, source)| source.profile_id() == Some(profile.as_str()))
-                        .map(|(reference, _)| reference.clone())
-                        .collect::<Vec<_>>();
-                    for reference in removed {
-                        self.remove_source(&reference);
-                    }
-                }
-            }
-        }
-    }
     pub(in crate::gui) fn start_reason(&self) -> Option<String> {
         if !self.editable() {
             return Some("Finish the current task before starting another.".into());
-        }
-        if self.source_setup.has_uncommitted_draft() {
-            return Some(crate::gui::source_setup::UNCOMMITTED_DRAFT.into());
         }
         if self.mode == Mode::Plan {
             return Some("Choose a task mode.".into());
@@ -624,44 +497,11 @@ impl State {
         if let Err(error) = self.task_scope().validate() {
             return Some(error.to_string());
         }
-        if !self.data_source_draft.trim().is_empty() {
-            return Some(self.source_draft_error().unwrap_or_else(|| {
-                "Add the source to this task, or clear the source field.".into()
-            }));
-        }
         let Some(ctx) = &self.context else {
             return Some("Waiting for the capture session…".into());
         };
         if !ctx.session {
             return Some("Open a capture session before starting this task.".into());
-        }
-        if self.separate_dataset {
-            if !ctx.task_data_available {
-                return Some("Separate task datasets are unavailable in this session. Choose the shared dataset workflow.".into());
-            }
-            if !self.cameras.is_empty() || self.dataset.is_some() {
-                return Some("A separate dataset currently supports sensor-only tasks. Deselect cameras and the current dataset, or turn off the separate dataset choice.".into());
-            }
-            if !self.allow_data {
-                return Some("Allow source values and dataset results to reach the AI provider before starting this data task.".into());
-            }
-            if self.data_sources.is_empty() && self.profile_sources.is_empty()
-                || !self.cached_sources.is_empty()
-                || self
-                    .data_sources
-                    .iter()
-                    .any(|source| source.starts_with("signal:"))
-            {
-                return Some("A separate dataset needs new captures. Add a source endpoint or protected binding, and remove running-source selections.".into());
-            }
-        }
-        if let Some(error) = self.profile_sources.iter().find_map(|source| {
-            source
-                .validate_local()
-                .and_then(|()| source.validate_in(ctx))
-                .err()
-        }) {
-            return Some(tools::redact::for_output_text(&error.to_string()));
         }
         if self.dataset.as_ref().is_some_and(|slot| {
             ctx.snapshot
@@ -674,17 +514,6 @@ impl State {
                 "The selected dataset was closed or replaced. Select the current dataset again."
                     .into(),
             );
-        }
-        if self.data_sources.iter().any(|source| {
-            source.starts_with("signal:")
-                && self.cached_sources.get(source).is_none_or(|selected| {
-                    !ctx.snapshot
-                        .signals
-                        .iter()
-                        .any(|status| selected.permits_cached(status))
-                })
-        }) {
-            return Some("An approved running source changed or disappeared. Deselect it and select the current source again before starting.".into());
         }
         if self
             .cameras
@@ -711,27 +540,9 @@ impl State {
             Ok(limits) => limits,
             Err(error) => return Some(error),
         };
-        if self.separate_dataset && (limits.max_bytes / 2).min(limits.max_data_bytes) == 0 {
-            return Some("Set a positive data byte limit for the separate task dataset.".into());
-        }
         ai::limits::Limiter::new(limits, self.now_ms, ceiling, self.prices().copied())
             .err()
             .map(|e| e.to_string())
-    }
-    pub(in crate::gui) fn task_dataset_cap(&self) -> Option<u64> {
-        self.parsed_limits()
-            .ok()
-            .map(|limits| (limits.max_bytes / 2).min(limits.max_data_bytes))
-    }
-    fn task_data_request(&self) -> Option<run::TaskDataRequest> {
-        (self.separate_dataset
-            && self
-                .context
-                .as_ref()
-                .is_some_and(|ctx| ctx.task_data_available))
-        .then(|| run::TaskDataRequest {
-            max_bytes: self.task_dataset_cap().unwrap_or(0),
-        })
     }
     fn parsed_limits(&self) -> Result<ai::Limits, String> {
         let mut value = serde_json::to_value(&self.limits).expect("limits JSON");
@@ -750,9 +561,8 @@ impl State {
                 }
             } else {
                 let raw_lower = raw.trim().to_ascii_lowercase();
-                let number = if field == "max_signal_ms"
-                    && matches!(raw_lower.as_str(), "0" | "0s" | "0ms")
-                    || field == "max_data_bytes" && matches!(raw_lower.as_str(), "0" | "0b" | "0 b")
+                let number = if field == "max_data_bytes"
+                    && matches!(raw_lower.as_str(), "0" | "0b" | "0 b")
                 {
                     0
                 } else if field.ends_with("_ms") {
@@ -808,15 +618,6 @@ impl State {
         if self.synthetic || self.job.is_some() {
             return;
         }
-        if matches!(
-            &job,
-            worker::Job::Retained
-                | worker::Job::CopyRetained(_)
-                | worker::Job::RevealRetained(_)
-                | worker::Job::RemoveRetained(_)
-        ) {
-            self.error = None;
-        }
         match worker::job(
             self.run_services
                 .clone()
@@ -826,9 +627,6 @@ impl State {
             Ok(r) => self.job = Some(r),
             Err(e) => self.error = Some(e),
         }
-    }
-    pub(in crate::gui) fn retained_busy(&self) -> bool {
-        self.job.is_some()
     }
     fn activity(&mut self, text: String, level: Level) {
         let mut text = tools::redact::for_output_text(&text);
@@ -862,7 +660,6 @@ impl State {
         }
         match input {
             Input::Mode(mode) if self.editable() => {
-                self.source_setup.clear_secret();
                 self.mode = mode;
                 return Effect::ModeChanged(mode);
             }
@@ -883,53 +680,7 @@ impl State {
                 }
             }
             Input::SeeImages(on) if self.editable() => self.allow_images = on,
-            Input::DataSourceDraft(value) if self.editable() => self.data_source_draft = value,
-            Input::AddDataSource
-                if self.editable() && !self.data_source_draft.trim().is_empty() =>
-            {
-                if let Some(error) = self.source_draft_error() {
-                    self.error = Some(error);
-                } else if let Ok(binding) =
-                    tools::context::DataSourceRef::approved(self.data_source_draft.trim())
-                {
-                    self.remove_source(&binding.reference);
-                    self.data_sources.insert(binding.uri);
-                    self.data_source_draft.clear();
-                    self.error = None;
-                }
-            }
-            Input::DataSource(source, on) if self.editable() => {
-                if on {
-                    let Some(status) = self.context.as_ref().and_then(|context| {
-                        context
-                            .snapshot
-                            .signals
-                            .iter()
-                            .find(|status| status.id == source)
-                    }) else {
-                        self.error =
-                            Some("Choose an available running source before selecting it.".into());
-                        return Effect::None;
-                    };
-                    let binding = tools::context::DataSourceRef::cached_source(status);
-                    self.remove_source(&source);
-                    self.cached_sources.insert(source.clone(), binding);
-                    self.data_sources.insert(source);
-                    self.error = None;
-                } else {
-                    self.remove_source(&source);
-                }
-            }
-            Input::SourceProfile(input) => {
-                self.source_setup.set_synthetic(self.synthetic);
-                let enabled = self.editable();
-                let effects = self.source_setup.input(input, enabled);
-                self.source_effects(effects);
-            }
             Input::UseDataset(on) if self.editable() => {
-                if on {
-                    self.separate_dataset = false;
-                }
                 self.dataset = if on {
                     self.context
                         .as_ref()
@@ -937,12 +688,6 @@ impl State {
                         .and_then(|dataset| dataset.slot_id.clone())
                 } else {
                     None
-                }
-            }
-            Input::SeparateDataset(on) if self.editable() => {
-                self.separate_dataset = on;
-                if on {
-                    self.dataset = None;
                 }
             }
             Input::AllowData(on) if self.editable() => self.allow_data = on,
@@ -972,11 +717,6 @@ impl State {
             }
             Input::Start if self.valid_to_start() && !self.synthetic => {
                 self.limits = self.parsed_limits().expect("validated limits");
-                self.dataset_baseline = self
-                    .context
-                    .as_ref()
-                    .and_then(|context| context.snapshot.dataset.as_ref())
-                    .and_then(|dataset| dataset.slot_id.clone());
                 let request = run::RunRequest {
                     goal: self.goal.clone(),
                     mode: if self.mode == Mode::Supervised {
@@ -990,7 +730,6 @@ impl State {
                     provider: self.settings.provider,
                     model: None,
                     wait_for_answer: true,
-                    task_data: self.task_data_request(),
                 };
                 match worker::start(self.services.clone(), self.settings.clone(), request) {
                     Ok(r) => {
@@ -1159,47 +898,6 @@ impl State {
                     self.enqueue(worker::Job::Read(id));
                 }
             }
-            Input::RetainedDatasets if !self.active() && self.job.is_none() => {
-                self.retained.clear();
-                self.remove_retained = None;
-                self.retained_open = true;
-                self.enqueue(worker::Job::Retained);
-            }
-            Input::CopyRetained(key) if !self.active() && self.job.is_none() => {
-                if let Some(row) = self
-                    .retained
-                    .iter()
-                    .find(|row| row.key == key && row.copyable())
-                    .cloned()
-                {
-                    self.enqueue(worker::Job::CopyRetained(row));
-                }
-            }
-            Input::RevealRetained(key) if self.job.is_none() => {
-                if let Some(row) = self.retained.iter().find(|row| row.key == key).cloned() {
-                    self.enqueue(worker::Job::RevealRetained(row));
-                }
-            }
-            Input::RemoveRetained(key) if !self.active() && self.job.is_none() => {
-                if self
-                    .retained
-                    .iter()
-                    .any(|row| row.key == key && row.removable())
-                {
-                    self.error = None;
-                    self.remove_retained = Some((key, worker::retained_key()));
-                }
-            }
-            Input::ConfirmRemoveRetained(key, review) if !self.active() && self.job.is_none() => {
-                if self.remove_retained == Some((key, review))
-                    && let Some(row) = self.retained.iter().find(|row| row.key == key).cloned()
-                    && row.removable()
-                {
-                    self.remove_retained = None;
-                    self.enqueue(worker::Job::RemoveRetained(row));
-                }
-            }
-            Input::CancelRemoveRetained => self.remove_retained = None,
             Input::ExportLog => {
                 if let Some(id) = self.log_id() {
                     self.enqueue(worker::Job::Export(id));
@@ -1207,7 +905,6 @@ impl State {
             }
             Input::CloseLog => self.log_text = None,
             Input::NewTask if !self.active() && self.job.is_none() => {
-                self.source_setup.clear_secret();
                 let services = self.services.clone();
                 let settings = self.next_settings.clone();
                 let context = self.context.clone();
@@ -1223,9 +920,7 @@ impl State {
             }
             Input::Open(open) => {
                 if !open {
-                    self.source_setup.clear_secret();
                     self.approval_secret = SecretDraft::default();
-                    self.remove_retained = None;
                 } else if !self.synthetic && self.crash.is_none() && !self.active() {
                     self.enqueue(worker::Job::Crash);
                 }
@@ -1253,8 +948,6 @@ impl State {
         if self.synthetic {
             return;
         }
-        let effects = self.source_setup.tick();
-        self.source_effects(effects);
         self.now_ms = wall_ms();
         let mut events = Vec::new();
         let mut disconnected = false;
@@ -1468,7 +1161,6 @@ impl State {
         }
         if call.tool == "close_dataset" {
             self.dataset = None;
-            self.dataset_baseline = None;
         }
         let summary = output
             .get("summary")
@@ -1482,54 +1174,6 @@ impl State {
     }
     fn reply(&mut self, reply: worker::Reply) {
         match reply {
-            worker::Reply::Copied(result) => match result {
-                Ok(Some(path)) => {
-                    self.notice = Some((
-                        format!(
-                            "Dataset copied to {}. Open task.duckdb in that folder; keep its WAL alongside it for recovery.",
-                            path.display()
-                        ),
-                        None,
-                        Level::Done,
-                    ))
-                }
-                Ok(None) => {}
-                Err(error) => self.error = Some(error),
-            },
-            worker::Reply::Retained(result) => match result {
-                Ok(rows) => self.retained = rows,
-                Err(error) => self.error = Some(error),
-            },
-            worker::Reply::Revealed(result) => {
-                if let Err(error) = result {
-                    self.error = Some(error);
-                }
-            }
-            worker::Reply::Removed(key, result)
-                if self.retained.iter().any(|row| row.key == key) =>
-            {
-                match result {
-                    Ok(receipt) => {
-                        self.retained.retain(|row| row.key != key);
-                        if let Some(receipt) = receipt
-                            && let Some(outcome) = &mut self.outcome
-                            && outcome.task_data.as_ref().is_some_and(|current| {
-                                current.id == receipt.id
-                                    && current.catalog.identity == receipt.catalog.identity
-                            })
-                        {
-                            outcome.task_data = Some(*receipt);
-                        }
-                        self.notice = Some((
-                            "Dataset removed and its storage reservation released.".into(),
-                            None,
-                            Level::Done,
-                        ));
-                    }
-                    Err(error) => self.error = Some(error),
-                }
-            }
-            worker::Reply::Removed(..) => {}
             worker::Reply::Crash(result) => match result {
                 Ok(Some(row)) if self.seen_crashes.insert(row.run_id.clone()) => {
                     self.crash = Some(CrashRow {

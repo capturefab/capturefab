@@ -23,7 +23,7 @@ PAGE = '''<!doctype html>
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1e1e20" media="(prefers-color-scheme: dark)">
-  <meta name="description" content="Published Capturefab builds with SHA-256 checksums, signatures, and corresponding source.">
+  <meta name="description" content="Download Capturefab for macOS, Windows or Linux. Choose your system and processor, then verify the file with its SHA-256 checksum.">
   <title>Capturefab downloads</title>
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="docs.css">
@@ -46,8 +46,10 @@ PAGE = '''<!doctype html>
     <main id="main">
       <section class="page-head" aria-labelledby="downloads-title">
         <h1 id="downloads-title">All downloads</h1>
-        <p class="lead">Every download includes the desktop app and the CLI; with no display it lists the CLI commands. Latest release: {status}.</p>
-        <p>Extract the archive before you open the app. Read the <a href="docs.html#installation">installation instructions and system requirements</a>.</p>
+        <p class="lead">Every app download includes the desktop app and the CLI. Latest release: {status}.</p>
+        <p>Choose your operating system and processor. ARM64 is for Apple silicon and 64-bit ARM systems. x64 is for Intel or AMD systems.</p>
+        <p>Compare the file's SHA-256 with the value below. Extract the archive before you open the app.</p>
+        <p>Read the <a href="docs.html#installation">installation instructions</a> for system requirements, command-line setup and use without a display.</p>
       </section>
 {body}    </main>
     <footer class="site-footer">

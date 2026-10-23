@@ -4,11 +4,9 @@ use super::{ExtentUsage, TaskDataset, TaskMode};
 use crate::{
     context::Context,
     dataset::{DatasetStatus, write},
-    signals::{Sample, SignalInfo, TagInfo},
 };
 use anyhow::{Context as _, Result, ensure};
 use serde::Serialize;
-use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct TaskCatalogIdentity {
@@ -32,21 +30,11 @@ pub struct TaskCatalogStatus {
 pub(super) struct Catalog {
     identity: TaskCatalogIdentity,
     status: DatasetStatus,
-    sources: BTreeMap<String, (String, String)>,
 }
 impl Catalog {
     pub(super) fn record_error(&mut self, error: &anyhow::Error) {
         self.status.last_error = Some(format!("{error:#}"));
     }
-}
-
-fn source_id(id: &str) -> Result<()> {
-    crate::signals::validate_id(id)?;
-    ensure!(
-        id != "all",
-        "a task catalog requires one exact source identity"
-    );
-    Ok(())
 }
 
 impl TaskDataset {
@@ -79,7 +67,6 @@ impl TaskDataset {
         self.catalog = Some(Catalog {
             identity: identity.clone(),
             status,
-            sources: BTreeMap::new(),
         });
         let result = (|| -> Result<()> {
             let conn = self.connection()?;
@@ -169,105 +156,6 @@ impl TaskDataset {
         result
     }
 
-    fn catalog_transaction(
-        &mut self,
-        operation: impl FnOnce(&duckdb::Connection) -> Result<()>,
-    ) -> Result<()> {
-        let result = (|| -> Result<()> {
-            let conn = self.connection()?;
-            conn.execute_batch("BEGIN TRANSACTION")?;
-            match operation(conn) {
-                Ok(()) => conn.execute_batch("COMMIT").map_err(Into::into),
-                Err(error) => {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    Err(error)
-                }
-            }
-        })();
-        self.finish_catalog_operation(result)
-    }
-
-    pub fn register(&mut self, source: &SignalInfo, tags: &[TagInfo]) -> Result<()> {
-        self.writable_catalog()?;
-        source_id(&source.id)?;
-        ensure!(
-            tags.len() <= crate::signals::MAX_TAGS,
-            "too many task source tags"
-        );
-        let protocol = write::protocol(source)?;
-        let catalog = self.catalog.as_ref().expect("checked catalog");
-        ensure!(
-            catalog
-                .sources
-                .get(&source.id)
-                .is_none_or(|known| known == &(source.uri.clone(), protocol.clone())),
-            "task catalog source identity changed; do not replace its registered endpoint"
-        );
-        self.catalog_transaction(|conn| write::register(conn, source, tags, &protocol))?;
-        let count = self
-            .connection()?
-            .query_row("SELECT count(*) FROM signals", [], |row| {
-                row.get::<_, u64>(0)
-            })
-            .map_err(Into::into);
-        let count = self.finish_catalog_operation(count)?;
-        let catalog = self.catalog.as_mut().expect("checked catalog");
-        catalog
-            .sources
-            .insert(source.id.clone(), (source.uri.clone(), protocol));
-        catalog.status.signals = count;
-        Ok(())
-    }
-
-    pub fn append_samples(&mut self, id: &str, batch: &[Sample]) -> Result<usize> {
-        self.writable_catalog()?;
-        source_id(id)?;
-        ensure!(
-            batch.len() <= crate::dataset::db::MAX_SAMPLES_PER_CALL,
-            "at most {} samples per task write",
-            crate::dataset::db::MAX_SAMPLES_PER_CALL
-        );
-        let (uri, protocol) = self
-            .catalog
-            .as_ref()
-            .expect("checked catalog")
-            .sources
-            .get(id)
-            .cloned()
-            .context("task samples require an explicitly registered source")?;
-        if batch.is_empty() {
-            return Ok(0);
-        }
-        let range = write::sample_ranges(batch);
-        self.catalog_transaction(|conn| {
-            write::append_samples(conn, id, &uri, &protocol, batch, &range)
-        })?;
-        let count = self
-            .connection()?
-            .query_row("SELECT count(*) FROM signals", [], |row| {
-                row.get::<_, u64>(0)
-            })
-            .map_err(Into::into);
-        let count = self.finish_catalog_operation(count)?;
-        let catalog = self.catalog.as_mut().expect("checked catalog");
-        catalog.status.signals = count;
-        catalog.status.samples += batch.len() as u64;
-        if let (Some(first), Some(last)) = (
-            range.values().map(|range| range.0).min(),
-            range.values().map(|range| range.1).max(),
-        ) {
-            catalog.status.first_ms = Some(
-                catalog
-                    .status
-                    .first_ms
-                    .map_or(first, |known| known.min(first)),
-            );
-            catalog.status.last_ms =
-                Some(catalog.status.last_ms.map_or(last, |known| known.max(last)));
-        }
-        Ok(batch.len())
-    }
-
     pub fn record_event(
         &mut self,
         kind: &str,
@@ -287,15 +175,7 @@ impl TaskDataset {
         );
         crate::context::validate(context)?;
         if let Some(id) = source {
-            source_id(id)?;
-            ensure!(
-                self.catalog
-                    .as_ref()
-                    .expect("checked catalog")
-                    .sources
-                    .contains_key(id),
-                "task events require an explicitly registered source"
-            );
+            ensure!(!id.is_empty(), "event source identity cannot be empty");
         }
         let result = write::record_event(
             self.connection()?,
@@ -329,11 +209,7 @@ impl TaskDataset {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::{
-        dataset::{OpenMode, Slot, task::TaskExtentBudget},
-        signals::{Protocol, Quality, Value},
-    };
-    use sha2::{Digest, Sha256};
+    use crate::dataset::{OpenMode, Slot, task::TaskExtentBudget};
     use std::path::PathBuf;
     #[cfg(feature = "parquet")]
     use std::sync::atomic::AtomicBool;
@@ -347,202 +223,6 @@ mod tests {
         crate::ipc::ensure_private_dir(&path).unwrap();
         path.canonicalize().unwrap()
     }
-    fn source() -> SignalInfo {
-        let uri = "sim-signal://task-catalog";
-        SignalInfo {
-            id: crate::signals::source_id(uri),
-            protocol: Protocol::SimSignal,
-            uri: uri.into(),
-            interval_ms: 10,
-        }
-    }
-    fn sample(ts_ms: u64, tag: &str, value: Value) -> Sample {
-        Sample {
-            ts_ms,
-            source_ts_ms: Some(ts_ms - 1),
-            tag: tag.into(),
-            value,
-            quality: Quality::Good,
-        }
-    }
-    fn payload(offset: usize, rows: usize) -> Vec<Sample> {
-        (offset..offset + rows)
-            .map(|row| {
-                let text: String = (0..16)
-                    .map(|block| {
-                        format!("{:x}", Sha256::digest(format!("{row}:{block}").as_bytes()))
-                    })
-                    .collect();
-                sample(row as u64 + 1, "payload", Value::Text(text))
-            })
-            .collect()
-    }
-    fn scalar(dataset: &TaskDataset, sql: &str) -> u64 {
-        dataset
-            .connection()
-            .unwrap()
-            .query_row(sql, [], |row| row.get(0))
-            .unwrap()
-    }
-
-    #[test]
-    fn typed_catalog_writes_canonical_signals_events_and_stable_fresh_identity() {
-        let parent = parent("typed");
-        let budget = TaskExtentBudget::new(16 * 1024 * 1024).unwrap();
-        let mut dataset = TaskDataset::create(&parent, budget.clone()).unwrap();
-        let identity = dataset.initialize_catalog("typed task").unwrap();
-        assert_ne!(identity.dataset_id, identity.slot_id);
-        assert_eq!(identity.slot_id.len(), 32);
-        let info = source();
-        dataset
-            .register(
-                &info,
-                &[TagInfo {
-                    tag: "temperature".into(),
-                    unit: Some("C".into()),
-                    kind: Some("number".into()),
-                }],
-            )
-            .unwrap();
-        let mut samples = vec![
-            sample(3000, "temperature", Value::Number(42.25)),
-            sample(1000, "ready", Value::Bool(true)),
-            sample(2000, "state", Value::Text("running".into())),
-        ];
-        samples[2].quality = Quality::Uncertain;
-        assert_eq!(dataset.append_samples(&info.id, &samples).unwrap(), 3);
-        let context = Context::from([("station".into(), "A1".into())]);
-        assert_eq!(
-            dataset
-                .record_event("capture", Some("sim:0"), Some(&info.id), "saved", &context)
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            dataset
-                .record_event("note", None, None, "reviewed", &Context::new())
-                .unwrap(),
-            2
-        );
-        dataset.checkpoint_catalog().unwrap();
-        let status = dataset.catalog_status().unwrap();
-        assert_eq!(status.identity, identity);
-        assert_eq!(status.dataset.dataset_id, identity.dataset_id);
-        assert_eq!(status.dataset.slot_id.as_ref(), Some(&identity.slot_id));
-        assert_eq!(status.dataset.samples, 3);
-        assert_eq!(status.dataset.signals, 3);
-        assert_eq!(status.dataset.events, 2);
-        assert_eq!(
-            (status.dataset.first_ms, status.dataset.last_ms),
-            (Some(1000), Some(3000))
-        );
-        assert!(!status.quarantined && !status.closed);
-        assert!(status.dataset.bytes > 0);
-        assert!(status.extents.peak <= status.extents.limit);
-        assert_eq!(
-            scalar(
-                &dataset,
-                "SELECT count(*) FROM samples WHERE tag='temperature' AND value_double=42.25 AND value_text IS NULL"
-            ),
-            1
-        );
-        assert_eq!(
-            scalar(
-                &dataset,
-                "SELECT count(*) FROM samples WHERE tag='ready' AND value_double=1 AND value_text='true'"
-            ),
-            1
-        );
-        assert_eq!(
-            scalar(
-                &dataset,
-                "SELECT count(*) FROM samples WHERE tag='state' AND value_text='running' AND value_double IS NULL AND quality='uncertain'"
-            ),
-            1
-        );
-        assert_eq!(
-            scalar(
-                &dataset,
-                "SELECT count(*) FROM events WHERE id=1 AND camera_id='sim:0' AND context='{\"station\":\"A1\"}'"
-            ),
-            1
-        );
-        assert_eq!(
-            scalar(
-                &dataset,
-                "SELECT count(*) FROM signals WHERE tag='temperature' AND unit='C' AND first_ms=3000 AND last_ms=3000"
-            ),
-            1
-        );
-        let pristine = duckdb::Connection::open_in_memory().unwrap();
-        pristine.execute_batch(crate::dataset::db::DDL).unwrap();
-        let table_sql = |conn: &duckdb::Connection| -> Vec<String> {
-            conn.prepare("SELECT sql FROM system.main.duckdb_tables() WHERE database_name=system.main.current_database() AND NOT internal ORDER BY table_name")
-                .unwrap()
-                .query_map([], |row| row.get(0))
-                .unwrap()
-                .collect::<duckdb::Result<_>>()
-                .unwrap()
-        };
-        assert_eq!(
-            table_sql(dataset.connection().unwrap()),
-            table_sql(&pristine)
-        );
-        assert!(dataset.execute_batch("DELETE FROM samples").is_err());
-        assert!(dataset.scalar_i64("SELECT 1").is_err());
-        let path = dataset.path().to_owned();
-        dataset.close().unwrap();
-        let status = dataset.catalog_status().unwrap();
-        assert!(status.closed);
-        assert_eq!(status.identity, identity);
-        assert!(dataset.append_samples(&info.id, &samples).is_err());
-        dataset.remove().unwrap();
-        assert!(!path.exists());
-        assert_eq!(budget.usage().unwrap().used, 0);
-        let mut other = TaskDataset::create(&parent, budget.clone()).unwrap();
-        assert_ne!(other.initialize_catalog("next task").unwrap(), identity);
-        other.remove().unwrap();
-        std::fs::remove_dir(parent).unwrap();
-    }
-
-    #[test]
-    fn typed_catalog_refuses_unregistered_or_replaced_source_without_quarantine() {
-        let parent = parent("sources");
-        let budget = TaskExtentBudget::new(8 * 1024 * 1024).unwrap();
-        let mut dataset = TaskDataset::create(&parent, budget).unwrap();
-        dataset.initialize_catalog("sources").unwrap();
-        let info = source();
-        let samples = [sample(1, "temperature", Value::Number(3.0))];
-        assert!(dataset.append_samples(&info.id, &samples).is_err());
-        assert!(
-            dataset
-                .record_event(
-                    "note",
-                    None,
-                    Some(&info.id),
-                    "unregistered",
-                    &Context::new()
-                )
-                .is_err()
-        );
-        dataset.register(&info, &[]).unwrap();
-        let mut replacement = info.clone();
-        replacement.uri = "sim-signal://another-endpoint".into();
-        assert!(dataset.register(&replacement, &[]).is_err());
-        assert!(dataset.append_samples("all", &samples).is_err());
-        assert_eq!(dataset.append_samples(&info.id, &samples).unwrap(), 1);
-        assert_eq!(
-            scalar(
-                &dataset,
-                "SELECT count(*) FROM signals WHERE uri='sim-signal://task-catalog'"
-            ),
-            1
-        );
-        assert!(!dataset.catalog_status().unwrap().quarantined);
-        dataset.remove().unwrap();
-        std::fs::remove_dir(parent).unwrap();
-    }
-
     #[test]
     fn typed_catalog_initialization_never_adopts_existing_tables_or_catalog_code() {
         let parent = parent("foreign");
@@ -565,7 +245,11 @@ mod tests {
             );
             assert!(dataset.catalog_status().unwrap().quarantined);
             assert!(dataset.initialize_catalog("retry").is_err());
-            assert!(dataset.register(&source(), &[]).is_err());
+            assert!(
+                dataset
+                    .record_event("note", None, None, "note", &Context::new())
+                    .is_err()
+            );
             dataset.remove().unwrap();
         }
         std::fs::remove_dir(parent).unwrap();
@@ -603,81 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn typed_append_quota_failure_quarantines_and_retains_extents_without_shared_writes() {
-        let parent = parent("append-quota");
-        let shared = Slot::new();
-        shared
-            .open(&parent.join("shared.duckdb"), OpenMode::Create, None)
-            .unwrap();
-        let before = shared.status_cached().unwrap();
-        let budget = TaskExtentBudget::new(4 * 1024 * 1024).unwrap();
-        let mut dataset = TaskDataset::create(&parent, budget.clone()).unwrap();
-        dataset.initialize_catalog("bounded append").unwrap();
-        let info = source();
-        dataset.register(&info, &[]).unwrap();
-        let mut refused = false;
-        for batch in 0..32 {
-            let result = dataset.append_samples(&info.id, &payload(batch * 1000, 1000));
-            if let Err(error) = result {
-                assert!(format!("{error:#}").contains("extent limit"), "{error:#}");
-                refused = true;
-                break;
-            }
-        }
-        assert!(refused, "typed writes must exhaust the 4 MiB extent cap");
-        let status = dataset.catalog_status().unwrap();
-        assert!(status.quarantined);
-        assert!(status.dataset.last_error.is_some());
-        assert!(status.extents.used > 0 && status.extents.denied > 0);
-        assert!(status.extents.peak <= status.extents.limit);
-        assert!(dataset.append_samples(&info.id, &[]).is_err());
-        assert!(dataset.register(&info, &[]).is_err());
-        assert!(
-            dataset
-                .record_event("note", None, None, "after failure", &Context::new())
-                .is_err()
-        );
-        assert!(dataset.checkpoint_catalog().is_err());
-        let after = shared.status_cached().unwrap();
-        assert_eq!(before.dataset_id, after.dataset_id);
-        assert_eq!(before.slot_id, after.slot_id);
-        assert_eq!(
-            (after.samples, after.signals, after.events),
-            (before.samples, before.signals, before.events)
-        );
-        dataset.remove().unwrap();
-        assert_eq!(budget.usage().unwrap().used, 0);
-        shared.close().unwrap();
-        std::fs::remove_dir_all(parent).unwrap();
-    }
-
-    #[test]
-    fn typed_checkpoint_quota_failure_quarantines_without_releasing_retained_charge() {
-        let parent = parent("checkpoint-quota");
-        let budget = TaskExtentBudget::new(8 * 1024 * 1024).unwrap();
-        let mut dataset = TaskDataset::create(&parent, budget.clone()).unwrap();
-        dataset.initialize_catalog("bounded checkpoint").unwrap();
-        let info = source();
-        dataset.register(&info, &[]).unwrap();
-        let usage = budget.usage().unwrap();
-        let remaining = usage.limit - usage.used;
-        let rows = ((remaining * 9 / 10) / (crate::signals::MAX_TEXT as u64 + 128)) as usize;
-        assert!((100..=crate::dataset::db::MAX_SAMPLES_PER_CALL).contains(&rows));
-        dataset.append_samples(&info.id, &payload(0, rows)).unwrap();
-        let error = dataset.checkpoint_catalog().unwrap_err();
-        assert!(format!("{error:#}").contains("extent limit"), "{error:#}");
-        let status = dataset.catalog_status().unwrap();
-        assert!(status.quarantined && status.extents.denied > 0);
-        assert!(status.extents.used > 0 && status.extents.peak <= status.extents.limit);
-        assert!(dataset.append_samples(&info.id, &payload(rows, 1)).is_err());
-        dataset.close().unwrap();
-        assert!(budget.usage().unwrap().used > 0);
-        dataset.remove().unwrap();
-        assert_eq!(budget.usage().unwrap().used, 0);
-        std::fs::remove_dir(parent).unwrap();
-    }
-
-    #[test]
     fn reserved_catalog_uses_exact_anchor_and_retains_global_cap_until_removed_receipt() {
         let parent = parent("reserved");
         let cap = 8 * 1024 * 1024;
@@ -696,10 +305,14 @@ mod tests {
         assert!(TaskDataset::create(dataset.path(), nested_budget.clone()).is_err());
         assert_eq!(nested_budget.usage().unwrap().used, 0);
         dataset.initialize_catalog("reserved task").unwrap();
-        let info = source();
-        dataset.register(&info, &[]).unwrap();
         dataset
-            .append_samples(&info.id, &[sample(1, "value", Value::Number(7.0))])
+            .record_event(
+                "note",
+                Some("sim:0"),
+                None,
+                "Captured frame",
+                &Context::new(),
+            )
             .unwrap();
         dataset.checkpoint_catalog().unwrap();
         let error =
@@ -713,7 +326,7 @@ mod tests {
         dataset.close().unwrap();
         let readonly =
             crate::dataset::db::Dataset::open_read_only(&dataset.database_path()).unwrap();
-        assert_eq!(readonly.status().samples, 1);
+        assert_eq!(readonly.status().events, 1);
         drop(readonly);
         let retained = || {
             crate::storage::quota_status().unwrap()["retained_namespaces"]
@@ -724,6 +337,8 @@ mod tests {
                 .cloned()
         };
         assert_eq!(retained().unwrap()["allocated_bytes"], cap);
+        assert_eq!(retained().unwrap()["phase"], "retained");
+        dataset.close().unwrap();
         let receipt = dataset.remove_reserved().unwrap();
         assert!(!path.exists());
         assert_eq!(budget.usage().unwrap().used, 0);
@@ -735,6 +350,38 @@ mod tests {
         assert!(retained().is_none());
         assert!(dataset.catalog_status().unwrap().closed);
         drop(dataset);
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn retained_constructor_closes_without_refund_and_explicit_remove_releases_its_charge() {
+        let parent = parent("retained-constructor");
+        let cap = 8 * 1024 * 1024;
+        let mut data =
+            TaskDataset::create_retained(&parent, &crate::storage::StoragePolicy::default(), cap)
+                .unwrap();
+        data.initialize_catalog("Camera captures").unwrap();
+        let path = data.path().to_owned();
+        data.close().unwrap();
+        let inventory = crate::storage::quota_status().unwrap();
+        let entry = inventory["retained_namespaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["path"].as_str() == path.to_str())
+            .unwrap();
+        assert_eq!(entry["allocated_bytes"], cap);
+        assert_eq!(entry["phase"], "retained");
+        let id = entry["id"].clone();
+        data.remove().unwrap();
+        assert!(!path.exists());
+        assert!(
+            crate::storage::quota_status().unwrap()["retained_namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["id"] != id)
+        );
         std::fs::remove_dir(parent).unwrap();
     }
 

@@ -1,7 +1,7 @@
 {
   "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface.",
-  "source_note": "Current development desktop build from the workspace source.",
-  "binary_sha256": "4d2e915ecd97c8ad4d592786995f54998ee20b9a192a2cd1b58f081e352166fd",
+  "source_note": "Camera capture development build from the workspace source; sensor and PLC integrations removed.",
+  "binary_sha256": "133eead4c2e6d88abae6b26bab556b24c436b766f5865e0a060d02799837c1bf",
   "logical_window": [
     1100,
     700
@@ -9,9 +9,9 @@
   "demo": "Built-in simulator cameras. Destination names, paths and scheduled jobs are built-in demonstration scenes. Capture, scheduling and Video scenes use the validated default storage policy as a read-only display fixture without accessing a storage ledger.",
   "images": [
     {
-      "file": "workspace.png",
-      "source": "source/workspace.png",
-      "source_sha256": "6e929d645c2c6047b661c8c1ea33dabe3bf6201487fd595648f6c596250507ee",
+      "file": "quick-command.png",
+      "source": "source/quick-command.png",
+      "source_sha256": "da4fdd21ee0123e0ac753864644b4e8495dd31dc77cb0e6368129f4f456d6a1e",
       "source_size": [
         2200,
         1400
@@ -26,14 +26,36 @@
         2200,
         1400
       ],
-      "sha256": "6e929d645c2c6047b661c8c1ea33dabe3bf6201487fd595648f6c596250507ee",
+      "sha256": "da4fdd21ee0123e0ac753864644b4e8495dd31dc77cb0e6368129f4f456d6a1e",
+      "scene": "dark,quick-command-plan,noscopes",
+      "description": "Quick command plan with checked, editable camera tools and an explicit Run plan action. Provider and camera observations are synthetic display fixtures."
+    },
+    {
+      "file": "workspace.png",
+      "source": "source/workspace.png",
+      "source_sha256": "6e2e8a1b5cc468719a2d00d61a13aafb465cb98532cc706592b88f517acdc2d5",
+      "source_size": [
+        2200,
+        1400
+      ],
+      "crop_pixels": [
+        0,
+        0,
+        2200,
+        1400
+      ],
+      "size": [
+        2200,
+        1400
+      ],
+      "sha256": "6e2e8a1b5cc468719a2d00d61a13aafb465cb98532cc706592b88f517acdc2d5",
       "scene": "dark,features,focus,exposure",
       "description": "A simulator camera in its own workbench window, with scopes and its Features inspector."
     },
     {
       "file": "cameras.png",
       "source": "source/picker.png",
-      "source_sha256": "4ca594e4aa016849502a7d086c0ab62c6cadd13e9614fd08c82629c95c1f2bf8",
+      "source_sha256": "2d756473061b74bd0b14875467cf6e2696cca09173b967704b365d05b1691c5f",
       "source_size": [
         2200,
         1400
@@ -48,14 +70,14 @@
         1000,
         1240
       ],
-      "sha256": "e847f8e5bf0469b7d324ed008f4422cea015154352191bee8dd1835e070baaff",
+      "sha256": "87ef4bafa8a08cd277b1c2e8112bd2896fa369e149243d850e1a5154cfef4bc4",
       "scene": "dark,welcome",
-      "description": "The camera picker in a window without a camera: found simulator cameras, the address field beside Search again, and data sources, Settings, Help and session controls."
+      "description": "The camera picker in a window without a camera: found simulator cameras, the address field beside Search again, Settings, Help and session controls."
     },
     {
       "file": "features.png",
       "source": "source/features.png",
-      "source_sha256": "7ee02bb19634c7a2683f10b374fc39e0506aa3c6a183549ddb632831c2136a4f",
+      "source_sha256": "5f6a8d8ce4857eba2247a0afa748f96ca417ea116f1c7ffa76707bf51d96c7e7",
       "source_size": [
         2200,
         1400
@@ -70,14 +92,14 @@
         568,
         1304
       ],
-      "sha256": "f884aa6e0daaf33cb91f31567ea3a6717a446b15af2e79ff7ea9c33911e6d681",
+      "sha256": "584f4ed98e573785ea22071402756b8d4a952fc0d0292ca3121013a78fb3c5aa",
       "scene": "dark,features,noscopes",
       "description": "Quick controls for the selected camera, with search and collapsed feature groups for less common settings."
     },
     {
       "file": "capture.png",
       "source": "source/capture.png",
-      "source_sha256": "c197c70dcc8074dab1e5293ee8ba6dcd6c5494333f21a2fee60518c112f711a0",
+      "source_sha256": "5aec35e5452fd0b56eac4a28f872a79f6c7e2c568525cac96031199e74c8d75a",
       "source_size": [
         2200,
         1400
@@ -92,14 +114,14 @@
         568,
         1400
       ],
-      "sha256": "44f5289cacc3e3891cfe4ac6a86e46fbeb79a7d90e0f5bade9962394cf9b929c",
+      "sha256": "fc883eeadedbf8c74c0132b67d32156d676caeee4e1590f1a462589244bc5b6e",
       "scene": "dark,capture,noscopes,inspector-storage-default",
       "description": "Ordinary capture controls first, followed by the Capture options (timeout and scheduling), Storage and retention, and Shell and agents disclosures."
     },
     {
       "file": "schedule.png",
       "source": "source/schedule.png",
-      "source_sha256": "e47f2c16cf406491bedafc3b5b4efefee13c99b8f4d5d0dd4ac42fceb965d46b",
+      "source_sha256": "9fad132eeae98706adb506d0748dce9b85a0a8b70640b2df56bd03e48295e4a8",
       "source_size": [
         2200,
         1400
@@ -114,14 +136,14 @@
         512,
         364
       ],
-      "sha256": "09ae2cb6166383395b15f43323befe95fcbcfec56d52df1dea84c645111030d1",
+      "sha256": "376cb7da7188ac4af8799226283fdef75038c569b6c335cda56d1ca8f81341da",
       "scene": "dark,capture,noscopes,inspector-widest,inspector-storage-default,scheduled",
       "description": "The capture scheduling form in Capture options, with start delay and frame interval."
     },
     {
       "file": "destinations.png",
       "source": "source/destinations.png",
-      "source_sha256": "f1ed1b468ddd044e957112d3232103b64cb3a1a169f3f16d5c792f47ba0c289f",
+      "source_sha256": "75b9cf4b828e31aabe46f7e6fb5cec07d41c301dd97e83decf8eae990d1413a7",
       "source_size": [
         2200,
         1400
@@ -136,14 +158,14 @@
         1144,
         800
       ],
-      "sha256": "41ee7c30b898d06539bfc921f880d89b5b72abd2b51ada2094bbe208089eb408",
+      "sha256": "62af1de2ade2294d58bb3cd1c8dfab50faa5ba53782177665a312324723770dd",
       "scene": "dark,destinations-list,noscopes",
       "description": "Destination manager showing example folder and S3-compatible bucket destinations."
     },
     {
       "file": "scopes.png",
       "source": "source/scopes.png",
-      "source_sha256": "66e0bcc64ed6ecdcdbef0e9743125c16e0b267873bf22014282479c7448cf633",
+      "source_sha256": "39da622a7077bc2452153a9539d60d226a8f13edddc81ffc6f79503f789e9a67",
       "source_size": [
         2200,
         1400
@@ -158,14 +180,14 @@
         1316,
         804
       ],
-      "sha256": "0a71fd4cbdc8daedc52ce8152e64e35b52dc2c69df94fbf8536903e977f8a332",
+      "sha256": "35076c6a345db2a065dfb7ab9cf08a5352dd50fdce2c4e75e57b65c910af63af",
       "scene": "dark,noinspector,focus,exposure",
       "description": "Live focus score with its focus measure chooser and exposure histogram alongside the focus region on a simulator image."
     },
     {
       "file": "forwarding.png",
       "source": "source/forwarding.png",
-      "source_sha256": "bfebfcb6136032e16e4317b0cd05b957348461c83eff7ac3f6d89f5bba95660c",
+      "source_sha256": "626ddbf7fa84b86e65d494682cab475d4c176c4b085d4f00ec8833e5bb26abc8",
       "source_size": [
         2200,
         1400
@@ -180,14 +202,14 @@
         568,
         840
       ],
-      "sha256": "9259e7f5303c1c2624403b88e64c10d37e759a71324449e6f1d3e1603dba9751",
+      "sha256": "618773fe2cc86deb1e0e4d002cf2ce5f26105a8dc7d7b813c738dc560262fc9f",
       "scene": "dark,forward,noscopes,inspector-storage-default",
       "description": "Video panel with the Record to file or Forward to URL choice, the folded Location and name section, a start action and the next file name, followed by the Video settings disclosure summing up codec, frame rate and bitrate."
     },
     {
       "file": "history.png",
       "source": "source/destinations.png",
-      "source_sha256": "f1ed1b468ddd044e957112d3232103b64cb3a1a169f3f16d5c792f47ba0c289f",
+      "source_sha256": "75b9cf4b828e31aabe46f7e6fb5cec07d41c301dd97e83decf8eae990d1413a7",
       "source_size": [
         2200,
         1400

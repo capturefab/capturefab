@@ -1,7 +1,7 @@
 //! Real process loss, WAL preservation and the public local recovery CLI.
 #![cfg(all(feature = "parquet", unix))]
 use capturefab::{
-    session::{SessionHandle, task_data::TaskDataPolicy},
+    dataset::task::TaskDataset,
     storage::{self, StoragePolicy},
 };
 use serde_json::{Value, json};
@@ -49,26 +49,24 @@ fn ok(root: &Path, args: &[&str]) -> Value {
 fn retained_dataset_recovery_survives_process_loss_and_preserves_wal_in_copies() {
     if let Some(mode) = std::env::var_os("CAPTUREFAB_RECOVERY_CHILD") {
         let root = PathBuf::from(std::env::var_os("HOME").unwrap());
-        let session = SessionHandle::new();
-        let data = session
-            .begin_task_data(TaskDataPolicy {
-                parent: root.join("captures"),
-                storage: StoragePolicy::default(),
-                max_bytes: 16 << 20,
-                lifetime: Duration::from_secs(60),
-                name: "Restart recovery".into(),
-            })
-            .unwrap();
-        let status = data.status();
-        data.note(
-            &status.catalog.identity.slot_id,
+        std::fs::create_dir_all(root.join("captures")).unwrap();
+        let mut data = TaskDataset::create_retained(
+            &root.join("captures"),
+            &StoragePolicy::default(),
+            16 << 20,
+        )
+        .unwrap();
+        data.initialize_catalog("Restart recovery").unwrap();
+        data.record_event(
+            "note",
+            Some("sim:0"),
+            None,
             "survives restart",
             &capturefab::context::Context::new(),
-            None,
         )
         .unwrap();
         if mode == "closed" {
-            data.close(Duration::from_secs(10)).unwrap();
+            data.close().unwrap();
         }
         let inventory = storage::quota_status().unwrap();
         let row = inventory["retained_namespaces"][0].clone();
@@ -84,7 +82,7 @@ fn retained_dataset_recovery_survives_process_loss_and_preserves_wal_in_copies()
                 assert!(Instant::now() < deadline, "parent never released the owner");
                 std::thread::sleep(Duration::from_millis(20));
             }
-            data.close(Duration::from_secs(10)).unwrap();
+            data.close().unwrap();
         }
         // Deliberately bypass all Rust/native destructors for the interrupted
         // case. The parent must recover the original WAL, not a clean fixture.

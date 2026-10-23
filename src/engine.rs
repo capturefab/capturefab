@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::session::{FeatureValue, LogEntry, SessionCommand, SessionSnapshot};
+use crate::session::{FeatureValue, ForwardingProgress, LogEntry, SessionCommand, SessionSnapshot};
 mod history;
 mod network_defaults;
 #[cfg(test)]
@@ -582,6 +582,71 @@ fn push_log(s: &mut SessionSnapshot, level: &str, message: String) {
     }
 }
 
+const FORWARD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+fn compact_forwarding(id: String, stats: &crate::media::ForwardStats) -> ForwardingProgress {
+    ForwardingProgress {
+        id,
+        accepted: stats.accepted,
+        written: stats.written,
+        dropped: stats.dropped,
+        late: stats.late,
+        stalled: stats.stalled,
+    }
+}
+#[derive(Default)]
+struct ForwardProgressSampler {
+    id: Option<String>,
+    at: Option<Instant>,
+}
+impl ForwardProgressSampler {
+    fn sample(
+        &mut self,
+        id: Option<&str>,
+        now: Instant,
+        stats: impl FnOnce() -> crate::media::ForwardStats,
+    ) -> Option<ForwardingProgress> {
+        let Some(id) = id else {
+            self.id = None;
+            self.at = None;
+            return None;
+        };
+        if self.id.as_deref() == Some(id)
+            && self
+                .at
+                .is_some_and(|at| now.saturating_duration_since(at) < FORWARD_PROGRESS_INTERVAL)
+        {
+            return None;
+        }
+        self.id = Some(id.into());
+        self.at = Some(now);
+        Some(compact_forwarding(id.into(), &stats()))
+    }
+}
+fn sync_forwarding_progress(
+    h: &WorkerHandle,
+    forwarder: &Option<(Forwarder, f64)>,
+    sampler: &mut ForwardProgressSampler,
+    now: Instant,
+) {
+    let id = h
+        .state
+        .read()
+        .unwrap_or_else(|error| error.into_inner())
+        .forwarding_id
+        .clone();
+    let id = forwarder.as_ref().and(id.as_deref());
+    let progress = sampler.sample(id, now, || {
+        forwarder.as_ref().expect("active forwarder").0.stats()
+    });
+    if let Some(progress) = progress {
+        let mut state = h.state.write().unwrap_or_else(|error| error.into_inner());
+        if state.forwarding_id.as_deref() == Some(&progress.id) {
+            state.forwarding_progress = Some(progress);
+        }
+    }
+}
+
 /// Stop forwarding; the stopped forwarder's final counters, if one ran.
 fn stop_forward(
     h: &WorkerHandle,
@@ -604,10 +669,18 @@ fn end_forward(
         a.set_forward_fps(None)?;
     }
     let meta = h.recording.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let id = h
+        .state
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .forwarding_id
+        .clone();
+    let mut final_progress = None;
     let stopped = match forwarder.take() {
         Some((mut f, _)) => {
             let stopped = f.stop();
             let stats = f.stats();
+            final_progress = id.map(|id| compact_forwarding(id, &stats));
             // A finished file is reported even when stopping reported an error.
             if let Some(file) = stats.recording.clone() {
                 let context = meta.map(|m| m.context).unwrap_or_default();
@@ -618,9 +691,7 @@ fn end_forward(
                     bytes: file.bytes,
                     sha256: Some(file.sha256),
                     destination: file.destination,
-                    object_key: file.object_key,
-                    remote_url: file.remote_url,
-                    upload_id: file.upload_id,
+
                     context,
                     item: crate::dataset::SavedItem::Recording {
                         started_ms: file.started_ms,
@@ -642,6 +713,9 @@ fn end_forward(
     if let Some((level, message)) = report(&stopped) {
         push_log(&mut s, level, message);
     }
+    if let Some(progress) = final_progress {
+        s.forwarding_progress = Some(progress);
+    }
     s.forwarding = None;
     s.forwarding_id = None;
     s.forwarding_since_ms = None;
@@ -655,8 +729,8 @@ fn forward_due(state: &SessionSnapshot, now_ms: u64) -> Option<u64> {
     Some(until.saturating_sub(state.forwarding_since_ms.unwrap_or(until)))
 }
 /// Stop a timed recording or forward once its end time has come, the way
-/// stop-forward does, so a recording is committed, cataloged and queued for
-/// upload whether or not the client that started it is still there.
+/// stop-forward does, so a recording is committed and cataloged for
+/// local storage whether or not the client that started it is still there.
 fn finish_timed_forward(
     h: &WorkerHandle,
     forwarder: &mut Option<(Forwarder, f64)>,
@@ -745,8 +819,7 @@ fn absolute_path(path: &std::path::Path) -> String {
         .to_string_lossy()
         .into_owned()
 }
-/// Queue a saved image for upload and report it to the coordinator's
-/// dataset. Returns what was queued, for the capture reply.
+/// Report a locally saved image to the coordinator's dataset.
 #[allow(clippy::too_many_arguments)]
 fn report_image(
     h: &WorkerHandle,
@@ -758,16 +831,7 @@ fn report_image(
     wall_ms: u64,
     job_id: Option<u64>,
     context: &crate::context::Context,
-) -> Option<crate::destination::Queued> {
-    let queued = resolved
-        .finished(path, Some(&stored.sha256))
-        .unwrap_or_else(|e| {
-            h.log(
-                "error",
-                format!("{} saved but not queued for upload: {e:#}", path.display()),
-            );
-            None
-        });
+) {
     h.push_saved(crate::dataset::SavedFile {
         seq: 0,
         wall_ms,
@@ -775,9 +839,7 @@ fn report_image(
         bytes: stored.bytes,
         sha256: Some(stored.sha256),
         destination: resolved.destination.clone(),
-        object_key: queued.as_ref().map(|q| q.key.clone()),
-        remote_url: queued.as_ref().map(|q| q.url.clone()),
-        upload_id: queued.as_ref().map(|q| q.id.clone()),
+
         context: context.clone(),
         item: crate::dataset::SavedItem::Capture {
             frame_id: frame.id,
@@ -795,7 +857,6 @@ fn report_image(
             job_id,
         },
     });
-    queued
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -872,14 +933,6 @@ fn process_plain(
         | SessionCommand::DatasetExportIf { .. } => {
             anyhow::bail!("datasets belong to the coordinator")
         }
-        SessionCommand::Signals
-        | SessionCommand::SignalBind { .. }
-        | SessionCommand::SignalRead { .. }
-        | SessionCommand::SignalBrowse { .. }
-        | SessionCommand::SignalStart { .. }
-        | SessionCommand::SignalCapture { .. }
-        | SessionCommand::SignalStop { .. }
-        | SessionCommand::SignalStopIf { .. } => anyhow::bail!("signals belong to the coordinator"),
         SessionCommand::NetworkScan { .. } => {
             anyhow::bail!("network scan belongs to the coordinator")
         }
@@ -998,6 +1051,10 @@ fn process_plain(
                 let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
                 s.forwarding = Some(shown.clone());
                 s.forwarding_id = Some(forwarding_id.clone());
+                s.forwarding_progress = Some(ForwardingProgress {
+                    id: forwarding_id.clone(),
+                    ..ForwardingProgress::default()
+                });
                 s.forwarding_since_ms = Some(since_ms);
                 s.forwarding_until_ms = until_ms;
             }
@@ -1080,6 +1137,10 @@ fn process_plain(
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .last_error = None;
+                h.state
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .forwarding_progress = None;
             }
             refresh(h, camera, true);
             h.log(
@@ -1363,7 +1424,6 @@ fn process_plain(
                 let mut files = Vec::new();
                 let mut frames = Vec::new();
                 let mut status = None;
-                let mut queued = Vec::new();
                 if !was_streaming && auto.is_some() && !settle_auto(h, c, auto, duration, false)? {
                     h.log(
                         "warn",
@@ -1417,13 +1477,9 @@ fn process_plain(
                         )
                         .with_context(|| format!("save {}", first.display()))?;
                         let file = path.to_string_lossy().into_owned();
-                        if let Some(q) = report_image(
+                        report_image(
                             h, &resolved, &path, stored, &frame, &format, wall_ms, None, &context,
-                        ) {
-                            queued.push(
-                                json!({"file":file,"upload_id":q.id,"key":q.key,"url":q.url}),
-                            );
-                        }
+                        );
                         metadata["file"] = json!(file);
                         files.push(file);
                     }
@@ -1436,10 +1492,6 @@ fn process_plain(
                 }
                 if let Some(name) = &resolved.destination {
                     value["destination"] = json!(name);
-                    if resolved.upload.is_some() {
-                        value["queued_uploads"] = json!(queued.len());
-                        value["queued"] = json!(queued);
-                    }
                 }
                 if let Some(status) = status {
                     value["auto"] = json!(status);
@@ -2047,6 +2099,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
     let mut rate_count = 0;
     let mut consecutive_errors = 0u32;
     let mut reconnecting = false;
+    let mut progress_sampler = ForwardProgressSampler::default();
     while !h.cancelled() {
         let receiving = camera.as_ref().is_some_and(|c| {
             c.is_streaming()
@@ -2106,6 +2159,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
         }
         h.flush_ring();
         sync_stream(&h, &camera);
+        sync_forwarding_progress(&h, &forwarder, &mut progress_sampler, Instant::now());
         let scheduled_scan = jobs.iter().any(|j| j.info.active() && j.deadline.is_some());
         if let Some(c) = camera
             .as_mut()
@@ -2206,9 +2260,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
         }
     }
     drop(saver);
-    if let Some((mut f, _)) = forwarder {
-        let _ = f.stop();
-    }
+    let _ = stop_forward(&h, &mut forwarder, &mut auto);
     let _ = release_auto(&h, &mut auto, &mut camera, true);
     if let Some(mut c) = camera
         && let Err(e) = c.stop()
@@ -2221,6 +2273,71 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forwarding_progress_is_sampled_four_times_a_second_without_payload_details() {
+        use std::cell::Cell;
+        let calls = Cell::new(0u32);
+        let stats = || {
+            calls.set(calls.get() + 1);
+            crate::media::ForwardStats {
+                accepted: 100,
+                written: 91,
+                dropped: 8,
+                late: 7,
+                stalled: true,
+                encoder: "private-encoder-detail".into(),
+                error: Some("private-error-detail".into()),
+                ..Default::default()
+            }
+        };
+        let mut sampler = ForwardProgressSampler::default();
+        let now = Instant::now();
+        let first = sampler.sample(Some("first"), now, stats).unwrap();
+        assert_eq!(
+            (
+                first.accepted,
+                first.written,
+                first.dropped,
+                first.late,
+                first.stalled
+            ),
+            (100, 91, 8, 7, true)
+        );
+        for millis in [1, 50, 100, 249] {
+            assert!(
+                sampler
+                    .sample(Some("first"), now + Duration::from_millis(millis), stats)
+                    .is_none()
+            );
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(
+            sampler
+                .sample(Some("first"), now + Duration::from_millis(250), stats)
+                .is_some()
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            sampler
+                .sample(Some("replacement"), now + Duration::from_millis(251), stats)
+                .unwrap()
+                .id,
+            "replacement"
+        );
+        assert!(
+            sampler
+                .sample(None, now + Duration::from_secs(1), stats)
+                .is_none()
+        );
+        assert_eq!(calls.get(), 3);
+        let encoded = serde_json::to_string(&first).unwrap();
+        assert!(
+            !encoded.contains("encoder")
+                && !encoded.contains("error")
+                && !encoded.contains("recording")
+        );
+    }
+
     #[test]
     fn ended_streams_count_as_errors_even_when_they_mention_timeouts() {
         use crate::types::{Categorized, ErrorKind, FrameWait};
@@ -2550,6 +2667,10 @@ mod tests {
         let first_id = first["forwarding_id"].as_str().unwrap().to_owned();
         assert!(crate::session::valid_forwarding_id(&first_id));
         assert_eq!(
+            h.snapshot().forwarding_progress.as_ref().unwrap().id,
+            first_id
+        );
+        assert_eq!(
             h.forward_clock
                 .lock()
                 .unwrap()
@@ -2567,6 +2688,10 @@ mod tests {
         )
         .unwrap();
         assert!(h.snapshot().forwarding_id.is_none());
+        assert_eq!(
+            h.snapshot().forwarding_progress.as_ref().unwrap().id,
+            first_id
+        );
         assert!(h.forward_clock.lock().unwrap().is_none());
         let next = run(
             &mut camera,
@@ -2576,6 +2701,10 @@ mod tests {
         .unwrap();
         let next_id = next["forwarding_id"].as_str().unwrap().to_owned();
         assert_ne!(first_id, next_id);
+        assert_eq!(
+            h.snapshot().forwarding_progress.as_ref().unwrap().id,
+            next_id
+        );
         let replacement_clock = h.forward_clock.lock().unwrap().clone().unwrap();
         assert_eq!(replacement_clock.forwarding_id, next_id);
         assert_eq!(
@@ -2604,6 +2733,7 @@ mod tests {
         assert!(forwarder.is_some());
         assert_eq!(after.forwarding, before.forwarding);
         assert_eq!(after.forwarding_id, before.forwarding_id);
+        assert_eq!(after.forwarding_progress, before.forwarding_progress);
         assert_eq!(after.forwarding_until_ms, before.forwarding_until_ms);
         let after_clock = h.forward_clock.lock().unwrap().clone().unwrap();
         assert_eq!(after_clock.forwarding_id, replacement_clock.forwarding_id);
@@ -2613,7 +2743,7 @@ mod tests {
             &mut camera,
             &mut forwarder,
             SessionCommand::StopForwardIf {
-                forwarding_id: next_id,
+                forwarding_id: next_id.clone(),
             },
         )
         .unwrap();
@@ -2621,6 +2751,7 @@ mod tests {
         assert!(forwarder.is_none());
         assert!(stopped.forwarding_id.is_none());
         assert!(stopped.forwarding_until_ms.is_none());
+        assert_eq!(stopped.forwarding_progress.as_ref().unwrap().id, next_id);
         assert!(h.forward_clock.lock().unwrap().is_none());
         h.shutdown();
     }

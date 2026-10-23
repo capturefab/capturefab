@@ -29,6 +29,10 @@ pub(in crate::gui) struct ConnectionFailure {
 
 pub(in crate::gui) trait Services: Send + Sync {
     fn load(&self) -> Loaded;
+    /// Cheap in-process invalidation only; no filesystem or credential reads.
+    fn revision(&self) -> u64 {
+        0
+    }
     fn save(&self, id: ProviderId, settings: ProviderSettings, select: bool) -> Result<(), String>;
     fn status(&self, id: ProviderId, settings: &ProviderSettings) -> CredentialStatus;
     fn store(&self, id: ProviderId, key: &str) -> Result<(), String>;
@@ -42,6 +46,9 @@ pub(in crate::gui) trait Services: Send + Sync {
 
 pub(in crate::gui) struct Native;
 impl Services for Native {
+    fn revision(&self) -> u64 {
+        ai::settings::revision()
+    }
     fn profile_region(&self, profile: &str) -> Option<String> {
         crate::aws::profile_region(profile)
     }
@@ -120,11 +127,20 @@ impl Services for Native {
             .map(|_| ())
             .map_err(|error| {
                 if let Some(provider) = error.downcast_ref::<ai::ProviderError>() {
+                    let excerpt = provider.details()["provider_message"]
+                        .as_str()
+                        .map(str::to_owned);
                     ConnectionFailure {
-                        message: provider.to_string(),
-                        excerpt: provider.details()["provider_message"]
-                            .as_str()
-                            .map(str::to_owned),
+                        message: if id == ProviderId::AppleFoundationModels {
+                            excerpt.clone().unwrap_or_else(|| provider.to_string())
+                        } else {
+                            provider.to_string()
+                        },
+                        excerpt: if id == ProviderId::AppleFoundationModels {
+                            None
+                        } else {
+                            excerpt
+                        },
                     }
                 } else {
                     ConnectionFailure {
@@ -157,26 +173,32 @@ fn environment_ready(id: ProviderId, present: &impl Fn(&str) -> bool) -> bool {
 }
 
 pub(super) enum Work {
-    Load,
+    Load(u64, u64),
     Save(ProviderId, ProviderSettings, bool),
     Status(ProviderId, ProviderSettings, u64),
     ProfileRegion(String),
-    Store(ProviderId, ProviderSettings, SecretDraft),
+    Store(ProviderId, ProviderSettings, (SecretDraft, u64)),
     Remove(ProviderId, ProviderSettings),
-    Test(ProviderId, ProviderSettings, Option<SecretDraft>),
+    Test(ProviderId, ProviderSettings, Option<(SecretDraft, u64)>),
     Flush(oneshot::Sender<Result<(), String>>),
 }
 pub(super) enum Reply {
-    Loaded(Loaded),
+    Loaded(Loaded, u64, u64),
     Saved(ProviderId, ProviderSettings, Result<(), String>),
     Status(ProviderId, Option<CredentialStatus>),
     ProfileRegion(String, Option<String>),
-    Credential(ProviderId, Option<bool>, Result<CredentialStatus, String>),
+    Credential(
+        ProviderId,
+        Option<bool>,
+        Result<CredentialStatus, String>,
+        Option<(SecretDraft, u64)>,
+    ),
     Tested {
         id: ProviderId,
         key_saved: bool,
         status: Option<CredentialStatus>,
         result: Result<(), ConnectionFailure>,
+        failed_key: Option<(SecretDraft, u64)>,
     },
 }
 pub(super) struct Worker {
@@ -195,7 +217,9 @@ pub(super) fn start(
             let mut save_errors = BTreeMap::new();
             while let Ok(work) = work.recv() {
                 let response = match work {
-                    Work::Load => Reply::Loaded(services.load()),
+                    Work::Load(revision, generation) => {
+                        Reply::Loaded(services.load(), revision, generation)
+                    }
                     Work::Save(id, settings, select) => {
                         let result = services.save(id, settings.clone(), select);
                         match &result {
@@ -219,18 +243,29 @@ pub(super) fn start(
                     }
                     Work::Store(id, settings, key) => {
                         let result = services
-                            .store(id, key.as_str())
+                            .store(id, key.0.as_str())
                             .map(|_| services.status(id, &settings));
-                        Reply::Credential(id, result.is_ok().then_some(true), result)
+                        let present = result.is_ok().then_some(true);
+                        let failed_key = result.is_err().then_some(key);
+                        Reply::Credential(id, present, result, failed_key)
                     }
                     Work::Remove(id, settings) => {
                         let result = services.remove(id).map(|_| services.status(id, &settings));
-                        Reply::Credential(id, result.is_ok().then_some(false), result)
+                        Reply::Credential(id, result.is_ok().then_some(false), result, None)
                     }
                     Work::Test(id, settings, key) => {
-                        let stored = key.as_ref().map(|key| services.store(id, key.as_str()));
-                        // Drop the zeroizing draft before a request can block.
-                        drop(key);
+                        let stored = key
+                            .as_ref()
+                            .map(|(key, _)| services.store(id, key.as_str()));
+                        // A refused store may be retried while its form is still
+                        // open. Successful drafts are dropped before a request
+                        // can block, and never travel back to the UI.
+                        let failed_key = if matches!(&stored, Some(Err(_))) {
+                            key
+                        } else {
+                            drop(key);
+                            None
+                        };
                         let key_saved = matches!(stored, Some(Ok(())));
                         let status = key_saved.then(|| services.status(id, &settings));
                         let result = match stored {
@@ -245,6 +280,7 @@ pub(super) fn start(
                             key_saved,
                             status,
                             result,
+                            failed_key,
                         }
                     }
                     Work::Flush(done) => {

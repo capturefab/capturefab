@@ -155,7 +155,7 @@ fn record(command: &HubCommand) -> Result<Option<Hub>> {
             _ => None,
         },
         rejected: None,
-        revision: None,
+        revision: [0; 16],
     };
     if server.accept_certificate {
         anyhow::ensure!(

@@ -1,7 +1,8 @@
 pub(crate) mod assistant;
-mod signal_profiles;
+mod resources;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
+pub use resources::ResourcesCommand;
 pub use tools::{ToolsCommand, ToolsConfirmationRequired};
 
 use crate::{
@@ -354,298 +355,18 @@ pub enum DatasetCommand {
         storage: StorageArgs,
     },
 }
-#[derive(Subcommand)]
-pub enum SignalsCommand {
-    /// Manage local source profiles and bind one to a running workbench
-    Profiles {
-        #[command(subcommand)]
-        command: signal_profiles::Command,
-    },
-    /// Read current values once
-    Read { uri: String },
-    /// List OPC UA nodes, MQTT topics or MTConnect data items
-    Browse {
-        uri: String,
-        #[arg(long, default_value = "5s", value_parser = parse_duration_text)]
-        duration: String,
-        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(1..=5000))]
-        limit: u32,
-    },
-    /// Start logging in a running session
-    Start {
-        uri: String,
-        #[arg(long, default_value = "1s", value_parser = parse_duration_text)]
-        interval: String,
-        /// Log only these tags (repeatable)
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-    },
-    /// Stop logging (ID from `signals`, or `all`)
-    Stop { id: String },
-}
-impl std::fmt::Debug for SignalsCommand {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Profiles { .. } => "Signals::Profiles",
-            Self::Read { .. } => "Signals::Read",
-            Self::Browse { .. } => "Signals::Browse",
-            Self::Start { .. } => "Signals::Start",
-            Self::Stop { .. } => "Signals::Stop",
-        })
-    }
-}
 #[derive(Debug, Subcommand)]
 pub enum DestinationCommand {
-    /// List saved destinations
+    /// List saved folders
     List,
-    /// Save a folder destination, such as a directory on an external drive or network share
+    /// Save a folder on this computer, a removable disk or a mounted drive
     AddFolder { name: String, path: PathBuf },
-    /// Save an S3-compatible bucket (AWS S3, Cloudflare R2, Backblaze B2, MinIO, RustFS, Wasabi)
-    AddS3 {
-        name: String,
-        #[arg(long)]
-        bucket: String,
-        #[arg(long, default_value = "us-east-1")]
-        region: String,
-        /// Service URL for non-AWS services, e.g. https://ACCOUNT.r2.cloudflarestorage.com or http://nas:9000
-        #[arg(long, default_value = "")]
-        endpoint: String,
-        /// Key prefix, e.g. cameras/line-1/
-        #[arg(long, default_value = "")]
-        prefix: String,
-        /// Address the bucket in the URL path (MinIO and most non-AWS services)
-        #[arg(long)]
-        path_style: bool,
-        /// Access key ID whose secret is kept in the OS credential store
-        #[arg(long, conflicts_with_all = ["profile", "env"])]
-        access_key_id: Option<String>,
-        /// Read the secret access key from stdin and save it in the OS credential store
-        #[arg(long, requires = "access_key_id")]
-        secret_stdin: bool,
-        /// Use this profile from the AWS shared credentials file instead
-        #[arg(long, conflicts_with = "env")]
-        profile: Option<String>,
-        /// Use AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY from the uploading process
-        #[arg(long)]
-        env: bool,
-        /// Keep local copies after a verified upload
-        #[arg(long)]
-        keep_local: bool,
-        /// Save without checking that the bucket is reachable
-        #[arg(long)]
-        no_check: bool,
-        /// Self-hosted service settings (path-style addressing); needs --endpoint
-        #[arg(long, value_enum)]
-        preset: Option<S3Preset>,
-        /// Check that the service refuses to replace objects, and use check-first uploads if it does not (implied by --preset unless --no-check)
-        #[arg(long, conflicts_with_all = ["no_check", "check_first"])]
-        probe_writes: bool,
-        /// Look up each key before writing, for services that ignore conditional writes
-        #[arg(long)]
-        check_first: bool,
-    },
-    /// Save an FTP server: explicit FTPS (AUTH TLS) unless --plain
-    AddFtp {
-        name: String,
-        /// DNS name, IPv4 address or [IPv6] address
-        #[arg(long)]
-        host: String,
-        #[arg(long, default_value_t = 21, value_parser = clap::value_parser!(u16).range(1..))]
-        port: u16,
-        #[arg(long)]
-        user: String,
-        /// Folder for uploads: relative to the login folder, or absolute with a leading /
-        #[arg(long, default_value = "")]
-        dir: String,
-        /// Plain FTP without TLS: files and the password travel unencrypted
-        #[arg(long)]
-        plain: bool,
-        /// Read the password from stdin and save it in the OS credential store
-        #[arg(long, conflicts_with_all = ["password_env", "anonymous"])]
-        password_stdin: bool,
-        /// Use CAPTUREFAB_FTP_PASSWORD from the uploading process
-        #[arg(long, conflicts_with = "anonymous")]
-        password_env: bool,
-        /// Sign in as an anonymous user, without a password
-        #[arg(long)]
-        anonymous: bool,
-        /// Keep local copies after a verified upload
-        #[arg(long)]
-        keep_local: bool,
-        /// Save without checking that the server is reachable
-        #[arg(long)]
-        no_check: bool,
-    },
-    /// Save an SFTP server, pinned to its host key
-    #[command(group(clap::ArgGroup::new("trust").required(true).args(["host_key", "accept_host_key"])))]
-    AddSftp {
-        name: String,
-        /// DNS name, IPv4 address or [IPv6] address
-        #[arg(long)]
-        host: String,
-        #[arg(long, default_value_t = 22, value_parser = clap::value_parser!(u16).range(1..))]
-        port: u16,
-        #[arg(long)]
-        user: String,
-        /// Folder for uploads: relative to the login folder, or absolute with a leading /
-        #[arg(long, default_value = "")]
-        dir: String,
-        /// The server's OpenSSH host-key fingerprint, SHA256:... (on the server:
-        /// ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub; a wrong one is refused
-        /// with the fingerprint the server offered)
-        #[arg(long)]
-        host_key: Option<String>,
-        /// Trust the key the server presents now; confirm its fingerprint with the administrator
-        #[arg(long, conflicts_with = "no_check")]
-        accept_host_key: bool,
-        /// Sign in with this private key; --password-stdin or --password-env then give its passphrase
-        #[arg(long)]
-        key_file: Option<PathBuf>,
-        /// Read the password (or key passphrase) from stdin and save it in the OS credential store
-        #[arg(long, conflicts_with = "password_env")]
-        password_stdin: bool,
-        /// Use CAPTUREFAB_SFTP_PASSWORD from the uploading process
-        #[arg(long)]
-        password_env: bool,
-        /// Keep local copies after a verified upload
-        #[arg(long)]
-        keep_local: bool,
-        /// Save without checking that the server is reachable
-        #[arg(long)]
-        no_check: bool,
-    },
-    /// Remove a saved destination
-    Remove {
-        name: String,
-        /// Also delete its secret from the OS credential store, unless another destination uses it
-        #[arg(long)]
-        forget_secret: bool,
-    },
-    /// Check that a destination is reachable and writable
-    Test {
-        name: String,
-        /// S3: check that the service refuses to replace objects, and switch to check-first uploads if it does not
-        #[arg(long)]
-        probe_writes: bool,
-    },
+    /// Remove a saved folder from the list without deleting its files
+    Remove { name: String },
+    /// Check that a saved folder is present and writable
+    Test { name: String },
 }
 
-/// Settings for self-hosted S3-compatible services.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum S3Preset {
-    Minio,
-    Rustfs,
-}
-
-impl S3Preset {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Minio => "minio",
-            Self::Rustfs => "rustfs",
-        }
-    }
-}
-
-/// A valid stand-in fingerprint, to check the other settings of an SFTP
-/// destination whose host key is accepted on first use.
-const PENDING_HOST_KEY: &str = "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-
-/// The FTP or SFTP destination an add-ftp or add-sftp command describes,
-/// with `host_key` for an SFTP server.
-fn server_destination(
-    command: &DestinationCommand,
-    host_key: &str,
-) -> Option<crate::destination::Destination> {
-    use crate::destination::{Destination, FtpServer, FtpTls, SecretSource, SftpServer, Target};
-    let secret = |stdin: bool, env: bool, none: bool| {
-        if env {
-            SecretSource::Environment
-        } else if none || !stdin {
-            SecretSource::NoSecret
-        } else {
-            SecretSource::Keychain
-        }
-    };
-    Some(match command {
-        DestinationCommand::AddFtp {
-            name,
-            host,
-            port,
-            user,
-            dir,
-            plain,
-            password_stdin,
-            password_env,
-            anonymous,
-            keep_local,
-            ..
-        } => Destination {
-            name: name.clone(),
-            target: Target::Ftp(FtpServer {
-                host: host.clone(),
-                port: *port,
-                user: user.clone(),
-                dir: dir.clone(),
-                tls: if *plain {
-                    FtpTls::Plain
-                } else {
-                    FtpTls::Explicit
-                },
-                // Without a password option, use the one saved earlier.
-                password: if !*password_stdin && !*password_env && !*anonymous {
-                    SecretSource::Keychain
-                } else {
-                    secret(*password_stdin, *password_env, *anonymous)
-                },
-                keep_local: *keep_local,
-            }),
-        },
-        DestinationCommand::AddSftp {
-            name,
-            host,
-            port,
-            user,
-            dir,
-            key_file,
-            password_stdin,
-            password_env,
-            keep_local,
-            ..
-        } => Destination {
-            name: name.clone(),
-            target: Target::Sftp(SftpServer {
-                host: host.clone(),
-                port: *port,
-                user: user.clone(),
-                dir: dir.clone(),
-                host_key: host_key.into(),
-                key_file: key_file.clone(),
-                password: secret(*password_stdin, *password_env, false),
-                keep_local: *keep_local,
-            }),
-        },
-        _ => return None,
-    })
-}
-#[derive(Debug, Subcommand)]
-pub enum UploadsCommand {
-    /// Show waiting, failed and completed uploads
-    Status,
-    /// Retry failed uploads (all, or one by ID)
-    Retry {
-        id: Option<String>,
-        /// Also start uploads waiting to retry, ending their destinations' backoff
-        #[arg(long)]
-        now: bool,
-    },
-    /// Drop a failed upload from the queue, keeping its local file
-    Forget { id: String },
-    /// Upload everything that is due, then report
-    Wait {
-        #[arg(long, default_value = "10m", value_parser = parse_duration_text)]
-        timeout: String,
-    },
-}
 #[derive(Debug, Subcommand)]
 pub enum StorageCommand {
     /// Show global policy, owned files and reservations
@@ -882,7 +603,7 @@ pub enum Command {
         #[arg(value_parser = clap::value_parser!(u64).range(1..))]
         id: u64,
     },
-    /// Manage saved capture destinations: folders, external drives, S3 buckets and FTP/SFTP servers
+    /// Manage saved folders on this computer, removable disks and mounted drives
     #[command(visible_alias = "destinations")]
     Destination {
         #[command(subcommand)]
@@ -896,10 +617,10 @@ pub enum Command {
     },
     /// List mounted external, removable and network volumes
     Volumes,
-    /// Show and manage the queue of captures waiting for upload
-    Uploads {
+    /// Manage CPU and camera-buffer limits; show current resource headroom
+    Resources {
         #[command(subcommand)]
-        command: Option<UploadsCommand>,
+        command: Option<ResourcesCommand>,
     },
     /// Show owned file usage and reserved recording space
     Storage {
@@ -945,35 +666,10 @@ pub enum Command {
         #[command(subcommand)]
         command: MemoryCommand,
     },
-    /// Catalog captures, recordings and signals in a DuckDB dataset and export analysis bundles
+    /// Catalog captures and recordings in a DuckDB dataset and export analysis bundles
     Dataset {
         #[command(subcommand)]
         command: DatasetCommand,
-    },
-    /// Read, browse and log sensor and PLC signals (Modbus TCP, MQTT, OPC UA, MTConnect, sim-signal://)
-    Signals {
-        #[command(subcommand)]
-        command: Option<SignalsCommand>,
-    },
-    /// Log signal sources for a duration into a dataset and/or CSV file, then exit
-    Log {
-        #[arg(required = true, num_args = 1..=16)]
-        uris: Vec<String>,
-        #[arg(long, default_value = "1s", value_parser = parse_duration_text)]
-        interval: String,
-        /// Stop after this duration, e.g. 10m; omitted runs until Ctrl-C
-        #[arg(long, value_parser = parse_duration_text)]
-        duration: Option<String>,
-        /// Also write samples to this new CSV file
-        #[arg(long)]
-        csv: Option<PathBuf>,
-        /// Log only these tags (repeatable)
-        #[arg(long = "tag")]
-        tags: Vec<String>,
-        #[command(flatten)]
-        dataset: DatasetArg,
-        #[command(flatten)]
-        storage: StorageArgs,
     },
     /// Check this computer (efficiency mode, GPU, session and state folders, GigE and USB limits, storage budget) and print a fix under each warning; --json adds interfaces and compiled capabilities
     Doctor,
@@ -1080,13 +776,6 @@ fn hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-#[cfg(feature = "s3")]
-fn read_secret(reader: impl io::Read) -> Result<zeroize::Zeroizing<String>> {
-    let secret = crate::secret_input::read_stdin_secret(reader, "S3 secret")?;
-    crate::s3::validate_secret(&secret)?;
-    Ok(secret)
-}
-
 struct Client<'a> {
     cli: &'a Cli,
     local: Option<SessionHandle>,
@@ -1163,7 +852,7 @@ impl<'a> Client<'a> {
                     None
                 }
                 SessionCommand::Activity { .. } => None,
-                command if command.is_dataset() || command.is_signal() => None,
+                command if command.is_dataset() => None,
                 _ => self.target.as_deref(),
             };
             ipc::call_to_as(
@@ -1250,12 +939,6 @@ fn camera_command(command: Option<&Command>) -> bool {
 }
 
 fn uses_session(command: Option<&Command>) -> bool {
-    if let Some(Command::Signals {
-        command: Some(SignalsCommand::Profiles { command }),
-    }) = command
-    {
-        return command.needs_session();
-    }
     camera_command(command)
         || matches!(command,Some(Command::Assistant {command}) if assistant::uses_session(command))
         || matches!(
@@ -1273,7 +956,6 @@ fn uses_session(command: Option<&Command>) -> bool {
                     | Command::Workflow {
                         command: WorkflowCommand::Apply { dry_run: false, .. }
                     }
-                    | Command::Signals { .. }
                     | Command::Dataset {
                         command: DatasetCommand::Open { .. }
                             | DatasetCommand::Close
@@ -1319,15 +1001,6 @@ fn resolve_session(cli: &mut Cli) -> Result<()> {
             }
             cli.session = Some(session.name.clone());
         }
-        // A one-shot read or browse needs no workbench: with several
-        // running, it runs here instead of refusing to choose.
-        _ if matches!(
-            &cli.command,
-            Some(Command::Signals {
-                command: Some(SignalsCommand::Read { .. } | SignalsCommand::Browse { .. }),
-                ..
-            })
-        ) => {}
         _ => {
             return input(Err(anyhow::anyhow!(
                 "multiple sessions are running ({}); choose --session NAME or --direct --camera ID; list them with capturefab sessions",
@@ -1413,6 +1086,10 @@ fn prepare_with(
             }
             None
         }
+        Some(Command::Resources { command }) => {
+            resources::prepare(command.as_ref())?;
+            None
+        }
         Some(Command::Hub { command }) => {
             crate::hubs::command::prepare(command)?;
             None
@@ -1427,35 +1104,6 @@ fn prepare_with(
                     );
                     Some(name)
                 }
-                DestinationCommand::AddS3 {
-                    name,
-                    preset,
-                    endpoint,
-                    ..
-                } => {
-                    if let Some(preset) = preset {
-                        ensure!(
-                            !endpoint.is_empty(),
-                            "--preset {} needs --endpoint http://HOST:9000",
-                            preset.name()
-                        );
-                    }
-                    Some(name)
-                }
-                DestinationCommand::AddFtp { name, .. }
-                | DestinationCommand::AddSftp { name, .. } => {
-                    let host_key = match command {
-                        DestinationCommand::AddSftp {
-                            host_key: Some(key),
-                            ..
-                        } => key.as_str(),
-                        _ => PENDING_HOST_KEY,
-                    };
-                    server_destination(command, host_key)
-                        .expect("server destination")
-                        .validate()?;
-                    Some(name)
-                }
                 DestinationCommand::Remove { name, .. } | DestinationCommand::Test { name, .. } => {
                     Some(name)
                 }
@@ -1463,16 +1111,6 @@ fn prepare_with(
             if let Some(name) = name {
                 crate::destination::validate_name(name)?;
             }
-            None
-        }
-        Some(Command::Uploads {
-            command:
-                Some(UploadsCommand::Retry { id: Some(id), .. } | UploadsCommand::Forget { id }),
-        }) => {
-            #[cfg(feature = "uploads")]
-            crate::upload::validate_id(id)?;
-            #[cfg(not(feature = "uploads"))]
-            let _ = id;
             None
         }
         Some(Command::Gui {
@@ -1656,7 +1294,6 @@ fn prepare_with(
             })
         }
         Some(Command::Dataset { .. }) => prepare_dataset(cli)?,
-        Some(Command::Signals { .. } | Command::Log { .. }) => prepare_signals(cli)?,
         Some(Command::Memory { command }) => Some(match command {
             MemoryCommand::Read { address, length } => SessionCommand::ReadMemory {
                 address: *address,
@@ -1741,16 +1378,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if matches!(cli.command, Some(Command::Hub { .. })) {
         cli.camera = None;
     }
-    if let Some(Command::Signals {
-        command: Some(SignalsCommand::Profiles { command }),
-    }) = &cli.command
-    {
-        // Profiles are local data setup; a stale camera selector is irrelevant.
-        cli.camera = None;
-        if !command.needs_session() {
-            return output(&cli, input(signal_profiles::run_local(command))?);
-        }
-    }
     let base = std::env::current_dir()?;
     let is_tools = matches!(&cli.command, Some(Command::Tools { .. }));
     let is_assistant = matches!(&cli.command, Some(Command::Assistant { .. }));
@@ -1799,7 +1426,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             return output(&cli, result);
         }
         None | Some(Command::Gui { .. }) => {
-            // Before a session, IPC server and uploader start for nothing,
+            // Before a session, IPC server start for nothing,
             // and before the checks below, so a build without the window is
             // `unsupported` with or without --json or --session.
             let display = display_available();
@@ -1845,12 +1472,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 dataset.apply(&client)?;
             }
             let handle = client.local.as_ref().unwrap().clone();
-            #[cfg(feature = "gui")]
-            crate::gui::migrate_prefs();
             let _server =
                 ipc::Server::start_with_kind(handle.clone(), name, ipc::SessionKind::Gui)?;
-            #[cfg(feature = "uploads")]
-            crate::upload::start();
             #[cfg(feature = "gui")]
             {
                 crate::gui::run_capture(
@@ -1860,10 +1483,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     screenshot,
                     demo_cameras,
                 )?;
-                // Recordings finish first, as they may queue uploads.
+                // Finish recordings before closing their session.
                 handle.shutdown();
-                #[cfg(feature = "uploads")]
-                crate::upload::fold();
                 return Ok(());
             }
             #[cfg(not(feature = "gui"))]
@@ -1948,6 +1569,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
         },
         Some(Command::Doctor) => return output(&cli, doctor()),
+        Some(Command::Resources { command }) => {
+            return output(&cli, resources::run(command.as_ref())?);
+        }
         Some(Command::Storage { command }) => {
             let result = match command {
                 Some(StorageCommand::TaskData { command }) => {
@@ -2009,9 +1633,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Some(Command::Volumes) => {
             return output(&cli, json!({"volumes": crate::volumes::list()}));
         }
-        Some(Command::Uploads { command }) => {
-            return output(&cli, uploads_command(command.as_ref())?);
-        }
         Some(Command::Compatibility { model }) => {
             return output(&cli, crate::compatibility::guide(model.as_deref()));
         }
@@ -2065,7 +1686,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             };
             return output(&cli, result);
         }
-        Some(Command::Log { .. }) => return log_command(&cli),
         Some(Command::Dataset {
             command:
                 command @ (DatasetCommand::Status { file: Some(_) }
@@ -2112,9 +1732,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     )
                 })
                 .transpose()?;
-            // A persistent session uploads what its cameras queue.
-            #[cfg(feature = "uploads")]
-            crate::upload::start();
             // Ctrl-C, SIGTERM from `systemctl stop` or SIGHUP from a closed
             // terminal; in place before serve says it is ready, so a signal
             // sent once it is always finds the handler.
@@ -2135,11 +1752,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
             // Blocks until a signal rather than waking to check for it.
             let _ = stopped.recv();
-            // Waits for the handler's shutdown: a recording to a bucket
-            // queues its upload as it finishes, before the queue is folded.
+            // Wait for recordings to finish saving.
             handle.shutdown();
-            #[cfg(feature = "uploads")]
-            crate::upload::fold();
             return Ok(());
         }
         _ => {}
@@ -2167,14 +1781,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     command: DatasetCommand::Open { .. }
                         | DatasetCommand::Close
                         | DatasetCommand::Note { .. }
-                }
-                | Command::Signals {
-                    command: None
-                        | Some(
-                            SignalsCommand::Start { .. }
-                                | SignalsCommand::Stop { .. }
-                                | SignalsCommand::Profiles { .. }
-                        )
                 }
         )
     );
@@ -2275,7 +1881,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Command::Forward {
             output: destination,
             duration,
-            destination: saved,
+            destination: _,
             auto,
             dataset,
             ..
@@ -2298,7 +1904,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
             let mut result = client.call(prepared.clone().unwrap())?;
             // The session ends a timed recording at its end time; the CLI
             // waits for that, and stops it only on Ctrl-C or as a fallback.
-            let mut timed = duration_ms.map(|ms| TimedRecording::new(ms, &result, errors));
+            let mut timed = duration_ms
+                .map(|ms| TimedRecording::new(ms, &result, errors))
+                .transpose()?;
             if cli.session.is_none() {
                 if !cli.json {
                     eprintln!(
@@ -2336,7 +1944,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         }
                         RecordingWait::Stop => {
                             result["stopped"] =
-                                client.call(timed.as_ref().unwrap().stop_command()?)?;
+                                client.call(timed.as_ref().unwrap().stop_command())?;
                             break;
                         }
                         RecordingWait::Failed => anyhow::bail!(
@@ -2347,7 +1955,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         ),
                     }
                 }
-                wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
+
                 output(&cli, result)?;
                 return Ok(());
             }
@@ -2381,7 +1989,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                             break;
                         }
                         RecordingWait::Stop => {
-                            result["stopped"] = client.call(timed.stop_command()?)?;
+                            result["stopped"] = client.call(timed.stop_command())?;
                             break;
                         }
                         RecordingWait::Failed => anyhow::bail!(
@@ -2421,7 +2029,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             format,
             count,
             settings,
-            destination: saved,
+            destination: _,
             auto,
             dataset,
             ..
@@ -2468,8 +2076,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     missing = None;
                     match job.status.as_str() {
                         "complete" => {
-                            let mut result = json!({"job":job});
-                            wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
+                            let result = json!({"job":job});
+
                             return output(&cli, result);
                         }
                         "failed" => anyhow::bail!(
@@ -2491,10 +2099,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     capture_format(*format, destination, *count)?.name(),
                 )?)?;
                 return Ok(());
-            }
-            let mut result = result;
-            if cli.session.is_none() {
-                wait_for_uploads(&cli, saved.as_deref(), &mut result)?;
             }
             result
         }
@@ -2526,9 +2130,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             })?,
         },
         Command::Dataset { command } => dataset_command(&cli, &client, command, prepared.clone())?,
-        Command::Signals { command } => {
-            signals_command(&cli, &client, command.as_ref(), prepared.clone())?
-        }
         Command::Rpc => {
             use std::io::Read;
             let mut data = Vec::new();
@@ -2575,6 +2176,10 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             envelope["session"] = json!(session);
         }
         return write_json(&envelope);
+    }
+    if matches!(&cli.command, Some(Command::Resources { .. })) {
+        io::stdout().write_all(resources::human(&value).as_bytes())?;
+        return Ok(());
     }
     if let Some(Command::Assistant { command }) = &cli.command {
         return assistant::print_human(command, &value);
@@ -2625,11 +2230,6 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         )?;
     } else if let Some(Command::Dataset { command }) = &cli.command {
         dataset_output(&mut out, command, &value)?;
-    } else if matches!(
-        &cli.command,
-        Some(Command::Signals { .. } | Command::Log { .. })
-    ) {
-        out.write_all(crate::signals::report::human(&value).as_bytes())?;
     } else if matches!(&cli.command, Some(Command::Activity { .. })) {
         writeln!(out, "Session activity · revision {}", value["revision"])?;
         for entry in value["activity"].as_array().into_iter().flatten() {
@@ -2837,9 +2437,8 @@ fn doctor() -> Value {
 /// What this build supports and where it runs; `doctor` adds the host checks.
 fn build_report() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"s3":cfg!(feature="s3"),"ftp":cfg!(feature="ftp"),"sftp":cfg!(feature="sftp"),"parquet":cfg!(feature="parquet"),"modbus":cfg!(feature="modbus"),"mqtt":cfg!(feature="mqtt"),"opcua":cfg!(feature="opcua"),"mtconnect":cfg!(feature="mtconnect"),"embedded_web":crate::remote::embedded(),"hubs":cfg!(feature="hubs"),"keychain":cfg!(feature="keychain")},"signals":crate::signals::compiled_protocols(),"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"session_directory":ipc::runtime_dir(),"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}});
+    let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"parquet":cfg!(feature="parquet"),"embedded_web":crate::remote::embedded(),"hubs":cfg!(feature="hubs"),"keychain":cfg!(feature="keychain")},"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}});
     value["features"]["ai"] = json!(cfg!(feature = "ai"));
-    value["features"]["uploads"] = json!(cfg!(feature = "uploads"));
     value["assistant"] = assistant::doctor();
     value
 }
@@ -2888,7 +2487,7 @@ fn command_schema(command: &clap::Command) -> Value {
     })
 }
 fn schema() -> Value {
-    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder, S3 bucket, FTP(S) or SFTP server; see destination list, volumes and uploads"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
+    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder; see destination list and volumes"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     contract["tools"] = tools::schema_contract();
     contract["assistant"] = assistant::schema_contract();
@@ -2939,7 +2538,7 @@ fn schema() -> Value {
         "recorded":"echoed in the capture result, kept on scheduled jobs and stored with each file in an open dataset"
     });
     contract["capture"]["result"] = json!({
-        "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?,queued_uploads?,queued?:[{file,upload_id,key,url}]}",
+        "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?}",
         "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the conditional-stop result",
         "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, and forwarding_until_ms while a timed recording or forward runs",
         "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback and assistant cleanup use this form; explicit human stop-forward stops the current instance."},
@@ -2992,10 +2591,9 @@ fn schema() -> Value {
     });
     contract["logs"] = json!({
         "snapshot":"status.logs; GET /api/session result.logs",
-        "legacy_fields":["time","level","message"],
-        "time":"Retained producer clock text without a date/zone. Do not parse it as an absolute timestamp.",
-        "timestamp":{"optional":true,"unix_ms":"signed Unix milliseconds (absolute UTC instant)","utc_offset_seconds":"producer offset used for the legacy time string, seconds east of UTC (-86399..86399)"},
-        "compatibility":"Old entries omit timestamp. Unknown or malformed optional timestamp metadata is treated as unavailable; legacy diagnostics remain readable. Desktop/browser format valid instants in the viewer's local zone; copied desktop logs include a dated numeric offset. The original three fields and version-1 envelope remain unchanged."
+        "fields":["timestamp","level","message"],
+        "timestamp":{"unix_ms":"signed Unix milliseconds (absolute UTC instant)","utc_offset_seconds":"producer offset, seconds east of UTC (-86399..86399)"},
+        "display":"Desktop/browser format instants in the viewer's local zone; copied desktop logs include a dated numeric offset."
     });
     contract["forwarding"] = json!({"cli":"record|forward -o OUTPUT [--duration 30s] [--on-exists fail|number] [--context KEY=VALUE]...; a local file output accepts the capture placeholders","duration":"Works with direct workers and persistent sessions. The CLI sends duration_ms: the camera worker stops the encoder at since_ms + duration_ms (wall clock), commits and catalogs the file, and the CLI stays alive until then. Ctrl-C stops it early. A recording that stops early or with a new camera error fails the command with that error. Without duration, persistent session forwarding returns immediately; direct forwarding runs until Ctrl-C.","duration_ms":"RPC and workflow forward commands accept duration_ms (1 ms to 10 years); the session ends the recording or stream itself, even after the client that started it exits. Size max_file_bytes for the whole duration: a recording that reaches it stops with storage_full and keeps the video written until then.","request_timeout":"--request-timeout controls a session request deadline, not recording duration; a timed-out request may still complete in the session. Inspect status before retrying writes."});
     contract["forwarding"]["timeline"] = json!(
@@ -3011,7 +2609,7 @@ fn schema() -> Value {
         "start":"serve --listen HOST:PORT [--web-dir DIR] [--allow-hubs]",
         "authentication":"Network access controls: anyone who can reach the listener can control the session. No HTTP login or token.",
         "browser":"Rust WASM client built with web-client/build.sh; same-origin HTTP API. Without --web-dir, serve uses the client built into the executable (release builds; doctor features.embedded_web), then a web folder beside the executable, then web-client/dist in the working directory",
-        "routes":{"GET /api/session":"SessionSnapshot", "GET /api/activity?after=REV&timeout_ms=20000":"{revision,activity}; waits for shared actions and job progress", "POST /api/command":"{version:1,camera?:ID,actor?:{id,name,kind},command:SessionCommand}", "GET /api/preview?camera=ID&format=png|jpeg":"newest frame scaled to fit 1280x720: Gray PNG for gray images, RGB PNG otherwise, or JPEG with format=jpeg where the build has the jpeg feature (Content-Type says which); 204 before the first frame. ETag names the frame and format; If-None-Match with it answers 304", "GET /api/destinations":"saved destination names and locations", "GET /api/storage":"global quota status", "GET, HEAD /health":"plain JSON readiness, uptime, camera counts and analytics health (200 ready, 503 unavailable)", "GET, HEAD /metrics":"Prometheus text exposition", "GET, HEAD /api/analytics":"AnalyticsSnapshot for the current session", "GET, HEAD /api/analytics.svg":"Plotters SVG acquisition dashboard", "GET, HEAD /api/signals?history=0|1":"{sources,persisting,dropped,sink_error}; history=1 adds recent points per tag"},
+        "routes":{"GET /api/session":"SessionSnapshot", "GET /api/activity?after=REV&timeout_ms=20000":"{revision,activity}; waits for shared actions and job progress", "POST /api/command":"{version:1,camera?:ID,actor?:{id,name,kind},command:SessionCommand}", "GET /api/preview?camera=ID&format=png|jpeg":"newest frame scaled to fit 1280x720: Gray PNG for gray images, RGB PNG otherwise, or JPEG with format=jpeg where the build has the jpeg feature (Content-Type says which); 204 before the first frame. ETag names the frame and format; If-None-Match with it answers 304", "GET /api/destinations":"saved destination names and locations", "GET /api/storage":"global quota status", "GET, HEAD /api/resources":"resource policy, effective limits, device load, camera buffers, storage and remaining disk space", "GET, HEAD /health":"plain JSON readiness, uptime, camera counts and analytics health (200 ready, 503 unavailable)", "GET, HEAD /metrics":"Prometheus text exposition", "GET, HEAD /api/analytics":"AnalyticsSnapshot for the current session", "GET, HEAD /api/analytics.svg":"Plotters SVG acquisition dashboard"},
         "result":"JSON APIs use the versioned ok/result/error envelope; /health returns plain JSON",
         "analytics":"In-memory DuckDB collects independently of clients, starting with the first connected camera: one sample per second of all cameras together, so 24 hours of time-series history for any camera count within a fixed sample limit; samples counts those samples, and seconds with no camera store nothing. Missed-frame charts and percentages count lost frames: totals and cameras add lost and preview_skipped, cameras and points add lost and lost_percent, and dropped/drop_percent keep the status meaning. /metrics adds capturefab_{session,camera}_lost_frames_total and capturefab_{session,camera}_preview_skipped_frames_total. Session counters survive camera disconnects and reset with the server process.",
         "outputs":"Capture paths and destinations belong to the server. Stdout captures are rejected.",
@@ -3071,27 +2669,24 @@ fn schema() -> Value {
         "lifetime":"Runs in foreground until Ctrl-C or --duration; protocol listeners and decoder/encoder children are stopped on exit."
     });
     contract["scanners"] = json!({"enumeration":"scanners --json or discover --json; transport is scanner","backends":{"linux":"SANE scanimage (installed separately)","windows":"Windows Image Acquisition (WIA)","macos":"ImageCaptureCore (bundled native helper)"},"feature":"scanner; enabled by default","settings":{"ScanResolution":{"default":150,"range":[75,600],"unit":"dpi"},"ScanMode":{"default":"Color","choices":["Color","Gray","Lineart"]},"ScanSource":{"default":"Default","choices":["Default","Flatbed","Feeder"]}},"acquisition":"capture requests one page; count requests successive pages, including feeder pages; connecting/start never scans; forwarding and auto exposure are unsupported","timeout":"Use --timeout-ms 60000 for physical scans; GUI scanner timeout defaults to 60000. Each page has its own deadline and timeout cancels the helper.","outputs":"Existing capture image formats, destinations and storage quotas; no PDF/OCR conversion","limits":{"frame_bytes":134217728,"shared_ring_default_bytes_per_slot":134217728},"compatibility":"Driver-dependent settings; unsupported resolutions, modes and source names fail without silent fallback. SANE source names vary between drivers."});
-    contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories, recorded in this user's state directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"recording_cut":"A recording that reaches its maximum file size (storage_full) or fails to write stops, and keeps the video written until then, recorded in the ledger and queued for upload like a finished file","on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6","free_space_floor":crate::storage::FREE_SPACE_FLOOR,"free_bytes":"storage --json reports free space on the disk of the default capture folder (~/Capturefab), or null. Every save must leave free_space_floor bytes free on its own disk, counting what active recordings may still write; delete-oldest removes the oldest owned files on that disk to keep it, except on Windows, and not again on a disk where that freed no space until a save there fits."});
-    #[cfg(feature = "uploads")]
-    {
-        contract["uploads"] = json!({
-            "cli":"uploads [status] | retry [ID] [--now] | forget ID | wait [--timeout 10m]",
-            "status":"{pending,uploading,failed,waiting_bytes,uploaded,uploaded_bytes,failures,last_error,destinations:{NAME:{pending,uploading,failed,waiting_bytes,next_attempt,last_error}},items:[newest 200],uploader_running,completed_seq,recent_completed:[newest 20]}",
-            "destinations":"Counts every queued upload per destination. next_attempt is when its next waiting upload may start, in Unix seconds: at or before now while one is due, later while the destination backs off after a failure, which holds back only uploads it already tried, null when none waits.",
-            "retry":"{retried}: failed uploads made due again; --now also starts uploads waiting to retry and ends their destinations' backoff",
-            "unheld":"An item queued while the storage ledger was busy carries unheld:true until the uploader holds it back from retention, or finds the ledger no longer has the file"
-        });
-    }
+    contract["resources"] = json!({
+        "cli":"resources [status] | configure [--cpu-threads auto|N] [--camera-buffers auto|SIZE] | reset",
+        "defaults":"Automatic: bounded image/codec threads, a shared camera-buffer budget from host RAM, and existing storage quotas. CPU and low-memory pressure reduce parallel work.",
+        "scope":"App-wide local settings in resources.json; new buffers are admitted within budget. Thread changes affect future pixel work and newly started codecs, never restart ongoing recordings.",
+        "status":"policy, effective, host, buffers and storage; unknown readings remain null or report an error",
+        "http":"GET /api/resources"
+    });
+    contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories, recorded in this user's state directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"recording_cut":"A recording that reaches its maximum file size (storage_full) or fails to write stops, and keeps the video written until then, recorded in the ledger","on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6","free_space_floor":crate::storage::FREE_SPACE_FLOOR,"free_bytes":"storage --json reports free space on the disk of the default capture folder (~/Capturefab), or null. Every save must leave free_space_floor bytes free on its own disk, counting what active recordings may still write; delete-oldest removes the oldest owned files on that disk to keep it, except on Windows, and not again on a disk where that freed no space until a save there fits."});
     contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the GUI, serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus interval times the shots so far: captured, being saved, skipped and retried, so a skipped or retried shot moves the schedule one interval later; zero interval captures consecutive frames. All frames must fall within 10 years. A past first timestamp starts immediately. Durations must resolve to whole milliseconds. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
     contract["auto"] = json!({"cli":"--session NAME auto [--balance B] | manual [--revert]; capture|forward|serve --auto [--balance B]","default":"manual; connecting never enables auto mode and it ends on disconnect","balance":"0 favors image quality, 1 favors frame rate; quality, balanced and frame-rate mean 0, 0.5 and 1; omitted keeps the current value, initially 0.5","status":"status.auto and cameras[].auto; null in manual mode","strategies":["firmware","software","video-mode","none"],"states":["waiting","converging","stable","limited"],"settled":["stable","limited"],"manual":"Setting a feature in auto.managed switches that camera to manual first and the set result adds \"auto\":null; manual turns ExposureAuto, GainAuto and BalanceWhiteAuto off so values hold","persistence":"Camera settings written by auto mode remain after manual, like set; manual --revert, disconnect and session exit restore their previous values (best effort)","capture":"--set applies before --auto; capture saves once exposure settles or after min(timeout_ms/2, 3 s) and result.auto reports the state; with --session auto mode stays on afterwards"});
     contract["history"] = json!({
         "cli":"--session NAME [--camera ID] history | undo | redo",
         "scope":"Reversible camera changes are recorded by the camera worker, including changes made through the GUI, CLI and RPC; each connected camera has its own history.",
-        "status":"status.history and cameras[].history contain undo and redo labels, or null when unavailable, and entries with setting_changes (the semantic assignment count for bounded assistant undo); old workers may omit the count. history returns the selected or addressed camera's labels.",
+        "status":"status.history and cameras[].history contain undo and redo labels, or null when unavailable, and entries with setting_changes (the semantic assignment count for bounded assistant undo). history returns the selected or addressed camera's labels.",
         "lifetime":"History is bounded and lasts while the camera remains connected; a new change clears its redo history.",
         "checkpoints":"Successful reversible commands also return camera_change:{token,camera,label,last_changed_at_us}. replay_camera_change targets that token with undo:true or undo:false for desktop history; expired tokens and conflicting camera state fail.",
         "conflicts":"Replay checks current camera state before changing it. A conflicting or failed replay reports an error and retains the history entry.",
-        "effects":"Captures, uploads, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by camera history. Stopping a stream with schedules or forwarding is also excluded. Scanner settings are reversible; scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed."
+        "effects":"Captures, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by camera history. Stopping a stream with schedules or forwarding is also excluded. Scanner settings are reversible; scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed."
     });
     contract["frame"] = json!({
         "rpc":"{\"op\":\"frame\"} through rpc, IPC or POST /api/command on a running session; --camera or the request's camera picks the camera",
@@ -3119,9 +2714,7 @@ fn schema() -> Value {
     ]);
     commands.push(json!({"op":"capture","output":"line1/{date}/{camera}-{datetime}-{seq}.png","count":1,"timeout_ms":2000,"format":"png","on_exists":"number","context":{"line":"L1","part":"A-100"}}));
     commands.extend(crate::dataset::rpc_examples());
-    commands.extend(crate::signals::rpc_examples());
     contract["dataset"] = crate::dataset::schema_contract();
-    contract["signals"] = crate::signals::schema_contract();
     contract["efficiency"] = json!({
         "cli":"--efficiency auto|smooth|efficient (global)",
         "environment":crate::efficiency::ENV,
@@ -3133,11 +2726,11 @@ fn schema() -> Value {
     contract["doctor"] = json!({
         "host":"{cpu_cores,memory_total,memory_available,on_battery,low_power}; on_battery is reported but never switches efficiency by itself",
         "efficiency":"{setting:auto|smooth|efficient,efficient,reasons}",
-        "paths":"{session,runtime,state,cache,temp,working_directory}, each {path,exists,fs_type,ram_backed,total_bytes,free_bytes} (cache is null without a home folder); without exists the facts describe the nearest existing parent; session is runtime, kept for older scripts",
-        "directories":"runtime_directory holds session descriptors and their locks, scanner and GPU JPEG staging; state_directory holds GUI settings, saved hubs and destinations, the upload queue and the storage ledger; cache_directory holds the extracted FFmpeg and, on Linux, dataset staging. On Linux runtime is $XDG_RUNTIME_DIR/capturefab, else /run/user/<uid>/capturefab when the user lingers (loginctl enable-linger) and that directory is theirs with mode 0700, else ~/.cache/capturefab/sessions, and state is $XDG_STATE_HOME/capturefab or ~/.local/state/capturefab; elsewhere both are one directory. CAPTUREFAB_SESSION_DIR sets both and CAPTUREFAB_CACHE_DIR the cache. session_directory is runtime_directory, kept for older scripts",
+        "paths":"{runtime,state,cache,temp,working_directory}, each {path,exists,fs_type,ram_backed,total_bytes,free_bytes} (cache is null without a home folder); without exists the facts describe the nearest existing parent",
+        "directories":"runtime_directory holds session descriptors and their locks, scanner and GPU JPEG staging; state_directory holds GUI settings, saved hubs and destinations, the storage ledger; cache_directory holds the extracted FFmpeg and, on Linux, dataset staging. On Linux runtime is $XDG_RUNTIME_DIR/capturefab, else /run/user/<uid>/capturefab when the user lingers (loginctl enable-linger) and that directory is theirs with mode 0700, else ~/.cache/capturefab/sessions, and state is $XDG_STATE_HOME/capturefab or ~/.local/state/capturefab; elsewhere both are one directory. CAPTUREFAB_SESSION_DIR sets both and CAPTUREFAB_CACHE_DIR the cache",
         "limits":"{rmem_max,usbfs_memory_mb}; null outside Linux",
         "graphics":"{available,adapter,backend,device_type,driver,max_texture_dimension_2d,software} from a helper process with a 3 s deadline in desktop builds, or {available:false,reason}",
-        "checks":"[{id,level:ok|warn,message,fix}]; ids include efficiency, graphics, runtime_dir, session_storage, old_state (one per set of files an older version left in another folder), receive_buffer, usb_access and storage_budget; checks that do not apply are omitted",
+        "checks":"[{id,level:ok|warn,message,fix}]; ids include efficiency, graphics, runtime_dir, session_storage, receive_buffer, usb_access and storage_budget; checks that do not apply are omitted",
         "ring_backing":"memfd|posix-shm|file: where camera frame rings live; file only on Windows or where anonymous shared memory is unavailable",
         "human":"Plain doctor prints the host summary and one line per check with its fix"
     });
@@ -3330,12 +2923,8 @@ fn dataset_output(out: &mut impl Write, command: &DatasetCommand, value: &Value)
             })
             .unwrap_or_default();
         format!(
-            "{name}: {} captures, {} recordings, {} signals, {} samples, {} events",
-            status["captures"],
-            status["recordings"],
-            status["signals"],
-            status["samples"],
-            status["events"]
+            "{name}: {} captures, {} recordings, {} events",
+            status["captures"], status["recordings"], status["events"]
         )
     };
     match command {
@@ -3386,101 +2975,6 @@ fn dataset_output(out: &mut impl Write, command: &DatasetCommand, value: &Value)
     Ok(())
 }
 
-/// Arguments of `signals` and `log`, checked before any session is touched.
-/// Only the URI shape is checked here; protocols missing from this build
-/// fail when the command runs.
-fn prepare_signals(cli: &Cli) -> Result<Option<SessionCommand>> {
-    Ok(match &cli.command {
-        Some(Command::Signals { command }) => Some(match command {
-            None => SessionCommand::Signals,
-            Some(SignalsCommand::Profiles { command }) => command.prepare_binding()?,
-            Some(SignalsCommand::Read { uri }) => SessionCommand::SignalRead {
-                uri: uri.clone(),
-                auth: None,
-                timeout_ms: cli.timeout_ms,
-            },
-            Some(SignalsCommand::Browse {
-                uri,
-                duration,
-                limit,
-            }) => SessionCommand::SignalBrowse {
-                uri: uri.clone(),
-                auth: None,
-                duration_ms: crate::scheduling::parse_duration(duration)?,
-                limit: *limit,
-            },
-            Some(SignalsCommand::Start {
-                uri,
-                interval,
-                tags,
-            }) => SessionCommand::SignalStart {
-                uri: uri.clone(),
-                auth: None,
-                interval_ms: crate::scheduling::parse_duration(interval)?,
-                tags: tags.clone(),
-            },
-            Some(SignalsCommand::Stop { id }) => SessionCommand::SignalStop { id: id.clone() },
-        }),
-        Some(Command::Log { .. }) => {
-            crate::signals::log::validate(&log_options(cli)?)?;
-            None
-        }
-        _ => None,
-    })
-}
-
-/// `signals` subcommands; the command was built by `prepare_signals`.
-fn signals_command(
-    _cli: &Cli,
-    client: &Client,
-    _command: Option<&SignalsCommand>,
-    prepared: Option<SessionCommand>,
-) -> Result<Value> {
-    client.call(prepared.context("signals command was not prepared")?)
-}
-
-/// `log`: run a local session that logs signal sources into a dataset or
-/// CSV file for a duration or until Ctrl-C, then print the result.
-fn log_command(cli: &Cli) -> Result<()> {
-    let options = log_options(cli)?;
-    let handle = SessionHandle::new();
-    let stopped = Arc::new(AtomicBool::new(false));
-    let flag = stopped.clone();
-    on_quit_signal(move || flag.store(true, Ordering::Relaxed))?;
-    let result = crate::signals::log::run(&handle, &options, &stopped);
-    handle.shutdown();
-    output(cli, result?)
-}
-
-/// `log` arguments as the signals module takes them.
-fn log_options(cli: &Cli) -> Result<crate::signals::log::LogOptions> {
-    let Some(Command::Log {
-        uris,
-        interval,
-        duration,
-        csv,
-        tags,
-        dataset,
-        storage,
-    }) = &cli.command
-    else {
-        anyhow::bail!("not a log command");
-    };
-    Ok(crate::signals::log::LogOptions {
-        uris: uris.clone(),
-        interval_ms: crate::scheduling::parse_duration(interval)?,
-        duration_ms: duration
-            .as_deref()
-            .map(crate::scheduling::parse_duration)
-            .transpose()?,
-        csv: csv.clone(),
-        dataset: dataset.dataset.clone(),
-        tags: tags.clone(),
-        policy: storage.policy()?,
-        progress: !cli.json,
-    })
-}
-
 /// How close to its end time a timed recording may stop and still count as
 /// finished on time, and how long past the requested duration the CLI waits
 /// for the session to end it before it sends stop-forward itself.
@@ -3506,8 +3000,6 @@ enum RecordingWait {
 struct ForwardStatus<'a> {
     forwarding: bool,
     forwarding_id: Option<&'a str>,
-    /// `forwarding_since_ms`: when the forward it reports started.
-    since_ms: Option<u64>,
     last_error: Option<&'a str>,
     /// When the camera last logged an error (UTC Unix ms), which tells the
     /// same error logged again from the one before.
@@ -3519,7 +3011,6 @@ impl<'a> ForwardStatus<'a> {
         Self {
             forwarding: state.forwarding.is_some(),
             forwarding_id: state.forwarding_id.as_deref(),
-            since_ms: state.forwarding_since_ms,
             last_error: state.last_error.as_deref(),
             error_logged_ms: state
                 .connected
@@ -3535,7 +3026,6 @@ impl<'a> ForwardStatus<'a> {
         Self {
             forwarding: !state["forwarding"].is_null(),
             forwarding_id: state["forwarding_id"].as_str(),
-            since_ms: state["forwarding_since_ms"].as_u64(),
             last_error: state["last_error"].as_str(),
             error_logged_ms: state["connected"]["id"]
                 .as_str()
@@ -3570,13 +3060,10 @@ struct TimedRecording {
     /// The requested duration, timed by the CLI from the forward reply.
     duration: Duration,
     /// When the session ends it (the reply's `until_ms`, UTC Unix ms).
-    until_ms: Option<u64>,
+    until_ms: u64,
     /// The worker-issued identity is authoritative even when a replacement
     /// starts in the same millisecond with the same output name.
-    forwarding_id: Option<String>,
-    /// When it started (the reply's `since_ms`), which tells it from a
-    /// recording started later on the same camera.
-    since_ms: Option<u64>,
+    forwarding_id: String,
     /// The camera's newest error from before the recording started, then
     /// as of the last status that showed it running. A newer one once it
     /// has stopped means it failed. A recording that wrote video retains
@@ -3586,24 +3073,28 @@ struct TimedRecording {
     errors: ErrorMark,
 }
 impl TimedRecording {
-    fn new(duration_ms: u64, reply: &Value, errors: ErrorMark) -> Self {
-        Self {
+    fn new(duration_ms: u64, reply: &Value, errors: ErrorMark) -> Result<Self> {
+        Ok(Self {
             duration: Duration::from_millis(duration_ms),
-            until_ms: reply["until_ms"].as_u64(),
-            forwarding_id: reply["forwarding_id"].as_str().map(str::to_owned),
-            since_ms: reply["since_ms"].as_u64(),
+            until_ms: reply["until_ms"]
+                .as_u64()
+                .context("The timed recording reply is missing its end time.")?,
+            forwarding_id: reply["forwarding_id"]
+                .as_str()
+                .filter(|id| crate::session::valid_forwarding_id(id))
+                .context("The recording reply is missing a valid forwarding identity.")?
+                .to_owned(),
             errors,
-        }
+        })
     }
     /// The `stopped` result of a recording the session ended on time.
     fn finished() -> Value {
         json!({"forwarding": null, "by": "duration"})
     }
-    fn stop_command(&self) -> Result<SessionCommand> {
-        let forwarding_id = self.forwarding_id.clone().context(
-            "This camera worker did not identify the recording; inspect status and stop it explicitly."
-        )?;
-        Ok(SessionCommand::StopForwardIf { forwarding_id })
+    fn stop_command(&self) -> SessionCommand {
+        SessionCommand::StopForwardIf {
+            forwarding_id: self.forwarding_id.clone(),
+        }
     }
     /// Decide from a `status` read at `now_ms` (UTC Unix ms), `elapsed`
     /// after the forward reply.
@@ -3614,20 +3105,10 @@ impl TimedRecording {
         elapsed: Duration,
         interrupted: bool,
     ) -> RecordingWait {
-        let ours = status.forwarding
-            && if let Some(id) = &self.forwarding_id {
-                status.forwarding_id == Some(id.as_str())
-            } else {
-                match (status.since_ms, self.since_ms) {
-                    (Some(reported), Some(started)) => reported == started,
-                    _ => true,
-                }
-            };
+        let ours = status.forwarding && status.forwarding_id == Some(self.forwarding_id.as_str());
         if !ours {
             let grace = RECORDING_GRACE.as_millis() as u64;
-            let on_time = self.until_ms.is_some_and(|until| {
-                now_ms.saturating_add(grace) >= until || elapsed >= self.duration
-            });
+            let on_time = now_ms.saturating_add(grace) >= self.until_ms || elapsed >= self.duration;
             return if on_time && !self.errors.newer_in(&status) {
                 RecordingWait::Finished
             } else {
@@ -3639,10 +3120,7 @@ impl TimedRecording {
         self.errors = ErrorMark::of(&status);
         // When the session keeps the end time, give it the grace to act
         // first; stop-forward is then only a fallback.
-        let timer = match self.until_ms {
-            Some(_) => self.duration.saturating_add(RECORDING_GRACE),
-            None => self.duration,
-        };
+        let timer = self.duration.saturating_add(RECORDING_GRACE);
         if interrupted || elapsed >= timer {
             RecordingWait::Stop
         } else {
@@ -3651,146 +3129,11 @@ impl TimedRecording {
     }
 }
 
-/// A direct CLI capture to a network destination uploads before exiting, so
-/// files are not left waiting for a process that never runs.
-fn wait_for_uploads(cli: &Cli, destination: Option<&str>, result: &mut Value) -> Result<()> {
-    let Some(name) = destination else {
-        return Ok(());
-    };
-    if cli.session.is_some() || !crate::destination::get(name)?.target.is_remote() {
-        return Ok(());
-    }
-    #[cfg(not(feature = "uploads"))]
-    let _ = result;
-    #[cfg(feature = "uploads")]
-    {
-        if !cli.json {
-            eprintln!("Uploading to {name}...");
-        }
-        let status = crate::upload::drain(Duration::from_secs(600))?;
-        if !cli.json {
-            eprintln!(
-                "{} waiting, {} failed{}",
-                status["pending"].as_u64().unwrap_or(0) + status["uploading"].as_u64().unwrap_or(0),
-                status["failed"].as_u64().unwrap_or(0),
-                status["last_error"]
-                    .as_str()
-                    .map(|e| format!("; last error: {e}"))
-                    .unwrap_or_default()
-            );
-        }
-        result["uploads"] = status;
-    }
-    Ok(())
-}
-
-/// The bucket an add-s3 command describes.
-fn s3_bucket(command: &DestinationCommand) -> Result<crate::destination::Bucket> {
-    use crate::destination::{Bucket, Credentials, NoOverwrite};
-    let DestinationCommand::AddS3 {
-        bucket,
-        region,
-        endpoint,
-        prefix,
-        path_style,
-        access_key_id,
-        profile,
-        env,
-        keep_local,
-        preset,
-        check_first,
-        ..
-    } = command
-    else {
-        anyhow::bail!("not an add-s3 command");
-    };
-    let credentials = match (access_key_id, profile, env) {
-        (Some(id), _, _) => Credentials::Keychain {
-            access_key_id: id.clone(),
-        },
-        (_, Some(name), _) => Credentials::Profile { name: name.clone() },
-        (_, _, true) => Credentials::Environment,
-        _ => {
-            return Err(InvalidInput(
-                "choose credentials: --access-key-id ID --secret-stdin, --profile NAME or --env"
-                    .into(),
-            )
-            .into());
-        }
-    };
-    Ok(Bucket {
-        endpoint: endpoint.clone(),
-        region: region.clone(),
-        bucket: bucket.clone(),
-        prefix: prefix.clone(),
-        // MinIO and RustFS serve buckets in the URL path, and an IP or
-        // localhost endpoint cannot take the bucket in its host name.
-        path_style: *path_style
-            || preset.is_some()
-            || crate::destination::endpoint_needs_path_style(endpoint),
-        credentials,
-        keep_local: *keep_local,
-        no_overwrite: if *check_first {
-            NoOverwrite::CheckFirst
-        } else {
-            NoOverwrite::IfNoneMatch
-        },
-    })
-}
-
-/// Find out whether a bucket refuses to replace objects; switch the saved
-/// destination to check-first uploads when it does not, and back when it
-/// does. The switch is a compare-and-swap, so a concurrent edit wins.
-#[cfg(feature = "s3")]
-fn probe_writes(saved: &crate::destination::Destination) -> Result<Value> {
-    use crate::destination::{NoOverwrite, Target};
-    let Target::S3(bucket) = &saved.target else {
-        return Err(InvalidInput("--probe-writes applies to S3 destinations only".into()).into());
-    };
-    let (writes, removed) = crate::s3::Client::new(bucket)?.probe_conditional_writes()?;
-    let mode = if writes == crate::s3::ConditionalWrites::Enforced {
-        NoOverwrite::IfNoneMatch
-    } else {
-        NoOverwrite::CheckFirst
-    };
-    let saved_now = if mode == bucket.no_overwrite {
-        true
-    } else {
-        let mut after = saved.clone();
-        if let Target::S3(bucket) = &mut after.target {
-            bucket.no_overwrite = mode;
-        }
-        crate::destination::replace(Some(saved), Some(&after)).is_ok()
-    };
-    Ok(json!({
-        "ok": true,
-        "conditional_writes": writes.as_str(),
-        "no_overwrite": mode,
-        "saved": saved_now,
-        "probe_removed": removed,
-    }))
-}
-
 fn destination_command(command: &DestinationCommand) -> Result<Value> {
     use crate::destination::{self, Destination, Target};
-    let describe = |d: &Destination| {
-        let mut value = serde_json::to_value(d).unwrap_or_default();
-        value["location"] = json!(d.describe());
-        if let Some(remote) = d.target.remote() {
-            value["insecure"] = json!(remote.insecure());
-        }
-        #[cfg(feature = "s3")]
-        if let Target::S3(crate::destination::Bucket {
-            credentials: crate::destination::Credentials::Keychain { access_key_id },
-            ..
-        }) = &d.target
-        {
-            value["secret_saved"] = json!(crate::s3::has_secret(access_key_id));
-        }
-        #[cfg(feature = "uploads")]
-        if let Some((service, account)) = d.target.remote().and_then(|r| r.secret_ref()) {
-            value["secret_saved"] = json!(crate::transfer::has_secret(service, &account));
-        }
+    let describe = |saved: &Destination| {
+        let mut value = serde_json::to_value(saved).unwrap_or_default();
+        value["location"] = json!(saved.describe());
         value
     };
     Ok(match command {
@@ -3798,328 +3141,27 @@ fn destination_command(command: &DestinationCommand) -> Result<Value> {
             json!({"destinations": destination::list()?.iter().map(describe).collect::<Vec<_>>()})
         }
         DestinationCommand::AddFolder { name, path } => {
-            let path = std::path::absolute(path)?;
             let saved = Destination {
                 name: name.clone(),
-                target: Target::Folder { path: path.clone() },
+                target: Target::Folder {
+                    path: std::path::absolute(path)?,
+                },
             };
             input(saved.validate())?;
-            crate::volumes::ensure_present(&path)?;
-            std::fs::create_dir_all(&path)
+            let Target::Folder { path } = &saved.target;
+            crate::volumes::ensure_present(path)?;
+            std::fs::create_dir_all(path)
                 .with_context(|| format!("cannot create {}", path.display()))?;
             destination::save(saved.clone())?;
-            json!({"destination": describe(&saved)})
+            json!({"destination":describe(&saved)})
         }
-        DestinationCommand::AddS3 {
-            name,
-            access_key_id,
-            secret_stdin,
-            no_check,
-            preset,
-            probe_writes: probe,
-            check_first,
-            ..
-        } => {
-            let saved = Destination {
-                name: name.clone(),
-                target: Target::S3(s3_bucket(command)?),
-            };
-            input(saved.validate())?;
-            #[cfg(not(feature = "s3"))]
-            {
-                let _ = (
-                    access_key_id,
-                    secret_stdin,
-                    no_check,
-                    preset,
-                    probe,
-                    check_first,
-                );
-                anyhow::bail!(
-                    "S3 destinations are unsupported in this build; rebuild with --features s3"
-                );
-            }
-            #[cfg(feature = "s3")]
-            {
-                if *secret_stdin {
-                    let secret = input(read_secret(io::stdin().lock()))?;
-                    crate::s3::store_secret(access_key_id.as_deref().unwrap_or(""), &secret)?;
-                }
-                let Target::S3(bucket) = &saved.target else {
-                    unreachable!()
-                };
-                let check = if *no_check {
-                    None
-                } else {
-                    Some(crate::s3::Client::new(bucket).and_then(|client| client.check()))
-                };
-                if let Some(Err(error)) = &check {
-                    if crate::s3::retryable(error) {
-                        anyhow::bail!(
-                            "cannot reach the bucket: {error:#}; fix the settings or save with --no-check"
-                        );
-                    }
-                    // Write-only keys may not inspect the bucket yet can
-                    // upload: save with a warning. Anything else (refused
-                    // credentials, a missing bucket) is not saved.
-                    if !format!("{error:#}").contains("may not inspect it") {
-                        anyhow::bail!(
-                            "the bucket check failed: {error:#}; fix the settings or save with --no-check"
-                        );
-                    }
-                }
-                destination::save(saved.clone())?;
-                let mut value = json!({"destination": describe(&saved)});
-                if let Some(check) = check {
-                    value["check"] = match check {
-                        Ok(()) => json!({"ok": true}),
-                        Err(error) => json!({"ok": false, "warning": format!("{error:#}")}),
-                    };
-                }
-                // Self-hosted services differ in conditional-write support,
-                // so presets find out unless asked not to check.
-                if *probe || (preset.is_some() && !*no_check && !*check_first) {
-                    value["probe"] = probe_writes(&saved).unwrap_or_else(
-                        |error| json!({"ok": false, "warning": format!("{error:#}")}),
-                    );
-                    if let Ok(current) = destination::get(name) {
-                        value["destination"] = describe(&current);
-                    }
-                }
-                value
-            }
-        }
-        DestinationCommand::AddFtp {
-            password_stdin,
-            no_check,
-            ..
-        }
-        | DestinationCommand::AddSftp {
-            password_stdin,
-            no_check,
-            ..
-        } => {
-            let (host, port, given, accept) = match command {
-                DestinationCommand::AddSftp {
-                    host,
-                    port,
-                    host_key,
-                    accept_host_key,
-                    ..
-                } => (host, *port, host_key.clone(), *accept_host_key),
-                DestinationCommand::AddFtp { host, port, .. } => (host, *port, None, false),
-                _ => unreachable!(),
-            };
-            let sftp = matches!(command, DestinationCommand::AddSftp { .. });
-            let (kind, feature) = if sftp {
-                ("SFTP", cfg!(feature = "sftp"))
-            } else {
-                ("FTP", cfg!(feature = "ftp"))
-            };
-            // Shape checks first: a bad setting is a usage error even in a
-            // build without this destination kind.
-            input(
-                server_destination(command, given.as_deref().unwrap_or(PENDING_HOST_KEY))
-                    .expect("server destination")
-                    .validate(),
-            )?;
-            ensure!(
-                feature,
-                "{kind} destinations are unsupported in this build; rebuild with --features {}",
-                kind.to_ascii_lowercase()
-            );
-            let host_key = match given {
-                Some(key) => key,
-                None if accept => {
-                    #[cfg(feature = "sftp")]
-                    {
-                        let key = crate::transfer::sftp::fetch_host_key(host, port).map_err(
-                            |error| {
-                                anyhow::anyhow!(
-                                    "cannot reach the server: {error:#}; fix the settings and try again"
-                                )
-                            },
-                        )?;
-                        eprintln!(
-                            "capturefab: trusting SFTP host key {key} for {host}:{port} on first use"
-                        );
-                        key
-                    }
-                    #[cfg(not(feature = "sftp"))]
-                    {
-                        let _ = (host, port);
-                        unreachable!("checked above")
-                    }
-                }
-                None => String::new(),
-            };
-            let saved = server_destination(command, &host_key).expect("server destination");
-            input(saved.validate())?;
-            let remote = saved.target.remote().expect("network destination");
-            #[cfg(not(feature = "uploads"))]
-            {
-                let _ = (password_stdin, no_check, remote);
-                unreachable!("checked above")
-            }
-            #[cfg(feature = "uploads")]
-            {
-                if *password_stdin {
-                    let secret = input(crate::transfer::read_stdin_secret(
-                        io::stdin().lock(),
-                        "password",
-                    ))?;
-                    let (service, account) = remote.secret_ref().expect("keychain secret");
-                    crate::transfer::store_secret(service, &account, &secret)?;
-                }
-                let check = (!*no_check)
-                    .then(|| crate::transfer::connect(&remote).and_then(|mut u| u.check()));
-                if let Some(Err(error)) = &check {
-                    // A refused sign-in, a wrong host key or an untrusted
-                    // certificate would only fail every upload: not saved.
-                    if crate::transfer::retryable(error) {
-                        anyhow::bail!(
-                            "cannot reach the server: {error:#}; fix the settings or save with --no-check"
-                        );
-                    }
-                    anyhow::bail!(
-                        "the server check failed: {error:#}; fix the settings or save with --no-check"
-                    );
-                }
-                destination::save(saved.clone())?;
-                let mut value = json!({"destination": describe(&saved)});
-                if sftp {
-                    value["host_key"] = json!({
-                        "fingerprint": host_key,
-                        "trust": if accept { "accepted_on_first_use" } else { "pinned" },
-                    });
-                }
-                if let Some(check) = check {
-                    value["check"] = match check {
-                        Ok(()) => json!({"ok": true}),
-                        Err(error) => json!({"ok": false, "warning": format!("{error:#}")}),
-                    };
-                }
-                value
-            }
-        }
-        DestinationCommand::Remove {
-            name,
-            forget_secret,
-        } => {
-            let removed = destination::remove(name)?;
-            let mut value = json!({"removed": removed.name});
-            #[cfg(feature = "uploads")]
-            if *forget_secret {
-                // S3 keychain keys are stored by access key ID; servers by
-                // user@host:port.
-                let secret = |target: &Target| match target {
-                    Target::S3(crate::destination::Bucket {
-                        credentials: crate::destination::Credentials::Keychain { access_key_id },
-                        ..
-                    }) => Some(("capturefab-s3", access_key_id.clone())),
-                    target => target.remote().and_then(|r| r.secret_ref()),
-                };
-                if let Some(reference) = secret(&removed.target) {
-                    match destination::list()?
-                        .into_iter()
-                        .find(|d| secret(&d.target).as_ref() == Some(&reference))
-                    {
-                        Some(other) => {
-                            value["secret_kept"] = json!(format!("used by {}", other.name))
-                        }
-                        None => crate::transfer::delete_secret(reference.0, &reference.1)?,
-                    }
-                }
-            }
-            #[cfg(not(feature = "uploads"))]
-            let _ = (forget_secret, &mut value);
-            value
-        }
-        DestinationCommand::Test {
-            name,
-            probe_writes: probe,
-        } => {
+        DestinationCommand::Remove { name } => json!({"removed":destination::remove(name)?.name}),
+        DestinationCommand::Test { name } => {
             let saved = destination::get(name)?;
-            if *probe {
-                if !matches!(saved.target, Target::S3(_)) {
-                    return Err(InvalidInput(
-                        "--probe-writes applies to S3 destinations only".into(),
-                    )
-                    .into());
-                }
-                #[cfg(feature = "s3")]
-                return probe_writes(&saved);
-            }
-            match &saved.target {
-                Target::Folder { path } => {
-                    crate::volumes::ensure_present(path)?;
-                    ensure!(path.is_dir(), "{} does not exist", path.display());
-                    let probe = path.join(format!(".capturefab-write-test-{}", std::process::id()));
-                    std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&probe)
-                        .with_context(|| format!("cannot write to {}", path.display()))?;
-                    std::fs::remove_file(&probe)?;
-                    json!({"ok": true, "free_bytes": fs2::available_space(path).ok()})
-                }
-                Target::S3(bucket) => {
-                    #[cfg(feature = "s3")]
-                    {
-                        crate::s3::Client::new(bucket)?.check()?;
-                        json!({"ok": true})
-                    }
-                    #[cfg(not(feature = "s3"))]
-                    {
-                        let _ = bucket;
-                        anyhow::bail!(
-                            "S3 destinations are unsupported in this build; rebuild with --features s3"
-                        )
-                    }
-                }
-                Target::Ftp(_) | Target::Sftp(_) => {
-                    let remote = saved.target.remote().expect("network destination");
-                    #[cfg(feature = "uploads")]
-                    {
-                        let probe = crate::transfer::connect(&remote)?.probe()?;
-                        json!({"ok": true, "kind": remote.kind(), "probe": probe})
-                    }
-                    #[cfg(not(feature = "uploads"))]
-                    {
-                        anyhow::bail!(
-                            "{} destinations are unsupported in this build",
-                            remote.kind().to_uppercase()
-                        )
-                    }
-                }
-            }
+            destination::test(&saved)?;
+            json!({"ok":true,"free_bytes":fs2::available_space(saved.local_root()).ok(),"destination":describe(&saved)})
         }
     })
-}
-
-fn uploads_command(command: Option<&UploadsCommand>) -> Result<Value> {
-    #[cfg(feature = "uploads")]
-    {
-        Ok(match command {
-            None | Some(UploadsCommand::Status) => crate::upload::status()?,
-            Some(UploadsCommand::Retry { id, now }) => {
-                json!({"retried": crate::upload::retry(id.as_deref(), *now)?})
-            }
-            Some(UploadsCommand::Forget { id }) => {
-                json!({"forgotten": crate::upload::forget(id)?})
-            }
-            Some(UploadsCommand::Wait { timeout }) => crate::upload::drain(Duration::from_millis(
-                crate::scheduling::parse_duration(timeout)?,
-            ))?,
-        })
-    }
-    #[cfg(not(feature = "uploads"))]
-    {
-        let _ = command;
-        anyhow::bail!(
-            "uploads are unsupported in this build; rebuild with --features s3, ftp or sftp"
-        )
-    }
 }
 
 const SERVE_HINT: &str = "Start a session with `capturefab serve --name bench`, then run `capturefab --session bench discover`.";
@@ -4273,52 +3315,19 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
 mod tests {
     use super::*;
     #[test]
-    fn source_profile_setup_is_offline_until_explicit_bind_and_debug_hides_input() {
-        for (args, session) in [
-            (vec!["capturefab", "signals", "profiles", "list"], false),
-            (
-                vec![
-                    "capturefab",
-                    "signals",
-                    "profiles",
-                    "save",
-                    "line-one",
-                    "--uri",
-                    "mqtts://host/topic",
-                    "--credentials-stdin",
-                ],
-                false,
-            ),
-            (
-                vec!["capturefab", "signals", "profiles", "bind", "line-one"],
-                true,
-            ),
-        ] {
-            let cli = Cli::try_parse_from(args).unwrap();
-            assert_eq!(uses_session(cli.command.as_ref()), session);
+    fn capture_contract_omits_retired_sensor_commands() {
+        for command in ["signals", "log"] {
+            assert!(Cli::try_parse_from(["capturefab", command]).is_err());
         }
-        for args in [
-            vec![
-                "capturefab",
-                "signals",
-                "read",
-                "mqtt://hidden-user:hidden-password@host/topic",
-            ],
-            vec![
-                "capturefab",
-                "signals",
-                "profiles",
-                "save",
-                "line-one",
-                "--uri",
-                "mqtt://hidden-user:hidden-password@host/topic",
-            ],
-        ] {
-            let cli = Cli::try_parse_from(args).unwrap();
-            let debug = format!("{:?}", cli.command);
-            assert!(!debug.contains("hidden-user"));
-            assert!(!debug.contains("hidden-password"));
-        }
+        let contract = schema();
+        assert!(contract.get("signals").is_none());
+        assert!(
+            contract["rpc"]["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|command| { !command["op"].as_str().unwrap().starts_with("signal") })
+        );
     }
     #[cfg(feature = "ai")]
     #[test]
@@ -4326,10 +3335,13 @@ mod tests {
         let contract = schema();
         assert_eq!(
             contract["assistant"]["providers"].as_array().unwrap().len(),
-            22
+            crate::assistant::ProviderId::ALL.len()
         );
         let presence = crate::assistant::doctor();
-        assert_eq!(presence["providers"].as_array().unwrap().len(), 22);
+        assert_eq!(
+            presence["providers"].as_array().unwrap().len(),
+            crate::assistant::ProviderId::ALL.len()
+        );
         assert!(
             presence["providers"]
                 .as_array()
@@ -4379,36 +3391,6 @@ mod tests {
                 .name(),
             "png"
         );
-    }
-    #[test]
-    #[cfg(feature = "s3")]
-    fn secret_stdin_preserves_key_bytes_and_bounds_reads() {
-        for (input, expected) in [
-            (" key \t", " key \t"),
-            (" key \t\n", " key \t"),
-            (" key \t\r\n", " key \t"),
-            ("clé 密钥 \n", "clé 密钥 "),
-            ("key\n\n", "key\n"),
-            ("key\r", "key\r"),
-        ] {
-            assert_eq!(read_secret(input.as_bytes()).unwrap().as_str(), expected);
-        }
-        let maximum = "x".repeat(4096);
-        assert_eq!(*read_secret(maximum.as_bytes()).unwrap(), maximum);
-        assert_eq!(
-            *read_secret(format!("{maximum}\r\n").as_bytes()).unwrap(),
-            maximum
-        );
-        for input in [
-            String::new(),
-            "\r\n".into(),
-            "x".repeat(4097),
-            format!("{}\n", "x".repeat(4097)),
-            "x".repeat(10000),
-        ] {
-            assert!(read_secret(input.as_bytes()).is_err());
-        }
-        assert!(read_secret(&b"\xff\n"[..]).is_err());
     }
     #[test]
     fn unix_cli_contract() {
@@ -4523,12 +3505,6 @@ mod tests {
                 "dataset_query",
                 "dataset_model_query_if",
                 "dataset_export",
-                "signals",
-                "signal_bind",
-                "signal_read",
-                "signal_browse",
-                "signal_start",
-                "signal_stop",
                 "frame",
                 "set_many"
             ]
@@ -4559,29 +3535,26 @@ mod tests {
     fn timed_recordings_end_in_the_session_and_stop_forward_is_a_fallback() {
         use RecordingWait::{Failed, Finished, Stop, Wait};
         let since = 1_000_000;
-        let reply = json!({"forwarding":"clip.mkv","since_ms":since,"until_ms":since + 30_000});
+        let id = "11111111111111111111111111111111";
+        let replacement = "22222222222222222222222222222222";
+        let reply = json!({"forwarding":"clip.mkv","forwarding_id":id,"since_ms":since,"until_ms":since + 30_000});
         let earlier = Some("an earlier failure");
         let logged = Some(since - 5_000);
-        let status = |forwarding, since_ms, last_error, error_logged_ms| ForwardStatus {
+        let status = |forwarding, forwarding_id, last_error, error_logged_ms| ForwardStatus {
             forwarding,
-            forwarding_id: None,
-            since_ms,
+            forwarding_id,
             last_error,
             error_logged_ms,
         };
         // The camera's error from before the recording started.
         let before = ErrorMark::of(&status(false, None, earlier, logged));
-        let recording = status(true, Some(since), earlier, logged);
+        let recording = status(true, Some(id), earlier, logged);
         let stopped = status(false, None, earlier, logged);
         let s = Duration::from_secs;
-        let mut timed = TimedRecording::new(30_000, &reply, before.clone());
+        let mut timed = TimedRecording::new(30_000, &reply, before.clone()).unwrap();
         // Still recording: wait out the duration and the session's grace.
         assert_eq!(timed.next(recording, since + 10_000, s(10), false), Wait);
-        let unknown_start = status(true, None, earlier, logged);
-        assert_eq!(
-            timed.next(unknown_start, since + 31_000, s(31), false),
-            Wait
-        );
+        assert_eq!(timed.next(recording, since + 31_000, s(31), false), Wait);
         assert_eq!(timed.next(recording, since + 32_000, s(32), false), Stop);
         // Ctrl-C stops it at once.
         assert_eq!(timed.next(recording, since + 1_000, s(1), true), Stop);
@@ -4595,11 +3568,11 @@ mod tests {
         // its nominal deadline after a system-clock rollback.
         assert_eq!(timed.next(stopped, since - 60_000, s(30), false), Finished);
         // Another participant's newer recording is not this one to stop.
-        let newer = status(true, Some(since + 30_500), earlier, logged);
+        let newer = status(true, Some(replacement), earlier, logged);
         assert_eq!(timed.next(newer, since + 31_000, s(33), false), Finished);
         // Stopped early, or with a new error, is a failure even if video was kept.
         assert_eq!(timed.next(stopped, since + 27_999, s(28), false), Failed);
-        let early = status(true, Some(since + 5_000), None, None);
+        let early = status(true, Some(replacement), None, None);
         assert_eq!(timed.next(early, since + 6_000, s(6), false), Failed);
         let full = Some("Forwarding stopped: Storage full");
         let storage_full = status(false, None, full, Some(since + 29_000));
@@ -4618,17 +3591,17 @@ mod tests {
         let trimmed = status(false, None, earlier, None);
         assert_eq!(timed.next(trimmed, since + 30_000, s(30), false), Finished);
         // An error while it still ran did not end it.
-        let mut noted = TimedRecording::new(30_000, &reply, before.clone());
+        let mut noted = TimedRecording::new(30_000, &reply, before.clone()).unwrap();
         let busy = Some("Shared frame buffer: busy");
-        let warned = status(true, Some(since), busy, Some(since + 10_000));
+        let warned = status(true, Some(id), busy, Some(since + 10_000));
         assert_eq!(noted.next(warned, since + 10_000, s(10), false), Wait);
         let ended = status(false, None, busy, Some(since + 10_000));
         assert_eq!(noted.next(ended, since + 30_000, s(30), false), Finished);
         // A short recording can fail, or end, before any status shows it
         // running (FFmpeg starts with the first frame). Only an error
         // logged since it started tells the two apart, even the same one.
-        let one_second = json!({"since_ms":since,"until_ms":since + 1_000});
-        let short = || TimedRecording::new(1_000, &one_second, before.clone());
+        let one_second = json!({"forwarding_id":id,"since_ms":since,"until_ms":since + 1_000});
+        let short = || TimedRecording::new(1_000, &one_second, before.clone()).unwrap();
         let at = since + 300;
         assert_eq!(short().next(stopped, at, s(0), false), Finished);
         let no_ffmpeg = Some("Forwarding stopped: no FFmpeg");
@@ -4636,11 +3609,6 @@ mod tests {
         assert_eq!(short().next(failed, at, s(0), false), Failed);
         let retried = status(false, None, earlier, Some(since + 50));
         assert_eq!(short().next(retried, at, s(0), false), Failed);
-        // Without the session's end time, the CLI's own timer ends it.
-        let untimed_reply = json!({"since_ms":since});
-        let mut untimed = TimedRecording::new(30_000, &untimed_reply, before);
-        assert_eq!(untimed.next(recording, since, s(30), false), Stop);
-        assert_eq!(untimed.next(stopped, since + 40_000, s(40), false), Failed);
         assert_eq!(
             TimedRecording::finished(),
             json!({"forwarding":null,"by":"duration"})
@@ -4651,11 +3619,10 @@ mod tests {
         let first = "11111111111111111111111111111111";
         let replacement = "22222222222222222222222222222222";
         let reply = json!({"forwarding_id":first,"since_ms":1000,"until_ms":31000});
-        let mut timed = TimedRecording::new(30_000, &reply, ErrorMark::default());
+        let mut timed = TimedRecording::new(30_000, &reply, ErrorMark::default()).unwrap();
         let status = |id| ForwardStatus {
             forwarding: true,
             forwarding_id: Some(id),
-            since_ms: Some(1000),
             last_error: None,
             error_logged_ms: None,
         };
@@ -4664,7 +3631,7 @@ mod tests {
             RecordingWait::Stop
         );
         assert!(
-            matches!(timed.stop_command().unwrap(), SessionCommand::StopForwardIf { forwarding_id } if forwarding_id == first)
+            matches!(timed.stop_command(), SessionCommand::StopForwardIf { forwarding_id } if forwarding_id == first)
         );
         assert_eq!(
             timed.next(status(replacement), 32000, Duration::from_secs(32), true),
@@ -4674,11 +3641,13 @@ mod tests {
             timed.next(status(replacement), 2000, Duration::from_secs(1), true),
             RecordingWait::Failed
         );
-        let legacy = TimedRecording::new(30_000, &json!({"since_ms":1000}), ErrorMark::default());
-        assert!(
-            legacy.stop_command().is_err(),
-            "an old worker's missing ID cannot authorize an unconditional stop"
-        );
+        for incomplete in [
+            json!({"until_ms":31000}),
+            json!({"forwarding_id":first}),
+            json!({"forwarding_id":"invalid","until_ms":31000}),
+        ] {
+            assert!(TimedRecording::new(30_000, &incomplete, ErrorMark::default()).is_err());
+        }
     }
     #[test]
     fn schema_lists_every_capture_job_field() {
@@ -4834,9 +3803,9 @@ mod tests {
             }
         }
         for unresolved in [
-            "cannot reach the server: cannot resolve ftps://nonexistent.invalid:21: failed to lookup address information: nodename nor servname provided, or not known",
-            "resolve Modbus server plc.invalid: failed to lookup address information: Name or service not known",
-            "connecting to sftp://x:22: Temporary failure in name resolution",
+            "cannot reach the server: cannot resolve http://nonexistent.invalid:80: failed to lookup address information: nodename nor servname provided, or not known",
+            "resolve camera host camera.invalid: failed to lookup address information: Name or service not known",
+            "connecting to rtsp://x:554: Temporary failure in name resolution",
         ] {
             assert_eq!(
                 error_code(&anyhow::anyhow!("{unresolved}")),
@@ -4868,19 +3837,19 @@ mod tests {
         );
         assert_eq!(
             error_code(&anyhow::anyhow!(
-                "FTP destinations are unsupported in this build; rebuild with --features ftp"
+                "GPU JPEG encoding is unsupported in this build"
             )),
             ("unsupported", 5)
         );
         assert_eq!(
             error_code(&anyhow::anyhow!(
-                "SFTP host key changed: expected SHA256:a, server offered SHA256:b; confirm with the server administrator and update the destination"
+                "camera configuration changed unexpectedly; inspect the current settings"
             )),
             ("operation_failed", 1)
         );
         assert_eq!(
             error_code(&anyhow::anyhow!(
-                "cannot reach the server: connecting on ftp://h:21: Connection refused (os error 61); fix the settings or save with --no-check"
+                "cannot reach the server: connecting on rtsp://h:554: Connection refused (os error 61); check the camera address"
             )),
             ("unavailable", 3)
         );
@@ -4975,123 +3944,6 @@ mod tests {
             contract["efficiency"]["environment"],
             "CAPTUREFAB_EFFICIENCY"
         );
-    }
-    #[test]
-    fn s3_presets_set_path_style_and_require_endpoint() {
-        let parse = |args: &[&str]| {
-            Cli::try_parse_from(
-                [
-                    "capturefab",
-                    "destination",
-                    "add-s3",
-                    "x",
-                    "--bucket",
-                    "camera-archive",
-                    "--env",
-                ]
-                .iter()
-                .chain(args),
-            )
-        };
-        let cli = parse(&["--preset", "rustfs"]).unwrap();
-        let error = prepare(&cli).unwrap_err().to_string();
-        assert!(
-            error.contains("--preset rustfs needs --endpoint"),
-            "{error}"
-        );
-        let cli = parse(&["--preset", "minio", "--endpoint", "http://nas:9000"]).unwrap();
-        assert!(prepare(&cli).is_ok());
-        let Some(Command::Destination { command }) = &cli.command else {
-            panic!("destination")
-        };
-        let DestinationCommand::AddS3 {
-            preset, path_style, ..
-        } = command
-        else {
-            panic!("add-s3")
-        };
-        assert_eq!((*preset, *path_style), (Some(S3Preset::Minio), false));
-        assert!(
-            s3_bucket(command).unwrap().path_style,
-            "presets imply path-style addressing"
-        );
-        assert!(parse(&["--probe-writes", "--no-check"]).is_err());
-        assert!(parse(&["--probe-writes", "--check-first"]).is_err());
-        assert!(parse(&["--preset", "aws"]).is_err());
-    }
-    #[test]
-    fn server_destinations_validate_before_touching_settings() {
-        let parse =
-            |args: &[&str]| Cli::try_parse_from(["capturefab", "destination"].iter().chain(args));
-        for args in [
-            &["add-ftp", "x", "--host", "ftp://h", "--user", "u"][..],
-            &[
-                "add-ftp", "x", "--host", "h", "--user", "u", "--dir", "../a",
-            ],
-            &[
-                "add-sftp",
-                "x",
-                "--host",
-                "h",
-                "--user",
-                "u",
-                "--host-key",
-                "bogus",
-            ],
-            &[
-                "add-sftp",
-                "x",
-                "--host",
-                "h",
-                "--user",
-                "u",
-                "--accept-host-key",
-                "--key-file",
-                "rel/id",
-            ],
-        ] {
-            let cli = parse(args).unwrap();
-            assert!(prepare(&cli).is_err(), "{args:?}");
-        }
-        assert!(parse(&["add-ftp", "x", "--host", "h", "--user", "u", "--port", "0"]).is_err());
-        assert!(parse(&["add-sftp", "x", "--host", "h", "--user", "u"]).is_err());
-        assert!(
-            parse(&[
-                "add-sftp",
-                "x",
-                "--host",
-                "h",
-                "--user",
-                "u",
-                "--accept-host-key",
-                "--no-check"
-            ])
-            .is_err()
-        );
-        assert!(
-            parse(&[
-                "add-ftp",
-                "x",
-                "--host",
-                "h",
-                "--user",
-                "u",
-                "--anonymous",
-                "--password-env"
-            ])
-            .is_err()
-        );
-        let cli = parse(&[
-            "add-sftp",
-            "x",
-            "--host",
-            "h",
-            "--user",
-            "u",
-            "--accept-host-key",
-        ])
-        .unwrap();
-        assert!(prepare(&cli).is_ok());
     }
     #[test]
     fn assignments_and_hex() {

@@ -70,7 +70,7 @@ pub const GET_OVERVIEW: ToolSpec = observe(
     "Summarize this Capturefab session and computer: the local time and UTC offset, whether a \
      session is running, connected cameras (ID, name, kind, live view, recording, jobs, auto \
      exposure, last error), cameras found by the last discovery, saved destinations, the \
-     storage budget and its use, uploads, recording defaults (codec, fps, bitrate) and FFmpeg \
+     storage budget and its use, recording defaults (codec, fps, bitrate) and FFmpeg \
      encoders. Call this first, and use only the camera IDs, names and destination names it \
      and the other tools return. Works without a session. Read-only.",
     schema::no_arguments,
@@ -96,9 +96,8 @@ pub const LIST_DESTINATIONS: ToolSpec = observe(
     "list_destinations",
     "List destinations",
     false,
-    "List the saved destinations captures and recordings can go to: name, kind (folder, s3, \
-     ftp or sftp), location, the server files are sent to, whether they leave this computer or \
-     travel unencrypted, free space and any problem such as an unmounted drive. A null \
+    "List the saved folders captures and recordings can go to: name, location, free space \
+     and any problem such as an unmounted drive. A null \
      destination saves to the default capture folder, listed as default. Read-only.",
     schema::no_arguments,
     &[],
@@ -110,8 +109,7 @@ pub const GET_STORAGE: ToolSpec = observe(
     false,
     "Report the storage budget captures and recordings must fit in (bytes, files, maximum age, \
      and whether a full budget stops captures or deletes the oldest), what is used and \
-     reserved, what is left, free disk space at the capture folder, and the upload queue \
-     (pending, failed, last error). Read-only.",
+     reserved, what is left, and free disk space at the capture folder. Read-only.",
     schema::no_arguments,
     &[],
 );
@@ -437,7 +435,7 @@ pub fn run_read(
             parse_args::<NoArgs>(spec, &call.args).map(|_| destinations(ctx).into())
         }
         "get_storage" => parse_args::<NoArgs>(spec, &call.args).map(|_| storage(ctx).into()),
-        "list_data_sources" | "get_dataset" | "query_dataset" => {
+        "get_dataset" | "query_dataset" => {
             super::data::read(host, ctx, call, opts.origin, opts.max_wait).map(ToolOutput::from)
         }
         "list_jobs" => parse_args(spec, &call.args)
@@ -503,7 +501,7 @@ fn preflight_for(
         return Err(vec![Issue::usage(None, needs_session(spec.name))]);
     }
     match spec.name {
-        "list_data_sources" | "get_dataset" => parse_args::<NoArgs>(spec, &call.args).map(|_| ()),
+        "get_dataset" => parse_args::<NoArgs>(spec, &call.args).map(|_| ()),
         "query_dataset" => super::data::preflight(ctx, call, origin),
         "get_overview" | "list_destinations" | "get_storage" => {
             parse_args::<NoArgs>(spec, &call.args).map(|_| ())
@@ -637,7 +635,6 @@ fn overview(ctx: &Context, origin: Origin) -> Value {
         "destinations": ctx.destinations,
         "default_folder": default_folder(ctx),
         "storage": storage_summary(ctx),
-        "uploads": ctx.uploads,
         "recording_defaults": ctx.defaults,
         "ffmpeg": {
             "available": ctx.media.available,
@@ -716,7 +713,6 @@ fn destinations(ctx: &Context) -> Value {
 fn storage(ctx: &Context) -> Value {
     let mut storage = storage_summary(ctx);
     storage["capture_folder"] = json!(super::redact::home_path(&ctx.capture_root));
-    storage["uploads"] = json!(ctx.uploads);
     storage
 }
 
@@ -1343,21 +1339,12 @@ impl Watch {
                 .activity
                 .iter()
                 .filter(|entry| entry.id > self.last_activity)
-                .filter(|entry| {
-                    self.ours.is_none()
-                        || entry
-                            .actor
-                            .as_ref()
-                            .is_none_or(|actor| Some(&actor.id) != self.ours.as_ref())
-                })
+                .filter(|entry| Some(&entry.actor.id) != self.ours.as_ref())
                 .find(|entry| {
                     self.camera.is_none() || entry.camera.as_deref() == self.camera.as_deref()
                 })
                 .map(|entry| {
-                    let who = entry
-                        .actor
-                        .as_ref()
-                        .map_or_else(|| entry.origin.label().to_owned(), |a| a.name.clone());
+                    let who = &entry.actor.name;
                     let on = entry
                         .camera
                         .as_deref()

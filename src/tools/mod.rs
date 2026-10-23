@@ -66,7 +66,7 @@ pub enum Risk {
     Bounded,
     /// Ends or redirects someone's work, or sends data off this computer.
     Disruptive,
-    /// Credentials and destinations: a person always approves these.
+    /// Destination changes: a person always approves these.
     HumanOnly,
 }
 
@@ -145,16 +145,10 @@ static CATALOG: &[ToolSpec] = &[
     read::GET_CAMERA_FEATURES,
     read::INSPECT_FRAME,
     read::WAIT_FOR,
-    data::LIST_DATA_SOURCES,
     data::GET_DATASET,
     data::QUERY_DATASET,
-    data::BROWSE_DATA_SOURCE,
-    data::READ_DATA_SOURCE,
     data::OPEN_DATASET,
     data::CLOSE_DATASET,
-    data::START_SIGNAL_CAPTURE,
-    data::STOP_SIGNAL_CAPTURE,
-    data::WAIT_FOR_DATA,
     data::ANNOTATE_DATASET,
     data::EXPORT_DATASET,
     control::CONNECT_CAMERA,
@@ -172,7 +166,6 @@ static CATALOG: &[ToolSpec] = &[
     capture::CANCEL_JOB,
     capture::STREAM_TO_URL,
     destinations::CREATE_FOLDER_DESTINATION,
-    destinations::CREATE_S3_DESTINATION,
 ];
 
 pub fn catalog() -> &'static [ToolSpec] {

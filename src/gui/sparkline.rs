@@ -83,11 +83,6 @@ impl History {
         self.samples.iter().map(|(_, sample)| *sample)
     }
 
-    /// The newest value.
-    pub fn last(&self) -> Option<f32> {
-        self.samples.back().map(|(_, sample)| sample.value)
-    }
-
     /// Lowest and highest value shown.
     pub fn range(&self) -> Option<(f32, f32)> {
         self.samples().fold(None, |range, s| {

@@ -1,5 +1,4 @@
-//! The optional raw-log timestamp is absolute; old opaque clock strings are
-//! never interpreted as browser-local dates or silently assigned today's date.
+//! Validate raw-log timestamps before passing them to the browser date APIs.
 use serde_json::Value;
 pub(super) fn unix_ms(log: &Value) -> Option<i64> {
     let stamp = log.get("timestamp")?;
@@ -14,8 +13,8 @@ pub(super) fn unix_ms(log: &Value) -> Option<i64> {
 mod tests {
     use super::*;
     #[test]
-    fn metadata_is_optional_bounded_and_never_parsed_from_legacy_time() {
-        let mut log = serde_json::json!({"time":"14:30:00","level":"warn","message":"diagnostic"});
+    fn timestamps_are_bounded_and_require_the_current_shape() {
+        let mut log = serde_json::json!({"level":"warn","message":"diagnostic"});
         assert_eq!(unix_ms(&log), None);
         for invalid in [
             serde_json::json!("bad"),

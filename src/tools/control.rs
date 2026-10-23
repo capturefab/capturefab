@@ -812,8 +812,7 @@ fn last_writer_is_us(ctx: &Context, plan: &PlanState, camera: &str, feature: &st
                 && a.feature.as_deref().is_none_or(|name| name == feature)
         })
         .max_by_key(|a| a.id)
-        .and_then(|a| a.actor.as_ref())
-        .is_some_and(|a| &a.id == actor)
+        .is_some_and(|a| &a.actor.id == actor)
 }
 fn batch(
     plan: &PlanState,

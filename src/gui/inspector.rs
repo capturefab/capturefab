@@ -20,10 +20,9 @@ pub(super) enum Section {
     CaptureOptions,
     Automation,
     EncoderOptions,
-    // Toggled from the dataset and signals views (Slices B and C).
+    // Toggled from the dataset view.
     CaptureTags,
     Dataset,
-    Signals,
     /// The Video tab's destination and file name, behind its preview.
     RecordLocation,
 }
@@ -641,7 +640,6 @@ pub(super) struct InspectorState {
     encoder_options_open: bool,
     tags_open: bool,
     dataset_open: bool,
-    signals_open: bool,
     record_location_open: bool,
     /// The last write or command that failed on each of the shown camera's
     /// features, as the whole error; show its first line at the row. Kept by
@@ -696,7 +694,6 @@ impl Default for InspectorState {
             encoder_options_open: false,
             tags_open: false,
             dataset_open: false,
-            signals_open: false,
             record_location_open: false,
             write_errors: HashMap::new(),
             accepted: Flashes::new(ACCEPTED),
@@ -884,7 +881,6 @@ impl Workbench {
             }
             Section::CaptureTags => self.inspect.tags_open = !self.inspect.tags_open,
             Section::Dataset => self.inspect.dataset_open = !self.inspect.dataset_open,
-            Section::Signals => self.inspect.signals_open = !self.inspect.signals_open,
             Section::RecordLocation => {
                 self.inspect.record_location_open = !self.inspect.record_location_open
             }
@@ -906,7 +902,6 @@ impl Workbench {
             (inspect.capture_options_open, "capture-options"),
             (inspect.tags_open, "capture-tags"),
             (inspect.dataset_open, "dataset"),
-            (inspect.signals_open, "signals"),
             (inspect.automation_open, "automatic-capture"),
             (inspect.encoder_options_open, "video-settings"),
             // Capture and Video share one storage section, so one key.
@@ -938,7 +933,6 @@ impl Workbench {
                 "capture-options" => inspect.capture_options_open = true,
                 "capture-tags" => inspect.tags_open = true,
                 "dataset" => inspect.dataset_open = true,
-                "signals" => inspect.signals_open = true,
                 "automatic-capture" => inspect.automation_open = true,
                 "video-settings" => inspect.encoder_options_open = true,
                 "storage" => self.storage_open = true,
@@ -1081,24 +1075,23 @@ impl Workbench {
     }
 
     /// Read current UI state even when the hidden panel is no longer rendered.
-    pub(super) fn signals_history_visible(&self) -> bool {
-        self.sidebar_shown() && self.tab == Tab::Capture && self.inspect.signals_open
-    }
-
     /// Point the settings panel's motions at what they show; from
     /// `sync_animations`.
     pub(super) fn sync_inspector(&mut self) {
         let now = self.now;
-        // The tick checks metadata; a new type or length cannot wait for it.
+        // The tick checks metadata; another camera, type or length cannot
+        // wait for it because selection redraws immediately.
         let kind = self.camera_kind();
-        if self.inspect.index.len != self.snapshot.features.len() || self.inspect.index.kind != kind
+        let moved = self.inspect.shown_camera.as_deref() != self.snapshot.active_camera.as_deref();
+        if moved
+            || self.inspect.index.len != self.snapshot.features.len()
+            || self.inspect.index.kind != kind
         {
             self.inspect.index = FeatureIndex::new(&self.snapshot.features, kind);
         }
         let tab = self.tab as usize as f32;
         let mode = self.mode_target();
         let output = if self.forward_streams() { 1.0 } else { 0.0 };
-        let moved = self.inspect.shown_camera.as_deref() != self.snapshot.active_camera.as_deref();
         let inspect = &mut self.inspect;
         if moved {
             inspect.shown_camera = self.snapshot.active_camera.clone();
@@ -2818,7 +2811,6 @@ impl Workbench {
             ),
             section_slot(Some(self.storage_settings(p))),
             section_slot(super::dataset::view(self, self.inspect.dataset_open, p)),
-            section_slot(super::signals::view(self, self.inspect.signals_open, p)),
             automation,
         ]
         .into()
@@ -3509,47 +3501,7 @@ impl Workbench {
             ));
         }
         if open {
-            content = content
-                .push(reason(
-                    "Your limits. An app-wide policy can be stricter.",
-                    p,
-                ))
-                .push(form_row("Use up to", self.num(Num::QuotaGib), "GiB", p))
-                .push(form_row(
-                    "Keep at most",
-                    self.num(Num::QuotaFiles),
-                    "files",
-                    p,
-                ))
-                .push(form_row(
-                    "When full",
-                    pick_list(
-                        &ON_FULL[..],
-                        find(&ON_FULL, self.quota_action),
-                        Message::OnFull,
-                    )
-                    .name("When a storage limit is reached")
-                    .width(Fill)
-                    .text_size(style::BODY)
-                    .padding([5, 8])
-                    .style(style::pick)
-                    .menu_style(style::menu),
-                    "",
-                    p,
-                ))
-                .push(checkbox(
-                    "Delete captures older than a set age",
-                    self.retention_enabled,
-                    Message::RetentionEnabled,
-                ));
-            if self.retention_enabled {
-                content = content.push(form_row(
-                    "Older than",
-                    self.num(Num::RetentionDays),
-                    "days",
-                    p,
-                ));
-            }
+            content = content.push(self.storage_controls(p));
         }
         // The backend also merges a separately configured app-wide policy.
         // Folded, the summary already gives its limits; warnings such as
@@ -3563,6 +3515,53 @@ impl Workbench {
         {
             let color = tone_color(caption.tone, p);
             content = content.push(text(caption.text).size(style::SMALL).color(color));
+        }
+        content.into()
+    }
+
+    /// Shared by Capture and the app-wide Resources sheet.
+    pub(super) fn storage_controls(&self, p: &'static Palette) -> Element<'_, Message> {
+        let mut content = column![]
+            .spacing(ROW_GAP)
+            .push(reason(
+                "Your limits. An app-wide policy can be stricter.",
+                p,
+            ))
+            .push(form_row("Use up to", self.num(Num::QuotaGib), "GiB", p))
+            .push(form_row(
+                "Keep at most",
+                self.num(Num::QuotaFiles),
+                "files",
+                p,
+            ))
+            .push(form_row(
+                "When full",
+                pick_list(
+                    &ON_FULL[..],
+                    find(&ON_FULL, self.quota_action),
+                    Message::OnFull,
+                )
+                .name("When a storage limit is reached")
+                .width(Fill)
+                .text_size(style::BODY)
+                .padding([5, 8])
+                .style(style::pick)
+                .menu_style(style::menu),
+                "",
+                p,
+            ))
+            .push(checkbox(
+                "Delete captures older than a set age",
+                self.retention_enabled,
+                Message::RetentionEnabled,
+            ));
+        if self.retention_enabled {
+            content = content.push(form_row(
+                "Older than",
+                self.num(Num::RetentionDays),
+                "days",
+                p,
+            ));
         }
         content.into()
     }
@@ -4383,6 +4382,33 @@ mod tests {
         assert_ne!(bench.inspect.index.key, key);
         assert_eq!(bench.inspect.index.labels[0], "Component gain");
         assert!(bench.inspect.index.words[0].contains("selected component"));
+    }
+
+    #[test]
+    fn selecting_a_camera_refreshes_equal_length_feature_labels_before_the_next_tick() {
+        let mut app = bench();
+        let mut first = liveness::streaming_camera(0, 0, 0.0);
+        first.features = vec![sample_feature("Gain", "Float", json!(1.0))].into();
+        let mut second = first.clone();
+        second.info.id = "sim:1".into();
+        let mut temperature = sample_feature("DeviceTemperature", "Float", json!(24.0));
+        temperature.display_name = "Sensor temperature".into();
+        second.features = vec![temperature].into();
+        app.snapshot.cameras = vec![first, second];
+        app.show_camera(Some("sim:0".into()));
+        app.sync_inspector();
+        assert_eq!(app.inspect.index.labels, ["Gain"]);
+        assert_eq!(app.inspect.index.quick, [0]);
+
+        // Selection redraws immediately, before a status tick can rebuild
+        // the metadata. The other camera has the same feature count/kind.
+        let _ = app.update(Message::Select("sim:1".into()));
+        assert_eq!(app.inspect.index.labels, ["Sensor temperature"]);
+        assert!(app.inspect.index.quick.is_empty());
+        app.expand_feature_groups(true);
+        let (labels, _) = features_view(&app, &mut []);
+        assert!(labels.iter().any(|label| label == "Sensor temperature"));
+        assert!(!labels.iter().any(|label| label == "Gain"));
     }
 
     #[test]

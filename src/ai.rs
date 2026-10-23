@@ -18,7 +18,7 @@ pub const MAX_MEASUREMENTS: usize = 16;
 #[serde(rename_all = "snake_case")]
 pub enum Provider {
     #[default]
-    #[serde(rename = "openai", alias = "open_ai")]
+    #[serde(rename = "openai")]
     OpenAi,
     Gemini,
     Claude,
@@ -662,12 +662,6 @@ mod tests {
                 provider
             );
         }
-        // Read drafts made with the earlier snake_case spelling while always
-        // writing the canonical provider name.
-        assert_eq!(
-            serde_json::from_value::<Provider>(json!("open_ai")).unwrap(),
-            Provider::OpenAi
-        );
     }
 
     fn definitions() -> Vec<MeasurementDefinition> {

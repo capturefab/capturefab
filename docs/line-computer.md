@@ -14,7 +14,7 @@ dpkg --print-architecture
 
 `arm64` takes the `linux-aarch64` archive and `amd64` the `linux-x86_64` one. `armhf` is a 32-bit system, for which there is no build: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS, so reinstall with that. Do not go by `uname -m`, which prints `aarch64` on 32-bit Raspberry Pi OS too. Releases need glibc 2.28 or newer: Debian 10, Ubuntu 18.10, Jetson Linux R34 and later.
 
-Take the Linux archive for your board. It is the same executable as the desktop app. With no `DISPLAY` or `WAYLAND_DISPLAY` it never opens a window, so you can run `capturefab serve` over SSH or as a service without a screen. From 0.2.2 on it includes the browser client for `serve --listen` and uploads to S3, FTP and SFTP; an older archive needs a [separately built client](remote-control.md#get-the-server-and-browser-client) passed with `--web-dir`. Download it and `SHA256SUMS` from [GitHub Releases](https://github.com/capturefab/capturefab/releases), then check and install it:
+Take the Linux archive for your board. It is the same executable as the desktop app. With no `DISPLAY` or `WAYLAND_DISPLAY` it never opens a window, so you can run `capturefab serve` over SSH or as a service without a screen. From 0.2.2 on it includes the browser client for `serve --listen`; an older archive needs a [separately built client](remote-control.md#get-the-server-and-browser-client) passed with `--web-dir`. Download it and `SHA256SUMS` from [GitHub Releases](https://github.com/capturefab/capturefab/releases), then check and install it:
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
@@ -61,7 +61,7 @@ echo net.core.rmem_max=33554432 | sudo tee /etc/sysctl.d/60-capturefab.conf
 | What | Where on Linux | Notes |
 | --- | --- | --- |
 | Runtime: running sessions and their descriptors | `$XDG_RUNTIME_DIR/capturefab`; without `XDG_RUNTIME_DIR`, `/run/user/<uid>/capturefab` for an account that lingers, otherwise `~/.cache/capturefab/sessions` on disk | Under `/run/user` it is memory (tmpfs), so nothing here wears the SD card; gone at reboot |
-| State: settings, saved destinations, the upload queue and the storage ledger | `$XDG_STATE_HOME/capturefab`, normally `~/.local/state/capturefab` | On disk; survives reboots. An older version's files move here once |
+| State: settings, saved destinations and the storage ledger | `$XDG_STATE_HOME/capturefab`, normally `~/.local/state/capturefab` | On disk; survives reboots |
 | Cache: the extracted FFmpeg, encoder probe results and dataset export staging | `$XDG_CACHE_HOME/capturefab`, normally `~/.cache/capturefab` | Safe to delete |
 | Captures saved to a relative path | The directory the CLI command ran in; for the browser, the service's working directory | `doctor` and `storage` measure free space on the disk of `~/Capturefab` |
 
@@ -73,7 +73,7 @@ A session is found by name in the runtime folder, so the service and your SSH lo
 sudo loginctl enable-linger pi
 ```
 
-Without lingering, a service that sets no `XDG_RUNTIME_DIR` keeps its sessions on disk in `~/.cache/capturefab/sessions`, where an SSH login does not look. `capturefab doctor` in your SSH login notes this under `runtime_dir` with the fix, and warns once such a session runs; `capturefab sessions` and `--session` name a session they find there. `env -u XDG_RUNTIME_DIR capturefab doctor` shows what the service sees, and the service prints its own warning to `journalctl -u capturefab-line1` when it starts. After an upgrade from an older version, its `old_state` check names any settings, destinations, upload queue or storage ledger that could not move into the state folder, and how to keep them.
+Without lingering, a service that sets no `XDG_RUNTIME_DIR` keeps its sessions on disk in `~/.cache/capturefab/sessions`, where an SSH login does not look. `capturefab doctor` in your SSH login notes this under `runtime_dir` with the fix, and warns once such a session runs; `capturefab sessions` and `--session` name a session they find there. `env -u XDG_RUNTIME_DIR capturefab doctor` shows what the service sees, and the service prints its own warning to `journalctl -u capturefab-line1` when it starts.
 
 ## 4. Run serve as a service
 
@@ -93,7 +93,7 @@ Environment=XDG_RUNTIME_DIR=/run/user/1000
 WorkingDirectory=~
 ExecStart=/usr/local/bin/capturefab serve --name line1 --listen 100.101.102.103:8787
 # systemctl stop sends SIGTERM to serve alone; serve then finishes recordings,
-# saves the upload queue and stops its camera workers itself.
+# saves its state and stops its camera workers itself.
 KillMode=mixed
 TimeoutStopSec=45
 Restart=on-failure
@@ -140,17 +140,7 @@ capturefab storage configure --max-space 12GiB
 capturefab storage --json
 ```
 
-When the budget is full, captures stop with a `storage_full` error (exit 6) rather than deleting anything. If losing the oldest captures is acceptable, for example because the line computer uploads everything to a server, `--on-full delete-oldest` deletes them instead; files still waiting to upload are kept. Upload destinations on a computer without a desktop login need `--password-env`, an SFTP `--key-file` or S3 `--env` or `--profile`, because no OS credential store runs there; see [copy files to a server](plant-floor.md#7-copy-files-to-a-server). An SFTP key, or an AWS profile in the service account's `~/.aws/credentials`, stays in a file only that account reads. Give the service a password or AWS keys from a file only root reads, not with `Environment=` lines: every account can read unit files, and their `Environment=` through `systemctl show`.
-
-```sh
-sudo install -d -m 700 /etc/capturefab
-sudo install -m 600 /dev/null /etc/capturefab/line1.env
-sudoedit /etc/capturefab/line1.env
-```
-
-Put one `NAME=value` per line in it, such as `CAPTUREFAB_SFTP_PASSWORD=...`, or `AWS_ACCESS_KEY_ID=...` and `AWS_SECRET_ACCESS_KEY=...`, then add `EnvironmentFile=/etc/capturefab/line1.env` to the unit's `[Service]` section and restart the service. systemd reads the file before it switches to `User=`.
-
-Only the service has these keys then, not your SSH shell, where `destination add-s3`, `add-sftp` and `add-ftp` check the destination before saving it. Save it with `--no-check`, and once the service runs, see that uploads go through with `capturefab uploads --json`; `destination test` also runs in your shell, without the keys.
+When the budget is full, captures stop with a `storage_full` error (exit 6) rather than deleting anything. If losing the oldest captures is acceptable, `--on-full delete-oldest` permits deletion of unchanged Capturefab-owned files. To save to a removable drive, mount it and select a folder on that drive as the destination. Capturefab refuses to write beneath a missing mount point.
 
 ## 7. Efficiency mode
 

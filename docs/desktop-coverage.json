@@ -1,0 +1,837 @@
+{
+  "version": 1,
+  "description": "Source-backed desktop actions, settings and browser capabilities. Entries identify the documentation for current implementation tokens.",
+  "features": {
+    "keyboard.undo": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Undo"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.redo": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Redo"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.discover": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Discover"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.connect_address": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ConnectAddress"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.new_window": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::NewWindow"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.overview": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Overview"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.toggle_stream": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ToggleStream"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.capture": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Capture"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.capture_all": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::CaptureAll"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.record": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Record"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.toggle_auto": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ToggleAuto"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.search_features": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::SearchFeatures"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.features_tab": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::FeaturesTab"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.capture_tab": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::CaptureTab"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.forward_tab": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ForwardTab"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.zoom_in": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ZoomIn"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.zoom_out": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ZoomOut"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.zoom_fit": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ZoomFit"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.zoom_actual": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ZoomActual"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.toggle_activity": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ToggleActivity"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.toggle_inspector": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ToggleInspector"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.toggle_sidebar": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ToggleSidebar"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.image_mode": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ImageMode"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.toggle_exposure": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ToggleExposure"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.toggle_focus_region": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::ToggleFocusRegion"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.copy_session_command": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::CopySessionCommand"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.fullscreen": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Fullscreen"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.help": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Help"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.quick_command": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::QuickCommand"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.settings": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Settings"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.close_window": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::CloseWindow"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "keyboard.quit": {
+      "source": "src/gui/keys.rs",
+      "terms": [
+        "Action::Quit"
+      ],
+      "url": "desktop.html#keyboard"
+    },
+    "windows.single_camera": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Connect to Camera\u2026"
+      ],
+      "url": "desktop.html#windows"
+    },
+    "windows.recents": {
+      "source": "src/gui/prefs.rs",
+      "terms": [
+        "RECENT_LIMIT: usize = 6"
+      ],
+      "url": "desktop.html#windows"
+    },
+    "windows.close_recording": {
+      "source": "src/gui/close_error.rs",
+      "terms": [
+        "Close"
+      ],
+      "url": "desktop.html#windows"
+    },
+    "menus.file": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "title: \"File\""
+      ],
+      "url": "desktop.html#menus"
+    },
+    "menus.edit": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "title: \"Edit\""
+      ],
+      "url": "desktop.html#menus"
+    },
+    "menus.view": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "title: \"View\""
+      ],
+      "url": "desktop.html#menus"
+    },
+    "menus.camera": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "title: \"Camera\""
+      ],
+      "url": "desktop.html#menus"
+    },
+    "menus.help": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "title: \"Help\""
+      ],
+      "url": "desktop.html#menus"
+    },
+    "menus.all_streams": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Start All Streams",
+        "Stop All Streams"
+      ],
+      "url": "desktop.html#menus"
+    },
+    "menus.all_recordings": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Stop All Recordings",
+        "Record All Cameras"
+      ],
+      "url": "desktop.html#menus"
+    },
+    "menus.all_exposure": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Use Auto Exposure for All",
+        "Use Manual Exposure for All"
+      ],
+      "url": "desktop.html#menus"
+    },
+    "settings.appearance": {
+      "source": "src/gui/settings.rs",
+      "terms": [
+        "Appearance",
+        "System",
+        "Light",
+        "Dark"
+      ],
+      "url": "desktop.html#settings"
+    },
+    "settings.interface_size": {
+      "source": "src/gui/settings.rs",
+      "terms": [
+        "Interface size",
+        "Standard",
+        "Large",
+        "Larger"
+      ],
+      "url": "desktop.html#settings"
+    },
+    "settings.simulators": {
+      "source": "src/gui/settings.rs",
+      "terms": [
+        "Include simulated cameras"
+      ],
+      "url": "desktop.html#settings"
+    },
+    "settings.auto_start": {
+      "source": "src/gui/settings.rs",
+      "terms": [
+        "Start the live view when a camera connects"
+      ],
+      "url": "desktop.html#settings"
+    },
+    "settings.credential_save": {
+      "source": "src/gui/settings.rs",
+      "terms": [
+        "API keys require Save key"
+      ],
+      "url": "desktop.html#settings"
+    },
+    "camera.feature_reload": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Refresh Features"
+      ],
+      "url": "desktop.html#camera-controls"
+    },
+    "camera.network_scan": {
+      "source": "src/gui/network.rs",
+      "terms": [
+        "Scan network"
+      ],
+      "url": "desktop.html#camera-controls"
+    },
+    "camera.network_report": {
+      "source": "src/gui/network.rs",
+      "terms": [
+        "Report"
+      ],
+      "url": "desktop.html#camera-controls"
+    },
+    "image.line_scan": {
+      "source": "src/gui/camera_view.rs",
+      "terms": [
+        "Recent lines",
+        "gaps mark skipped blocks"
+      ],
+      "url": "desktop.html#image-view"
+    },
+    "image.depth": {
+      "source": "src/gui/camera_view.rs",
+      "terms": [
+        "Scalar colors"
+      ],
+      "url": "desktop.html#image-view"
+    },
+    "image.thermal": {
+      "source": "src/gui/camera_view.rs",
+      "terms": [
+        "Heatmap"
+      ],
+      "url": "desktop.html#image-view"
+    },
+    "capture.dataset": {
+      "source": "src/gui/dataset.rs",
+      "terms": [
+        "Catalog captures automatically"
+      ],
+      "url": "desktop.html#capture-controls"
+    },
+    "capture.destinations": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Manage Destinations\u2026"
+      ],
+      "url": "desktop.html#capture-controls"
+    },
+    "capture.record_forward": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Set Up Recording or Forwarding\u2026"
+      ],
+      "url": "desktop.html#capture-controls"
+    },
+    "capture.schedule": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Schedule Capture"
+      ],
+      "url": "desktop.html#capture-controls"
+    },
+    "capture.activity": {
+      "source": "src/gui/toolbar.rs",
+      "terms": [
+        "Copy log"
+      ],
+      "url": "desktop.html#capture-controls"
+    },
+    "performance.modes": {
+      "source": "src/gui/performance.rs",
+      "terms": [
+        "Automatic",
+        "Smooth",
+        "Efficient"
+      ],
+      "url": "desktop.html#performance"
+    },
+    "performance.lag": {
+      "source": "src/gui/performance.rs",
+      "terms": [
+        "the preview fell behind"
+      ],
+      "url": "desktop.html#performance"
+    },
+    "performance.preview_limit": {
+      "source": "src/gui/performance.rs",
+      "terms": [
+        "1280 pixels"
+      ],
+      "url": "desktop.html#performance"
+    },
+    "performance.override": {
+      "source": "src/efficiency.rs",
+      "terms": [
+        "CAPTUREFAB_EFFICIENCY"
+      ],
+      "url": "desktop.html#performance"
+    },
+    "resources.open": {
+      "source": "src/gui/resources.rs",
+      "terms": [
+        "Resource usage & limits"
+      ],
+      "url": "desktop.html#resources"
+    },
+    "resources.cpu": {
+      "source": "src/gui/resources.rs",
+      "terms": [
+        "Image processing thread limit"
+      ],
+      "url": "desktop.html#resources"
+    },
+    "resources.buffers": {
+      "source": "src/gui/resources.rs",
+      "terms": [
+        "Shared camera buffer limit"
+      ],
+      "url": "desktop.html#resources"
+    },
+    "resources.disk": {
+      "source": "src/gui/resources.rs",
+      "terms": [
+        "Disk limit"
+      ],
+      "url": "desktop.html#resources"
+    },
+    "resources.reset": {
+      "source": "src/gui/resources.rs",
+      "terms": [
+        "Automatic work limits"
+      ],
+      "url": "desktop.html#resources"
+    },
+    "resources.delivery": {
+      "source": "src/gui/resources.rs",
+      "terms": [
+        "Last 10 seconds"
+      ],
+      "url": "desktop.html#resources"
+    },
+    "resources.auto": {
+      "source": "src/resources/mod.rs",
+      "terms": [
+        "pub fn processing_threads",
+        "pub fn buffer_limit"
+      ],
+      "url": "desktop.html#resources"
+    },
+    "analytics.acquisition": {
+      "source": "src/gui/analytics.rs",
+      "terms": [
+        "Acquisition"
+      ],
+      "url": "desktop.html#acquisition-analytics"
+    },
+    "analytics.snapshot": {
+      "source": "src/gui/analytics/history.rs",
+      "terms": [
+        "Show history data",
+        "Update history",
+        "History page"
+      ],
+      "url": "desktop.html#acquisition-analytics"
+    },
+    "analytics.axes": {
+      "source": "src/gui/analytics/history.rs",
+      "terms": [
+        "Axes and aggregation"
+      ],
+      "url": "desktop.html#acquisition-analytics"
+    },
+    "measurements.configure": {
+      "source": "src/gui/video_analytics.rs",
+      "terms": [
+        "Prompt measurements",
+        "Provider",
+        "Model",
+        "Sample every"
+      ],
+      "url": "desktop.html#prompt-measurements"
+    },
+    "measurements.edit": {
+      "source": "src/gui/video_analytics.rs",
+      "terms": [
+        "Add measurement",
+        "Remove"
+      ],
+      "url": "desktop.html#prompt-measurements"
+    },
+    "measurements.start_stop": {
+      "source": "src/gui/video_analytics.rs",
+      "terms": [
+        "Start collection",
+        "Stop collection"
+      ],
+      "url": "desktop.html#prompt-measurements"
+    },
+    "measurements.pause": {
+      "source": "src/gui/video_analytics.rs",
+      "terms": [
+        "Collection paused because its configuration changed."
+      ],
+      "url": "desktop.html#prompt-measurements"
+    },
+    "measurements.history": {
+      "source": "src/gui/video_analytics.rs",
+      "terms": [
+        "Measurement history"
+      ],
+      "url": "desktop.html#prompt-measurements"
+    },
+    "measurements.keys": {
+      "source": "src/gui/video_analytics.rs",
+      "terms": [
+        "Save key",
+        "Remove saved key",
+        "Refresh"
+      ],
+      "url": "desktop.html#prompt-measurements"
+    },
+    "measurements.key_heading": {
+      "source": "src/gui/settings.rs",
+      "terms": [
+        "Prompt measurement keys"
+      ],
+      "url": "desktop.html#prompt-measurements"
+    },
+    "measurements.limits": {
+      "source": "src/video_analytics.rs",
+      "terms": [
+        "MAX_MEASUREMENTS",
+        "MAX_INTERVAL_SECONDS"
+      ],
+      "url": "desktop.html#prompt-measurements"
+    },
+    "browser.connections": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Discover",
+        "More connection options",
+        "Disconnect camera"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.simulators": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Include simulated cameras in discovery"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.features": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Camera settings",
+        "Search camera features",
+        "Auto exposure",
+        "Manual exposure"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.preview": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Live preview",
+        "Start stream",
+        "Stop stream"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.capture": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Save frame",
+        "Capture options",
+        "Frame count"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.destination": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Destination",
+        "Server filesystem"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.limits": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Storage limit (MiB)",
+        "Maximum files"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.schedule": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Timelapse schedule",
+        "Interval (seconds)",
+        "Start time (local)"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.jobs": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Capture jobs",
+        "Refresh jobs"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.analytics": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Capture insights"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.activity": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Session activity",
+        "Your name"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "browser.logs": {
+      "source": "web-client/index.html",
+      "terms": [
+        "Server log"
+      ],
+      "url": "desktop.html#remote-browser"
+    },
+    "http.health": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/health\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.metrics": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/metrics\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.analytics": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/analytics\"",
+        "\"/api/analytics.svg\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.resources": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/resources\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.measurements": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/measurements\"",
+        "\"/api/measurements.svg\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.session": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/session\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.activity": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/activity\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.destinations": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/destinations\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.storage": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/storage\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.preview": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/preview\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "http.command": {
+      "source": "src/remote.rs",
+      "terms": [
+        "\"/api/command\""
+      ],
+      "url": "desktop.html#remote-monitoring"
+    },
+    "assistant.apple_setup": {
+      "source": "src/assistant/provider.rs",
+      "terms": [
+        "id: \"apple_foundation_models\"",
+        "default_model: \"on-device\""
+      ],
+      "url": "docs.html#apple-intelligence"
+    },
+    "assistant.apple_availability": {
+      "source": "src/assistant/foundation_models.swift",
+      "terms": [
+        ".deviceNotEligible",
+        ".appleIntelligenceNotEnabled",
+        ".modelNotReady"
+      ],
+      "url": "docs.html#apple-intelligence"
+    },
+    "assistant.apple_text_only": {
+      "source": "src/assistant/vision.rs",
+      "terms": [
+        "if provider.is_on_device()"
+      ],
+      "url": "docs.html#apple-intelligence"
+    },
+    "assistant.apple_cost": {
+      "source": "src/assistant/settings.rs",
+      "terms": [
+        "const ON_DEVICE: Prices",
+        "if id.is_on_device()"
+      ],
+      "url": "docs.html#apple-intelligence"
+    },
+    "assistant.apple_settings": {
+      "source": "src/gui/assistant/settings.rs",
+      "terms": [
+        "Test local AI",
+        "Checking local AI availability"
+      ],
+      "url": "desktop.html#settings"
+    },
+    "resources.encoder_loss": {
+      "source": "src/gui/resources.rs",
+      "terms": [
+        "encoder_dropped",
+        "encoder_late"
+      ],
+      "url": "desktop.html#resources"
+    },
+    "destinations.legacy_records": {
+      "source": "src/destination.rs",
+      "terms": [
+        "fn read_folders",
+        "Old saved remote destinations are ignored"
+      ],
+      "url": "docs.html#destinations"
+    },
+    "resources.legacy_limits": {
+      "source": "src/resources/mod.rs",
+      "terms": [
+        "_retired_upload_limit"
+      ],
+      "url": "desktop.html#resources"
+    }
+  }
+}

@@ -33,6 +33,7 @@ fn camera(id: &str, pid: u32, frames: u64, dropped: u64, bytes: u64) -> CameraSn
         stale: false,
         error_logged: None,
         forwarding_id: None,
+        forwarding_progress: None,
         forwarding_since_ms: None,
         forwarding_until_ms: None,
     }

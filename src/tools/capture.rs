@@ -108,7 +108,7 @@ pub const CAPTURE_PHOTOS: ToolSpec = ToolSpec {
     risk: Risk::Bounded,
     needs_session: true,
     needs_vision: false,
-    description: "Save 1..1000 photos (default 1) as png (default), jpeg, raw, pgm or ppm. Connects a discovered camera first. File names are single templates; existing files are numbered. Scanners consume pages and wait up to 60 seconds per page. A remote destination uploads the saved files.",
+    description: "Save 1..1000 photos (default 1) as png (default), jpeg, raw, pgm or ppm. Connects a discovered camera first. File names are single templates; existing files are numbered. Scanners consume pages and wait up to 60 seconds per page.",
     schema: photos_schema,
     fields: &[
         CAMERA,
@@ -669,17 +669,6 @@ fn output(
                 sentence(problem),
                 IssueCode::Unavailable,
             ));
-        }
-        if found.remote {
-            checked.leaves_computer = true;
-            checked.warning(
-                "destination",
-                format!(
-                    "Uploads files to {}.{}",
-                    found.host.as_deref().unwrap_or(&found.location),
-                    if found.insecure { " Unencrypted." } else { "" }
-                ),
-            );
         }
         checked
             .facts

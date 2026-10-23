@@ -20,11 +20,6 @@ use std::{
 
 const RECENT_LIMIT: usize = 6;
 const FILE: &str = "gui.prefs.json";
-pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
-    what: "GUI settings",
-    names: &[FILE],
-    lock: None,
-};
 
 const MIN_WINDOW: Size = Size::new(900.0, 620.0);
 
@@ -510,9 +505,6 @@ pub struct Prefs {
     pub window: Option<[f32; 2]>,
     pub logs_open: bool,
     pub video_analytics: super::video_analytics::Preferences,
-    /// 0 for files written before versioning; `Prefs::default()` is current.
-    #[serde(default)]
-    pub prefs_version: u32,
     /// Start the live view when a camera connects.
     pub auto_start: bool,
     /// Capture context sent with every capture and recording.
@@ -521,8 +513,6 @@ pub struct Prefs {
     pub dataset_path: Option<PathBuf>,
     /// Catalog captures in a dataset under the capture folder when none is open.
     pub dataset_auto: bool,
-    /// Recently added signal sources, never with credentials.
-    pub recent_signals: Vec<String>,
     /// The settings panel's disclosures the user left open, by stable key
     /// ("features:Image", "storage"); unknown keys are ignored on load.
     pub open_sections: Vec<String>,
@@ -581,12 +571,10 @@ impl Default for Prefs {
             window: None,
             logs_open: false,
             video_analytics: Default::default(),
-            prefs_version: 3,
             auto_start: true,
             tags: CaptureTags::default(),
             dataset_path: None,
             dataset_auto: true,
-            recent_signals: Vec::new(),
             open_sections: Vec::new(),
         }
     }
@@ -654,27 +642,6 @@ impl Prefs {
 
 fn path() -> PathBuf {
     crate::ipc::state_dir().join(FILE)
-}
-
-/// Rename settings saved under the old name, which a session called `gui`
-/// needs for its descriptor, then move them into the state directory.
-pub fn migrate() {
-    migrate_in(&crate::ipc::runtime_dir());
-    crate::ipc::adopt_state(&STATE);
-}
-
-fn migrate_in(dir: &Path) {
-    let old = dir.join("gui.json");
-    let is_prefs = fs::read(&old)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .is_some_and(|value| value.is_object() && value.get("token").is_none());
-    if is_prefs {
-        let new = dir.join(FILE);
-        if new.exists() || fs::rename(&old, &new).is_err() {
-            let _ = fs::remove_file(&old);
-        }
-    }
 }
 
 pub fn load() -> Prefs {
@@ -820,30 +787,11 @@ fn write_snapshots(
 }
 
 fn load_from(path: &Path) -> Prefs {
-    let mut prefs: Prefs = fs::read(path)
+    fs::read(path)
         .ok()
         .filter(|bytes| bytes.len() <= 1 << 20)
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    upgrade(&mut prefs);
-    prefs
-}
-
-/// Bring preferences saved by an older version up to the current one.
-fn upgrade(prefs: &mut Prefs) {
-    // Version 2: the old defaults, one fixed file name and an RTSP forward,
-    // become dated, numbered files under the capture folder. Values the
-    // user chose are kept.
-    if prefs.prefs_version < 2 {
-        if prefs.output == "capture.png" {
-            prefs.output = default_capture_output();
-        }
-        if prefs.forward_output == "rtsp://127.0.0.1:8554/capturefab" {
-            prefs.forward_output = default_record_output();
-        }
-    }
-    // Version 3 adds `performance`, which files without it read as Automatic.
-    prefs.prefs_version = prefs.prefs_version.max(Prefs::default().prefs_version);
+        .unwrap_or_default()
 }
 
 fn save_to(path: &Path, prefs: &Prefs) -> Result<()> {
@@ -1011,9 +959,9 @@ mod tests {
             assert_eq!(scale.factor(), factor);
             assert_eq!(scale.to_string(), label);
         }
-        let old: Prefs = serde_json::from_str(r#"{"count":17}"#).unwrap();
-        assert_eq!(old.count, 17);
-        assert_eq!(old.ui_scale, UiScale::Standard);
+        let partial: Prefs = serde_json::from_str(r#"{"count":17}"#).unwrap();
+        assert_eq!(partial.count, 17);
+        assert_eq!(partial.ui_scale, UiScale::Standard);
         let future: Prefs = serde_json::from_str(r#"{"ui_scale":"huge","count":17}"#).unwrap();
         assert_eq!(
             future.count, 17,
@@ -1041,15 +989,11 @@ mod tests {
         }
         let dir = test_dir("performance");
         let file = dir.join(FILE);
-        fs::write(
-            &file,
-            br#"{"performance":"turbo","count":17,"prefs_version":2}"#,
-        )
-        .unwrap();
+        fs::write(&file, br#"{"performance":"turbo","count":17}"#).unwrap();
         let future = load_from(&file);
         assert_eq!(
-            (future.performance, future.count, future.prefs_version),
-            (Mode::Auto, 17, 3),
+            (future.performance, future.count),
+            (Mode::Auto, 17),
             "a newer choice keeps the other preferences"
         );
         fs::write(&file, br#"{"count":17}"#).unwrap();
@@ -1274,7 +1218,7 @@ mod tests {
         prefs.remember(recent("rtsp://camera.local/stream"));
         save_to(&file, &prefs).unwrap();
         assert_eq!(load_from(&file), prefs);
-        fs::write(&file, br#"{"count":3,"tab":"features","unknown":true}"#).unwrap();
+        fs::write(&file, br#"{"count":3,"tab":"capture","unknown":true}"#).unwrap();
         assert_eq!(
             load_from(&file),
             Prefs {
@@ -1284,58 +1228,6 @@ mod tests {
         );
         fs::write(&file, b"not json").unwrap();
         assert_eq!(load_from(&file), Prefs::default());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn upgrade_replaces_only_legacy_defaults() {
-        let dir = std::env::temp_dir().join(format!("capturefab-upgrade-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join(FILE);
-        fs::write(
-            &file,
-            br#"{"output":"capture.png","forward_output":"rtsp://127.0.0.1:8554/capturefab"}"#,
-        )
-        .unwrap();
-        let prefs = load_from(&file);
-        assert_eq!(prefs.output, default_capture_output());
-        assert_eq!(prefs.forward_output, default_record_output());
-        assert_eq!(prefs.prefs_version, 3);
-        assert!(prefs.output.ends_with("{camera}-{datetime}-{seq}.png"));
-        fs::write(
-            &file,
-            br#"{"output":"mine.png","forward_output":"rtsp://h/x"}"#,
-        )
-        .unwrap();
-        let prefs = load_from(&file);
-        assert_eq!(
-            (prefs.output.as_str(), prefs.forward_output.as_str()),
-            ("mine.png", "rtsp://h/x")
-        );
-        // Once upgraded, a value equal to an old default is the user's choice.
-        fs::write(&file, br#"{"output":"capture.png","prefs_version":2}"#).unwrap();
-        assert_eq!(load_from(&file).output, "capture.png");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn migration_frees_the_default_session_descriptor() {
-        let dir = std::env::temp_dir().join(format!("capturefab-migrate-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let old = dir.join("gui.json");
-        let descriptor =
-            br#"{"version":1,"name":"gui","pid":1,"address":"127.0.0.1:1","token":"t"}"#;
-        fs::write(&old, descriptor).unwrap();
-        migrate_in(&dir);
-        assert_eq!(fs::read(&old).unwrap(), descriptor);
-        fs::write(&old, br#"{"count":7}"#).unwrap();
-        migrate_in(&dir);
-        assert!(!old.exists());
-        assert_eq!(load_from(&dir.join(FILE)).count, 7);
-        fs::write(&old, br#"{"count":9}"#).unwrap();
-        migrate_in(&dir);
-        assert!(!old.exists());
-        assert_eq!(load_from(&dir.join(FILE)).count, 7);
         fs::remove_dir_all(&dir).unwrap();
     }
 

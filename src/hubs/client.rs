@@ -300,7 +300,7 @@ pub(crate) mod tests {
             tls_server_name: None,
             rtsp_port: (kind == Kind::Frigate).then_some(8554),
             rejected: None,
-            revision: None,
+            revision: [0; 16],
         }
     }
     pub(crate) fn secret(kind: Kind, value: &str) -> Secret {

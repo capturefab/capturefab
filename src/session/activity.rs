@@ -111,14 +111,6 @@ pub enum ActivityOrigin {
     Client,
     Gui,
 }
-impl ActivityOrigin {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Client => "CLI / API",
-            Self::Gui => "GUI",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -146,8 +138,7 @@ impl ActivityState {
 pub struct SessionActivity {
     pub id: u64,
     pub origin: ActivityOrigin,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub actor: Option<SessionActor>,
+    pub actor: SessionActor,
     pub operation: String,
     pub camera: Option<String>,
     pub feature: Option<String>,
@@ -333,9 +324,6 @@ impl Activity {
                 | SessionCommand::DatasetQuery { .. }
                 | SessionCommand::DatasetQueryIf { .. }
                 | SessionCommand::DatasetModelQueryIf { .. }
-                | SessionCommand::Signals
-                | SessionCommand::SignalRead { .. }
-                | SessionCommand::SignalBrowse { .. }
         ) {
             return None;
         }
@@ -358,10 +346,10 @@ impl Activity {
         entries.entries.push_back(SessionActivity {
             id,
             origin,
-            actor: Some(SessionActor {
+            actor: SessionActor {
                 name: bounded(&redact(&actor.name), 128),
                 ..actor
-            }),
+            },
             operation: operation.into(),
             camera: camera.map(|camera| bounded(&redact(camera), 1024)),
             feature,
@@ -620,26 +608,6 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
             "dataset_export",
             format!("Export dataset → {}", file_name(output)),
         ),
-        SignalBind { .. } => ("signal_bind", "Bind local signal credentials".into()),
-        SignalRead { uri, .. } => (
-            "signal_read",
-            format!("Read {}", crate::media::redact_url(uri)),
-        ),
-        SignalBrowse { uri, .. } => (
-            "signal_browse",
-            format!("Browse {}", crate::media::redact_url(uri)),
-        ),
-        SignalStart { uri, .. } => (
-            "signal_start",
-            format!("Log {}", crate::media::redact_url(uri)),
-        ),
-        SignalCapture { uri, .. } => (
-            "signal_capture",
-            format!("Capture {}", crate::media::redact_url(uri)),
-        ),
-        SignalStop { id } => ("signal_stop", format!("Stop logging {id}")),
-        SignalStopIf { id, .. } => ("signal_stop_if", format!("Stop capture {id}")),
-        Signals => ("signals", "Signal status".into()),
     }
 }
 /// The last component of a path, so activity never shows a full folder tree.
@@ -736,7 +704,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     #[test]
-    fn participant_identity_is_validated_and_legacy_entries_deserialize() {
+    fn participant_identity_is_validated_and_required() {
         let actor = SessionActor::new("agent:planner", "Planning agent", ActorKind::Agent).unwrap();
         assert_eq!(serde_json::to_value(&actor).unwrap()["kind"], "agent");
         for (id, name) in [
@@ -758,15 +726,10 @@ mod tests {
                 &SessionCommand::Start,
             )
             .unwrap();
-        assert_eq!(activity.snapshot().activity[0].actor.as_ref(), Some(&actor));
-        let mut legacy = serde_json::to_value(&activity.snapshot().activity[0]).unwrap();
-        legacy.as_object_mut().unwrap().remove("actor");
-        assert!(
-            serde_json::from_value::<SessionActivity>(legacy)
-                .unwrap()
-                .actor
-                .is_none()
-        );
+        assert_eq!(activity.snapshot().activity[0].actor, actor);
+        let mut missing_actor = serde_json::to_value(&activity.snapshot().activity[0]).unwrap();
+        missing_actor.as_object_mut().unwrap().remove("actor");
+        assert!(serde_json::from_value::<SessionActivity>(missing_actor).is_err());
         drop(command);
     }
     #[test]
@@ -897,10 +860,7 @@ mod tests {
         activity.observe_jobs(&[camera.clone()]);
         let view = activity.snapshot();
         assert_eq!(view.revision, before + 1);
-        assert_eq!(
-            view.activity[0].actor.as_ref().unwrap().id,
-            "agent:scheduler"
-        );
+        assert_eq!(view.activity[0].actor.id, "agent:scheduler");
         assert_eq!(view.activity[0].file_count, 1);
         assert_eq!(view.activity[0].job.as_ref().unwrap().captured, 1);
         activity.observe_jobs(&[camera.clone()]);

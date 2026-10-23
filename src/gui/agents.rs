@@ -166,16 +166,13 @@ fn briefing(prefix: &str) -> String {
          Keep using this session and actor attribution so I can follow your work \
          in Activity. Replace capture-agent with a distinct name for your harness \
          if other agents share this session. Clear CAPTUREFAB_CAMERA from your \
-         harness environment before calling camera tools. Ask me for the capture goal, camera or data source, dataset and output destination \
+         harness environment before calling camera tools. Ask me for the capture goal, camera, dataset and output destination \
          if I have not given them. Inspect before changing settings. Dry-run \
          actions, review their checks and obtain my approval for Disruptive or HumanOnly actions \
          before using --confirmed-by-user. Never put credentials in arguments or prompts.\n\n\
          Read inspection image paths with your image viewer. Verify saved captures \
-         and report their paths, failures and any jobs still running. For sensor tasks, \
-         discover open_dataset, start_signal_capture, wait_for_data, query_dataset and export_dataset. \
-         Use finite duration, sample and payload limits; verify written counts, final flush, \
-         drops and export checksums. Use the acknowledged source capture and dataset slot \
-         identities to preserve other participants’ work. If a request \
+         and report their paths, failures and any jobs still running. Use camera datasets \
+         to catalog, query and export saved captures. If a request \
          times out, inspect status before retrying a write. Pause when I need to \
          intervene, then re-read the session before continuing."
     )
@@ -250,7 +247,7 @@ impl Workbench {
             heading("Step in when needed", p),
             description("Open Activity to follow the agent's actions and saved files. Pause your harness before editing camera controls, then ask it to inspect the session again. Captures, schedules and recordings already accepted can keep running after a harness stops; check their status.").into(),
             heading("Prefer to ask inside Capturefab?", p),
-            description("Quick Command uses your chosen provider and API key or local model. Review a plan first, approve each change, or run an image or data task with limits.").into(),
+            description("Quick Command uses your chosen provider and API key or local model. Review a plan first, approve each change, or run a camera capture task with limits.").into(),
             button(text("Open Quick Command…").size(style::BODY))
                 .name("Open built-in assistant from agent setup")
                 .style(style::secondary)

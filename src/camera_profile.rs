@@ -117,7 +117,6 @@ pub enum CameraCapability {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
 pub struct CameraProfile {
     pub kind: CameraKind,
     pub source: DetectionSource,
@@ -613,10 +612,8 @@ mod tests {
     }
 
     #[test]
-    fn detection_is_deterministic_and_backward_compatible() {
-        let old = json!({"id":"test", "transport":"gig_e", "vendor":"Test", "model":"Generic", "serial":"1", "address":null});
-        let info: CameraInfo = serde_json::from_value(old).unwrap();
-        assert_eq!(info.profile, CameraProfile::default());
+    fn detection_is_deterministic_and_profiles_round_trip() {
+        let info = camera("Generic");
         let features = [
             f("Scan3dCoordinateScale", json!(0.1)),
             f("Scan3dOutputMode", json!("CalibratedC")),
@@ -630,10 +627,11 @@ mod tests {
             json!("line_scan")
         );
         assert_eq!(
-            serde_json::from_value::<CameraProfile>(json!({"kind":"depth"}))
-                .unwrap()
-                .source,
-            DetectionSource::Unknown
+            serde_json::from_value::<CameraProfile>(
+                serde_json::to_value(detect(&info, &features)).unwrap()
+            )
+            .unwrap(),
+            detect(&info, &features)
         );
     }
 }

@@ -27,16 +27,6 @@ pub enum Op {
         command: SessionCommand,
         dataset_from_plan: bool,
     },
-    StopSignal {
-        source: String,
-        capture_id: Option<String>,
-    },
-    WaitData {
-        source: String,
-        capture_id: Option<String>,
-        timeout_ms: u64,
-        samples: Option<u64>,
-    },
     Connect {
         selector: String,
     },
@@ -58,7 +48,6 @@ pub enum Op {
     },
     CreateDestination {
         destination: Destination,
-        needs_secret: bool,
     },
     /// A credential-free Forward; the password is merged in a temporary
     /// command immediately before sending it to the host.
@@ -80,17 +69,6 @@ impl Serialize for Op {
                 command,
                 dataset_from_plan,
             } => json!({"command":command,"dataset_from_plan":dataset_from_plan}),
-            Self::StopSignal { source, capture_id } => {
-                json!({"op":"signal_stop_if","source":source,"capture_id":capture_id})
-            }
-            Self::WaitData {
-                source,
-                capture_id,
-                timeout_ms,
-                samples,
-            } => {
-                json!({"op":"wait_for_data","source":source,"capture_id":capture_id,"timeout_ms":timeout_ms,"samples":samples})
-            }
             Self::Connect { selector } => json!({"op":"connect","selector":selector}),
             Self::Command { camera, command } => {
                 json!({"camera":camera.selector(),"command":command})
@@ -104,11 +82,8 @@ impl Serialize for Op {
             Self::Restartable { camera, commands } => {
                 json!({"op":"restartable","camera":camera.selector(),"commands":commands})
             }
-            Self::CreateDestination {
-                destination,
-                needs_secret,
-            } => {
-                json!({"op":"create_destination","destination":destination,"needs_secret":needs_secret})
+            Self::CreateDestination { destination } => {
+                json!({"op":"create_destination","destination":destination})
             }
             Self::Stream { camera, command } => {
                 json!({"camera":camera.selector(),"command":command})
@@ -209,7 +184,6 @@ impl Serialize for Checked {
 pub struct PlanState {
     pub dataset_slot: Option<String>,
     pub dataset_planned: bool,
-    pub signal_captures: BTreeMap<String, Option<String>>,
     pub origin: Origin,
     pub actor_id: Option<String>,
     /// Optional ownership facts prevent conservative CLI classification
@@ -226,9 +200,6 @@ pub struct PlanState {
     pub canceled_jobs: BTreeSet<(String, u64)>,
     pub changed_features: BTreeMap<String, BTreeSet<String>>,
     pub planned_bytes: u64,
-    /// Private signal payload allowances do not reserve the already-paid native
-    /// dataset extents a second time. Exports still require global file space.
-    pub prepaid_signal_payload_bytes: u64,
     pub planned_files: u64,
 }
 
@@ -241,12 +212,6 @@ impl PlanState {
                 .as_ref()
                 .and_then(|dataset| dataset.slot_id.clone()),
             dataset_planned: false,
-            signal_captures: ctx
-                .snapshot
-                .signals
-                .iter()
-                .map(|source| (source.id.clone(), Some(source.capture_id.clone())))
-                .collect(),
             origin: Origin::Cli,
             actor_id: None,
             run: None,
@@ -293,7 +258,6 @@ impl PlanState {
             canceled_jobs: BTreeSet::new(),
             changed_features: BTreeMap::new(),
             planned_bytes: 0,
-            prepaid_signal_payload_bytes: 0,
             planned_files: 0,
         }
     }
@@ -361,12 +325,8 @@ pub struct RunFacts {
     /// when its worker lifetime ends.
     pub worker_pids: BTreeMap<String, u32>,
     pub human_values: BTreeMap<(String, String), String>,
-    /// Approved source references, selected by the caller rather than the model.
-    pub data_sources: BTreeSet<String>,
     /// The exact open dataset slot lifetime authorized for this task.
     pub dataset: Option<String>,
-    /// Acknowledged captures actually started by this run: source reference → token.
-    pub signal_captures: BTreeMap<String, String>,
 }
 
 fn raise(checked: &mut Checked, reason: &str) {
@@ -464,17 +424,12 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
             .iter()
             .filter(|a| a.camera.as_deref() == Some(&camera))
     };
-    let owns = |a: &crate::session::SessionActivity| {
-        actor
-            .as_deref()
-            .is_some_and(|id| a.actor.as_ref().is_some_and(|a| a.id == id))
-    };
+    let owns =
+        |a: &crate::session::SessionActivity| actor.as_deref().is_some_and(|id| a.actor.id == id);
     let foreign_recent_write = activity()
         .filter(|a| {
             !owns(a)
-                && a.actor
-                    .as_ref()
-                    .is_none_or(|a| a.kind != crate::session::ActorKind::Agent)
+                && a.actor.kind != crate::session::ActorKind::Agent
                 && a.state != crate::session::ActivityState::Failed
                 && matches!(
                     a.operation.as_str(),
@@ -627,37 +582,26 @@ pub struct StepOutcome {
 }
 
 /// One executor per plan or run preserves connect aliases and undo tokens.
-#[cfg(test)]
-type DestinationCreator<'a> = dyn Fn(&Destination, Option<Zeroizing<String>>) -> Result<Value> + 'a;
-
 pub struct Executor<'a> {
     dataset_slot: Option<String>,
-    dataset_sink_generation: Option<u64>,
-    signal_captures: BTreeMap<String, String>,
     host: &'a dyn ToolHost,
     secrets: &'a dyn SecretSource,
     pub aliases: HashMap<String, String>,
     pub tokens: Vec<(String, String)>,
     acknowledged: Vec<Value>,
     forwarders: BTreeMap<String, String>,
-    #[cfg(test)]
-    destination_creator: Option<&'a DestinationCreator<'a>>,
 }
 
 impl<'a> Executor<'a> {
     pub fn new(host: &'a dyn ToolHost, secrets: &'a dyn SecretSource) -> Self {
         Self {
             dataset_slot: None,
-            dataset_sink_generation: None,
-            signal_captures: BTreeMap::new(),
             host,
             secrets,
             aliases: HashMap::new(),
             tokens: Vec::new(),
             acknowledged: Vec::new(),
             forwarders: BTreeMap::new(),
-            #[cfg(test)]
-            destination_creator: None,
         }
     }
 
@@ -857,53 +801,13 @@ impl<'a> Executor<'a> {
                     if *dataset_from_plan {
                         let slot = self.dataset_slot.as_deref().context("The earlier step did not acknowledge its dataset. Review the dataset before continuing.")?;
                         super::data::bind_dataset(&mut command, slot)?;
-                        if let SessionCommand::SignalCapture {
-                            sink_generation, ..
-                        }
-                        | SessionCommand::DatasetCloseIf {
-                            sink_generation, ..
-                        } = &mut command
-                        {
-                            *sink_generation = Some(self.dataset_sink_generation.context("The earlier step did not acknowledge its sample sink. Review the dataset before starting capture.")?);
-                        }
                     }
                     super::data::contain_output(checked.output_root.as_deref(), &command)?;
                     command.validate()?;
                     let result = self.host.execute(None, command)?;
-                    if let Some(generation) = result["sink_generation"].as_u64() {
-                        self.dataset_sink_generation = Some(generation);
-                    }
-                    super::data::acknowledge(
-                        &result,
-                        &mut self.dataset_slot,
-                        &mut self.signal_captures,
-                    );
+                    super::data::acknowledge(&result, &mut self.dataset_slot);
                     self.acknowledged.push(redact::for_output(result.clone()));
                     super::read::bound(result)
-                }
-                Op::StopSignal { source, capture_id } => {
-                    let capture_id = capture_id.as_ref().or_else(|| self.signal_captures.get(source))
-                        .context("The earlier step did not acknowledge its signal capture. Inspect it before stopping.")?;
-                    let command = SessionCommand::SignalStopIf {
-                        id: source.clone(),
-                        capture_id: capture_id.clone(),
-                    };
-                    command.validate()?;
-                    let result = self.host.execute(None, command)?;
-                    self.acknowledged.push(redact::for_output(result.clone()));
-                    result
-                }
-                Op::WaitData {
-                    source,
-                    capture_id,
-                    timeout_ms,
-                    samples,
-                } => {
-                    let capture_id = capture_id
-                        .as_ref()
-                        .or_else(|| self.signal_captures.get(source))
-                        .context("Identify a signal capture before waiting for it.")?;
-                    super::data::wait(self.host, source, capture_id, *timeout_ms, *samples, cancel)?
                 }
                 Op::Connect { selector } => {
                     let command = SessionCommand::Connect {
@@ -1023,22 +927,7 @@ impl<'a> Executor<'a> {
                     );
                     json!({"results":sequence})
                 }
-                Op::CreateDestination {
-                    destination,
-                    needs_secret,
-                } => {
-                    let secret = self.secrets.secret(checked.id, "secret");
-                    ensure!(
-                        !needs_secret || secret.is_some(),
-                        "Enter the destination's secret key before creating it."
-                    );
-                    #[cfg(test)]
-                    if let Some(create) = self.destination_creator {
-                        results.push(redact::for_output(create(destination, secret)?));
-                        continue;
-                    }
-                    create_destination(destination, secret)?
-                }
+                Op::CreateDestination { destination } => create_destination(destination)?,
                 Op::Observe(call) => {
                     let ctx = Context::gather(
                         self.host,
@@ -1168,89 +1057,22 @@ fn url_host(value: &str) -> Option<String> {
     )
 }
 
-fn create_destination(
-    destination: &Destination,
-    secret: Option<Zeroizing<String>>,
-) -> Result<Value> {
+fn create_destination(destination: &Destination) -> Result<Value> {
     destination.validate()?;
-    if let crate::destination::Target::Folder { path } = &destination.target {
-        let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from)
-            .context("Choose a folder for captures after configuring your home directory.")?;
-        for protected in [crate::ipc::runtime_dir(), crate::ipc::state_dir()] {
-            super::values::folder_path_live(
-                path,
-                &home,
-                &protected,
-                &crate::destination::staging_root(),
-            )
-            .map_err(|issue| anyhow!(issue.message))?;
-        }
-        crate::destination::create(destination, secret)?;
-        return Ok(json!({"destination":destination}));
-    }
-    #[cfg(not(feature = "s3"))]
-    {
-        let _ = secret;
-        bail!("S3 destinations are unsupported in this build; rebuild with --features s3.")
-    }
-    #[cfg(feature = "s3")]
-    {
-        use crate::destination::{Credentials, NoOverwrite, Target, secrets};
-        let Target::S3(bucket) = &destination.target else {
-            bail!("This tool creates folder or S3 destinations.");
-        };
-        let write = match (&bucket.credentials, secret) {
-            (Credentials::Keychain { access_key_id }, Some(secret)) => {
-                crate::s3::validate_secret(&secret)?;
-                secrets::SecretWrite::queue(Some((access_key_id.clone(), secret)))
-            }
-            (_, None) => None,
-            _ => bail!("Only keychain credentials take a secret key."),
-        };
-        let change = secrets::store_secret(write)?;
-        let result = (|| {
-            let client = crate::s3::Client::new(bucket)?;
-            let check = client.check();
-            let warning = match check {
-                Ok(()) => None,
-                Err(error)
-                    if !crate::s3::retryable(&error)
-                        && format!("{error:#}").contains("may not inspect it") =>
-                {
-                    Some(format!("{error:#}"))
-                }
-                Err(error) => {
-                    return Err(
-                        error.context("The bucket check failed; fix the destination settings.")
-                    );
-                }
-            };
-            let mut saved = destination.clone();
-            let mut probe = None;
-            if !bucket.endpoint.is_empty() {
-                let (writes, removed) = client.probe_conditional_writes()?;
-                if let Target::S3(bucket) = &mut saved.target {
-                    bucket.no_overwrite = if writes == crate::s3::ConditionalWrites::Enforced {
-                        NoOverwrite::IfNoneMatch
-                    } else {
-                        NoOverwrite::CheckFirst
-                    };
-                }
-                probe = Some(json!({"conditional_writes":writes.as_str(),"probe_removed":removed}));
-            }
-            crate::destination::create(&saved, None)?;
-            Ok(json!({"destination":saved,"warning":warning,"probe":probe}))
-        })();
-        if result.is_err()
-            && let Some(change) = &change
-        {
-            secrets::restore_secret(change, true)
-                .context("Restore the credential after the destination could not be created.")?;
-        }
-        result
-    }
+    let crate::destination::Target::Folder { path } = &destination.target;
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .context("Choose a folder for captures after configuring your home directory.")?;
+    super::values::folder_path_live(
+        path,
+        &home,
+        &crate::ipc::runtime_dir(),
+        &crate::ipc::state_dir(),
+    )
+    .map_err(|issue| anyhow!(issue.message))?;
+    crate::destination::create(destination)?;
+    Ok(json!({"destination":destination}))
 }
 
 #[derive(Debug)]
@@ -1663,11 +1485,8 @@ pub fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{ActivityState, FeatureValue};
     use crate::tools::tests::{FakeHost, SCANNER, fixture_context, fixture_snapshot};
-    use crate::{
-        destination::{Bucket, Credentials, NoOverwrite, Target},
-        session::{ActivityState, FeatureValue},
-    };
 
     fn step(tool: &str, args: Value) -> Checked {
         Checked::new(
@@ -1842,15 +1661,15 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_destination_login_change_is_a_different_approval_target() {
+    fn a_saved_destination_path_change_is_a_different_approval_target() {
         let ctx = fixture_context(fixture_snapshot());
         let mut approved = checked_capture(&ctx, "capture_photos");
         let mut destination = ctx.destinations[1].clone();
-        destination.approval_identity = Some("alice-credential-selection".into());
+        destination.approval_identity = Some("first-folder-identity".into());
         approved.destination = Some(destination);
         let mut fresh = approved.clone();
         fresh.destination.as_mut().unwrap().approval_identity =
-            Some("bob-credential-selection".into());
+            Some("second-folder-identity".into());
         assert_eq!(
             serde_json::to_value(&approved.destination).unwrap(),
             serde_json::to_value(&fresh.destination).unwrap()
@@ -2243,56 +2062,6 @@ mod tests {
     }
 
     #[test]
-    fn s3_secret_sources_follow_stable_step_ids_after_reordering() {
-        let host = FakeHost::new(fixture_snapshot());
-        let secrets = |id: StepId, field: &str| {
-            (field == "secret").then(|| Zeroizing::new(format!("secret-for-{}", id.0)))
-        };
-        let writes = std::cell::RefCell::new(Vec::new());
-        let create = |destination: &Destination, secret: Option<Zeroizing<String>>| {
-            writes
-                .borrow_mut()
-                .push((destination.name.clone(), secret.unwrap().to_string()));
-            Ok(json!({"created":destination.name}))
-        };
-        let mut executor = Executor::new(&host, &secrets);
-        executor.destination_creator = Some(&create);
-        for id in [44, 12] {
-            let destination = Destination {
-                name: format!("d{id}"),
-                target: Target::S3(Bucket {
-                    endpoint: String::new(),
-                    region: "us-east-1".into(),
-                    bucket: "bucket-name".into(),
-                    prefix: String::new(),
-                    path_style: false,
-                    credentials: Credentials::Keychain {
-                        access_key_id: "AKIA0000000000000000".into(),
-                    },
-                    keep_local: false,
-                    no_overwrite: NoOverwrite::IfNoneMatch,
-                }),
-            };
-            let mut checked = step("create_s3_destination", json!({}));
-            checked.id = StepId(id);
-            checked.ops.push(Op::CreateDestination {
-                destination,
-                needs_secret: true,
-            });
-            executor
-                .run_step(&checked, &AtomicBool::new(false))
-                .unwrap();
-        }
-        assert_eq!(
-            *writes.borrow(),
-            [
-                ("d44".into(), "secret-for-44".into()),
-                ("d12".into(), "secret-for-12".into())
-            ]
-        );
-    }
-
-    #[test]
     fn approval_binding_detects_camera_times_and_argument_changes() {
         let before = step(
             "schedule_captures",
@@ -2598,7 +2367,12 @@ mod tests {
         ctx.snapshot.activity.push(crate::session::SessionActivity {
             id: 100,
             origin: crate::session::ActivityOrigin::Gui,
-            actor: None,
+            actor: crate::session::SessionActor::new(
+                "desktop-test",
+                "Desktop",
+                crate::session::ActorKind::Human,
+            )
+            .unwrap(),
             operation: "set".into(),
             camera: Some("sim:0".into()),
             feature: Some("Gain".into()),

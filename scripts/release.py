@@ -24,7 +24,6 @@ LINE_COMPUTER = re.search(r'^repository\s*=\s*"([^"]+)"', (ROOT / 'Cargo.toml').
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
 # No 32-bit ARM: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS.
 TARGETS = [(os_, arch) for os_, arches in [('linux', ['x86_64', 'aarch64']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches]
-FEATURES = ['--features', 'wgpu']
 # The oldest systems release executables must start on: glibc 2.28 (RHEL,
 # Rocky and Alma 8, Debian 10, Ubuntu 18.10 and newer) and the macOS
 # deployment targets. Windows executables must not need the Visual C++
@@ -278,10 +277,7 @@ def web_metadata():
 
 def cargo_features(web):
     """The release cargo feature flags, plus embedded-web with a built client."""
-    flags = list(FEATURES)
-    if web:
-        flags[-1] += ',embedded-web'
-    return flags
+    return ['--features', 'embedded-web'] if web else []
 
 def crate_components(metadata, lock):
     """CycloneDX components for the crates a package links, with Cargo.lock checksums."""
@@ -351,7 +347,7 @@ def license_notices(metadata, title='Rust crates compiled into this Capturefab e
     return f'{title}\n' + ''.join(f'\n===== {", ".join(names)} =====\n\n{text}\n' for text, names in texts.items())
 
 def notices(target, web=False):
-    metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', target, *FEATURES], cwd=ROOT, capture_output=True, text=True).stdout
+    metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', target], cwd=ROOT, capture_output=True, text=True).stdout
     text = license_notices(json.loads(metadata))
     if web:
         text += '\n' + license_notices(web_metadata(), 'Rust crates compiled into the browser client (web-client) built into this executable for serve --listen, and their license texts.')

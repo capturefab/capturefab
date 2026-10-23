@@ -227,7 +227,7 @@ mod tests {
             tls_server_name: None,
             rtsp_port: None,
             rejected: None,
-            revision: None,
+            revision: [0; 16],
         };
         store.save_with(&hub, |_| Ok(()), |_| Ok(())).unwrap();
         store.get("home").unwrap()

@@ -39,10 +39,11 @@ pub enum ProviderId {
     #[serde(rename = "lmstudio")]
     LmStudio,
     Custom,
+    AppleFoundationModels,
 }
 
 impl ProviderId {
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::OpenAi,
         Self::Anthropic,
         Self::Gemini,
@@ -65,6 +66,7 @@ impl ProviderId {
         Self::Ollama,
         Self::LmStudio,
         Self::Custom,
+        Self::AppleFoundationModels,
     ];
 
     pub fn id(self) -> &'static str {
@@ -77,6 +79,11 @@ impl ProviderId {
 
     pub fn protocol(self) -> Protocol {
         self.info().protocol
+    }
+
+    /// OS inference runs in a bundled native helper, never an HTTP endpoint.
+    pub fn is_on_device(self) -> bool {
+        self == Self::AppleFoundationModels
     }
 }
 
@@ -117,6 +124,7 @@ pub enum AuthScheme {
     Bedrock,
     OptionalBearer,
     Ollama,
+    None,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,7 +251,7 @@ const CHAT: Dialect = Dialect {
 const NORMAL_EFFORT: Option<[&str; 3]> = Some(["low", "medium", "high"]);
 const HIGH_EFFORT: Option<[&str; 3]> = Some(["low", "high", "high"]);
 
-pub static PROVIDERS: [ProviderInfo; 22] = [
+pub static PROVIDERS: [ProviderInfo; 23] = [
     ProviderInfo {
         id: "openai",
         name: "OpenAI",
@@ -706,6 +714,26 @@ pub static PROVIDERS: [ProviderInfo; 22] = [
             ..CHAT
         }),
     },
+    ProviderInfo {
+        id: "apple_foundation_models",
+        name: "Apple Intelligence",
+        // Chat is the internal conversation format; no HTTP request is sent.
+        protocol: Protocol::Chat,
+        base_url: "foundation-models://local",
+        auth: AuthScheme::None,
+        key_envs: &[],
+        settings: &[],
+        default_model: "on-device",
+        suggested_models: &["on-device"],
+        suggested_vision_model: None,
+        keychain_account: "apple_foundation_models",
+        vision_default: Some(false),
+        dialect: Some(Dialect {
+            max_images_per_request: 0,
+            max_image_bytes: 0,
+            ..CHAT
+        }),
+    },
 ];
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -768,6 +796,51 @@ impl ProviderSettings {
     /// environment. Missing run-time fields are checked by endpoint construction.
     pub fn validate(&self, id: ProviderId) -> Result<(), Vec<SettingsError>> {
         let mut issues = Vec::new();
+        if id.is_on_device() {
+            if self
+                .model
+                .as_deref()
+                .is_some_and(|model| model != id.info().default_model)
+            {
+                issues.push(SettingsError::new(
+                    "model",
+                    "Apple Intelligence uses the on-device system model.",
+                ));
+            }
+            for (field, value) in [
+                ("account_id", &self.account_id),
+                ("gateway_id", &self.gateway_id),
+                ("region", &self.region),
+                ("profile", &self.profile),
+                ("project", &self.project),
+                ("location", &self.location),
+            ] {
+                if value.is_some() {
+                    issues.push(SettingsError::new(
+                        field,
+                        "Apple Intelligence does not use cloud configuration.",
+                    ));
+                }
+            }
+            if self.effort.is_some() {
+                issues.push(SettingsError::new(
+                    "effort",
+                    "Apple Intelligence does not expose reasoning effort.",
+                ));
+            }
+            if self.vision == Some(VisionMode::On) {
+                issues.push(SettingsError::new(
+                    "vision",
+                    "Apple Intelligence supports text only; choose Auto or Off.",
+                ));
+            }
+            if self.saved_key {
+                issues.push(SettingsError::new(
+                    "saved_key",
+                    "Apple Intelligence does not use an API key.",
+                ));
+            }
+        }
         for (field, value) in [
             ("model", &self.model),
             ("base_url", &self.base_url),
@@ -1264,6 +1337,12 @@ pub fn endpoints(
 ) -> Result<EndpointSet, Vec<SettingsError>> {
     settings.validate(id)?;
     validate_model(model).map_err(|issue| vec![issue])?;
+    if id.is_on_device() && model != id.info().default_model {
+        return Err(vec![SettingsError::new(
+            "model",
+            "Apple Intelligence uses the on-device system model.",
+        )]);
+    }
     let make = |url: String, protocol| Endpoint { url, protocol };
     if id == ProviderId::Vertex {
         let location = settings.location.as_deref().unwrap_or("global");
@@ -1290,6 +1369,9 @@ pub fn endpoints(
         return Ok(EndpointSet { primary, express });
     }
     let url = match id {
+        ProviderId::AppleFoundationModels => {
+            format!("{}/chat/completions", id.info().base_url)
+        }
         ProviderId::Bedrock => {
             let region = settings.region.as_deref().ok_or_else(|| {
                 vec![SettingsError::new(
@@ -1366,6 +1448,47 @@ fn vertex_encode(value: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    #[test]
+    fn native_provider_has_a_fixed_local_model_and_rejects_remote_configuration() {
+        let id = ProviderId::AppleFoundationModels;
+        assert!(id.is_on_device());
+        assert!(id.info().key_envs.is_empty());
+        let endpoint = endpoints(id, &ProviderSettings::default(), "on-device").unwrap();
+        assert_eq!(
+            endpoint.select(false).unwrap().url,
+            "foundation-models://local/chat/completions"
+        );
+        assert!(endpoints(id, &ProviderSettings::default(), "remote-model").is_err());
+        for settings in [
+            ProviderSettings {
+                model: Some("cloud-model".into()),
+                ..ProviderSettings::default()
+            },
+            ProviderSettings {
+                base_url: Some("https://api.example/v1".into()),
+                ..ProviderSettings::default()
+            },
+            ProviderSettings {
+                endpoint: Some("https://api.example/v1".into()),
+                ..ProviderSettings::default()
+            },
+            ProviderSettings {
+                saved_key: true,
+                ..ProviderSettings::default()
+            },
+            ProviderSettings {
+                vision: Some(VisionMode::On),
+                ..ProviderSettings::default()
+            },
+            ProviderSettings {
+                effort: Some(Effort::High),
+                ..ProviderSettings::default()
+            },
+        ] {
+            assert!(settings.validate(id).is_err(), "{settings:?}");
+        }
+    }
 
     fn settings_url(field: &str, url: &str) -> ProviderSettings {
         let mut settings = ProviderSettings::default();
@@ -1496,6 +1619,12 @@ mod tests {
             ("ollama", "qwen3.8", Protocol::Chat, &["OLLAMA_API_KEY"][..]),
             ("lmstudio", "", Protocol::Chat, &["LM_API_TOKEN"][..]),
             ("custom", "", Protocol::Chat, &["CAPTUREFAB_AI_API_KEY"][..]),
+            (
+                "apple_foundation_models",
+                "on-device",
+                Protocol::Chat,
+                &[][..],
+            ),
         ];
         let mut seen = BTreeSet::new();
         for (provider, (id, model, protocol, envs)) in ProviderId::ALL.into_iter().zip(expected) {
@@ -1521,7 +1650,7 @@ mod tests {
                 validate_model(suggestion).unwrap();
             }
         }
-        assert_eq!(seen.len(), 22);
+        assert_eq!(seen.len(), ProviderId::ALL.len());
         assert_eq!(ProviderId::Anthropic.info().keychain_account, "claude");
         assert_eq!(ProviderId::OpenAi.info().keychain_account, "openai");
         assert_eq!(ProviderId::Gemini.info().keychain_account, "gemini");

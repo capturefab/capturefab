@@ -169,7 +169,7 @@ Each desktop window shows exactly one camera; there is no camera list, overview
 grid or Next/Previous camera. A window without a camera shows the camera picker:
 found and recent cameras as cards (a recent card reveals **Forget** on hover),
 the simulator offer, the address field (`connect-address`, focused by
-Cmd/Ctrl-L) beside **Search again**, then data sources, Settings, Help and the
+Cmd/Ctrl-L) beside **Search again**, then Settings, Help and the
 session command. **File › Connect to Camera…** (Cmd/Ctrl-N) focuses an empty
 window or opens a new one in the same process and session. Picking, typing or
 connecting a camera that another window shows brings that window forward
@@ -234,6 +234,57 @@ the rendered fixture and actual-widget body geometry only; OS window behavior
 and native Windows and Linux execution remain unverified. This review does not
 establish full HIG completion.
 
+## October 22, 2026 screen audit
+
+This pass inspected the application's screen families and failure, pending,
+scrolled and compact states. Its fixes cover:
+
+- Camera pickers deduplicate connected/discovered aliases, retain pending
+  indicators for connections by serial, and refresh equal-length feature caches
+  immediately on selection. Address submission checks file paths off the UI
+  thread and cancels delayed results after edits, selection or navigation.
+- Quick Guide explanations, address examples and action buttons wrap within
+  compact sheets. Dataset paths and long values wrap inside the inspector.
+  Measurement screenshots no longer wait for a hidden Acquisition report.
+  Compact approval decisions remain visible, and scanner guidance reserves
+  space beside floating Capture or Features panels.
+- Failed provider-key saves retain the private draft for retry; closing Settings
+  still clears it. Committed settings refresh sibling windows without replacing
+  open drafts or settings used by active credential operations and tests.
+  Refreshes invalidate old readiness and connection receipts, including
+  replacements of an already-saved key. Quick
+  Command retries retain the exact failed provider prompt and do not resend an
+  older request for a local validation error.
+- Browser polling no longer replaces newer command notices with a retained
+  camera error. Stopped streams omit stale FPS, and clearing a preview resets its
+  status label.
+
+The full renderer matrix produced and reviewed 171 views across
+`target/screen-audit-final-2026-10-22` and
+`target/screen-audit-panels-2026-10-22`. Per-image manifests retain binary and PNG
+hashes; review notes record the inspected names and coverage limits. The local
+combined gallery is `target/screen-audit-combined-2026-10-22/index.html`.
+Ten affected scanner and approval views were recaptured and reviewed in
+`target/screen-audit-fixes-2026-10-22` after the last layout fixes; the combined
+gallery uses these replacements. Its verifier checks each PNG hash and requires
+a review from that image's source run. The final current-source library run
+passed 2,234 tests with 18 ignored, using four test threads without omitting any
+tests. All five earlier media failures passed isolated execution and the full
+rerun. Strict all-feature/all-target native Clippy, formatting, the native build,
+13 browser tests, strict WASM Clippy, the WASM release build and seven screenshot
+script tests passed. Focused widget checks cover the approval decisions across
+24 compact size/appearance/scale cases and placeholder guidance beside either
+floating panel at every interface size.
+
+The browser simulator flow was exercised and five saved PNG captures were
+decoded. A final check with the rebuilt client and native server verified live
+preview, stopped-stream status without stale FPS, and preview-label reset on
+disconnect. macOS was locked during this pass, so current native window interaction,
+OS chrome and the separate Settings window remain unverified. Renderer fixtures
+and widget tests do not establish those platform behaviors. The historical HIG
+requirements and platform gates below remain separate from this screen audit;
+this pass does not establish full HIG completion.
+
 ## Requirements and current evidence
 
 | Requirement | Implemented source evidence | Runtime gate or remaining gap |
@@ -246,7 +297,7 @@ establish full HIG completion.
 | Keyboard operation and visible focus | `gui/button.rs` adds Tab/Shift-Tab, Enter, Space release, disabled exclusion and focus rings. Shared checkboxes, radio segments, numeric slider controls and disclosures expose corresponding behavior. `gui/pick_list.rs` adds arrow/Home/End/Page navigation, type-ahead, selection, cancellation and long-menu scrolling. `gui/keyboard_history.rs` guards modal input and forwards native clipboard edits to real editors. Scoped dialog defaults preserve popup confirmation and IME composition. `gui/accessibility/scroll.rs` reveals the freshly focused control after Tab/Shift-Tab and native focus. | The compact macOS workflow revealed Capture fully through Tab at 900×620 with Larger interface size. Complete remaining critical workflows without a pointer on each desktop, including focus restoration and native-menu editing. |
 | Native assistive technology | `gui/accessibility.rs` collects actual widget semantics and bounds while an assistive technology listens: from its first request for a tree until AT-SPI reports it gone (macOS and Windows never do). Draws after input or a change of state collect at once; draws of new camera frames alone at most four times a second. `gui/accessibility/native.rs` installs AccessKit adapters on each hidden native window before showing it. Buttons, checkboxes, radio choices, sliders, disclosures, pick lists, options and text fields publish roles, names, states and supported actions. | Inspect the actual native tree and complete workflows with VoiceOver, Narrator and Orca. A source test cannot establish that the operating system exposes or operates the intended control. |
 | Validation, failures and progress | Text-field semantics expose the current draft, invalid state and precise validation reason through `gui/text_input.rs`. Capture/recording output and bitrate errors appear inline and in field descriptions. Shared headings and errors use semantic Heading and Alert wrappers. Toolbar notices announce the command outcome with its details once through Alert/Status live regions; important errors remain until a new command, newer error or dismissal, and the activity log retains them. Local file output labels the action Start recording; stream output uses Start forwarding. Preview content has an Image description without a frame-arrival live region. | Verify actionable error recovery, notice announcements and reading order. Pending/completed states must be understandable without color and must not flood announcements during camera refresh. |
-| Destructive actions and preservation | Destination removal has an explicit confirmation and leaves files untouched. `storage.rs` protects changed external files, active recordings and queued uploads. `gui/storage_policy.rs` reads the configured policy on a worker, and the inspector distinguishes requested values from actual app-wide/effective limits. Captions explain permanent deletion, write-triggered age enforcement and when app-wide Delete oldest overrides Stop. Loading/unavailable states avoid presenting an unknown policy as confirmed. | Runtime verify configured policy changes, failed policy reads and deletion/removal flows. Source coverage establishes policy disclosure behavior, rather than actual deletion or assistive-technology usability. |
+| Destructive actions and preservation | Destination removal has an explicit confirmation and leaves files untouched. `storage.rs` protects changed external files, active recordings. `gui/storage_policy.rs` reads the configured policy on a worker, and the inspector distinguishes requested values from actual app-wide/effective limits. Captions explain permanent deletion, write-triggered age enforcement and when app-wide Delete oldest overrides Stop. Loading/unavailable states avoid presenting an unknown policy as confirmed. | Runtime verify configured policy changes, failed policy reads and deletion/removal flows. Source coverage establishes policy disclosure behavior, rather than actual deletion or assistive-technology usability. |
 | Layout and high DPI | iced layout uses logical units. Native accessibility bounds apply nested scroll translations and viewport clipping before native display/interface scaling. Sheets measure and reserve their actual header/footer height before allocating the scroll body. A camera window keeps capture and video settings in a left sidebar and camera features in a right inspector, each with its own title-bar toggle and remembered state. Both dock from 1080 units wide, where the toolbar folds its labels to glyphs (Capture All's last); narrower, they float over the stage one at a time. The camera picker shows neither. Settings and sheet bodies scroll. Initial/restored sizes and auxiliary windows are fitted after interface-scale changes. Actual widget layouts cover long titles/errors, pinned actions, compact inspectors and focused-control reveal at every interface size. | Verify the camera picker, inspector, destination editor, errors and settings at 1x/Retina and Windows/Linux scales, including longer labels. Software geometry and macOS compact checks do not establish other desktops' native hit testing or multi-monitor behavior. |
 | Complete native workflows | Camera work continues through the shared session/worker model. Pointer, keyboard, menu and accessibility actions use the same messages, draft validation, command refusal and local undo history. | On each supported platform, test discovery, connect, selection, features, capture, destinations, recording, stop, failures, settings and window closure through keyboard and assistive technology. |
 
@@ -392,9 +443,8 @@ labels and unbroken paths wrap within the row's remaining width, retaining their
 complete native text. Raw worker/coordinator messages wrap the same way, and a
 shared content gutter keeps both kinds of entries clear of the overlay scrollbar.
 
-Raw log entries retain their original clock text and add optional validated Unix
-milliseconds and producer UTC offset. Old entries and malformed optional metadata
-remain readable without inventing an instant. The desktop formats raw and
+Raw log entries contain validated Unix milliseconds and the producer UTC offset.
+The desktop formats raw and
 structured Activity timestamps through one local-time path. macOS uses cached
 NSDateFormatter instances and current user preferences; Windows uses
 GetTimeFormatEx/GetDateFormatEx with user overrides. Visible clock labels have a
@@ -406,7 +456,7 @@ caches. Locale changes do not create a new error announcement identity.
 Activity now shows date headings for contiguous runs in each recorded source:
 Diagnostics for raw logs and Command updates for structured commands. Each row's
 clock, copied value and calendar-day identity use the same viewer-local instant;
-localized day captions do not determine identity. Legacy logs and invalid times
+localized day captions do not determine identity. Invalid activity times
 show Date unavailable. Entries retain their source order and copied contents.
 Permanent heading slots preserve row and timestamp identities and focus when a
 command completes across midnight. Bounded heading-ID caches are pruned even
@@ -696,9 +746,9 @@ The full output is retained in
 check was not retried without a toolchain change. The older successful snapshot
 does not verify the latest per-window focus/style or bundled-dependency changes.
 
-The separate `gui,s3` cross-check stopped in `ring` 0.17.14's C build because the
+A separate optional-feature cross-check stopped in `ring` 0.17.14's C build because the
 Windows CRT/SDK header `assert.h` is unavailable; this is a toolchain prerequisite
-failure before the S3-enabled application could be checked. No SDK was downloaded
+failure before the application could be checked. No SDK was downloaded
 or replaced with stubs. Native Windows execution, Narrator and the other native
 screen-reader workflows remain unverified. These compile/source results do not
 establish runtime usability or full HIG completion.
@@ -817,10 +867,7 @@ At 900×620 native window size with Larger interface size, Tab navigation scroll
 the Capture inspector until the entire Capture button was visible. This checks
 the focused-control reveal in the built app as well as the software layout tests.
 
-In the S3 destination editor, Escape first closed only the dropdown. Subsequent
-Escape presses returned from the draft to the destination manager, then from the
-manager to the main workbench. The native folder destination picker also opened
-and cancelled successfully.
+The native folder destination picker opened and cancelled successfully.
 
 An isolated preferences-write failure was exercised through the native Quit
 command. The application retained its main window and exposed “Could not save
@@ -890,7 +937,7 @@ exposes the same Quit shortcut; these distinct commands follow the
 Destination editor draft fields, selectors, checkboxes, folder selection and
 save/navigation actions disable during a pending save. Advanced disclosure stays
 available so users can read the frozen values. Actual widget tests cover folder
-and S3 credential variants, disabled native actions, Tab exclusion, retained
+variants, disabled native actions, Tab exclusion, retained
 values and stable IDs when saving completes.
 
 These checks establish working macOS accessibility semantics and action routing
@@ -970,3 +1017,11 @@ Apple's [Settings guidelines](https://developer.apple.com/design/human-interface
 are the reference for the App-menu Settings command, Command-comma and the
 separate macOS settings presentation. Interface text scaling and display DPI are
 separate concerns; both implementations require the layout checks above.
+
+## Resources
+
+The toolbar’s **Resources** control opens one sheet for live device CPU load, shared camera-buffer memory and capture storage. A small status indicator highlights pressure or recent camera-frame losses without adding another capture tab. Settings links to the same sheet.
+
+The rows show current usage, effective limits and headroom; **Adjust** reveals their controls. Automatic protection is the default. CPU pressure and low available memory reduce processing parallelism and automatic preview work. Buffer limits apply before a new camera allocation, and disk controls reuse the existing quota and retention policy. Unknown or stale readings say so instead of showing a reassuring zero.
+
+Frame delivery distinguishes camera/worker losses from preview frames skipped to keep the display current. Active user limits and hardware-pressure safeguards are shown beside those observations. Thread and buffer controls state their scope; they are not hard quotas for total application CPU or all resident memory. Changing limits does not restart a running recording or reduce saved image resolution.

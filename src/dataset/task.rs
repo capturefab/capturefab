@@ -32,7 +32,6 @@ mod snapshot_impl;
 mod writer;
 use super::snapshot;
 pub use super::snapshot::{SnapshotLimits, SnapshotProjection, SnapshotReceipt};
-pub(crate) use export::RetainedExportStage;
 pub use writer::{TaskCatalogIdentity, TaskCatalogStatus};
 
 #[repr(C)]
@@ -214,19 +213,7 @@ impl TaskDataset {
         lease: Arc<RetainedNamespaceLease>,
     ) -> Result<NamespaceRemovalReceipt> {
         let anchor = lease.recovery_anchor()?;
-        if let Err(error) = Self::validate_namespace_path(anchor.path()) {
-            // Earlier versions could publish an empty namespace before the
-            // native adapter rejected its path. The recovered exclusive owner
-            // lock proves the old owner has gone; anchored rmdir proves this
-            // exact original directory contains no retained files. Never use
-            // this fallback for a nonempty or replaced workspace.
-            anchor.remove_empty().with_context(|| {
-                format!(
-                    "legacy namespace path cannot admit a native engine ({error:#}); only a verified empty workspace can be removed"
-                )
-            })?;
-            return anchor.removed_receipt();
-        }
+        Self::validate_namespace_path(anchor.path())?;
         let budget = TaskExtentBudget::new(lease.cap())?;
         let encoded = CString::new(
             anchor
@@ -276,6 +263,37 @@ impl TaskDataset {
         let path = parent.join(format!("task-{}", super::db::random_name()?));
         let anchor = OutputDirectoryPlan::prepare(&path, Some(&parent))?.publish()?;
         Self::open_anchor(anchor, budget, None)
+    }
+    /// Create a camera catalog workspace whose full storage allowance remains
+    /// charged after the engine closes or the process exits. Recovery commands
+    /// explicitly preserve or remove these retained files.
+    pub fn create_retained(
+        parent: &Path,
+        policy: &crate::storage::StoragePolicy,
+        max_bytes: u64,
+    ) -> Result<Self> {
+        ensure!(
+            cfg!(unix),
+            "isolated task storage is unsupported on this platform"
+        );
+        let budget = TaskExtentBudget::new(max_bytes)?;
+        let lease = crate::storage::reserve_task_namespace(parent, policy, max_bytes)?;
+        match Self::create_reserved(lease.clone(), budget) {
+            Ok(dataset) => Ok(dataset),
+            Err(error) => {
+                // Only an unconsumed admission can be cancelled here. Once the
+                // engine has claimed it, create_reserved owns native cleanup
+                // and a failed or uncertain cleanup must retain its full charge.
+                if let Ok(receipt) = lease.cancel_unclaimed() {
+                    lease.confirm_removed(&receipt).with_context(|| {
+                        format!(
+                            "task setup failed: {error:#}; namespace removal could not be journaled"
+                        )
+                    })?;
+                }
+                Err(error)
+            }
+        }
     }
     /// The global storage reservation is durable before the same fresh anchor
     /// is handed to the native engine. Its full cap survives close and Drop.
@@ -505,26 +523,38 @@ impl TaskDataset {
             "task engine close is uncertain; retained files must not be removed"
         );
         drop(self.conn.take());
-        if self.database.is_null() {
-            return Ok(());
-        }
-        let mut database = std::mem::replace(&mut self.database, ptr::null_mut());
-        // SAFETY: every Connection is gone, and ownership moves into this call.
-        let result =
-            bridge(|error| unsafe { capturefab_task_database_close(&mut database, error) });
-        self.close_uncertain = result.is_err();
-        if let Err(error) = &result {
-            self.mode = TaskMode::Failed;
-            if let Some(catalog) = &mut self.catalog {
-                catalog.record_error(error);
+        if !self.database.is_null() {
+            let mut database = std::mem::replace(&mut self.database, ptr::null_mut());
+            // SAFETY: every Connection is gone, and ownership moves into this call.
+            let result =
+                bridge(|error| unsafe { capturefab_task_database_close(&mut database, error) });
+            self.close_uncertain = result.is_err();
+            if let Err(error) = &result {
+                self.mode = TaskMode::Failed;
+                if let Some(catalog) = &mut self.catalog {
+                    catalog.record_error(error);
+                }
             }
+            result?;
         }
-        result
+        if !self.removed
+            && let Some(lease) = &self.retained
+        {
+            // A journal failure can be retried on the next close; native
+            // shutdown already succeeded and the full storage cap stays held.
+            lease.mark_retained()?;
+        }
+        Ok(())
     }
     /// Remove only this anchored namespace after engine close. Open/deleted or
     /// uncertain extents retain their charges until disappearance is proven.
     pub fn remove(mut self) -> Result<()> {
-        self.remove_native()
+        if let Some(lease) = self.retained.clone() {
+            let receipt = self.remove_reserved()?;
+            lease.confirm_removed(&receipt)
+        } else {
+            self.remove_native()
+        }
     }
     fn remove_native(&mut self) -> Result<()> {
         if self.removed {

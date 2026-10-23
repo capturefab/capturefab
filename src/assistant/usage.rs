@@ -48,6 +48,17 @@ impl Prices {
 }
 
 impl Usage {
+    pub(super) fn from_local(body: &Value) -> Option<Self> {
+        let usage = body.get("local_usage")?;
+        Some(Self {
+            input: usage["input_tokens"].as_u64()?,
+            output: usage["output_tokens"].as_u64()?,
+            provider_cost_usd: Some(0.0),
+            estimated: true,
+            ..Self::default()
+        })
+    }
+
     pub fn from_protocol(
         protocol: Protocol,
         body: &Value,
@@ -228,6 +239,23 @@ pub fn converse(body: &Value, input_bytes: usize, output_bytes: usize) -> Usage 
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn native_usage_keeps_both_pass_estimates_and_has_no_api_cost() {
+        let usage =
+            Usage::from_local(&json!({"local_usage":{"input_tokens":2100,"output_tokens":180}}))
+                .unwrap();
+        assert_eq!(usage.input, 2100);
+        assert_eq!(usage.output, 180);
+        assert!(usage.estimated);
+        assert_eq!(usage.estimated_cost(None), Some(0.0));
+        for value in [
+            json!({}),
+            json!({"local_usage":{"input_tokens":-1,"output_tokens":0}}),
+        ] {
+            assert!(Usage::from_local(&value).is_none());
+        }
+    }
 
     #[test]
     fn each_protocol_maps_disjoint_input_and_counts_reasoning_once() {

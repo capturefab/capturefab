@@ -163,6 +163,8 @@ fn allocate(file: &File, length: u64) -> std::io::Result<()> {
 struct Mapping {
     raw: MmapRaw,
     file: Option<RingFile>,
+    // Dropped after unmapping and releasing any backing file.
+    buffer_lease: Option<crate::resources::buffers::BufferLease>,
 }
 impl Mapping {
     fn atomic(&self, offset: usize) -> &AtomicU32 {
@@ -248,6 +250,30 @@ fn ring_bytes(capacity: usize) -> usize {
     HEADER + SLOTS * (META + capacity)
 }
 impl SharedRing {
+    /// Bytes reserved by this layout, including all three frame slots.
+    pub(crate) fn allocation_bytes(capacity: usize) -> Result<u64> {
+        ensure!(valid_capacity(capacity), "invalid camera buffer capacity");
+        Ok(ring_bytes(capacity) as u64)
+    }
+    /// Bind admission to the mapping itself, including counters that outlive
+    /// a Process or Feed. This must precede sharing the mapping.
+    pub(crate) fn attach_buffer_lease(
+        &mut self,
+        lease: crate::resources::buffers::BufferLease,
+    ) -> Result<()> {
+        ensure!(
+            lease.capacity_bytes() == Self::allocation_bytes(self.capacity)?,
+            "camera buffer reservation does not match its allocation"
+        );
+        let mapping =
+            Arc::get_mut(&mut self.map).context("camera buffer was shared before reservation")?;
+        ensure!(
+            mapping.buffer_lease.is_none(),
+            "camera buffer already has a reservation"
+        );
+        mapping.buffer_lease = Some(lease);
+        Ok(())
+    }
     /// A ring for a new worker: anonymous memory where the platform has it,
     /// otherwise a file in `dir`, which must be private.
     pub fn create(dir: &Path, capacity: usize) -> Result<Self> {
@@ -275,7 +301,9 @@ impl SharedRing {
     /// name `sweep` looks for, so a sweep never mistakes it for a dead one.
     fn create_file(dir: &Path, capacity: usize) -> Result<Self> {
         let length = ring_bytes(capacity) as u64;
-        enough_space(dir, fs2::available_space(dir).unwrap_or(u64::MAX), length)?;
+        let available = fs2::available_space(dir)
+            .context("check disk headroom before allocating camera buffers")?;
+        enough_space(dir, available, length)?;
         let mut random = [0u8; 16];
         getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("random ring name: {e}"))?;
         let name = hex(&random);
@@ -321,7 +349,14 @@ impl SharedRing {
         Ok(Self::init(raw, Some(file), capacity))
     }
     fn init(raw: MmapRaw, file: Option<RingFile>, capacity: usize) -> Self {
-        let mut ring = Self::new(Arc::new(Mapping { raw, file }), capacity);
+        let mut ring = Self::new(
+            Arc::new(Mapping {
+                raw,
+                file,
+                buffer_lease: None,
+            }),
+            capacity,
+        );
         // New memory and files read as zeros, so every slot starts FREE.
         // Writing slot headers here would commit pages no frame needs yet.
         ring.put(0, MAGIC);
@@ -376,7 +411,11 @@ impl SharedRing {
     }
     fn opened(raw: MmapRaw) -> Result<Self> {
         ensure!(raw.len() >= HEADER, "truncated shared ring");
-        let map = Arc::new(Mapping { raw, file: None });
+        let map = Arc::new(Mapping {
+            raw,
+            file: None,
+            buffer_lease: None,
+        });
         ensure!(map.bytes(0, 8) == MAGIC, "shared ring version mismatch");
         let capacity = usize::try_from(u64::from_le_bytes(map.bytes(8, 8).try_into()?))?;
         // Shared memory may be rounded up to whole pages.
@@ -389,6 +428,10 @@ impl SharedRing {
     /// Let `command` open this ring: append the worker's argument and, for
     /// anonymous memory, have that child, and only it, inherit the descriptor.
     pub fn pass_to(&self, command: &mut std::process::Command) {
+        crate::resources::buffers::clear_inheritance(command);
+        if let Some(lease) = &self.map.buffer_lease {
+            lease.pass_to(command);
+        }
         command.args(self.worker_arg());
         #[cfg(unix)]
         if let Some(fd) = &self.handoff {
@@ -748,20 +791,25 @@ fn preview(frame: &Frame, capacity: usize) -> Result<Frame> {
     })
 }
 
-/// A ring file must fit on its disk or tmpfs: a frame touching a page the
-/// filesystem cannot back kills the worker with SIGBUS instead of an error.
+/// A ring file must fit on its disk or tmpfs while preserving the same free
+/// disk floor as saved captures. Touching an unbacked page can kill the worker
+/// with SIGBUS instead of returning an allocation error.
 fn enough_space(dir: &Path, free: u64, length: u64) -> Result<()> {
-    if free < length {
+    if !length
+        .checked_add(crate::storage::FREE_SPACE_FLOOR)
+        .is_some_and(|needed| free >= needed)
+    {
         return Err(storage_full(dir, free, length));
     }
     Ok(())
 }
 fn storage_full(dir: &Path, free: u64, length: u64) -> anyhow::Error {
     anyhow::anyhow!(
-        "storage full: {} has {} free, and a camera frame ring needs {}; free space or lower CAPTUREFAB_FRAME_BYTES",
+        "storage full: {} has {} free; a camera frame ring needs {} plus {} kept as disk headroom. Free disk space or lower CAPTUREFAB_FRAME_BYTES.",
         dir.display(),
         crate::analytics::human_bytes(free),
-        crate::analytics::human_bytes(length)
+        crate::analytics::human_bytes(length),
+        crate::analytics::human_bytes(crate::storage::FREE_SPACE_FLOOR)
     )
 }
 
@@ -982,6 +1030,44 @@ mod tests {
         assert!(reader.fresh());
     }
     #[test]
+    fn unwatched_keep_alives_replace_full_slots_without_losses() {
+        let mut writer = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
+        let offered = (SLOTS * 2 + 1) as u32;
+        for id in 1..=u64::from(offered) {
+            // Make each keep-alive due without sleeping or polling the ring.
+            writer.published_at = Some(Instant::now() - KEEP_ALIVE);
+            assert_eq!(writer.write(&frame(id), false).unwrap(), Published::Frame);
+            if id >= SLOTS as u64 {
+                // With no reader freeing slots, every later publication must
+                // replace a READY slot while keeping the ring full.
+                assert!(
+                    (0..SLOTS).all(
+                        |slot| writer.atomic(writer.base(slot)).load(Ordering::Acquire) == READY
+                    )
+                );
+                assert!((0..SLOTS).any(|slot| writer.quad(writer.base(slot) + 8) == id));
+            }
+            assert_eq!(writer.preview_skipped(), 0);
+        }
+        assert_eq!(writer.sequence(), offered);
+        assert_eq!(writer.counters().acquired_sequence(), offered);
+        assert_eq!(writer.atomic(POLLS).load(Ordering::Relaxed), 0);
+
+        let mut reader = writer.reader().unwrap();
+        let mut taken = Frame::default();
+        let meta = reader.take_into(&mut taken, false).unwrap().unwrap();
+        let newest = frame(u64::from(offered));
+        assert_eq!(meta.seq, offered);
+        assert_eq!(taken.id, newest.id);
+        assert_eq!((taken.width, taken.height), (newest.width, newest.height));
+        assert_eq!(taken.pixel_format, newest.pixel_format);
+        assert_eq!(taken.timestamp_ns, newest.timestamp_ns);
+        assert_eq!(taken.data, newest.data);
+        assert!(reader.fresh());
+        assert_eq!(writer.atomic(POLLS).load(Ordering::Relaxed), 0);
+        assert_eq!(writer.preview_skipped(), 0);
+    }
+    #[test]
     fn idle_readers_get_one_keep_alive_a_second() {
         let mut writer = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
         let mut reader = writer.reader().unwrap();
@@ -1159,11 +1245,25 @@ mod tests {
     }
     #[test]
     #[cfg(unix)]
-    fn ring_files_reserve_their_blocks_except_on_tmpfs() {
+    fn backing_files_reserve_their_blocks_except_on_tmpfs() {
         use std::os::unix::fs::MetadataExt;
         let allocated = |dir: &Path| {
-            let ring = SharedRing::create_file(dir, 1 << 20).unwrap();
-            let path = PathBuf::from(ring.worker_arg().unwrap());
+            // Test backing allocation separately from admission: CI's /dev/shm
+            // is commonly smaller than the disk headroom we now preserve.
+            let path = dir.join("allocation.shm");
+            let file = RingFile {
+                file: Some(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                        .unwrap(),
+                ),
+                path: path.clone(),
+            };
+            let raw = file.map(ring_bytes(1 << 20) as u64).unwrap();
+            let _ring = SharedRing::init(raw, Some(file), 1 << 20);
             let meta = std::fs::metadata(path).unwrap();
             assert_eq!(meta.len(), ring_bytes(1 << 20) as u64);
             meta.blocks() * 512
@@ -1186,6 +1286,11 @@ mod tests {
         let error = enough_space(Path::new("/sessions"), 1024, 50_331_904).unwrap_err();
         assert!(error.to_string().starts_with("storage full: "), "{error}");
         assert_eq!(crate::cli::error_code(&error), ("storage_full", 6));
-        enough_space(Path::new("/sessions"), 50_331_904, 50_331_904).unwrap();
+        let length = 50_331_904;
+        let needed = length + crate::storage::FREE_SPACE_FLOOR;
+        enough_space(Path::new("/sessions"), needed, length).unwrap();
+        assert!(enough_space(Path::new("/sessions"), needed - 1, length).is_err());
+        assert!(enough_space(Path::new("/sessions"), u64::MAX, u64::MAX).is_err());
+        assert!(error.to_string().contains("disk headroom"));
     }
 }

@@ -27,6 +27,20 @@ default source; `CAPTUREFAB_SESSION` pins camera/session commands. `--direct`
 overrides that environment default and conflicts only with explicit `--session`.
 `start`, `auto` and other persistent controls require an already connected camera.
 
+For natural-language requests through the local Apple Intelligence model on a
+supported Mac running macOS 26 or later:
+
+```sh
+capturefab assistant use apple_foundation_models
+capturefab assistant test apple_foundation_models --json
+capturefab --session bench assistant ask 'List the connected cameras.' --json
+```
+
+Enable Apple Intelligence and let macOS download its model first. This provider
+needs no API key or server, processes text on-device, and never falls back to a
+remote API. It does not inspect camera images. See [AI capture assistant](assistant.md)
+for other providers, plan review and bounded tasks.
+
 ## Validate and apply a file
 
 Save this UTF-8 JSON as `workflow.json`:
@@ -85,7 +99,7 @@ exits.
 | Workflow relative local path | Workflow file's directory; `captures/first.png` above is beside `workflow.json` |
 | Workflow read from stdin (`-`) | Calling terminal's directory |
 | Absolute local path | Used as supplied |
-| Named `destination` | `output` stays a relative name inside the saved folder or bucket |
+| Named `destination` | `output` stays a relative name inside the saved folder |
 | Forwarding stream URL | Used as supplied, with credentials redacted in plans/status |
 
 Bare existing filenames are recognized as local file sources. Use `file:clip.mkv`
@@ -133,7 +147,7 @@ edit camera selectors and output names before applying to hardware.
 | [start-recording.json](../examples/workflows/start-recording.json) | Start local H.264 recording with a 64 MiB file cap and a 512 MiB requested storage ceiling |
 | [stop-recording.json](../examples/workflows/stop-recording.json) | Finish that recording, then stop its camera acquisition |
 | [timed-recording.json](../examples/workflows/timed-recording.json) | Record a numbered H.264 file for one minute; the session ends it, so it needs no stop file |
-| [plant-line.json](../examples/workflows/plant-line.json) | Open a dataset, start a simulated line's signals, add a note and save one tagged, numbered capture |
+| [plant-line.json](../examples/workflows/plant-line.json) | Open a dataset, add a note and save one tagged, numbered capture |
 
 ```sh
 capturefab workflow validate examples/workflows/multi-camera-timelapse.json --json
@@ -185,24 +199,17 @@ recording, removes the partial file and reports a storage error, so size
 36 MiB per minute plus 16 MiB of margin. Encoder support depends on the FFmpeg
 build and host; `ffmpeg --json` and `doctor --json` describe availability.
 
-## Log signals and catalog captures
+## Catalog captures
 
-Workflow steps can also open a dataset, start sensor and PLC sources and add
-notes. These steps omit the outer `camera` target:
+Workflow steps can open a camera dataset and add notes without an outer `camera` target:
 
 ```json
 {"command": {"op": "dataset_open", "path": "plant/line1.duckdb", "mode": "auto"}}
-{"command": {"op": "signal_start", "uri": "sim-signal://line1", "interval_ms": 1000}}
 {"command": {"op": "dataset_note", "text": "shift A start", "context": {"line": "L1"}}}
 {"command": {"op": "dataset_export", "output": "exports/shift-a", "formats": ["csv"]}}
 ```
 
-`dataset_open.path` and `dataset_export.output` resolve beside the workflow file,
-like capture outputs. `mode` is `auto` (create or open), `create` or `open`.
-Signal URIs keep their meaning and are redacted in plans. Sources and the open
-dataset stay in the session after Apply; stop them with
-`{"op": "signal_stop", "id": "all"}` and `{"op": "dataset_close"}`. The
-[plant-floor guide](plant-floor.md) shows the full task.
+`dataset_open.path` and `dataset_export.output` resolve beside the workflow file. The dataset stays open after Apply; close it with `{"op":"dataset_close"}`.
 
 ## Recover and observe
 
@@ -259,3 +266,14 @@ Get-Content -Raw .\workflow.json | capturefab workflow validate - --json
 
 The stdin form resolves outputs in the current terminal directory. Shell users
 can similarly redirect stdin with `capturefab workflow validate - --json < workflow.json`.
+
+## Resource budgets
+
+Use `capturefab resources --json` for current usage, automatic or chosen policy, effective limits and headroom. These settings apply locally across sessions sharing the same state directory, without connecting a camera.
+
+```sh
+capturefab resources configure --cpu-threads 2 --camera-buffers 1GiB
+capturefab resources reset
+```
+
+`auto` restores one field to its automatic safeguard. CPU threads govern image operations and new codec instances; camera buffers are shared frame-ring allocations. Automatic pressure protection can reduce work below a user ceiling. Use `capturefab storage` for disk quotas and retention.

@@ -86,10 +86,11 @@ fn fixture() -> Workbench {
     // day followed by an earlier arrival; this panel is a journal, not a sort.
     app.snapshot.logs = [instant, instant + 86_400_000, instant - 86_400_000]
         .into_iter().enumerate().map(|(index, instant)| LogEntry {
-            timestamp: LogTimestamp::new(instant, 14 * 3600),
-            ..LogEntry::legacy("04:30:00", "warn", format!(
+            timestamp: LogTimestamp::new(instant, 14 * 3600).unwrap(),
+            level: "warn".into(),
+            message: format!(
                 "Diagnostic {index}: retained camera connection details remain readable when the date caption or message wraps."
-            ))
+            )
         }).collect();
     app.snapshot.activity = [(703, instant), (701, instant + 86_400_000), (702, instant - 86_400_000)]
         .into_iter().map(|(id, instant)| -> SessionActivity {

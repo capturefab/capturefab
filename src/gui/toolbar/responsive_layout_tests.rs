@@ -94,6 +94,7 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
                 "Capture All",
                 destination.as_str(),
                 "Session analytics for all cameras",
+                "Resource usage and limits",
                 "Session activity",
                 "Show activity details",
                 "Dismiss notification",
@@ -126,6 +127,8 @@ fn responsive_toolbar_keeps_capture_and_session_actions_visible_and_clickable() 
                         "Capture All" => matches!(message, Message::AllCapture),
                         "Session analytics for all cameras" =>
                             matches!(message, Message::Analytics(true)),
+                        "Resource usage and limits" =>
+                            matches!(message, Message::Resources(resources::Input::Open(true))),
                         "Session activity" => matches!(message, Message::ToggleActivity),
                         "Show activity details" => matches!(message, Message::ShowActivity),
                         "Dismiss notification" => matches!(message, Message::DismissNotice),

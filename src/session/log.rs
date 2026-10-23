@@ -1,5 +1,4 @@
-//! Absolute event times accompany the legacy producer clock string. Display
-//! clients must not infer an instant from that date- and zone-free string.
+//! Validated absolute event times retain the recording producer's UTC offset.
 use chrono::{DateTime, FixedOffset, Local, SecondsFormat, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -48,72 +47,36 @@ impl<'de> Deserialize<'de> for LogTimestamp {
     }
 }
 
-fn optional_timestamp<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<LogTimestamp>, D::Error> {
-    // Optional metadata from a newer/foreign producer must not make a useful
-    // legacy diagnostic disappear. Invalid metadata remains explicitly unknown.
-    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.and_then(|value| serde_json::from_value(value).ok()))
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogEntry {
-    pub time: String,
+    pub timestamp: LogTimestamp,
     pub level: String,
     pub message: String,
-    #[serde(
-        default,
-        deserialize_with = "optional_timestamp",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub timestamp: Option<LogTimestamp>,
 }
 
 impl LogEntry {
-    pub fn legacy(
-        time: impl Into<String>,
-        level: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            time: time.into(),
-            level: level.into(),
-            message: message.into(),
-            timestamp: None,
-        }
-    }
     pub fn now_utc(level: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::at(Utc::now().fixed_offset(), false, level, message)
+        Self::at(Utc::now().fixed_offset(), level, message)
     }
     pub fn now_local(level: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::at(Local::now().fixed_offset(), false, level, message)
-    }
-    pub fn now_local_millis(level: impl Into<String>, message: impl Into<String>) -> Self {
-        Self::at(Local::now().fixed_offset(), true, level, message)
+        Self::at(Local::now().fixed_offset(), level, message)
     }
     fn at(
         time: DateTime<FixedOffset>,
-        millis: bool,
         level: impl Into<String>,
         message: impl Into<String>,
     ) -> Self {
         Self {
-            time: time
-                .format(if millis { "%H:%M:%S%.3f" } else { "%H:%M:%S" })
-                .to_string(),
             level: level.into(),
             message: message.into(),
-            timestamp: LogTimestamp::new(time.timestamp_millis(), time.offset().local_minus_utc()),
+            timestamp: LogTimestamp::new(time.timestamp_millis(), time.offset().local_minus_utc())
+                .expect("the current clock time and UTC offset are valid"),
         }
     }
     pub(super) fn same_event(&self, other: &Self) -> bool {
-        let same_time = match (self.timestamp, other.timestamp) {
-            (Some(a), Some(b)) => a.unix_ms == b.unix_ms,
-            (None, None) => self.time == other.time,
-            _ => false,
-        };
-        same_time && self.level == other.level && self.message == other.message
+        self.timestamp.unix_ms == other.timestamp.unix_ms
+            && self.level == other.level
+            && self.message == other.message
     }
 }
 
@@ -121,48 +84,37 @@ impl LogEntry {
 mod tests {
     use super::*;
     #[test]
-    fn old_json_retains_its_exact_shape_and_invalid_optional_metadata_is_unknown() {
-        let old = serde_json::json!({"time":"14:30:00","level":"warn","message":"diagnostic"});
-        let entry: LogEntry = serde_json::from_value(old.clone()).unwrap();
-        assert!(entry.timestamp.is_none());
-        assert_eq!(serde_json::to_value(entry).unwrap(), old);
+    fn missing_or_invalid_timestamps_are_rejected() {
+        let entry = serde_json::json!({"level":"warn","message":"diagnostic"});
+        assert!(serde_json::from_value::<LogEntry>(entry.clone()).is_err());
         for timestamp in [
+            serde_json::json!(null),
             serde_json::json!("invalid"),
             serde_json::json!({"unix_ms":i64::MAX,"utc_offset_seconds":0}),
             serde_json::json!({"unix_ms":0,"utc_offset_seconds":86400}),
             serde_json::json!({"unix_ms":"bad","utc_offset_seconds":0}),
             serde_json::json!({}),
         ] {
-            let mut value = old.clone();
+            let mut value = entry.clone();
             value["timestamp"] = timestamp;
-            let entry: LogEntry = serde_json::from_value(value).unwrap();
-            assert!(entry.timestamp.is_none());
-            assert_eq!(entry.message, "diagnostic");
+            assert!(serde_json::from_value::<LogEntry>(value).is_err());
         }
     }
     #[test]
-    fn captured_instant_supplies_legacy_clock_date_and_source_zone_without_a_second_read() {
+    fn captured_instant_retains_date_and_source_zone_without_a_second_read() {
         let utc = DateTime::parse_from_rfc3339("2026-10-14T14:30:00.123Z").unwrap();
         let local = utc.with_timezone(&FixedOffset::west_opt(4 * 3600).unwrap());
-        let worker = LogEntry::at(utc, false, "error", "same event");
-        let coordinator = LogEntry::at(local, true, "error", "same event");
-        assert_eq!(worker.time, "14:30:00");
-        assert_eq!(coordinator.time, "10:30:00.123");
+        let worker = LogEntry::at(utc, "error", "same event");
+        let coordinator = LogEntry::at(local, "error", "same event");
         assert!(worker.same_event(&coordinator));
         assert_eq!(
-            coordinator.timestamp.unwrap().rfc3339(),
+            coordinator.timestamp.rfc3339(),
             "2026-10-14T10:30:00.123-04:00"
         );
         let roundtrip: LogEntry =
             serde_json::from_value(serde_json::to_value(&coordinator).unwrap()).unwrap();
         assert_eq!(roundtrip.timestamp, coordinator.timestamp);
-        let tomorrow = LogEntry::at(
-            local + chrono::Duration::days(1),
-            true,
-            "error",
-            "same event",
-        );
-        assert_eq!(tomorrow.time, coordinator.time);
+        let tomorrow = LogEntry::at(local + chrono::Duration::days(1), "error", "same event");
         assert!(!tomorrow.same_event(&coordinator));
     }
 }

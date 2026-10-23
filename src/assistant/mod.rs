@@ -4,6 +4,7 @@ pub mod agent;
 pub mod approval;
 pub mod conversation;
 pub mod credentials;
+pub mod foundation_models;
 pub mod google;
 pub mod http;
 pub mod limits;
@@ -52,7 +53,7 @@ mod tests {
     fn doctor_is_presence_only_and_schema_names_all_providers() {
         let doctor = doctor();
         let entries = doctor["providers"].as_array().unwrap();
-        assert_eq!(entries.len(), 22);
+        assert_eq!(entries.len(), ProviderId::ALL.len());
         for (entry, id) in entries.iter().zip(provider::ProviderId::ALL) {
             assert_eq!(entry["id"], id.id());
             assert!(entry["env_configured"].is_boolean());
@@ -60,7 +61,7 @@ mod tests {
         }
         let schema = schema_contract();
         let providers = schema["providers"].as_array().unwrap();
-        assert_eq!(providers.len(), 22);
+        assert_eq!(providers.len(), ProviderId::ALL.len());
         for (entry, id) in providers.iter().zip(provider::ProviderId::ALL) {
             assert_eq!(entry["id"], id.id());
             assert!(entry["env_vars"].is_array());

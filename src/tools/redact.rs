@@ -14,14 +14,7 @@ use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 
 /// Keys `for_model` leaves out wherever they appear: identifiers that tell a
 /// provider about the user's accounts, hardware or network.
-const MODEL_DROPPED: [&str; 6] = [
-    "access_key_id",
-    "profile",
-    "serial",
-    "address",
-    "auth",
-    "signal_bindings",
-];
+const MODEL_DROPPED: [&str; 5] = ["access_key_id", "profile", "serial", "address", "auth"];
 /// UI-only Secret fields must never survive serialization, even when a
 /// caller accidentally puts them in a value before redacting it.
 const SECRET_FIELDS: [&str; 2] = ["secret", "password"];
@@ -530,17 +523,6 @@ mod tests {
         for text in [output.to_string(), model.to_string()] {
             assert!(!text.contains("stream-password") && !text.contains("aws-secret"));
         }
-    }
-
-    #[test]
-    fn signal_profile_epochs_are_local_only() {
-        let model = for_model(
-            json!({"source":{"id":"signal:0123456789abcdef","auth":{"profile":{"id":"private-profile","revision":"private-revision"},"epoch":"private-epoch"}},"signal_bindings":[{"endpoint":"mqtts://host/private-topic"}]}),
-        );
-        assert_eq!(model["source"]["id"], "signal:0123456789abcdef");
-        assert!(model["source"].get("auth").is_none());
-        assert!(model.get("signal_bindings").is_none());
-        assert!(!model.to_string().contains("private-"));
     }
 
     #[test]

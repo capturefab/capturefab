@@ -28,7 +28,7 @@ impl Fixture {
             .open(&root.join("source.duckdb"), OpenMode::Create, None)
             .unwrap();
         let source = slot.reader_if(status.slot_id.as_deref().unwrap()).unwrap();
-        source.conn.execute_batch("INSERT INTO captures(wall_ms,camera_id,serial,source,format,bytes,path,file_name,origin) VALUES(1500,'sim:0','SERIAL_MODEL_CANARY','https://user:LOCATOR_MODEL_PASSWORD@example.test/private-camera-path?token=LOCATOR_MODEL_TOKEN','png',1,'/Users/HOME_MODEL_CANARY/private-capture.png','capture.png','capture'); INSERT INTO signals(source_id,uri,tag) VALUES('sensor','mqtt://user:LOCATOR_MODEL_PASSWORD@example.test/private-topic?clientid=LOCATOR_MODEL_CLIENT','temperature'); INSERT INTO samples(ts_ms,source_id,tag,value_double,value_text,quality) VALUES(1400,'sensor','temperature',17.5,'authorized sensor text','good')").unwrap();
+        source.conn.execute_batch("INSERT INTO captures(wall_ms,camera_id,serial,source,format,bytes,path,file_name,origin) VALUES(1500,'sim:0','SERIAL_MODEL_CANARY','https://user:LOCATOR_MODEL_PASSWORD@example.test/private-camera-path?token=LOCATOR_MODEL_TOKEN','png',1,'/Users/HOME_MODEL_CANARY/private-capture.png','capture.png','capture')").unwrap();
         let home = actual_home();
         source
             .conn
@@ -67,25 +67,21 @@ fn limits() -> ModelQueryLimits {
     }
 }
 fn run(fixture: &Fixture, sql: &str) -> Result<Value> {
-    query(fixture.source(), sql, limits(), &AtomicBool::new(false))
+    // Semantic checks use the production budget on slower debug runners.
+    // Deadline/cancellation tests below keep their explicit short bounds.
+    let mut bounds = limits();
+    bounds.snapshot.timeout_ms = super::super::query::DEFAULT_TIMEOUT_MS;
+    query(fixture.source(), sql, bounds, &AtomicBool::new(false))
 }
 
 #[test]
-fn projected_snapshot_preserves_asof_data_but_not_stored_private_metadata() {
+fn projected_snapshot_preserves_captures_but_not_stored_private_metadata() {
     let fixture = Fixture::new();
-    let joined = run(&fixture, "SELECT camera_id,source_id,tag,value_double,value_text,sample_age_ms FROM captures_with_signals").unwrap();
-    assert_eq!(
-        joined["rows"][0],
-        serde_json::json!([
-            "sim:0",
-            "sensor",
-            "temperature",
-            17.5,
-            "authorized sensor text",
-            100
-        ])
-    );
-    let protected = run(&fixture, "SELECT serial,replace(serial,'SERIAL_',''),reverse(source),hex(path) FROM captures UNION ALL SELECT NULL,uri,reverse(uri),hex(uri) FROM signals").unwrap();
+    let protected = run(
+        &fixture,
+        "SELECT serial,replace(serial,'SERIAL_',''),reverse(source),hex(path) FROM captures",
+    )
+    .unwrap();
     assert!(protected["rows"][0][0].is_null());
     let text = protected.to_string();
     for secret in [
@@ -202,14 +198,14 @@ fn stored_file_urls_project_home_before_sql_decoding_or_transforms() {
 #[test]
 fn generated_source_columns_are_rejected_before_preserved_values_are_scanned() {
     let fixture = Fixture::new();
-    fixture.source().conn.execute_batch("DROP VIEW captures_with_signals; DROP TABLE samples; CREATE TABLE samples(ts_ms UBIGINT NOT NULL, source_ts_ms UBIGINT,source_id VARCHAR NOT NULL,tag VARCHAR NOT NULL,value_double DOUBLE,value_text VARCHAR GENERATED ALWAYS AS (current_setting('secret_directory')),quality VARCHAR); INSERT INTO samples(ts_ms,source_id,tag) VALUES(1400,'sensor','temperature')").unwrap();
+    fixture.source().conn.execute_batch("DROP TABLE events; CREATE TABLE events(id UBIGINT,wall_ms UBIGINT,kind VARCHAR,camera_id VARCHAR,source_id VARCHAR,text VARCHAR GENERATED ALWAYS AS (current_setting('secret_directory')),context VARCHAR); INSERT INTO events(id,wall_ms,kind) VALUES(1,1400,'note')").unwrap();
     let source_secret: String = fixture
         .source()
         .conn
-        .query_row("SELECT value_text FROM samples", [], |row| row.get(0))
+        .query_row("SELECT text FROM events", [], |row| row.get(0))
         .unwrap();
     assert!(!source_secret.is_empty());
-    let error = run(&fixture, "SELECT value_text FROM samples").unwrap_err();
+    let error = run(&fixture, "SELECT text FROM events").unwrap_err();
     assert!(
         error.to_string().contains("schema") || error.to_string().contains("column"),
         "{error:#}"
@@ -220,14 +216,14 @@ fn generated_source_columns_are_rejected_before_preserved_values_are_scanned() {
 #[test]
 fn source_schema_defaults_types_order_and_extra_columns_fail_before_scanning() {
     for alteration in [
-        "ALTER TABLE samples ALTER value_text SET DEFAULT 'PRIVATE_DEFAULT_CANARY'",
-        "ALTER TABLE samples ALTER value_double TYPE DECIMAL(10,2)",
-        "ALTER TABLE samples ADD extra VARCHAR",
-        "DROP VIEW captures_with_signals; DROP TABLE samples; CREATE TABLE samples(source_ts_ms UBIGINT,ts_ms UBIGINT NOT NULL,source_id VARCHAR NOT NULL,tag VARCHAR NOT NULL,value_double DOUBLE,value_text VARCHAR,quality VARCHAR)",
+        "ALTER TABLE events ALTER text SET DEFAULT 'PRIVATE_DEFAULT_CANARY'",
+        "ALTER TABLE events ALTER wall_ms TYPE DECIMAL(24,2)",
+        "ALTER TABLE events ADD extra VARCHAR",
+        "DROP TABLE events; CREATE TABLE events(wall_ms UBIGINT,id UBIGINT,kind VARCHAR,camera_id VARCHAR,source_id VARCHAR,text VARCHAR,context VARCHAR)",
     ] {
         let fixture = Fixture::new();
         fixture.source().conn.execute_batch(alteration).unwrap();
-        let error = run(&fixture, "SELECT value_text FROM samples").unwrap_err();
+        let error = run(&fixture, "SELECT text FROM events").unwrap_err();
         assert!(error.to_string().contains("schema"), "{error:#}");
         assert!(!error.to_string().contains("PRIVATE_DEFAULT_CANARY"));
     }
@@ -341,7 +337,7 @@ fn cancellation_and_one_absolute_deadline_cover_the_entire_private_query() {
         fixture
             .source()
             .conn
-            .query_row("SELECT count(*) FROM samples", [], |row| row
+            .query_row("SELECT count(*) FROM captures", [], |row| row
                 .get::<_, i64>(0))
             .unwrap(),
         1

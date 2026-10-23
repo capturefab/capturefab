@@ -524,6 +524,27 @@ fn metric(text: &str, name: &str) -> f64 {
 #[test]
 fn monitoring_empty_session_methods_and_browser_origins() {
     let fixture = Fixture::start();
+    assert_eq!(fixture.http("GET", "/api/signals", None, b"").status, 404);
+    let session = fixture.http("GET", "/api/session", None, b"").result();
+    for removed in ["signals", "signal_sink", "signal_bindings"] {
+        assert!(session.get(removed).is_none(), "{session}");
+    }
+    for operation in ["signals", "signal_read", "signal_start", "signal_capture"] {
+        let command =
+            serde_json::to_vec(&json!({"version": 1, "command": {"op": operation}})).unwrap();
+        assert_eq!(
+            fixture.http("POST", "/api/command", None, &command).status,
+            400
+        );
+    }
+    let resources = fixture.http("GET", "/api/resources", None, b"").result();
+    assert!(resources["policy"].is_object());
+    assert!(resources["effective"]["buffer_bytes"].as_u64().unwrap() > 0);
+    assert!(resources["host"]["cpu_cores"].as_u64().unwrap() > 0);
+    assert_eq!(
+        fixture.http("POST", "/api/resources", None, b"{}").status,
+        405
+    );
     let health = fixture.http("GET", "/health", None, b"");
     assert_eq!(health.status, 200);
     assert_eq!(

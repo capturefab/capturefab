@@ -166,6 +166,8 @@ pub(in crate::gui) struct State {
     settings: Settings,
     loaded: bool,
     loading: bool,
+    revision: u64,
+    edit_generation: u64,
     visible: bool,
     open: bool,
     synthetic: bool,
@@ -206,6 +208,8 @@ impl State {
             settings: Settings::default(),
             loaded: false,
             loading: false,
+            revision: 0,
+            edit_generation: 0,
             visible: false,
             open: false,
             synthetic: false,
@@ -234,17 +238,30 @@ impl State {
         }
     }
     pub(in crate::gui) fn ensure_loaded(&mut self) {
-        if self.loaded || self.loading || self.synthetic {
+        if self.loading || self.synthetic {
             return;
         }
-        match worker::start(self.services.clone(), self.generation.clone()) {
-            Ok(worker) => {
-                self.worker = Some(worker);
-                self.loading = true;
-                self.send(worker::Work::Load);
-            }
-            Err(error) => self.error = Some(error),
+        let revision = self.services.revision();
+        if self.loaded
+            && (revision == self.revision
+                || self.visible
+                || self.busy()
+                || !self.unsaved.is_empty()
+                || !self.secret.0.is_empty())
+        {
+            return;
         }
+        if self.worker.is_none() {
+            match worker::start(self.services.clone(), self.generation.clone()) {
+                Ok(worker) => self.worker = Some(worker),
+                Err(error) => {
+                    self.error = Some(error);
+                    return;
+                }
+            }
+        }
+        self.loading = true;
+        self.send(worker::Work::Load(revision, self.edit_generation));
     }
     pub(in crate::gui) fn loaded(&self) -> bool {
         self.loaded
@@ -272,8 +289,20 @@ impl State {
             && self.unsaved.is_empty()
     }
     pub(in crate::gui) fn clear_secret(&mut self) {
+        // Closing a form or changing providers must invalidate a failed key
+        // still on the worker, so its reply cannot resurrect a cleared draft.
+        self.generation.fetch_add(1, Ordering::SeqCst);
         self.secret = SecretDraft::default();
         self.test_after_profile = None;
+    }
+    fn restore_failed_key(&mut self, id: ProviderId, key: Option<(SecretDraft, u64)>) {
+        if let Some((key, generation)) = key
+            && self.visible
+            && id == self.id()
+            && generation == self.generation.load(Ordering::SeqCst)
+        {
+            self.secret = key;
+        }
     }
     /// Measurement keys share the same accounts; update their nonsecret hint
     /// without loading settings or touching credentials on the UI thread.
@@ -286,10 +315,14 @@ impl State {
         if self.visible == visible {
             return;
         }
+        if visible {
+            // Refresh a sibling window's committed changes before this window
+            // becomes an active Settings editor whose drafts must be kept.
+            self.ensure_loaded();
+        }
         self.visible = visible;
         self.generation.fetch_add(1, Ordering::SeqCst);
         if visible {
-            self.ensure_loaded();
             self.request_status();
         } else {
             self.clear_secret();
@@ -319,6 +352,7 @@ impl State {
     fn request_status(&mut self) {
         self.request_profile_region(false);
         if !self.loaded
+            || self.loading
             || !self.visible
             || self.settings.provider.is_none()
             || !self.section_open()
@@ -368,14 +402,18 @@ impl State {
             self.test_pending = true;
             self.connection = None;
             self.error = None;
-            let key = self
-                .valid_secret()
-                .then(|| std::mem::take(&mut self.secret));
+            let key = self.valid_secret().then(|| {
+                (
+                    std::mem::take(&mut self.secret),
+                    self.generation.load(Ordering::SeqCst),
+                )
+            });
             self.credential_pending = key.is_some();
             self.send(worker::Work::Test(self.id(), self.selected(), key));
         }
     }
     fn changed(&mut self, now: Instant) {
+        self.edit_generation = self.edit_generation.wrapping_add(1);
         let id = self.id();
         let settings = self.selected();
         self.connection = None;
@@ -413,6 +451,20 @@ impl State {
             return;
         }
         if !self.can_edit() {
+            return;
+        }
+        if self.id() == ProviderId::AppleFoundationModels
+            && matches!(
+                input,
+                Input::Field(..)
+                    | Input::Suggestion(..)
+                    | Input::Vision(..)
+                    | Input::Effort(..)
+                    | Input::Secret(..)
+                    | Input::SaveKey
+                    | Input::RemoveKey
+            )
+        {
             return;
         }
         match input {
@@ -460,7 +512,10 @@ impl State {
                 self.error = None;
                 self.connection = None;
                 self.credential_pending = true;
-                let key = std::mem::take(&mut self.secret);
+                let key = (
+                    std::mem::take(&mut self.secret),
+                    self.generation.load(Ordering::SeqCst),
+                );
                 self.send(worker::Work::Store(self.id(), self.selected(), key));
             }
             Input::RemoveKey => {
@@ -572,11 +627,33 @@ impl State {
                 _ => break,
             }
         }
+        if self.loaded {
+            self.ensure_loaded();
+        }
     }
     fn reply(&mut self, reply: worker::Reply) {
         match reply {
-            worker::Reply::Loaded(loaded) => {
+            worker::Reply::Loaded(loaded, revision, generation) => {
+                self.loading = false;
+                // An editor may reopen while a background refresh is in
+                // flight. Newer input or a credential/test operation owns the
+                // displayed configuration until that operation finishes.
+                if self.loaded
+                    && (generation != self.edit_generation
+                        || self.credential_pending
+                        || self.test_pending)
+                {
+                    return;
+                }
                 self.settings = loaded.settings;
+                self.revision = revision;
+                // A revision may replace a credential while its saved-key
+                // hint and every non-secret field stay identical. Never carry
+                // a passed test or readiness receipt across a fresh read.
+                self.connection = None;
+                self.status = None;
+                self.notice = None;
+                self.details_open = false;
                 self.original = self.settings.providers.clone();
                 self.environment_ready = loaded.environment_ready;
                 self.environment_names = loaded.environment_names;
@@ -617,8 +694,9 @@ impl State {
                     }
                 }
             }
-            worker::Reply::Credential(id, present, result) => {
+            worker::Reply::Credential(id, present, result, failed_key) => {
                 self.credential_pending = false;
+                self.restore_failed_key(id, failed_key);
                 if let Some(present) = present {
                     self.settings.providers.entry(id).or_default().saved_key = present;
                     self.original.entry(id).or_default().saved_key = present;
@@ -638,9 +716,11 @@ impl State {
                 key_saved,
                 status,
                 result,
+                failed_key,
             } => {
                 self.test_pending = false;
                 self.credential_pending = false;
+                self.restore_failed_key(id, failed_key);
                 if key_saved {
                     self.settings.providers.entry(id).or_default().saved_key = true;
                     self.original.entry(id).or_default().saved_key = true;
@@ -669,7 +749,11 @@ impl State {
                 return "Testing connection";
             }
             if self.credential_pending {
-                return "Checking credentials";
+                return if id == ProviderId::AppleFoundationModels {
+                    "Checking availability"
+                } else {
+                    "Checking credentials"
+                };
             }
             if let Some(connection) = &self.connection {
                 return if connection.is_ok() {
@@ -931,28 +1015,38 @@ impl State {
         if self.settings.provider.is_none() {
             return content.push(text("Choose a provider for natural language captures in Quick Command. External agents can use the CLI without an app provider. No request is sent when you open Settings.").size(style::SMALL).color(p.secondary)).into();
         }
-        content = content.push(self.field_view(Field::Model, &issues, p));
-        let mut suggestions = vec![];
-        for model in std::iter::once(id.info().default_model)
-            .chain(id.info().suggested_models.iter().copied())
-            .chain(id.info().suggested_vision_model)
-        {
-            if !model.is_empty() && !suggestions.iter().any(|entry: &String| entry == model) {
-                suggestions.push(model.to_owned());
-            }
-        }
-        if !suggestions.is_empty() {
+        let local = id == ProviderId::AppleFoundationModels;
+        if local {
             content = content.push(
-                pick_list(suggestions, None::<String>, Input::Suggestion)
-                    .name("Suggested assistant model")
-                    .placeholder("Choose a suggested model…")
-                    .enabled(ready)
-                    .width(Fill)
-                    .padding([6, 10])
-                    .text_size(style::BODY)
-                    .style(style::pick)
-                    .menu_style(style::menu),
+                text("Uses the on-device Apple Intelligence model. Requires macOS 26 or later, a supported Mac, and Apple Intelligence enabled with its model downloaded. No API key or server is needed. Requests stay on this Mac; there is no automatic cloud fallback.")
+                    .size(style::SMALL)
+                    .color(p.secondary)
+                    .wrapping(text::Wrapping::WordOrGlyph),
             );
+        } else {
+            content = content.push(self.field_view(Field::Model, &issues, p));
+            let mut suggestions = vec![];
+            for model in std::iter::once(id.info().default_model)
+                .chain(id.info().suggested_models.iter().copied())
+                .chain(id.info().suggested_vision_model)
+            {
+                if !model.is_empty() && !suggestions.iter().any(|entry: &String| entry == model) {
+                    suggestions.push(model.to_owned());
+                }
+            }
+            if !suggestions.is_empty() {
+                content = content.push(
+                    pick_list(suggestions, None::<String>, Input::Suggestion)
+                        .name("Suggested assistant model")
+                        .placeholder("Choose a suggested model…")
+                        .enabled(ready)
+                        .width(Fill)
+                        .padding([6, 10])
+                        .text_size(style::BODY)
+                        .style(style::pick)
+                        .menu_style(style::menu),
+                );
+            }
         }
         for field in [
             Field::BaseUrl,
@@ -977,11 +1071,16 @@ impl State {
             content = content.push(text(note).size(style::SMALL).color(p.ink(p.warn)));
         }
         let status = if self.credential_pending {
-            "Checking credentials…".into()
+            if local {
+                "Checking local AI availability…"
+            } else {
+                "Checking credentials…"
+            }
+            .into()
         } else {
             self.status.as_ref().map(|status|{
             if status.ready{format!("Ready · {}",status.source)}else if settings.saved_key{"Check the saved key. It may be locked or no longer available.".into()}else{format!("Needs setup · {}",status.missing.join(" "))}
-        }).unwrap_or_else(||"Credential status is checked only for this provider while this section is shown.".into())
+        }).unwrap_or_else(||if local { "Local AI availability is checked while this section is shown." } else { "Credential status is checked only for this provider while this section is shown." }.into())
         };
         content = content.push(accessibility::label(
             text(status.clone())
@@ -991,66 +1090,83 @@ impl State {
             status,
             accessibility::Role::Status,
         ));
-        let (credential_label, credential_help) = self.credential_help();
         let secret_error = self.secret_error();
-        content = content.push(
-            column![
-                text(credential_label).size(style::SMALL).color(p.secondary),
-                text(credential_help)
+        if !local {
+            let (credential_label, credential_help) = self.credential_help();
+            content = content.push(
+                column![
+                    text(credential_label).size(style::SMALL).color(p.secondary),
+                    text(credential_help)
+                        .size(style::SMALL)
+                        .color(p.secondary)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                    text_input(credential_label, &self.secret.0)
+                        .name(format!("{id} assistant API key"))
+                        .description(SECRET_HELP)
+                        .invalid(secret_error.map(str::to_owned))
+                        .secure(true)
+                        .on_input_maybe(
+                            ready.then_some(|value: String| Input::Secret(value.into()))
+                        )
+                        .on_submit_maybe((ready && self.valid_secret()).then_some(Input::SaveKey))
+                        .padding([6, 10])
+                        .size(style::BODY)
+                        .style(if secret_error.is_some() {
+                            style::input_invalid
+                        } else {
+                            style::input
+                        }),
+                    text(SECRET_HELP).size(style::SMALL).color(p.secondary),
+                    text("Environment credentials take precedence over saved keys.")
+                        .size(style::SMALL)
+                        .color(p.secondary),
+                    row![
+                        button(text("Save key").size(style::BODY))
+                            .name("Save assistant API key in OS credential store")
+                            .padding([6, 12])
+                            .style(style::secondary)
+                            .on_press_maybe(
+                                (ready && self.valid_secret()).then_some(Input::SaveKey)
+                            ),
+                        button(text("Remove saved key").size(style::BODY))
+                            .name("Remove saved assistant API key")
+                            .padding([6, 12])
+                            .style(style::secondary)
+                            .on_press_maybe(
+                                (ready && settings.saved_key).then_some(Input::RemoveKey)
+                            )
+                    ]
+                    .spacing(8),
+                    text("OpenAI, Gemini and Claude keys are shared with prompt measurements.")
+                        .size(style::SMALL)
+                        .color(p.secondary)
+                ]
+                .spacing(6),
+            );
+            if let Some(error) = secret_error {
+                content = content.push(field_error(error, p));
+            }
+        }
+        if local {
+            content = content.push(
+                text("Text only: the local model can use numeric measurements and permitted tool results, but cannot inspect camera images.")
                     .size(style::SMALL)
                     .color(p.secondary)
                     .wrapping(text::Wrapping::WordOrGlyph),
-                text_input(credential_label, &self.secret.0)
-                    .name(format!("{id} assistant API key"))
-                    .description(SECRET_HELP)
-                    .invalid(secret_error.map(str::to_owned))
-                    .secure(true)
-                    .on_input_maybe(ready.then_some(|value: String| Input::Secret(value.into())))
-                    .on_submit_maybe((ready && self.valid_secret()).then_some(Input::SaveKey))
-                    .padding([6, 10])
-                    .size(style::BODY)
-                    .style(if secret_error.is_some() {
-                        style::input_invalid
-                    } else {
-                        style::input
-                    }),
-                text(SECRET_HELP).size(style::SMALL).color(p.secondary),
-                text("Environment credentials take precedence over saved keys.")
-                    .size(style::SMALL)
-                    .color(p.secondary),
-                row![
-                    button(text("Save key").size(style::BODY))
-                        .name("Save assistant API key in OS credential store")
-                        .padding([6, 12])
-                        .style(style::secondary)
-                        .on_press_maybe((ready && self.valid_secret()).then_some(Input::SaveKey)),
-                    button(text("Remove saved key").size(style::BODY))
-                        .name("Remove saved assistant API key")
-                        .padding([6, 12])
-                        .style(style::secondary)
-                        .on_press_maybe((ready && settings.saved_key).then_some(Input::RemoveKey))
-                ]
-                .spacing(8),
-                text("OpenAI, Gemini and Claude keys are shared with prompt measurements.")
-                    .size(style::SMALL)
-                    .color(p.secondary)
-            ]
-            .spacing(6),
-        );
-        if let Some(error) = secret_error {
-            content = content.push(field_error(error, p));
-        }
-        let vision = settings.vision.unwrap_or_default();
-        let decision = ai::vision::resolve(id, settings.model(id), vision, None, false);
-        let resolved = match decision.resolved {
-            Some(true) => "On",
-            Some(false) => "Off",
-            None => "Unknown · off until support is known",
-        };
-        content=content.push(column![text("See camera images").size(style::SMALL).color(p.secondary),
+            );
+        } else {
+            let vision = settings.vision.unwrap_or_default();
+            let decision = ai::vision::resolve(id, settings.model(id), vision, None, false);
+            let resolved = match decision.resolved {
+                Some(true) => "On",
+                Some(false) => "Off",
+                None => "Unknown · off until support is known",
+            };
+            content=content.push(column![text("See camera images").size(style::SMALL).color(p.secondary),
             pick_list([VisionChoice(VisionMode::Auto),VisionChoice(VisionMode::On),VisionChoice(VisionMode::Off)],Some(VisionChoice(vision)),|value|Input::Vision(value.0))
                 .name("Assistant camera images").enabled(ready).width(Fill).padding([6,10]).text_size(style::BODY).style(style::pick).menu_style(style::menu),
             text(format!("Resolved: {resolved}. Auto uses known model support; task images still need your consent.")).size(style::SMALL).color(p.secondary)].spacing(6));
+        }
         if supports_effort(id) {
             content = content.push(
                 column![
@@ -1094,6 +1210,8 @@ impl State {
         } else {
             text(if self.valid_secret() {
                 "Save key and test connection"
+            } else if local {
+                "Test local AI"
             } else {
                 "Test connection"
             })
@@ -1118,7 +1236,14 @@ impl State {
                     (ready && !checking_profile && secret_error.is_none()).then_some(Input::Test),
                 ),
         );
-        content=content.push(text(format!("Sends a small test request to {id}. API usage may incur charges. No camera information or images are sent.")).size(style::SMALL).color(p.secondary));
+        let test_help = if local {
+            "Runs a small local tool-call test through Apple Intelligence. No camera information or images are included.".into()
+        } else {
+            format!(
+                "Sends a small test request to {id}. API usage may incur charges. No camera information or images are sent."
+            )
+        };
+        content = content.push(text(test_help).size(style::SMALL).color(p.secondary));
         if !issues.is_empty() {
             content = content.push(
                     text("Complete the provider fields above. Test connection will show any missing fields.")
@@ -1371,6 +1496,202 @@ mod tests {
         (state, services)
     }
 
+    #[derive(Default)]
+    struct SharedSettings {
+        settings: Mutex<Settings>,
+        revision: AtomicU64,
+        loads: AtomicUsize,
+    }
+    impl Services for SharedSettings {
+        fn load(&self) -> Loaded {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            Loaded {
+                settings: self.settings.lock().unwrap().clone(),
+                warnings: vec![],
+                environment_ready: BTreeSet::new(),
+                environment_names: vec![],
+                environment: BTreeMap::new(),
+            }
+        }
+        fn revision(&self) -> u64 {
+            self.revision.load(Ordering::SeqCst)
+        }
+        fn save(
+            &self,
+            id: ProviderId,
+            provider: ProviderSettings,
+            select: bool,
+        ) -> Result<(), String> {
+            let mut settings = self.settings.lock().unwrap();
+            settings.providers.insert(id, provider);
+            if select {
+                settings.provider = Some(id);
+            }
+            self.revision.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        fn status(&self, _: ProviderId, _: &ProviderSettings) -> ai::CredentialStatus {
+            panic!("hidden settings must not read credentials");
+        }
+        fn store(&self, _: ProviderId, _: &str) -> Result<(), String> {
+            panic!("nonsecret synchronization does not store credentials");
+        }
+        fn remove(&self, _: ProviderId) -> Result<(), String> {
+            panic!("nonsecret synchronization does not remove credentials");
+        }
+        fn test(&self, _: ProviderId, _: ProviderSettings) -> Result<(), ConnectionFailure> {
+            panic!("nonsecret synchronization does not contact a provider");
+        }
+    }
+
+    #[test]
+    fn sibling_windows_reload_committed_provider_and_model_without_touching_credentials() {
+        let services = Arc::new(SharedSettings::default());
+        let mut editor = State::with_services(services.clone());
+        let mut sibling = State::with_services(services.clone());
+        editor.ensure_loaded();
+        sibling.ensure_loaded();
+        settle(&mut editor);
+        settle(&mut sibling);
+        assert!(sibling.settings.provider.is_none());
+        let now = Instant::now();
+        editor.input(Input::Provider(ProviderId::OpenAi), now);
+        editor.input(Input::Field(Field::Model, "shared-model".into()), now);
+        editor.tick(now + DEBOUNCE);
+        settle(&mut editor);
+        sibling.tick(Instant::now());
+        settle(&mut sibling);
+        assert_eq!(sibling.settings.provider, Some(ProviderId::OpenAi));
+        assert_eq!(sibling.selected().model.as_deref(), Some("shared-model"));
+        let loads = services.loads.load(Ordering::SeqCst);
+        sibling.tick(Instant::now());
+        assert_eq!(
+            services.loads.load(Ordering::SeqCst),
+            loads,
+            "unchanged settings do not poll disk"
+        );
+
+        // An active Settings draft remains local until the user leaves it.
+        sibling.visible = true;
+        sibling.input(
+            Input::Field(Field::Model, "unfinished-local-model".into()),
+            now,
+        );
+        editor.input(Input::Field(Field::Model, "newer-shared-model".into()), now);
+        editor.tick(now + DEBOUNCE);
+        settle(&mut editor);
+        sibling.tick(now);
+        assert_eq!(
+            sibling.selected().model.as_deref(),
+            Some("unfinished-local-model")
+        );
+        assert!(!sibling.loading);
+    }
+
+    #[test]
+    fn a_late_settings_refresh_keeps_newer_editor_input() {
+        let (mut state, _) = loaded();
+        let generation = state.edit_generation;
+        let older = state.settings.clone();
+        state.loading = true;
+        state.input(
+            Input::Field(Field::Model, "newer-draft-model".into()),
+            Instant::now(),
+        );
+        state.reply(worker::Reply::Loaded(
+            Loaded {
+                settings: older,
+                warnings: vec![],
+                environment_ready: BTreeSet::new(),
+                environment_names: vec![],
+                environment: BTreeMap::new(),
+            },
+            1,
+            generation,
+        ));
+        assert_eq!(state.selected().model.as_deref(), Some("newer-draft-model"));
+        assert!(!state.loading);
+        assert!(state.dirty.contains_key(&ProviderId::Anthropic));
+    }
+
+    #[test]
+    fn refreshed_settings_never_reuse_an_older_connection_or_credential_receipt() {
+        for change in ["provider", "model", "replacement-key"] {
+            let (mut state, _) = loaded();
+            let id = state.id();
+            state.settings.providers.entry(id).or_default().saved_key = true;
+            state.connection = Some(Ok(()));
+            state.status = Some(ai::CredentialStatus {
+                ready: true,
+                source: "OS credential store".into(),
+                missing: vec![],
+            });
+            state.notice = Some("API key saved in the OS credential store.".into());
+            state.details_open = true;
+            assert!(state.ready_to_continue());
+
+            let mut settings = state.settings.clone();
+            match change {
+                "provider" => settings.provider = Some(ProviderId::OpenAi),
+                "model" => {
+                    settings.providers.entry(state.id()).or_default().model =
+                        Some("new-model".into())
+                }
+                // Replacing an existing saved key changes no nonsecret fields.
+                "replacement-key" => assert_eq!(settings, state.settings),
+                _ => unreachable!(),
+            }
+            state.set_visible(false);
+            state.reply(worker::Reply::Loaded(
+                Loaded {
+                    settings,
+                    warnings: vec![],
+                    environment_ready: BTreeSet::new(),
+                    environment_names: vec![],
+                    environment: BTreeMap::new(),
+                },
+                state.revision + 1,
+                state.edit_generation,
+            ));
+            assert!(
+                state.connection.is_none(),
+                "{change} invalidates the tested connection"
+            );
+            assert!(
+                state.status.is_none(),
+                "{change} invalidates credential readiness"
+            );
+            assert!(!state.ready_to_continue());
+            assert!(state.notice.is_none());
+            assert!(!state.details_open);
+            assert!(!state.summary().contains("Connection passed"));
+        }
+    }
+
+    #[test]
+    fn a_late_settings_refresh_cannot_replace_the_configuration_being_tested() {
+        let (mut state, _) = loaded();
+        let before = state.settings.clone();
+        let mut replacement = before.clone();
+        replacement.providers.entry(state.id()).or_default().model = Some("new-model".into());
+        state.loading = true;
+        state.test_pending = true;
+        state.reply(worker::Reply::Loaded(
+            Loaded {
+                settings: replacement,
+                warnings: vec![],
+                environment_ready: BTreeSet::new(),
+                environment_names: vec![],
+                environment: BTreeMap::new(),
+            },
+            state.revision + 1,
+            state.edit_generation,
+        ));
+        assert_eq!(state.settings, before);
+        assert!(state.test_pending);
+        assert!(!state.loading);
+    }
+
     #[test]
     fn bedrock_profile_region_is_validated_on_the_worker_without_persisting_it() {
         let root = std::env::temp_dir().join(format!(
@@ -1514,7 +1835,7 @@ mod tests {
     fn construction_and_all_provider_readiness_do_not_read_the_credential_store() {
         let services = Arc::new(Stub::default());
         let mut state = State::with_services(services.clone());
-        assert_eq!(state.provider_rows().len(), 22);
+        assert_eq!(state.provider_rows().len(), ProviderId::ALL.len());
         assert_eq!(services.loaded.load(Ordering::SeqCst), 0);
         assert!(services.status.lock().unwrap().is_empty());
         state.set_visible(true);
@@ -1566,6 +1887,10 @@ mod tests {
         let mut state = State::with_services(services.clone());
         state.loaded = true;
         for (id, source) in [
+            (
+                ProviderId::AppleFoundationModels,
+                "On-device Apple Intelligence",
+            ),
             (ProviderId::Ollama, "No API key required"),
             (ProviderId::LmStudio, "No API key required"),
             (ProviderId::Custom, "No API key required"),
@@ -1599,6 +1924,92 @@ mod tests {
         assert!(services.keys.lock().unwrap().is_empty());
     }
     #[test]
+    fn apple_intelligence_settings_show_local_controls_without_remote_configuration() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+
+        let mut state = State::scene(false);
+        state.settings.provider = Some(ProviderId::AppleFoundationModels);
+        state.clear_secret();
+        state.status = Some(ai::CredentialStatus {
+            ready: false,
+            source: "On-device Apple Intelligence".into(),
+            missing: vec!["Enable Apple Intelligence in System Settings.".into()],
+        });
+        let renderer = crate::gui::destinations::layout_tests::renderer();
+        let mut view = accessibility::mapped(state.content(Palette::of(false), 0), |input| {
+            Message::Assistant(crate::gui::assistant::Input::Settings(input))
+        });
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(700.0, 1600.0)),
+        );
+        let (snapshot, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        let labels: Vec<_> = snapshot
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label())
+            .collect();
+        assert!(labels.contains(&"Assistant provider"));
+        assert!(labels.contains(&"Test assistant connection"));
+        assert!(
+            labels
+                .iter()
+                .any(|label| label.contains("Enable Apple Intelligence"))
+        );
+        assert!(!labels.contains(&"Assistant model"));
+        assert!(!labels.contains(&"Suggested assistant model"));
+        assert!(!labels.contains(&"Assistant base url"));
+        assert!(!labels.contains(&"Assistant camera images"));
+        assert!(!labels.contains(&"Assistant reasoning effort"));
+        assert!(
+            !snapshot
+                .nodes
+                .iter()
+                .any(|(_, node)| node.role() == accessibility::Role::PasswordInput)
+        );
+    }
+    #[test]
+    fn apple_intelligence_ignores_remote_configuration_events_and_tests_without_a_key() {
+        let (mut state, services) = loaded();
+        state.input(
+            Input::Provider(ProviderId::AppleFoundationModels),
+            Instant::now(),
+        );
+        settle(&mut state);
+        let original = state.selected();
+        for input in [
+            Input::Field(Field::Model, "remote-model".into()),
+            Input::Field(Field::BaseUrl, "https://example.test".into()),
+            Input::Suggestion("remote-model".into()),
+            Input::Vision(VisionMode::On),
+            Input::Effort(Effort::High),
+            Input::Secret("remote-key".to_owned().into()),
+            Input::SaveKey,
+            Input::RemoveKey,
+        ] {
+            state.input(input, Instant::now());
+        }
+        assert_eq!(state.selected(), original);
+        assert!(state.secret.0.is_empty());
+        services.test_success.store(true, Ordering::SeqCst);
+        state.input(Input::Test, Instant::now());
+        settle(&mut state);
+        assert_eq!(
+            *services.selected.lock().unwrap(),
+            Some(ProviderId::AppleFoundationModels)
+        );
+        assert_eq!(services.tests.load(Ordering::SeqCst), 1);
+        assert!(services.keys.lock().unwrap().is_empty());
+        assert!(matches!(state.connection, Some(Ok(()))));
+    }
+    #[test]
     fn provider_readiness_uses_connection_results_and_discards_old_configuration_status() {
         let services = Arc::new(Stub::default());
         let mut state = State::with_services(services.clone());
@@ -1615,6 +2026,7 @@ mod tests {
             key_saved: false,
             status: None,
             result: Ok(()),
+            failed_key: None,
         });
         assert!(state.summary().ends_with(" · Connection passed"));
         state.reply(worker::Reply::Tested {
@@ -1625,6 +2037,7 @@ mod tests {
                 message: "Server unavailable".into(),
                 excerpt: None,
             }),
+            failed_key: None,
         });
         assert!(state.summary().ends_with(" · Connection failed"));
         state.input(Input::Provider(ProviderId::Bedrock), Instant::now());
@@ -1924,6 +2337,56 @@ mod tests {
             matches!(state.connection, Some(Err(ref error)) if error.message.contains("could not save"))
         );
         assert!(!state.credential_pending && !state.test_pending);
+        assert_eq!(
+            state.secret.as_str(),
+            "new-test-key",
+            "the failed save can be retried"
+        );
+        services.fail_store.store(false, Ordering::SeqCst);
+        services.test_success.store(true, Ordering::SeqCst);
+        state.input(Input::Test, Instant::now());
+        settle(&mut state);
+        assert!(state.secret.0.is_empty());
+        assert!(matches!(state.connection, Some(Ok(()))));
+        assert_eq!(services.tests.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn a_failed_key_store_keeps_the_draft_for_save_key_retry() {
+        let (mut state, services) = loaded();
+        services.fail_store.store(true, Ordering::SeqCst);
+        state.input(
+            Input::Secret("retry-test-key".to_owned().into()),
+            Instant::now(),
+        );
+        state.input(Input::SaveKey, Instant::now());
+        settle(&mut state);
+        assert_eq!(state.secret.as_str(), "retry-test-key");
+        assert!(!state.selected().saved_key);
+        assert!(state.error.as_deref().unwrap().contains("could not save"));
+        services.fail_store.store(false, Ordering::SeqCst);
+        state.input(Input::SaveKey, Instant::now());
+        settle(&mut state);
+        assert!(state.secret.0.is_empty());
+        assert!(state.selected().saved_key);
+    }
+    #[test]
+    fn a_failed_key_reply_cannot_restore_a_draft_after_its_form_is_closed() {
+        for hide_settings in [false, true] {
+            let (mut state, _) = loaded();
+            let generation = state.generation.load(Ordering::SeqCst);
+            if hide_settings {
+                state.set_visible(false);
+            } else {
+                state.input(Input::Open(false), Instant::now());
+            }
+            state.reply(worker::Reply::Credential(
+                ProviderId::Anthropic,
+                None,
+                Err("The OS credential store could not save this key.".into()),
+                Some(("closed-test-key".to_owned().into(), generation)),
+            ));
+            assert!(state.secret.0.is_empty(), "closing drops drafts in flight");
+        }
     }
     #[test]
     fn testing_missing_fields_reveals_errors_without_sending_a_request() {

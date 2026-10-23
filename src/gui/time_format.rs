@@ -1,5 +1,4 @@
 //! Localized presentation is separate from a diagnostic's absolute event time.
-//! Legacy clock text has no recoverable date/zone and is never reinterpreted.
 use super::*;
 use crate::session::{LogEntry, SessionActivity};
 use chrono::{DateTime, Local, SecondsFormat, Utc};
@@ -13,7 +12,7 @@ pub(super) struct Labels {
 }
 
 /// Group by the viewer's local calendar day, independently of the localized
-/// caption. Producer offsets and legacy clock strings cannot supply that day.
+/// caption or the producer's UTC offset.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Day {
     pub key: Option<chrono::NaiveDate>,
@@ -80,8 +79,7 @@ pub(super) fn dated_row<'a>(
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct LogKey {
-    instant: Option<i64>,
-    legacy: String,
+    instant: i64,
     level: String,
     message: String,
 }
@@ -91,12 +89,7 @@ pub(super) fn log_keys(logs: &[LogEntry]) -> Vec<RawKey> {
     logs.iter()
         .map(|entry| {
             let key = LogKey {
-                instant: entry.timestamp.map(|stamp| stamp.unix_ms()),
-                legacy: if entry.timestamp.is_some() {
-                    String::new()
-                } else {
-                    entry.time.clone()
-                },
+                instant: entry.timestamp.unix_ms(),
                 level: entry.level.clone(),
                 message: entry.message.clone(),
             };
@@ -109,23 +102,19 @@ pub(super) fn log_keys(logs: &[LogEntry]) -> Vec<RawKey> {
 }
 
 pub(super) fn log(entry: &LogEntry) -> Labels {
-    if let Some(timestamp) = entry.timestamp
-        && let Some(mut labels) = instant(timestamp.unix_ms())
-    {
-        labels
-            .full
-            .push_str(&format!(" · Recorded {}", timestamp.rfc3339()));
-        return labels;
-    }
-    let compact = if entry.time.is_empty() {
-        "—"
-    } else {
-        &entry.time
-    };
+    let timestamp = entry.timestamp;
+    let mut labels = instant(timestamp.unix_ms()).unwrap_or_else(unavailable);
+    labels
+        .full
+        .push_str(&format!(" · Recorded {}", timestamp.rfc3339()));
+    labels
+}
+
+fn unavailable() -> Labels {
     Labels {
-        compact: compact.into(),
-        full: format!("{compact} · Date and time zone unavailable"),
-        copy: format!("{compact} (date and time zone unavailable)"),
+        compact: "—".into(),
+        full: "Time unavailable (invalid timestamp)".into(),
+        copy: "— (invalid timestamp)".into(),
         day: Day::unavailable(),
     }
 }
@@ -134,12 +123,7 @@ pub(super) fn activity(entry: &SessionActivity) -> Labels {
     i64::try_from(entry.finished_at_ms.unwrap_or(entry.submitted_at_ms))
         .ok()
         .and_then(instant)
-        .unwrap_or_else(|| Labels {
-            compact: "—".into(),
-            full: "Time unavailable (invalid timestamp)".into(),
-            copy: "— (invalid timestamp)".into(),
-            day: Day::unavailable(),
-        })
+        .unwrap_or_else(unavailable)
 }
 
 /// A moment, UTC Unix milliseconds, in the viewer's local time as the

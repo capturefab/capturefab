@@ -84,7 +84,7 @@ fn local_assistant_activity_keeps_its_agent_label_without_participant_notices() 
     let mut entry = SessionActivity {
         id: 1,
         origin: ActivityOrigin::Gui,
-        actor: Some(actor),
+        actor,
         operation: "capture".into(),
         camera: Some("sim:0".into()),
         feature: None,
@@ -103,7 +103,7 @@ fn local_assistant_activity_keeps_its_agent_label_without_participant_notices() 
     app.snapshot.activity.push(entry.clone());
     app.sync_client_activity();
     assert!(app.notice.is_none());
-    entry.actor.as_mut().unwrap().id = "another-agent".into();
+    entry.actor.id = "another-agent".into();
     assert!(app.other_activity(&entry));
 }
 

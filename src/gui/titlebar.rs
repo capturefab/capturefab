@@ -136,10 +136,9 @@ impl Workbench {
             });
         }
         if self.chrome.scene_log && !snapshot.logs.iter().any(|entry| entry.level == "warn") {
-            for (time, level, message) in SCENE_LOG {
+            for (unix_ms, level, message) in SCENE_LOG {
                 snapshot.logs.push(LogEntry {
-                    timestamp: None,
-                    time: time.into(),
+                    timestamp: crate::session::LogTimestamp::new(unix_ms, 0).unwrap(),
                     level: level.into(),
                     message: message.into(),
                 });
@@ -149,20 +148,20 @@ impl Workbench {
 }
 
 /// Log lines for the `log-sample` scene: a warning, a command failure,
-/// which the session logs without a time and long enough to wrap, and news.
-const SCENE_LOG: [(&str, &str, &str); 3] = [
+/// long enough to wrap, and news.
+const SCENE_LOG: [(i64, &str, &str); 3] = [
     (
-        "04:12:07",
+        1_792_017_000_123,
         "warn",
         "USB discovery: access denied; check the device permissions",
     ),
     (
-        "",
+        1_792_017_010_123,
         "error",
         "the camera stopped responding: reading register 0x0938 timed out after 3 attempts: \
          no reply from 192.168.1.20:3956 within 500 ms; check the cable and the camera's power",
     ),
-    ("04:12:31", "info", "Saved capture-0002.png"),
+    (1_792_017_024_123, "info", "Saved capture-0002.png"),
 ];
 
 /// Width of the fps figure's slot in a status pill.
@@ -385,22 +384,14 @@ fn auto_about(status: &AutoStatus, os: Os) -> String {
     about
 }
 
-/// Stable keys for the errors and warnings in `logs`, with their levels, to
-/// know each again after the log scrolls: a line's content and how many
-/// identical lines came before it, so a repeat of a read problem (failed
-/// commands are logged without a time) still counts as new. Should an
-/// earlier copy scroll out of the log between reads, one repeat may take
-/// its key and go unnoticed.
+/// Stable keys identify an event by its instant, level and content, plus its
+/// occurrence count when identical events were recorded in the same millisecond.
 fn alert_keys(logs: &[LogEntry]) -> impl Iterator<Item = (u64, Level)> + '_ {
     let mut copies: HashMap<u64, u32> = HashMap::new();
     logs.iter().filter_map(move |entry| {
         let level = Level::from_log(&entry.level)?;
         let mut hasher = DefaultHasher::new();
-        if let Some(timestamp) = entry.timestamp {
-            timestamp.unix_ms().hash(&mut hasher);
-        } else {
-            entry.time.hash(&mut hasher);
-        }
+        entry.timestamp.unix_ms().hash(&mut hasher);
         (&entry.level, &entry.message).hash(&mut hasher);
         let copy = copies.entry(hasher.finish()).or_default();
         *copy += 1;
@@ -1031,26 +1022,23 @@ mod tests {
         bench
     }
 
-    fn log(time: &str, level: &str, message: &str) -> LogEntry {
+    fn log(unix_ms: i64, level: &str, message: &str) -> LogEntry {
         LogEntry {
-            timestamp: None,
-            time: time.into(),
+            timestamp: crate::session::LogTimestamp::new(unix_ms, 0).unwrap(),
             level: level.into(),
             message: message.into(),
         }
     }
     #[test]
-    fn absolute_log_identity_ignores_legacy_clock_presentation_and_distinguishes_dates() {
-        let mut first = log("14:30:00", "error", "failure");
-        first.timestamp = crate::session::LogTimestamp::new(1_792_017_000_123, 0);
+    fn absolute_log_identity_ignores_producer_offsets_and_distinguishes_dates() {
+        let first = log(1_792_017_000_123, "error", "failure");
         let mut other_clock = first.clone();
-        other_clock.time = "10:30:00.123".into();
         other_clock.timestamp =
-            crate::session::LogTimestamp::new(first.timestamp.unwrap().unix_ms(), -4 * 3600);
+            crate::session::LogTimestamp::new(first.timestamp.unix_ms(), -4 * 3600).unwrap();
         let key = |entry| alert_keys(&[entry]).collect::<Vec<_>>();
         assert_eq!(key(first.clone()), key(other_clock.clone()));
         other_clock.timestamp =
-            crate::session::LogTimestamp::new(first.timestamp.unwrap().unix_ms() + 86_400_000, 0);
+            crate::session::LogTimestamp::new(first.timestamp.unix_ms() + 86_400_000, 0).unwrap();
         assert_ne!(key(first), key(other_clock));
     }
 
@@ -1253,12 +1241,12 @@ mod tests {
     #[test]
     fn problems_count_until_the_log_is_read() {
         let mut seen = HashSet::new();
-        let mut logs = vec![log("10:00:00", "info", "Connected to sim:0")];
+        let mut logs = vec![log(1000, "info", "Connected to sim:0")];
         assert_eq!(unseen(&logs, &mut seen, false), None);
-        logs.push(log("10:00:01", "warn", "USB discovery: access denied"));
+        logs.push(log(1001, "warn", "USB discovery: access denied"));
         assert_eq!(unseen(&logs, &mut seen, false), Some(Level::Warning));
-        logs.push(log("", "error", "the camera stopped responding"));
-        logs.push(log("10:00:03", "warn", "slow link"));
+        logs.push(log(1002, "error", "the camera stopped responding"));
+        logs.push(log(1003, "warn", "slow link"));
         assert_eq!(
             unseen(&logs, &mut seen, false),
             Some(Level::Error),
@@ -1268,11 +1256,11 @@ mod tests {
         assert_eq!(unseen(&logs, &mut seen, false), None);
         // The log scrolls past old lines, or shows another camera's.
         logs.remove(0);
-        logs.insert(0, log("09:59:59", "WARN", "older"));
+        logs.insert(0, log(999, "WARN", "older"));
         assert_eq!(unseen(&logs, &mut seen, false), Some(Level::Warning));
         assert_eq!(unseen(&logs, &mut seen, true), None);
         // The same command fails again: a new line, though not new words.
-        logs.push(log("", "error", "the camera stopped responding"));
+        logs.push(log(1002, "error", "the camera stopped responding"));
         assert_eq!(unseen(&logs, &mut seen, false), Some(Level::Error));
         assert_eq!(unseen(&logs, &mut seen, true), None);
         assert_eq!(unseen(&logs, &mut seen, false), None);

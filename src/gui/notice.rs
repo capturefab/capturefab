@@ -374,8 +374,6 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
         Job::DatasetClose => done("Dataset closed".into()),
         Job::DatasetNote => done("Note added".into()),
         Job::DatasetExport => done("Dataset exported".into()),
-        Job::SignalStart => done("Data source started".into()),
-        Job::SignalStop => done("Data source stopped".into()),
         Job::Set(feature) => {
             let name = value["name"].as_str().unwrap_or(feature);
             let mut text = match value.get("value") {
@@ -426,8 +424,6 @@ fn failure(job: &Job) -> String {
         Job::DatasetClose => "Could not close the dataset",
         Job::DatasetNote => "Could not add the note",
         Job::DatasetExport => "Could not export the dataset",
-        Job::SignalStart => "Could not start the data source",
-        Job::SignalStop => "Could not stop the data source",
         Job::SetMany => "Could not set the features",
         Job::Set(feature) => return format!("Could not set {}", words(feature)),
         Job::Execute(feature) => return format!("Could not execute {}", words(feature)),
@@ -487,7 +483,7 @@ fn saved(value: &Value) -> (String, Option<String>, Level) {
             |name| name.to_string_lossy().into_owned(),
         )
     };
-    let (mut text, detail) = match files.as_slice() {
+    let (text, detail) = match files.as_slice() {
         [] => {
             let frames = value["count"].as_u64().unwrap_or(1);
             (
@@ -514,33 +510,6 @@ fn saved(value: &Value) -> (String, Option<String>, Level) {
             )
         }
     };
-    // Only bucket destinations report a queue.
-    if let (Some(queued), Some(destination)) = (
-        value["queued_uploads"].as_u64(),
-        value["destination"].as_str(),
-    ) {
-        let stuck = (files.len() as u64).saturating_sub(queued);
-        if stuck == 0 {
-            if queued > 0 {
-                text.push_str(&format!(" · uploading to {destination}"));
-            }
-        } else {
-            text.push_str(&if stuck as usize == files.len() {
-                " · not queued for upload".to_owned()
-            } else {
-                format!(" · {} not queued for upload", grouped(stuck))
-            });
-            let why = format!(
-                "{} not queued for upload to {destination}; Activity has the reason.",
-                plural(stuck, "file was", "files were")
-            );
-            let detail = Some(match detail {
-                Some(saved) => format!("{saved}\n{why}"),
-                None => why,
-            });
-            return (text, detail, Level::Warning);
-        }
-    }
     (text, detail, Level::Done)
 }
 
@@ -617,8 +586,8 @@ mod tests {
             ),
             (
                 Job::Capture,
-                json!({"files": ["c.png"], "destination": "lab", "queued_uploads": 1}),
-                "Saved c.png · uploading to lab",
+                json!({"files": ["c.png"], "destination": "lab"}),
+                "Saved c.png",
             ),
             (
                 Job::Capture,
@@ -715,29 +684,6 @@ mod tests {
             failed(Job::Forward { recording: true }),
             "Could not start recording: busy"
         );
-    }
-
-    #[test]
-    fn uploads_that_could_not_be_queued_are_a_warning() {
-        let (text, detail, level) = notice(
-            Job::Capture,
-            json!({"files": ["shots/c.png"], "destination": "lab", "queued_uploads": 0}),
-        );
-        assert_eq!(level, Level::Warning);
-        assert_eq!(text, "Saved c.png · not queued for upload");
-        let detail = detail.unwrap();
-        assert!(detail.starts_with("shots/c.png\n"));
-        assert!(detail.contains("1 file was not queued for upload to lab"));
-        let (text, _, level) = notice(
-            Job::Capture,
-            json!({
-                "files": ["shots/a.png", "shots/b.png", "shots/c.png"],
-                "destination": "lab",
-                "queued_uploads": 1
-            }),
-        );
-        assert_eq!(level, Level::Warning);
-        assert_eq!(text, "Saved 3 files to shots · 2 not queued for upload");
     }
 
     fn bench() -> Workbench {

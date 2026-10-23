@@ -258,7 +258,9 @@ pub(crate) fn worker_threads(pixels: usize) -> usize {
     if pixels < 512 * 1024 {
         return 1;
     }
-    spare_cores(std::thread::available_parallelism().map_or(1, |n| n.get()))
+    crate::resources::processing_threads(spare_cores(
+        std::thread::available_parallelism().map_or(1, |n| n.get()),
+    ))
 }
 /// Up to eight of a computer's `cores`, always leaving one for the camera
 /// workers and the window.
@@ -1444,7 +1446,10 @@ mod tests {
         assert_eq!(worker_threads(1000), 1);
         assert_eq!([1, 2, 4, 8, 9, 16].map(spare_cores), [1, 1, 3, 7, 8, 8]);
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        assert_eq!(worker_threads(64 << 20), spare_cores(cores));
+        assert!(
+            (1..=spare_cores(cores)).contains(&worker_threads(64 << 20)),
+            "resource pressure may reduce parallel work, but never exceed available spare cores"
+        );
     }
     #[test]
     fn direct_conversions_match_rgb() {

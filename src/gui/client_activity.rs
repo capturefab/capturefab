@@ -1,6 +1,6 @@
 //! Reflect work from CLI and API clients without treating it as a UI edit.
 use super::*;
-use crate::session::{ActivityJob, ActivityOrigin, ActivityState, SessionActivity};
+use crate::session::{ActivityJob, ActivityState, SessionActivity};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
@@ -369,16 +369,13 @@ impl Workbench {
         // The toolbar may clip a long attribution. Its tooltip retains the
         // actor and progress alongside the outcome; announcements include the
         // same summary once, through Notice::announcement's shared handling.
-        let attribution = entry
-            .actor
-            .as_ref()
-            .map(|actor| format!("Participant: {} · {}", actor_kind(actor.kind), actor.id));
-        let detail = attribution
-            .iter()
-            .chain(entry.detail.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        let detail = (!detail.is_empty()).then(|| format!("{text}\n{}", detail.join("\n")));
+        let mut detail = vec![format!(
+            "Participant: {} · {}",
+            actor_kind(entry.actor.kind),
+            entry.actor.id
+        )];
+        detail.extend(entry.detail.iter().cloned());
+        let detail = Some(format!("{text}\n{}", detail.join("\n")));
         self.set_notice(text, detail, level);
     }
 
@@ -472,12 +469,7 @@ impl Workbench {
     }
 
     pub(super) fn other_activity(&self, entry: &SessionActivity) -> bool {
-        entry
-            .actor
-            .as_ref()
-            .map_or(entry.origin == ActivityOrigin::Client, |actor| {
-                actor.id != self.actor.id && !self.assistant_actor_is_local(&actor.id)
-            })
+        entry.actor.id != self.actor.id && !self.assistant_actor_is_local(&entry.actor.id)
     }
 }
 
@@ -508,14 +500,11 @@ pub(super) fn activity_line(
     if effective_state(entry) != ActivityState::Succeeded || entry.job.is_some() {
         line.push_str(&format!(" · {}", activity_state(entry)));
     }
-    let agent = entry
-        .actor
-        .as_ref()
-        .is_some_and(|actor| actor.kind == crate::session::ActorKind::Agent);
+    let agent = entry.actor.kind == crate::session::ActorKind::Agent;
     if agent {
         // An agent's whole ID: the row wraps rather than leave two agents
         // looking alike.
-        let actor = entry.actor.as_ref().expect("agent");
+        let actor = &entry.actor;
         line = format!("AI agent {} [{}] · {line}", actor.name, actor.id);
     } else if other {
         line = format!("{} · {line}", actor_display(entry));
@@ -536,10 +525,8 @@ pub(super) fn activity_line(
 
 /// Expanded activity and accessible status retain full participant identity.
 pub(super) fn actor_text(entry: &SessionActivity) -> String {
-    entry.actor.as_ref().map_or_else(
-        || entry.origin.label().into(),
-        |actor| format!("{} [{}] · {}", actor.name, actor.id, actor_kind(actor.kind)),
-    )
+    let actor = &entry.actor;
+    format!("{} [{}] · {}", actor.name, actor.id, actor_kind(actor.kind))
 }
 
 fn actor_kind(kind: crate::session::ActorKind) -> &'static str {
@@ -566,22 +553,18 @@ pub(super) fn activity_detail(entry: &SessionActivity) -> Option<&str> {
 }
 
 pub(super) fn actor_display(entry: &SessionActivity) -> String {
-    entry.actor.as_ref().map_or_else(
-        || entry.origin.label().into(),
-        |actor| {
-            let name = if actor.name.chars().count() > 24 {
-                format!("{}…", actor.name.chars().take(24).collect::<String>())
-            } else {
-                actor.name.clone()
-            };
-            let id = if actor.id.len() > 24 {
-                format!("…{}", &actor.id[actor.id.len() - 8..])
-            } else {
-                actor.id.clone()
-            };
-            format!("{name} [{id}]")
-        },
-    )
+    let actor = &entry.actor;
+    let name = if actor.name.chars().count() > 24 {
+        format!("{}…", actor.name.chars().take(24).collect::<String>())
+    } else {
+        actor.name.clone()
+    };
+    let id = if actor.id.len() > 24 {
+        format!("…{}", &actor.id[actor.id.len() - 8..])
+    } else {
+        actor.id.clone()
+    };
+    format!("{name} [{id}]")
 }
 
 pub(super) fn active(entry: &SessionActivity) -> bool {
@@ -648,8 +631,6 @@ fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
         Job::DatasetClose => entry.operation == "dataset_close",
         Job::DatasetNote => entry.operation == "dataset_note",
         Job::DatasetExport => entry.operation == "dataset_export",
-        Job::SignalStart => entry.operation == "signal_start",
-        Job::SignalStop => matches!(entry.operation.as_str(), "signal_stop" | "signal_stop_if"),
         Job::Set(feature) => entry.operation == "set" && entry.feature.as_ref() == Some(feature),
         Job::SetMany => entry.operation == "set_many",
         Job::Execute(feature) => {
@@ -661,6 +642,7 @@ fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::ActivityOrigin;
     use serde_json::json;
     fn select(bench: &mut Workbench, camera: &str, width: u64) {
         bench.snapshot.connected = Some(crate::transport::simulator::info_named(camera));
@@ -701,14 +683,12 @@ mod tests {
         SessionActivity {
             id,
             origin: ActivityOrigin::Client,
-            actor: Some(
-                crate::session::SessionActor::new(
-                    "agent-a",
-                    "Agent A",
-                    crate::session::ActorKind::Agent,
-                )
-                .unwrap(),
-            ),
+            actor: crate::session::SessionActor::new(
+                "agent-a",
+                "Agent A",
+                crate::session::ActorKind::Agent,
+            )
+            .unwrap(),
             operation: "capture".into(),
             camera: Some("sim:0".into()),
             feature: None,
@@ -726,10 +706,7 @@ mod tests {
     #[test]
     fn activity_rows_read_plainly_and_name_who_only_when_it_matters() {
         let human = |id: &str, name: &str| {
-            Some(
-                crate::session::SessionActor::new(id, name, crate::session::ActorKind::Human)
-                    .unwrap(),
-            )
+            crate::session::SessionActor::new(id, name, crate::session::ActorKind::Human).unwrap()
         };
         let line = |entry: &SessionActivity, other: bool| activity_line(entry, other, None).0;
         let mut connect = entry(1, ActivityState::Succeeded);
@@ -767,14 +744,12 @@ mod tests {
         // Agents always say so, with their whole ID.
         let mut agent = entry(2, ActivityState::Running);
         let id = format!("cli-agent-{}", "b".repeat(64));
-        agent.actor = Some(
-            crate::session::SessionActor::new(
-                id.clone(),
-                "Workflow agent",
-                crate::session::ActorKind::Agent,
-            )
-            .unwrap(),
-        );
+        agent.actor = crate::session::SessionActor::new(
+            id.clone(),
+            "Workflow agent",
+            crate::session::ActorKind::Agent,
+        )
+        .unwrap();
         let (row, full) = activity_line(&agent, false, None);
         assert_eq!(
             row,
@@ -800,14 +775,12 @@ mod tests {
     fn compact_actor_labels_leave_full_identity_in_expanded_activity() {
         let mut command = entry(1, ActivityState::Succeeded);
         let id = format!("cli-agent-{}", "a".repeat(64));
-        command.actor = Some(
-            crate::session::SessionActor::new(
-                id.clone(),
-                "Workflow agent",
-                crate::session::ActorKind::Agent,
-            )
-            .unwrap(),
-        );
+        command.actor = crate::session::SessionActor::new(
+            id.clone(),
+            "Workflow agent",
+            crate::session::ActorKind::Agent,
+        )
+        .unwrap();
         assert_eq!(
             actor_text(&command),
             format!("Workflow agent [{id}] · AI agent")
@@ -825,14 +798,12 @@ mod tests {
         let mut bench = Workbench::new(SessionHandle::new(), "activity-tree".into(), true, None);
         let mut first = entry(1, ActivityState::Running);
         first.submitted_at_ms = 1_000;
-        first.actor = Some(
-            crate::session::SessionActor::new(
-                "cli-agent-with-a-long-distinct-identity",
-                "Workflow agent",
-                crate::session::ActorKind::Agent,
-            )
-            .unwrap(),
-        );
+        first.actor = crate::session::SessionActor::new(
+            "cli-agent-with-a-long-distinct-identity",
+            "Workflow agent",
+            crate::session::ActorKind::Agent,
+        )
+        .unwrap();
         first.detail = Some("Waiting for the acquisition trigger".into());
         let mut second = entry(2, ActivityState::Succeeded);
         second.finished_at_ms = Some(2_000);
@@ -977,9 +948,9 @@ mod tests {
     fn native_activity_identity_cache_is_pruned_even_when_the_panel_is_closed() {
         let mut bench = Workbench::new(SessionHandle::new(), "activity-prune".into(), true, None);
         let mut first = entry(1, ActivityState::Running);
-        first.actor = Some(bench.actor.clone());
+        first.actor = bench.actor.clone();
         let mut second = entry(2, ActivityState::Running);
-        second.actor = Some(bench.actor.clone());
+        second.actor = bench.actor.clone();
         bench.snapshot.activity = vec![first, second.clone()];
         drop(bench.client_activity_rows(Palette::of(false)));
         let retained = bench.client_activity.row_ids.borrow()[&2];
@@ -1071,26 +1042,22 @@ mod tests {
         let mut renderer = super::super::destinations::layout_tests::renderer();
         let mut bench = Workbench::new(SessionHandle::new(), "activity-wrap".into(), true, None);
         let mut desktop = entry(1, ActivityState::Succeeded);
-        desktop.actor = Some(
-            crate::session::SessionActor::new(
-                "desktop:27591",
-                "Desktop 27591",
-                crate::session::ActorKind::Human,
-            )
-            .unwrap(),
-        );
+        desktop.actor = crate::session::SessionActor::new(
+            "desktop:27591",
+            "Desktop 27591",
+            crate::session::ActorKind::Human,
+        )
+        .unwrap();
         desktop.operation = "start".into();
         desktop.label = "Start acquisition".into();
         desktop.detail = None;
         let mut long = entry(2, ActivityState::Failed);
-        long.actor = Some(
-            crate::session::SessionActor::new(
-                "a".repeat(128),
-                "Workflow agent",
-                crate::session::ActorKind::Agent,
-            )
-            .unwrap(),
-        );
+        long.actor = crate::session::SessionActor::new(
+            "a".repeat(128),
+            "Workflow agent",
+            crate::session::ActorKind::Agent,
+        )
+        .unwrap();
         long.label = "Capture failed: output folder is read-only".into();
         long.detail = Some(format!("/isolated/{}/capture.png", "unbroken".repeat(48)));
         bench.snapshot.activity = vec![desktop, long];
@@ -1241,7 +1208,7 @@ mod tests {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
         let mut gui = entry(1, ActivityState::Succeeded);
         gui.origin = ActivityOrigin::Gui;
-        gui.actor = Some(bench.actor.clone());
+        gui.actor = bench.actor.clone();
         bench.snapshot.activity = vec![gui];
         bench.sync_client_activity();
         assert!(bench.notice.is_none() && bench.last_saved.is_none());
@@ -1266,14 +1233,12 @@ mod tests {
         let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
         let mut peer = entry(1, ActivityState::Succeeded);
         peer.origin = ActivityOrigin::Gui;
-        peer.actor = Some(
-            crate::session::SessionActor::new(
-                "desktop-peer",
-                "Morgan",
-                crate::session::ActorKind::Human,
-            )
-            .unwrap(),
-        );
+        peer.actor = crate::session::SessionActor::new(
+            "desktop-peer",
+            "Morgan",
+            crate::session::ActorKind::Human,
+        )
+        .unwrap();
         bench.snapshot.activity = vec![peer];
         bench.sync_client_activity();
         assert!(bench.client_activity.unread);
@@ -1303,10 +1268,7 @@ mod tests {
         );
         let activity = bench.handle.snapshot().activity;
         assert_eq!(activity.last().unwrap().camera.as_deref(), Some("sim:0"));
-        assert_eq!(
-            activity.last().unwrap().actor.as_ref().unwrap(),
-            &bench.actor
-        );
+        assert_eq!(&activity.last().unwrap().actor, &bench.actor);
     }
 
     #[test]

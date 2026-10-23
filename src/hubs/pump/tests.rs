@@ -452,7 +452,7 @@ fn a_new_authentication_refusal_cannot_be_cleared_by_connect_success() {
         tls_server_name: None,
         rtsp_port: None,
         rejected: None,
-        revision: None,
+        revision: [0; 16],
     };
     store.save_with(&hub, |_| Ok(()), |_| Ok(())).unwrap();
     let hub = store.get("test").unwrap();

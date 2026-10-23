@@ -13,11 +13,9 @@ use crate::{
 use serde_json::json;
 use std::sync::Arc;
 
-pub(in crate::gui) const WORDS: [&str; 12] = [
+pub(in crate::gui) const WORDS: [&str; 10] = [
     "quick-command",
     "quick-command-data-consent",
-    "quick-command-data-sources",
-    "quick-command-data-auth",
     "quick-command-plan",
     "quick-command-invalid",
     "quick-command-running",
@@ -60,42 +58,18 @@ pub(in crate::gui) fn fixture(word: &str, snapshot: SessionSnapshot) -> quick::S
         state.allow_images = true;
         return state;
     }
-    if word == "quick-command-data-sources" {
-        state.allow_data = true;
-        state.data_sources_open = true;
-        state.data_sources.push(
-            crate::tools::context::DataSourceRef::approved(
-                "mqtt://line1.example/line1/temperature",
-            )
-            .unwrap(),
-        );
-        state.data_source_draft = "modbus-tcp://plc.example/1/holding/0".into();
-        return state;
-    }
-    if word == "quick-command-data-auth" {
-        state.allow_data = true;
-        state.data_sources_open = true;
-        state.source_setup.fixture();
-        state.prompt = "Read the approved temperature source.".into();
-        return state;
-    }
     if word == "quick-command-exported" {
-        let source = crate::tools::context::DataSourceRef::approved("sim-signal://line1").unwrap();
-        state.allow_data = true;
-        state.data_sources.push(source.clone());
         let context = state.context.as_mut().unwrap();
         #[cfg(windows)]
         {
             context.capture_root = PathBuf::from(r"C:\Capturefab Review\captures");
         }
-        context.allow_data = true;
-        context.data_sources.push(source.clone());
         state
             .plan
             .propose(
                 ToolCall {
-                    tool: "read_data_source".into(),
-                    args: json!({"source":source.reference,"timeout":"1s"}),
+                    tool: "get_overview".into(),
+                    args: json!({}),
                 },
                 None,
             )
@@ -120,6 +94,8 @@ pub(in crate::gui) fn fixture(word: &str, snapshot: SessionSnapshot) -> quick::S
     }
     if word == "quick-command-error" {
         state.error = Some("The AI provider could not complete this request. Try again.".into());
+        state.last_prompt =
+            Some("Record the camera for 30 seconds and take one photo for the run log.".into());
         state.provider_excerpt = Some("The service is temporarily busy.".into());
         return state;
     }
@@ -205,16 +181,12 @@ pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
     }
     let policy = StoragePolicy::default();
     Context {
-        data_profiles: Vec::new(),
         now_ms: 1_792_344_960_000,
         zone: Zone::Fixed(-14_400),
         session: true,
         snapshot,
-        data_sources: Vec::new(),
         allow_data: false,
         data_dataset: None,
-        task_data_available: cfg!(unix) && cfg!(feature = "parquet"),
-        task_data_reserved_bytes: 0,
         destinations: vec![DestinationInfo {
             approval_identity: None,
             name: "inspection-archive".into(),
@@ -235,7 +207,6 @@ pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
             free_disk: Some(40_000_000_000),
         },
         media: MediaInfo::from_names(&["libx264".into(), "libx265".into()]),
-        uploads: None,
         capture_root: PathBuf::from(if cfg!(windows) {
             r"C:\tmp\capturefab-scene\captures"
         } else {

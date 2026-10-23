@@ -255,7 +255,7 @@ pub struct Hub {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// Required: an old or hand-written record never defaults to a keychain
+    /// Required so a hand-written record never defaults to a keychain
     /// lookup that might belong to another server.
     pub secret: SecretSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -272,10 +272,9 @@ pub struct Hub {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejected: Option<Rejected>,
     /// A new, non-secret identity for every save, including re-adding the
-    /// same URL with a changed keychain or environment secret. Old workers
-    /// must not latch a refusal against that replacement.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) revision: Option<[u8; 16]>,
+    /// same URL with a changed keychain or environment secret. Requests
+    /// started before the save must not mark that replacement rejected.
+    pub(crate) revision: [u8; 16],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -662,12 +661,6 @@ struct File {
     hubs: Vec<Hub>,
 }
 
-pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
-    what: "saved hubs",
-    names: &["hubs.json"],
-    lock: Some("hubs.lock"),
-};
-
 /// The saved hubs of one state directory.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -676,8 +669,6 @@ pub struct Store {
 
 impl Store {
     pub fn session() -> Self {
-        static ADOPTED: std::sync::Once = std::sync::Once::new();
-        ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
         Self::at(crate::ipc::state_dir())
     }
     pub fn at(dir: impl Into<PathBuf>) -> Self {
@@ -825,7 +816,7 @@ impl Store {
         let mut revision = [0; 16];
         getrandom::fill(&mut revision)
             .map_err(|error| anyhow::anyhow!("cannot create a saved hub revision: {error}"))?;
-        hub.revision = Some(revision);
+        hub.revision = revision;
         self.locked(
             |file| {
                 if let Some(other) = file.hubs.iter().find(|other| {
@@ -933,6 +924,7 @@ pub fn keychain_unsupported() -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn hub(name: &str, kind: Kind, url: &str) -> Hub {
         Hub {
@@ -946,7 +938,7 @@ mod tests {
             tls_server_name: None,
             rtsp_port: (kind == Kind::Frigate).then_some(8554),
             rejected: None,
-            revision: None,
+            revision: [0; 16],
         }
     }
     fn temp(name: &str) -> PathBuf {
@@ -1223,16 +1215,24 @@ mod tests {
     }
 
     #[test]
-    fn records_without_a_secret_source_or_with_unknown_fields_are_refused() {
+    fn records_missing_required_fields_or_with_unknown_fields_are_refused() {
         let dir = temp("parse");
         fs::create_dir_all(&dir).unwrap();
         let store = Store::at(&dir);
+        let record = serde_json::to_value(hub("home", Kind::HomeAssistant, "http://ha")).unwrap();
+        let mut missing_secret = record.clone();
+        missing_secret.as_object_mut().unwrap().remove("secret");
+        let mut missing_revision = record.clone();
+        missing_revision.as_object_mut().unwrap().remove("revision");
+        let mut unknown_field = record;
+        unknown_field["token"] = json!("x");
         for body in [
-            r#"{"version":1,"hubs":[{"name":"home","kind":"home_assistant","url":"http://ha"}]}"#,
-            r#"{"version":1,"hubs":[{"name":"home","kind":"home_assistant","url":"http://ha","secret":"keychain","token":"x"}]}"#,
-            r#"{"version":2,"hubs":[]}"#,
+            json!({"version": 1, "hubs": [missing_secret]}),
+            json!({"version": 1, "hubs": [missing_revision]}),
+            json!({"version": 1, "hubs": [unknown_field]}),
+            json!({"version": 2, "hubs": []}),
         ] {
-            fs::write(dir.join("hubs.json"), body).unwrap();
+            fs::write(dir.join("hubs.json"), body.to_string()).unwrap();
             assert!(store.list().is_err(), "{body}");
         }
         let _ = fs::remove_dir_all(dir);

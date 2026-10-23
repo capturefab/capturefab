@@ -1,6 +1,6 @@
 //! Performance: the efficiency setting as the desktop applies it, what the
 //! desktop tells Automatic, and whether each shown camera's preview keeps up.
-//! Captures and recordings keep every frame, whatever this decides.
+//! Saved image quality and recording settings stay unchanged. Frame delivery reports losses.
 use super::*;
 use crate::efficiency::{Mode, Resolved};
 
@@ -152,6 +152,22 @@ pub(super) fn start(mode: Mode) {
     process::reset(mode);
     #[cfg(not(test))]
     process::set(mode);
+}
+
+/// Device pressure makes Automatic previews lighter without changing capture
+/// or recording settings. The test implementation remains thread-local.
+pub(super) fn resource_pressure(reason: Option<&'static str>) {
+    for known in [
+        "device CPU or memory pressure",
+        "conservative resource safeguards",
+    ] {
+        if Some(known) != reason {
+            process::clear_hint(known);
+        }
+    }
+    if let Some(reason) = reason {
+        process::hint(reason);
+    }
 }
 
 /// What the Performance setting's segments say.
@@ -402,7 +418,7 @@ impl Workbench {
         if !before && efficient() && !std::mem::replace(&mut state.noticed, true) {
             self.set_notice(
                 "Switched to Efficient mode because this computer was falling behind",
-                Some("Captures and recordings keep every frame. Settings › Performance can choose Smooth again.".into()),
+                Some("Saved image quality and recording settings stay unchanged. Frame delivery reports any losses. Settings › Performance can choose Smooth again.".into()),
                 Level::Done,
             );
         }
@@ -422,9 +438,44 @@ impl Workbench {
         Some(format!("Preview {drawn:.0} of {sent:.0} fps"))
     }
 
+    /// Name the active preview cap and its known cause without inferring that
+    /// a chosen processing limit caused a dropped camera or encoder frame.
+    pub(super) fn preview_limit_note(&self) -> Option<String> {
+        let resolved = process::current();
+        if !resolved.efficient {
+            return None;
+        }
+        let cause = if resolved.setting == Mode::Efficient {
+            if self.performance == Mode::Efficient {
+                "Your Efficient setting"
+            } else {
+                "The Efficient override"
+            }
+        } else if resolved
+            .reasons
+            .iter()
+            .any(|reason| reason == "device CPU or memory pressure")
+        {
+            "Automatic protection for device pressure"
+        } else if resolved
+            .reasons
+            .iter()
+            .any(|reason| reason == "conservative resource safeguards")
+        {
+            "Automatic protection while resource use is checked"
+        } else if resolved.reasons.iter().any(|reason| reason == OVERLOAD) {
+            "Automatic protection after the preview fell behind"
+        } else if resolved.reasons.iter().any(|reason| reason == SOFTWARE) {
+            "Automatic protection for software rendering"
+        } else {
+            "Automatic preview protection"
+        };
+        Some(format!("{cause} limits preview drawing to at most 15 fps."))
+    }
+
     /// What the preview figure means, and what to do about it.
     pub(super) fn preview_about(&self) -> String {
-        let mut about = "This computer is drawing fewer frames than the camera sends. Captures and recordings still get every frame.".to_owned();
+        let mut about = "This computer is drawing fewer frames than the camera sends. Preview skips are separate from camera frame loss.".to_owned();
         if efficient() {
             about.push_str(" Efficient mode is on.");
         } else if let Some(overridden) = self.performance_overridden() {
@@ -489,7 +540,7 @@ impl Workbench {
                 index as f32,
             ),
             text(
-                "Efficient draws up to 15 camera frames a second, 5 in the overview, keeps scaled-down pictures to 1280 pixels and skips animations. New recordings encode faster. Captures and recordings keep every frame."
+                "Efficient draws up to 15 camera frames a second, 5 in the overview, keeps scaled-down pictures to 1280 pixels and skips animations. New recordings encode faster. Saved image quality and recording settings stay unchanged. Frame delivery reports any losses."
             )
             .size(style::SMALL)
             .color(p.secondary),
@@ -666,7 +717,12 @@ mod tests {
         assert!(efficient(), "Automatic heard it");
         let notice = bench.notice.clone().unwrap();
         assert!(notice.text.starts_with("Switched to Efficient mode"));
-        assert!(notice.detail.unwrap().contains("keep every frame"));
+        assert!(
+            notice
+                .detail
+                .unwrap()
+                .contains("recording settings stay unchanged")
+        );
         // Efficient preview draws at most 15 a second, which it manages.
         draw(&mut bench, 15, 5);
         assert_eq!(bench.preview_figure("sim:0"), None);

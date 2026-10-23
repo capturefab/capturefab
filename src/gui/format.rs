@@ -871,6 +871,7 @@ mod tests {
         };
         let snapshot = |info: CameraInfo| crate::session::CameraSnapshot {
             info,
+            forwarding_progress: None,
             ..super::super::liveness::streaming_camera(0, 0, 0.0)
         };
         let streams = [

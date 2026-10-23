@@ -44,33 +44,22 @@ fn is_own(entry: &Value, actor_id: &str) -> bool {
 
 fn actor_label(entry: &Value) -> String {
     let actor = &entry["actor"];
-    let name = text(actor, "name");
-    if !name.is_empty() {
-        let id = text(actor, "id");
-        let short_id = if id.len() > 16 {
-            id.get(id.len() - 8..).unwrap_or(id)
-        } else {
-            id
-        };
-        format!(
-            "{} · {}{}",
-            name,
-            if text(actor, "kind") == "agent" {
-                "AI agent"
-            } else {
-                "Human"
-            },
-            if short_id.is_empty() {
-                String::new()
-            } else {
-                format!(" · {short_id}")
-            }
-        )
-    } else if text(entry, "origin") == "gui" {
-        "Desktop user".into()
+    let id = text(actor, "id");
+    let short_id = if id.len() > 16 {
+        id.get(id.len() - 8..).unwrap_or(id)
     } else {
-        "CLI / API participant".into()
-    }
+        id
+    };
+    format!(
+        "{} · {} · {}",
+        text(actor, "name"),
+        if text(actor, "kind") == "agent" {
+            "AI agent"
+        } else {
+            "Human"
+        },
+        short_id
+    )
 }
 
 fn state(entry: &Value) -> &str {

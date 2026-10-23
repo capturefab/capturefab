@@ -1,12 +1,10 @@
 //! Coordinator arms for the dataset commands. None of them touch a camera
 //! worker, so none take a command turn.
 use super::{ExportFormat, Slot, export::ExportRequest};
-use crate::{session::SessionCommand, signals::hub::SignalHub};
+use crate::session::SessionCommand;
 use anyhow::{Result, bail, ensure};
 use serde_json::{Value, json};
-use std::{path::PathBuf, sync::Arc, time::Duration};
-
-const SINK_TIMEOUT: Duration = Duration::from_secs(10);
+use std::{path::PathBuf, sync::Arc};
 
 fn absolute(path: &str, what: &str) -> Result<PathBuf> {
     let path = PathBuf::from(path);
@@ -14,14 +12,14 @@ fn absolute(path: &str, what: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn run(slot: &Arc<Slot>, signals: &SignalHub, command: SessionCommand) -> Result<Value> {
+pub fn run(slot: &Arc<Slot>, command: SessionCommand) -> Result<Value> {
     match command {
         SessionCommand::DatasetStatus => Ok(serde_json::to_value(slot.status_cached())?),
         SessionCommand::DatasetOpen {
             path,
             mode,
             max_bytes,
-        } => open(slot, signals, &path, mode, max_bytes, None),
+        } => open(slot, &path, mode, max_bytes, None),
         SessionCommand::DatasetOpenIf {
             expected_slot_id,
             path,
@@ -29,17 +27,13 @@ pub fn run(slot: &Arc<Slot>, signals: &SignalHub, command: SessionCommand) -> Re
             max_bytes,
         } => open(
             slot,
-            signals,
             &path,
             mode,
             max_bytes,
             Some(expected_slot_id.as_deref()),
         ),
-        SessionCommand::DatasetClose => close(slot, signals, None, None),
-        SessionCommand::DatasetCloseIf {
-            slot_id,
-            sink_generation,
-        } => close(slot, signals, Some(&slot_id), sink_generation),
+        SessionCommand::DatasetClose => close(slot, None),
+        SessionCommand::DatasetCloseIf { slot_id } => close(slot, Some(&slot_id)),
         SessionCommand::DatasetNote {
             text,
             context,
@@ -138,7 +132,6 @@ pub fn run(slot: &Arc<Slot>, signals: &SignalHub, command: SessionCommand) -> Re
 
 fn open(
     slot: &Arc<Slot>,
-    signals: &SignalHub,
     path: &str,
     mode: super::OpenMode,
     max_bytes: Option<u64>,
@@ -153,45 +146,15 @@ fn open(
             slot.open(&path, mode, max_bytes)
         }
     };
-    let status = match result {
-        Ok(status) => status,
-        Err(error) => {
-            // A stale conditional command cannot change even the sink of an
-            // empty slot; only a valid open that failed may detach it.
-            if expected.is_none() && slot.status_cached().is_none() && signals.has_sink() {
-                let _ = signals.set_sink(None, SINK_TIMEOUT);
-            }
-            return Err(error);
-        }
-    };
-    // Never hold a writer lock here: the hub's writer thread takes it.
-    if !signals.has_sink() {
-        let sink: Arc<dyn crate::signals::SampleSink> = slot.clone();
-        if let Err(e) = signals.set_sink(Some(sink), SINK_TIMEOUT) {
-            eprintln!("capturefab: signal samples will not reach the dataset: {e:#}");
-        }
-    }
-    // This receipt is captured while the dataset lifecycle is still held, so
-    // later plan steps bind the sink actually acknowledged by this open.
-    let mut result = serde_json::to_value(status)?;
-    result["sink_generation"] = json!(signals.sink_status().generation);
-    Ok(result)
+    Ok(serde_json::to_value(result?)?)
 }
 
-fn close(
-    slot: &Arc<Slot>,
-    signals: &SignalHub,
-    expected: Option<&str>,
-    sink_generation: Option<u64>,
-) -> Result<Value> {
+fn close(slot: &Arc<Slot>, expected: Option<&str>) -> Result<Value> {
     let _lifecycle = slot.lifecycle();
     if let Some(id) = expected {
         slot.ensure_slot(Some(id))?;
     }
-    if signals.has_sink() || sink_generation.is_some() {
-        signals.set_sink_if_generation(None, sink_generation, SINK_TIMEOUT)?;
-    }
     slot.set_auto_path(None);
     let closed = slot.close()?;
-    Ok(json!({"closed": closed, "sink_generation": signals.sink_status().generation}))
+    Ok(json!({"closed": closed}))
 }

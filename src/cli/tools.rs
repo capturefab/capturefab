@@ -55,7 +55,7 @@ pub enum ToolsCommand {
         /// Validate and show the normalized call and commands without executing
         #[arg(long)]
         dry_run: bool,
-        /// Read exactly one destination secret or stream password from stdin
+        /// Read exactly one stream password from stdin
         #[arg(long)]
         secret_stdin: bool,
         /// Pass only after the user approved this exact action
@@ -75,7 +75,7 @@ pub enum ToolsCommand {
         /// Validate and show normalized calls and commands without executing
         #[arg(long)]
         dry_run: bool,
-        /// Read exactly one destination secret or stream password from stdin
+        /// Read exactly one stream password from stdin
         #[arg(long)]
         secret_stdin: bool,
         /// Pass only after the user approved every exact action in this plan
@@ -174,9 +174,6 @@ fn secret_targets(steps: &[(StepId, ToolCall)]) -> Vec<(StepId, &'static str)> {
         .iter()
         .filter_map(|(id, call)| match call.tool.as_str() {
             "stream_to_url" => Some((*id, "password")),
-            "create_s3_destination" if call.args["credentials"] == "keychain" => {
-                Some((*id, "secret"))
-            }
             _ => None,
         })
         .collect()
@@ -732,7 +729,7 @@ pub(super) fn schema_contract() -> Value {
         "issues":{"shape":{"step":"1-based integer","field":"argument path or null","message":"redacted sentence","severity":"error or warning","code":"typed category"},"exit_codes":{"usage":2,"unavailable":3,"timeout":4,"unsupported":5,"storage_full":6,"operation_failed":1}},
         "confirmation":{"risks":["disruptive","human_only"],"flag":"--confirmed-by-user","rule":"Pass only after the user approved this exact action.","missing":"usage (exit 2) with risk and checked steps, before checked validation or availability errors","dry_run":"confirmation is not necessary; checked issues determine the exit code"},
         "images":{"tool":"inspect_frame","default":"private ephemeral <runtime_dir>/inspect/ files outside the storage ledger","directory_mode":"0700","file_mode":"0600","max_files":MAX_IMAGES,"max_bytes":MAX_IMAGE_BYTES,"image_out":"storage-budgeted new file; existing files are never overwritten","inline_image":"image.base64 holds the encoded preview","metadata":["path","mime","width","height","bytes","sha256"]},
-        "secrets":{"source":"--secret-stdin","count":"exactly one eligible step","fields":["create_s3_destination.secret","stream_to_url.password"],"schemas":"secret and password are UI/CLI-only and absent from schemas"},
+        "secrets":{"source":"--secret-stdin","count":"exactly one eligible step","fields":["stream_to_url.password"],"schemas":"secret and password are UI/CLI-only and absent from schemas"},
         "field_kinds":{"string_list":{"json":"array of strings; optional fields also accept null","editor":"one name per row; Add and Remove preserve string values"}},
         "redaction":"URL passwords, credential query values, RTMP stream keys and AWS access key IDs are removed from output; model output additionally removes serial, address, profile and full network URL paths."
     })

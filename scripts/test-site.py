@@ -93,7 +93,8 @@ def check_pages(root, errors):
         errors.extend(f"{name}: {error}" for error in page.errors)
         if not (page.lang and page.main):
             errors.append(f"{name}: semantic page language/main missing")
-    scripts = {"index.html": ["app.js", "docs.js"], "docs.html": ["app.js", "docs.js"], "downloads.html": ["docs.js"]}
+    scripts = {"index.html": ["app.js", "docs.js"], "docs.html": ["app.js", "docs.js"], "downloads.html": ["docs.js"],
+               "reference.html": ["app.js", "docs.js"], "desktop.html": ["app.js", "docs.js"]}
     for name, page in pages.items():
         if page.scripts != scripts.get(name, []):
             errors.append(f"{name}: unexpected or missing script dependency: {page.scripts}")
@@ -428,9 +429,17 @@ def validate(root=ROOT):
 
 def main():
     errors, versions = validate()
+    spec = importlib.util.spec_from_file_location("docs_coverage", Path(__file__).with_name("docs-coverage.py"))
+    coverage = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(coverage)
+    try:
+        report = coverage.validate(ROOT.parent)
+        errors.extend(f"documentation coverage: {error}" for error in report["errors"])
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        errors.append(f"cannot validate documentation coverage: {error}")
     if errors:
         sys.exit("\n".join(errors))
-    print(f"Static site validated; accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
+    print(f"Static site validated; source-based documentation coverage, accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
 
 
 if __name__ == "__main__":

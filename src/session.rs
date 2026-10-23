@@ -1,7 +1,6 @@
 //! Multi-camera coordinator: one isolated process per camera, shared-memory pixels.
 mod activity;
 mod log;
-pub mod task_data;
 pub use crate::shared_memory::FrameMeta;
 use crate::{
     genicam::FeatureInfo,
@@ -94,7 +93,7 @@ pub enum SessionCommand {
         format: String,
         #[serde(default)]
         storage: crate::storage::StoragePolicy,
-        /// A saved destination (folder or S3 bucket); `output` is then a name inside it.
+        /// A saved folder destination; `output` is then a name inside it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
         /// What to do when an output name without {seq} exists; fail by default.
@@ -113,7 +112,7 @@ pub enum SessionCommand {
         interval_ms: u64,
         #[serde(default)]
         storage: crate::storage::StoragePolicy,
-        /// A saved destination (folder or S3 bucket); `output` is then a name inside it.
+        /// A saved folder destination; `output` is then a name inside it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
         /// What to do when an output name without {seq} exists; fail by default.
@@ -178,7 +177,7 @@ pub enum SessionCommand {
         storage: crate::storage::StoragePolicy,
         #[serde(default = "crate::media::default_recording_cap")]
         max_file_bytes: u64,
-        /// A saved destination (folder or S3 bucket); `output` is then a name inside it.
+        /// A saved folder destination; `output` is then a name inside it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<String>,
         /// What to do when an output name without {seq} exists; fail by default.
@@ -250,8 +249,6 @@ pub enum SessionCommand {
     /// Close only the exact open instance that was approved.
     DatasetCloseIf {
         slot_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sink_generation: Option<u64>,
     },
     DatasetNoteIf {
         slot_id: String,
@@ -302,66 +299,6 @@ pub enum SessionCommand {
         max_bytes: u64,
         timeout_ms: u64,
     },
-    /// One-shot read of a signal source's current values.
-    SignalRead {
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth: Option<crate::signals::auth::AuthBinding>,
-        #[serde(default = "crate::signals::default_timeout_ms")]
-        timeout_ms: u64,
-    },
-    /// List OPC UA nodes, MQTT topics or MTConnect data items for a bounded time.
-    SignalBrowse {
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth: Option<crate::signals::auth::AuthBinding>,
-        #[serde(default = "crate::signals::default_browse_ms")]
-        duration_ms: u64,
-        #[serde(default = "crate::signals::default_browse_limit")]
-        limit: u32,
-    },
-    /// Start logging a signal source in this session.
-    SignalStart {
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth: Option<crate::signals::auth::AuthBinding>,
-        #[serde(default = "crate::signals::default_interval_ms")]
-        interval_ms: u64,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tags: Vec<String>,
-    },
-    /// Acquire a finite signal capture into the exact open dataset slot.
-    SignalCapture {
-        uri: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        auth: Option<crate::signals::auth::AuthBinding>,
-        #[serde(default = "crate::signals::default_interval_ms")]
-        interval_ms: u64,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        tags: Vec<String>,
-        duration_ms: u64,
-        max_samples: u64,
-        max_bytes: u64,
-        slot_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sink_generation: Option<u64>,
-    },
-    /// Explicit local action: bind a saved profile's current credentials to
-    /// this coordinator without making a network connection.
-    SignalBind {
-        profile: crate::signals::auth::ProfileRef,
-    },
-    /// Stop a signal source by `signal:<16 hex>` ID, or `all`.
-    SignalStop {
-        id: String,
-    },
-    /// Stop only the specified source instance; never a replacement.
-    SignalStopIf {
-        id: String,
-        capture_id: String,
-    },
-    /// Signal source status.
-    Signals,
 }
 /// One feature assignment of `SetMany`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,7 +338,6 @@ pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
                     | "stop_forward"
                     | "dataset_close"
                     | "dataset_status"
-                    | "signals"
             )
         })
         && let Some(field) = fields.keys().find(|key| key.as_str() != "op")
@@ -666,14 +602,6 @@ impl SessionCommand {
             | Self::DatasetQueryIf { .. }
             | Self::DatasetModelQueryIf { .. }
             | Self::DatasetExportIf { .. } => crate::dataset::validate_command(self)?,
-            Self::SignalRead { .. }
-            | Self::SignalBind { .. }
-            | Self::SignalBrowse { .. }
-            | Self::SignalStart { .. }
-            | Self::SignalCapture { .. }
-            | Self::SignalStop { .. }
-            | Self::SignalStopIf { .. }
-            | Self::Signals => crate::signals::validate_command(self)?,
             _ => {}
         }
         Ok(())
@@ -696,23 +624,10 @@ impl SessionCommand {
                 | Self::DatasetExportIf { .. }
         )
     }
-    pub fn is_signal(&self) -> bool {
-        matches!(
-            self,
-            Self::SignalRead { .. }
-                | Self::SignalBind { .. }
-                | Self::SignalBrowse { .. }
-                | Self::SignalStart { .. }
-                | Self::SignalCapture { .. }
-                | Self::SignalStop { .. }
-                | Self::SignalStopIf { .. }
-                | Self::Signals
-        )
-    }
 }
 /// How long a client waits for the session to answer `command` unless told
 /// otherwise: a minute, or longer for commands whose own timeouts or work
-/// can exceed it (multi-frame captures, exports, signal reads and browses).
+/// can exceed it (multi-frame captures, exports).
 pub fn default_request_timeout(command: &SessionCommand) -> Duration {
     Duration::from_millis(match command {
         SessionCommand::Capture {
@@ -733,8 +648,6 @@ pub fn default_request_timeout(command: &SessionCommand) -> Duration {
             *timeout_ms
         })
         .saturating_add(10_000),
-        SessionCommand::SignalRead { timeout_ms, .. } => timeout_ms.saturating_add(10_000),
-        SessionCommand::SignalBrowse { duration_ms, .. } => duration_ms.saturating_add(15_000),
         _ => 60_000,
     })
 }
@@ -815,10 +728,9 @@ fn frame_capacity(class: FrameClass) -> Result<usize> {
 const LOG_LINES: usize = 200;
 /// Session log sources besides camera workers, which count up from `WORKERS`.
 const COORDINATOR: u64 = 0;
-const SIGNALS: u64 = 1;
 const WORKERS: u64 = 2;
 /// The session's newest log lines from camera workers, the coordinator and
-/// signal sources, in time order. Each source's lines are taken once and in
+/// camera workers, in time order. Each source's lines are taken once and in
 /// order, so trimming never brings a line back or reshuffles the rest.
 #[derive(Default)]
 struct SessionLog {
@@ -826,17 +738,11 @@ struct SessionLog {
     /// The next line number to take from each source.
     taken: BTreeMap<u64, u64>,
     coordinator: u64,
-    /// The signal hub's lines last seen, to tell its new ones.
-    signals: Vec<LogEntry>,
     revision: u64,
 }
 impl SessionLog {
     fn add(&mut self, source: u64, seq: u64, entry: LogEntry) {
-        // Lines without a timestamp come from old producers; place them on arrival.
-        let time = entry.timestamp.map_or_else(
-            || chrono::Utc::now().timestamp_millis(),
-            LogTimestamp::unix_ms,
-        );
+        let time = entry.timestamp.unix_ms();
         // One event reported by two producers is kept once.
         if self
             .lines
@@ -868,14 +774,6 @@ impl SessionLog {
     }
     fn forget(&mut self, source: u64) {
         self.taken.remove(&source);
-    }
-    fn take_signals(&mut self, now: Vec<LogEntry>) {
-        let kept = kept_lines(&self.signals, &now);
-        for line in &now[kept..] {
-            self.coordinator += 1;
-            self.add(SIGNALS, self.coordinator, line.clone());
-        }
-        self.signals = now;
     }
     fn lines(&self) -> Vec<LogEntry> {
         self.lines.values().cloned().collect()
@@ -937,7 +835,7 @@ impl WorkerLog {
             .iter()
             .rev()
             .find(|(_, entry)| entry.level == "error")
-            .map(|(_, entry)| entry.time.clone())
+            .map(|(_, entry)| entry.timestamp.rfc3339())
     }
 }
 /// Frames a worker lost on the way, never frames skipped for a preview.
@@ -961,7 +859,7 @@ pub fn camera_error_logged_ms(logs: &[LogEntry], camera: &str) -> Option<u64> {
     let tag = activity::redact(&format!("[{camera}] "));
     logs.iter()
         .filter(|entry| entry.level == "error" && entry.message.starts_with(&tag))
-        .filter_map(|entry| entry.timestamp)
+        .map(|entry| entry.timestamp)
         .map(|timestamp| u64::try_from(timestamp.unix_ms()).unwrap_or(0))
         .max()
 }
@@ -982,10 +880,19 @@ pub struct CameraHistoryEntry {
     pub last_changed_at_us: u64,
     pub feature: Option<String>,
     pub kind: String,
-    /// Semantic feature assignments restored by this checkpoint. Old workers
-    /// omit this; bounded assistant runs must not assume an omitted count is zero.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setting_changes: Option<u32>,
+    /// Semantic feature assignments restored by this checkpoint.
+    pub setting_changes: u32,
+}
+/// Compact delivery counters for one exact recording or forward. Final
+/// counters remain visible after it stops; the next forward replaces them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardingProgress {
+    pub id: String,
+    pub accepted: u64,
+    pub written: u64,
+    pub dropped: u64,
+    pub late: u64,
+    pub stalled: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraSnapshot {
@@ -1006,6 +913,8 @@ pub struct CameraSnapshot {
     /// Opaque identity of this exact recording or forward, including replacements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_progress: Option<ForwardingProgress>,
     /// When the current recording or forward started, UTC Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_since_ms: Option<u64>,
@@ -1075,6 +984,8 @@ pub struct SessionSnapshot {
     /// Opaque identity of this exact recording or forward, including replacements.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_progress: Option<ForwardingProgress>,
     /// When the current recording or forward started, UTC Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_since_ms: Option<u64>,
@@ -1093,14 +1004,6 @@ pub struct SessionSnapshot {
     /// The session's open dataset catalog.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dataset: Option<crate::dataset::DatasetStatus>,
-    /// Signal sources logging in this session (at most 32 tags each).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub signals: Vec<crate::signals::SourceStatus>,
-    /// Cached readiness and local identity of the common signal persistence sink.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signal_sink: Option<crate::signals::SignalSinkStatus>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub signal_bindings: Vec<crate::signals::auth::BindingReceipt>,
 }
 impl SessionSnapshot {
     /// Project one participant's local view without changing shared selection.
@@ -1128,6 +1031,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.fps = camera.fps;
         state.forwarding = camera.forwarding.clone();
         state.forwarding_id = camera.forwarding_id.clone();
+        state.forwarding_progress = camera.forwarding_progress.clone();
         state.forwarding_since_ms = camera.forwarding_since_ms;
         state.forwarding_until_ms = camera.forwarding_until_ms;
         state.jobs = camera.jobs.clone();
@@ -1147,6 +1051,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.fps = 0.0;
         state.forwarding = None;
         state.forwarding_id = None;
+        state.forwarding_progress = None;
         state.forwarding_since_ms = None;
         state.forwarding_until_ms = None;
         state.jobs.clear();
@@ -1199,9 +1104,6 @@ fn addressed_status(
     );
     fields.insert("logs".into(), serde_json::to_value(&snapshot.logs)?);
     fields.insert("dataset".into(), serde_json::to_value(&snapshot.dataset)?);
-    if !snapshot.signals.is_empty() {
-        fields.insert("signals".into(), serde_json::to_value(&snapshot.signals)?);
-    }
     Ok(camera_state)
 }
 type Reply = Receiver<Result<Value>>;
@@ -1434,6 +1336,7 @@ impl Report {
             worker_pid,
             forwarding: s.forwarding.clone(),
             forwarding_id: s.forwarding_id.clone(),
+            forwarding_progress: s.forwarding_progress.clone(),
             forwarding_since_ms: s.forwarding_since_ms,
             forwarding_until_ms: s.forwarding_until_ms,
             jobs: s.jobs.clone(),
@@ -1472,6 +1375,7 @@ struct Process {
 // Linux can briefly refuse exec after a newly written helper was closed,
 // including while another process is completing a concurrent fork/exec. No
 // child was started on ETXTBSY, so retry only that error for a bounded time.
+#[cfg(any(feature = "gui", feature = "nvjpeg", feature = "vaapi"))]
 pub(crate) fn spawn_helper(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
@@ -1497,7 +1401,7 @@ pub(crate) fn spawn_helper(
 /// processes join. A terminal sends Ctrl-C, and the shell sends the SIGHUP of
 /// a closed terminal, to the whole foreground group: in this one, they would
 /// end a recording before this process could finish it, catalog it and queue
-/// its upload. The worker still exits when told to or when its stdin closes.
+/// its local save. The worker still exits when told to or when its stdin closes.
 fn worker_command(
     executable: std::path::PathBuf,
     efficiency: crate::efficiency::Mode,
@@ -1534,7 +1438,9 @@ impl Process {
         // before this coordinator's first camera.
         static SWEEP: std::sync::Once = std::sync::Once::new();
         SWEEP.call_once(|| crate::shared_memory::sweep(&dir));
-        let ring = SharedRing::create(&dir, capacity)?;
+        let lease = crate::resources::buffers::reserve(SharedRing::allocation_bytes(capacity)?)?;
+        let mut ring = SharedRing::create(&dir, capacity)?;
+        ring.attach_buffer_lease(lease)?;
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(std::path::PathBuf::from)
             .unwrap_or(std::env::current_exe()?);
@@ -1749,15 +1655,9 @@ struct Coordinator {
     log: Mutex<SessionLog>,
     activity: Arc<activity::Activity>,
     dataset: Arc<crate::dataset::Slot>,
-    signals: crate::signals::hub::SignalHub,
-    task_data: OnceLock<Arc<task_data::Registry>>,
 }
 impl Drop for Coordinator {
     fn drop(&mut self) {
-        if let Some(tasks) = self.task_data.get() {
-            tasks.begin_close_all();
-        }
-        self.signals.stop_all_nowait();
         self.dataset.close_quiet();
         // The poller holds only a Weak; wake it so it exits now, not next tick.
         if let Some(poller) = self.poller.get() {
@@ -1807,8 +1707,6 @@ impl Drop for PendingSlot {
 enum CommandTarget {
     Camera(String),
     Discovery,
-    /// Signal sources start and stop in order.
-    Signals,
 }
 #[derive(Default)]
 struct CommandOrder {
@@ -1901,32 +1799,6 @@ impl Default for SessionHandle {
     }
 }
 impl SessionHandle {
-    /// Local sideband dispatch for task data. Attribution does not select the
-    /// route: the checked capability is held separately from command JSON.
-    pub(crate) fn task_data_activity(
-        &self,
-        handle: &task_data::TaskDataHandle,
-        origin: ActivityOrigin,
-        actor: SessionActor,
-        command: &SessionCommand,
-        apply: impl FnOnce() -> Result<Value>,
-    ) -> Result<Value> {
-        self.check_task_data(handle)?;
-        command.validate()?;
-        actor.validate()?;
-        ensure!(!self.is_shutting_down(), "session is shutting down");
-        let _slot = PendingSlot::acquire(&self.inner, false)?;
-        let mut activity = self.inner.activity.begin_as(origin, actor, None, command);
-        if let Some(activity) = &activity {
-            activity.running();
-        }
-        let result = apply();
-        if let Some(activity) = &mut activity {
-            activity.finish(&result);
-        }
-        result
-    }
-
     pub fn new() -> Self {
         let h = Self {
             allow_hub_connect: true,
@@ -1949,8 +1821,6 @@ impl SessionHandle {
                 log: Mutex::default(),
                 activity: Arc::new(activity::Activity::default()),
                 dataset: Arc::new(crate::dataset::Slot::new()),
-                signals: crate::signals::hub::SignalHub::new(),
-                task_data: OnceLock::new(),
             }),
         };
         let weak = Arc::downgrade(&h.inner);
@@ -2031,14 +1901,10 @@ impl SessionHandle {
     }
     /// Changes whenever a snapshot could: a camera worker reports
     /// something new, the session log grows, selection, devices or activity
-    /// change, or a signal source runs. Views compare it with the revision
+    /// change,. Views compare it with the revision
     /// they last drew to skip unchanged work. Asking counts as watching.
     pub fn revision(&self) -> u64 {
         self.watch();
-        // Signal values change all the time.
-        if self.inner.signals.has_sources() {
-            self.inner.revision.fetch_add(1, Ordering::Relaxed);
-        }
         self.inner
             .revision
             .load(Ordering::Relaxed)
@@ -2219,12 +2085,8 @@ impl SessionHandle {
         state.activity = activity.activity;
         state.activity_revision = activity.revision;
         state.dataset = self.inner.dataset.status_cached();
-        state.signals = self.inner.signals.status_brief();
-        state.signal_sink = Some(self.inner.signals.sink_status());
-        state.signal_bindings = self.inner.signals.cached_bindings();
         project_selected(&mut state);
-        let mut log = locked(&self.inner.log);
-        log.take_signals(self.inner.signals.logs());
+        let log = locked(&self.inner.log);
         state.logs = log.lines();
         (state, log.revision)
     }
@@ -2541,21 +2403,12 @@ impl SessionHandle {
     fn command_turn(&self, target: Option<&str>, command: &SessionCommand) -> Option<CommandTurn> {
         if matches!(
             command,
-            SessionCommand::Status
-                | SessionCommand::Activity { .. }
-                | SessionCommand::Signals
-                | SessionCommand::SignalRead { .. }
-                | SessionCommand::SignalBrowse { .. }
+            SessionCommand::Status | SessionCommand::Activity { .. }
         ) || command.is_dataset()
         {
             return None;
         }
         let target = match command {
-            SessionCommand::SignalStart { .. }
-            | SessionCommand::SignalBind { .. }
-            | SessionCommand::SignalCapture { .. }
-            | SessionCommand::SignalStop { .. }
-            | SessionCommand::SignalStopIf { .. } => CommandTarget::Signals,
             SessionCommand::Discover { .. } | SessionCommand::NetworkScan { .. } => {
                 CommandTarget::Discovery
             }
@@ -2602,7 +2455,7 @@ impl SessionHandle {
         // Observations never wait for a command gate or a busy worker's pipe.
         if matches!(
             command,
-            SessionCommand::Status | SessionCommand::Activity { .. } | SessionCommand::Signals
+            SessionCommand::Status | SessionCommand::Activity { .. }
         ) {
             let (tx, rx) = mpsc::channel();
             let _ = tx.send(self.process(target.as_deref(), command, origin, actor));
@@ -2619,7 +2472,6 @@ impl SessionHandle {
                     | SessionCommand::Select { .. }
                     | SessionCommand::Status
             ) || command.is_dataset()
-                || command.is_signal()
             {
                 None
             } else {
@@ -2662,7 +2514,7 @@ impl SessionHandle {
                 {
                     let message = activity::redact(&format!("{e:#}"));
                     h.edit_state().last_error = Some(message.clone());
-                    locked(&h.inner.log).note(LogEntry::now_local_millis("error", message));
+                    locked(&h.inner.log).note(LogEntry::now_local("error", message));
                 }
                 if let Some(activity) = &mut activity {
                     activity.finish(&result);
@@ -2938,41 +2790,7 @@ impl SessionHandle {
                 self.scan_network(Duration::from_millis(timeout_ms), origin, &actor)
             }
             command if command.is_dataset() => {
-                crate::dataset::coordinator::run(&self.inner.dataset, &self.inner.signals, command)
-            }
-            SessionCommand::SignalCapture {
-                uri,
-                auth,
-                interval_ms,
-                tags,
-                duration_ms,
-                max_samples,
-                max_bytes,
-                slot_id,
-                sink_generation,
-            } => {
-                let _lifecycle = self.inner.dataset.lifecycle();
-                self.inner.dataset.ensure_slot(Some(&slot_id))?;
-                Ok(serde_json::to_value(
-                    self.inner.signals.capture_for_dataset_bound(
-                        &uri,
-                        interval_ms,
-                        tags,
-                        crate::signals::CaptureLimits {
-                            duration_ms,
-                            max_samples,
-                            max_bytes,
-                        },
-                        crate::signals::hub::DatasetCaptureTarget {
-                            slot_id: &slot_id,
-                            sink_generation,
-                            auth: auth.as_ref(),
-                        },
-                    )?,
-                )?)
-            }
-            command if command.is_signal() => {
-                crate::signals::hub::run(&self.inner.signals, command)
+                crate::dataset::coordinator::run(&self.inner.dataset, command)
             }
             // Both read the snapshot this request stores, without building another.
             SessionCommand::Status if target.is_some() => {
@@ -3359,10 +3177,6 @@ impl SessionHandle {
     pub fn dataset(&self) -> &Arc<crate::dataset::Slot> {
         &self.inner.dataset
     }
-    /// The session's signal sources.
-    pub fn signals(&self) -> &crate::signals::hub::SignalHub {
-        &self.inner.signals
-    }
     /// Before workers are dropped: stop recordings cleanly and catalog the
     /// files every worker still holds.
     fn finalize_workers(&self) {
@@ -3426,18 +3240,6 @@ impl SessionHandle {
             .activity
             .cancel_jobs(None, None, "session stopped before schedule completed");
         self.wake();
-        if let Some(tasks) = self.inner.task_data.get() {
-            tasks.close_all(Duration::from_secs(10));
-        }
-        // Signals first, so their final samples reach the dataset before it closes.
-        let signals = &self.inner.signals;
-        signals.stop_all(Duration::from_secs(3));
-        let flushed = signals
-            .flush(Duration::from_secs(10))
-            .and_then(|()| signals.set_sink(None, Duration::from_secs(10)));
-        if let Err(e) = flushed {
-            eprintln!("capturefab: signal samples not flushed: {e:#}");
-        }
         self.finalize_workers();
         self.inner.dataset.close_quiet();
         for feed in self
@@ -3524,7 +3326,12 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
-    let ring = Arc::new(Mutex::new(SharedRing::open(ring)?));
+    let lease = crate::resources::buffers::inherited()?;
+    let mut ring = SharedRing::open(ring)?;
+    if let Some(lease) = lease {
+        ring.attach_buffer_lease(lease)?;
+    }
+    let ring = Arc::new(Mutex::new(ring));
     let handle = crate::engine::WorkerHandle::with_ring(ring);
     let result = (|| -> Result<()> {
         let input = std::io::stdin();
@@ -3751,9 +3558,10 @@ mod tests {
         );
     }
     #[test]
-    fn plant_floor_commands_keep_old_wire_shapes_and_strict_unit_ops() {
-        let old = r#"{"op":"capture","output":"a.png","count":1,"timeout_ms":100,"format":"png"}"#;
-        let command = SessionCommand::from_json_slice(old.as_bytes()).unwrap();
+    fn plant_floor_command_defaults_and_unit_ops_are_strict() {
+        let capture =
+            r#"{"op":"capture","output":"a.png","count":1,"timeout_ms":100,"format":"png"}"#;
+        let command = SessionCommand::from_json_slice(capture.as_bytes()).unwrap();
         assert_eq!(
             serde_json::to_value(&command).unwrap()["on_exists"],
             Value::Null
@@ -3764,7 +3572,7 @@ mod tests {
                 .find("context")
                 .is_none()
         );
-        for op in ["dataset_close", "dataset_status", "signals"] {
+        for op in ["dataset_close", "dataset_status"] {
             let extra = format!(r#"{{"op":"{op}","x":1}}"#);
             assert!(
                 SessionCommand::from_json_slice(extra.as_bytes()).is_err(),
@@ -3773,16 +3581,8 @@ mod tests {
             let bare = format!(r#"{{"op":"{op}"}}"#);
             SessionCommand::from_json_slice(bare.as_bytes()).unwrap();
         }
-        let start = br#"{"op":"signal_start","uri":"sim-signal://line1"}"#;
-        let SessionCommand::SignalStart {
-            interval_ms, tags, ..
-        } = SessionCommand::from_json_slice(start).unwrap()
-        else {
-            panic!("not a signal start")
-        };
-        assert_eq!((interval_ms, tags.len()), (1000, 0));
         let snapshot = serde_json::to_value(SessionSnapshot::default()).unwrap();
-        assert!(snapshot.get("dataset").is_none() && snapshot.get("signals").is_none());
+        assert!(snapshot.get("dataset").is_none());
         assert!(snapshot.get("forwarding_until_ms").is_none());
         // A forward without a duration keeps its old shape both ways.
         let old = br#"{"op":"forward","output":"a.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M"}"#;
@@ -3826,6 +3626,55 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn compact_worker_replies_keep_live_and_final_encoder_progress() {
+        let mut sent = Sent::default();
+        let mut report = Report::new();
+        for (active, written, dropped) in [(true, 8, 1), (true, 18, 3), (false, 22, 3)] {
+            let mut snapshot = SessionSnapshot {
+                connected: Some(crate::transport::simulator::info_named("sim:0")),
+                forwarding_id: active.then(|| "recording-one".into()),
+                forwarding_progress: Some(ForwardingProgress {
+                    id: "recording-one".into(),
+                    accepted: 25,
+                    written,
+                    dropped,
+                    late: 2,
+                    stalled: false,
+                }),
+                ..Default::default()
+            };
+            let kept = sent.strip(&mut snapshot);
+            assert!(
+                kept.features && kept.history,
+                "ordinary compact replies omit unchanged heavy fields"
+            );
+            let wire = serde_json::to_vec(&snapshot).unwrap();
+            let decoded: SessionSnapshot = serde_json::from_slice(&wire).unwrap();
+            report.apply(decoded, kept, false);
+            let camera = report.camera(7, 0).unwrap();
+            assert_eq!(
+                camera.forwarding_progress.as_ref().unwrap().written,
+                written
+            );
+            assert_eq!(
+                camera.forwarding_progress.as_ref().unwrap().dropped,
+                dropped
+            );
+            let mut selected = SessionSnapshot {
+                cameras: vec![camera],
+                active_camera: Some("sim:0".into()),
+                ..Default::default()
+            };
+            project_selected(&mut selected);
+            assert_eq!(
+                selected.forwarding_progress.as_ref().unwrap().id,
+                "recording-one"
+            );
+            assert_eq!(selected.forwarding_id.is_some(), active);
+        }
+    }
+
     #[test]
     fn conditional_forward_stop_requires_an_exact_opaque_identity() {
         let command = SessionCommand::from_json_slice(
@@ -3905,6 +3754,7 @@ mod tests {
             stale: true,
             error_logged: None,
             forwarding_id: Some(format!("{frames:032x}")),
+            forwarding_progress: None,
             forwarding_since_ms: Some(frames * 1000),
             forwarding_until_ms: Some(frames * 1000 + 60_000),
         }
@@ -3992,7 +3842,7 @@ mod tests {
     fn lines_logged_while_a_poll_builds_its_snapshot_are_stored_with_it() {
         let handle = SessionHandle::new();
         let (in_flight, revision) = handle.assemble();
-        locked(&handle.inner.log).note(LogEntry::now_local_millis("error", "client failure"));
+        locked(&handle.inner.log).note(LogEntry::now_local("error", "client failure"));
         handle.commit(in_flight, revision);
         let stored = handle.inner.state.read().unwrap().logs.clone();
         assert_eq!(stored.len(), 1);
@@ -4002,15 +3852,16 @@ mod tests {
     #[test]
     fn log_timestamps_survive_redaction_snapshot_merge_and_same_clock_events() {
         let first = LogEntry {
-            timestamp: LogTimestamp::new(1_792_017_000_123, 0),
-            ..LogEntry::legacy("12:30:00", "error", "rtsp://user:secret@example.test/live")
+            timestamp: LogTimestamp::new(1_792_017_000_123, 0).unwrap(),
+            level: "error".into(),
+            message: "rtsp://user:secret@example.test/live".into(),
         };
         let tagged = camera_log(&first, "camera-a");
         assert_eq!(tagged.timestamp, first.timestamp);
         assert!(tagged.message.starts_with("[camera-a]"));
         assert!(!tagged.message.contains("secret"));
         let later = LogEntry {
-            timestamp: LogTimestamp::new(first.timestamp.unwrap().unix_ms() + 86_400_000, 0),
+            timestamp: LogTimestamp::new(first.timestamp.unix_ms() + 86_400_000, 0).unwrap(),
             ..tagged.clone()
         };
         // The later line arrives first; the session log orders by time.
@@ -4037,8 +3888,9 @@ mod tests {
     #[test]
     fn a_cameras_newest_error_is_found_by_its_tag_and_time() {
         let at = |unix_ms, level, message| LogEntry {
-            timestamp: LogTimestamp::new(unix_ms, 0),
-            ..LogEntry::legacy("12:30:00", level, message)
+            timestamp: LogTimestamp::new(unix_ms, 0).unwrap(),
+            level: String::from(level),
+            message: String::from(message),
         };
         let logs = [
             camera_log(
@@ -4057,9 +3909,8 @@ mod tests {
                 "rtsp://user:pw@cam/a",
             ),
             at(7_000, "error", "A session line"),
-            camera_log(&LogEntry::legacy("12:30:09", "error", "No time"), "sim:0"),
         ];
-        // The repeat of an error counts; lines without a time do not.
+        // The repeat of an error counts.
         assert_eq!(camera_error_logged_ms(&logs, "sim:0"), Some(3_000));
         assert_eq!(camera_error_logged_ms(&logs[..6], "sim:00"), Some(5_000));
         assert_eq!(
@@ -4431,7 +4282,12 @@ mod tests {
                 .iter()
                 .all(|entry| entry.state == ActivityState::Failed)
         );
-        assert!(snapshot.logs.iter().all(|entry| !entry.time.is_empty()));
+        assert!(
+            snapshot
+                .logs
+                .iter()
+                .all(|entry| entry.timestamp.unix_ms() > 0)
+        );
         handle.request(SessionCommand::Status).unwrap();
         assert_eq!(
             handle.snapshot().activity.len(),
@@ -4828,8 +4684,9 @@ mod tests {
     }
     fn timed(unix_ms: i64, message: &str) -> LogEntry {
         LogEntry {
-            timestamp: LogTimestamp::new(unix_ms, 0),
-            ..LogEntry::legacy("12:00:00", "info", message)
+            timestamp: LogTimestamp::new(unix_ms, 0).unwrap(),
+            level: "info".into(),
+            message: message.into(),
         }
     }
     /// Send `worker` on a pipe as `run_worker` does and merge the reply as
@@ -5070,10 +4927,7 @@ mod tests {
         log.take(&b);
         assert_eq!(log.lines(), first, "a second merge changes nothing");
         assert_eq!(first.len(), LOG_LINES);
-        let times: Vec<_> = first
-            .iter()
-            .map(|line| line.timestamp.unwrap().unix_ms())
-            .collect();
+        let times: Vec<_> = first.iter().map(|line| line.timestamp.unix_ms()).collect();
         assert!(times.is_sorted());
         assert_eq!(
             times[0],
@@ -5108,7 +4962,10 @@ mod tests {
         assert_eq!(log.tagged.len(), 2);
         assert!(log.tagged[0].1.message.starts_with("[cam] "));
         assert!(!log.tagged[0].1.message.contains("secret"));
-        assert_eq!(log.newest_error().as_deref(), Some("12:00:00"));
+        assert_eq!(
+            log.newest_error().as_deref(),
+            Some("1970-01-01T00:00:00.002+00:00")
+        );
         log.update(1, Vec::new());
         assert_eq!(
             (log.raw.len(), log.tagged.len(), log.tagged[0].0),

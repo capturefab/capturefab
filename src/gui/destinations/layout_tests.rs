@@ -282,13 +282,11 @@ fn compact_destination_editor_keeps_header_and_footer_actions_inside_the_sheet()
         for scale in crate::gui::prefs::UiScale::ALL {
             let viewport = native / scale.factor();
             let max_height = (viewport.height - 80.0).max(320.0);
-            let mut editor = Editor::new_bucket();
+            let mut editor = Editor::new_folder("archive".into(), PathBuf::from("/tmp/captures"));
             editor.name = "laboratory-camera-archive-with-a-long-destination-name".into();
             editor.original = Some(editor.name.clone());
-            editor.source = Source::Environment;
-            editor.advanced = true;
             editor.message = Some((
-                "The destination could not be reached because the configured network storage service refused the request. Check the connection and credentials, then try the destination again. ".repeat(4),
+                "The destination could not be reached because the configured network storage service refused the request. Check the folder permissions, then try the destination again. ".repeat(4),
                 true,
             ));
             let mut picker = Picker::new(false, false);
@@ -469,7 +467,8 @@ fn compact_sheet_keeps_a_short_form_natural_and_long_manager_rows_scrollable() {
             Layout::new(&node),
             &renderer,
         );
-        for action in ["Add folder…", "Add S3 bucket…"] {
+        {
+            let action = "Add folder…";
             let button = snapshot
                 .nodes
                 .iter()
@@ -562,9 +561,7 @@ fn compact_editor_tab_and_shift_tab_reveal_the_actual_fields_and_pinned_actions(
         let viewport = Size::new(640.0, 360.0) / scale.factor();
         let mut picker = Picker::new(false, false);
         picker.manager_open = true;
-        let mut editor = Editor::new_bucket();
-        editor.advanced = true;
-        editor.provider = 4;
+        let editor = Editor::new_folder("archive".into(), PathBuf::from("/tmp/captures"));
         picker.editor = Some(editor);
         let mut view = accessibility::mapped(
             picker.manager(
@@ -594,9 +591,9 @@ fn footer_undo_and_redo_fit_beside_the_actions_at_every_interface_size() {
         let viewport = Size::new(640.0, 480.0) / scale.factor();
         let mut picker = Picker::new(false, false);
         let mut output = String::new();
-        picker.update(Message::AddBucket, &mut output);
-        picker.update(Message::Bucket("line-1".into()), &mut output);
-        picker.update(Message::Region("eu-west-1".into()), &mut output);
+        picker.update(Message::AddFolder, &mut output);
+        picker.update(Message::Name("line-1".into()), &mut output);
+        picker.update(Message::Folder("/tmp/second".into()), &mut output);
         picker.undo();
         let mut view = accessibility::mapped(
             picker.manager(

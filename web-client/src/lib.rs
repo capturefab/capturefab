@@ -36,6 +36,7 @@ struct App {
     feature_drafts: BTreeMap<String, String>,
     camera_drafts: BTreeMap<String, BTreeMap<String, String>>,
     camera_markup: String,
+    reported_camera_error: Option<(String, String)>,
     job_markup: String,
     destinations: Value,
     command_busy: bool,
@@ -419,11 +420,7 @@ fn log_date_label(log: &Value) -> String {
             return format!("{local} [{iso}]");
         }
     }
-    let time = text(log, "time");
-    format!(
-        "{} (date and time zone unavailable)",
-        if time.is_empty() { "—" } else { time }
-    )
+    "Time unavailable (invalid timestamp)".into()
 }
 
 fn sync_feature_camera(app: &mut App) {
@@ -615,6 +612,21 @@ fn reconcile_camera_selection(app: &mut App) {
     }
 }
 
+fn new_camera_error(app: &mut App) -> Option<String> {
+    let current = camera(app).and_then(|camera| {
+        camera
+            .get("last_error")
+            .and_then(Value::as_str)
+            .filter(|error| !error.is_empty())
+            .map(|error| (app.selected.clone(), error.to_owned()))
+    });
+    if current == app.reported_camera_error {
+        return None;
+    }
+    app.reported_camera_error = current.clone();
+    current.map(|(_, error)| error)
+}
+
 fn update_stream_controls(streaming: bool) {
     let focused = document().active_element().map(|active| active.id());
     visible("stream-start", !streaming);
@@ -674,6 +686,9 @@ fn restore_command_focus(app: &mut App) {
 }
 fn render(app: &mut App) {
     reconcile_camera_selection(app);
+    // A retained camera failure is announced once. Repeated status polls must
+    // not replace the result of a newer command with the same old failure.
+    let camera_error = new_camera_error(app);
     render_cameras(app);
     if let Some(camera) = camera(app) {
         let info = &camera["info"];
@@ -712,11 +727,11 @@ fn render(app: &mut App) {
         set_text(
             "stream-status",
             &format!(
-                "{} · {fps:.1} fps{}",
-                if flag(camera, "streaming") {
-                    "Streaming"
+                "{}{}",
+                if streaming {
+                    format!("Streaming · {fps:.1} fps")
                 } else {
-                    "Stream stopped"
+                    "Stream stopped".into()
                 },
                 if camera.get("auto").is_some_and(|a| !a.is_null()) {
                     " · auto exposure"
@@ -733,9 +748,6 @@ fn render(app: &mut App) {
                 number(camera, "lost")
             ),
         );
-        if let Some(error) = camera.get("last_error").and_then(Value::as_str) {
-            notice(error, true);
-        }
     } else {
         set_text(
             "camera-title",
@@ -762,6 +774,9 @@ fn render(app: &mut App) {
         );
         set_text("frame-stats", "0 frames · 0 lost");
         clear_preview(app);
+    }
+    if let Some(error) = camera_error {
+        notice(&error, true);
     }
     render_jobs(app);
     render_features(app);
@@ -796,6 +811,7 @@ fn clear_preview(app: &mut App) {
     let _ = element("preview").remove_attribute("src");
     visible("preview", false);
     visible("preview-empty", true);
+    set_text("preview-status", "Preview up to 4 fps");
 }
 fn connection_succeeded(app: &mut App) -> bool {
     let reconnected = !app.connected;
@@ -1357,31 +1373,14 @@ fn preview() {
                 return;
             }
         };
-        let frame_id = response
-            .headers()
-            .get("X-Frame-Id")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        let timestamp = response
-            .headers()
-            .get("X-Frame-Timestamp-Ns")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        // ETags identify frames even when camera frame IDs repeat, as
+        // scanned pages' do.
         let etag = response
             .headers()
             .get("ETag")
             .ok()
             .flatten()
             .unwrap_or_default();
-        // The tag names the frame even where camera frame ids repeat, as
-        // scanned pages' do; older servers send none.
-        let identity = if etag.is_empty() {
-            format!("{worker}:{frame_id}:{timestamp}")
-        } else {
-            etag.clone()
-        };
         let result = match response.blob() {
             Ok(promise) => JsFuture::from(promise)
                 .await
@@ -1400,7 +1399,7 @@ fn preview() {
             {
                 return;
             }
-            if !frame_id.is_empty() && app.preview_frame == identity {
+            if etag.is_empty() || app.preview_frame == etag {
                 return;
             }
             let Ok(blob) = result else {
@@ -1412,7 +1411,7 @@ fn preview() {
             if let Some(old) = app.preview_url.replace(url.clone()) {
                 let _ = Url::revoke_object_url(&old);
             }
-            app.preview_frame = identity;
+            app.preview_frame = etag.clone();
             app.preview_etag = etag;
             element("preview")
                 .unchecked_into::<HtmlImageElement>()
@@ -1970,6 +1969,44 @@ mod tests {
         reconcile_camera_selection(&mut app);
         assert_eq!(app.selected, "sim:1");
         assert!(camera(&app).is_none());
+    }
+
+    #[test]
+    fn retained_camera_errors_do_not_replace_newer_command_results_on_every_poll() {
+        let mut app = App {
+            selected: "sim:0".into(),
+            session: json!({"cameras": [
+                {"info": {"id": "sim:0"}, "last_error": "Width violates Min=64"},
+                {"info": {"id": "sim:1"}, "last_error": "Width violates Min=64"}
+            ]}),
+            ..Default::default()
+        };
+        assert_eq!(
+            new_camera_error(&mut app).as_deref(),
+            Some("Width violates Min=64")
+        );
+        // Scheduling can succeed without clearing the camera's last error.
+        // Its success notice should survive subsequent identical snapshots.
+        assert_eq!(new_camera_error(&mut app), None);
+        app.session["cameras"][0]["last_error"] = json!("Gain is read only");
+        assert_eq!(
+            new_camera_error(&mut app).as_deref(),
+            Some("Gain is read only")
+        );
+        app.selected = "sim:1".into();
+        assert_eq!(
+            new_camera_error(&mut app).as_deref(),
+            Some("Width violates Min=64")
+        );
+        app.session["cameras"][1]["last_error"] = Value::Null;
+        assert_eq!(new_camera_error(&mut app), None);
+        app.session["cameras"][1]["last_error"] = json!("Width violates Min=64");
+        assert_eq!(
+            new_camera_error(&mut app).as_deref(),
+            Some("Width violates Min=64")
+        );
+        app.session["cameras"] = json!([]);
+        assert_eq!(new_camera_error(&mut app), None);
     }
 
     #[test]

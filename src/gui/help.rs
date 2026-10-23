@@ -100,8 +100,8 @@ impl Workbench {
     /// while the scene is set up and true once its cameras stream. Returns
     /// whether the word was taken; see `apply_scene`. Words: `help-more`
     /// (the guide with its connection notes open), and the destination
-    /// sheet's `destinations-list`, `folder-editor`, `bucket-editor` and
-    /// `testing`, and `uploads-offline` (see `Picker::scene`).
+    /// sheet's `destinations-list`, `folder-editor`, `folder-error` and
+    /// `testing` (see `Picker::scene`).
     pub(super) fn scene_sheets(&mut self, word: &str, late: bool) -> bool {
         if late {
             return false;
@@ -262,7 +262,7 @@ impl Workbench {
                     }
                 }
             }
-            steps = steps.push(step);
+            steps = steps.push(step.wrap().vertical_spacing(6));
         }
         steps.into()
     }
@@ -357,6 +357,13 @@ impl Workbench {
                 body,
                 self.network_sheet(p, height),
                 Some(Message::NetworkReport(false)),
+                t,
+            )
+        } else if self.resources.open {
+            modal(
+                body,
+                self.resources_sheet(p, height),
+                Some(Message::Resources(resources::Input::Open(false))),
                 t,
             )
         } else if self.analytics.open {
@@ -475,7 +482,7 @@ impl Workbench {
                 .spacing(32),
             )
             .push(
-                text("Undo and Redo work in text fields and restore reversible settings changes. Captures and uploads stay saved.")
+                text("Undo and Redo work in text fields and restore reversible settings changes. Captured files stay saved.")
                     .size(style::SMALL)
                     .color(p.secondary),
             )
@@ -557,25 +564,33 @@ fn webcam_scheme() -> &'static str {
 /// source, what to type for it in small monospace.
 fn connection_notes<'a>(p: &'static Palette) -> Element<'a, Message> {
     let note = |kind: &'static str, about: &'static str, syntax: Option<&'static str>| {
-        let mut line = row![
-            text(kind)
+        let mut detail = column![
+            text(about)
                 .size(style::SMALL)
-                .font(style::MEDIUM)
-                .color(p.text)
-                .width(92),
-            text(about).size(style::SMALL).color(p.secondary),
+                .color(p.secondary)
+                .width(Fill)
+                .wrapping(text::Wrapping::WordOrGlyph),
         ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+        .spacing(3)
+        .width(Fill);
         if let Some(syntax) = syntax {
-            line = line.push(
+            detail = detail.push(
                 text(syntax)
                     .size(style::CAPTION)
                     .font(style::MONO)
                     .color(p.secondary),
             );
         }
-        line
+        row![
+            text(kind)
+                .size(style::SMALL)
+                .font(style::MEDIUM)
+                .color(p.text)
+                .width(92),
+            detail,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Start)
     };
     column![
         note(
@@ -615,6 +630,158 @@ fn connection_notes<'a>(p: &'static Palette) -> Element<'a, Message> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn quick_guide_first_step_actions_keep_readable_button_labels_in_compact_windows() {
+        use crate::gui::destinations::layout_tests::renderer;
+        use iced::Rectangle;
+        use iced::advanced::{Layout, layout, widget::Operation, widget::Tree};
+
+        #[derive(Default)]
+        struct Actions(Vec<(String, Rectangle)>);
+        impl Operation for Actions {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                if let Some(control) = state.downcast_ref::<accessibility::Control<Message>>()
+                    && control.node.role() == accessibility::Role::Button
+                {
+                    self.0.push((control.node.label().unwrap().into(), bounds));
+                }
+            }
+        }
+        let renderer = renderer();
+        let app = bench();
+        let mut baseline = vec![];
+        for (index, width) in [1000.0, 480.0, 480.0 / UiScale::Larger.factor()]
+            .into_iter()
+            .enumerate()
+        {
+            let mut view = app.guide_steps_view(Palette::of(false));
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, 1000.0)),
+            );
+            let mut actions = Actions::default();
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut actions);
+            assert_eq!(actions.0.len(), 2);
+            if index == 0 {
+                baseline = actions.0;
+                continue;
+            }
+            for (name, bounds) in actions.0 {
+                let natural = baseline.iter().find(|(label, _)| label == &name).unwrap().1;
+                assert!(
+                    bounds.width + 0.5 >= natural.width && bounds.height <= natural.height + 0.5,
+                    "{name} keeps its label at {width} logical pixels: {bounds:?}; natural {natural:?}"
+                );
+                assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.5);
+            }
+        }
+    }
+
+    #[test]
+    fn connecting_camera_notes_keep_addresses_readable_at_every_interface_size() {
+        use crate::gui::destinations::layout_tests::{render_artifact_themed, renderer};
+        use iced::Rectangle;
+        use iced::advanced::{Layout, layout, widget::Operation, widget::Tree};
+
+        #[derive(Default)]
+        struct NotesGeometry(Vec<(String, Rectangle)>);
+        impl Operation for NotesGeometry {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+            fn text(
+                &mut self,
+                _: Option<&iced::advanced::widget::Id>,
+                bounds: Rectangle,
+                value: &str,
+            ) {
+                self.0.push((value.into(), bounds));
+            }
+        }
+
+        let mut renderer = renderer();
+        let mut baseline = connection_notes(Palette::of(false));
+        let mut baseline_tree = Tree::new(baseline.as_widget());
+        let baseline_node = baseline.as_widget_mut().layout(
+            &mut baseline_tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1600.0, 1200.0)),
+        );
+        let mut baseline_geometry = NotesGeometry::default();
+        baseline.as_widget_mut().operate(
+            &mut baseline_tree,
+            Layout::new(&baseline_node),
+            &renderer,
+            &mut baseline_geometry,
+        );
+        for dark in [false, true] {
+            for scale in UiScale::ALL {
+                let viewport = Size::new(480.0, 1200.0) / scale.factor();
+                let mut view = connection_notes(Palette::of(dark));
+                let mut tree = Tree::new(view.as_widget());
+                let node = view.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport),
+                );
+                let mut geometry = NotesGeometry::default();
+                view.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut geometry,
+                );
+                for syntax in [
+                    "rtsp://host/stream",
+                    "sim:replay:PATH",
+                    webcam_scheme(),
+                    "hub:NAME/CAMERA",
+                ] {
+                    let bounds = geometry
+                        .0
+                        .iter()
+                        .find(|(value, _)| value == syntax)
+                        .unwrap()
+                        .1;
+                    let natural = baseline_geometry
+                        .0
+                        .iter()
+                        .find(|(value, _)| value == syntax)
+                        .unwrap()
+                        .1;
+                    assert!(
+                        bounds.width + 0.5 >= natural.width && bounds.height <= 24.0,
+                        "{syntax} must stay readable at {scale}: {bounds:?}"
+                    );
+                    assert!(bounds.x + bounds.width <= viewport.width + 0.5);
+                }
+                render_artifact_themed(
+                    &format!(
+                        "connection-notes-{}-{scale}",
+                        if dark { "dark" } else { "light" }
+                    ),
+                    &view,
+                    &tree,
+                    &node,
+                    &mut renderer,
+                    viewport,
+                    (dark, scale.factor()),
+                );
+            }
+        }
+    }
+
     fn bench() -> Workbench {
         Workbench::new(SessionHandle::new(), "test".into(), true, None)
     }
@@ -631,7 +798,7 @@ mod tests {
         let mut output = "capture.png".to_owned();
         picker.update(destinations::Message::OpenManager, &mut output);
         assert_eq!(picker_focus(picker, false, false), Some("sheet-close"));
-        picker.update(destinations::Message::AddBucket, &mut output);
+        picker.update(destinations::Message::AddFolder, &mut output);
         let changed = picker.take_to_top();
         assert!(changed);
         let field = picker_focus(picker, true, changed).expect("editor focus");
@@ -848,7 +1015,7 @@ mod tests {
         let mut bench = bench();
         let esc = Action::Overview.bindings(Os::CURRENT)[0];
         bench.capture_to.manager_open = true;
-        let _ = bench.handle_message(Message::CapturePicker(destinations::Message::AddBucket));
+        let _ = bench.handle_message(Message::CapturePicker(destinations::Message::AddFolder));
         assert!(bench.capture_to.editing());
         // The focused field took the key to leave itself.
         let _ = bench.shortcut(esc, false);

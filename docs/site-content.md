@@ -49,7 +49,7 @@ They supplement general STE vocabulary; they do not exempt ordinary prose from t
 | save, file, filename, path, directory | Software output and filesystem concepts used by the CLI and Capture inspector. |
 | select, click, focus, field, checkbox, inspector | Software interface actions and controls. Preserve exact labels from `src/gui/`. |
 | session, worker, headless, CLI, RPC, JSON | Local automation and process terms; `src/session/` and installed `schema`/`--help`. |
-| upload, queue, S3, bucket, destination | File-transfer and storage terms; destination and upload implementations. |
+| folder, drive, destination, retention | Local file storage terms; destination and storage implementations. |
 | stream, streaming, forwarding, recording, encoder, bitrate | Media operations or control names. Use nouns; avoid progressive verb phrases. |
 | exposure, gain, histogram, focus region, calibration | Camera and image-measurement terms. Availability depends on the source. |
 | GigE Vision, USB3 Vision, GenICam, ONVIF, FFmpeg | Exact protocol, specification or product names. |
@@ -71,3 +71,47 @@ A development screenshot does not establish behavior in every published release.
 After a documentation edit, regenerate `web/search-index.json` with `python3 scripts/docs-search.py`.
 Run its `--check` mode, `node scripts/test-docs-search.js` and `python3 scripts/test-site.py`.
 Render the pages on desktop and mobile before publication.
+
+## Documentation coverage
+
+The public documentation has three entry points:
+
+- `web/docs.html`: setup and task guides.
+- `web/desktop.html`: desktop settings, controls, analytics and browser operation.
+- `web/reference.html`: CLI commands, options, tools and session RPC operations.
+
+Search indexes every HTML page with `data-doc-section` articles. Each article must
+have a unique local anchor, matching title and heading, and a summary.
+
+Run `python3 scripts/docs-coverage.py` to audit the current source. Add `--json`
+for a machine-readable report. The normal site check runs this audit too.
+The checked-in inventories are `docs/cli-coverage.json` and
+`docs/desktop-coverage.json`.
+
+The audit compares every visible command and declared alias, registered tool,
+public session RPC operation, keyboard action and HTTP route with its guide.
+It checks CLI option and positional-argument spellings, including shared options.
+It also verifies the source terms and explanatory targets for the desktop
+feature inventory. The RPC `grab` operation and hidden CLI commands are internal.
+Feature-gated public commands remain included, so the docs cover supported builds.
+
+For a new feature, add instructions, expected results and applicable limits.
+Then update its inventory entry and regenerate search. For a removed feature,
+remove obsolete instructions and mappings. Source comparison detects new commands,
+tools, RPC operations, keyboard actions and routes automatically. New controls
+outside these registries must also be added to the desktop feature inventory.
+
+A passing audit establishes full coverage of these source interfaces and the
+reviewed feature inventory. It does not establish hardware compatibility or prove
+that every sentence is accurate. Review behavior, options and examples against
+the source. The documentation follows the current source tree; an installed
+release can expose fewer features. Its `--help` and `schema --json` identify its
+available interface.
+
+The release follow-up also covers Apple Intelligence.
+Local-model requirements, image limits and usage reporting come from
+`src/assistant/foundation_models.*`, `provider.rs`, `vision.rs` and `settings.rs`.
+
+The current destination contract contains folder destinations only.
+Use mounted network folders for remote file storage. Keep stream forwarding
+and AI-provider requests distinct from captured-file storage in public copy.

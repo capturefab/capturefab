@@ -37,6 +37,7 @@ struct ToolbarFit {
     history: bool,
     activity_label: bool,
     analytics_label: bool,
+    resources_label: bool,
     destination_label: bool,
     /// The destination shows at all; the docked sidebar also shows it.
     destination: bool,
@@ -339,6 +340,8 @@ impl Workbench {
                 Action::QuickCommand.hint("Quick command", Os::CURRENT),
             ),
             space().width(8),
+            self.resources_indicator(fit.resources_label, p),
+            space().width(8),
             tip_above(
                 button(analytics)
                     .name("Session analytics for all cameras")
@@ -382,6 +385,7 @@ impl Workbench {
             history,
             activity_label: main >= 620.0,
             analytics_label: main >= 520.0,
+            resources_label: main >= 740.0,
             destination_label: main >= 700.0,
             destination: true,
             capture_all_label: true,
@@ -411,19 +415,22 @@ impl Workbench {
             } else {
                 0.0
             };
-            let actions = if fit.analytics_label { 76.0 } else { 28.0 }
+            let actions = if fit.resources_label { 108.0 } else { 40.0 }
+                + if fit.analytics_label { 76.0 } else { 28.0 }
                 + 36.0
                 + if fit.activity_label { 80.0 } else { 28.0 }
                 + if fit.history { 104.0 } else { 0.0 };
-            let gaps = if fit.history { 4.0 } else { 3.0 } * 10.0;
+            let gaps = if fit.history { 5.0 } else { 4.0 } * 10.0;
             main - 2.0 * (GUTTER - 6.0) - gaps - actions - capture_room
         };
         // A warning or error must say what went wrong: the extras give way,
         // one at a time, until its text has room to read.
         if self.problem_notice_shown() {
-            let steps: [fn(&mut ToolbarFit); 4] = [
+            let steps: [fn(&mut ToolbarFit); 6] = [
+                |fit| fit.resources_label = false,
                 |fit| fit.destination_label = false,
                 |fit| fit.capture_all_label = false,
+                |fit| fit.record_label = false,
                 |fit| fit.activity_label = false,
                 |fit| fit.analytics_label = false,
             ];
@@ -438,12 +445,15 @@ impl Workbench {
         // order, Capture All's last, so nothing overlaps. Without a notice the
         // status needs only room for a few words, unless the destination's
         // label can yield it more.
-        let least = if self.notice.is_some() {
+        let least = if self.problem_notice_shown() && main >= 600.0 {
+            PROBLEM_STATUS
+        } else if self.notice.is_some() {
             MIN_STATUS
         } else {
             NOTICE_TEXT_MIN
         };
-        let steps: [fn(&mut ToolbarFit); 6] = [
+        let steps: [fn(&mut ToolbarFit); 7] = [
+            |fit| fit.resources_label = false,
             |fit| fit.destination_label = false,
             |fit| fit.activity_label = false,
             |fit| fit.analytics_label = false,
@@ -1316,8 +1326,8 @@ mod tests {
             "Saves to Lab NAS"
         );
         assert_eq!(
-            save_summary("2026-10-17/line/cam-####.png", Some("bucket"), root),
-            "Saves to bucket · 2026-10-17"
+            save_summary("2026-10-17/line/cam-####.png", Some("archive"), root),
+            "Saves to archive · 2026-10-17"
         );
         // Windows separators.
         assert_eq!(

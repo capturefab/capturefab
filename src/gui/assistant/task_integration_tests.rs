@@ -74,13 +74,6 @@ impl LiveRun {
             ..Default::default()
         })
     }
-    fn data() -> Self {
-        Self::with_scope(RunScope {
-            data_sources: vec!["sim-signal://handoff".into()],
-            allow_data: true,
-            ..Default::default()
-        })
-    }
     fn with_scope(scope: RunScope) -> Self {
         let (mut deps, _, _) = deps(ProviderId::Anthropic, Vec::new());
         let directory = deps.log_directory.clone();
@@ -103,7 +96,6 @@ impl LiveRun {
                 provider: None,
                 model: None,
                 wait_for_answer: true,
-                task_data: None,
             },
             Arc::new(deps),
             Arc::new(DenyApprover::default()),
@@ -273,71 +265,6 @@ fn hiding_a_running_sheet_preserves_controls_and_take_over_waits_for_a_safe_stop
     assert!(!app.assistant.quick.open);
     assert!(app.inspector_open);
     assert!(app.notice.is_some());
-}
-
-#[test]
-fn camera_free_data_takeover_waits_for_runtime_completion_then_opens_actual_manual_controls() {
-    use iced::advanced::{Layout, layout, widget::Tree};
-    let run = LiveRun::data();
-    let mut app = app_with_run(&run, true);
-    assert!(app.snapshot.cameras.is_empty());
-    assert!(app.snapshot.connected.is_none());
-    app.assistant.tasks.cameras.clear();
-    app.sidebar_open = false;
-    app.sidebar_peek = false;
-    app.tab = super::super::Tab::Forward;
-    let _ = app.update_assistant(Input::Task(tasks::Input::TakeOver(
-        tasks::TakeoverTarget::Data,
-    )));
-    assert!(app.assistant.tasks.active());
-    assert!(app.assistant.quick.open);
-    assert!(!app.sidebar_open);
-    assert!(!run.records().iter().any(|record| record["kind"] == "end"));
-    let _ = app.take_assistant_handoff();
-    assert!(
-        !app.sidebar_open,
-        "stopping alone cannot reveal manual controls before the run ends"
-    );
-    run.gate.released.store(true, Ordering::SeqCst);
-    wait_until(|| run.handle.result().is_some());
-    app.tick_assistant();
-    let _ = app.take_assistant_handoff();
-    assert!(!app.assistant.tasks.active());
-    assert!(!app.assistant.quick.open);
-    assert_eq!(app.tab, super::super::Tab::Capture);
-    assert!(app.sidebar_shown());
-    assert!(run.records().iter().any(|record| record["kind"] == "end"));
-    assert!(app.signals.input.is_empty());
-    assert!(app.handle.snapshot().signals.is_empty());
-    assert!(app.handle.snapshot().signal_bindings.is_empty());
-    let renderer = destinations::layout_tests::renderer();
-    let mut view = app.sidebar(Palette::of(false), false);
-    let mut tree = Tree::new(view.as_widget());
-    let node = view.as_widget_mut().layout(
-        &mut tree,
-        &renderer,
-        &layout::Limits::new(Size::ZERO, Size::new(INSPECTOR, 620.0)),
-    );
-    let (snapshot, _, _) = accessibility::snapshot_widget(
-        view.as_widget_mut(),
-        &mut tree,
-        Layout::new(&node),
-        &renderer,
-    );
-    assert!(
-        snapshot
-            .nodes
-            .iter()
-            .any(|(_, node)| node.role() == accessibility::Role::TextInput
-                && node.label() == Some("Add data source")
-                && !node.is_disabled())
-    );
-    assert!(
-        snapshot
-            .nodes
-            .iter()
-            .any(|(_, node)| node.label() == Some("Protected source profiles"))
-    );
 }
 
 struct JournalServices {

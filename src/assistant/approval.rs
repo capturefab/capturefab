@@ -1,8 +1,10 @@
 //! Human decisions are bound to checked actions. A grant for a task cannot
 //! silently add a new camera, risk class or egress target.
+#[cfg(test)]
+use crate::tools::Op;
 use crate::{
     session::{ActivityOrigin, ActorKind, SessionActor},
-    tools::{Checked, Op, Risk, StepId, redact},
+    tools::{Checked, Risk, StepId, redact},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -32,7 +34,7 @@ pub enum RunMode {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalScope {
     Once,
-    #[serde(rename = "run", alias = "for_run")]
+    #[serde(rename = "run")]
     ForRun,
 }
 
@@ -75,15 +77,7 @@ impl ApprovalRequest {
             camera: checked.call.args["camera"]
                 .as_str()
                 .map(redact::for_output_text),
-            needs_secret: checked.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    Op::CreateDestination {
-                        needs_secret: true,
-                        ..
-                    }
-                )
-            }),
+            needs_secret: false,
             allow_run_scope: checked.risk != Risk::HumanOnly,
             expires_at_ms,
         }
@@ -409,7 +403,7 @@ mod tests {
     use super::*;
     use crate::{
         session::SessionCommand,
-        tools::{CameraRef, Issue, StepId, ToolCall, context::DestinationInfo},
+        tools::{CameraRef, Issue, StepId, ToolCall},
     };
     use serde_json::Value;
     use std::thread;
@@ -490,62 +484,25 @@ mod tests {
             changed.call.args["url"] = json!(url);
             assert!(policy.requires(&changed));
         }
-        let mut upload = checked(Risk::Bounded);
-        upload.leaves_computer = true;
-        upload.destination = Some(DestinationInfo {
-            approval_identity: None,
-            name: "captures".into(),
-            kind: "s3".into(),
-            location: "one-bucket".into(),
-            host: Some("s3.example".into()),
-            insecure: false,
-            problem: None,
-            free_bytes: Some(100),
-            remote: true,
-        });
-        policy.record(&upload, &approved(ApprovalScope::ForRun));
-        let mut changed = upload.clone();
-        changed.destination.as_mut().unwrap().free_bytes = Some(5);
-        assert!(!policy.requires(&changed));
-        changed.destination.as_mut().unwrap().location = "two-bucket".into();
-        assert!(policy.requires(&changed));
-        changed = upload.clone();
-        changed.destination.as_mut().unwrap().approval_identity =
-            Some("new-login-or-credentials".into());
-        assert!(policy.requires(&changed));
-        assert!(recheck_approved(&upload, &changed).is_err());
     }
 
     #[test]
-    fn data_grants_bind_endpoint_dataset_and_capture_lifetimes() {
+    fn data_grants_bind_dataset_lifetimes() {
         let mut original = checked(Risk::Bounded);
         original.call = ToolCall {
-            tool: "start_signal_capture".into(),
-            args: json!({"source":"signal:1111111111111111"}),
+            tool: "query_dataset".into(),
+            args: json!({"slot_id":"slot-one"}),
         };
-        original.data_resources = BTreeSet::from([
-            "source:signal:1111111111111111".into(),
-            "endpoint:exact-uri-one".into(),
-            "dataset:slot-one".into(),
-            "signal:capture-one".into(),
-            "sink:1".into(),
-        ]);
+        original.data_resources = BTreeSet::from(["dataset:slot-one".into()]);
         let mut policy = ApprovalPolicy::new(RunMode::Supervised);
         policy.record(&original, &approved(ApprovalScope::ForRun));
         assert!(!policy.requires(&original));
-        for (old, new) in [
-            ("endpoint:exact-uri-one", "endpoint:exact-uri-two"),
-            ("dataset:slot-one", "dataset:slot-two"),
-            ("signal:capture-one", "signal:capture-two"),
-            ("sink:1", "sink:2"),
-        ] {
-            let mut replacement = original.clone();
-            replacement.data_resources.remove(old);
-            replacement.data_resources.insert(new.into());
-            assert!(policy.requires(&replacement), "{new}");
-            assert!(recheck_approved(&original, &replacement).is_err());
-        }
-        policy.invalidate_data_resource("source:signal:1111111111111111");
+        let mut replacement = original.clone();
+        replacement.data_resources.remove("dataset:slot-one");
+        replacement.data_resources.insert("dataset:slot-two".into());
+        assert!(policy.requires(&replacement));
+        assert!(recheck_approved(&original, &replacement).is_err());
+        policy.invalidate_data_resource("dataset:slot-one");
         assert!(policy.requires(&original));
     }
 

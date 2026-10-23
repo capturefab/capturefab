@@ -567,22 +567,9 @@ fn disk_checks_use_the_selected_destination_and_remote_steps_warn() {
     assert!(!run(&ctx, "capture_photos", input).ready());
     let mut input = args("capture_photos");
     input["destination"] = json!("archive");
-    ctx.destinations[1].insecure = true;
-    let remote = run(&ctx, "capture_photos", input);
-    ready(&remote);
-    assert!(remote.leaves_computer);
-    assert!(issue(
-        &remote,
-        "destination",
-        Severity::Warning,
-        "minio.example:9000"
-    ));
-    assert!(issue(
-        &remote,
-        "destination",
-        Severity::Warning,
-        "Unencrypted."
-    ));
+    let local = run(&ctx, "capture_photos", input);
+    ready(&local);
+    assert!(!local.leaves_computer);
 }
 
 #[test]

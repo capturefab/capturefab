@@ -108,8 +108,7 @@ pub fn runtime_dir() -> PathBuf {
     let login = login_runtime_dir().filter(|(_, login)| *login == LoginDir::Usable);
     runtime_dir_in(&var, login.map(|(dir, _)| dir))
 }
-/// What must outlive a reboot: GUI settings, saved destinations, the upload
-/// queue and the storage ledger. The Linux runtime directory is a RAM disk
+/// What must outlive a reboot: GUI settings, saved destinations and the storage ledger. The Linux runtime directory is a RAM disk
 /// that logout clears, so there they live under XDG_STATE_HOME; elsewhere
 /// the two are one directory.
 pub fn state_dir() -> PathBuf {
@@ -134,8 +133,7 @@ pub fn cache_dir() -> Option<PathBuf> {
     }
     cache_dir_in(&var)
 }
-/// Unit tests never touch the user's sessions, storage ledger or upload
-/// queue: without CAPTUREFAB_SESSION_DIR each test process gets its own
+/// Unit tests never touch the user's sessions or storage ledger: without CAPTUREFAB_SESSION_DIR each test process gets its own
 /// private directory, which its tests share as they would the real one.
 fn test_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -163,8 +161,8 @@ fn xdg(var: &impl Fn(&str) -> Option<PathBuf>, name: &str) -> Option<PathBuf> {
 fn home(var: &impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
     var("HOME").unwrap_or_else(std::env::temp_dir)
 }
-/// The one directory versions before the split kept everything in, as macOS
-/// and Windows still do: the login's runtime directory, or a folder on disk.
+/// The shared runtime and state directory on macOS and Windows: the
+/// login's runtime directory, or a folder on disk.
 fn session_dir_in(var: &impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
     xdg(var, "XDG_RUNTIME_DIR").map_or_else(|| disk_session_dir(var), |dir| dir.join("capturefab"))
 }
@@ -342,217 +340,6 @@ fn owned_private(dir: &Path, uid: u32) -> bool {
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: geteuid has no preconditions and always succeeds.
     unsafe { libc::geteuid() }
-}
-/// Files that move into the state directory together, and the lock that
-/// guards them in both places.
-pub(crate) struct StateSet {
-    /// What the files hold, for messages.
-    pub what: &'static str,
-    pub names: &'static [&'static str],
-    pub lock: Option<&'static str>,
-}
-/// What became of a set that versions before the split kept in a session
-/// directory.
-#[derive(Debug, PartialEq)]
-pub(crate) enum Adoption {
-    /// No old directory holds any of it.
-    Nothing,
-    /// One does, and moves on the set's first use.
-    Pending(PathBuf),
-    /// It stays in these directories: the state directory has its own, or
-    /// more than one holds a copy, and only the user can tell which to keep.
-    LeftBehind(Vec<PathBuf>),
-}
-pub(crate) fn adoption(set: &StateSet) -> Adoption {
-    plan_adoption(&legacy_dirs(), &state_dir(), set.names)
-}
-fn plan_adoption(olds: &[PathBuf], new: &Path, names: &[&str]) -> Adoption {
-    let mut holding: Vec<PathBuf> = olds
-        .iter()
-        .filter(|dir| !held(dir, names).is_empty())
-        .cloned()
-        .collect();
-    match holding.len() {
-        0 => Adoption::Nothing,
-        1 if held(new, names).is_empty() => Adoption::Pending(holding.remove(0)),
-        _ => Adoption::LeftBehind(holding),
-    }
-}
-/// The `names` present in `dir`.
-pub(crate) fn held<'a>(dir: &Path, names: &[&'a str]) -> Vec<&'a str> {
-    names
-        .iter()
-        .copied()
-        .filter(|name| fs::symlink_metadata(dir.join(name)).is_ok())
-        .collect()
-}
-/// Every session directory a version before the split may have kept state
-/// in. A service and a login resolved different ones, so all of them count,
-/// whatever this process's environment. Only Linux moved its state.
-pub(crate) fn legacy_dirs() -> Vec<PathBuf> {
-    if !cfg!(target_os = "linux") || cfg!(test) || var("CAPTUREFAB_SESSION_DIR").is_some() {
-        return Vec::new();
-    }
-    let login = login_runtime_dir().map(|(dir, _)| dir);
-    let mut dirs = legacy_dirs_in(&var, login, &state_dir());
-    // Older versions refused any other directory too.
-    dirs.retain(|dir| check_private_dir(dir).is_ok());
-    dirs
-}
-/// $XDG_RUNTIME_DIR/capturefab, the login runtime directory's and the folder
-/// on disk, each once.
-fn legacy_dirs_in(
-    var: &impl Fn(&str) -> Option<PathBuf>,
-    login: Option<PathBuf>,
-    state: &Path,
-) -> Vec<PathBuf> {
-    let runtime = xdg(var, "XDG_RUNTIME_DIR").into_iter().chain(login);
-    let mut dirs = Vec::new();
-    for dir in runtime
-        .map(|dir| dir.join("capturefab"))
-        .chain([disk_session_dir(var)])
-    {
-        if dir != state && !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    }
-    dirs
-}
-/// Move a set of state files a version before the split kept in a session
-/// directory into the state directory, on the set's first use in a process.
-/// A set it cannot move is named on stderr, and `doctor` says what to do.
-pub(crate) fn adopt_state(set: &StateSet) {
-    let new = state_dir();
-    let left = match plan_adoption(&legacy_dirs(), &new, set.names) {
-        Adoption::Nothing => return,
-        Adoption::Pending(old) => match move_state(&old, &new, set.names, set.lock) {
-            Ok(moved) if !moved.is_empty() => {
-                eprintln!(
-                    "capturefab: moved {} from {} to {}",
-                    moved.join(", "),
-                    old.display(),
-                    new.display()
-                );
-                return;
-            }
-            // Another process moved it, or made the set first, meanwhile.
-            Ok(_) if held(&old, set.names).is_empty() => return,
-            Ok(_) => vec![old],
-            Err(error) => {
-                eprintln!(
-                    "capturefab: left {} in {}, as it cannot move to {}: {error:#}",
-                    set.names.join(", "),
-                    old.display(),
-                    new.display()
-                );
-                return;
-            }
-        },
-        Adoption::LeftBehind(olds) => olds,
-    };
-    let left: Vec<String> = left.iter().map(|dir| dir.display().to_string()).collect();
-    eprintln!(
-        "capturefab: not using {} an older version left in {}; run `capturefab doctor`",
-        set.what,
-        left.join(" and ")
-    );
-}
-/// Move the `names` found in `old` to `new` while `new` has none of them,
-/// holding `lock` in both, so no other process changes either copy
-/// meanwhile. Everything is copied before anything is put in place, and a
-/// failure takes back what was placed, so the old set stays whole; nothing
-/// in `new` is ever replaced. Returns the names moved.
-fn move_state(old: &Path, new: &Path, names: &[&str], lock: Option<&str>) -> Result<Vec<String>> {
-    let found = |dir: &Path| held(dir, names);
-    if found(old).is_empty() || !found(new).is_empty() {
-        return Ok(Vec::new());
-    }
-    check_private_dir(old)?;
-    ensure_private_dir(new)?;
-    let _locks = lock
-        .map(|lock| -> Result<_> {
-            let locks = (lock_file(&new.join(lock))?, lock_file(&old.join(lock))?);
-            locks.0.lock_exclusive()?;
-            locks.1.lock_exclusive()?;
-            Ok(locks)
-        })
-        .transpose()?;
-    // Another process may have moved them while this one waited.
-    let moving = found(old);
-    if moving.is_empty() || !found(new).is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut copies = Vec::new();
-    let mut placed = Vec::new();
-    let result = (|| -> Result<()> {
-        for name in &moving {
-            // Named per process: a set without a lock can race another.
-            let copy = new.join(format!(".{name}.{}.moving", std::process::id()));
-            copies.push(copy.clone());
-            copy_private(&old.join(name), &copy)?;
-        }
-        for (name, copy) in moving.iter().zip(&copies) {
-            place(copy, &new.join(name))?;
-            placed.push(new.join(name));
-        }
-        sync_dir(new)
-    })();
-    if let Err(error) = result {
-        for path in placed.iter().chain(&copies) {
-            let _ = fs::remove_file(path);
-        }
-        return Err(error);
-    }
-    for name in &moving {
-        let _ = fs::remove_file(old.join(name));
-    }
-    Ok(moving.into_iter().map(str::to_owned).collect())
-}
-/// A private copy of the regular file `from`, made durable.
-fn copy_private(from: &Path, to: &Path) -> Result<()> {
-    ensure!(
-        fs::symlink_metadata(from)?.is_file(),
-        "{} is not a regular file",
-        from.display()
-    );
-    // Left by an interrupted move of a process with the same id.
-    let _ = fs::remove_file(to);
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut output = options.open(to)?;
-    std::io::copy(&mut fs::File::open(from)?, &mut output)?;
-    output.sync_all()?;
-    Ok(())
-}
-/// Put `copy` at `path` unless something is already there.
-fn place(copy: &Path, path: &Path) -> Result<()> {
-    match fs::hard_link(copy, path) {
-        Ok(()) => fs::remove_file(copy)?,
-        // A file system without hard links; the set's lock keeps other
-        // processes from adding the file meanwhile.
-        Err(error)
-            if error.kind() != std::io::ErrorKind::AlreadyExists
-                && fs::symlink_metadata(path).is_err() =>
-        {
-            fs::rename(copy, path)?
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("cannot create {}", path.display()));
-        }
-    }
-    Ok(())
-}
-fn sync_dir(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    fs::File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
 }
 /// A lock file only this user can open.
 fn lock_file(path: &Path) -> std::io::Result<fs::File> {
@@ -1193,16 +980,10 @@ mod tests {
         if std::env::var_os("CAPTUREFAB_SESSION_DIR").is_none() {
             assert_eq!(runtime_dir(), dir);
             assert_eq!(state_dir(), dir);
-            assert_eq!(
-                crate::destination::staging_root(),
-                dir.join("staging"),
-                "staged uploads stay in it too"
-            );
         }
         if std::env::var_os("CAPTUREFAB_CACHE_DIR").is_none() {
             assert!(cache_dir().unwrap().starts_with(std::env::temp_dir()));
         }
-        assert!(legacy_dirs().is_empty(), "nothing to move in tests");
         assert_eq!(missed_runtime_dir(), None);
     }
 
@@ -1235,8 +1016,8 @@ mod tests {
             runtime_dir_in(&unit, login.clone()),
             PathBuf::from("/run/capturefab/capturefab")
         );
-        // Without a usable login directory, the folder on disk older
-        // versions used; a relative XDG_RUNTIME_DIR counts as unset.
+        // Without a usable login directory, sessions fall back to disk;
+        // a relative XDG_RUNTIME_DIR counts as unset.
         let fallback = PathBuf::from("/home/pi/.cache/capturefab/sessions");
         assert_eq!(runtime_dir_in(&service, None), fallback);
         let relative = env(&[("XDG_RUNTIME_DIR", "run"), ("HOME", "/home/pi")]);
@@ -1360,76 +1141,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn state_may_be_in_any_directory_an_older_version_used() {
-        let login = Some(PathBuf::from("/run/user/1000"));
-        let state = PathBuf::from("/home/pi/.local/state/capturefab");
-        let disk = PathBuf::from("/home/pi/.cache/capturefab/sessions");
-        let user = PathBuf::from("/run/user/1000/capturefab");
-        // An SSH shell also looks where a service without XDG_RUNTIME_DIR
-        // kept its state.
-        let shell = env(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("HOME", "/home/pi")]);
-        assert_eq!(
-            legacy_dirs_in(&shell, login.clone(), &state),
-            [user.clone(), disk.clone()]
-        );
-        let service = env(&[("HOME", "/home/pi")]);
-        assert_eq!(
-            legacy_dirs_in(&service, login.clone(), &state),
-            [user.clone(), disk.clone()]
-        );
-        assert_eq!(
-            legacy_dirs_in(&service, None, &state),
-            std::slice::from_ref(&disk)
-        );
-        // A unit that gained RuntimeDirectory= still finds what its login
-        // and its older self kept.
-        let unit = env(&[("XDG_RUNTIME_DIR", "/run/capturefab"), ("HOME", "/home/pi")]);
-        assert_eq!(
-            legacy_dirs_in(&unit, login, &state),
-            [
-                PathBuf::from("/run/capturefab/capturefab"),
-                user,
-                disk.clone()
-            ]
-        );
-        assert!(legacy_dirs_in(&service, None, &disk).is_empty());
-    }
-
-    #[test]
-    fn state_moves_only_when_one_copy_is_left() {
-        let root = TestDir::new();
-        let (runtime, disk, new) = (root.0.join("run"), root.0.join("disk"), root.0.join("new"));
-        for dir in [&runtime, &disk, &new] {
-            ensure_private_dir(dir).unwrap();
-        }
-        let olds = [runtime.clone(), disk.clone()];
-        let names = ["a.json", "b.json"];
-        assert_eq!(plan_adoption(&olds, &new, &names), Adoption::Nothing);
-        // A service's set on disk moves for a shell whose own runtime
-        // directory holds nothing: the regression where it stayed behind.
-        fs::write(disk.join("b.json"), "service").unwrap();
-        fs::write(runtime.join("other"), "").unwrap();
-        assert_eq!(
-            plan_adoption(&olds, &new, &names),
-            Adoption::Pending(disk.clone())
-        );
-        // Two copies, or one beside the state directory's own, wait for the
-        // user to choose.
-        fs::write(runtime.join("a.json"), "shell").unwrap();
-        assert_eq!(
-            plan_adoption(&olds, &new, &names),
-            Adoption::LeftBehind(olds.to_vec())
-        );
-        fs::remove_file(runtime.join("a.json")).unwrap();
-        fs::write(new.join("a.json"), "new").unwrap();
-        assert_eq!(
-            plan_adoption(&olds, &new, &names),
-            Adoption::LeftBehind(vec![disk])
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn a_directory_of_another_user_is_refused() {
         // The root directory belongs to root; its mode alone would not
         // refuse a private one that another user created first.
@@ -1441,109 +1152,6 @@ mod tests {
         ensure_private_dir(&dir.0.join("a/b")).unwrap();
     }
 
-    /// A legacy session directory holding `files`, and an empty state one.
-    fn legacy(files: &[(&str, &str)]) -> (TestDir, PathBuf, PathBuf) {
-        let root = TestDir::new();
-        let old = root.0.join("old");
-        let new = root.0.join("new");
-        ensure_private_dir(&old).unwrap();
-        for (name, text) in files {
-            fs::write(old.join(name), text).unwrap();
-        }
-        (root, old, new)
-    }
-
-    #[test]
-    fn state_moves_once_and_whole() {
-        let (_root, old, new) = legacy(&[("a.json", "A"), ("b.json", "B"), ("other", "O")]);
-        let names = ["a.json", "b.json", "c.json"];
-        let moved = move_state(&old, &new, &names, Some("set.lock")).unwrap();
-        assert_eq!(moved, ["a.json", "b.json"]);
-        assert_eq!(fs::read_to_string(new.join("a.json")).unwrap(), "A");
-        assert_eq!(fs::read_to_string(new.join("b.json")).unwrap(), "B");
-        assert!(!old.join("a.json").exists() && !old.join("b.json").exists());
-        assert!(old.join("other").exists(), "files of other sets stay");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(new.join("a.json"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
-        let leftovers: Vec<_> = fs::read_dir(&new)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .filter(|name| name.to_string_lossy().ends_with(".moving"))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
-        // Once the state directory has the set, an old file that turns up
-        // again stays where it is.
-        fs::write(old.join("a.json"), "stale").unwrap();
-        assert!(
-            move_state(&old, &new, &names, Some("set.lock"))
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(fs::read_to_string(new.join("a.json")).unwrap(), "A");
-        assert_eq!(fs::read_to_string(old.join("a.json")).unwrap(), "stale");
-    }
-
-    #[test]
-    fn state_never_replaces_a_file() {
-        let (_root, old, new) = legacy(&[("a.json", "old A"), ("b.json", "old B")]);
-        ensure_private_dir(&new).unwrap();
-        fs::write(new.join("b.json"), "new B").unwrap();
-        let names = ["a.json", "b.json"];
-        assert!(move_state(&old, &new, &names, None).unwrap().is_empty());
-        assert!(!new.join("a.json").exists(), "a set never moves in part");
-        assert_eq!(fs::read_to_string(new.join("b.json")).unwrap(), "new B");
-        assert_eq!(fs::read_to_string(old.join("a.json")).unwrap(), "old A");
-        // Placing refuses a file that appeared after the check.
-        let copy = new.join(".a.json.moving");
-        fs::write(&copy, "copy").unwrap();
-        assert!(place(&copy, &new.join("b.json")).is_err());
-        assert_eq!(fs::read_to_string(new.join("b.json")).unwrap(), "new B");
-    }
-
-    #[test]
-    fn a_failed_move_leaves_the_old_set_whole() {
-        let (_root, old, new) = legacy(&[("a.json", "A")]);
-        fs::create_dir(old.join("b.json")).unwrap();
-        let error = move_state(&old, &new, &["a.json", "b.json"], None).unwrap_err();
-        assert!(error.to_string().contains("not a regular file"), "{error}");
-        assert_eq!(fs::read_to_string(old.join("a.json")).unwrap(), "A");
-        assert_eq!(fs::read_dir(&new).unwrap().count(), 0, "no copies left");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn state_moves_only_from_a_private_directory_of_this_user() {
-        use std::os::unix::fs::PermissionsExt;
-        let (_root, old, new) = legacy(&[("a.json", "A")]);
-        fs::set_permissions(&old, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(move_state(&old, &new, &["a.json"], None).is_err());
-        assert!(old.join("a.json").exists() && !new.join("a.json").exists());
-    }
-
-    #[test]
-    fn state_moves_while_no_process_holds_its_lock() {
-        let (_root, old, new) = legacy(&[("a.json", "A")]);
-        // An older version updating the set holds its lock there.
-        let held = lock_file(&old.join("set.lock")).unwrap();
-        held.lock_exclusive().unwrap();
-        let mover = {
-            let (old, new) = (old.clone(), new.clone());
-            std::thread::spawn(move || move_state(&old, &new, &["a.json"], Some("set.lock")))
-        };
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(!new.join("a.json").exists(), "waits for the lock");
-        fs::write(old.join("a.json"), "A2").unwrap();
-        FileExt::unlock(&held).unwrap();
-        assert_eq!(mover.join().unwrap().unwrap(), ["a.json"]);
-        assert_eq!(fs::read_to_string(new.join("a.json")).unwrap(), "A2");
-    }
     #[test]
     fn authenticated_probes_do_not_change_camera_state_or_activity() {
         let dir = TestDir::new();
@@ -1607,11 +1215,7 @@ mod tests {
         let view = handle.activity();
         assert_eq!(view.activity.len(), 2);
         for actor in actors {
-            assert!(
-                view.activity
-                    .iter()
-                    .any(|entry| entry.actor.as_ref() == Some(&actor))
-            );
+            assert!(view.activity.iter().any(|entry| entry.actor == actor));
         }
         let revision = view.revision;
         let invalid = SessionActor {

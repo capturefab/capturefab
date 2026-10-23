@@ -3,14 +3,14 @@
 use super::{
     context::{
         Compiled, Context, DestinationInfo, MediaInfo, NoSession, RecordingDefaults, SessionHost,
-        Sources, StorageInfo, ToolHost, UploadInfo, Zone, gather_with, snapshot_from,
+        Sources, StorageInfo, ToolHost, Zone, gather_with, snapshot_from,
     },
     read::{ReadOptions, ToolOutput, TurnCache, run_read},
     *,
 };
 use crate::{
     auto::AutoStatus,
-    destination::{Bucket, Credentials, Destination, Target},
+    destination::{Destination, Target},
     genicam::FeatureInfo,
     scheduling::CaptureJob,
     session::{
@@ -38,33 +38,6 @@ pub(crate) const STREAM: &str = "media:fedcba9876543210";
 pub(crate) const SCANNER: &str = "scanner:ica:office";
 pub(crate) const FACETIME: &str = "avfoundation:FaceTime HD Camera";
 pub(crate) const ONVIF: &str = "onvif:http://10.0.0.5/onvif/device_service";
-
-/// A local receipt fixture, without touching a profile file or secret store.
-pub(crate) fn fixture_bound_source(ctx: &mut Context, endpoint: &str) -> context::DataSourceRef {
-    use crate::signals::auth::{AuthBinding, BindingReceipt, ProfileInfo, ProfileRef, SecretKind};
-    let receipt = BindingReceipt {
-        endpoint: endpoint.into(),
-        reference: crate::signals::source_id(endpoint),
-        auth: AuthBinding {
-            profile: ProfileRef {
-                id: "a".repeat(32),
-                revision: "b".repeat(32),
-            },
-            epoch: "c".repeat(32),
-        },
-    };
-    ctx.data_profiles.push(ProfileInfo {
-        profile: receipt.auth.profile.clone(),
-        name: "line-one".into(),
-        endpoint: endpoint.into(),
-        reference: receipt.reference.clone(),
-        protocol: crate::signals::parse(endpoint).unwrap().protocol,
-        secret: SecretKind::Environment,
-        insecure: false,
-    });
-    ctx.snapshot.signal_bindings.push(receipt.clone());
-    context::DataSourceRef::from_binding(&receipt).unwrap()
-}
 
 /// A scripted session. `snapshot()` steps through the scripted snapshots
 /// and then repeats the last; `execute()` records each command and answers
@@ -236,6 +209,7 @@ pub(crate) fn camera(info: CameraInfo) -> CameraSnapshot {
         worker_pid: 1,
         forwarding: None,
         forwarding_id: None,
+        forwarding_progress: None,
         forwarding_since_ms: None,
         forwarding_until_ms: None,
         jobs: Vec::new(),
@@ -422,12 +396,8 @@ pub(crate) fn fixture_context(snapshot: SessionSnapshot) -> Context {
         zone: Zone::Fixed(7200),
         session: true,
         snapshot,
-        data_sources: Vec::new(),
-        data_profiles: Vec::new(),
         allow_data: false,
         data_dataset: None,
-        task_data_available: false,
-        task_data_reserved_bytes: 0,
         destinations: vec![
             DestinationInfo {
                 approval_identity: None,
@@ -443,13 +413,13 @@ pub(crate) fn fixture_context(snapshot: SessionSnapshot) -> Context {
             DestinationInfo {
                 approval_identity: None,
                 name: "archive".into(),
-                kind: "s3".into(),
-                location: "s3://acme/cams/ at https://minio.example:9000".into(),
-                host: Some("minio.example:9000".into()),
+                kind: "folder".into(),
+                location: "~/Captures/archive".into(),
+                host: None,
                 insecure: false,
                 problem: None,
                 free_bytes: Some(50_000_000_000),
-                remote: true,
+                remote: false,
             },
         ],
         storage: StorageInfo {
@@ -466,11 +436,6 @@ pub(crate) fn fixture_context(snapshot: SessionSnapshot) -> Context {
             "hevc_videotoolbox".into(),
             "aac".into(),
         ]),
-        uploads: Some(UploadInfo {
-            pending: 1,
-            last_error: Some("upload to srt://h?passphrase=x failed".into()),
-            ..UploadInfo::default()
-        }),
         capture_root: home().join("Capturefab"),
         compiled: Compiled::current(),
         defaults: RecordingDefaults::default(),
@@ -529,7 +494,6 @@ fn catalog_lists_the_observe_tools_with_their_sessions() {
             "get_camera_features",
             "inspect_frame",
             "wait_for",
-            "list_data_sources",
             "get_dataset",
             "query_dataset"
         ]
@@ -577,7 +541,6 @@ fn string_list_form_fields_match_their_array_of_strings_schemas() {
         fields,
         [
             ("get_camera_features", "names"),
-            ("start_signal_capture", "tags"),
             ("export_dataset", "tables"),
         ]
     );
@@ -736,10 +699,7 @@ fn overview_is_redacted_for_models_and_people() {
         people["cameras"][4]["last_error"],
         "could not open rtsp://<redacted>@h/s: refused"
     );
-    assert_eq!(
-        people["uploads"]["last_error"],
-        "upload to srt://h?passphrase=<redacted> failed"
-    );
+    assert!(people.get("uploads").is_none());
 }
 
 #[test]
@@ -980,9 +940,9 @@ fn destinations_and_storage_report_budget_and_locations() {
     );
     assert_eq!(
         destinations["destinations"][1]["location"],
-        "s3://acme at https://minio.example:9000"
+        "~/Captures/archive"
     );
-    assert_eq!(destinations["destinations"][1]["remote"], true);
+    assert_eq!(destinations["destinations"][1]["remote"], false);
     let storage = run(&host, &ctx, "get_storage", json!({}), &opts)
         .unwrap()
         .value;
@@ -994,8 +954,7 @@ fn destinations_and_storage_report_budget_and_locations() {
         "1.8 GB used and 0 B reserved of a 10.7 GB budget, so 8.9 GB is left; 7.1 GB free on disk."
     );
     assert_eq!(storage["when_full"], "New captures and recordings stop.");
-    assert_eq!(storage["uploads"]["pending"], 1);
-    assert_eq!(storage["uploads"]["last_error"], "upload to srt://h failed");
+    assert!(storage.get("uploads").is_none());
     let issues = run(&host, &ctx, "get_storage", json!({"verbose": true}), &opts).unwrap_err();
     assert_eq!(
         messages(&issues),
@@ -1721,17 +1680,13 @@ impl Sources for FakeSources {
         ]))
     }
 
-    fn uploads(&self) -> Option<Result<Value>> {
-        Some(Err(anyhow::anyhow!("uploads.json is locked")))
-    }
-
     fn free_space(&self, path: &Path) -> Option<u64> {
         (!path.starts_with("/Volumes/Gone")).then_some(42)
     }
 
     fn volume_problem(&self, path: &Path) -> Option<String> {
         if self.missing_volume.as_deref() == Some(path) {
-            return Some("The staging volume is disconnected.".into());
+            return Some("The destination volume is disconnected.".into());
         }
         path.starts_with("/Volumes/Gone").then(|| {
             "external volume /Volumes/Gone is not mounted; reconnect it or choose another destination"
@@ -1742,18 +1697,6 @@ impl Sources for FakeSources {
 
 #[test]
 fn gathering_reads_destinations_storage_and_encoders_without_secrets() {
-    let bucket = Bucket {
-        endpoint: "https://minio.example:9000".into(),
-        region: "us-east-1".into(),
-        bucket: "acme".into(),
-        prefix: "cams/".into(),
-        path_style: true,
-        credentials: Credentials::Keychain {
-            access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
-        },
-        keep_local: false,
-        no_overwrite: Default::default(),
-    };
     let sources = FakeSources {
         missing_volume: None,
         destinations: vec![
@@ -1771,7 +1714,9 @@ fn gathering_reads_destinations_storage_and_encoders_without_secrets() {
             },
             Destination {
                 name: "archive".into(),
-                target: Target::S3(bucket),
+                target: Target::Folder {
+                    path: home().join("Captures/archive"),
+                },
             },
         ],
     };
@@ -1797,13 +1742,10 @@ fn gathering_reads_destinations_storage_and_encoders_without_secrets() {
         )
     );
     let archive = &ctx.destinations[2];
-    assert_eq!(
-        archive.location,
-        "s3://acme/cams/ at https://minio.example:9000"
+    assert_eq!(archive.location.replace('\\', "/"), "~/Captures/archive");
+    assert!(
+        archive.host.is_none() && !archive.remote && !archive.insecure && archive.problem.is_none()
     );
-    assert_eq!(archive.host.as_deref(), Some("minio.example:9000"));
-    assert!(archive.remote && !archive.insecure);
-    assert_eq!(archive.problem.is_some(), !cfg!(feature = "s3"));
     // The request policy is clamped by the configured one.
     assert_eq!(ctx.storage.effective.max_bytes, 1 << 30);
     assert_eq!(ctx.storage.effective.on_full, "delete-oldest");
@@ -1815,10 +1757,6 @@ fn gathering_reads_destinations_storage_and_encoders_without_secrets() {
     assert_eq!(ctx.media.encoders_by_codec["hevc"], ["libx265"]);
     assert_eq!(ctx.media.encoders_by_codec["av1"], ["libsvtav1"]);
     assert!(ctx.media.encoders_by_codec["h264"].is_empty() && ctx.media.available);
-    assert_eq!(
-        ctx.uploads.as_ref().unwrap().problem.as_deref(),
-        Some("uploads.json is locked")
-    );
     let text = format!("{ctx:?}");
     assert!(
         !text.contains("AKIA") && !text.contains("storage.json"),
@@ -1837,52 +1775,12 @@ fn gathering_reads_destinations_storage_and_encoders_without_secrets() {
 }
 
 #[test]
-fn destinations_of_kinds_this_build_lacks_carry_a_problem() {
-    let compiled = Compiled {
-        s3: false,
-        ftp: false,
-        sftp: false,
-        uploads: false,
-        jpeg: false,
-    };
-    let sources = FakeSources {
-        destinations: Vec::new(),
-        missing_volume: None,
-    };
-    let s3 = Destination {
-        name: "archive".into(),
-        target: Target::S3(Bucket {
-            endpoint: "http://nas.local:9000".into(),
-            region: "us-east-1".into(),
-            bucket: "acme".into(),
-            prefix: String::new(),
-            path_style: true,
-            credentials: Credentials::Environment,
-            keep_local: false,
-            no_overwrite: Default::default(),
-        }),
-    };
-    let info = DestinationInfo::new(&s3, &compiled, &sources);
-    assert_eq!(
-        info.problem.as_deref(),
-        Some("S3 destinations need a build with --features s3")
-    );
-    assert!(info.insecure);
-    assert!(!compiled.supports("ftp") && compiled.supports("folder"));
-
-    let compiled = Compiled {
-        s3: true,
-        ..compiled
-    };
-    let sources = FakeSources {
-        destinations: Vec::new(),
-        missing_volume: Some(s3.local_root()),
-    };
-    let info = DestinationInfo::new(&s3, &compiled, &sources);
-    assert_eq!(
-        info.problem.as_deref(),
-        Some("The staging volume is disconnected.")
-    );
+fn destination_context_only_supports_folders() {
+    let compiled = Compiled { jpeg: false };
+    assert!(compiled.supports("folder"));
+    for kind in ["s3", "ftp", "sftp"] {
+        assert!(!compiled.supports(kind));
+    }
 }
 
 #[test]

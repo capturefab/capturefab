@@ -4,26 +4,8 @@ use crate::gui::accessibility::{Node, NodeId, Role, mapped, snapshot_widget};
 use iced::Size;
 use std::collections::BTreeMap;
 
-fn editor(source: Option<Source>) -> Editor {
-    let mut editor = match source {
-        None => Editor::new_folder("line-1".into(), std::env::temp_dir().join("captures")),
-        Some(source) => {
-            let mut editor = Editor::new_bucket();
-            editor.source = source;
-            editor.provider = 4;
-            editor.endpoint = "https://storage.example.com".into();
-            editor.bucket = "line-1".into();
-            editor.access_key_id = "AKIA".into();
-            editor.secret = "test-secret".into();
-            editor.profile = "camera-profile".into();
-            editor.prefix = "cameras/line-1/".into();
-            editor.advanced = true;
-            editor
-        }
-    };
-    editor.name = "line-1".into();
-    editor.name_touched = true;
-    editor
+fn editor() -> Editor {
+    Editor::new_folder("line-1".into(), std::env::temp_dir().join("captures"))
 }
 use iced::advanced::{
     Layout, layout,
@@ -85,15 +67,10 @@ fn saving_freezes_all_destination_edits_but_keeps_their_values_readable() {
         Some("tiny-skia"),
     ))
     .expect("the compiled software renderer is available");
-    for source in [
-        None,
-        Some(Source::Keychain),
-        Some(Source::Profile),
-        Some(Source::Environment),
-    ] {
+    {
         let mut picker = Picker::new(false, false);
         picker.manager_open = true;
-        picker.editor = Some(editor(source));
+        picker.editor = Some(editor());
         let mut tree = Tree::empty();
         let (before, before_focus) = inspect(&picker, &mut tree, &renderer);
         assert!(before.values().any(|node| node.role() == Role::TextInput));
@@ -153,18 +130,9 @@ fn saving_freezes_all_destination_edits_but_keeps_their_values_readable() {
             }
         }
         assert_eq!(
-            pending_focus.total,
-            usize::from(source.is_some()),
-            "only S3's Advanced disclosure remains traversable for reading"
+            pending_focus.total, 0,
+            "saving disables every editing action"
         );
-        if source.is_some() {
-            // This is a permitted local navigation action, even during save.
-            let mut output = String::new();
-            picker.update(Message::Advanced(false), &mut output);
-            assert!(!picker.editor.as_ref().unwrap().advanced);
-            picker.update(Message::Advanced(true), &mut output);
-        }
-
         picker.editor.as_mut().unwrap().saving = None;
         let (after, after_focus) = inspect(&picker, &mut tree, &renderer);
         assert_eq!(after.len(), before.len());
@@ -203,14 +171,9 @@ fn return_from_each_actual_single_line_field_requests_save_once() {
         Some("tiny-skia"),
     ))
     .unwrap();
-    for source in [
-        None,
-        Some(Source::Keychain),
-        Some(Source::Profile),
-        Some(Source::Environment),
-    ] {
+    {
         let mut picker = Picker::new(false, false);
-        picker.editor = Some(editor(source));
+        picker.editor = Some(editor());
         picker.manager_open = true;
         let mut view = mapped(
             picker.manager(Palette::of(false), 640.0, 0, Instant::now(), None, None),
@@ -661,194 +624,20 @@ fn drive_shortcuts_say_what_they_do_and_mark_the_drive_in_use() {
 }
 
 #[test]
-fn destination_rows_summarize_in_plain_words() {
-    let s3 = |endpoint: &str, keep_local: bool| Destination {
-        name: "b".into(),
-        target: Target::S3(Bucket {
-            endpoint: endpoint.into(),
-            region: "auto".into(),
-            bucket: "line-1".into(),
-            prefix: "capturefab/".into(),
-            path_style: false,
-            credentials: Credentials::Environment,
-            keep_local,
-            no_overwrite: NoOverwrite::IfNoneMatch,
-        }),
+fn destination_rows_show_local_paths() {
+    let d = Destination {
+        name: "archive".into(),
+        target: Target::Folder {
+            path: "/Volumes/Archive".into(),
+        },
     };
-    assert_eq!(
-        row_summary(&s3("", false)),
-        "Amazon S3 · line-1/capturefab/"
-    );
-    assert_eq!(
-        row_summary(&s3("https://abc.r2.cloudflarestorage.com", true)),
-        "Cloudflare R2 · line-1/capturefab/ · keeps local copies"
-    );
-    assert_eq!(
-        row_summary(&s3("https://s3.us-west-004.backblazeb2.com", false)),
-        "Backblaze B2 · line-1/capturefab/"
-    );
-    assert_eq!(
-        row_summary(&s3("https://storage.example.com", false)),
-        "Other S3-compatible · line-1/capturefab/"
-    );
+    assert_eq!(row_summary(&d), "/Volumes/Archive");
     let home = Path::new("/Users/ada");
     assert_eq!(
         tilde(&home.join("Captures"), Some(home)).replace('\\', "/"),
         "~/Captures"
     );
     assert_eq!(tilde(home, Some(home)), "~");
-    assert_eq!(tilde(Path::new("/Volumes/A"), Some(home)), "/Volumes/A");
-    let ftp = Destination {
-        name: "line1".into(),
-        target: Target::Ftp(destination::FtpServer {
-            host: "10.0.0.5".into(),
-            port: 21,
-            user: "cam".into(),
-            dir: "incoming".into(),
-            tls: destination::FtpTls::Explicit,
-            password: destination::SecretSource::Environment,
-            keep_local: false,
-        }),
-    };
-    assert_eq!(row_summary(&ftp), ftp.describe());
-}
-
-#[test]
-fn credentials_and_r2_regions_wait_under_advanced_unless_customised() {
-    let bucket = |change: fn(&mut Editor)| {
-        let mut editor = editor(Some(Source::Keychain));
-        editor.prefix = DEFAULT_PREFIX.into();
-        editor.provider = 0;
-        editor.endpoint = String::new();
-        editor.path_style = false;
-        editor.advanced = false;
-        change(&mut editor);
-        editor
-    };
-    assert!(!bucket(|_| {}).custom_advanced());
-    assert!(bucket(|e| e.source = Source::Profile).custom_advanced());
-    assert!(bucket(|e| e.source = Source::Environment).custom_advanced());
-    let r2 = |e: &mut Editor| {
-        e.provider = 1;
-        e.region = "auto".into();
-        e.path_style = true;
-    };
-    assert!(!bucket(r2).custom_advanced());
-    assert!(
-        bucket(|e| {
-            e.provider = 1;
-            e.path_style = true;
-            e.region = "eu".into();
-        })
-        .custom_advanced()
-    );
-    // Amazon's region is in the main column, so it opens nothing.
-    assert!(!bucket(|e| e.region = "eu-west-1".into()).custom_advanced());
-    // A refused field under Advanced opens it.
-    let mut profile = bucket(|e| {
-        e.source = Source::Profile;
-        e.profile = String::new();
-    });
-    profile.advanced = false;
-    profile.refuse(profile.destination().unwrap_err());
-    assert!(profile.advanced);
-    let mut region = bucket(|e| {
-        e.provider = 1;
-        e.region = String::new();
-    });
-    region.refuse(region.destination().unwrap_err());
-    assert!(region.advanced);
-    let mut amazon = bucket(|e| e.region = String::new());
-    amazon.refuse(amazon.destination().unwrap_err());
-    assert!(!amazon.advanced);
-    let summary = |change| advanced_summary(&bucket(change));
-    assert_eq!(summary(|_| {}), "Folder capturefab/");
-    assert_eq!(summary(|e| e.prefix = String::new()), "No folder");
-    assert_eq!(
-        summary(|e| e.source = Source::Profile),
-        "Folder capturefab/ · AWS profile camera-profile"
-    );
-    assert_eq!(
-        summary(|e| e.source = Source::Environment),
-        "Folder capturefab/ · environment credentials"
-    );
-    assert_eq!(
-        summary(|e| {
-            e.provider = 1;
-            e.path_style = true;
-            e.region = "eu".into();
-        }),
-        "Folder capturefab/ · path-style · region eu"
-    );
-}
-
-#[test]
-fn the_main_column_holds_the_bucket_essentials_in_order() {
-    let fields = |change: fn(&mut Editor)| {
-        let mut editor = Editor::new_bucket();
-        change(&mut editor);
-        let mut picker = Picker::new(false, false);
-        picker.manager_open = true;
-        picker.editor = Some(editor);
-        nodes_of(
-            mapped(
-                picker.manager(Palette::of(false), 2000.0, 0, Instant::now(), None, None),
-                crate::gui::Message::CapturePicker,
-            ),
-            560.0,
-        )
-        .into_iter()
-        .filter(|(_, node)| {
-            matches!(
-                node.role(),
-                Role::ComboBox | Role::TextInput | Role::PasswordInput
-            )
-        })
-        .filter_map(|(_, node)| node.label().map(str::to_owned))
-        .collect::<Vec<_>>()
-    };
-    assert_eq!(
-        fields(|_| {}),
-        [
-            "S3-compatible service",
-            "S3 bucket",
-            "S3 region",
-            "S3 access key ID",
-            "S3 secret access key",
-            "Destination name"
-        ]
-    );
-    assert_eq!(
-        fields(|e| {
-            e.provider = 1;
-            e.endpoint = PROVIDERS[1].1.into();
-            e.region = "auto".into();
-            e.path_style = true;
-        }),
-        [
-            "S3-compatible service",
-            "S3 endpoint",
-            "S3 bucket",
-            "S3 access key ID",
-            "S3 secret access key",
-            "Destination name"
-        ]
-    );
-    let advanced = fields(|e| {
-        e.provider = 1;
-        e.source = Source::Profile;
-        e.advanced = true;
-    });
-    assert_eq!(
-        advanced[advanced.len() - 4..],
-        [
-            "S3 key prefix",
-            "S3 region",
-            "Credentials source",
-            "AWS profile"
-        ]
-    );
-    assert!(!advanced.contains(&"S3 access key ID".to_string()));
 }
 
 #[test]
@@ -864,8 +653,8 @@ fn an_editor_without_history_offers_no_undo_stops() {
     // Once edited, the footer offers Undo before Test.
     let mut picker = Picker::new(false, false);
     let mut output = String::new();
-    picker.update(Message::AddBucket, &mut output);
-    picker.update(Message::Bucket("line-1".into()), &mut output);
+    picker.update(Message::AddFolder, &mut output);
+    picker.update(Message::Name("line-1".into()), &mut output);
     let nodes = nodes_of(
         mapped(
             picker.manager(Palette::of(false), 2000.0, 0, Instant::now(), None, None),
@@ -882,7 +671,7 @@ fn an_editor_without_history_offers_no_undo_stops() {
             .map(|(_, node)| (node.bounds().unwrap(), node.is_disabled()))
             .unwrap_or_else(|| panic!("{prefix}"))
     };
-    let (undo, undo_disabled) = bounds("Undo Bucket name");
+    let (undo, undo_disabled) = bounds("Undo Destination name");
     let (redo, redo_disabled) = bounds("Nothing to redo");
     let (test, _) = bounds("Check that ");
     assert!(!undo_disabled && redo_disabled);
@@ -892,7 +681,7 @@ fn an_editor_without_history_offers_no_undo_stops() {
 #[test]
 fn a_check_outcome_shows_once_unless_it_is_a_problem() {
     let count = |message: (&str, bool)| {
-        let mut editor = editor(None);
+        let mut editor = editor();
         editor.message = Some((message.0.into(), message.1));
         let mut picker = Picker::new(false, false);
         picker.manager_open = true;

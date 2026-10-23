@@ -74,11 +74,20 @@ pub(super) struct SideState {
     file_probe: Option<(String, Receiver<bool>)>,
     /// The disk's last answer, and the address it was about.
     file_answer: Option<(String, bool)>,
+    /// Resolving whether whitespace around submitted input belongs to a
+    /// real file name. Kept separate from the hint's trimmed-path probe.
+    address_connect: Option<AddressConnect>,
     /// Whether a camera was connected at the last tick.
     had_camera: bool,
     /// The stage dimming from the welcome screen's surface to its own as the
     /// first camera connects.
     pub(super) stage_in: Motion,
+}
+
+struct AddressConnect {
+    address: String,
+    camera: Option<String>,
+    answer: Receiver<bool>,
 }
 
 impl Default for SideState {
@@ -95,6 +104,7 @@ impl Default for SideState {
             typed_at: None,
             file_probe: None,
             file_answer: None,
+            address_connect: None,
             had_camera: false,
             stage_in: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Fade),
         }
@@ -130,6 +140,68 @@ impl SideState {
             .as_ref()
             .filter(|(asked, _)| asked == typed)
             .map(|(_, file)| *file)
+    }
+
+    /// A submitted address can go straight to the camera worker unless
+    /// trimming changes it. Then only the disk can tell whether those edge
+    /// spaces are part of a file name, and that check must leave the UI free.
+    fn request_address_connect(
+        &mut self,
+        address: &str,
+        camera: Option<&str>,
+        ask: impl FnOnce(String) -> Receiver<bool>,
+    ) -> Option<String> {
+        if address.is_empty() {
+            return None;
+        }
+        if address.trim() == address {
+            self.address_connect = None;
+            return Some(address.to_owned());
+        }
+        if self.address_connect.as_ref().is_some_and(|pending| {
+            pending.address == address && pending.camera.as_deref() == camera
+        }) {
+            return None;
+        }
+        self.address_connect = Some(AddressConnect {
+            address: address.to_owned(),
+            camera: camera.map(str::to_owned),
+            answer: ask(address.to_owned()),
+        });
+        None
+    }
+
+    /// Editing or leaving the address screen retires its request, even if
+    /// the filesystem worker answers after the user returns to the same text.
+    fn retain_address_connect(&mut self, address: &str, camera: Option<&str>, available: bool) {
+        if self.address_connect.as_ref().is_some_and(|pending| {
+            !available || pending.address != address || pending.camera.as_deref() != camera
+        }) {
+            self.address_connect = None;
+        }
+    }
+
+    fn poll_address_connect(&mut self) -> Result<Option<String>, TryRecvError> {
+        let Some(pending) = &self.address_connect else {
+            return Ok(None);
+        };
+        let result = pending.answer.try_recv();
+        match result {
+            Ok(file) => {
+                let pending = self.address_connect.take().expect("just checked");
+                let address = if file {
+                    pending.address
+                } else {
+                    pending.address.trim().to_owned()
+                };
+                Ok((!address.is_empty()).then_some(address))
+            }
+            Err(TryRecvError::Empty) => Ok(None),
+            Err(error) => {
+                self.address_connect = None;
+                Err(error)
+            }
+        }
     }
 
     /// Take the disk's answer on whether an address is a file, if it came,
@@ -211,11 +283,36 @@ impl Workbench {
     /// `sync_animations`. Also reads a changed address, here rather than in
     /// the view; whether it is a file is asked on the tick (`poll_file`).
     pub(super) fn sync_side(&mut self) {
+        self.retain_address_connect();
         if self.side.hint.0 != self.address {
             let typed = self.address.trim();
             let reading = read_address(typed, &self.snapshot.devices, self.side.is_file(typed));
             self.side.hint = (self.address.clone(), reading);
             self.side.typed_at = Some(self.now);
+        }
+    }
+
+    fn retain_address_connect(&mut self) {
+        let available =
+            self.closing.is_none() && !self.image_mode && !self.settings_open && !self.sheet_open();
+        self.side.retain_address_connect(
+            &self.address,
+            self.snapshot.active_camera.as_deref(),
+            available,
+        );
+    }
+
+    /// Return in the picker never reads the filesystem on the event loop.
+    pub(super) fn connect_address(&mut self) {
+        if self.connecting(&self.address) || self.connecting(self.address.trim()) {
+            return;
+        }
+        if let Some(address) = self.side.request_address_connect(
+            &self.address,
+            self.snapshot.active_camera.as_deref(),
+            probe_file,
+        ) {
+            self.connect(address);
         }
     }
 
@@ -234,6 +331,16 @@ impl Workbench {
     /// The welcome screen's bookkeeping on the slow tick,
     /// after the snapshot refresh; from `tick()`.
     pub(super) fn tick_side(&mut self) {
+        self.retain_address_connect();
+        match self.side.poll_address_connect() {
+            Ok(Some(address)) if !self.connecting(&address) => self.connect(address),
+            Err(_) => self.set_notice(
+                "Could not check the camera file path",
+                Some("The filesystem worker stopped. Submit the address again to retry.".into()),
+                Level::Error,
+            ),
+            _ => {}
+        }
         let now = self.now;
         let typed = self.address.trim();
         // Newly found cameras arrive one after another, in list order.
@@ -348,29 +455,6 @@ impl Workbench {
                         transport: crate::types::Transport::Media,
                     },
                 ]
-            }
-            // Data sources with values and sparklines, and Live signals open.
-            "signals-empty" => {
-                let _ = self.open_data_sources();
-            }
-            "signals-persistence-error" => {
-                let (sources, sink) = signals::persistence_failure_fixture();
-                self.signals.fixture = Some(sources);
-                self.signals.fixture_sink = Some(sink);
-                self.tick_signals();
-                let _ = self.open_data_sources();
-            }
-            "signals" | "signals-auth" => {
-                self.signals.fixture = Some(signals::fixture());
-                if word == "signals-auth" {
-                    self.tab = Tab::Capture;
-                    self.sidebar_open = true;
-                    self.sidebar_peek = true;
-                    self.sidebar_summoned = true;
-                    self.signals.source_setup.fixture();
-                }
-                self.tick_signals();
-                self.restore_open_sections(&["signals".into()]);
             }
             "side-address" => self.address = "192.168.1.20".into(),
             "side-unknown" => self.address = "line-7 camera".into(),
@@ -523,9 +607,10 @@ impl Workbench {
                 .is_some_and(|at| self.now.saturating_duration_since(at) >= TYPING_PAUSE)
     }
 
-    /// Whether a connect to `camera`, by ID or address, is on its way.
+    /// Whether a connect to `camera`, by ID, serial or address, is on its way.
     pub(super) fn connecting_to(&self, camera: &CameraInfo) -> bool {
         self.connecting(&camera.id)
+            || (!camera.serial.is_empty() && self.connecting(&camera.serial))
             || camera
                 .address
                 .as_deref()
@@ -533,7 +618,7 @@ impl Workbench {
     }
 
     /// Under the welcome screen's cards: the network check once GigE is in
-    /// play, the data sources, the address field and what it will try, and
+    /// play, the address field and what it will try, and
     /// the window's settings.
     pub(super) fn picker_footer<'a>(
         &'a self,
@@ -559,7 +644,16 @@ impl Workbench {
                 style::input
             });
         // One line, whatever it says, so the field above never moves.
-        let hint: Element<'_, Message> = if let Some((error, _)) = failure {
+        let hint: Element<'_, Message> = if self.side.address_connect.is_some() {
+            one_line(
+                "Checking file path…",
+                style::CAPTION,
+                style::SANS,
+                p.secondary,
+            )
+            .width(Fill)
+            .into()
+        } else if let Some((error, _)) = failure {
             let ink = Level::Error.color(p);
             tip_above(
                 row![
@@ -680,7 +774,6 @@ impl Workbench {
             // Simulated cameras are a setting; the empty state offers one.
             container(hint).padding([0.0, EDGE + INSET]),
             container(network).padding([0.0, EDGE]),
-            container(self.sidebar_signals(p)).padding([0.0, EDGE]),
             container(rule::horizontal(1).style(style::line)).padding([0.0, EDGE]),
             container(settings).padding(iced::Padding {
                 left: EDGE + 4.0,
@@ -744,6 +837,7 @@ mod tests {
             ("srt://10.0.0.5:9000", Some("Will try SRT at 10.0.0.5:9000")),
             ("file:///videos/line.mkv", Some("Will try the video file")),
             ("avfoundation:0", Some("Will try a webcam")),
+            ("scanner:ica:document", Some("Will try a document scanner")),
             // Tests run in the package root.
             ("Cargo.toml", Some("Will try the video file")),
             ("gige:10.0.0.2", Some("Will try GigE Vision at 10.0.0.2")),
@@ -780,6 +874,120 @@ mod tests {
         );
         // Reading never asks the disk itself.
         assert_eq!(read_address("Cargo.toml", &devices, None), None);
+    }
+
+    #[test]
+    fn submitting_an_address_without_edge_spaces_never_checks_the_disk_on_the_ui_thread() {
+        let mut side = SideState::default();
+        for address in [
+            "/tmp/a video file.mkv",
+            "rtsp://camera.local/stream",
+            "192.168.1.20",
+            "sim:0",
+        ] {
+            assert_eq!(
+                side.request_address_connect(address, None, |_| unreachable!("no disk access")),
+                Some(address.to_owned())
+            );
+        }
+        assert_eq!(
+            side.request_address_connect("", None, |_| unreachable!()),
+            None
+        );
+    }
+
+    #[test]
+    fn submitted_edge_spaces_wait_for_the_filesystem_and_preserve_real_file_names_once() {
+        let mut side = SideState::default();
+        for (address, file, expected) in [
+            (" /tmp/video file.mkv ", true, Some(" /tmp/video file.mkv ")),
+            (
+                " rtsp://camera.local/stream ",
+                false,
+                Some("rtsp://camera.local/stream"),
+            ),
+            (" ", false, None),
+            (" ", true, Some(" ")),
+        ] {
+            let (sender, receiver) = mpsc::channel();
+            assert_eq!(
+                side.request_address_connect(address, None, |asked| {
+                    assert_eq!(asked, address);
+                    receiver
+                }),
+                None
+            );
+            // Return and ticks stay responsive while a path is slow. A
+            // repeated Return must not add a second filesystem request.
+            assert_eq!(side.poll_address_connect().unwrap(), None);
+            assert_eq!(
+                side.request_address_connect(address, None, |_| unreachable!("already checking")),
+                None
+            );
+            sender.send(file).unwrap();
+            assert_eq!(side.poll_address_connect().unwrap().as_deref(), expected);
+            assert_eq!(side.poll_address_connect().unwrap(), None, "consumed once");
+        }
+    }
+
+    #[test]
+    fn delayed_path_resolution_is_cancelled_after_edit_selection_settings_or_close() {
+        for action in ["edit", "selection", "settings", "image", "close"] {
+            let mut app = bench();
+            app.address = " /tmp/slow-network-video.mkv ".into();
+            let (sender, receiver) = mpsc::channel();
+            app.side
+                .request_address_connect(&app.address, None, |_| receiver);
+            match action {
+                "edit" => {
+                    let _ = app.update(Message::Address("new address".into()));
+                    // Returning to identical text cannot revive the old request.
+                    let _ = app.update(Message::Address(" /tmp/slow-network-video.mkv ".into()));
+                }
+                "selection" => app.snapshot.active_camera = Some("sim:0".into()),
+                "settings" => app.settings_open = true,
+                "image" => app.image_mode = true,
+                "close" => app.closing = Some(CloseTarget::Window),
+                _ => unreachable!(),
+            }
+            app.sync_side();
+            assert!(
+                app.side.address_connect.is_none(),
+                "cancelled after {action}"
+            );
+            assert!(
+                sender.send(true).is_err(),
+                "late reply retired after {action}"
+            );
+            assert_eq!(app.side.poll_address_connect().unwrap(), None);
+        }
+    }
+
+    #[test]
+    fn a_stopped_path_worker_retires_the_request_for_retry() {
+        let mut side = SideState::default();
+        let (sender, receiver) = mpsc::channel();
+        side.request_address_connect(" /tmp/video.mkv ", None, |_| receiver);
+        drop(sender);
+        assert_eq!(side.poll_address_connect(), Err(TryRecvError::Disconnected));
+        assert!(side.address_connect.is_none());
+    }
+
+    #[test]
+    fn resubmitting_an_address_already_connecting_never_queues_a_second_request() {
+        for (address, target) in [
+            ("sim:0", "sim:0"),
+            (" sim:0 ", "sim:0"),
+            (" /tmp/video file.mkv ", " /tmp/video file.mkv "),
+        ] {
+            let mut app = bench();
+            app.address = address.into();
+            app.scene_hold(Job::Connect).target = Some(target.into());
+            let pending = app.pending.len();
+            app.connect_address();
+            assert_eq!(app.pending.len(), pending);
+            assert!(app.side.address_connect.is_none(), "{address:?}");
+        }
     }
 
     #[test]
@@ -1029,6 +1237,21 @@ mod tests {
             let (_, extra) = bench.welcome_content(p);
             assert!(extra > 0.0, "the callout and recents add height");
         }
+    }
+
+    #[test]
+    fn a_connect_by_serial_keeps_the_matching_camera_card_busy() {
+        let mut app = bench();
+        let mut camera = device("camera-id", "CAMERA-SERIAL");
+        camera.address = Some("192.168.1.20".into());
+        for target in [&camera.id, &camera.serial, camera.address.as_ref().unwrap()] {
+            app.pending.clear();
+            app.scene_hold(Job::Connect).target = Some(target.clone());
+            assert!(app.connecting_to(&camera), "connecting by {target}");
+        }
+        app.pending.clear();
+        app.scene_hold(Job::Connect).target = Some("OTHER-SERIAL".into());
+        assert!(!app.connecting_to(&camera));
     }
 
     #[test]

@@ -16,8 +16,9 @@ def clean(parts):
 
 class Documentation(HTMLParser):
     """Index visible article text, including command examples and captions."""
-    def __init__(self):
+    def __init__(self, page="docs.html"):
         super().__init__(convert_charrefs=True)
+        self.page = page
         self.stack = []
         self.current = None
         self.documents = []
@@ -81,21 +82,28 @@ class Documentation(HTMLParser):
             self.errors.append(f"{identity}: data-doc-title must match its h2")
         if not section["summary"]:
             self.errors.append(f"{identity}: missing .doc-summary")
-        section["url"] = f"docs.html#{identity}"
+        section["url"] = f"{self.page}#{identity}"
         self.documents.append(section)
 
 
 def index(web=WEB):
-    parser = Documentation()
-    parser.feed((web / "docs.html").read_text(encoding="utf-8"))
-    parser.close()
-    if parser.current is not None:
-        parser.errors.append("unclosed documentation section")
-    if not parser.documents:
-        parser.errors.append("no documentation sections found")
-    if parser.errors:
-        raise ValueError("; ".join(parser.errors))
-    return dict(schema_version=1, documents=parser.documents)
+    documents = []
+    errors = []
+    # Keep the task guides first when equally relevant results have equal scores.
+    pages = [web / "docs.html", *sorted(path for path in web.glob("*.html") if path.name != "docs.html")]
+    for path in pages:
+        parser = Documentation(path.name)
+        parser.feed(path.read_text(encoding="utf-8"))
+        parser.close()
+        if parser.current is not None:
+            parser.errors.append("unclosed documentation section")
+        errors.extend(f"{path.name}: {error}" for error in parser.errors)
+        documents.extend(parser.documents)
+    if not documents:
+        errors.append("no documentation sections found")
+    if errors:
+        raise ValueError("; ".join(errors))
+    return dict(schema_version=1, documents=documents)
 
 
 def generated(web=WEB):

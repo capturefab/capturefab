@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    tags: ['v*-rc.*']
     # Merging a pull request that raises the version (see prepare-release.yml)
     # creates an RC draft and promotes it after validation. Path filters do not apply to tags.
     branches: [main]
@@ -44,8 +44,8 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ]; then
             version=$(python3 scripts/release.py version)
             suffix=${GITHUB_REF_NAME#"v$version-rc."}
-            if [ "$GITHUB_REF_NAME" != "v$version" ] && ! [[ "$GITHUB_REF_NAME" == "v$version-rc."* && "$suffix" =~ ^[1-9][0-9]*$ ]]; then
-              echo "::error::Tag must match Cargo.toml or its -rc.N candidate"
+            if ! [[ "$GITHUB_REF_NAME" == "v$version-rc."* && "$suffix" =~ ^[1-9][0-9]*$ ]]; then
+              echo "::error::Tag must be a -rc.N candidate matching Cargo.toml"
               exit 1
             fi
             release=true

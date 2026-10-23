@@ -27,7 +27,7 @@ pub(in crate::gui) fn blocking_focus_id(step: &PlanStep) -> String {
     let Some(spec) = tools::spec(&step.call.tool) else {
         return step_focus_id(step.id);
     };
-    let first = spec.fields.iter().find(|field| show_field(step, field));
+    let first = spec.fields.first();
     let key = step.checked.as_ref().and_then(|checked| {
         checked
             .issues
@@ -41,11 +41,7 @@ pub(in crate::gui) fn blocking_focus_id(step: &PlanStep) -> String {
     };
     let key = key.as_str();
     let root = key.split('.').next().unwrap_or(key);
-    let Some(field) = spec
-        .fields
-        .iter()
-        .find(|field| field.key == root && show_field(step, field))
-    else {
+    let Some(field) = spec.fields.iter().find(|field| field.key == root) else {
         return step_focus_id(step.id);
     };
     let actual = if step.call.tool == "schedule_captures"
@@ -143,7 +139,6 @@ fn card<'a>(
         "wait_for" => Icon::Timer,
         "stream_to_url" => Icon::Broadcast,
         "create_folder_destination" => Icon::FolderPlus,
-        "create_s3_destination" => Icon::CloudArrowUp,
         _ => Icon::Camera,
     };
     let heading = format!("Step {}: {title}", index + 1);
@@ -250,9 +245,6 @@ fn card<'a>(
                 }
                 continue;
             }
-            if !show_field(step, field) {
-                continue;
-            }
             if core_field(spec, field) {
                 body = body.push(field_view(state, step, field, first, p));
                 first = false;
@@ -279,15 +271,6 @@ fn card<'a>(
                 }
             }
         }
-    }
-    if step.call.tool == "create_s3_destination" {
-        body = body.push(
-            button(text("Test destination").size(style::SMALL))
-                .name(format!("Test S3 destination in step {}", index + 1))
-                .padding([5, 10])
-                .style(style::secondary)
-                .on_press_maybe(state.editable().then_some(quick::Input::TestS3(step.id))),
-        );
     }
     if let Some(checked) = checked {
         if !checked.facts.is_empty() {
@@ -372,15 +355,6 @@ fn core_field(spec: &tools::ToolSpec, field: &FieldSpec) -> bool {
         )
 }
 
-fn show_field(step: &PlanStep, field: &FieldSpec) -> bool {
-    !(step.call.tool == "create_s3_destination"
-        && match field.key {
-            "secret" | "access_key_id" => step.call.args["credentials"] != "keychain",
-            "profile" => step.call.args["credentials"] != "profile",
-            _ => false,
-        })
-}
-
 fn card_issue(
     state: &quick::State,
     step: &PlanStep,
@@ -401,8 +375,7 @@ fn card_issue(
     }) else {
         return true;
     };
-    !show_field(step, field)
-        || (!state.drafts.visible(step.id, &key, &step.call.args) && field.kind != FieldKind::Bool)
+    !state.drafts.visible(step.id, &key, &step.call.args) && field.kind != FieldKind::Bool
 }
 
 fn form_key(key: &str) -> String {
@@ -708,10 +681,8 @@ fn choice_field<'a>(
                 .iter()
                 .take_while(|previous| previous.id != step.id)
             {
-                if matches!(
-                    preceding.call.tool.as_str(),
-                    "create_folder_destination" | "create_s3_destination"
-                ) && let Some(name) = preceding.call.args["name"].as_str()
+                if matches!(preceding.call.tool.as_str(), "create_folder_destination")
+                    && let Some(name) = preceding.call.args["name"].as_str()
                     && !choices.iter().any(|choice| choice.value == name)
                 {
                     choices.push(Choice {
@@ -964,7 +935,7 @@ pub(in crate::gui) fn string_list_focus_id(
     index: Option<usize>,
 ) -> String {
     let first = tools::spec(&step.call.tool)
-        .and_then(|spec| spec.fields.iter().find(|field| show_field(step, field)))
+        .and_then(|spec| spec.fields.first())
         .is_some_and(|field| field.key == key);
     let first_control = index == Some(0)
         || index.is_none() && step.call.args[key].as_array().is_none_or(Vec::is_empty);
@@ -1086,32 +1057,6 @@ fn field_style(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn string_list_schema_errors_target_the_name_row_and_open_its_options() {
-        let mut state = super::super::scenes::fixture("quick-command", SessionSnapshot::default());
-        let id = state
-            .plan
-            .propose(
-                tools::ToolCall {
-                    tool: "start_signal_capture".into(),
-                    args: json!({"tags":["temperature",2]}),
-                },
-                None,
-            )
-            .unwrap();
-        state
-            .plan
-            .recheck(state.context.as_ref().unwrap(), None, &tools::EmptySecrets);
-        let step = &mut state.plan.steps[0];
-        step.checked.as_mut().unwrap().issues =
-            vec![tools::Issue::usage(Some("tags[1]"), "Use a tag name.")];
-        assert_eq!(blocking_focus_id(step), field_id(id, "tags.1"));
-        let step = &state.plan.steps[0];
-        assert_eq!(field_issue(&state, step, "tags.1"), Some("Use a tag name."));
-        assert_eq!(field_issue(&state, step, "tags"), Some("Use a tag name."));
-        assert_eq!(field_issue(&state, step, "tags.0"), None);
-    }
 
     #[test]
     fn read_only_fields_keep_the_normal_value_and_outline_paint() {

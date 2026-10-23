@@ -494,7 +494,7 @@ mod tests {
                     tls_server_name: None,
                     rtsp_port: None,
                     rejected: None,
-                    revision: None,
+                    revision: [0; 16],
                 },
                 |_| Ok(()),
                 |_| Ok(()),

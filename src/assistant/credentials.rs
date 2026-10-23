@@ -413,6 +413,38 @@ pub fn status(
     settings: &ProviderSettings,
     check_keychain: bool,
 ) -> CredentialStatus {
+    if id.is_on_device() {
+        let result = settings
+            .validate(id)
+            .map_err(|issues| {
+                issues
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .and_then(|()| {
+                if !check_keychain {
+                    return Err(
+                        "Test Apple Intelligence to check on-device model availability.".into(),
+                    );
+                }
+                super::foundation_models::availability()
+                    .map_err(|error| error.excerpt.clone().unwrap_or_else(|| error.to_string()))
+            });
+        return match result {
+            Ok(()) => CredentialStatus {
+                ready: true,
+                source: "On-device · no API key required".into(),
+                missing: Vec::new(),
+            },
+            Err(message) => CredentialStatus {
+                ready: false,
+                source: "On-device model".into(),
+                missing: vec![message],
+            },
+        };
+    }
     status_in(&NativeSource, id, settings, check_keychain)
 }
 
@@ -626,6 +658,12 @@ fn resolve_in(
 ) -> Result<ResolvedCredentials> {
     let explicit_profile = settings.profile.as_deref();
     let settings = effective(source, id, settings)?;
+    if id.is_on_device() {
+        return Ok(ResolvedCredentials {
+            auth: Auth::None,
+            settings,
+        });
+    }
     if id == ProviderId::Vertex {
         if google::status(source)?.is_some() {
             check_endpoint(id, &settings, false)?;
@@ -718,6 +756,10 @@ pub fn store_key(id: ProviderId, key: String) -> Result<()> {
 }
 
 fn store_key_in(source: &dyn Source, id: ProviderId, key: String) -> Result<()> {
+    ensure!(
+        !id.is_on_device(),
+        "Apple Intelligence does not use an API key."
+    );
     let key = valid_key(key, "API key")?;
     source.save_key(id.info().keychain_account, &key)?;
     source.saved_hint(id, true)
@@ -728,6 +770,10 @@ pub fn delete_key(id: ProviderId) -> Result<()> {
 }
 
 fn delete_key_in(source: &dyn Source, id: ProviderId) -> Result<()> {
+    ensure!(
+        !id.is_on_device(),
+        "Apple Intelligence does not use an API key."
+    );
     source.delete_key(id.info().keychain_account)?;
     source.saved_hint(id, false)
 }
@@ -877,6 +923,26 @@ pub(super) mod test_source {
 #[cfg(test)]
 mod tests {
     use super::{test_source::Stub, *};
+
+    #[test]
+    fn on_device_resolution_never_reads_credentials_or_cloud_configuration() {
+        let mut source = Stub::default().vars(&[
+            ("OPENAI_API_KEY", "remote-key"),
+            ("OLLAMA_HOST", "https://remote.example/v1"),
+        ]);
+        source.keychain_error = true;
+        let resolved = resolve_in(
+            &source,
+            ProviderId::AppleFoundationModels,
+            &ProviderSettings::default(),
+        )
+        .unwrap();
+        assert!(matches!(resolved.auth, Auth::None));
+        assert!(source.calls.borrow().is_empty());
+        assert!(store_key_in(&source, ProviderId::AppleFoundationModels, "unused".into()).is_err());
+        assert!(delete_key_in(&source, ProviderId::AppleFoundationModels).is_err());
+        assert!(source.calls.borrow().is_empty());
+    }
 
     fn header_value(auth: &Auth) -> (&str, &str) {
         match auth {

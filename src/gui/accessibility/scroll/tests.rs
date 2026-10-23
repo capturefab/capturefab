@@ -129,6 +129,8 @@ fn actual_scrolled_inspector_bounds_follow_visual_translation_and_native_focus_r
     );
     let before = snapshot(&mut view, &mut tree, &node, &renderer);
     let (target, field) = named(&before, "Maximum file age", Role::TextInput);
+    // The field starts below this compact viewport. Native focus must reveal
+    // it rather than merely focus a control that was already visible.
     assert_eq!(field.bounds().unwrap().height(), 0.0);
     assert!(!field.is_hidden());
     assert!(field.supports_action(Action::Focus));
@@ -162,12 +164,11 @@ fn actual_scrolled_inspector_bounds_follow_visual_translation_and_native_focus_r
 }
 
 #[test]
-fn actual_mapped_destination_editor_uses_scrolled_bounds_and_reveals_native_focus() {
+fn actual_mapped_folder_editor_keeps_native_focus_visible() {
     let renderer = renderer();
     let mut picker = destinations::Picker::new(false, false);
     let mut output = "capture.png".into();
-    picker.update(destinations::Message::AddBucket, &mut output);
-    picker.update(destinations::Message::Advanced(true), &mut output);
+    picker.update(destinations::Message::AddFolder, &mut output);
     let mut view = super::super::mapped(
         picker.manager(
             style::Palette::of(false),
@@ -186,8 +187,8 @@ fn actual_mapped_destination_editor_uses_scrolled_bounds_and_reveals_native_focu
         &layout::Limits::new(Size::ZERO, Size::new(560.0, 310.0)),
     );
     let before = snapshot(&mut view, &mut tree, &node, &renderer);
-    let (target, field) = named(&before, "S3 key prefix", Role::TextInput);
-    assert_eq!(field.bounds().unwrap().height(), 0.0);
+    let (target, field) = named(&before, "Destination folder", Role::TextInput);
+    assert!(field.bounds().unwrap().height() > 0.0);
     apply(
         &mut view,
         &mut tree,
@@ -198,24 +199,23 @@ fn actual_mapped_destination_editor_uses_scrolled_bounds_and_reveals_native_focu
     let geometry = raw(&mut view, &mut tree, &node, &renderer);
     let (viewport, translation) = geometry.scrolls[0];
     let after = snapshot(&mut view, &mut tree, &node, &renderer);
-    let (id, field) = named(&after, "S3 key prefix", Role::TextInput);
+    let (id, field) = named(&after, "Destination folder", Role::TextInput);
     assert_eq!(id, target);
     assert_eq!(after.focus, target);
     assert_eq!(
         field.bounds(),
         Some(rect(
-            clipped(geometry.controls["S3 key prefix"] - translation, viewport),
+            clipped(
+                geometry.controls["Destination folder"] - translation,
+                viewport
+            ),
             1.0
         ))
     );
     assert!(field.bounds().unwrap().height() > 15.0);
     assert_eq!(
-        named(&before, "Close New S3 bucket", Role::Button)
-            .1
-            .bounds(),
-        named(&after, "Close New S3 bucket", Role::Button)
-            .1
-            .bounds()
+        named(&before, "Close New folder", Role::Button).1.bounds(),
+        named(&after, "Close New folder", Role::Button).1.bounds()
     );
 }
 

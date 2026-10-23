@@ -2,7 +2,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Limits {
     pub max_rounds: u32,
     pub max_wall_ms: u64,
@@ -14,14 +14,9 @@ pub struct Limits {
     pub max_bytes: u64,
     pub max_recordings: u32,
     pub max_recording_ms: u64,
-    /// Cumulative source captures, including a restarted capture of one source.
-    pub max_sources: u32,
-    pub max_samples: u64,
-    /// Reserved signal payload plus twice each export bundle limit (staging
+    /// Twice each export bundle limit (staging
     /// and published copy); also charged to max_bytes, including failed attempts.
     pub max_data_bytes: u64,
-    /// Cumulative reserved acquisition time across signal captures.
-    pub max_signal_ms: u64,
     pub max_setting_changes: u32,
     pub max_consecutive_errors: u32,
     pub max_identical_calls: u32,
@@ -41,10 +36,7 @@ impl Default for Limits {
             max_bytes: 2 * 1024 * 1024 * 1024,
             max_recordings: 2,
             max_recording_ms: 1_800_000,
-            max_sources: 8,
-            max_samples: 1_000_000,
             max_data_bytes: 512 * 1024 * 1024,
-            max_signal_ms: 1_800_000,
             max_setting_changes: 300,
             max_consecutive_errors: 5,
             max_identical_calls: 3,
@@ -105,18 +97,6 @@ impl Limits {
                 "Enter a settings-change limit from 0 to 10,000.",
             ),
             (
-                self.max_sources <= 256,
-                "Enter a source-capture limit from 0 to 256.",
-            ),
-            (
-                self.max_samples <= 100_000_000,
-                "Enter a sample limit from 0 to 100,000,000.",
-            ),
-            (
-                self.max_signal_ms <= 604_800_000,
-                "Enter a total signal-duration limit from 0 to 7 days.",
-            ),
-            (
                 (1..=5).contains(&self.max_consecutive_errors),
                 "Enter a consecutive-error limit from 1 to 5.",
             ),
@@ -148,6 +128,23 @@ impl Limits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn camera_limits_survive_loading_legacy_sensor_settings() {
+        let limits: Limits = serde_json::from_value(serde_json::json!({
+            "max_captures": 17,
+            "max_sources": 4,
+            "max_samples": 100,
+            "max_signal_ms": 5000
+        }))
+        .unwrap();
+        assert_eq!(limits.max_captures, 17);
+        assert!(limits.validate().is_ok());
+        let saved = serde_json::to_value(limits).unwrap();
+        for removed in ["max_sources", "max_samples", "max_signal_ms"] {
+            assert!(saved.get(removed).is_none());
+        }
+    }
+
     #[test]
     fn defaults_and_ceilings_are_explicit() {
         assert!(Limits::default().validate().is_ok());

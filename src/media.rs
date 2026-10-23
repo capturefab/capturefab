@@ -777,7 +777,9 @@ impl Active {
     }
 }
 fn cores() -> usize {
-    thread::available_parallelism().map_or(1, |cores| cores.get())
+    crate::resources::processing_threads(
+        thread::available_parallelism().map_or(1, |cores| cores.get()),
+    )
 }
 /// FFmpeg's default frame threading runs cores + 1 threads per stream, each
 /// holding frames and adding latency; share the cores between live streams.
@@ -866,7 +868,7 @@ pub(crate) fn command(exe: &Executable) -> Command {
         cmd.creation_flags(0x08000000);
     }
     cmd.stdin(Stdio::null());
-    // Camera and signal secrets may live in this process's environment;
+    // Camera hub secrets may live in this process's environment;
     // FFmpeg never needs them.
     for (name, _) in std::env::vars_os() {
         if is_hub_secret_variable(&name) {
@@ -881,12 +883,10 @@ fn is_hub_secret_variable(name: &std::ffi::OsStr) -> bool {
     // Windows environment names are case-insensitive, including when the
     // inherited spelling differs from the saved uppercase variable name.
     name.to_str().is_some_and(|name| {
-        [HUB_SECRET_PREFIX, crate::signals::auth::ENV_PREFIX]
-            .iter()
-            .any(|expected| {
-                name.get(..expected.len())
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
-            })
+        [HUB_SECRET_PREFIX].iter().any(|expected| {
+            name.get(..expected.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
+        })
     })
 }
 fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Result<(bool, String)> {
@@ -2677,7 +2677,7 @@ pub struct ForwardConfig {
     #[serde(default = "default_recording_cap")]
     pub max_file_bytes: u64,
     /// A saved destination for local recordings; `output` is then a file
-    /// name inside it, and bucket destinations upload the finished file.
+    /// name inside it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
 }
@@ -2852,7 +2852,7 @@ pub struct Forwarder {
     config: ForwardConfig,
     process: Option<EncoderProcess>,
     final_stats: ForwardStats,
-    /// The recording's destination, which may upload the finished file.
+    /// The recording's local folder destination.
     destination: Option<crate::destination::Resolved>,
     /// The recording file, created when its name was picked so no other
     /// writer can take the name before the first frame.
@@ -4316,9 +4316,9 @@ impl Forwarder {
             let path = output.storage.path().to_path_buf();
             let (bytes, sha256) = (output.storage.bytes_written(), output.storage.sha256());
             let result = if valid {
-                output.storage.finish_cut().and_then(|()| {
-                    // The file is complete and in the ledger even if queueing fails.
-                    let mut recorded = crate::dataset::RecordedFile {
+                output.storage.finish_cut().map(|()| {
+                    // The complete local file is recorded in the storage ledger.
+                    let recorded = crate::dataset::RecordedFile {
                         path: path.display().to_string(),
                         bytes,
                         sha256,
@@ -4331,23 +4331,8 @@ impl Forwarder {
                             .destination
                             .as_ref()
                             .and_then(|d| d.destination.clone()),
-                        object_key: None,
-                        remote_url: None,
-                        upload_id: None,
                     };
-                    let queued = match &self.destination {
-                        Some(destination) => destination
-                            .finished(&path, Some(&recorded.sha256))
-                            .context("recording saved but not queued for upload"),
-                        None => Ok(None),
-                    };
-                    if let Ok(Some(queued)) = &queued {
-                        recorded.object_key = Some(queued.key.clone());
-                        recorded.remote_url = Some(queued.url.clone());
-                        recorded.upload_id = Some(queued.id.clone());
-                    }
                     self.final_stats.recording = Some(recorded);
-                    queued.map(drop)
                 })
             } else {
                 output.storage.abort()
@@ -5583,8 +5568,6 @@ esac"#
             "CAPTUREFAB_HUB_TEST_SECRET",
             "capturefab_hub_test_secret",
             "Capturefab_Hub_Secret",
-            "CAPTUREFAB_SIGNAL_LINE_PASSWORD",
-            "capturefab_signal_line_password",
         ] {
             assert!(is_hub_secret_variable(std::ffi::OsStr::new(name)));
         }

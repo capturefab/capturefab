@@ -3,7 +3,7 @@ use crate::session::LogTimestamp;
 
 fn activity_at(unix_ms: u64) -> SessionActivity {
     serde_json::from_value(serde_json::json!({
-        "id":1,"origin":"client","operation":"capture","camera":null,"feature":null,
+        "id":1,"origin":"client","actor":{"id":"test-client","name":"Test client","kind":"human"},"operation":"capture","camera":null,"feature":null,
         "label":"Capture","state":"succeeded","submitted_at_ms":unix_ms,
         "started_at_ms":null,"finished_at_ms":unix_ms,"detail":null,"file_count":0,"files":[]
     }))
@@ -14,10 +14,16 @@ fn worker_coordinator_and_activity_show_the_same_instant_and_copy_a_dated_zone()
     let time = DateTime::parse_from_rfc3339("2026-10-14T14:30:00.123Z")
         .unwrap()
         .timestamp_millis();
-    let mut worker = LogEntry::legacy("14:30:00", "error", "worker");
-    worker.timestamp = LogTimestamp::new(time, 0);
-    let mut coordinator = LogEntry::legacy("10:30:00.123", "error", "coordinator");
-    coordinator.timestamp = LogTimestamp::new(time, -4 * 3600);
+    let worker = LogEntry {
+        timestamp: LogTimestamp::new(time, 0).unwrap(),
+        level: "error".into(),
+        message: "worker".into(),
+    };
+    let coordinator = LogEntry {
+        timestamp: LogTimestamp::new(time, -4 * 3600).unwrap(),
+        level: "error".into(),
+        message: "coordinator".into(),
+    };
     // Linux publishes native locale results asynchronously; compare one settled
     // presentation rather than the instant when its first cache miss completes.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -50,7 +56,7 @@ fn worker_coordinator_and_activity_show_the_same_instant_and_copy_a_dated_zone()
     assert!(b.full.contains("2026-10-14T10:30:00.123-04:00"));
 }
 #[test]
-fn midnight_dst_and_invalid_legacy_metadata_never_invent_an_instant() {
+fn midnight_dst_and_invalid_activity_times_preserve_their_meaning() {
     let before = LogTimestamp::new(
         DateTime::parse_from_rfc3339("2026-11-01T01:30:00-04:00")
             .unwrap()
@@ -80,26 +86,17 @@ fn midnight_dst_and_invalid_legacy_metadata_never_invent_an_instant() {
             .full
             .contains("invalid timestamp")
     );
-    for raw in [
-        serde_json::json!("bad"),
-        serde_json::json!({"unix_ms":i64::MAX,"utc_offset_seconds":0}),
-    ] {
-        let entry: LogEntry = serde_json::from_value(serde_json::json!({"time":"02:03:04","level":"warn","message":"legacy","timestamp":raw})).unwrap();
-        let labels = log(&entry);
-        assert_eq!(labels.compact, "02:03:04");
-        assert!(labels.full.contains("Date and time zone unavailable"));
-        assert!(labels.copy.contains("date and time zone unavailable"));
-    }
 }
 
 #[test]
-fn day_groups_follow_the_displayed_local_date_without_interpreting_legacy_clocks() {
+fn day_groups_follow_the_displayed_local_date_independently_of_producer_offsets() {
     let instant = DateTime::parse_from_rfc3339("2026-10-14T00:30:00Z")
         .unwrap()
         .timestamp_millis();
     let worker = |offset| LogEntry {
-        timestamp: LogTimestamp::new(instant, offset),
-        ..LogEntry::legacy("00:30:00", "info", "event")
+        timestamp: LogTimestamp::new(instant, offset).unwrap(),
+        level: "info".into(),
+        message: "event".into(),
     };
     let expected = DateTime::parse_from_rfc3339(&log(&worker(0)).copy)
         .unwrap()
@@ -113,9 +110,6 @@ fn day_groups_follow_the_displayed_local_date_without_interpreting_legacy_clocks
         activity_day(&activity_at(instant as u64)).key,
         Some(expected)
     );
-    let legacy = log_day(&LogEntry::legacy("23:59:59", "info", "legacy"));
-    assert_eq!(legacy.key, None);
-    assert_eq!(legacy.label, "Date unavailable");
     assert_eq!(activity_day(&activity_at(u64::MAX)).key, None);
 }
 
@@ -177,8 +171,9 @@ fn raw_timestamp_identity_survives_front_eviction_and_prunes_when_closed_or_empt
         None,
     );
     let entry = |index: i64| LogEntry {
-        timestamp: LogTimestamp::new(1_792_017_000_123 + index * 86_400_000, 0),
-        ..LogEntry::legacy("14:30:00", "info", format!("Event {index}"))
+        timestamp: LogTimestamp::new(1_792_017_000_123 + index * 86_400_000, 0).unwrap(),
+        level: "info".into(),
+        message: format!("Event {index}"),
     };
     app.snapshot.logs = vec![entry(0), entry(1), entry(2)];
     let mut tree = Tree::empty();
@@ -211,9 +206,9 @@ fn raw_timestamp_identity_survives_front_eviction_and_prunes_when_closed_or_empt
     let original = collect(&app, &mut tree);
     let retained: Vec<_> = app.snapshot.logs[1..]
         .iter()
-        .map(|entry| entry.timestamp.unwrap().rfc3339())
+        .map(|entry| entry.timestamp.rfc3339())
         .collect();
-    let removed = original[&app.snapshot.logs[0].timestamp.unwrap().rfc3339()];
+    let removed = original[&app.snapshot.logs[0].timestamp.rfc3339()];
     app.snapshot.logs.remove(0);
     app.snapshot.logs.push(entry(3));
     app.sync_client_activity();

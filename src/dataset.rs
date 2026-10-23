@@ -1,6 +1,6 @@
 //! Dataset catalog: one `.duckdb` file per dataset, owned by the session
 //! coordinator (never a camera worker), recording every saved capture and
-//! recording, signal samples and notes, with exports for later analysis.
+//! recording and notes, with exports for later analysis.
 pub mod coordinator;
 mod db;
 pub mod export;
@@ -96,12 +96,6 @@ pub struct SavedFile {
     pub sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_id: Option<String>,
     #[serde(default, skip_serializing_if = "Context::is_empty")]
     pub context: Context,
     #[serde(flatten)]
@@ -169,12 +163,6 @@ pub struct RecordedFile {
     pub fps: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub object_key: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -189,8 +177,6 @@ pub struct DatasetStatus {
     pub created_ms: u64,
     pub captures: u64,
     pub recordings: u64,
-    pub signals: u64,
-    pub samples: u64,
     pub events: u64,
     /// The database file plus its write-ahead log.
     pub bytes: u64,
@@ -203,8 +189,6 @@ pub struct DatasetStatus {
     pub last_saved: Option<String>,
     #[serde(default)]
     pub missed_files: u64,
-    #[serde(default)]
-    pub dropped_samples: u64,
     #[serde(default)]
     pub last_error: Option<String>,
 }
@@ -235,8 +219,7 @@ pub fn default_query_limit() -> u32 {
 }
 
 /// The coordinator's dataset slot: at most one open dataset per session,
-/// shared with the signal hub (as its sample sink) and the GUI. The writer
-/// lock is held only for inserts, open and close; queries and exports run on
+/// shared with the GUI. The writer lock is held only for inserts, open and close; queries and exports run on
 /// cloned connections outside it.
 #[derive(Default)]
 pub struct Slot {
@@ -247,7 +230,7 @@ pub struct Slot {
     auto_path: Mutex<Option<PathBuf>>,
     /// Why the automatic dataset could not be opened, until it is re-armed.
     auto_error: Mutex<Option<String>>,
-    /// Serializes open and close, which check and change the signal sink.
+    /// Serializes open and close while validating dataset identities.
     lifecycle: Mutex<()>,
 }
 
@@ -327,7 +310,7 @@ impl Slot {
         Ok(())
     }
     /// Check while holding `lifecycle()` when a caller must also change the
-    /// signal sink. Readers and notes instead check under the writer lock.
+    /// dataset lifecycle. Readers and notes instead check under the writer lock.
     pub fn ensure_slot(&self, expected_slot_id: Option<&str>) -> Result<()> {
         Self::check_slot(&lock(&self.writer), expected_slot_id)
     }
@@ -450,8 +433,8 @@ impl Slot {
     pub fn auto_error(&self) -> Option<String> {
         lock(&self.auto_error).clone()
     }
-    /// Held while a session opens or closes the dataset and swaps the
-    /// signal sink, so the two cannot interleave.
+    /// Held while a session opens or closes the dataset, so those operations
+    /// cannot interleave.
     pub fn lifecycle(&self) -> std::sync::MutexGuard<'_, ()> {
         lock(&self.lifecycle)
     }
@@ -535,84 +518,8 @@ fn new_slot_id() -> Result<String> {
     Ok(format!("{}{}", db::random_name()?, db::random_name()?))
 }
 
-impl crate::signals::SampleSink for Slot {
-    fn register(
-        &self,
-        source: &crate::signals::SignalInfo,
-        tags: &[crate::signals::TagInfo],
-    ) -> Result<()> {
-        // Signals open the GUI's automatic dataset just as captures do.
-        self.with_open(true, |d| d.register(source, tags))
-            .unwrap_or(Ok(()))
-    }
-    fn write(&self, source_id: &str, batch: &[crate::signals::Sample]) -> Result<()> {
-        self.with_open(!batch.is_empty(), |d| {
-            let written = d.append_samples(source_id, batch);
-            if written.is_err() {
-                d.status.dropped_samples += batch.len() as u64;
-            }
-            written.map(drop)
-        })
-        .unwrap_or_else(|| {
-            // Count the samples as dropped rather than written.
-            match self.auto_error() {
-                Some(error) => bail!("the automatic dataset could not be opened: {error}"),
-                None if batch.is_empty() => Ok(()),
-                None => bail!("no dataset is open; samples were not stored"),
-            }
-        })
-    }
-    fn event(&self, kind: &str, source_id: &str, text: &str) -> Result<()> {
-        self.record_event(kind, None, Some(source_id), text, &Context::new())
-            .map(drop)
-    }
-    fn finish(&self) -> Result<()> {
-        self.checkpoint()
-    }
-    fn describe(&self) -> String {
-        self.status_cached()
-            .map(|s| format!("dataset {}", db::file_label(Path::new(&s.path))))
-            .unwrap_or_else(|| "dataset".into())
-    }
-    fn dataset_slot_id(&self) -> Option<String> {
-        lock(&self.writer)
-            .as_ref()
-            .and_then(|d| d.status.slot_id.clone())
-    }
-    fn register_for_dataset_slot(
-        &self,
-        expected_slot_id: &str,
-        source: &crate::signals::SignalInfo,
-        tags: &[crate::signals::TagInfo],
-    ) -> Result<()> {
-        self.with_expected(expected_slot_id, |dataset| dataset.register(source, tags))
-    }
-    fn write_for_dataset_slot(
-        &self,
-        expected_slot_id: &str,
-        source_id: &str,
-        batch: &[crate::signals::Sample],
-    ) -> Result<()> {
-        self.with_expected(expected_slot_id, |dataset| {
-            let result = dataset.append_samples(source_id, batch);
-            if result.is_err() {
-                dataset.status.dropped_samples += batch.len() as u64;
-            }
-            result.map(drop)
-        })
-    }
-}
-
 /// Tables an export can write, in order.
-pub const TABLES: [&str; 7] = [
-    "captures",
-    "recordings",
-    "signals",
-    "samples",
-    "events",
-    "captures_with_signals",
-    "captures_wide",
-];
+pub const TABLES: [&str; 3] = ["captures", "recordings", "events"];
 pub const MAX_NOTE_BYTES: usize = 4096;
 /// The smallest `--max-bytes`: room for an empty dataset and some data.
 pub const MIN_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -808,16 +715,12 @@ pub fn schema_contract() -> Value {
         "schema_version": SCHEMA_VERSION,
         "file": "one .duckdb file per dataset, owned by one session; existing files are never overwritten",
         "identity": "dataset_id identifies the persistent file; slot_id is an opaque coordinator token for one open instance and changes after close/reopen, including the same file",
-        "checked_commands": "dataset_open_if binds expected_slot_id (null means empty); dataset_close_if, dataset_note_if, dataset_query_if, dataset_model_query_if and dataset_export_if require the exact current slot_id; dataset_close_if can also bind sink_generation, refusing to detach a replacement sink; open and close receipts include the acknowledged sink_generation; stale requests have no effects on a replacement",
+        "checked_commands": "dataset_open_if binds expected_slot_id (null means empty); dataset_close_if, dataset_note_if, dataset_query_if, dataset_model_query_if and dataset_export_if require the exact current slot_id; stale requests have no effects on a replacement",
         "time_base": "UTC Unix milliseconds, host clock",
         "tables": {
-            "captures": "one row per saved image: wall_ms, camera, frame, format, bytes, path, sha256, destination, object_key, context (JSON text)",
+            "captures": "one row per saved image: wall_ms, camera, frame, format, bytes, path, sha256, destination, context (JSON text)",
             "recordings": "one row per finished local recording: start_ms, end_ms, camera, path, bytes, sha256, codec",
-            "signals": "one row per signal tag: source_id, protocol, uri (redacted), tag, unit, kind",
-            "samples": "ts_ms, source_ts_ms, source_id, tag, value_double, value_text, quality",
-            "events": "notes, dataset_opened/closed, data_gap, signal_gap, signal_error",
-            "captures_with_signals": "view: each capture with the latest sample of every tag at or before its wall_ms (ASOF join): capture_id, wall_ms, camera_id, path, object_key, context, source_id, tag, unit, sample_ms, sample_age_ms (wall_ms - sample_ms), value_double, value_text, quality",
-            "captures_wide": "export only: one row per capture, one column per tag (1..256 tags)",
+            "events": "notes, dataset_opened/closed and data_gap",
         },
         "formats": if cfg!(feature = "parquet") { json!(["csv", "parquet", "json", "jsonl"]) } else { json!(["csv"]) },
         "default_formats": if cfg!(feature = "parquet") { json!(["parquet", "csv"]) } else { json!(["csv"]) },
@@ -859,7 +762,7 @@ pub fn rpc_examples() -> Vec<Value> {
         json!({"op":"dataset_query","sql":"SELECT count(*) FROM captures"}),
         json!({"op":"dataset_export","output":"/data/export-1","formats":["csv"]}),
         json!({"op":"dataset_open_if","expected_slot_id":null,"path":"/data/plant.duckdb"}),
-        json!({"op":"dataset_close_if","slot_id":"0123456789abcdef0123456789abcdef","sink_generation":1}),
+        json!({"op":"dataset_close_if","slot_id":"0123456789abcdef0123456789abcdef"}),
         json!({"op":"dataset_note_if","slot_id":"0123456789abcdef0123456789abcdef","text":"shift B start"}),
         json!({"op":"dataset_query_if","slot_id":"0123456789abcdef0123456789abcdef","sql":"SELECT count(*) FROM captures","max_result_bytes":16384}),
         json!({"op":"dataset_model_query_if","slot_id":"0123456789abcdef0123456789abcdef","sql":"SELECT count(*) FROM captures","max_result_bytes":16384}),
@@ -879,9 +782,7 @@ mod seam_tests {
             bytes: 2,
             sha256: None,
             destination: None,
-            object_key: None,
-            remote_url: None,
-            upload_id: None,
+
             context: Context::new(),
             item: SavedItem::Capture {
                 frame_id: 3,

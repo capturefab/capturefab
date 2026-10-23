@@ -1,0 +1,667 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#fafaf7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#181b20" media="(prefers-color-scheme: dark)">
+  <meta name="description" content="Search the Capturefab command reference: connect cameras and scanners, capture and name images, record video, catalog data in a dataset, export for analysis, save to folders or removable drives and automate the desktop or CLI.">
+  <meta property="og:title" content="Capturefab command reference">
+  <meta property="og:description" content="Practical guides, real app screenshots and a searchable reference for the camera workbench.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://capturefab.com/reference.html">
+  <meta property="og:image" content="https://capturefab.com/images/gui.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <title>Command reference — Capturefab</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="docs.css">
+  <link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
+  <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml" sizes="any">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png" sizes="180x180">
+  <link rel="canonical" href="https://capturefab.com/reference.html">
+  <link rel="alternate" type="application/atom+xml" title="Capturefab releases" href="feed.xml">
+  <script src="app.js" defer></script>
+  <script src="docs.js" defer></script>
+</head>
+<body class="docs-page">
+  <a class="skip-link" href="#main">Skip to command reference</a>
+  <div class="shell">
+    <header class="site-header">
+      <a class="wordmark" href="index.html" aria-label="Capturefab home"><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</a>
+      <nav aria-label="Main navigation">
+        <a href="index.html">Product</a>
+        <a href="docs.html">Documentation</a>
+        <a href="downloads.html">Downloads</a>
+        <a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a>
+      </nav>
+      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
+    </header>
+
+<main id="main" class="docs-layout"><aside class="docs-sidebar" aria-label="Command reference navigation"><div class="sidebar-group"><p>Command reference</p><a href="#cli-basics">How to use commands</a><a href="#cli-global-options">Global options</a><a href="#cli-discovery">Find cameras and sources</a><a href="#cli-camera-control">Read and change camera settings</a><a href="#cli-capture">Capture images and manage schedules</a><a href="#cli-recording">Record and forward video</a><a href="#cli-sessions">Sessions and shared activity</a><a href="#cli-datasets">Datasets and exports</a><a href="#cli-destinations">Saved destinations</a><a href="#cli-storage">Storage and retention</a><a href="#cli-resources">Resource limits</a><a href="#cli-hubs">Camera hubs</a><a href="#cli-simulation">Virtual camera servers</a><a href="#cli-tools">Tools for external agents</a><a href="#cli-assistant">Built-in assistant</a><a href="#cli-workflows">Workflows</a><a href="#cli-diagnostics">Diagnostics and command help</a><a href="#tool-catalog">Tool catalog</a><a href="#rpc-reference">RPC operations</a></div><a class="sidebar-source" href="docs.html">Back to user guide</a></aside><div class="docs-content">
+<details class="docs-mobile-nav"><summary>Browse command reference</summary><nav aria-label="Command reference topics"><a href="#cli-basics">How to use commands</a><a href="#cli-global-options">Global options</a><a href="#cli-discovery">Find cameras and sources</a><a href="#cli-camera-control">Read and change camera settings</a><a href="#cli-capture">Capture images and manage schedules</a><a href="#cli-recording">Record and forward video</a><a href="#cli-sessions">Sessions and shared activity</a><a href="#cli-datasets">Datasets and exports</a><a href="#cli-destinations">Saved destinations</a><a href="#cli-storage">Storage and retention</a><a href="#cli-resources">Resource limits</a><a href="#cli-hubs">Camera hubs</a><a href="#cli-simulation">Virtual camera servers</a><a href="#cli-tools">Tools for external agents</a><a href="#cli-assistant">Built-in assistant</a><a href="#cli-workflows">Workflows</a><a href="#cli-diagnostics">Diagnostics and command help</a><a href="#tool-catalog">Tool catalog</a><a href="#rpc-reference">RPC operations</a></nav></details>
+<header class="docs-head"><p class="eyebrow">Reference</p><h1>Commands, options and automation</h1><p class="lead">Find a command, its inputs and its limits. For step-by-step tasks, open the <a href="docs.html">user guide</a>.</p></header>
+<article class="doc-section" id="cli-basics" data-doc-section data-doc-title="How to use commands" data-doc-category="Command reference" data-doc-tags="CLI,terminal,JSON,exit code,help"><h2>How to use commands</h2><p class="doc-summary">Run commands from a terminal or an external agent.</p>
+<p>Start with <code>capturefab COMMAND --help</code>. Use <code>capturefab COMMAND SUBCOMMAND --help</code> for a nested command.</p>
+<p>Running <code>capturefab</code> without a command opens the desktop app. Other commands do not open it.</p>
+<p>Camera commands use the only running session automatically. With multiple sessions, select one with <code>--session NAME</code>.</p>
+<p>Where supported, a camera command can use a temporary worker when no session runs. Use <code>--direct --camera ID</code> to choose this explicitly.</p>
+<p>Local output paths belong to the calling terminal. Named destination paths belong to that destination.</p>
+<p>Use one number and unit for durations, such as <code>30s</code>, <code>5m</code> or <code>1.5h</code>. File sizes accept values such as <code>512MiB</code> and <code>2GiB</code>.</p>
+<div class="code-wrap"><pre><code>capturefab gui --name bench
+# Run subsequent commands in another terminal:
+capturefab --session bench connect sim:0
+capturefab --session bench --camera sim:0 capture -o shot.png
+capturefab --session bench status --json</code></pre></div>
+<h3>JSON and errors</h3><p><code>--json</code> returns one <code>{version, ok, result}</code> object, or <code>{version, ok, error}</code> on failure.</p><p>Progress and diagnostics go to stderr. Read <code>error.code</code> before deciding whether to retry.</p>
+<div class="table-scroll"><table><thead><tr><th>Exit code</th><th>Meaning</th></tr></thead><tbody><tr><td>0</td><td>Success, including a closed stdout pipe</td></tr><tr><td>1</td><td>Operation or input/output failure</td></tr><tr><td>2</td><td>Invalid arguments or input</td></tr><tr><td>3</td><td>Camera or session unavailable</td></tr><tr><td>4</td><td>Timeout</td></tr><tr><td>5</td><td>Unsupported feature or format</td></tr><tr><td>6</td><td>Storage quota or disk full</td></tr></tbody></table></div>
+<p>For <code>assistant run</code>, exit 0 can also mean <code>needs_user</code>. Read the result before treating the task as finished.</p><p>A request timeout can occur after the session accepts a command. Read <code>status</code> before sending the same write again.</p>
+<p>Installed builds can have different optional features. Use <code>doctor --json</code>, <code>schema --json</code> and installed help to confirm availability.</p>
+</article>
+<article class="doc-section" id="cli-global-options" data-doc-section data-doc-title="Global options" data-doc-category="Command reference" data-doc-tags="flags,environment,actor,timeout,efficiency"><h2>Global options</h2><p class="doc-summary">These options apply before or after the command.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--json</code></td><td>Write one versioned JSON result to stdout. Diagnostics use stderr.</td><td>—</td></tr>
+<tr><td><code>--camera / -c</code></td><td>Camera ID, serial number, IP address or source locator. See Source locators in the user guide.</td><td>—</td></tr>
+<tr><td><code>--session</code></td><td>Select a GUI or headless session. Default: CAPTUREFAB_SESSION, then the only running session.</td><td>—</td></tr>
+<tr><td><code>--actor</code></td><td>Name shown beside your actions in the shared activity history.</td><td>—</td></tr>
+<tr><td><code>--actor-kind</code></td><td>Caller type: human or agent. This label does not authenticate the caller.</td><td>Default: human. Choices: human, agent</td></tr>
+<tr><td><code>--direct</code></td><td>Use a temporary camera worker. Conflicts with --session and overrides CAPTUREFAB_SESSION.</td><td>—</td></tr>
+<tr><td><code>--request-timeout</code></td><td>Session request deadline, such as 30s or 5m. Default adapts to the capture count.</td><td>—</td></tr>
+<tr><td><code>--timeout-ms</code></td><td>Per-frame or transport timeout: 1–60,000 ms. Use 60,000 for physical scanners.</td><td>Default: 2000</td></tr>
+<tr><td><code>--simulate</code></td><td>Include the built-in pattern camera in discovery.</td><td>—</td></tr>
+<tr><td><code>--hwaccel</code></td><td>Decoder acceleration for new workers. Existing sessions keep their setting. Default: auto.</td><td>Default: auto</td></tr>
+<tr><td><code>--efficiency</code></td><td>Use auto, smooth or efficient. See the performance guide for precedence and effects.</td><td>Choices: auto, smooth, efficient</td></tr>
+</tbody></table></div><p>Boolean flags are off unless supplied. They take no value.</p><p><code>--help</code> or <code>-h</code> shows command help. <code>--version</code> or <code>-V</code> shows the executable version.</p><p>Environment defaults: <code>CAPTUREFAB_CAMERA</code>, <code>CAPTUREFAB_SESSION</code>, <code>CAPTUREFAB_ACTOR</code>, <code>CAPTUREFAB_ACTOR_KIND</code> and <code>CAPTUREFAB_HWACCEL</code>.</p><p><code>CAPTUREFAB_EFFICIENCY</code> supplies efficiency mode. For desktop launches, the saved Performance setting follows the environment default.</p><p><code>CAPTUREFAB_DATASET</code> supplies <code>--dataset</code> for GUI, serve, capture and recording commands.</p>
+</article>
+<article class="doc-section" id="cli-discovery" data-doc-section data-doc-title="Find cameras and sources" data-doc-category="Command reference" data-doc-tags="discover,network-scan,scanners,native,onvif,compatibility"><h2>Find cameras and sources</h2><p class="doc-summary">Find available sources and examine their capabilities.</p>
+<p>Task guide: <a href="docs.html#discovery">Find cameras and sources</a>.</p>
+<h3 id="command-discover"><code>capturefab discover</code></h3>
+<p>Find cameras, document scanners and cameras on saved hubs. Aliases: list and cameras.</p>
+<p>Aliases: <code>list</code>, <code>cameras</code>.</p>
+<h3 id="command-network-scan"><code>capturefab network-scan</code></h3>
+<p>Examine GigE network paths. In a session, tune connected cameras that are not busy.</p>
+<h3 id="command-scanners"><code>capturefab scanners</code></h3>
+<p>List document scanners using the platform scanner driver.</p>
+<h3 id="command-native"><code>capturefab native</code></h3>
+<p>List host-driver cameras (AVFoundation, V4L2, DirectShow).</p>
+<h3 id="command-onvif"><code>capturefab onvif</code></h3>
+<p>Discover/resolve ONVIF camera profiles and RTSP stream URIs.</p>
+<h3 id="command-onvif-discover"><code>capturefab onvif discover</code></h3>
+<p>Find ONVIF cameras on the network.</p>
+<h3 id="command-onvif-resolve"><code>capturefab onvif resolve</code></h3>
+<p>Resolve an ONVIF media profile to its stream URL.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>ENDPOINT</code></td><td>ONVIF endpoint URL.</td><td>Required</td></tr>
+<tr><td><code>--username</code></td><td>Camera user name.</td><td>—</td></tr>
+<tr><td><code>--password</code></td><td>Camera password. Prefer the CAPTUREFAB_CAMERA_PASSWORD environment variable.</td><td>—</td></tr>
+<tr><td><code>--profile</code></td><td>Media profile token to resolve. Omit it to use the default profile.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-compatibility"><code>capturefab compatibility</code></h3>
+<p>Show available connection routes for a camera model, including HDMI capture devices.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>MODEL</code></td><td>Optional camera model name to find.</td><td>—</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-camera-control" data-doc-section data-doc-title="Read and change camera settings" data-doc-category="Command reference" data-doc-tags="info,features,get,set,execute,start,stop,auto,manual,undo,redo,history,xml,memory"><h2>Read and change camera settings</h2><p class="doc-summary">Control the addressed camera and its live acquisition.</p>
+<p>Feature names and ranges come from the camera. Some features are locked during live acquisition.</p><p>CLI <code>set</code> writes sequentially. Use RPC <code>set_many</code> for an atomic group with one undo checkpoint.</p><p>Task guide: <a href="docs.html#features">Read and change camera settings</a>.</p>
+<h3 id="command-info"><code>capturefab info</code></h3>
+<p>Show camera identity and readable features.</p>
+<h3 id="command-features"><code>capturefab features</code></h3>
+<p>List camera features, access, values, units and limits.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--filter</code></td><td>Part of a feature name to match.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-get"><code>capturefab get</code></h3>
+<p>Read the named camera features.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>FEATURES</code></td><td>One or more exact feature names.</td><td>Required. Accepts multiple values</td></tr>
+</tbody></table></div>
+<h3 id="command-set"><code>capturefab set</code></h3>
+<p>Write FEATURE=VALUE assignments in order. A failure can leave earlier assignments applied.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>ASSIGNMENTS</code></td><td>One or more FEATURE=VALUE assignments.</td><td>Required. Accepts multiple values</td></tr>
+</tbody></table></div>
+<h3 id="command-execute"><code>capturefab execute</code></h3>
+<p>Execute a camera command, such as TriggerSoftware. Camera commands cannot be undone.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>FEATURE</code></td><td>Exact camera feature name.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-start"><code>capturefab start</code></h3>
+<p>Start live acquisition in a persistent session.</p>
+<h3 id="command-stop"><code>capturefab stop</code></h3>
+<p>Stop live acquisition in a persistent session.</p>
+<h3 id="command-auto"><code>capturefab auto</code></h3>
+<p>Enable automatic exposure, gain and frame-rate control for the addressed camera.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--balance</code></td><td>Auto mode balance: 0 favors image quality. 1 favors frame rate. Named values: quality, balanced, frame-rate.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-manual"><code>capturefab manual</code></h3>
+<p>Stop automatic control. Hold current values, or use --revert to restore pre-auto values.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--revert</code></td><td>Restore every feature auto mode changed to its value from before auto mode.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-undo"><code>capturefab undo</code></h3>
+<p>Undo the latest reversible camera change in an existing session.</p>
+<h3 id="command-redo"><code>capturefab redo</code></h3>
+<p>Redo the latest undone camera change in an existing session.</p>
+<h3 id="command-history"><code>capturefab history</code></h3>
+<p>Show the next undo and redo labels for the selected or addressed camera.</p>
+<h3 id="command-xml"><code>capturefab xml</code></h3>
+<p>Print the GenICam XML from a connected camera.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--output / -o</code></td><td>File, folder or filename template. With a destination, use a relative name inside it.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-memory"><code>capturefab memory</code></h3>
+<p>Read or write camera registers for protocol debugging. These writes bypass ordinary feature validation.</p>
+<h3 id="command-memory-read"><code>capturefab memory read</code></h3>
+<p>Read the specified camera register range.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>ADDRESS</code></td><td>Register address in decimal or hexadecimal, such as 0x100.</td><td>Required</td></tr>
+<tr><td><code>LENGTH</code></td><td>Number of bytes to read, from 1 to 65,536.</td><td>Default: 4</td></tr>
+</tbody></table></div>
+<h3 id="command-memory-write"><code>capturefab memory write</code></h3>
+<p>Write hexadecimal bytes to the specified camera register. This cannot be undone.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>ADDRESS</code></td><td>Register address in decimal or hexadecimal, such as 0x100.</td><td>Required</td></tr>
+<tr><td><code>DATA</code></td><td>Hex bytes, such as 00000001.</td><td>Required</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-capture" data-doc-section data-doc-title="Capture images and manage schedules" data-doc-category="Command reference" data-doc-tags="capture,jobs,cancel"><h2>Capture images and manage schedules</h2><p class="doc-summary">Save images now or at scheduled times.</p>
+<p>Use PNG, JPEG, raw, PGM or PPM. A known filename extension selects the format; folders and stdout default to PNG.</p><p><code>-o -</code> writes one image to stdout. Omit <code>--json</code> for binary output; this capture uses a temporary worker.</p><p>Schedules remain active while their GUI, headless session or direct process runs. They are not restored after exit.</p><p>Task guide: <a href="docs.html#capture">Capture images and manage schedules</a>.</p>
+<h3 id="command-capture"><code>capturefab capture</code></h3>
+<p>Save one or more images. Existing files are never overwritten.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--output / -o</code></td><td>File, folder or filename template. With a destination, use a relative name inside it.</td><td>Required</td></tr>
+<tr><td><code>--count / -n</code></td><td>Number of images, from 1 to 100,000.</td><td>Default: 1</td></tr>
+<tr><td><code>--format / -f</code></td><td>Image format. Inferred from a single file/template extension, otherwise PNG.</td><td>Choices: png, jpeg, raw, pgm, ppm</td></tr>
+<tr><td><code>--set</code></td><td>Set FEATURE=VALUE before acquisition. May be repeated.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--at</code></td><td>Start at an RFC 3339 timestamp with a time zone. Conflicts with --delay.</td><td>—</td></tr>
+<tr><td><code>--delay</code></td><td>Wait for this duration before the first capture. Conflicts with --at.</td><td>—</td></tr>
+<tr><td><code>--interval</code></td><td>Time between capture slots, such as 10s. Use --count to set the number of captures.</td><td>—</td></tr>
+<tr><td><code>--destination</code></td><td>Saved destination (see `destination list`). --output is then a name inside it.</td><td>—</td></tr>
+<tr><td><code>--on-exists</code></td><td>Use fail or number when a file exists. The {seq} placeholder always selects a free number.</td><td>Default: fail. Choices: fail, number</td></tr>
+<tr><td><code>--context</code></td><td>Add a KEY=VALUE tag. This option accepts multiple uses. Each key must be unique.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--max-space</code></td><td>Maximum owned bytes across outputs. Default: saved policy, initially 10GiB.</td><td>—</td></tr>
+<tr><td><code>--max-files</code></td><td>Maximum owned files, from 1 to 100,000. Default: saved policy, initially 10,000.</td><td>—</td></tr>
+<tr><td><code>--delete-oldest</code></td><td>Delete the oldest eligible owned files when the storage limit is reached.</td><td>—</td></tr>
+<tr><td><code>--on-full</code></td><td>Action at the storage limit: stop or delete-oldest.</td><td>Choices: stop, delete-oldest</td></tr>
+<tr><td><code>--max-age</code></td><td>Expire owned files after this duration. A delete-oldest policy is necessary.</td><td>—</td></tr>
+<tr><td><code>--no-max-age</code></td><td>Remove the saved file age limit.</td><td>—</td></tr>
+<tr><td><code>--auto</code></td><td>Enable auto mode first so Capturefab tunes exposure, gain and frame rate.</td><td>—</td></tr>
+<tr><td><code>--balance</code></td><td>Auto mode balance: 0 favors image quality. 1 favors frame rate. Named values: quality, balanced, frame-rate.</td><td>—</td></tr>
+<tr><td><code>--dataset</code></td><td>Catalog output in this .duckdb file. Create the file if it is missing.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-jobs"><code>capturefab jobs</code></h3>
+<p>List capture schedules in a persistent session.</p>
+<h3 id="command-cancel"><code>capturefab cancel</code></h3>
+<p>Cancel a scheduled capture job on the selected camera.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>ID</code></td><td>ID returned by the corresponding list command.</td><td>Required</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-recording" data-doc-section data-doc-title="Record and forward video" data-doc-category="Command reference" data-doc-tags="forward,stop-forward,ffmpeg"><h2>Record and forward video</h2><p class="doc-summary">Record a bounded file or send video to another service.</p>
+<p>A file recording defaults to a 512 MiB limit. Set enough space for the requested duration.</p><p>With <code>--duration</code>, the CLI waits and the camera worker stops the encoder at the deadline. Ctrl-C stops it early.</p><p>Without a duration, session recording returns immediately. Direct recording runs until Ctrl-C. Use <code>status</code> before retrying a timed-out request.</p><p>Task guide: <a href="docs.html#recording">Record and forward video</a>.</p>
+<h3 id="command-forward"><code>capturefab forward</code></h3>
+<p>Record to a file or send video to a stream URL. The record alias has identical behavior.</p>
+<p>Aliases: <code>record</code>.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--output / -o</code></td><td>File, folder or filename template. With a destination, use a relative name inside it.</td><td>Required</td></tr>
+<tr><td><code>--codec</code></td><td>Output video codec, such as h264.</td><td>Default: h264</td></tr>
+<tr><td><code>--encoder</code></td><td>FFmpeg encoder name, such as libx264. Default auto tests available encoders.</td><td>Default: auto</td></tr>
+<tr><td><code>--fps</code></td><td>Output frames per second.</td><td>Default: 30</td></tr>
+<tr><td><code>--bitrate</code></td><td>Video bitrate, such as 4M or 800k.</td><td>Default: 4M</td></tr>
+<tr><td><code>--duration</code></td><td>Stop after this duration, such as 30s or 5m. The camera worker enforces the deadline.</td><td>—</td></tr>
+<tr><td><code>--max-file-size</code></td><td>Bounded maximum size of a local recording file.</td><td>Default: 512MiB</td></tr>
+<tr><td><code>--destination</code></td><td>Saved destination (see `destination list`). --output is then a name inside it.</td><td>—</td></tr>
+<tr><td><code>--on-exists</code></td><td>Use fail or number when a file exists. The {seq} placeholder always selects a free number.</td><td>Default: fail. Choices: fail, number</td></tr>
+<tr><td><code>--context</code></td><td>Add a KEY=VALUE tag. This option accepts multiple uses. Each key must be unique.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--max-space</code></td><td>Maximum owned bytes across outputs. Default: saved policy, initially 10GiB.</td><td>—</td></tr>
+<tr><td><code>--max-files</code></td><td>Maximum owned files, from 1 to 100,000. Default: saved policy, initially 10,000.</td><td>—</td></tr>
+<tr><td><code>--delete-oldest</code></td><td>Delete the oldest eligible owned files when the storage limit is reached.</td><td>—</td></tr>
+<tr><td><code>--on-full</code></td><td>Action at the storage limit: stop or delete-oldest.</td><td>Choices: stop, delete-oldest</td></tr>
+<tr><td><code>--max-age</code></td><td>Expire owned files after this duration. A delete-oldest policy is necessary.</td><td>—</td></tr>
+<tr><td><code>--no-max-age</code></td><td>Remove the saved file age limit.</td><td>—</td></tr>
+<tr><td><code>--auto</code></td><td>Enable auto mode first so Capturefab tunes exposure, gain and frame rate.</td><td>—</td></tr>
+<tr><td><code>--balance</code></td><td>Auto mode balance: 0 favors image quality. 1 favors frame rate. Named values: quality, balanced, frame-rate.</td><td>—</td></tr>
+<tr><td><code>--dataset</code></td><td>Catalog output in this .duckdb file. Create the file if it is missing.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-stop-forward"><code>capturefab stop-forward</code></h3>
+<p>Stop the current recording or forwarded stream on the addressed camera.</p>
+<h3 id="command-ffmpeg"><code>capturefab ffmpeg</code></h3>
+<p>Inspect bundled FFmpeg, codecs and supported protocols.</p>
+</article>
+<article class="doc-section" id="cli-sessions" data-doc-section data-doc-title="Sessions and shared activity" data-doc-category="Command reference" data-doc-tags="gui,serve,sessions,connect,select,disconnect,status,activity,rpc"><h2>Sessions and shared activity</h2><p class="doc-summary">Open a workspace and control it from other processes.</p>
+<p><code>gui</code> and <code>serve</code> run in the foreground. Keep their process open while other CLI calls use the session.</p><p>Each camera has its own worker. Set <code>--camera</code> explicitly when multiple people or agents share a session.</p><p>Browser access has no separate login. Everyone who can reach the HTTP listener can control its session.</p><p>Task guide: <a href="docs.html#sessions">Sessions and shared activity</a>.</p>
+<h3 id="command-gui"><code>capturefab gui</code></h3>
+<p>Open the desktop app and its local automation session.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--name</code></td><td>Name for this item.</td><td>Default: gui</td></tr>
+<tr><td><code>--screenshot</code></td><td>Save a real rendered workbench screenshot, then exit (release tooling).</td><td>—</td></tr>
+<tr><td><code>--screenshot-cameras</code></td><td>Number of simulator cameras in a tooling screenshot, from 0 to 16.</td><td>Default: 1</td></tr>
+<tr><td><code>--dataset</code></td><td>Catalog output in this .duckdb file. Create the file if it is missing.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-serve"><code>capturefab serve</code></h3>
+<p>Run a headless session in the foreground. Add --listen to enable the browser client and HTTP API.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--name</code></td><td>Name for this item.</td><td>Default: bench</td></tr>
+<tr><td><code>--stream</code></td><td>Start live acquisition on startup.</td><td>—</td></tr>
+<tr><td><code>--listen</code></td><td>Serve the WASM remote workbench on this address (e.g. 100.64.0.1:8787).</td><td>—</td></tr>
+<tr><td><code>--web-dir</code></td><td>Folder containing the built browser client. Use with --listen.</td><td>—</td></tr>
+<tr><td><code>--allow-hubs</code></td><td>Allow remote clients to open saved hubs with this computer’s hub credentials. Use with --listen.</td><td>—</td></tr>
+<tr><td><code>--auto</code></td><td>Enable auto mode first so Capturefab tunes exposure, gain and frame rate.</td><td>—</td></tr>
+<tr><td><code>--balance</code></td><td>Auto mode balance: 0 favors image quality. 1 favors frame rate. Named values: quality, balanced, frame-rate.</td><td>—</td></tr>
+<tr><td><code>--dataset</code></td><td>Catalog output in this .duckdb file. Create the file if it is missing.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-sessions"><code>capturefab sessions</code></h3>
+<p>List local GUI and headless sessions.</p>
+<h3 id="command-connect"><code>capturefab connect</code></h3>
+<p>Connect the named camera in a running session.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>CAMERA</code></td><td>Camera ID, serial number, IP address or source locator. See Source locators in the user guide.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-select"><code>capturefab select</code></h3>
+<p>Set the session default camera for CLI calls that omit --camera.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>CAMERA</code></td><td>Camera ID, serial number, IP address or source locator. See Source locators in the user guide.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-disconnect"><code>capturefab disconnect</code></h3>
+<p>Disconnect the addressed camera in a running session.</p>
+<h3 id="command-status"><code>capturefab status</code></h3>
+<p>Show the state of an existing persistent session.</p>
+<h3 id="command-activity"><code>capturefab activity</code></h3>
+<p>Read shared session activity. Optionally wait for its revision to change.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--after</code></td><td>Revision from a previous activity result. Omit for immediate history.</td><td>—</td></tr>
+<tr><td><code>--wait</code></td><td>Wait up to this duration for changes (maximum 25s. Default: no wait).</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-rpc"><code>capturefab rpc</code></h3>
+<p>Send a SessionCommand JSON object from stdin to an existing session.</p>
+</article>
+<article class="doc-section" id="cli-datasets" data-doc-section data-doc-title="Datasets and exports" data-doc-category="Command reference" data-doc-tags="dataset"><h2>Datasets and exports</h2><p class="doc-summary">Catalog captured files, add notes and export analysis data.</p>
+<p>One session holds one open dataset. Close it before switching files or changing its size policy.</p><p><code>--file</code> reads a dataset outside the session. Use it only when another process does not hold that file.</p><p>Task guide: <a href="docs.html#datasets">Datasets and exports</a>.</p>
+<h3 id="command-dataset"><code>capturefab dataset</code></h3>
+<p>Catalog captures and recordings in a DuckDB dataset and export analysis bundles.</p>
+<h3 id="command-dataset-open"><code>capturefab dataset open</code></h3>
+<p>Open or create the session&#x27;s dataset; existing files are never overwritten.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>PATH</code></td><td>File or folder path.</td><td>Required</td></tr>
+<tr><td><code>--new</code></td><td>Create a new file. Fail if it exists.</td><td>—</td></tr>
+<tr><td><code>--existing</code></td><td>Open an existing dataset. Fail if it is missing.</td><td>—</td></tr>
+<tr><td><code>--max-bytes</code></td><td>Largest size the dataset file may grow to, e.g. 8GiB.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-dataset-close"><code>capturefab dataset close</code></h3>
+<p>Checkpoint and close the session&#x27;s dataset.</p>
+<h3 id="command-dataset-status"><code>capturefab dataset status</code></h3>
+<p>Show the session&#x27;s dataset, or summarize --file.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--file</code></td><td>Input file path.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-dataset-note"><code>capturefab dataset note</code></h3>
+<p>Add a timestamped note (shift handover, defect, setup change).</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>TEXT</code></td><td>Note text.</td><td>Required</td></tr>
+<tr><td><code>--context</code></td><td>Add a KEY=VALUE tag. This option accepts multiple uses. Each key must be unique.</td><td>Accepts multiple values</td></tr>
+</tbody></table></div>
+<h3 id="command-dataset-query"><code>capturefab dataset query</code></h3>
+<p>Run one read-only SELECT; --file reads a dataset no session holds.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--file</code></td><td>Input file path.</td><td>—</td></tr>
+<tr><td><code>SQL</code></td><td>One read-only SELECT statement.</td><td>Required</td></tr>
+<tr><td><code>--limit</code></td><td>Maximum returned rows, from 1 to 10,000.</td><td>Default: 1000</td></tr>
+</tbody></table></div>
+<h3 id="command-dataset-export"><code>capturefab dataset export</code></h3>
+<p>Write data files, manifest.json and README.md into a new folder.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--file</code></td><td>Input file path.</td><td>—</td></tr>
+<tr><td><code>--output / -o</code></td><td>New folder for the export bundle. Existing folders are refused.</td><td>Required</td></tr>
+<tr><td><code>--format</code></td><td>Export format. Multiple values use commas.</td><td>Choices: csv, parquet, json, jsonl. Accepts multiple values</td></tr>
+<tr><td><code>--tables</code></td><td>Table names to export. Multiple names use commas.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--since</code></td><td>Only rows at or after this time (RFC 3339 with timezone).</td><td>—</td></tr>
+<tr><td><code>--until</code></td><td>Only rows at or before this time (RFC 3339 with timezone).</td><td>—</td></tr>
+<tr><td><code>--max-space</code></td><td>Maximum owned bytes across outputs. Default: saved policy, initially 10GiB.</td><td>—</td></tr>
+<tr><td><code>--max-files</code></td><td>Maximum owned files, from 1 to 100,000. Default: saved policy, initially 10,000.</td><td>—</td></tr>
+<tr><td><code>--delete-oldest</code></td><td>Delete the oldest eligible owned files when the storage limit is reached.</td><td>—</td></tr>
+<tr><td><code>--on-full</code></td><td>Action at the storage limit: stop or delete-oldest.</td><td>Choices: stop, delete-oldest</td></tr>
+<tr><td><code>--max-age</code></td><td>Expire owned files after this duration. A delete-oldest policy is necessary.</td><td>—</td></tr>
+<tr><td><code>--no-max-age</code></td><td>Remove the saved file age limit.</td><td>—</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-destinations" data-doc-section data-doc-title="Saved destinations" data-doc-category="Command reference" data-doc-tags="destination,volumes"><h2>Saved destinations</h2><p class="doc-summary">Save folder destinations for captures and recordings.</p>
+<p>Choose a folder on your disk, a removable drive or a mounted network drive. Removing a destination leaves its files in place.</p><p>Task guide: <a href="docs.html#destinations">Saved destinations</a>.</p>
+<h3 id="command-destination"><code>capturefab destination</code></h3>
+<p>Manage saved folders on your disk, removable drives or mounted network drives.</p>
+<p>Aliases: <code>destinations</code>.</p>
+<h3 id="command-destination-list"><code>capturefab destination list</code></h3>
+<p>List saved destinations.</p>
+<h3 id="command-destination-add-folder"><code>capturefab destination add-folder</code></h3>
+<p>Save a folder destination, such as a directory on an external drive or network share.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>Name for this item.</td><td>Required</td></tr>
+<tr><td><code>PATH</code></td><td>File or folder path.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-destination-remove"><code>capturefab destination remove</code></h3>
+<p>Remove a saved destination.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>Name for this item.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-destination-test"><code>capturefab destination test</code></h3>
+<p>Test whether a destination is reachable and writable.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>Name for this item.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-volumes"><code>capturefab volumes</code></h3>
+<p>List mounted external, removable and network volumes.</p>
+</article>
+<article class="doc-section" id="cli-storage" data-doc-section data-doc-title="Storage and retention" data-doc-category="Command reference" data-doc-tags="storage,retention"><h2>Storage and retention</h2><p class="doc-summary">Set file retention limits and inspect storage usage.</p>
+<p>The default policy allows 10 GiB and 10,000 owned files, then stops new output. Reservations count toward these limits.</p><p>Delete-oldest affects eligible Capturefab-owned files. Existing unrelated files and modified files are not deleted.</p><p>Storage task workspaces contain a database and its write-ahead log. Copy both together before removing an orphan workspace.</p><p>Task guide: <a href="docs.html#storage">Storage and retention</a>.</p><h3 id="command-storage"><code>capturefab storage</code></h3>
+<p>Show owned file usage and reserved recording space.</p>
+<h3 id="command-storage-status"><code>capturefab storage status</code></h3>
+<p>Show global policy, owned files and reservations.</p>
+<h3 id="command-storage-task-data"><code>capturefab storage task-data</code></h3>
+<p>Review or remove retained task workspaces, including after a restart.</p>
+<h3 id="command-storage-task-data-list"><code>capturefab storage task-data list</code></h3>
+<p>List durable workspaces and whether their owner has released them.</p>
+<h3 id="command-storage-task-data-copy"><code>capturefab storage task-data copy</code></h3>
+<p>Save the database and WAL together into a new ordinary folder.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>ID</code></td><td>ID returned by the corresponding list command.</td><td>Required</td></tr>
+<tr><td><code>OUTPUT</code></td><td>New folder for the database and write-ahead log. Existing folders are refused.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-storage-task-data-remove"><code>capturefab storage task-data remove</code></h3>
+<p>Permanently remove one orphan workspace and release its reservation.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>ID</code></td><td>Reservation ID from storage task-data list. Never a path.</td><td>Required</td></tr>
+<tr><td><code>--confirmed-by-user</code></td><td>Use only after the user approves the exact action or all actions in the plan.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-storage-configure"><code>capturefab storage configure</code></h3>
+<p>Persist the global storage ceiling for all cameras and future sessions.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--max-space</code></td><td>Maximum owned bytes across outputs. Default: saved policy, initially 10GiB.</td><td>—</td></tr>
+<tr><td><code>--max-files</code></td><td>Maximum owned files, from 1 to 100,000. Default: saved policy, initially 10,000.</td><td>—</td></tr>
+<tr><td><code>--delete-oldest</code></td><td>Delete the oldest eligible owned files when the storage limit is reached.</td><td>—</td></tr>
+<tr><td><code>--on-full</code></td><td>Action at the storage limit: stop or delete-oldest.</td><td>Choices: stop, delete-oldest</td></tr>
+<tr><td><code>--max-age</code></td><td>Expire owned files after this duration. A delete-oldest policy is necessary.</td><td>—</td></tr>
+<tr><td><code>--no-max-age</code></td><td>Remove the saved file age limit.</td><td>—</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-resources" data-doc-section data-doc-title="Resource limits" data-doc-category="Command reference" data-doc-tags="resources"><h2>Resource limits</h2><p class="doc-summary">Set local CPU and camera-buffer limits.</p>
+<p>These limits apply across local Capturefab processes. They are separate from the disk storage policy.</p><p>Thread changes affect future image work and new codecs. Ongoing recordings keep running.</p><p>Task guide: <a href="docs.html#resources">Resource limits</a>.</p>
+<h3 id="command-resources"><code>capturefab resources</code></h3>
+<p>Show resource use or change CPU and camera-buffer limits.</p>
+<h3 id="command-resources-status"><code>capturefab resources status</code></h3>
+<p>Show the current limits, use and remaining capacity.</p>
+<h3 id="command-resources-configure"><code>capturefab resources configure</code></h3>
+<p>Change the named limits. Omitted limits keep their values.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--cpu-threads</code></td><td>Maximum image and codec threads per camera worker. Use auto or 1–64.</td><td>—</td></tr>
+<tr><td><code>--camera-buffers</code></td><td>Shared camera-buffer limit: auto, or 64MiB–64GiB.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-resources-reset"><code>capturefab resources reset</code></h3>
+<p>Restore automatic CPU and camera-buffer limits.</p>
+</article>
+<article class="doc-section" id="cli-hubs" data-doc-section data-doc-title="Camera hubs" data-doc-category="Command reference" data-doc-tags="hub"><h2>Camera hubs</h2><p class="doc-summary">Save hub connections and discover their cameras.</p>
+<p>Save Home Assistant, Frigate, go2rtc or UniFi Protect access here. Credentials belong to the process that opens the camera.</p><p>With remote browser control, hub cameras also need <code>serve --allow-hubs</code>. Removing a hub does not remove its secret unless requested.</p><p>Task guide: <a href="docs.html#hubs">Camera hubs</a>.</p>
+<h3 id="command-hub"><code>capturefab hub</code></h3>
+<p>Save Home Assistant, Frigate, go2rtc and UniFi Protect servers and open their cameras as hub:NAME/CAMERA.</p>
+<p>Aliases: <code>hubs</code>.</p>
+<h3 id="command-hub-list"><code>capturefab hub list</code></h3>
+<p>List saved hubs.</p>
+<h3 id="command-hub-cameras"><code>capturefab hub cameras</code></h3>
+<p>List cameras on one saved hub, or on all of them; each ID is a --camera selector.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>A saved hub. Every saved hub when omitted.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-hub-test"><code>capturefab hub test</code></h3>
+<p>Examine that a saved hub answers and accepts its secret.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>A saved hub.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-hub-add-home-assistant"><code>capturefab hub add-home-assistant</code></h3>
+<p>Save a Home Assistant hub. Camera IDs use hub:NAME/camera.ENTITY.</p>
+<p>Aliases: <code>hub add-ha</code>.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>A name for the hub: letters, digits, &#x27;.&#x27;, &#x27;-&#x27; and &#x27;_&#x27;.</td><td>Required</td></tr>
+<tr><td><code>--url</code></td><td>The server&#x27;s address, such as http://homeassistant.local:8123.</td><td>Required</td></tr>
+<tr><td><code>--secret-stdin</code></td><td>Read one secret from stdin into the OS credential store. Use the token, password or API key for that service.</td><td>—</td></tr>
+<tr><td><code>--secret-env</code></td><td>Name of a CAPTUREFAB_HUB_… environment variable in the process that opens the hub camera.</td><td>—</td></tr>
+<tr><td><code>--certificate</code></td><td>Expected TLS certificate fingerprint, starting SHA256:. A different certificate is refused.</td><td>—</td></tr>
+<tr><td><code>--accept-certificate</code></td><td>Trust the currently presented TLS certificate. Confirm its fingerprint with the server administrator.</td><td>—</td></tr>
+<tr><td><code>--tls-server-name</code></td><td>Examine the certificate against NAME instead of the URL&#x27;s host (for a certificate issued to a domain name reached by IP).</td><td>—</td></tr>
+<tr><td><code>--no-check</code></td><td>Save without checking that the server answers and accepts the secret.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-hub-add-frigate"><code>capturefab hub add-frigate</code></h3>
+<p>Save a Frigate NVR. Use port 5000 without authentication, or port 8971 with a user.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>A name for the hub: letters, digits, &#x27;.&#x27;, &#x27;-&#x27; and &#x27;_&#x27;.</td><td>Required</td></tr>
+<tr><td><code>--user</code></td><td>The Frigate user to sign in as (port 8971).</td><td>—</td></tr>
+<tr><td><code>--rtsp-port</code></td><td>The port of Frigate&#x27;s RTSP restream.</td><td>Default: 8554</td></tr>
+<tr><td><code>--url</code></td><td>The server&#x27;s address, such as http://homeassistant.local:8123.</td><td>Required</td></tr>
+<tr><td><code>--secret-stdin</code></td><td>Read one secret from stdin into the OS credential store. Use the token, password or API key for that service.</td><td>—</td></tr>
+<tr><td><code>--secret-env</code></td><td>Name of a CAPTUREFAB_HUB_… environment variable in the process that opens the hub camera.</td><td>—</td></tr>
+<tr><td><code>--certificate</code></td><td>Expected TLS certificate fingerprint, starting SHA256:. A different certificate is refused.</td><td>—</td></tr>
+<tr><td><code>--accept-certificate</code></td><td>Trust the currently presented TLS certificate. Confirm its fingerprint with the server administrator.</td><td>—</td></tr>
+<tr><td><code>--tls-server-name</code></td><td>Examine the certificate against NAME instead of the URL&#x27;s host (for a certificate issued to a domain name reached by IP).</td><td>—</td></tr>
+<tr><td><code>--no-check</code></td><td>Save without checking that the server answers and accepts the secret.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-hub-add-go2rtc"><code>capturefab hub add-go2rtc</code></h3>
+<p>Save a go2rtc hub. Camera IDs use hub:NAME/STREAM.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>A name for the hub: letters, digits, &#x27;.&#x27;, &#x27;-&#x27; and &#x27;_&#x27;.</td><td>Required</td></tr>
+<tr><td><code>--user</code></td><td>The go2rtc API user name, when it has one.</td><td>—</td></tr>
+<tr><td><code>--url</code></td><td>The server&#x27;s address, such as http://homeassistant.local:8123.</td><td>Required</td></tr>
+<tr><td><code>--secret-stdin</code></td><td>Read one secret from stdin into the OS credential store. Use the token, password or API key for that service.</td><td>—</td></tr>
+<tr><td><code>--secret-env</code></td><td>Name of a CAPTUREFAB_HUB_… environment variable in the process that opens the hub camera.</td><td>—</td></tr>
+<tr><td><code>--certificate</code></td><td>Expected TLS certificate fingerprint, starting SHA256:. A different certificate is refused.</td><td>—</td></tr>
+<tr><td><code>--accept-certificate</code></td><td>Trust the currently presented TLS certificate. Confirm its fingerprint with the server administrator.</td><td>—</td></tr>
+<tr><td><code>--tls-server-name</code></td><td>Examine the certificate against NAME instead of the URL&#x27;s host (for a certificate issued to a domain name reached by IP).</td><td>—</td></tr>
+<tr><td><code>--no-check</code></td><td>Save without checking that the server answers and accepts the secret.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-hub-add-unifi-protect"><code>capturefab hub add-unifi-protect</code></h3>
+<p>Save a UniFi Protect snapshot source. Create its API key in the console’s integration settings.</p>
+<p>Aliases: <code>hub add-unifi</code>.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>A name for the hub: letters, digits, &#x27;.&#x27;, &#x27;-&#x27; and &#x27;_&#x27;.</td><td>Required</td></tr>
+<tr><td><code>--url</code></td><td>The server&#x27;s address, such as http://homeassistant.local:8123.</td><td>Required</td></tr>
+<tr><td><code>--secret-stdin</code></td><td>Read one secret from stdin into the OS credential store. Use the token, password or API key for that service.</td><td>—</td></tr>
+<tr><td><code>--secret-env</code></td><td>Name of a CAPTUREFAB_HUB_… environment variable in the process that opens the hub camera.</td><td>—</td></tr>
+<tr><td><code>--certificate</code></td><td>Expected TLS certificate fingerprint, starting SHA256:. A different certificate is refused.</td><td>—</td></tr>
+<tr><td><code>--accept-certificate</code></td><td>Trust the currently presented TLS certificate. Confirm its fingerprint with the server administrator.</td><td>—</td></tr>
+<tr><td><code>--tls-server-name</code></td><td>Examine the certificate against NAME instead of the URL&#x27;s host (for a certificate issued to a domain name reached by IP).</td><td>—</td></tr>
+<tr><td><code>--no-check</code></td><td>Save without checking that the server answers and accepts the secret.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-hub-remove"><code>capturefab hub remove</code></h3>
+<p>Remove a saved hub; --forget-secret also deletes its saved secret.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>A saved hub.</td><td>Required</td></tr>
+<tr><td><code>--forget-secret</code></td><td>Also remove the saved secret from the OS credential store.</td><td>—</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-simulation" data-doc-section data-doc-title="Virtual camera servers" data-doc-category="Command reference" data-doc-tags="simulate"><h2>Virtual camera servers</h2><p class="doc-summary">Serve test images through GigE Vision, RTSP or ONVIF.</p>
+<p>Presets: gige (640 × 480, 30 fps), rtsp (1920 × 1080, 30 fps), onvif (1280 × 720, 15 fps), vision (640 × 480, 60 fps).</p><p>H.264 dimensions must be even. A media folder is read one level deep, in filename order, without following symlinks.</p><p>Task guide: <a href="docs.html#simulation">Virtual camera servers</a>.</p>
+<h3 id="command-simulate"><code>capturefab simulate</code></h3>
+<p>Host virtual GigE Vision, RTSP or ONVIF cameras using looping test data.</p>
+<h3 id="command-simulate-presets"><code>capturefab simulate presets</code></h3>
+<p>Show camera presets and their integration use cases.</p>
+<h3 id="command-simulate-run"><code>capturefab simulate run</code></h3>
+<p>Host a virtual camera until Ctrl-C (or --duration).</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--preset</code></td><td>Virtual camera preset.</td><td>Default: onvif. Choices: gige, rtsp, onvif, vision</td></tr>
+<tr><td><code>--source</code></td><td>Image, video file or one-level media folder. Sources loop in filename order.</td><td>—</td></tr>
+<tr><td><code>--bind</code></td><td>Local IPv4 address. Use a LAN address for remote clients.</td><td>Default: 127.0.0.1</td></tr>
+<tr><td><code>--advertise</code></td><td>Reachable camera IPv4 address. Necessary when --bind is 0.0.0.0.</td><td>—</td></tr>
+<tr><td><code>--gige-port</code></td><td>GigE Vision UDP port.</td><td>Default: 3956</td></tr>
+<tr><td><code>--rtsp-port</code></td><td>RTSP TCP port.</td><td>Default: 8554</td></tr>
+<tr><td><code>--onvif-port</code></td><td>ONVIF HTTP port.</td><td>Default: 8080</td></tr>
+<tr><td><code>--name</code></td><td>Name shown in camera discovery, from 1 to 128 bytes.</td><td>Default: Capturefab virtual camera</td></tr>
+<tr><td><code>--width</code></td><td>Output width in pixels, from 64 to 1,920.</td><td>—</td></tr>
+<tr><td><code>--height</code></td><td>Output height in pixels, from 64 to 1,080.</td><td>—</td></tr>
+<tr><td><code>--fps</code></td><td>Delivered frame rate, from 1 to 120. Source video timing is resampled.</td><td>—</td></tr>
+<tr><td><code>--bitrate</code></td><td>H.264 bitrate, e.g. 2M or 800k.</td><td>—</td></tr>
+<tr><td><code>--duration</code></td><td>Stop the virtual camera after this duration, such as 30s or 5m.</td><td>—</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-tools" data-doc-section data-doc-title="Tools for external agents" data-doc-category="Command reference" data-doc-tags="tools"><h2>Tools for external agents</h2><p class="doc-summary">Read tool schemas and execute checked tool calls.</p>
+<p>Use a file for the plan or arguments when <code>--secret-stdin</code> reads a secret. Both inputs cannot share stdin.</p><p>Use the catalog below for every tool. Read its schema with <code>tools describe NAME --json</code> before constructing arguments.</p><p>Every argument key is necessary. Use JSON <code>null</code> where the schema permits a default.</p><p>Set the camera inside <code>args.camera</code>; omit global <code>--camera</code> and <code>CAPTUREFAB_CAMERA</code> for tool calls.</p><p>The CLI writes inspection images to private temporary files by default. Use <code>--image-out</code> for a budgeted saved file.</p><p>Action dry runs return normalized commands without executing them. Plans hold 1–64 calls and at most 256 KiB.</p><p>Calls run in order. A failure stops the plan; earlier effects remain. Human approval must cover the exact disruptive action.</p><p>Task guide: <a href="docs.html#camera-tools">Tools for external agents</a>.</p>
+<h3 id="command-tools"><code>capturefab tools</code></h3>
+<p>List, examine and run shared image and data tools for people and external agents.</p>
+<h3 id="command-tools-list"><code>capturefab tools list</code></h3>
+<p>List shared image and data tools, risks and portable argument schemas.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--compact</code></td><td>Return just names, titles, risks and capability flags. Use describe for each schema.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-tools-describe"><code>capturefab tools describe</code></h3>
+<p>Read one tool&#x27;s description and argument schema without a session.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>Tool name from tools list.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-tools-call"><code>capturefab tools call</code></h3>
+<p>Read session facts or examine and run one image or data tool.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>Tool name from tools list.</td><td>Required</td></tr>
+<tr><td><code>--args</code></td><td>JSON object containing every argument. Use null for defaults.</td><td>—</td></tr>
+<tr><td><code>--args-file</code></td><td>Read the JSON argument object from this file, or - for stdin.</td><td>—</td></tr>
+<tr><td><code>--dry-run</code></td><td>Validate and show the normalized call and commands without executing.</td><td>—</td></tr>
+<tr><td><code>--secret-stdin</code></td><td>Read one stream password from stdin. A stream password is not saved.</td><td>—</td></tr>
+<tr><td><code>--confirmed-by-user</code></td><td>Use only after the user approves the exact action or all actions in the plan.</td><td>—</td></tr>
+<tr><td><code>--image-out</code></td><td>Save an inspect_frame image at this new path. The storage budget applies. Existing files are refused.</td><td>—</td></tr>
+<tr><td><code>--inline-image</code></td><td>Include inspect_frame image bytes as base64 in the JSON result.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-tools-apply"><code>capturefab tools apply</code></h3>
+<p>Examine and run a version 1 image and data tool plan in order.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>FILE</code></td><td>Version 1 tool plan file. Use - for stdin.</td><td>Required</td></tr>
+<tr><td><code>--dry-run</code></td><td>Validate and show normalized calls and commands without executing.</td><td>—</td></tr>
+<tr><td><code>--secret-stdin</code></td><td>Read one stream password from stdin. A stream password is not saved.</td><td>—</td></tr>
+<tr><td><code>--confirmed-by-user</code></td><td>Use only after the user approves the exact action or all actions in the plan.</td><td>—</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-assistant" data-doc-section data-doc-title="Built-in assistant" data-doc-category="Command reference" data-doc-tags="assistant"><h2>Built-in assistant</h2><p class="doc-summary">Set provider access, plan tasks and run tasks within limits.</p>
+<p>The optional <code>ai</code> build feature provides these commands. Provider setup is separate from an external agent’s own model access.</p><p><code>ask</code> returns a plan. <code>run</code> performs a task and enforces its camera scope and limits.</p><p>Images and dataset rows have separate permissions. Supervised mode asks before each change; autonomous mode allows routine changes within limits.</p><p>Ctrl-C stops new work. Already accepted camera commands can finish; read the task report for remaining work.</p><p>Task guide: <a href="docs.html#assistant">Built-in assistant</a>.</p>
+<h3 id="command-assistant"><code>capturefab assistant</code></h3>
+<p>Configure an AI provider, plan captures or run a bounded camera task.</p>
+<h3>Apple Intelligence</h3><p>Select <code>apple_foundation_models</code> to use the fixed <code>on-device</code> system model. No API key, endpoint or reasoning-effort setting applies.</p><p>The provider needs macOS 26 or later, an eligible Mac, Apple Intelligence enabled and its model ready. The build must include the native helper.</p><p>Use <code>assistant test apple_foundation_models</code> to test it. Camera-image input and <code>test --vision</code> are unsupported.</p><p>Requests stay local with no remote fallback. Existing tool approvals, task scopes and limits still apply.</p><p>See <a href="docs.html#apple-intelligence">local model setup and troubleshooting</a>.</p>
+<h3 id="command-assistant-providers"><code>capturefab assistant providers</code></h3>
+<p>List providers, credential readiness and image support without making a request.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--check-keychain</code></td><td>Read saved keys from the OS credential store. The OS can display a permission prompt.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-assistant-use"><code>capturefab assistant use</code></h3>
+<p>Select a provider and save its non-secret settings.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>PROVIDER</code></td><td>Provider ID from assistant providers.</td><td>Required</td></tr>
+<tr><td><code>--model</code></td><td>Model ID. Uses the provider default when no model is saved.</td><td>—</td></tr>
+<tr><td><code>--base-url</code></td><td>HTTPS API origin, or a local HTTP origin for Ollama or Custom.</td><td>—</td></tr>
+<tr><td><code>--account-id</code></td><td>Cloudflare account ID.</td><td>—</td></tr>
+<tr><td><code>--gateway-id</code></td><td>Cloudflare AI Gateway ID.</td><td>—</td></tr>
+<tr><td><code>--region</code></td><td>AWS region for Bedrock.</td><td>—</td></tr>
+<tr><td><code>--profile</code></td><td>AWS shared-config profile for Bedrock.</td><td>—</td></tr>
+<tr><td><code>--project</code></td><td>Google Cloud project ID for Vertex AI.</td><td>—</td></tr>
+<tr><td><code>--location</code></td><td>Google Cloud location for Vertex AI.</td><td>—</td></tr>
+<tr><td><code>--endpoint</code></td><td>Azure AI Foundry endpoint.</td><td>—</td></tr>
+<tr><td><code>--effort</code></td><td>Reasoning effort sent only when this provider has a documented control.</td><td>Choices: low, medium, high</td></tr>
+<tr><td><code>--vision</code></td><td>Use auto, on or off for provider image support.</td><td>Choices: auto, on, off</td></tr>
+</tbody></table></div>
+<h3 id="command-assistant-key"><code>capturefab assistant key</code></h3>
+<p>Save or remove a provider key in the OS credential store.</p>
+<h3 id="command-assistant-key-set"><code>capturefab assistant key set</code></h3>
+<p>Read one key from stdin and save it in the OS credential store.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>PROVIDER</code></td><td>Provider ID from assistant providers.</td><td>Required</td></tr>
+<tr><td><code>--key-stdin</code></td><td>Read the key from stdin, preserving all bytes except one final newline.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-assistant-key-remove"><code>capturefab assistant key remove</code></h3>
+<p>Remove the saved key; environment credentials are unchanged.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>PROVIDER</code></td><td>Provider ID from assistant providers.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-assistant-test"><code>capturefab assistant test</code></h3>
+<p>Send a small tool round trip to the selected provider.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>PROVIDER</code></td><td>Provider ID. Defaults to the selected provider.</td><td>—</td></tr>
+<tr><td><code>--vision</code></td><td>Also send a generated 64 × 64 image to test image support.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-assistant-ask"><code>capturefab assistant ask</code></h3>
+<p>Read observations and return an editable plan. Changes run only with --apply and the allowed tools.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>PROMPT</code></td><td>Request text. Omit when using --prompt-file.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--prompt-file</code></td><td>Read UTF-8 request text from this file. Use - for stdin. Omit the positional prompt.</td><td>—</td></tr>
+<tr><td><code>--provider</code></td><td>Override the selected provider for this request.</td><td>—</td></tr>
+<tr><td><code>--model</code></td><td>Override this provider&#x27;s model for this request.</td><td>—</td></tr>
+<tr><td><code>--apply</code></td><td>Run the plan only if every step is allowed and all output stays local.</td><td>—</td></tr>
+<tr><td><code>--allow-tools</code></td><td>Comma-separated tools that --apply may execute. Remote output remains excluded.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--plan-out</code></td><td>Export the version 1 plan to a new private file. Never overwrite.</td><td>—</td></tr>
+<tr><td><code>--allow-data</code></td><td>Permit dataset query results to reach the provider.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-assistant-run"><code>capturefab assistant run</code></h3>
+<p>Run a camera task inside the specified camera scope, approval policy and limits.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>PROMPT</code></td><td>Request text. Omit when using --prompt-file.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--prompt-file</code></td><td>Read UTF-8 request text from this file. Use - for stdin. Omit the positional prompt.</td><td>—</td></tr>
+<tr><td><code>--camera</code></td><td>Allowed camera ID. This option accepts comma-separated values or multiple uses, up to eight cameras.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--dataset</code></td><td>Exact open dataset slot ID from tools call get_dataset --json.</td><td>—</td></tr>
+<tr><td><code>--allow-data</code></td><td>Permit camera metadata, notes and dataset rows to reach the provider.</td><td>—</td></tr>
+<tr><td><code>--destination</code></td><td>Allowed saved destination name. This option accepts comma-separated values or multiple uses.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--see-images</code></td><td>Allow inspected camera images to be sent to the provider.</td><td>—</td></tr>
+<tr><td><code>--mode</code></td><td>Ask before each change, or run routine changes without asking.</td><td>Default: supervised. Choices: supervised, autonomous</td></tr>
+<tr><td><code>--approvals</code></td><td>Use ask with a terminal, or deny. Default: ask in a terminal, deny otherwise.</td><td>Choices: ask, deny</td></tr>
+<tr><td><code>--max-rounds</code></td><td>Maximum model rounds, from 1 to 1,000.</td><td>—</td></tr>
+<tr><td><code>--max-time</code></td><td>Maximum task wall time, from 1m to 24h. Waiting counts.</td><td>—</td></tr>
+<tr><td><code>--max-cost</code></td><td>Estimated US-dollar limit, from 0 to 500. Remote providers need saved prices. Apple Intelligence has zero provider cost.</td><td>—</td></tr>
+<tr><td><code>--max-input-tokens</code></td><td>Maximum input tokens, including replayed history, from 1 to 50,000,000.</td><td>—</td></tr>
+<tr><td><code>--max-output-tokens</code></td><td>Maximum output tokens, including reasoning, from 1 to 5,000,000.</td><td>—</td></tr>
+<tr><td><code>--max-images</code></td><td>Maximum newly sent observation images, from 0 to 2,000.</td><td>—</td></tr>
+<tr><td><code>--max-captures</code></td><td>Maximum still captures, from 0 to 100,000. Zero also disables schedules.</td><td>—</td></tr>
+<tr><td><code>--max-size</code></td><td>Limit reserved output bytes. Includes images, recordings and twice each export bundle limit.</td><td>—</td></tr>
+<tr><td><code>--max-recordings</code></td><td>Maximum file recordings, from 0 to 32. Streams require separate exact approval.</td><td>—</td></tr>
+<tr><td><code>--max-recording</code></td><td>Maximum duration of one recording or stream, from 1s to 7d.</td><td>—</td></tr>
+<tr><td><code>--approval-timeout</code></td><td>Approval deadline, from 1s to 24h. The task wall limit still applies.</td><td>—</td></tr>
+<tr><td><code>--max-data-size</code></td><td>Limit data-export reservations. Each export reserves twice its bundle limit. 0 disables exports.</td><td>—</td></tr>
+<tr><td><code>--on-human-change</code></td><td>Pause, inform the model, or stop after a person changes a scoped camera or dataset.</td><td>Default: pause. Choices: pause, inform, stop</td></tr>
+<tr><td><code>--events</code></td><td>Write action-log JSONL to a new private file. Use - for stderr.</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-assistant-runs"><code>capturefab assistant runs</code></h3>
+<p>List local assistant action logs, including unfinished tasks.</p>
+<h3 id="command-assistant-log"><code>capturefab assistant log</code></h3>
+<p>Read one local assistant action log.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>RUN_ID</code></td><td>Run ID from assistant runs.</td><td>Required</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-workflows" data-doc-section data-doc-title="Workflows" data-doc-category="Command reference" data-doc-tags="workflow"><h2>Workflows</h2><p class="doc-summary">Validate or run ordered session commands from a JSON file.</p>
+<p>Files use version 1 with 1–256 steps and a 1 MiB limit. All steps are validated before execution.</p><p>Apply needs a running session. A failure stops later steps; earlier effects remain.</p><p>Relative paths resolve beside the workflow file. For stdin, paths resolve from the calling terminal’s folder.</p><p>Task guide: <a href="docs.html#workflows">Workflows</a>.</p>
+<h3 id="command-workflow"><code>capturefab workflow</code></h3>
+<p>Validate and apply repeatable multi-camera setup, capture and recording plans.</p>
+<h3 id="command-workflow-validate"><code>capturefab workflow validate</code></h3>
+<p>Validate every step and show the resolved plan without contacting cameras.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>FILE</code></td><td>Version 1 workflow file. Use - for stdin.</td><td>Required</td></tr>
+</tbody></table></div>
+<h3 id="command-workflow-apply"><code>capturefab workflow apply</code></h3>
+<p>Apply ordered steps to a persistent session; stop on the first failure.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>FILE</code></td><td>Version 1 workflow file. Use - for stdin.</td><td>Required</td></tr>
+<tr><td><code>--dry-run</code></td><td>Validate and print the plan without making changes.</td><td>—</td></tr>
+</tbody></table></div>
+</article>
+<article class="doc-section" id="cli-diagnostics" data-doc-section data-doc-title="Diagnostics and command help" data-doc-category="Command reference" data-doc-tags="doctor,schema,completions,help"><h2>Diagnostics and command help</h2><p class="doc-summary">Read capabilities, the automation schema and shell help.</p>
+<p>Task guide: <a href="docs.html#troubleshooting">Diagnostics and command help</a>.</p>
+<h3 id="command-doctor"><code>capturefab doctor</code></h3>
+<p>Report this computer’s camera, storage and acceleration capabilities. Each warning includes a suggested action.</p>
+<h3 id="command-schema"><code>capturefab schema</code></h3>
+<p>Emit the versioned CLI and session automation contract as JSON.</p>
+<h3 id="command-completions"><code>capturefab completions</code></h3>
+<p>Generate completion definitions for bash, zsh, fish, PowerShell or Elvish.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>SHELL</code></td><td>Shell to generate completions for.</td><td>Required. Choices: bash, elvish, fish, powershell, zsh</td></tr>
+</tbody></table></div>
+<h3 id="command-help"><code>capturefab help</code></h3>
+<p>Print this message or the help of the given subcommand(s).</p>
+</article>
+<article class="doc-section" id="tool-catalog" data-doc-section data-doc-title="Tool catalog" data-doc-category="Command reference" data-doc-tags="get_overview,list_cameras,list_destinations,get_storage,list_jobs,get_camera_features,inspect_frame,wait_for,connect_camera,start_live_view,stop_live_view,set_camera_features,set_camera_roi,set_auto_exposure,run_camera_command,undo_camera_change,capture_photos,start_recording,stop_recording,schedule_captures,cancel_job,stream_to_url,get_dataset,open_dataset,close_dataset,query_dataset,annotate_dataset,export_dataset,create_folder_destination"><h2>Tool catalog</h2><p class="doc-summary">Read the purpose and arguments of every shared camera and data tool.</p>
+<p>Each row below documents a tool and every top-level argument. The installed schema gives nested fields, permitted values and numeric limits.</p><p>Tool argument limits can be stricter than CLI limits. Do not reuse CLI limits without reading the tool schema.</p><p>A call can have a higher risk class when it affects other work. Read its dry-run result before execution.</p><p>Observe tools read state. Reversible tools change settings. Bounded tools create limited output. Disruptive and HumanOnly actions ask for approval.</p><p><code>inspect_frame</code> accepts fresh 0–10, a preview edge of 0 or 256–1,568, and an optional normalized region.</p><p><code>wait_for</code> accepts timeouts from 1s to 10m. It reports whether the condition was met.</p><p><code>query_dataset</code> accepts 1–1,000 rows and 1–30s. Model results have a 16 KiB limit.</p><p>Model queries first use a private snapshot of standard tables. Snapshots over 100,000 rows or 16 MiB fail explicitly.</p><h3 id="tool-get-overview"><code>get_overview</code></h3><p>Read session state, cameras, destinations, storage and recording defaults. Works without a session.</p><p>Minimum risk class: <code>observe</code>. Session: not always necessary.</p><p>Arguments: <code>{}</code>.</p><h3 id="tool-list-cameras"><code>list_cameras</code></h3><p>List connected and discovered cameras. Set discover to true for a new search in a running session.</p><p>Minimum risk class: <code>observe</code>. Session: not always necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>discover</code></td><td>Search for cameras for about 3 s first (needs a session).</td></tr><tr><td><code>include_simulated</code></td><td>Also list simulator cameras (sim:N).</td></tr></tbody></table></div><h3 id="tool-list-destinations"><code>list_destinations</code></h3><p>Read destination names, folders and availability. Works without a session.</p><p>Minimum risk class: <code>observe</code>. Session: not always necessary.</p><p>Arguments: <code>{}</code>.</p><h3 id="tool-get-storage"><code>get_storage</code></h3><p>Read the file budget, reservations and free space. Works without a session.</p><p>Minimum risk class: <code>observe</code>. Session: not always necessary.</p><p>Arguments: <code>{}</code>.</p><h3 id="tool-list-jobs"><code>list_jobs</code></h3><p>Read schedules, recordings and streams. A null camera lists all cameras.</p><p>Minimum risk class: <code>observe</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A camera ID or name; null lists every camera.</td></tr></tbody></table></div><h3 id="tool-get-camera-features"><code>get_camera_features</code></h3><p>Read imaging controls, limits and access. Set search or names to narrow the result.</p><p>Minimum risk class: <code>observe</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A connected camera&#x27;s ID or name.</td></tr><tr><td><code>names</code></td><td>Exact feature names; null for the imaging controls.</td></tr><tr><td><code>search</code></td><td>Part of a feature name, such as Exposure; null for the imaging controls.</td></tr></tbody></table></div><h3 id="tool-inspect-frame"><code>inspect_frame</code></h3><p>Read a fresh camera image and exposure or focus measurements. A stopped camera acquires one frame and stays stopped. Document scanners are refused.</p><p>Minimum risk class: <code>observe</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A connected camera&#x27;s ID or name.</td></tr><tr><td><code>fresh</code></td><td>New frames to wait for, 0..10; null for 1.</td></tr><tr><td><code>include_image</code></td><td>Send the image when images are allowed; null for true.</td></tr><tr><td><code>max_dimension</code></td><td>The image&#x27;s longest edge: 0 for measurements only, else 256..1568; null for 1024.</td></tr><tr><td><code>region</code></td><td>An object with x, y, width and height fractions from 0 to 1; null selects the whole frame.</td></tr></tbody></table></div><h3 id="tool-wait-for"><code>wait_for</code></h3><p>Wait for time, frames, stable auto exposure, job completion, recording stop or another participant’s action.</p><p>Minimum risk class: <code>observe</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A connected camera&#x27;s ID or name; required for frames, auto_settled and recording_stopped.</td></tr><tr><td><code>frames</code></td><td>New frames to wait for, 1..1000, with until frames; else null.</td></tr><tr><td><code>job_id</code></td><td>The job to wait for, with until job_done; else null.</td></tr><tr><td><code>timeout</code></td><td>The longest wait, 1s..10m, such as 30s or 2m.</td></tr><tr><td><code>until</code></td><td>What to wait for.</td></tr></tbody></table></div><h3 id="tool-get-dataset"><code>get_dataset</code></h3><p>Read dataset identity, standard tables, row counts, size, limits and errors without reading rows.</p><p>Minimum risk class: <code>observe</code>. Session: necessary.</p><p>Arguments: <code>{}</code>.</p><h3 id="tool-query-dataset"><code>query_dataset</code></h3><p>Run one read-only SELECT against the reviewed dataset. Model access to data must be allowed separately.</p><p>Minimum risk class: <code>observe</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>limit</code></td><td>1..1000 rows, default 100</td></tr><tr><td><code>sql</code></td><td>One read-only SELECT</td></tr><tr><td><code>timeout</code></td><td>1s..30s</td></tr></tbody></table></div><h3 id="tool-open-dataset"><code>open_dataset</code></h3><p>Open or create a .duckdb catalog inside the capture folder. Existing databases are never overwritten.</p><p>Minimum risk class: <code>bounded</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>file_name</code></td><td>Relative .duckdb file inside capture folder</td></tr><tr><td><code>max_bytes</code></td><td>Positive dataset-wide size policy in bytes; allocation can overshoot; minimum 16 MiB</td></tr><tr><td><code>mode</code></td><td>auto opens or creates; create refuses an existing file; open refuses a missing file.</td></tr></tbody></table></div><h3 id="tool-close-dataset"><code>close_dataset</code></h3><p>Close the exact reviewed dataset instance. Approval is necessary because other work can use it.</p><p>Minimum risk class: <code>disruptive</code>. Session: necessary.</p><p>Arguments: <code>{}</code>.</p><h3 id="tool-annotate-dataset"><code>annotate_dataset</code></h3><p>Save a timestamped note of up to 4,096 bytes in the reviewed dataset.</p><p>Minimum risk class: <code>bounded</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>text</code></td><td>Timestamped note, at most 4096 bytes</td></tr></tbody></table></div><h3 id="tool-export-dataset"><code>export_dataset</code></h3><p>Export selected data to a new analysis folder. Each attempt reserves twice the maximum bundle size.</p><p>Minimum risk class: <code>bounded</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>folder</code></td><td>New relative folder inside capture root</td></tr><tr><td><code>format</code></td><td>Export format</td></tr><tr><td><code>max_bytes</code></td><td>Maximum complete bundle bytes; reserves twice this amount for staged and published copies</td></tr><tr><td><code>since_ms</code></td><td>Inclusive start time</td></tr><tr><td><code>tables</code></td><td>Selected tables</td></tr><tr><td><code>timeout</code></td><td>1s..10m</td></tr><tr><td><code>until_ms</code></td><td>Inclusive end time</td></tr></tbody></table></div><h3 id="tool-connect-camera"><code>connect_camera</code></h3><p>Connect a source without starting live view. Size and fps arguments apply only to host webcams.</p><p>Minimum risk class: <code>reversible</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A camera ID or exact friendly name.</td></tr><tr><td><code>fps</code></td><td>Host webcam frame rate 0.1..240; null for the source default.</td></tr><tr><td><code>size</code></td><td>Host webcam size WxH, each side 16..8192; null for the source default.</td></tr></tbody></table></div><h3 id="tool-start-live-view"><code>start_live_view</code></h3><p>Start acquisition on a connected camera. For a scanner, this arms acquisition; an explicit capture requests a page. The tool asks for approval.</p><p>Minimum risk class: <code>reversible</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A camera ID or exact friendly name.</td></tr></tbody></table></div><h3 id="tool-stop-live-view"><code>stop_live_view</code></h3><p>Stop acquisition. First stop recordings and streams, and cancel active capture schedules.</p><p>Minimum risk class: <code>reversible</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A camera ID or exact friendly name.</td></tr></tbody></table></div><h3 id="tool-set-camera-features"><code>set_camera_features</code></h3><p>Apply 1–16 feature values atomically. Optional expected values prevent overwriting a changed setting.</p><p>Minimum risk class: <code>reversible</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A camera ID or exact friendly name.</td></tr><tr><td><code>restart_stream</code></td><td>Allow a safe Stop, SetMany, Start for stream-locked features.</td></tr><tr><td><code>values</code></td><td>1–16 objects with feature, value and expect. Values are strings; expect can be null. All entries are validated before writing.</td></tr></tbody></table></div><h3 id="tool-set-camera-roi"><code>set_camera_roi</code></h3><p>Set sensor offsets and dimensions within camera limits. Use full to restore the full sensor area.</p><p>Minimum risk class: <code>reversible</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A camera ID or exact friendly name.</td></tr><tr><td><code>full</code></td><td>Use the full sensor and zero offsets.</td></tr><tr><td><code>height</code></td><td>Height in sensor pixels; null keeps the current value.</td></tr><tr><td><code>width</code></td><td>Width in sensor pixels; null keeps the current value.</td></tr><tr><td><code>x</code></td><td>Left sensor offset in pixels; null keeps the current value.</td></tr><tr><td><code>y</code></td><td>Top sensor offset in pixels; null keeps the current value.</td></tr></tbody></table></div><h3 id="tool-set-auto-exposure"><code>set_auto_exposure</code></h3><p>Select auto, hold or revert. A balance from 0 to 1 favors quality or frame rate.</p><p>Minimum risk class: <code>reversible</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>balance</code></td><td>0–1, from image quality to frame rate. Applies only to auto; null keeps the current or default balance.</td></tr><tr><td><code>camera</code></td><td>A camera ID or exact friendly name.</td></tr><tr><td><code>mode</code></td><td>Choose automatic control, hold current values, or restore pre-auto values.</td></tr></tbody></table></div><h3 id="tool-run-camera-command"><code>run_camera_command</code></h3><p>Run an allowed camera command, such as TriggerSoftware. Commands cannot be undone.</p><p>Minimum risk class: <code>reversible</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A camera ID or exact friendly name.</td></tr><tr><td><code>command</code></td><td>An existing allowlisted camera command.</td></tr></tbody></table></div><h3 id="tool-undo-camera-change"><code>undo_camera_change</code></h3><p>Undo the specified camera_change token. A null token uses this caller’s last change.</p><p>Minimum risk class: <code>reversible</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>A camera ID or exact friendly name.</td></tr><tr><td><code>token</code></td><td>A camera_change token, or null for this caller&#x27;s latest token.</td></tr></tbody></table></div><h3 id="tool-capture-photos"><code>capture_photos</code></h3><p>Save 1–1,000 images; default 1. Default format is PNG. Scanners consume pages.</p><p>Minimum risk class: <code>bounded</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>Camera ID or exact friendly name.</td></tr><tr><td><code>count</code></td><td>1..1000 photos; default 1.</td></tr><tr><td><code>destination</code></td><td>Saved destination name; null for the capture folder.</td></tr><tr><td><code>file_name</code></td><td>Single file name or template; no folders.</td></tr><tr><td><code>format</code></td><td>PNG by default.</td></tr><tr><td><code>tags</code></td><td>At most 16 tags; null for none.</td></tr></tbody></table></div><h3 id="tool-start-recording"><code>start_recording</code></h3><p>Record video with a duration or a 512 MiB default reservation. Keep the session open and the computer awake.</p><p>Minimum risk class: <code>bounded</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>bitrate</code></td><td>Video bitrate such as 4M; Video settings by default.</td></tr><tr><td><code>camera</code></td><td>Camera ID or exact friendly name.</td></tr><tr><td><code>codec</code></td><td>Video settings by default; h265 normalizes to hevc.</td></tr><tr><td><code>destination</code></td><td>Saved destination; null for local capture folder.</td></tr><tr><td><code>duration</code></td><td>Duration with units, at least 1 second.</td></tr><tr><td><code>file_name</code></td><td>Recording template; default MP4.</td></tr><tr><td><code>fps</code></td><td>0.1..240; Video settings by default.</td></tr><tr><td><code>tags</code></td><td>At most 16 tags; null for none.</td></tr></tbody></table></div><h3 id="tool-stop-recording"><code>stop_recording</code></h3><p>Finish the current recording or stream. Stopping another participant’s work asks for approval.</p><p>Minimum risk class: <code>bounded</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>Camera ID or exact friendly name.</td></tr></tbody></table></div><h3 id="tool-schedule-captures"><code>schedule_captures</code></h3><p>Save images at an interval. Set exactly one end condition: duration, count or until.</p><p>Minimum risk class: <code>bounded</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>Camera ID or exact friendly name.</td></tr><tr><td><code>count</code></td><td>1..100000 photos.</td></tr><tr><td><code>destination</code></td><td>Saved destination name; null for the capture folder.</td></tr><tr><td><code>duration</code></td><td>Duration with units, at least 1 second.</td></tr><tr><td><code>every</code></td><td>Positive interval with units, such as 5m.</td></tr><tr><td><code>file_name</code></td><td>Single file name or template; no folders.</td></tr><tr><td><code>format</code></td><td>PNG by default.</td></tr><tr><td><code>start_at</code></td><td>HH:MM locally or RFC3339 with offset; null for now.</td></tr><tr><td><code>tags</code></td><td>At most 16 tags; null for none.</td></tr><tr><td><code>until</code></td><td>HH:MM locally or RFC3339 with offset.</td></tr></tbody></table></div><h3 id="tool-cancel-job"><code>cancel_job</code></h3><p>Cancel the specified schedule. Existing output stays saved. Cancelling another participant’s job asks for approval.</p><p>Minimum risk class: <code>bounded</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>camera</code></td><td>Connected camera.</td></tr><tr><td><code>job_id</code></td><td>Schedule ID from list_jobs.</td></tr></tbody></table></div><h3 id="tool-stream-to-url"><code>stream_to_url</code></h3><p>Send video to RTSP, RTMP or SRT. Approval is always necessary. Supply passwords separately.</p><p>Minimum risk class: <code>disruptive</code>. Session: necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>bitrate</code></td><td>Video bitrate such as 4M; Video settings by default.</td></tr><tr><td><code>camera</code></td><td>Connected camera.</td></tr><tr><td><code>codec</code></td><td>Video settings by default; h265 normalizes to hevc.</td></tr><tr><td><code>duration</code></td><td>Duration with units, at least 1 second.</td></tr><tr><td><code>fps</code></td><td>0.1..240; Video settings by default.</td></tr><tr><td><code>url</code></td><td>RTSP, RTMP or SRT destination without credentials.</td></tr></tbody></table></div><h3 id="tool-create-folder-destination"><code>create_folder_destination</code></h3><p>Create a new named folder destination. Human approval is necessary.</p><p>Minimum risk class: <code>human_only</code>. Session: not always necessary.</p><div class="table-scroll"><table><thead><tr><th>Argument</th><th>Meaning</th></tr></thead><tbody><tr><td><code>name</code></td><td>A new destination name, 1..64 letters, digits, dots, underscores or hyphens.</td></tr><tr><td><code>path</code></td><td>An absolute capture folder; ~/ expands to the home folder.</td></tr></tbody></table></div></article>
+<article class="doc-section" id="rpc-reference" data-doc-section data-doc-title="RPC operations" data-doc-category="Command reference" data-doc-tags="discover,network_scan,optimize_network,connect,select,disconnect,get,set,set_many,execute,start,stop,undo,redo,replay_camera_change,auto,manual,capture,schedule,jobs,cancel_job,status,frame,activity,features,xml,read_memory,write_memory,forward,stop_forward,stop_forward_if,dataset_open,dataset_close,dataset_status,dataset_note,dataset_query,dataset_export,dataset_open_if,dataset_close_if,dataset_note_if,dataset_query_if,dataset_model_query_if,dataset_export_if"><h2>RPC operations</h2><p class="doc-summary">Use structured JSON to control a running session.</p>
+<p>Send a JSON object to <code>capturefab --session NAME rpc</code> through stdin. Set <code>op</code> to the operation below.</p><p>For HTTP, use <code>POST /api/command</code> with <code>{version:1, camera:ID, command:{op:…}}</code>.</p><p>Private local IPC uses an authentication token. The HTTP listener uses network access controls and has no separate login.</p><p>Use <code>schema --json</code> for runnable request examples, response fields and errors. Private IPC requests have a 1 MiB size limit.</p><div class="code-wrap"><pre><code>printf '%s\n' '{"op":"frame","fresh":1,"max_dimension":1024}' | capturefab --session bench --camera sim:0 rpc --json</code></pre></div>
+<p>RPC <code>frame</code> format is <code>auto</code>, <code>jpeg</code> or <code>png</code>. Auto selects JPEG when supported, otherwise PNG.</p><p>RPC <code>frame</code> accepts fresh 0–10 and timeout_ms 1–10,000. The default timeout is 3,000 ms.</p><p>Its longest preview edge is 64–2,048 pixels, default 1,024. Use 0 for measurements only; encoded images have a 1.5 MiB limit.</p><p>Use normalized <code>[x,y,width,height]</code> for a region. A stopped camera acquires one frame and remains stopped; scanners are refused.</p><div class="table-scroll"><table><thead><tr><th>Operation</th><th>Purpose and inputs</th></tr></thead><tbody><tr id="rpc-discover"><td><code>discover</code></td><td>Find cameras. Inputs: timeout_ms and simulated.</td></tr><tr id="rpc-network-scan"><td><code>network_scan</code></td><td>Examine GigE paths and tune connected cameras. Input: timeout_ms.</td></tr><tr id="rpc-optimize-network"><td><code>optimize_network</code></td><td>Apply a byte-per-second budget to the addressed camera. Prefer network_scan for shared interfaces.</td></tr><tr id="rpc-connect"><td><code>connect</code></td><td>Connect camera with timeout_ms.</td></tr><tr id="rpc-select"><td><code>select</code></td><td>Set the CLI default camera.</td></tr><tr id="rpc-disconnect"><td><code>disconnect</code></td><td>Disconnect the addressed camera.</td></tr><tr id="rpc-get"><td><code>get</code></td><td>Read feature.</td></tr><tr id="rpc-set"><td><code>set</code></td><td>Write one feature and value.</td></tr><tr id="rpc-set-many"><td><code>set_many</code></td><td>Write values atomically. Each entry contains feature and value; 1–32 entries share one undo checkpoint.</td></tr><tr id="rpc-execute"><td><code>execute</code></td><td>Execute a camera command named by feature.</td></tr><tr id="rpc-start"><td><code>start</code></td><td>Start acquisition.</td></tr><tr id="rpc-stop"><td><code>stop</code></td><td>Stop acquisition.</td></tr><tr id="rpc-undo"><td><code>undo</code></td><td>Undo the latest reversible camera change.</td></tr><tr id="rpc-redo"><td><code>redo</code></td><td>Redo the latest undone camera change.</td></tr><tr id="rpc-replay-camera-change"><td><code>replay_camera_change</code></td><td>Replay the supplied token with undo true or false. Refuse stale or conflicting camera state.</td></tr><tr id="rpc-auto"><td><code>auto</code></td><td>Enable automatic control. Optional balance: 0–1.</td></tr><tr id="rpc-manual"><td><code>manual</code></td><td>Hold current values. Set revert true to restore pre-auto values.</td></tr><tr id="rpc-capture"><td><code>capture</code></td><td>Save output with count, timeout_ms and format. Optional storage, destination, on_exists and context match CLI capture.</td></tr><tr id="rpc-schedule"><td><code>schedule</code></td><td>Schedule captures with first_at_ms and interval_ms. Other fields match capture.</td></tr><tr id="rpc-jobs"><td><code>jobs</code></td><td>Read capture jobs.</td></tr><tr id="rpc-cancel-job"><td><code>cancel_job</code></td><td>Cancel the job named by id.</td></tr><tr id="rpc-status"><td><code>status</code></td><td>Read session and camera state.</td></tr><tr id="rpc-frame"><td><code>frame</code></td><td>Read measurements and a bounded preview. Inputs: fresh, timeout_ms, max_dimension, format and optional region.</td></tr><tr id="rpc-activity"><td><code>activity</code></td><td>Read session activity. Optional after and timeout_ms wait for a newer revision.</td></tr><tr id="rpc-features"><td><code>features</code></td><td>Read camera features.</td></tr><tr id="rpc-xml"><td><code>xml</code></td><td>Read the GenICam XML.</td></tr><tr id="rpc-read-memory"><td><code>read_memory</code></td><td>Read length bytes at address.</td></tr><tr id="rpc-write-memory"><td><code>write_memory</code></td><td>Write the byte array data at address. This cannot be undone.</td></tr><tr id="rpc-forward"><td><code>forward</code></td><td>Start video output with codec, encoder, fps and bitrate. Optional duration_ms enforces a stop deadline.</td></tr><tr id="rpc-stop-forward"><td><code>stop_forward</code></td><td>Stop the current encoder.</td></tr><tr id="rpc-stop-forward-if"><td><code>stop_forward_if</code></td><td>Stop only when forwarding_id matches the current instance.</td></tr><tr id="rpc-dataset-open"><td><code>dataset_open</code></td><td>Open path with mode auto, create or open. Optional max_bytes sets the dataset growth limit.</td></tr><tr id="rpc-dataset-close"><td><code>dataset_close</code></td><td>Close the dataset.</td></tr><tr id="rpc-dataset-status"><td><code>dataset_status</code></td><td>Read dataset state.</td></tr><tr id="rpc-dataset-note"><td><code>dataset_note</code></td><td>Add text, optional context and optional camera attribution.</td></tr><tr id="rpc-dataset-query"><td><code>dataset_query</code></td><td>Run read-only sql with limit and timeout_ms.</td></tr><tr id="rpc-dataset-export"><td><code>dataset_export</code></td><td>Export output with formats, tables, optional since_ms and until_ms, and storage policy.</td></tr><tr id="rpc-dataset-open-if"><td><code>dataset_open_if</code></td><td>Open only if expected_slot_id still matches. Other fields match dataset_open.</td></tr><tr id="rpc-dataset-close-if"><td><code>dataset_close_if</code></td><td>Close only the supplied slot_id.</td></tr><tr id="rpc-dataset-note-if"><td><code>dataset_note_if</code></td><td>Add a note only to the supplied slot_id.</td></tr><tr id="rpc-dataset-query-if"><td><code>dataset_query_if</code></td><td>Query only the supplied slot_id. <code>max_result_bytes</code> bounds the response.</td></tr><tr id="rpc-dataset-model-query-if"><td><code>dataset_model_query_if</code></td><td>Query a private metadata-filtered snapshot of the supplied slot_id. Bounds also apply to results.</td></tr><tr id="rpc-dataset-export-if"><td><code>dataset_export_if</code></td><td>Export only the supplied slot_id. <code>approved_root</code> pins the output root; max_bytes and timeout_ms bound the operation.</td></tr></tbody></table></div>
+</article>
+</div></main><footer class="site-footer"><p>Capturefab · <a href="docs.html">User guide</a> · <a href="downloads.html">Downloads</a> · <a href="https://github.com/capturefab/capturefab">Source</a></p></footer></div></body></html>

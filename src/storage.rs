@@ -14,15 +14,12 @@
 //! files are kept. A crash between those two steps leaves records that loading
 //! skips by number. A crash during an append leaves an unterminated last line,
 //! which the next locker truncates; any other unreadable record fails closed.
-//! Version 2 marks this format, so older binaries refuse the ledger as
-//! unsupported instead of ignoring the journal; a version 1 ledger is converted
-//! on its first lock.
+//! Version 3 records both individual captures and task namespaces. Known older
+//! ledgers are upgraded only after their complete journal has been validated.
 mod namespace;
 mod output_directory;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
-#[cfg(feature = "gui")]
-pub(crate) use namespace::{RecoveredNamespace, copy_task_namespace};
 pub(crate) use namespace::{
     RetainedNamespaceLease, ensure_not_task_namespace, recover_task_namespaces,
     reserve_task_namespace,
@@ -43,17 +40,11 @@ use std::{
 };
 
 const LEDGER_LIMIT: u64 = 64 * 1024 * 1024;
-const LEDGER_VERSION: u32 = 2;
-const NAMESPACE_LEDGER_VERSION: u32 = 3;
+const LEDGER_VERSION: u32 = 3;
 const SNAPSHOT: &str = "storage.json";
 const JOURNAL: &str = "storage.journal";
 const POLICY: &str = "storage-policy.json";
 const SUMMARY: &str = "storage-summary.json";
-pub(crate) static STATE: crate::ipc::StateSet = crate::ipc::StateSet {
-    what: "the storage ledger and budget",
-    names: &[POLICY, SUMMARY, JOURNAL, SNAPSHOT],
-    lock: Some("storage.lock"),
-};
 /// Tests compact far sooner, so that they exercise it.
 const COMPACT_BYTES: u64 = if cfg!(test) { 64 * 1024 } else { 1024 * 1024 };
 /// Entries without a live reservation only change when something else touches
@@ -186,7 +177,7 @@ struct Entry {
     modified_ns: Option<u64>,
     #[serde(default)]
     changed: bool,
-    /// Queued for upload: retention must not delete it before then.
+    /// Legacy unsent file: retain its old protection when reading existing ledgers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_upload: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -365,12 +356,8 @@ fn lock_wait(file: &File) -> Result<()> {
 }
 impl Manager {
     /// The one place the storage bookkeeping directory is chosen; every
-    /// ledger, policy and summary path is resolved from it. Leases of
-    /// writers an older version left running are not moved, so their
-    /// reservations are reclaimed as interrupted.
+    /// ledger, policy and summary path is resolved from it.
     fn global() -> Self {
-        static ADOPTED: std::sync::Once = std::sync::Once::new();
-        ADOPTED.call_once(|| crate::ipc::adopt_state(&STATE));
         Self {
             directory: crate::ipc::state_dir(),
         }
@@ -759,7 +746,7 @@ fn read_header(journal: &mut File) -> Result<(JournalHeader, u64)> {
         .flatten()
         .ok_or_else(|| anyhow!("invalid storage journal header; preserve storage.json and storage.journal and inspect them before resetting ownership"))?;
     ensure!(
-        matches!(header.version, LEDGER_VERSION | NAMESPACE_LEDGER_VERSION),
+        matches!(header.version, 2 | LEDGER_VERSION),
         "unsupported storage journal version"
     );
     Ok((header, line.len() as u64))
@@ -844,31 +831,32 @@ impl Locked {
             None => Ledger::default(),
         };
         ensure!(
-            matches!(
-                self.ledger.version,
-                1 | LEDGER_VERSION | NAMESPACE_LEDGER_VERSION
-            ) && self.ledger.entries.len() <= 100_000,
+            (1..=LEDGER_VERSION).contains(&self.ledger.version)
+                && self.ledger.entries.len() <= 100_000,
             "unsupported or oversized storage ledger"
         );
+        let mut upgrade = self.ledger.version < LEDGER_VERSION;
         self.validate()?;
         self.position = Position {
             snapshot,
             ..Position::default()
         };
         self.journal = None;
-        if self.ledger.version == 1 {
-            // Version 1 had no journal. Rewriting it in this format makes
-            // older binaries refuse it from now on.
-            self.ledger.version = LEDGER_VERSION;
-            self.compact()?;
-            self.write_summary();
-            return Ok(());
-        }
         if let Some(mut journal) = self.open_journal()? {
             let (header, offset) = read_header(&mut journal)?;
+            upgrade |= header.version < LEDGER_VERSION;
             self.position.journal = Some(header.journal);
             self.replay(&mut journal, offset)?;
             self.journal = Some(journal);
+        }
+        if upgrade {
+            // Keep every entry and live lease, including retired upload holds.
+            // Replay must succeed before either file can be replaced. If a
+            // crash leaves the old v2 journal after the v3 snapshot, its record
+            // sequence numbers let the next load skip already included changes.
+            self.ledger.version = LEDGER_VERSION;
+            self.compact()?;
+            self.write_summary();
         }
         Ok(())
     }
@@ -952,7 +940,7 @@ impl Locked {
         for entry in &self.ledger.entries {
             check_entry(entry)?;
             ensure!(
-                entry.namespace.is_none() || self.ledger.version == NAMESPACE_LEDGER_VERSION,
+                entry.namespace.is_none() || self.ledger.version == LEDGER_VERSION,
                 "task namespaces require storage ledger version 3"
             );
             ensure!(
@@ -1845,32 +1833,6 @@ pub fn save_bytes(bytes: &[u8], path: &Path, policy: &StoragePolicy) -> Result<S
     writer.finish_written()?;
     Ok(stored)
 }
-/// Hold a finished capture back from retention while it waits for upload,
-/// or release it. Returns the SHA-256 recorded when the file was finished.
-pub fn hold_for_upload(path: &Path, held: bool) -> Result<String> {
-    let mut locked = Manager::global().lock()?;
-    let index = locked.find(path)?;
-    let entry = &locked.ledger.entries[index];
-    let sha256 = entry
-        .sha256
-        .clone()
-        .ok_or_else(|| anyhow!("{} has no recorded checksum", entry.path.display()))?;
-    if entry.pending_upload != held {
-        locked.entry_mut(index).pending_upload = held;
-        locked.persist()?;
-    }
-    Ok(sha256)
-}
-/// Delete the local copy of an uploaded capture, only if it is still exactly
-/// the file Capturefab wrote (identity, size, time and SHA-256).
-pub fn remove_uploaded(path: &Path) -> Result<bool> {
-    let mut locked = Manager::global().lock()?;
-    let index = locked.find(path)?;
-    locked.entry_mut(index).pending_upload = false;
-    let removed = locked.delete(index);
-    locked.persist()?;
-    removed
-}
 /// Delete a finished capture only if it is still exactly the file Capturefab
 /// wrote. False when the ledger does not track it or it changed; it is kept.
 pub fn remove(path: &Path) -> Result<bool> {
@@ -1911,7 +1873,7 @@ fn read_usage(directory: &Path) -> Result<Option<Usage>> {
                 .context("invalid storage usage summary")?;
             Ok((summary.version == 1).then_some(summary.usage))
         }
-        // Nothing saved yet, or written by a version without the summary.
+        // Nothing saved yet, or a commit interrupted before its summary.
         Err(error) if not_found(&error) => Ok(fs::symlink_metadata(directory.join(SNAPSHOT))
             .is_err()
             .then(Usage::default)),
@@ -2974,7 +2936,44 @@ mod tests {
         assert_eq!(fs::read(temp.path("capture")).unwrap(), b"data");
     }
     #[test]
-    fn a_version_1_ledger_is_converted_and_newer_versions_are_refused() {
+    fn unsupported_storage_versions_are_refused_without_rewriting() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        completed(
+            &manager,
+            &temp.path("capture"),
+            &policy(100, 10, "stop"),
+            b"data",
+        );
+        let snapshot = manager.directory.join(SNAPSHOT);
+        let journal = manager.directory.join(JOURNAL);
+        for version in [0, LEDGER_VERSION + 1] {
+            let bytes = json!({"version": version, "sequence": 0, "entries": []}).to_string();
+            fs::write(&snapshot, &bytes).unwrap();
+            forget(&manager);
+            let error = manager.lock().err().unwrap().to_string();
+            assert!(error.contains("unsupported"), "{error}");
+            assert_eq!(fs::read_to_string(&snapshot).unwrap(), bytes);
+        }
+        fs::write(&snapshot, serde_json::to_vec(&Ledger::default()).unwrap()).unwrap();
+        for version in [0, 1, LEDGER_VERSION + 1] {
+            let bytes = format!(
+                "{}\n",
+                json!({"version": version, "journal": nonce().unwrap()})
+            );
+            fs::write(&journal, &bytes).unwrap();
+            forget(&manager);
+            let error = manager.lock().err().unwrap().to_string();
+            assert!(
+                error.contains("unsupported storage journal version"),
+                "{error}"
+            );
+            assert_eq!(fs::read_to_string(&journal).unwrap(), bytes);
+        }
+        assert_eq!(fs::read(temp.path("capture")).unwrap(), b"data");
+    }
+    #[test]
+    fn version_1_snapshot_upgrades_without_losing_owned_files() {
         let temp = Temp::new();
         let manager = temp.manager();
         completed(
@@ -2985,22 +2984,127 @@ mod tests {
         );
         let entries = manager.lock().unwrap().ledger.entries.clone();
         let snapshot = manager.directory.join(SNAPSHOT);
-        let journal = manager.directory.join(JOURNAL);
         fs::write(
             &snapshot,
             json!({"version": 1, "entries": entries}).to_string(),
         )
         .unwrap();
-        fs::remove_file(&journal).unwrap();
+        fs::remove_file(manager.directory.join(JOURNAL)).unwrap();
         forget(&manager);
-        assert_eq!(manager.lock().unwrap().allocated().unwrap(), 4);
-        let converted: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
-        assert_eq!(converted["version"], LEDGER_VERSION);
-        assert!(journal.exists());
-        fs::write(&snapshot, json!({"version": 4, "entries": []}).to_string()).unwrap();
+        let loaded = manager.lock().unwrap();
+        assert_eq!(loaded.ledger.version, LEDGER_VERSION);
+        assert_eq!(loaded.allocated().unwrap(), 4);
+        assert_eq!(
+            serde_json::to_value(&loaded.ledger.entries).unwrap(),
+            serde_json::to_value(&entries).unwrap()
+        );
+        let migrated: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        assert_eq!(migrated["version"], LEDGER_VERSION);
+        assert!(manager.directory.join(JOURNAL).exists());
+        assert_eq!(fs::read(temp.path("capture")).unwrap(), b"data");
+    }
+    #[test]
+    fn version_2_upgrade_replays_changes_and_preserves_live_and_upload_holds() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let policy = policy(100, 10, "stop");
+        completed(&manager, &temp.path("pending"), &policy, b"data");
+        let mut live = manager.writer(&temp.path("live"), &policy, 10).unwrap();
+        live.write_all(b"live").unwrap();
+        manager.lock().unwrap().compact().unwrap();
+        {
+            let mut locked = manager.lock().unwrap();
+            let pending = locked.find(&temp.path("pending")).unwrap();
+            locked.entry_mut(pending).pending_upload = true;
+            locked.persist().unwrap();
+        }
+        completed(&manager, &temp.path("second"), &policy, b"two");
+        let expected = serde_json::to_value(&manager.lock().unwrap().ledger.entries).unwrap();
+        let snapshot = manager.directory.join(SNAPSHOT);
+        let journal = manager.directory.join(JOURNAL);
+        let mut old_snapshot: Value =
+            serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        old_snapshot["version"] = json!(2);
+        fs::write(&snapshot, old_snapshot.to_string()).unwrap();
+        let original_journal = fs::read_to_string(&journal).unwrap();
+        let (header, records) = original_journal.split_once('\n').unwrap();
+        assert!(
+            !records.is_empty(),
+            "the migration must replay live changes"
+        );
+        let mut header: Value = serde_json::from_str(header).unwrap();
+        header["version"] = json!(2);
+        let old_journal = format!("{header}\n{records}");
+        fs::write(&journal, &old_journal).unwrap();
         forget(&manager);
-        let error = manager.lock().err().unwrap().to_string();
-        assert!(error.contains("unsupported"), "{error}");
+        {
+            let loaded = manager.lock().unwrap();
+            assert_eq!(loaded.ledger.version, LEDGER_VERSION);
+            assert_eq!(loaded.allocated().unwrap(), 17);
+            assert_eq!(
+                serde_json::to_value(&loaded.ledger.entries).unwrap(),
+                expected
+            );
+            let pending = loaded.find(&temp.path("pending")).unwrap();
+            assert!(loaded.ledger.entries[pending].pending_upload);
+            assert!(!Locked::removable(&loaded.ledger.entries[pending]));
+            let active = loaded
+                .ledger
+                .entries
+                .iter()
+                .find(|entry| entry.path == live.path())
+                .expect("the live reservation survives the upgrade");
+            assert!(active.lease.is_some());
+            assert_eq!(active.reserved, 10);
+        }
+        assert!(
+            manager
+                .writer(&temp.path("over-budget"), &policy, 84)
+                .is_err()
+        );
+        // Simulate an interrupted migration: v3 snapshot, old v2 journal.
+        fs::write(&journal, &old_journal).unwrap();
+        forget(&manager);
+        {
+            let reloaded = manager.lock().unwrap();
+            assert_eq!(reloaded.allocated().unwrap(), 17);
+            assert_eq!(
+                serde_json::to_value(&reloaded.ledger.entries).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(fs::read(temp.path("pending")).unwrap(), b"data");
+        assert_eq!(fs::read(temp.path("second")).unwrap(), b"two");
+        live.finish().unwrap();
+        assert_eq!(fs::read(temp.path("live")).unwrap(), b"live");
+        assert_eq!(manager.lock().unwrap().allocated().unwrap(), 11);
+    }
+    #[test]
+    fn invalid_version_2_journal_never_rewrites_the_snapshot() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        completed(
+            &manager,
+            &temp.path("capture"),
+            &policy(100, 10, "stop"),
+            b"data",
+        );
+        let snapshot = manager.directory.join(SNAPSHOT);
+        let journal = manager.directory.join(JOURNAL);
+        let mut value: Value = serde_json::from_slice(&fs::read(&snapshot).unwrap()).unwrap();
+        value["version"] = json!(2);
+        let snapshot_bytes = value.to_string();
+        let journal_bytes = format!(
+            "{}\ninvalid journal record\n",
+            json!({"version": 2, "journal": nonce().unwrap()})
+        );
+        fs::write(&snapshot, &snapshot_bytes).unwrap();
+        fs::write(&journal, &journal_bytes).unwrap();
+        forget(&manager);
+        assert!(manager.lock().is_err());
+        assert_eq!(fs::read_to_string(&snapshot).unwrap(), snapshot_bytes);
+        assert_eq!(fs::read_to_string(&journal).unwrap(), journal_bytes);
+        assert_eq!(fs::read(temp.path("capture")).unwrap(), b"data");
     }
     #[test]
     fn usage_and_policy_are_read_without_the_lock() {

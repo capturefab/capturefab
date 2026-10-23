@@ -122,9 +122,6 @@ impl Workbench {
             );
         }
         self.assistant.tasks.tick(self.now);
-        if self.assistant.tasks.take_context_refresh() {
-            self.assistant.quick.refresh_context(self.now);
-        }
         if let Some(target) = self.assistant.tasks.take_takeover() {
             self.assistant.takeover = Some(target);
         }
@@ -182,10 +179,6 @@ impl Workbench {
             self.assistant.quick.settings.clone()
         };
         self.assistant.quick.configure(settings.clone(), services);
-        self.assistant
-            .quick
-            .source_setup
-            .configure(Arc::new(source_setup::Native(self.handle.clone())));
         let task_services = Arc::new(tasks_worker::NativeServices::new(
             self.handle.clone(),
             self.actor.clone(),
@@ -198,10 +191,6 @@ impl Workbench {
             },
         ));
         self.assistant.tasks.configure(settings, task_services);
-        self.assistant
-            .tasks
-            .source_setup
-            .configure(Arc::new(source_setup::Native(self.handle.clone())));
         if self.assistant.settings.loaded() {
             self.assistant
                 .quick
@@ -243,11 +232,16 @@ impl Workbench {
                 tasks::TakeoverTarget::Data => {
                     let _ = self.update_assistant(Input::Quick(quick::Input::Open(false)));
                     self.set_notice(
-                        "You have control of data sources. The assistant stopped.",
+                        "You have control of the camera dataset. The assistant stopped.",
                         None,
                         Level::Done,
                     );
-                    self.open_data_sources()
+                    self.tab = Tab::Capture;
+                    self.sidebar_open = true;
+                    self.sidebar_peek = true;
+                    self.sidebar_summoned = true;
+                    self.restore_open_sections(&["dataset".into()]);
+                    Task::none()
                 }
             };
         }

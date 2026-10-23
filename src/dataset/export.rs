@@ -4,7 +4,7 @@
 pub(super) mod bounded;
 use super::{
     ExportFormat, Reader, TABLES,
-    db::{file_label, now_ms, sql_text},
+    db::{file_label, now_ms},
     query::with_timeout,
 };
 use crate::storage::StoragePolicy;
@@ -22,8 +22,6 @@ use std::{
 const METADATA_RESERVE: u64 = 64 * 1024;
 /// The "Summary for AI tools" section stays under this many bytes.
 pub const SUMMARY_BYTES: usize = 8 * 1024;
-/// `captures_wide` is written only for 1..=256 distinct tags.
-pub const WIDE_TAGS: usize = 256;
 pub const MAX_TIMEOUT_MS: u64 = 600_000;
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(570);
 
@@ -78,9 +76,8 @@ impl ExportFormat {
 /// The time column each table is filtered on.
 fn time_column(table: &str) -> Option<&'static str> {
     match table {
-        "captures" | "events" | "captures_with_signals" | "captures_wide" => Some("wall_ms"),
+        "captures" | "events" => Some("wall_ms"),
         "recordings" => Some("start_ms"),
-        "samples" => Some("ts_ms"),
         _ => None,
     }
 }
@@ -91,15 +88,7 @@ fn describe_table(table: &str) -> &'static str {
             "One row per saved image, with camera identity, frame metadata, file path, SHA-256 and capture context."
         }
         "recordings" => "One row per finished local video recording.",
-        "signals" => "One row per sensor or PLC tag: source, redacted URI, unit and kind.",
-        "samples" => "Every logged signal sample. ts_ms is the host clock when the value was read.",
-        "events" => "Notes, dataset open/close, data gaps and signal errors.",
-        "captures_with_signals" => {
-            "Each capture joined with the latest sample of every tag at or before the capture time (ASOF join). sample_age_ms is how old that sample was."
-        }
-        "captures_wide" => {
-            "One row per capture with one column per tag (latest numeric value at or before capture time)."
-        }
+        "events" => "Notes, dataset open/close and data gaps.",
         _ => "",
     }
 }
@@ -111,26 +100,15 @@ fn describe_column(name: &str) -> &'static str {
             "UTC Unix milliseconds, host clock, when the frame was received or the event happened"
         }
         "start_ms" | "end_ms" => "Recording start or end, UTC Unix milliseconds",
-        "ts_ms" | "sample_ms" => "UTC Unix milliseconds, host clock, when the value was read",
-        "source_ts_ms" => "The device's own timestamp, when the protocol reports one",
-        "sample_age_ms" => "wall_ms minus sample_ms",
         "camera_id" => "Camera identifier",
         "path" => "Absolute path of the saved file on the capturing computer",
         "file_name" => "File name of the saved file",
         "sha256" => "SHA-256 of the file as written",
         "bytes" => "File size in bytes",
-        "object_key" => {
-            "Remote object key when the file was queued for upload; the file may then live only on the remote"
-        }
+        "object_key" => "Legacy remote object key from a catalogue created by an older version",
         "context" => "Capture context (line, station, part, lot, note) as JSON text",
         "frame_id" => "Camera frame counter",
         "timestamp_ns" => "Camera or transport timestamp in nanoseconds (device clock)",
-        "value_double" => "Numeric value; booleans are 0 or 1",
-        "value_text" => "Text value; booleans are 'true' or 'false'",
-        "quality" => "good, uncertain or bad",
-        "unit" => "Engineering unit, when known",
-        "tag" => "Signal tag name",
-        "source_id" => "Signal source identifier (signal:<hex>)",
         "vendor" | "model" | "serial" => "Camera vendor, model or serial number, as reported",
         "transport" => "How the camera was reached, such as gige, media or simulator",
         "source" => "Camera address or stream URL, with credentials removed",
@@ -142,13 +120,10 @@ fn describe_column(name: &str) -> &'static str {
         "codec" | "encoder" | "fps" => "Video codec, FFmpeg encoder and frame rate",
         "destination" => "Saved destination name, when one was used",
         "upload_id" | "remote_url" | "uploaded_ms" => {
-            "Upload queue entry, remote location and upload time (UTC Unix milliseconds), once uploaded"
+            "Legacy transfer metadata retained from older catalogues; not used for new saves"
         }
-        "protocol" => "Signal protocol (modbus-tcp, mqtt, opc.tcp, mtconnect, sim-signal)",
-        "uri" => "Signal source URI, with credentials removed",
-        "kind" => "Value kind for signals (number, bool, text); event kind for events",
-        "description" => "Tag description, when the source reports one",
-        "first_ms" | "last_ms" => "First and last sample, UTC Unix milliseconds",
+        "kind" => "Event kind",
+        "first_ms" | "last_ms" => "First and last capture, UTC Unix milliseconds",
         "text" => "Event text, such as a note",
         _ => "",
     }
@@ -399,7 +374,6 @@ fn write_new(to: &Path, bytes: &[u8], policy: &StoragePolicy) -> Result<(u64, St
 struct Metadata {
     columns: BTreeMap<String, Vec<(String, String)>>,
     cameras: Vec<Value>,
-    signals: Vec<Value>,
     notes: Vec<(u64, String)>,
     /// Capture context key -> value -> captures.
     contexts: BTreeMap<String, BTreeMap<String, u64>>,
@@ -456,63 +430,12 @@ impl ExportSource<'_> {
         }
     }
 
-    /// The SELECT for `captures_wide`, or `None` without 1..=256 tags.
-    fn wide_select(&self, request: &ExportRequest) -> Result<Option<String>> {
-        let pairs: Vec<(String, String)> = {
-            let mut statement = self
-                .conn
-                .prepare("SELECT DISTINCT source_id, tag FROM samples ORDER BY tag, source_id")?;
-            statement
-                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .collect::<duckdb::Result<_>>()?
-        };
-        if pairs.is_empty() || pairs.len() > WIDE_TAGS {
-            return Ok(None);
-        }
-        let mut seen = BTreeMap::<&str, usize>::new();
-        for (_, tag) in &pairs {
-            *seen.entry(tag.as_str()).or_default() += 1;
-        }
-        let repeated = seen.values().any(|count| *count > 1);
-        let key = if repeated {
-            "source_id || ':' || tag"
-        } else {
-            "tag"
-        };
-        let keys: Vec<String> = pairs
-            .iter()
-            .map(|(source, tag)| {
-                let key = if repeated {
-                    format!("{source}:{tag}")
-                } else {
-                    tag.clone()
-                };
-                format!("'{}'", sql_text(&key))
-            })
-            .collect();
-        Ok(Some(format!(
-            "SELECT * FROM (PIVOT (SELECT capture_id, wall_ms, camera_id, path, value_double, {key} AS key
-               FROM captures_with_signals{}) ON key IN ({}) USING first(value_double)
-               GROUP BY capture_id, wall_ms, camera_id, path) ORDER BY capture_id",
-            self.filter("captures_with_signals", request),
-            keys.join(", ")
-        )))
-    }
-
     pub(super) fn export_select(
         &self,
         table: &str,
         request: &ExportRequest,
     ) -> Result<Option<String>> {
-        if table == "captures_wide" {
-            return self.wide_select(request);
-        }
-        let order = match table {
-            "signals" => " ORDER BY source_id, tag",
-            "samples" => " ORDER BY ts_ms",
-            "captures_with_signals" => " ORDER BY capture_id, source_id, tag",
-            _ => " ORDER BY 1",
-        };
+        let order = " ORDER BY 1";
         Ok(Some(format!(
             "SELECT * FROM {table}{}{order}",
             self.filter(table, request)
@@ -522,13 +445,13 @@ impl ExportSource<'_> {
     fn metadata(&self, request: &ExportRequest) -> Result<Metadata> {
         let conn = &self.conn;
         let mut meta = Metadata::default();
-        for table in TABLES.iter().filter(|t| **t != "captures_wide") {
+        for table in &TABLES {
             let mut statement = conn.prepare(&format!("DESCRIBE {table}"))?;
             let columns = statement
                 .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
                 .collect::<duckdb::Result<Vec<_>>>()?;
             meta.columns.insert(table.to_string(), columns);
-            if *table != "captures_with_signals" {
+            {
                 let count: u64 = conn.query_row(
                     &format!(
                         "SELECT count(*) FROM {table}{}",
@@ -557,30 +480,6 @@ impl ExportSource<'_> {
                     "captures": r.get::<_, u64>(5)?,
                     "first_ms": r.get::<_, Option<u64>>(6)?,
                     "last_ms": r.get::<_, Option<u64>>(7)?,
-                }))
-            })?
-            .collect::<duckdb::Result<_>>()?;
-        let sample_filter = self.filter("samples", request).replace("WHERE", "AND");
-        let mut statement = conn.prepare(&format!(
-            "SELECT g.source_id, g.uri, g.tag, g.unit, g.kind, count(s.ts_ms), min(s.value_double),
-                    max(s.value_double), avg(s.value_double), min(s.ts_ms), max(s.ts_ms)
-             FROM signals g LEFT JOIN samples s ON s.source_id = g.source_id AND s.tag = g.tag{sample_filter}
-             GROUP BY ALL ORDER BY g.source_id, g.tag"
-        ))?;
-        meta.signals = statement
-            .query_map([], |r| {
-                Ok(json!({
-                    "source_id": r.get::<_, String>(0)?,
-                    "uri": r.get::<_, String>(1)?,
-                    "tag": r.get::<_, String>(2)?,
-                    "unit": r.get::<_, Option<String>>(3)?,
-                    "kind": r.get::<_, Option<String>>(4)?,
-                    "samples": r.get::<_, u64>(5)?,
-                    "min": r.get::<_, Option<f64>>(6)?,
-                    "max": r.get::<_, Option<f64>>(7)?,
-                    "mean": r.get::<_, Option<f64>>(8)?,
-                    "first_ms": r.get::<_, Option<u64>>(9)?,
-                    "last_ms": r.get::<_, Option<u64>>(10)?,
                 }))
             })?
             .collect::<duckdb::Result<_>>()?;
@@ -624,10 +523,9 @@ impl ExportSource<'_> {
         let (first, last): (Option<u64>, Option<u64>) = conn.query_row(
             &format!(
                 "SELECT min(t), max(t) FROM (SELECT wall_ms AS t FROM captures{} UNION ALL
-                 SELECT start_ms FROM recordings{} UNION ALL SELECT ts_ms FROM samples{})",
+                 SELECT start_ms FROM recordings{})",
                 self.filter("captures", request),
-                self.filter("recordings", request),
-                self.filter("samples", request)
+                self.filter("recordings", request)
             ),
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
@@ -644,16 +542,6 @@ impl ExportSource<'_> {
         files: &[Value],
         meta: &Metadata,
     ) -> Value {
-        let units: BTreeMap<String, String> = meta
-            .signals
-            .iter()
-            .filter_map(|s| {
-                Some((
-                    s["tag"].as_str()?.to_owned(),
-                    s["unit"].as_str()?.to_owned(),
-                ))
-            })
-            .collect();
         let mut tables = Vec::new();
         for table in TABLES {
             let table_files: Vec<Value> = files
@@ -669,36 +557,9 @@ impl ExportSource<'_> {
                 .find(|f| f["table"] == table)
                 .map(|f| f["rows"].clone())
                 .unwrap_or(Value::Null);
-            let columns: Vec<Value> = match meta.columns.get(table) {
-                Some(columns) => columns
-                    .iter()
-                    .map(|(name, kind)| {
-                        let mut column = json!({"name": name, "type": kind, "description": describe_column(name)});
-                        if name == "value_double" && table == "samples" {
-                            column["unit"] = json!("see signals.unit for the tag");
-                        }
-                        column
-                    })
-                    .collect(),
-                None => {
-                    let mut columns = vec![
-                        json!({"name": "capture_id", "type": "UBIGINT", "description": describe_column("capture_id")}),
-                        json!({"name": "wall_ms", "type": "UBIGINT", "description": describe_column("wall_ms")}),
-                        json!({"name": "camera_id", "type": "VARCHAR", "description": describe_column("camera_id")}),
-                        json!({"name": "path", "type": "VARCHAR", "description": describe_column("path")}),
-                    ];
-                    for signal in &meta.signals {
-                        if let Some(tag) = signal["tag"].as_str() {
-                            let mut column = json!({"name": tag, "type": "DOUBLE", "description": "Latest value at or before wall_ms"});
-                            if let Some(unit) = units.get(tag) {
-                                column["unit"] = json!(unit);
-                            }
-                            columns.push(column);
-                        }
-                    }
-                    columns
-                }
-            };
+            let columns: Vec<Value> = meta.columns.get(table).into_iter().flatten()
+                .map(|(name, kind)| json!({"name":name,"type":kind,"description":describe_column(name)}))
+                .collect();
             tables.push(json!({
                 "name": table,
                 "rows": rows,
@@ -724,7 +585,6 @@ impl ExportSource<'_> {
             "last_ms": meta.last_ms,
             "tables": tables,
             "cameras": meta.cameras,
-            "signals": meta.signals,
         })
     }
 
@@ -738,7 +598,7 @@ impl ExportSource<'_> {
         };
         out.push_str(&format!("# {name}: Capturefab dataset export\n\n"));
         out.push_str(
-            "Images, recordings and sensor or PLC signals captured with Capturefab, exported for analysis.\n\
+            "Images and recordings captured with Capturefab, exported for analysis.\n\
              The files below describe what was saved and when; the images and videos themselves stay at the\n\
              paths listed in `captures.path` and `recordings.path`.\n\n",
         );
@@ -783,11 +643,7 @@ impl ExportSource<'_> {
             let name = table["name"].as_str().unwrap_or("data");
             let path = file["path"].as_str().unwrap_or("");
             let format = file["format"].as_str().unwrap_or("csv");
-            let variable = match name {
-                "captures_with_signals" => "joined",
-                "captures_wide" => "wide",
-                name => name,
-            };
+            let variable = name;
             let (pandas_reader, polars_reader, duck_reader, args) = match format {
                 "parquet" => ("read_parquet", "read_parquet", "read_parquet", ""),
                 "json" => ("read_json", "read_json", "read_json_auto", ""),
@@ -804,8 +660,7 @@ impl ExportSource<'_> {
         }
         out.push_str(&format!("\n## Loading\n\npandas:\n\n```python\n{pandas}```\n\nDuckDB:\n\n```sql\n{sql}```\n\npolars:\n\n```python\n{polars}```\n\n"));
         out.push_str(
-            "## Notes on paths\n\nMedia paths are absolute paths on the capturing computer. A non-null `object_key` means the \
-             file was queued for upload to that remote destination and may live only there.\n\n",
+            "## Notes on paths\n\nMedia paths are absolute paths on the capturing computer. Files are saved on the local or selected mounted drive.\n\n",
         );
         out.push_str(&self.summary(meta, &iso));
         out
@@ -854,24 +709,6 @@ impl ExportSource<'_> {
                 } else {
                     String::new()
                 }
-            ));
-        }
-        for signal in &meta.signals {
-            let number = |key: &str| {
-                signal[key]
-                    .as_f64()
-                    .map(|v| format!("{v:.4}"))
-                    .unwrap_or_else(|| "n/a".into())
-            };
-            lines.push(format!(
-                "- tag {} [{}] from {}: {} samples, min {}, max {}, mean {}",
-                signal["tag"].as_str().unwrap_or(""),
-                signal["unit"].as_str().unwrap_or("no unit"),
-                signal["uri"].as_str().unwrap_or(""),
-                signal["samples"],
-                number("min"),
-                number("max"),
-                number("mean")
             ));
         }
         for (ms, note) in &meta.notes {

@@ -1,12 +1,11 @@
 //! AWS Signature Version 4 and the AWS credential sources Capturefab reads:
-//! environment variables and the shared credentials and config files. S3
-//! uploads (`s3`) and Amazon Bedrock sign their requests with it.
+//! environment variables and the shared credentials and config files.
+//! Amazon Bedrock signs its requests with it.
 //!
 //! Secrets stay in buffers that are cleared when dropped, are never logged or
 //! serialized, and leave the process only as HMAC signatures. Capturefab does
 //! not run SSO sign-ins, `credential_process` helpers or instance-metadata
 //! lookups.
-use crate::destination::Credentials;
 use anyhow::{Result, anyhow, bail, ensure};
 use sha2::{Digest, Sha256};
 use std::{borrow::Cow, ffi::OsString, fmt::Write as _, path::PathBuf};
@@ -42,12 +41,10 @@ impl Keys {
         self.token.is_some()
     }
 
-    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     pub(crate) fn secret(&self) -> &str {
         &self.secret
     }
 
-    #[cfg_attr(not(feature = "s3"), allow(dead_code))]
     pub(crate) fn token(&self) -> Option<&str> {
         self.token.as_deref().map(String::as_str)
     }
@@ -95,24 +92,9 @@ fn var(vars: Vars<'_>, name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and, for temporary
-/// credentials, `AWS_SESSION_TOKEN`. The keys are not validated: each caller
-/// checks them with its own wording.
-pub(crate) fn keys_from_env_in(vars: Vars<'_>) -> Result<Keys> {
-    match (
-        var(vars, "AWS_ACCESS_KEY_ID"),
-        var(vars, "AWS_SECRET_ACCESS_KEY"),
-    ) {
-        (Some(id), Some(secret)) => Ok(Keys::new(id, secret, var(vars, "AWS_SESSION_TOKEN"))),
-        _ => bail!(
-            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set in the uploading process"
-        ),
-    }
-}
-
 /// The `[name]` profile of the AWS shared credentials file
 /// (`AWS_SHARED_CREDENTIALS_FILE`, else `~/.aws/credentials`), with its
-/// session token. Not validated, like `keys_from_env_in`.
+/// session token; the caller validates the selected credentials.
 pub(crate) fn keys_from_profile_in(name: &str, vars: Vars<'_>) -> Result<Keys> {
     let path =
         credentials_file(vars).ok_or_else(|| anyhow!("cannot locate the AWS credentials file"))?;
@@ -163,7 +145,14 @@ pub(crate) fn bedrock_chain_in(profile: Option<&str>, vars: Vars<'_>) -> Result<
             false,
         ),
     };
-    Credentials::Profile { name: name.clone() }.validate()?;
+    ensure!(
+        !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+        "AWS profile name must contain 1-64 ASCII letters, digits, dots, underscores or hyphens"
+    );
     // In the AWS CLI's order, a profile set up for SSO signs in with SSO even
     // when it also has static keys, and credential_process runs only without
     // them. Capturefab can do neither, so it refuses rather than sign with
@@ -797,33 +786,6 @@ mod tests {
             .starts_with(&format!("cannot read {}", missing.display()))
         );
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn environment_keys_need_both_variables() {
-        let keys = keys_from_env_in(&vars(&[
-            ("AWS_ACCESS_KEY_ID", &"AKIDEXAMPLE"),
-            ("AWS_SECRET_ACCESS_KEY", &"secret"),
-            ("AWS_SESSION_TOKEN", &"token"),
-        ]))
-        .unwrap();
-        assert_eq!(
-            (keys.id(), keys.secret(), keys.token()),
-            ("AKIDEXAMPLE", "secret", Some("token"))
-        );
-        for env in [
-            vars(&[("AWS_ACCESS_KEY_ID", &"AKIDEXAMPLE")]),
-            vars(&[
-                ("AWS_ACCESS_KEY_ID", &"AKIDEXAMPLE"),
-                ("AWS_SECRET_ACCESS_KEY", &""),
-            ]),
-            vars(&[]),
-        ] {
-            assert_eq!(
-                error_text(keys_from_env_in(&env)),
-                "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set in the uploading process"
-            );
-        }
     }
 
     #[test]

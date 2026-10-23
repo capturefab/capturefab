@@ -199,10 +199,9 @@ class ReleaseTests(unittest.TestCase):
                     release.build(args)
                 self.assertEqual(len(builds), 1)
                 for command, env in builds:
-                    features = command[-1].split(',')
-                    self.assertEqual('embedded-web' in features, web is not None, command)
+                    features = command[command.index('--features') + 1].split(',') if '--features' in command else []
+                    self.assertEqual(features, ['embedded-web'] if web else [], command)
                     self.assertEqual(env.get('CAPTUREFAB_WEB_DIST'), str(dist.resolve()) if web else None)
-                self.assertIn('wgpu', builds[0][0][-1].split(','))
                 self.assertNotIn('--no-default-features', builds[0][0])
 
     def test_package_records_and_licenses_an_embedded_browser_client(self):

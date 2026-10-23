@@ -94,6 +94,7 @@ impl Workbench {
 
     pub(super) fn analytics_staged(&self) -> bool {
         !self.analytics.open
+            || self.analytics.tab == Tab::Measurements
             || self.analytics.report.as_ref().is_some_and(|report| {
                 self.snapshot.cameras.is_empty()
                     || report.points.iter().any(|point| point.fps > 0.0)
@@ -398,6 +399,35 @@ fn chart_fixture() -> chart::Graphic {
 mod tests {
     use super::*;
     use iced::advanced::{Layout, layout, widget::Tree};
+
+    #[test]
+    fn measurement_review_scenes_do_not_wait_for_a_hidden_acquisition_report() {
+        for scene in [
+            "analytics-measurements",
+            "analytics-measurements-populated",
+            "analytics-invalid",
+        ] {
+            let mut bench = Workbench::new(
+                SessionHandle::new(),
+                "measurement-staging".into(),
+                true,
+                None,
+            );
+            let _ = bench.scene_video_analytics(scene, false);
+            assert!(bench.analytics.open);
+            assert_eq!(bench.analytics.tab, Tab::Measurements);
+            assert!(bench.analytics.report.is_none());
+            assert!(
+                bench.analytics_staged(),
+                "{scene} can reach its late fixture and screenshot"
+            );
+            bench.analytics.tab = Tab::Acquisition;
+            assert!(
+                !bench.analytics_staged(),
+                "acquisition still waits for actual measurements"
+            );
+        }
+    }
 
     #[test]
     fn analytics_tabs_remain_visible_when_scrolled_and_preserve_measurement_drafts() {

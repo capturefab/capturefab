@@ -95,7 +95,8 @@ impl Workbench {
                     && !self.help_open
                     && !self.network_open
                     && !self.assistant.quick.open
-                    && !self.analytics.open,
+                    && !self.analytics.open
+                    && !self.resources.open,
             ))
         };
         let edit = |title, command, key| {

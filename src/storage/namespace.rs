@@ -228,16 +228,6 @@ pub(crate) fn recover_task_namespaces() -> Result<Vec<NamespaceRecovery>> {
     Manager::global().recover_namespaces()
 }
 
-#[cfg(feature = "gui")]
-pub(crate) fn copy_task_namespace(
-    anchor: &Arc<OutputDirectory>,
-    cap: u64,
-    output: &Path,
-    policy: &StoragePolicy,
-) -> Result<()> {
-    Manager::global().copy_namespace(anchor, cap, output, policy)
-}
-
 impl Manager {
     fn copy_namespace(
         &self,
@@ -471,12 +461,6 @@ impl Manager {
         let lease_path = locked.directory.join(&lease_name);
         let lease = private_options().create_new(true).open(&lease_path)?;
         lease.lock_exclusive()?;
-        // Upgrade only when this new ownership kind is used. Loading already
-        // replayed the entire v2 journal under this same OS storage lock.
-        if locked.ledger.version != NAMESPACE_LEDGER_VERSION {
-            locked.ledger.version = NAMESPACE_LEDGER_VERSION;
-            locked.compact()?;
-        }
         locked.push(Entry {
             id: id.clone(),
             path: path.clone(),
@@ -775,85 +759,6 @@ mod tests {
         }
     }
 
-    /// Reproduce an old Active record whose native admission failed because
-    /// its already-published parent contained a colon. No engine ever opened.
-    fn legacy_colon_namespace(temp: &Temp) -> PathBuf {
-        let parent = temp.root.join("legacy:capture-root");
-        crate::ipc::ensure_private_dir(&parent).unwrap();
-        let id = nonce().unwrap();
-        let path = parent.join(format!("task-{id}"));
-        let anchor = OutputDirectoryPlan::prepare(&path, Some(&parent))
-            .unwrap()
-            .publish()
-            .unwrap();
-        let mut locked = temp.manager.lock().unwrap();
-        locked.ledger.version = NAMESPACE_LEDGER_VERSION;
-        locked.push(Entry {
-            id,
-            path: path.clone(),
-            base: parent.clone(),
-            identity: identity(&anchor.metadata().unwrap()),
-            created: now(),
-            bytes: 0,
-            reserved: 10,
-            lease: None,
-            sha256: None,
-            modified_ns: None,
-            changed: true,
-            pending_upload: false,
-            namespace: Some(NamespaceRecord {
-                cap: 10,
-                phase: NamespacePhase::Active,
-                uncertain: true,
-                parent_identity: identity(&fs::metadata(parent).unwrap()),
-            }),
-        });
-        locked.persist().unwrap();
-        path
-    }
-
-    #[test]
-    fn legacy_native_incompatible_empty_namespace_has_anchored_recovery() {
-        let temp = Temp::new();
-        let path = legacy_colon_namespace(&temp);
-        let handle = temp
-            .manager
-            .recover_namespaces()
-            .unwrap()
-            .remove(0)
-            .handle
-            .unwrap();
-        assert_eq!(reload(&temp.manager).allocated().unwrap(), 10);
-        handle.remove().unwrap();
-        handle.remove().unwrap();
-        assert!(!path.exists());
-        assert_eq!(reload(&temp.manager).allocated().unwrap(), 0);
-    }
-
-    #[test]
-    fn legacy_native_incompatible_recovery_preserves_nonempty_or_replaced_workspaces() {
-        let temp = Temp::new();
-        let path = legacy_colon_namespace(&temp);
-        fs::write(path.join("task.duckdb"), b"keep").unwrap();
-        let handle = temp
-            .manager
-            .recover_namespaces()
-            .unwrap()
-            .remove(0)
-            .handle
-            .unwrap();
-        assert!(handle.remove().is_err());
-        assert_eq!(fs::read(path.join("task.duckdb")).unwrap(), b"keep");
-        assert_eq!(reload(&temp.manager).allocated().unwrap(), 10);
-        fs::remove_file(path.join("task.duckdb")).unwrap();
-        let moved = temp.root.join("moved-original");
-        fs::rename(&path, &moved).unwrap();
-        crate::ipc::ensure_private_dir(&path).unwrap();
-        assert!(handle.remove().is_err());
-        assert!(path.is_dir() && moved.is_dir());
-        assert_eq!(reload(&temp.manager).allocated().unwrap(), 10);
-    }
-
     #[test]
     fn orphan_recovery_keeps_full_charge_copies_real_catalog_and_releases_only_after_removal() {
         use crate::dataset::task::{TaskDataset, TaskExtentBudget};
@@ -1056,7 +961,7 @@ mod tests {
         drop(anchor);
         drop(lease);
         let mut locked = reload(&temp.manager);
-        assert_eq!(locked.ledger.version, NAMESPACE_LEDGER_VERSION);
+        assert_eq!(locked.ledger.version, LEDGER_VERSION);
         assert_eq!(locked.allocated().unwrap(), 8);
         assert_eq!(locked.ledger.entries[0].reserved, 8);
         assert!(locked.ledger.entries[0].lease.is_none());
@@ -1154,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn namespace_admission_replays_v2_journal_before_upgrading_and_survives_old_journal() {
+    fn namespace_admission_survives_replayed_journal_after_compaction() {
         let temp = Temp::new();
         for name in ["first", "second"] {
             let mut file = temp
@@ -1166,16 +1071,14 @@ mod tests {
         }
         assert_eq!(reload(&temp.manager).ledger.version, LEDGER_VERSION);
         let old = fs::read(temp.manager.directory.join(JOURNAL)).unwrap();
-        // At the upgrade crash boundary, the complete v2 journal has been
-        // replayed into a v3 snapshot, but its old journal may remain. No
-        // Pending namespace has been created or engine admitted at this point.
-        let mut upgrading = reload(&temp.manager);
-        upgrading.ledger.version = NAMESPACE_LEDGER_VERSION;
-        upgrading.compact().unwrap();
-        drop(upgrading);
+        // A crash after the snapshot is replaced may leave its already
+        // included journal behind. Replaying it must not double-charge files.
+        let mut compacting = reload(&temp.manager);
+        compacting.compact().unwrap();
+        drop(compacting);
         fs::write(temp.manager.directory.join(JOURNAL), &old).unwrap();
         let recovered = reload(&temp.manager);
-        assert_eq!(recovered.ledger.version, NAMESPACE_LEDGER_VERSION);
+        assert_eq!(recovered.ledger.version, LEDGER_VERSION);
         assert_eq!(recovered.allocated().unwrap(), 4);
         assert!(
             recovered
@@ -1190,7 +1093,7 @@ mod tests {
         let mut locked = reload(&temp.manager);
         assert_eq!(locked.allocated().unwrap(), 8);
         assert_eq!(locked.ledger.entries.len(), 3);
-        assert_eq!(locked.ledger.version, NAMESPACE_LEDGER_VERSION);
+        assert_eq!(locked.ledger.version, LEDGER_VERSION);
         assert!(
             locked
                 .ledger
@@ -1211,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn refused_namespace_does_not_publish_or_upgrade_an_ordinary_file_ledger() {
+    fn refused_namespace_does_not_publish_storage() {
         let temp = Temp::new();
         let missing = temp.root.join("never-created/captures");
         assert!(
@@ -1322,7 +1225,7 @@ mod tests {
         let id = nonce().unwrap();
         let path = temp.parent.join(format!("task-{id}"));
         let mut locked = temp.manager.lock().unwrap();
-        locked.ledger.version = NAMESPACE_LEDGER_VERSION;
+        locked.ledger.version = LEDGER_VERSION;
         let lease_name = format!("storage-{id}.lease");
         let lease_path = locked.directory.join(&lease_name);
         let live = private_options()

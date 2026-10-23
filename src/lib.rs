@@ -19,7 +19,7 @@ pub mod analytics;
 #[cfg(feature = "ai")]
 pub mod assistant;
 pub mod auto;
-#[cfg(any(feature = "s3", feature = "ai"))]
+#[cfg(feature = "ai")]
 pub mod aws;
 pub mod camera;
 pub mod camera_profile;
@@ -48,23 +48,17 @@ pub mod network;
 pub mod nvjpeg;
 pub mod onvif;
 pub mod remote;
-#[cfg(feature = "s3")]
-pub mod s3;
+pub mod resources;
 pub mod scanner;
 pub mod scheduling;
 pub mod secret_input;
 pub mod session;
 pub mod shared_memory;
-pub mod signals;
 pub mod simulation;
 pub mod storage;
 pub mod tools;
-#[cfg(feature = "uploads")]
-pub mod transfer;
 pub mod transport;
 pub mod types;
-#[cfg(feature = "uploads")]
-pub mod upload;
 #[cfg(feature = "vaapi")]
 pub mod vajpeg;
 #[cfg(feature = "ai")]

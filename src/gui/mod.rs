@@ -36,14 +36,13 @@ mod prefs;
 pub(crate) use prefs::saved_performance;
 mod preview;
 mod refresh;
+mod resources;
 mod reveal;
 mod scene;
 mod scopes;
 mod secret;
 mod settings;
 mod sidebar;
-mod signals;
-mod source_setup;
 mod sparkline;
 mod stage;
 mod storage_policy;
@@ -89,7 +88,6 @@ use motion::{Kind, Motion};
 use notice::{Batch, Level, Notice, Saved, command_notice};
 use pick_list::pick_list;
 use prefs::{CaptureTags, Prefs, Recent, UiScale};
-pub(crate) use prefs::{STATE as PREFS_STATE, migrate as migrate_prefs};
 use preview::Shown;
 use scene::{Scene, ScreenshotRequest};
 use std::{
@@ -132,7 +130,7 @@ const FOCUS_EVERY: Duration = Duration::from_millis(66);
 const EFFICIENT_SIDE: u32 = 1280;
 
 /// Quit on SIGINT, SIGTERM or SIGHUP as the Quit command does, so the
-/// session finishes its recordings, folds the upload queue and removes its
+/// session finishes its recordings and removes its
 /// descriptor: `requested` tells the next tick. A second signal exits at
 /// once, in case the window cannot quit.
 fn quit_on_signal(requested: Arc<AtomicBool>) {
@@ -420,8 +418,6 @@ impl Pending {
             Job::DatasetClose => "Closing dataset",
             Job::DatasetNote => "Adding note",
             Job::DatasetExport => "Exporting dataset",
-            Job::SignalStart => "Starting data source",
-            Job::SignalStop => "Stopping data source",
             Job::SetMany => "Setting features",
             Job::Set(feature) => return format!("Setting {}", words(feature)),
             Job::Execute(feature) => return format!("Executing {}", words(feature)),
@@ -465,8 +461,6 @@ enum Job {
     #[allow(dead_code)] // Notes come from the CLI and RPC for now.
     DatasetNote,
     DatasetExport,
-    SignalStart,
-    SignalStop,
     /// Write a feature, by name.
     Set(String),
     /// Write several features as one camera change. The desktop only
@@ -512,7 +506,6 @@ impl Measured {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Tab {
-    #[serde(alias = "features")]
     Capture,
     Forward,
 }
@@ -612,6 +605,7 @@ enum Message {
     Appearance(Appearance),
     UiScale(UiScale),
     Performance(crate::efficiency::Mode),
+    Resources(resources::Input),
     ScaledViewport(Size),
     CloseRequested(window::Id),
     WindowOpened(window::Id),
@@ -747,7 +741,6 @@ enum Message {
     AutoStart(bool),
     Tag(tags::TagField, String),
     Dataset(dataset::Msg),
-    Signals(signals::Msg),
     DismissNotice,
     /// Hide a camera's error badge, by camera ID, until the error recurs.
     DismissStageError(String),
@@ -835,6 +828,7 @@ struct Workbench {
     /// Settings › Performance, as chosen here.
     performance: crate::efficiency::Mode,
     performance_state: performance::PerformanceState,
+    resources: resources::State,
     screenshot: Option<ScreenshotRequest>,
     logs_open: bool,
     help_open: bool,
@@ -902,7 +896,6 @@ struct Workbench {
     /// Capture context sent with captures and recordings.
     tags: CaptureTags,
     dataset: dataset::DatasetUi,
-    signals: signals::SignalsUi,
     recent: Vec<Recent>,
     saved: Option<Prefs>,
     prefs_saver: prefs::Saver,
@@ -934,7 +927,7 @@ struct Workbench {
     sidebar_open: bool,
     /// Whether the sidebar floats over the stage in a narrower window.
     sidebar_peek: bool,
-    /// The sidebar was asked for with no camera, as data sources are; the
+    /// The sidebar was opened with no camera selected; the
     /// picker otherwise shows no panels.
     sidebar_summoned: bool,
     /// What the Video tab held on the side it last left, in memory only:
@@ -977,7 +970,6 @@ impl Workbench {
         let shown = |open: bool| if open { 1.0 } else { 0.0 };
         let main_window = window::Id::unique();
         let dataset = dataset::DatasetUi::start(&handle, saved.as_ref());
-        let signals = signals::SignalsUi::start(saved.as_ref());
         let client_activity = client_activity::State::from_snapshot(&handle.snapshot());
         let video_analytics =
             video_analytics::State::new(handle.clone(), prefs.video_analytics.clone());
@@ -1042,6 +1034,7 @@ impl Workbench {
             ui_scale: UiScale::Standard,
             performance: Default::default(),
             performance_state: Default::default(),
+            resources: Default::default(),
             screenshot: None,
             logs_open: prefs.logs_open,
             help_open: false,
@@ -1092,7 +1085,6 @@ impl Workbench {
             auto_start: false,
             tags: Default::default(),
             dataset,
-            signals,
             recent: Vec::new(),
             saved,
             prefs_saver: prefs::Saver::new(),
@@ -1261,10 +1253,8 @@ impl Workbench {
             tags: self.tags.clone(),
             dataset_path: self.dataset.path.clone(),
             dataset_auto: self.dataset.auto,
-            recent_signals: self.signals.recent.clone(),
             open_sections: self.open_section_keys(),
             // Not yet mirrored on the workbench: keep what was loaded.
-            ..self.saved.clone().unwrap_or_default()
         }
     }
 
@@ -1396,9 +1386,8 @@ impl Workbench {
         let busy = !self.pending.is_empty()
             || self.snapshot.activity.iter().any(|entry| {
                 entry.state.active()
-                    && !(self.assistant_actor_is_local(
-                        entry.actor.as_ref().map_or("", |actor| actor.id.as_str()),
-                    ) && !self.assistant.quick.open)
+                    && !(self.assistant_actor_is_local(&entry.actor.id)
+                        && !self.assistant.quick.open)
             })
             || self.screenshot.is_some()
             || self.capture_to.busy()
@@ -1709,7 +1698,6 @@ impl Workbench {
         self.result_stage(pending, result);
         self.result_inspector(pending, result);
         self.dataset_settled(pending, result);
-        self.signals_settled(pending, result);
         let notice = if pending.batch {
             self.batch_result(&pending.job, result)
         } else {
@@ -1862,6 +1850,7 @@ impl Workbench {
         self.tick_frames();
         self.refresh.settle(self.now);
         self.tick_performance();
+        self.tick_resources();
         let destination_before = local_history::LocalState::capture(self);
         self.capture_to.tick(&mut self.output);
         self.record_to.tick(&mut self.forward_output);
@@ -1878,7 +1867,6 @@ impl Workbench {
         self.tick_inspector();
         self.tick_analytics();
         self.tick_video_analytics();
-        self.tick_signals();
         self.save_prefs();
         Task::batch([
             pages,
@@ -2937,13 +2925,13 @@ impl Workbench {
                 self.adopt(&prefs);
                 self.dataset.path = prefs.dataset_path.clone();
                 self.dataset.auto = prefs.dataset_auto;
-                self.signals.recent = prefs.recent_signals.clone();
                 self.video_analytics.preferences = prefs.video_analytics.clone();
                 self.saved = self.saved.take().map(|saved| (*prefs).with_layout(&saved));
             }
             Message::Appearance(value) => self.appearance = value,
             Message::UiScale(value) => self.ui_scale = value,
             Message::Performance(mode) => self.performance = mode,
+            Message::Resources(input) => return self.resources_input(input),
             Message::ScaledViewport(size) => {
                 self.width = size.width;
                 self.height = size.height;
@@ -3092,16 +3080,7 @@ impl Workbench {
                 self.side.connect_failures.remove(self.address.trim());
                 self.address = value;
             }
-            Message::ConnectAddress => {
-                let address = if std::path::Path::new(&self.address).is_file() {
-                    self.address.clone()
-                } else {
-                    self.address.trim().to_owned()
-                };
-                if !address.is_empty() {
-                    self.connect(address);
-                }
-            }
+            Message::ConnectAddress => self.connect_address(),
             Message::ToggleStream => self.toggle_stream(),
             Message::Capture => self.capture(),
             Message::Select(camera) => self.show_camera(Some(camera)),
@@ -3440,7 +3419,7 @@ impl Workbench {
             Message::Reveal(path) => {
                 if std::fs::symlink_metadata(&path).is_err() {
                     self.set_notice(
-                        "The file is no longer on this computer (it may have been uploaded)",
+                        "The file is no longer available at its saved location",
                         Some(path.to_string_lossy().into_owned()),
                         Level::Warning,
                     );
@@ -3455,7 +3434,6 @@ impl Workbench {
             Message::AutoStart(on) => self.auto_start = on,
             Message::Tag(field, value) => field.set(&mut self.tags, value),
             Message::Dataset(message) => return self.dataset_update(message),
-            Message::Signals(message) => return self.signals_update(message),
             Message::Screenshot(shot) => {
                 if let Some(request) = &mut self.screenshot {
                     let path = request.sequence.path(&request.path);
@@ -3545,6 +3523,7 @@ impl Workbench {
             }
             Action::Overview if self.network_open => self.network_open = false,
             Action::Overview if self.analytics.open => self.analytics.open = false,
+            Action::Overview if self.resources.open => self.resources.open = false,
             Action::Overview if self.settings_open && self.settings_window.is_none() => {
                 return self.handle_message(Message::Settings(false));
             }
@@ -3891,7 +3870,7 @@ mod tests {
         let output = app.output.clone();
         app.capture_to.manager_open = true;
         app.capture_to
-            .update(destinations::Message::AddBucket, &mut app.output);
+            .update(destinations::Message::AddFolder, &mut app.output);
         app.capture_to.update(
             destinations::Message::Name("unfinished destination".into()),
             &mut app.output,
@@ -4078,7 +4057,7 @@ mod tests {
             !bench.inspector_shown() && !bench.sidebar_shown(),
             "the picker has no panels"
         );
-        // Asked for with no camera, as data sources are, the sidebar shows.
+        // Opened with no camera selected, the sidebar shows.
         let _ = bench.handle_message(Message::ShowTab(Tab::Capture));
         assert!(bench.sidebar_shown() && !bench.inspector_shown());
         let _ = bench.handle_message(Message::ToggleSidebar);

@@ -1026,11 +1026,11 @@ mod tests {
         update(&mut app, Message::Encoder("custom".into()));
         update(
             &mut app,
-            Message::CapturePicker(destinations::Message::AddBucket),
+            Message::CapturePicker(destinations::Message::AddFolder),
         );
         update(
             &mut app,
-            Message::CapturePicker(destinations::Message::Bucket("first".into())),
+            Message::CapturePicker(destinations::Message::Name("first".into())),
         );
         key(&mut app, Action::Undo);
         assert_eq!(app.forward_encoder, "custom");
@@ -1191,7 +1191,7 @@ mod tests {
                 last_changed_at_us: i,
                 feature: Some("Gain".into()),
                 kind: "set".into(),
-                setting_changes: Some(1),
+                setting_changes: 1,
             })
             .collect();
         app.snapshot.cameras = vec![camera];

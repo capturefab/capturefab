@@ -22,6 +22,39 @@ fn view<'a>(state: &'a quick::State, p: &'static Palette, height: f32) -> Elemen
 }
 
 #[test]
+fn local_quick_command_errors_do_not_offer_to_retry_a_provider_request() {
+    let renderer = renderer();
+    for provider_failure in [false, true] {
+        let mut state = scenes::fixture("quick-command-error", SessionSnapshot::default());
+        if !provider_failure {
+            state.last_prompt = None;
+            state.error = Some("Choose a connected camera.".into());
+        }
+        let size = Size::new(480.0, 620.0);
+        let mut view = view(&state, Palette::of(false), size.height);
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let (snapshot, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        assert_eq!(
+            snapshot
+                .nodes
+                .iter()
+                .any(|(_, node)| node.label() == Some("Retry assistant request")),
+            provider_failure,
+        );
+    }
+}
+
+#[test]
 fn exported_plan_copy_uses_this_workbench_and_exact_path_with_a_dry_run() {
     use iced::futures::StreamExt;
     let renderer = renderer();
@@ -158,7 +191,6 @@ fn exported_plan_copy_uses_this_workbench_and_exact_path_with_a_dry_run() {
                     "clipboard preserves quoted locators exactly"
                 );
                 assert!(app.pending.is_empty());
-                assert!(app.handle.snapshot().signals.is_empty());
             }
         }
     }
@@ -280,7 +312,7 @@ fn quick_command_scenes_keep_prompt_close_and_approval_controls_inside_the_sheet
                         "Quick command request",
                         "Assistant provider and model",
                         "See camera images",
-                        "Read sensor values and dataset rows",
+                        "Read dataset rows",
                     ] {
                         let control = snapshot
                             .nodes
@@ -593,218 +625,6 @@ fn empty_quick_command_starts_with_its_heading_and_suggestions_above_consent() {
 }
 
 #[test]
-fn quick_source_binding_controls_are_local_and_reachable_at_compact_scales() {
-    let mut renderer = renderer();
-    for dark in [false, true] {
-        for scale in UiScale::ALL {
-            let size = Size::new(480.0, 620.0) / scale.factor();
-            let state = scenes::fixture("quick-command-data-sources", SessionSnapshot::default());
-            let mut view = view(&state, Palette::of(dark), size.height);
-            let mut tree = Tree::new(view.as_widget());
-            let node = view.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, size),
-            );
-            let (snapshot, _, _) = accessibility::snapshot_widget(
-                view.as_widget_mut(),
-                &mut tree,
-                Layout::new(&node),
-                &renderer,
-            );
-            for label in [
-                "Quick command data source endpoint",
-                "Add data source to Quick Command",
-            ] {
-                let input = &snapshot
-                    .nodes
-                    .iter()
-                    .find(|(_, node)| node.label() == Some(label))
-                    .unwrap()
-                    .1;
-                assert!(
-                    !input.is_disabled(),
-                    "{label} supports deliberate local editing"
-                );
-            }
-            let source = &state.data_sources[0];
-            assert!(snapshot.nodes.iter().any(|(_, node)| node.label()
-                == Some(format!("Remove approved source {}", source.reference).as_str())));
-            assert!(
-                snapshot
-                    .nodes
-                    .iter()
-                    .any(|(_, node)| node.role() == accessibility::Role::CheckBox
-                        && node.label() == Some("Read sensor values and dataset rows")
-                        && node.toggled() == Some(accesskit::Toggled::True))
-            );
-            assert_focus_traversal_reveals(&mut view, &mut tree, &node, &renderer);
-            if scale == UiScale::Standard {
-                apply(
-                    &mut view,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
-                        "quick-command-data-source",
-                    )),
-                );
-                apply(
-                    &mut view,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    accessibility::focus_reveal_operation(iced::window::Id::unique()),
-                );
-                artifact(
-                    &format!(
-                        "quick-command-data-sources-{}-480x620",
-                        if dark { "dark" } else { "light" }
-                    ),
-                    &mut view,
-                    &mut tree,
-                    &node,
-                    &mut renderer,
-                    size,
-                    (dark, scale.factor()),
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn protected_quick_source_editor_masks_password_and_reveals_every_local_control() {
-    let mut renderer = renderer();
-    for dark in [false, true] {
-        for scale in UiScale::ALL {
-            for physical in [Size::new(480.0, 620.0), Size::new(1100.0, 700.0)] {
-                let size = physical / scale.factor();
-                let state = scenes::fixture("quick-command-data-auth", SessionSnapshot::default());
-                let mut view = view(&state, Palette::of(dark), size.height);
-                let mut tree = Tree::new(view.as_widget());
-                let node = view.as_widget_mut().layout(
-                    &mut tree,
-                    &renderer,
-                    &layout::Limits::new(Size::ZERO, size),
-                );
-                let (snapshot, _, _) = accessibility::snapshot_widget(
-                    view.as_widget_mut(),
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                );
-                for label in [
-                    "Source profile name",
-                    "Source endpoint",
-                    "Source user name",
-                    "Source authentication",
-                    "Source password",
-                    "Save protected source profile",
-                ] {
-                    let role = match label {
-                        "Source authentication" => accessibility::Role::ComboBox,
-                        "Source password" => accessibility::Role::PasswordInput,
-                        "Save protected source profile" => accessibility::Role::Button,
-                        _ => accessibility::Role::TextInput,
-                    };
-                    let control = &snapshot
-                        .nodes
-                        .iter()
-                        .find(|(_, node)| node.label() == Some(label) && node.role() == role)
-                        .unwrap_or_else(|| panic!("protected source editor exposes {label}"))
-                        .1;
-                    assert!(
-                        !control.is_disabled(),
-                        "{label} is editable before an assistant request"
-                    );
-                    if label == "Source password" {
-                        assert_eq!(control.role(), accessibility::Role::PasswordInput);
-                        assert!(
-                            control
-                                .value()
-                                .is_none_or(|value| !value.contains("fixture-only-password"))
-                        );
-                    }
-                }
-                assert!(
-                    snapshot
-                        .nodes
-                        .iter()
-                        .any(|(_, node)| node.label() == Some("Send quick command")
-                            && node.is_disabled())
-                );
-                assert_focus_traversal_reveals(&mut view, &mut tree, &node, &renderer);
-                apply(
-                    &mut view,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
-                        "quick-source-profile-save",
-                    )),
-                );
-                apply(
-                    &mut view,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    accessibility::focus_reveal_operation(iced::window::Id::unique()),
-                );
-                apply(
-                    &mut view,
-                    &mut tree,
-                    &node,
-                    &renderer,
-                    iced::advanced::widget::operation::focusable::focus::<Message>(Id::new(
-                        "quick-source-profile-password",
-                    )),
-                );
-                let (snapshot, _, _) = accessibility::snapshot_widget(
-                    view.as_widget_mut(),
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                );
-                let password = &snapshot
-                    .nodes
-                    .iter()
-                    .find(|(_, node)| {
-                        node.label() == Some("Source password")
-                            && node.role() == accessibility::Role::PasswordInput
-                    })
-                    .unwrap()
-                    .1;
-                let bounds = password.bounds().unwrap();
-                assert!(
-                    bounds.x0 >= -0.5
-                        && bounds.y0 >= -0.5
-                        && bounds.x1 <= f64::from(size.width) + 0.5
-                        && bounds.y1 <= f64::from(size.height) + 0.5,
-                    "protected password is visible after keyboard focus at {scale}: {bounds:?}"
-                );
-                if scale == UiScale::Standard {
-                    artifact(
-                        &format!(
-                            "quick-command-data-auth-{}-{}x{}",
-                            if dark { "dark" } else { "light" },
-                            physical.width,
-                            physical.height
-                        ),
-                        &mut view,
-                        &mut tree,
-                        &node,
-                        &mut renderer,
-                        size,
-                        (dark, scale.factor()),
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
 fn bottom_anchored_quick_command_history_keeps_home_and_end_in_visual_order() {
     let renderer = renderer();
     let state = scenes::fixture("quick-command-plan", SessionSnapshot::default());
@@ -937,147 +757,6 @@ fn return_in_every_generic_text_editor_and_on_remove_never_runs_a_plan() {
                     Message::Assistant(Input::Quick(quick::Input::Run(_)))
                 ))
         );
-    }
-}
-
-#[test]
-fn string_list_rows_have_single_name_editors_and_keyboard_add_remove_controls() {
-    let mut renderer = renderer();
-    for (tool, key, label) in [
-        ("start_signal_capture", "tags", "Tags"),
-        ("export_dataset", "tables", "Tables"),
-        ("get_camera_features", "names", "Features"),
-    ] {
-        let mut state = scenes::fixture("quick-command", SessionSnapshot::default());
-        let spec = crate::tools::spec(tool).unwrap();
-        let mut args: serde_json::Map<String, Value> = (spec.schema)()["properties"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(|key| (key.clone(), Value::Null))
-            .collect();
-        args.insert(key.into(), json!(["first", "second"]));
-        let id = state
-            .plan
-            .propose(
-                crate::tools::ToolCall {
-                    tool: tool.into(),
-                    args: Value::Object(args),
-                },
-                None,
-            )
-            .unwrap();
-        state.options_open.insert(id);
-        for dark in [false, true] {
-            for scale in UiScale::ALL {
-                let size = Size::new(480.0, 620.0) / scale.factor();
-                let mut view = view(&state, Palette::of(dark), size.height);
-                let mut tree = Tree::new(view.as_widget());
-                let node = view.as_widget_mut().layout(
-                    &mut tree,
-                    &renderer,
-                    &layout::Limits::new(Size::ZERO, size),
-                );
-                let (snapshot, _, _) = accessibility::snapshot_widget(
-                    view.as_widget_mut(),
-                    &mut tree,
-                    Layout::new(&node),
-                    &renderer,
-                );
-                for (index, value) in ["first", "second"].into_iter().enumerate() {
-                    let input = snapshot
-                        .nodes
-                        .iter()
-                        .find(|(_, node)| {
-                            node.role() == accessibility::Role::TextInput
-                                && node.label()
-                                    == Some(format!("Step {} {label} {}", id.0, index + 1).as_str())
-                        })
-                        .expect("each name has one native text input");
-                    assert_eq!(input.1.value(), Some(value));
-                }
-                assert!(!snapshot.nodes.iter().any(|(_, node)| {
-                    node.label()
-                        .is_some_and(|label| label.contains("Expected value"))
-                }));
-                assert_focus_traversal_reveals(&mut view, &mut tree, &node, &renderer);
-                if scale == UiScale::Standard {
-                    apply(
-                        &mut view,
-                        &mut tree,
-                        &node,
-                        &renderer,
-                        iced::advanced::widget::operation::focusable::focus::<Message>(Id::from(
-                            cards::field_id(id, &format!("{key}.0")),
-                        )),
-                    );
-                    apply(
-                        &mut view,
-                        &mut tree,
-                        &node,
-                        &renderer,
-                        accessibility::focus_reveal_operation(iced::window::Id::unique()),
-                    );
-                    artifact(
-                        &format!(
-                            "string-list-{key}-{}-480x620",
-                            if dark { "dark" } else { "light" }
-                        ),
-                        &mut view,
-                        &mut tree,
-                        &node,
-                        &mut renderer,
-                        size,
-                        (dark, scale.factor()),
-                    );
-                }
-            }
-        }
-        let press = |state: &quick::State, control: String| {
-            let mut view = view(state, Palette::of(false), 620.0);
-            let mut tree = Tree::new(view.as_widget());
-            let node = view.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(480.0, 620.0)),
-            );
-            apply(
-                &mut view,
-                &mut tree,
-                &node,
-                &renderer,
-                iced::advanced::widget::operation::focusable::focus::<Message>(Id::from(control)),
-            );
-            enter(&mut view, &mut tree, &node, &renderer)
-        };
-        let messages = press(&state, cards::field_id(id, &format!("{key}-add")));
-        assert!(messages.iter().any(|message| matches!(
-            message,
-            Message::Assistant(Input::Quick(quick::Input::StringList { remove: None, .. }))
-        )));
-        for message in messages {
-            if let Message::Assistant(Input::Quick(input)) = message {
-                let _ = state.input(input, Instant::now());
-            }
-        }
-        assert_eq!(
-            state.plan.steps[0].call.args[key],
-            json!(["first", "second", ""])
-        );
-        let messages = press(&state, cards::field_id(id, &format!("{key}.0-remove")));
-        assert!(messages.iter().any(|message| matches!(
-            message,
-            Message::Assistant(Input::Quick(quick::Input::StringList {
-                remove: Some(0),
-                ..
-            }))
-        )));
-        for message in messages {
-            if let Message::Assistant(Input::Quick(input)) = message {
-                let _ = state.input(input, Instant::now());
-            }
-        }
-        assert_eq!(state.plan.steps[0].call.args[key], json!(["second", ""]));
     }
 }
 

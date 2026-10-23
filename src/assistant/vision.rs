@@ -155,7 +155,9 @@ pub fn resolve(
     live: Option<bool>,
     runtime_rejected: bool,
 ) -> VisionDecision {
-    let (resolved, source) = if runtime_rejected {
+    let (resolved, source) = if provider.is_on_device() {
+        (Some(false), VisionSource::BuiltInTable)
+    } else if runtime_rejected {
         (Some(false), VisionSource::RuntimeRejection)
     } else {
         match mode {
@@ -364,6 +366,21 @@ pub fn is_image_rejection(status: Option<u16>, excerpt: &str, had_images: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_model_is_text_only_even_with_an_image_override_or_metadata() {
+        for mode in [VisionMode::Auto, VisionMode::On, VisionMode::Off] {
+            let decision = resolve(
+                ProviderId::AppleFoundationModels,
+                "on-device",
+                mode,
+                Some(true),
+                false,
+            );
+            assert!(!decision.enabled);
+            assert_eq!(decision.placement, ImagePlacement::Unsupported);
+        }
+    }
     use serde_json::json;
 
     #[test]

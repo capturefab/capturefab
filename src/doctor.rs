@@ -6,7 +6,7 @@
 
 use crate::analytics::human_bytes;
 use crate::efficiency::{self, Mode, Resolved};
-use crate::ipc::{Adoption, LoginDir, StateSet};
+use crate::ipc::LoginDir;
 use crate::storage::{FREE_SPACE_FLOOR, StoragePolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -109,53 +109,6 @@ pub struct Limits {
     pub usbfs_memory_mb: Option<u64>,
 }
 
-/// A set of state files an older version left where Capturefab no longer
-/// reads it.
-#[derive(Debug, Clone, PartialEq)]
-struct LeftBehind {
-    what: &'static str,
-    /// The set's files found there.
-    files: Vec<&'static str>,
-    dirs: Vec<PathBuf>,
-    /// The state directory has a copy of its own.
-    replaced: bool,
-}
-impl LeftBehind {
-    fn of(set: &StateSet, state: &Path) -> Option<Self> {
-        let Adoption::LeftBehind(dirs) = crate::ipc::adoption(set) else {
-            return None;
-        };
-        let found: Vec<&str> = dirs
-            .iter()
-            .flat_map(|dir| crate::ipc::held(dir, set.names))
-            .collect();
-        let files = set
-            .names
-            .iter()
-            .copied()
-            .filter(|name| found.contains(name))
-            .collect();
-        Some(Self {
-            what: set.what,
-            files,
-            dirs,
-            replaced: !crate::ipc::held(state, set.names).is_empty(),
-        })
-    }
-}
-/// Every set of state files, to find what older versions left elsewhere.
-static STATE_SETS: &[&StateSet] = &[
-    &crate::storage::STATE,
-    &crate::destination::STATE,
-    &crate::hubs::registry::STATE,
-    #[cfg(feature = "ai")]
-    &crate::assistant::settings::STATE,
-    #[cfg(feature = "uploads")]
-    &crate::upload::STATE,
-    #[cfg(feature = "gui")]
-    &crate::gui::PREFS_STATE,
-];
-
 /// Only Linux reads these from sysfs.
 #[cfg_attr(not(all(target_os = "linux", feature = "usb")), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq)]
@@ -185,8 +138,6 @@ struct Facts {
     /// From a login that has XDG_RUNTIME_DIR: where a service without it
     /// keeps sessions instead.
     service_runtime_dir: Option<ServiceDir>,
-    /// State an older version kept elsewhere that did not move.
-    left_behind: Vec<LeftBehind>,
     limits: Limits,
     usb: Vec<UsbCamera>,
     budget: u64,
@@ -209,12 +160,7 @@ struct ServiceDir {
 impl Facts {
     fn gather() -> Self {
         let state = crate::ipc::state_dir();
-        // Reading the ledger first moves one still waiting to.
         let (budget, used) = ledger(&state);
-        let left_behind = STATE_SETS
-            .iter()
-            .filter_map(|set| LeftBehind::of(set, &state))
-            .collect();
         Self {
             efficiency: efficiency::current(),
             #[cfg(feature = "gui")]
@@ -240,7 +186,6 @@ impl Facts {
                     running,
                 }
             }),
-            left_behind,
             limits: limits(),
             usb: usb_cameras(),
             working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
@@ -273,7 +218,6 @@ impl HostReport {
         report["host"] = json!(efficiency::host());
         report["efficiency"] = json!(facts.efficiency);
         report["paths"] = json!({
-            "session": facts.runtime,
             "runtime": facts.runtime,
             "state": facts.state,
             "cache": crate::ipc::cache_dir().map(Place::of),
@@ -345,7 +289,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     }
     writeln!(
         out,
-        "More: {GUIDE}. doctor --json adds compiled features, scanners, signal protocols, JPEG encoders and network interfaces."
+        "More: {GUIDE}. doctor --json adds compiled features, scanners, JPEG encoders and network interfaces."
     )?;
     if report["os"] == "linux" {
         writeln!(out, "Running it as a service: {LINE_COMPUTER}")?;
@@ -372,12 +316,6 @@ fn checks(facts: &Facts) -> Vec<Check> {
         )
     }));
     checks.push(session_check(&facts.state, facts.session_dir_set));
-    checks.extend(
-        facts
-            .left_behind
-            .iter()
-            .map(|left| old_state_check(left, &facts.state)),
-    );
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
     checks.extend(
@@ -542,41 +480,6 @@ fn login_dir_problem(login: &Path, why: LoginDir) -> (String, String) {
     }
 }
 
-/// State an older version kept in another directory stays there when the
-/// state directory has its own, or more than one directory holds a copy:
-/// only the user knows which ledger, budget or queue is current.
-fn old_state_check(left: &LeftBehind, state: &Place) -> Check {
-    let state = state.path.display();
-    let dirs: Vec<String> = left
-        .dirs
-        .iter()
-        .map(|dir| dir.display().to_string())
-        .collect();
-    let dirs = dirs.join(" and ");
-    let files = left.files.join(", ");
-    let why = if left.replaced {
-        format!("{state} has its own")
-    } else {
-        "more than one folder holds a copy".into()
-    };
-    let fix = match left.dirs.as_slice() {
-        [_] if left.replaced => format!(
-            "To keep the old copy instead, stop Capturefab and move {files} from {dirs} into {state}, replacing the ones there; otherwise delete them from {dirs}."
-        ),
-        _ => format!(
-            "Stop Capturefab and choose the copy to keep: move its files ({files}) into {state}, replacing any there, then delete the old copies from {dirs}."
-        ),
-    };
-    Check::warn(
-        "old_state",
-        format!(
-            "Capturefab no longer reads {} an older version left in {dirs}, as {why}.",
-            left.what
-        ),
-        fix,
-    )
-}
-
 /// Informational rather than a warning: by default state is on disk, so
 /// memory means the user chose it, and only they know whether it must
 /// outlive a reboot.
@@ -725,18 +628,12 @@ fn suggested_budget(used: u64, free: u64) -> String {
 
 /// The configured budget and the bytes counted against it, from the storage
 /// ledger's lock-free reads, so `doctor` never waits behind capture
-/// bookkeeping; its usage summary includes the journal's tail. Usage is None
-/// while unknown, such as after an older version saved, which omits the
-/// check. Without a state directory nothing is stored yet, and `doctor`
-/// does not create one to find that out, unless the ledger of a version
-/// before the split is waiting to move into it.
+/// bookkeeping; its usage summary includes the journal's tail. Unknown
+/// usage omits the check. Without a state directory nothing is stored yet,
+/// and `doctor` does not create one to find that out.
 fn ledger(state: &Path) -> (u64, Option<u64>) {
     let default = StoragePolicy::default().max_bytes;
-    let moving = matches!(
-        crate::ipc::adoption(&crate::storage::STATE),
-        Adoption::Pending(_)
-    );
-    if !state.is_dir() && !moving {
+    if !state.is_dir() {
         return (default, Some(0));
     }
     let budget = crate::storage::configured_policy().map_or(default, |policy| policy.max_bytes);
@@ -1266,49 +1163,6 @@ mod tests {
     }
 
     #[test]
-    fn state_an_older_version_left_behind_warns_with_how_to_keep_it() {
-        let state = place("/home/pi/.local/state/capturefab", "ext4", 6 << 30);
-        let service = PathBuf::from("/home/pi/.cache/capturefab/sessions");
-        let mut left = LeftBehind {
-            what: "the storage ledger and budget",
-            files: vec!["storage-policy.json", "storage.json"],
-            dirs: vec![service.clone()],
-            replaced: true,
-        };
-        let check = old_state_check(&left, &state);
-        assert_eq!(check.id, "old_state");
-        assert_eq!(check.level, Level::Warn);
-        assert_eq!(
-            check.message,
-            "Capturefab no longer reads the storage ledger and budget an older version left in /home/pi/.cache/capturefab/sessions, as /home/pi/.local/state/capturefab has its own."
-        );
-        assert_eq!(
-            check.fix.as_deref(),
-            Some(
-                "To keep the old copy instead, stop Capturefab and move storage-policy.json, storage.json from /home/pi/.cache/capturefab/sessions into /home/pi/.local/state/capturefab, replacing the ones there; otherwise delete them from /home/pi/.cache/capturefab/sessions."
-            )
-        );
-        // With a copy in each folder only the user knows which is current.
-        left.dirs.insert(0, "/run/user/1000/capturefab".into());
-        left.replaced = false;
-        let check = old_state_check(&left, &state);
-        assert!(
-            check.message.ends_with(
-                "left in /run/user/1000/capturefab and /home/pi/.cache/capturefab/sessions, as more than one folder holds a copy."
-            ),
-            "{}",
-            check.message
-        );
-        let fix = check.fix.unwrap();
-        assert!(
-            fix.starts_with("Stop Capturefab and choose the copy to keep"),
-            "{fix}"
-        );
-        // Nothing an older version left means no check at all, as in tests.
-        assert_eq!(LeftBehind::of(&crate::storage::STATE, &state.path), None);
-    }
-
-    #[test]
     fn usb_check_names_inaccessible_cameras_and_their_udev_rule() {
         assert_eq!(usb_check(&[]), None);
         let camera = UsbCamera {
@@ -1463,7 +1317,7 @@ mod tests {
             "{text}"
         );
         // What plain doctor no longer prints, so the docs' pointers still work.
-        assert!(lines[4].contains("scanners, signal protocols"), "{text}");
+        assert!(lines[4].contains("scanners, JPEG"), "{text}");
         // Linux hosts also get the service guide that walks through these fixes.
         assert!(lines[5].ends_with("/docs/line-computer.md"), "{text}");
         assert_eq!(lines.len(), 6);

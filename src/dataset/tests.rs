@@ -1,5 +1,4 @@
 use super::*;
-use crate::signals::{Protocol, Quality, Sample, SampleSink, SignalInfo, TagInfo, Value as Signal};
 use std::{fs, path::PathBuf};
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -34,9 +33,7 @@ fn capture(path: &str, wall_ms: u64) -> SavedFile {
         bytes: 100,
         sha256: Some("ab".repeat(32)),
         destination: None,
-        object_key: None,
-        remote_url: None,
-        upload_id: None,
+
         context: [("line".to_string(), "L1".to_string())].into(),
         item: SavedItem::Capture {
             frame_id: 1,
@@ -69,25 +66,6 @@ fn count(path: &std::path::Path, sql: &str) -> Value {
         .query(sql, 10, 0)
         .unwrap()["rows"][0][0]
         .clone()
-}
-
-fn source() -> SignalInfo {
-    SignalInfo {
-        id: "signal:0001".into(),
-        protocol: Protocol::SimSignal,
-        uri: "sim-signal://line1".into(),
-        interval_ms: 100,
-    }
-}
-
-fn sample(ts_ms: u64, tag: &str, value: Signal) -> Sample {
-    Sample {
-        ts_ms,
-        source_ts_ms: None,
-        tag: tag.into(),
-        value,
-        quality: Quality::Good,
-    }
 }
 
 #[test]
@@ -206,32 +184,12 @@ fn auto_path_opens_lazily_on_first_saved_file() {
     assert_eq!(slot.status_cached().unwrap().captures, 1);
     slot.close().unwrap();
     assert!(path.exists());
-    // Signal samples open it too.
-    let samples = dir.join("samples.duckdb");
-    slot.set_auto_path(Some(samples.clone()));
-    slot.write("signal:0001", &[]).unwrap();
-    assert!(!samples.exists());
-    slot.write("signal:0001", &[sample(1, "t", Signal::Number(1.0))])
-        .unwrap();
-    assert_eq!(slot.status_cached().unwrap().samples, 1);
-    slot.close().unwrap();
-    // Without a dataset, samples are refused (counted as dropped), not
-    // reported as written.
-    slot.set_auto_path(None);
-    let error = slot
-        .write("signal:0001", &[sample(2, "t", Signal::Number(1.0))])
-        .unwrap_err();
-    assert!(error.to_string().contains("no dataset is open"), "{error}");
     // An automatic dataset that cannot be opened says why, and keeps saying
     // so until it is armed again.
     fs::write(dir.join("file"), b"x").unwrap();
     slot.set_auto_path(Some(dir.join("file").join("capturefab.duckdb")));
     slot.record_saved(batch(vec![capture("/x/b.png", 6)]), 0);
     assert!(slot.auto_error().is_some());
-    let error = slot
-        .write("signal:0001", &[sample(3, "t", Signal::Number(1.0))])
-        .unwrap_err();
-    assert!(error.to_string().contains("automatic dataset"), "{error}");
     slot.set_auto_path(None);
     assert!(slot.auto_error().is_none());
     let _ = fs::remove_dir_all(dir);
@@ -337,77 +295,12 @@ fn reader_does_not_block_writer_and_close_interrupts_readers() {
 }
 
 #[test]
-fn samples_signals_notes_and_asof_view() {
-    let dir = temp_dir("signals");
-    let path = dir.join("s.duckdb");
-    let slot = Slot::new();
-    slot.open(&path, OpenMode::Create, None).unwrap();
-    // A sink with nothing open accepts writes silently.
-    let tags = [TagInfo {
-        tag: "temp".into(),
-        unit: Some("degC".into()),
-        kind: Some("number".into()),
-    }];
-    slot.register(&source(), &tags).unwrap();
-    slot.write(
-        "signal:0001",
-        &[
-            sample(100, "temp", Signal::Number(20.0)),
-            sample(200, "temp", Signal::Number(21.5)),
-            sample(300, "temp", Signal::Number(30.0)),
-            sample(150, "running", Signal::Bool(true)),
-        ],
-    )
-    .unwrap();
-    slot.event("signal_gap", "signal:0001", "helper restarted")
-        .unwrap();
-    assert_eq!(
-        slot.record_event("note", None, None, "shift B", &Context::new())
-            .unwrap()
-            .map(|id| id > 0),
-        Some(true)
-    );
-    slot.record_saved(batch(vec![capture("/x/a.png", 250)]), 0);
-    let status = slot.status_cached().unwrap();
-    assert_eq!((status.samples, status.signals), (4, 2));
-    slot.finish().unwrap();
-    slot.close().unwrap();
-    let dataset = Dataset::open_read_only(&path).unwrap();
-    let reader = dataset.reader().unwrap();
-    let rows = reader
-        .query(
-            "SELECT tag, value_double, sample_age_ms, unit FROM captures_with_signals ORDER BY tag",
-            10,
-            0,
-        )
-        .unwrap();
-    assert_eq!(
-        rows["rows"],
-        json!([["running", 1.0, 100, null], ["temp", 21.5, 50, "degC"]])
-    );
-    let signal = reader
-        .query(
-            "SELECT first_ms, last_ms, protocol, kind FROM signals WHERE tag = 'temp'",
-            1,
-            0,
-        )
-        .unwrap();
-    assert_eq!(signal["rows"][0], json!([100, 300, "sim-signal", "number"]));
-    drop((reader, dataset));
-    // With nothing open the samples are refused, so the hub counts them as
-    // dropped rather than written.
-    assert!(
-        slot.write("x", &[sample(1, "t", Signal::Number(1.0))])
-            .is_err()
-    );
-    let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
 fn size_cap_reports_storage_full() {
     let dir = temp_dir("cap");
     let slot = Slot::new();
-    slot.open(&dir.join("c.duckdb"), OpenMode::Create, Some(1024 * 1024))
+    // Exercise the writer's quota guard with a cap below any database header;
+    // the empty catalog's file size changes when camera tables change.
+    slot.open(&dir.join("c.duckdb"), OpenMode::Create, Some(1))
         .unwrap();
     slot.record_saved(batch(vec![capture("/x/a.png", 1)]), 0);
     let status = slot.status_cached().unwrap();
@@ -493,13 +386,7 @@ fn validate_command_bounds() {
         ("", false),
         ("foreign/path", false),
     ] {
-        assert_eq!(
-            ok(C::DatasetCloseIf {
-                slot_id: id.into(),
-                sink_generation: None
-            }),
-            accepted
-        );
+        assert_eq!(ok(C::DatasetCloseIf { slot_id: id.into() }), accepted);
     }
     for (max_result_bytes, accepted) in [
         (0, false),
@@ -569,15 +456,6 @@ fn export_bundle_writes_every_format_once_and_never_overwrites() {
     let slot = Slot::new();
     slot.open(&dir.join("e.duckdb"), OpenMode::Create, None)
         .unwrap();
-    slot.register(&source(), &[]).unwrap();
-    slot.write(
-        "signal:0001",
-        &[
-            sample(100, "temp", Signal::Number(20.0)),
-            sample(100, "it's", Signal::Number(1.0)),
-        ],
-    )
-    .unwrap();
     slot.record_saved(batch(vec![capture("/x/a.png", 150)]), 0);
     slot.record_event("note", None, None, "first \"note\"", &Context::new())
         .unwrap();
@@ -598,7 +476,6 @@ fn export_bundle_writes_every_format_once_and_never_overwrites() {
         .export(&export_request(output.clone(), formats.clone()))
         .unwrap();
     assert_eq!(result["tables"]["captures"], 1);
-    assert_eq!(result["tables"]["captures_wide"], 1);
     for table in TABLES {
         for format in &formats {
             assert!(
@@ -621,20 +498,11 @@ fn export_bundle_writes_every_format_once_and_never_overwrites() {
             );
         }
     }
-    let wide = fs::read_to_string(output.join("captures_wide.csv")).unwrap();
-    assert!(wide.contains("temp") && wide.contains("it's"), "{wide}");
     let readme = fs::read_to_string(output.join("README.md")).unwrap();
     let summary = &readme[readme.find("## Summary for AI tools").unwrap()..];
     assert!(summary.len() <= export::SUMMARY_BYTES && summary.contains("first 'note'"));
     // Capture context (line, part, lot) is summarized for AI tools.
     assert!(summary.contains("- context line: L1 (1)"), "{summary}");
-    // The long ASOF table is not loaded under the name `wide`.
-    assert!(
-        readme.contains("wide = pd.read_csv('captures_wide.csv')") || cfg!(feature = "parquet")
-    );
-    assert!(readme.contains("joined = pd.read_"), "{readme}");
-    assert!(!readme.contains("wide = pd.read_csv('captures_with_signals"));
-    assert!(!readme.contains("wide = pd.read_parquet('captures_with_signals"));
     if cfg!(feature = "parquet") {
         let check = Dataset::open_read_only(&dir.join("e.duckdb")).err();
         assert!(check.is_some(), "the session still holds the dataset");
@@ -643,13 +511,13 @@ fn export_bundle_writes_every_format_once_and_never_overwrites() {
             .query_row(
                 &format!(
                     "SELECT count(*) FROM '{}'",
-                    output.join("samples.parquet").display()
+                    output.join("captures.parquet").display()
                 ),
                 [],
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(rows, 2);
+        assert_eq!(rows, 1);
     }
     let before = fs::read(output.join("manifest.json")).unwrap();
     let error = slot
@@ -706,14 +574,13 @@ fn checked_dataset_identity_changes_on_reopen_and_preserves_replacement() {
     let dir = temp_dir("checked-slot");
     let path = dir.join("data.duckdb");
     let slot = Arc::new(Slot::new());
-    let hub = crate::signals::hub::SignalHub::new();
     let open = || C::DatasetOpenIf {
         expected_slot_id: None,
         path: path.to_string_lossy().into_owned(),
         mode: OpenMode::Auto,
         max_bytes: None,
     };
-    let first = coordinator::run(&slot, &hub, open()).unwrap();
+    let first = coordinator::run(&slot, open()).unwrap();
     let first_id = first["slot_id"].as_str().unwrap().to_owned();
     assert_eq!(first_id.len(), 32);
     let unchanged = slot
@@ -722,28 +589,24 @@ fn checked_dataset_identity_changes_on_reopen_and_preserves_replacement() {
     assert_eq!(unchanged.slot_id.as_deref(), Some(first_id.as_str()));
     coordinator::run(
         &slot,
-        &hub,
         C::DatasetCloseIf {
             slot_id: first_id.clone(),
-            sink_generation: None,
         },
     )
     .unwrap();
-    let second = coordinator::run(&slot, &hub, open()).unwrap();
+    let second = coordinator::run(&slot, open()).unwrap();
     let second_id = second["slot_id"].as_str().unwrap().to_owned();
     assert_ne!(first_id, second_id);
     assert_eq!(
         first["dataset_id"], second["dataset_id"],
         "file identity persists"
     );
-    assert!(hub.has_sink());
     let auto = dir.join("automatic.duckdb");
     slot.set_auto_path(Some(auto.clone()));
     let events = slot.status_cached().unwrap().events;
     for command in [
         C::DatasetCloseIf {
             slot_id: first_id.clone(),
-            sink_generation: None,
         },
         C::DatasetNoteIf {
             slot_id: first_id.clone(),
@@ -779,14 +642,10 @@ fn checked_dataset_identity_changes_on_reopen_and_preserves_replacement() {
         },
         open(),
     ] {
-        let error = coordinator::run(&slot, &hub, command).unwrap_err();
+        let error = coordinator::run(&slot, command).unwrap_err();
         assert!(
             error.to_string().contains("dataset slot changed"),
             "{error:#}"
-        );
-        assert!(
-            hub.has_sink(),
-            "stale close must not detach the replacement sink"
         );
         assert_eq!(
             slot.auto_path(),
@@ -798,44 +657,7 @@ fn checked_dataset_identity_changes_on_reopen_and_preserves_replacement() {
         assert_eq!(status.events, events);
     }
     assert!(!dir.join("wrong-export").exists());
-    let tags = [TagInfo {
-        tag: "t".into(),
-        unit: Some("°C".into()),
-        kind: Some("number".into()),
-    }];
-    assert!(
-        slot.register_for_dataset_slot(&first_id, &source(), &tags)
-            .is_err()
-    );
-    assert!(
-        slot.write_for_dataset_slot(
-            &first_id,
-            "signal:0001",
-            &[sample(1, "t", Signal::Number(1.0))]
-        )
-        .is_err()
-    );
-    assert_eq!(slot.status_cached().unwrap().signals, 0);
-    assert_eq!(slot.status_cached().unwrap().samples, 0);
-    slot.register_for_dataset_slot(&second_id, &source(), &tags)
-        .unwrap();
-    slot.write_for_dataset_slot(
-        &second_id,
-        "signal:0001",
-        &[sample(1, "t", Signal::Number(1.0))],
-    )
-    .unwrap();
-    assert_eq!(slot.status_cached().unwrap().samples, 1);
-    coordinator::run(
-        &slot,
-        &hub,
-        C::DatasetCloseIf {
-            slot_id: second_id,
-            sink_generation: None,
-        },
-    )
-    .unwrap();
-    assert!(!hub.has_sink());
+    coordinator::run(&slot, C::DatasetCloseIf { slot_id: second_id }).unwrap();
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -965,7 +787,6 @@ fn bounded_export_caps_all_files_checksums_and_refuses_overwrite() {
     let readme = fs::read_to_string(request.output.join("README.md")).unwrap();
     assert!(readme.contains("events = pd.read_"));
     assert!(!readme.contains("captures = pd.read_"));
-    assert!(!readme.contains("samples = pl.read_"));
     let bytes = result["bytes"].as_u64().unwrap();
     let files = result["files"].as_array().unwrap();
     assert_eq!(
@@ -1100,79 +921,6 @@ fn closing_a_slot_cancels_its_checked_reader_before_reuse() {
     assert!(!request.output.exists());
     drop(reader);
     closing.join().unwrap();
-    let _ = fs::remove_dir_all(dir);
-}
-
-#[test]
-fn bounded_export_preserves_joined_samples_and_time_filters() {
-    let dir = temp_dir("bounded-joined");
-    let slot = Slot::new();
-    slot.open(&dir.join("mixed.duckdb"), OpenMode::Create, None)
-        .unwrap();
-    slot.register(&source(), &[]).unwrap();
-    slot.write(
-        "signal:0001",
-        &[
-            sample(100, "temp", Signal::Number(20.0)),
-            sample(200, "temp", Signal::Number(30.0)),
-        ],
-    )
-    .unwrap();
-    slot.record_saved(
-        batch(vec![capture("/x/one.png", 150), capture("/x/two.png", 250)]),
-        0,
-    );
-    let mut formats = vec![ExportFormat::Csv];
-    if cfg!(feature = "parquet") {
-        formats.push(ExportFormat::Parquet);
-    }
-    let mut request = export_request(dir.join("selected"), formats.clone());
-    request.tables = vec!["samples".into(), "captures_with_signals".into()];
-    request.since_ms = Some(150);
-    request.until_ms = Some(250);
-    let result = slot
-        .reader()
-        .unwrap()
-        .export_bounded(&request, 1_000_000, 10000)
-        .unwrap();
-    assert_eq!(result["tables"]["samples"], 1);
-    assert_eq!(result["tables"]["captures_with_signals"], 2);
-    let conn = duckdb::Connection::open_in_memory().unwrap();
-    for format in formats {
-        let ext = format.extension();
-        let rows: Vec<(u64, f64)> = conn
-            .prepare(&format!(
-                "SELECT sample_ms, value_double FROM '{}' ORDER BY capture_id",
-                request
-                    .output
-                    .join(format!("captures_with_signals.{ext}"))
-                    .display()
-            ))
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<duckdb::Result<_>>()
-            .unwrap();
-        assert_eq!(rows, [(100, 20.0), (200, 30.0)]);
-        let rows: u64 = conn
-            .query_row(
-                &format!(
-                    "SELECT count(*) FROM '{}' WHERE ts_ms = 200",
-                    request.output.join(format!("samples.{ext}")).display()
-                ),
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(rows, 1);
-        assert!(!request.output.join(format!("captures.{ext}")).exists());
-    }
-    let manifest: Value =
-        serde_json::from_slice(&fs::read(request.output.join("manifest.json")).unwrap()).unwrap();
-    assert_eq!(manifest["filters"]["since_ms"], 150);
-    assert_eq!(manifest["filters"]["until_ms"], 250);
-    assert_eq!(manifest["slot_id"], result["slot_id"]);
-    slot.close().unwrap();
     let _ = fs::remove_dir_all(dir);
 }
 

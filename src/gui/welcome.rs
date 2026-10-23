@@ -85,8 +85,20 @@ impl Workbench {
         }
         let t = self.side.stage_in.get(self.now);
         let surface = style::mix(p.base, p.stage, t);
+        // Floating panels cover the stage's center in compact windows.
+        // Keep its guidance and actions in the room the user can see.
+        let (left, right) = if self.panels_docked() {
+            (0.0, 0.0)
+        } else {
+            (
+                self.sidebar_slide.lerp(0.0, INSPECTOR, self.now),
+                self.inspector_slide.lerp(0.0, INSPECTOR, self.now),
+            )
+        };
         let ready = center(ready).padding(iced::Padding {
             top: motion::rise(16.0, t),
+            left,
+            right,
             ..iced::Padding::ZERO
         });
         container(veil(ready, surface, 0.0, t))
@@ -150,10 +162,14 @@ impl Workbench {
             .recent
             .iter()
             .filter(|recent| {
-                !self.snapshot.devices.iter().any(|device| {
-                    device.id == recent.target
-                        || device.address.as_deref() == Some(recent.target.as_str())
-                })
+                !connected
+                    .clone()
+                    .chain(self.snapshot.devices.iter())
+                    .any(|device| {
+                        device.id == recent.target
+                            || device.serial == recent.target
+                            || device.address.as_deref() == Some(recent.target.as_str())
+                    })
             })
             // With nothing found, the searching or not-found slot holds the
             // first card's place, so there are never more than four slots.
@@ -716,6 +732,76 @@ mod tests {
     }
 
     #[test]
+    fn ready_guidance_and_actions_fit_beside_either_floating_panel_at_every_scale() {
+        use crate::gui::destinations::layout_tests::{prepare_artifact_frame, renderer};
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = renderer();
+        for (scanner, guidance, action) in [
+            (true, "Ready to scan a document", "Scan & save"),
+            (false, "Ready for your first frame", "Capture one frame"),
+        ] {
+            for scale in prefs::UiScale::ALL {
+                for sidebar in [true, false] {
+                    let mut app = bench();
+                    let mut camera = crate::transport::simulator::info();
+                    if scanner {
+                        camera.transport = Transport::Scanner;
+                        camera.profile.kind = CameraKind::DocumentScanner;
+                    }
+                    app.snapshot.active_camera = Some(camera.id.clone());
+                    app.snapshot.connected = Some(camera);
+                    app.ui_scale = scale;
+                    app.width = 900.0 / scale.factor();
+                    app.sidebar_peek = sidebar;
+                    app.inspector_peek = !sidebar;
+                    app.sidebar_slide.set(if sidebar { 1.0 } else { 0.0 });
+                    app.inspector_slide.set(if sidebar { 0.0 } else { 1.0 });
+                    let size = Size::new(app.width, 620.0 / scale.factor() - BAR - TOOLBAR);
+                    let mut view = app.ready(Palette::of(false));
+                    let mut tree = Tree::new(view.as_widget());
+                    let node = view.as_widget_mut().layout(
+                        &mut tree,
+                        &renderer,
+                        &layout::Limits::new(Size::ZERO, size),
+                    );
+                    prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
+                    let (snapshot, _, _) = accessibility::snapshot_widget(
+                        view.as_widget_mut(),
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                    );
+                    let (left, right) = if sidebar {
+                        (INSPECTOR, size.width)
+                    } else {
+                        (0.0, size.width - INSPECTOR)
+                    };
+                    let mut labels = vec![guidance, action];
+                    if !scanner {
+                        labels.push("Start stream");
+                    }
+                    for label in labels {
+                        let bounds = snapshot
+                            .nodes
+                            .iter()
+                            .find(|(_, control)| control.label() == Some(label))
+                            .and_then(|(_, control)| control.bounds())
+                            .unwrap_or_else(|| panic!("{label} is visible"));
+                        assert!(
+                            bounds.x0 >= f64::from(left) - 0.5
+                                && bounds.x1 <= f64::from(right) + 0.5
+                                && bounds.y0 >= 0.0
+                                && bounds.y1 <= f64::from(size.height) + 0.5,
+                            "{label} fits beside {} at {scale}: {bounds:?}",
+                            if sidebar { "Capture" } else { "Features" }
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_new_window_shows_the_picker_with_its_address_field() {
         use crate::gui::destinations::layout_tests::{prepare_artifact_frame, renderer};
         use iced::advanced::{Layout, layout, widget::Tree};
@@ -744,7 +830,20 @@ mod tests {
             Layout::new(&node),
             &renderer,
         );
-        for label in ["Camera address", "Settings", "Open data sources"] {
+        for removed in [
+            "Open data sources",
+            "Live signals",
+            "Protected source profiles",
+        ] {
+            assert!(
+                snapshot
+                    .nodes
+                    .iter()
+                    .all(|(_, node)| node.label() != Some(removed)),
+                "The camera picker must not expose {removed}."
+            );
+        }
+        for label in ["Camera address", "Settings"] {
             let bounds = snapshot
                 .nodes
                 .iter()
@@ -846,6 +945,35 @@ mod tests {
             detail: format!("GigE · {target}"),
             transport: Transport::GigE,
         }
+    }
+
+    #[test]
+    fn connected_and_discovered_cameras_do_not_repeat_as_recent_aliases() {
+        let mut app = bench();
+        let mut camera = liveness::streaming_camera(0, 0, 0.0);
+        camera.info.id = "camera-id".into();
+        camera.info.serial = "CAMERA-SERIAL".into();
+        camera.info.address = Some("192.168.1.20".into());
+        app.recent = ["camera-id", "CAMERA-SERIAL", "192.168.1.20", "192.168.1.21"]
+            .into_iter()
+            .map(recent)
+            .collect();
+
+        // Another window can keep a camera connected after discovery has
+        // stopped advertising it. Its existing card must still replace
+        // every recent alias, so those aliases cannot reconnect it.
+        app.snapshot.cameras = vec![camera.clone()];
+        let (found, recent, _) = app.welcome_choices();
+        assert_eq!(found.len(), 1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].target, "192.168.1.21");
+
+        app.snapshot.cameras.clear();
+        app.snapshot.devices = vec![camera.info];
+        let (found, recent, _) = app.welcome_choices();
+        assert_eq!(found.len(), 1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].target, "192.168.1.21");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # AI capture assistant
 
-The optional assistant uses the same checked capture tools as external agents. It can examine frames, adjust imaging settings, capture files, acquire sensor values and query or export a dataset. Select a provider and model before you send a request. The `ai` build feature supplies the assistant; builds without it return exit 5 for every `assistant` subcommand.
+The optional assistant uses the same checked capture tools as external agents. It can examine frames, adjust imaging settings, capture files and query or export a dataset. Select a provider and model before you send a request. The `ai` build feature supplies the assistant; builds without it return exit 5 for every `assistant` subcommand.
 
-Everything runs on the local computer. The optional AI assistant and prompt measurements send data to the AI provider you choose, only when you send a request. Provider requests use your account and its data terms.
+Capture and tool execution run on the local computer. The optional AI assistant uses the provider you choose, only when you send a request. Apple Intelligence processes assistant requests on-device; remote providers and prompt measurements send data to the selected API using your account and its data terms.
 
 ## Set up a provider
 
@@ -54,6 +54,7 @@ These are Capturefab's catalog entries and configured defaults. They are not pro
 | `perplexity` | `PERPLEXITY_API_KEY` | Optional model |
 | `ollama` | `OLLAMA_API_KEY` only for `ollama.com` | Optional `base_url`; local servers use no key |
 | `lmstudio` | Optional `LM_API_TOKEN` | Model; optional `base_url` |
+| `apple_foundation_models` | None | Built-in Apple Intelligence model; macOS 26 or later |
 | `custom` | Optional `CAPTUREFAB_AI_API_KEY` | Model and `base_url` |
 
 `assistant use PROVIDER` accepts `--model`, `--base-url`, `--account-id`, `--gateway-id`, `--region`, `--profile`, `--project`, `--location`, `--endpoint`, `--effort low|medium|high` and `--vision auto|on|off`. Fields apply only to the relevant provider. Environment defaults include `CLOUDFLARE_ACCOUNT_ID`, `AZURE_OPENAI_ENDPOINT`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`, `AWS_REGION`, `AWS_DEFAULT_REGION`, `AWS_PROFILE` and `OLLAMA_HOST`. Stored settings take precedence over environment defaults.
@@ -69,6 +70,18 @@ capturefab assistant use custom --base-url http://127.0.0.1:8080/v1 --model loca
 
 Cloud endpoints use HTTPS and provider-specific host restrictions. Custom, Ollama and LM Studio can use plain HTTP on loopback or private addresses. Capturefab never sends a key over plain HTTP to a non-loopback host. Plain HTTP and loopback requests bypass environment proxies. A configured custom endpoint can receive a saved key, so review its host before selecting it.
 
+### Apple Intelligence on this Mac
+
+Choose **Apple Intelligence** in Settings → **AI assistant**, then select **Test local AI**. Capturefab uses Apple's [Foundation Models framework](https://developer.apple.com/documentation/foundationmodels) with the built-in on-device model. You need macOS 26 or later, a Mac that supports Apple Intelligence, and Apple Intelligence enabled with its model downloaded. Settings reports the operating system's availability result and explains when the model is unavailable.
+
+```sh
+capturefab assistant use apple_foundation_models
+capturefab assistant test apple_foundation_models --json
+capturefab --session bench assistant ask 'List the connected cameras.' --json
+```
+
+No API key, server URL, separate model installation or model selection is required. Assistant prompts and tool results stay on this Mac; an unavailable or failed local model never triggers a remote fallback. The local model is text-only, so it can use numeric measurements and permitted dataset results but cannot inspect camera images. Camera tool permissions, plan review and task limits apply as usual. The system model has a smaller context window than most remote models; use short, focused requests and start a new conversation if its context is full. This choice does not change the separate remote prompt-measurement providers. Source builds need a macOS 26 or newer SDK to include the native helper; the application remains usable on older systems.
+
 ## Credentials and precedence
 
 For ordinary API-key providers, the first nonempty provider environment variable wins, followed by that provider's saved key. A provider never borrows another provider's environment key. An invalid nonempty key is an error, not a reason to use another credential.
@@ -83,11 +96,11 @@ For Bedrock, the bearer environment token wins. An explicit saved `profile`, `AW
 
 ## What leaves this computer
 
-Each provider request can contain your prompt, previous conversation text, proposed plan, tool schemas and redacted session details. These details include camera names, models and IDs, discovered devices, destination names and locations, storage use, job file names and recent activity. Tool results include numeric frame measurements. With images enabled, requests also contain the camera previews the assistant examines, including fresh checkpoint images during long tasks.
+Each provider request can contain your prompt, previous conversation text, proposed plan, tool schemas and redacted session details. These details include camera names, models and IDs, discovered devices, destination names and locations, storage use, job file names and recent activity. Tool results include numeric frame measurements. With images enabled, requests also contain the camera previews the assistant examines, including fresh checkpoint images during long tasks. Apple Intelligence processes these text requests locally and does not support images; remote providers receive them at their configured API.
 
-Data tasks require separate permission. **Allow source values and dataset results** in task setup, or `--allow-data` on the CLI, permits selected source tag names, values, units, quality, timestamps, dataset notes and query results to reach the provider. Choosing a data source does not grant image permission. Source locations are redacted; executable source endpoints and credentials stay local.
+Camera dataset access requires separate permission. **Read dataset rows** in task setup, or `--allow-data` on the CLI, permits camera tags, dataset notes and query results to reach the provider. Image permission stays separate. Private camera metadata is redacted before it reaches the model.
 
-Capturefab excludes API keys, passwords and secret form fields from model content. Model-facing camera metadata removes serial and address fields, reduces network URLs to their scheme and host, and replaces the home-directory prefix with `~`. Dataset SQL receives the same projection before it can transform these metadata fields. Consented sensor values, notes and file names remain data. Provider authentication is sent separately to the selected endpoint. Frames are downscaled previews, not a copy of every saved capture. Scene text, file names, device descriptions and logs are data, never instructions.
+Capturefab excludes API keys, passwords and secret form fields from model content. Model-facing camera metadata removes serial and address fields, reduces network URLs to their scheme and host, and replaces the home-directory prefix with `~`. Dataset SQL receives the same projection before it can transform these metadata fields. Consented camera tags, notes and file names remain data. Provider authentication is sent separately to the selected endpoint. Frames are downscaled previews, not a copy of every saved capture. Scene text, file names, device descriptions and logs are data, never instructions.
 
 Choosing a local endpoint changes where the request goes; it does not change the request's contents. The provider's or local server's data terms and logging configuration still apply. The assistant does not have a general shell, arbitrary file reader, raw register writer or unrestricted network tool.
 
@@ -106,22 +119,6 @@ secrets when needed. **Run plan** executes the displayed revision after a fresh
 check. A changed action stops execution for another review. Return commits field
 edits and never runs the plan. After a partial failure, completed steps stay in
 the transcript and **Run remaining steps** keeps the failed and later steps.
-
-Closing with the close button, Escape or the shortcut keeps the conversation and
-active work. **Stop** cancels a model turn and restores its earlier plan, or stops
-plan execution after the accepted command finishes. Closing clears unsaved
-secrets. **New conversation** clears the plan and history. **Export plan…** writes
-a private plan file and offers a `capturefab tools apply --dry-run` command using
-the app's executable and current workbench selection. The command uses the reviewed
-output folder for relative file names and restores the terminal's working directory
-afterward. It clears inherited camera and session overrides that could select a
-different target. Inspect the checks before removing `--dry-run` to run approved
-actions. Exported
-anonymous sensor steps contain their currently approved, credential-free source
-endpoints so another CLI process can check them; the in-app plan keeps its opaque
-references. Removed or changed bindings block export. Protected source plans must
-run in the app, or be reviewed again after binding the saved profile locally in
-the target workbench; account epochs and credentials are never exported.
 
 ```sh
 capturefab serve --name bench
@@ -154,7 +151,7 @@ When the plan has steps, `--plan-out FILE` creates a private version-1 tool plan
 
 Observe reads state. Reversible actions change camera state. Bounded actions acquire a fixed amount of data. Disruptive actions can interrupt work or send video elsewhere. HumanOnly actions create destinations or need a person's direct decision. Live circumstances can raise an action's risk. Only changes with an acknowledged history token can use camera Undo.
 
-The assistant always asks before a Disruptive or HumanOnly action. This includes streaming to a URL, creating a folder or S3 destination, starting physical scanner acquisition, stopping another participant's work, restarting busy acquisition, and overwriting a value a person changed during the task. Unsafe transport, firmware, persistent-network, user-set and raw-register operations are refused by the camera tool registry.
+The assistant always asks before a Disruptive or HumanOnly action. This includes streaming to a URL, creating a folder destination, starting physical scanner acquisition, stopping another participant's work, restarting busy acquisition, and overwriting a value a person changed during the task. Unsafe transport, firmware, persistent-network, user-set and raw-register operations are refused by the camera tool registry.
 
 An approval is for the displayed action. The runtime rechecks its camera, destination, output, risk and other facts before execution. Approval for a task covers the same tool, camera and risk, with the same egress target; HumanOnly approval is always once. A human change or replacement camera worker invalidates earlier grants. Denied or unanswered actions return an error to the model. Three denials or timeouts end the task as `needs_user`.
 
@@ -178,9 +175,7 @@ at the limit. Cost is an estimate when prices are known; otherwise tokens are
 shown.
 
 **Stop**, **Pause/Resume**, and **Take over** remain available while working.
-Take over stops the task and waits for its current command and owned-data flush to finish. It
-selects the task's camera, or opens manual Data sources for a data-only task. The camera
-picker's Data sources action is available whenever no camera is shown in the window.
+Take over stops the task, waits for its current command to finish and selects its camera.
 Human camera controls stay enabled. Messages reach the assistant at the next round. Closing
 the sheet keeps the task running; the toolbar shows progress, Stop and pending
 approval. Quitting asks whether to keep running or stop and quit. After a task,
@@ -201,7 +196,7 @@ capturefab --session bench assistant run --prompt-file task.txt \
   --see-images --mode supervised --approvals ask --on-human-change pause
 ```
 
-Run scope pins up to eight explicit camera IDs, approved data sources, an optional open dataset instance and allowed saved destination names. Select at least one camera, source or dataset; a data-only task needs no camera. An empty destination list permits the local capture root only. A model-supplied URL, path or destination cannot add to scope. Discover a camera before selecting it for a task. Capture activity is attributed to `assistant:{pid}:{run8}` with actor kind `agent`.
+Run scope pins up to eight explicit camera IDs, an optional open dataset instance and allowed saved destination names. Select at least one camera or dataset. An empty destination list permits the local capture root only. A model-supplied URL, path or destination cannot add to scope. Discover a camera before selecting it for a task. Capture activity is attributed to `assistant:{pid}:{run8}` with actor kind `agent`.
 
 `--see-images` permits previews; omit it for measurements only. Effective `--max-recordings 0` disables file recording. Effective `--max-captures 0` disables captures and schedules. Streams remain separate actions that always need exact human approval. CLI recordings and schedules must end within the task deadline. The CLI never permits effects to outlive the task.
 
@@ -209,63 +204,9 @@ Run scope pins up to eight explicit camera IDs, approved data sources, an option
 
 `wait_for` waits for time, frames, settled auto exposure, completed jobs, stopped recordings or activity. It checks cancellation, human changes and wall time at most every 250 ms. Waiting does not consume another model round. A reply without tool calls ends the CLI run as `needs_user`; it does not poll for an answer in the background.
 
-## Sensor data and mixed captures
+## Camera datasets
 
-In task setup, select cached sources or add credential-free source endpoints, select an existing dataset when needed, and enable data permission. On the CLI, repeat `--source URI` to approve sources. `--dataset SLOT_ID` selects the exact open instance reported by `tools call get_dataset --args '{}' --json`; it is not a database filename. The assistant can instead use `open_dataset` to create a catalog inside the capture folder. Close the current dataset before selecting a different file. Closing the shared dataset or stopping another participant's signal capture requires approval.
-
-In **Plan first**, open **Sources…** and add a credential-free endpoint, then enable **Read sensor values and dataset rows**. The endpoint stays local; the provider receives an opaque reference and redacted location. Adding a source does not contact it: fresh reads, browsing and captures become reviewable plan steps and wait for **Run plan**. Bindings survive context refreshes and follow-up requests in that conversation; removing a binding or changing data consent resets provider history and invalidates the reviewed plan revision. **New conversation** clears bindings and consent. Cached source references remain available for observations with data permission and never become executable endpoints without a local binding. Task setup also supports explicit sources for supervised or autonomous runs.
-
-For authenticated MQTT or OPC UA sources, use the saved-source editor in **Sources…**, task setup or the manual Data sources inspector. Enter the endpoint without credentials, then choose a local username and either the OS credential store or a `CAPTUREFAB_SIGNAL_` password environment reference. **Save profile** keeps credentials locally; **Use source** explicitly resolves them in the selected workbench. A password is never read back into the editor. Choosing a source for an assistant does not contact its endpoint; the resulting network action still needs review. In manual controls, **Start logging** binds the profile and starts the source. OPC UA credentials currently use the protocol's existing security policy; review the editor's transport warning.
-
-The CLI exposes the same flow with `signals profiles list|save|remove|bind`. `save --credentials-stdin` reads a JSON object with `username` and `password` from protected stdin and saves the password in the OS store. Add `--password-env CAPTUREFAB_SIGNAL_NAME` and omit `password` from that JSON to use the workbench's environment instead. Keep credentials out of shell command arguments and history. Updating or removing a profile requires its exact listed revision. For a bounded assistant task, repeat `--source-profile NAME --allow-data` to bind saved profiles explicitly; external harnesses can run `signals profiles bind NAME`, then use its opaque reference with data tools.
-
-Bindings belong to one workbench session, saved-profile revision and credential epoch. Editing a profile, changing its password or restarting the workbench requires **Use source** again. Existing tasks cannot adopt a replacement account at the same endpoint. Checking a cached source in task setup pins the account binding immediately; an account change before Start requires reselection. Cached selections do not grant a fresh connection.
-
-```sh
-capturefab --session bench assistant run \
-  'Create mixed.duckdb with a 16 MiB limit. Log 12 values from the approved sensor at 100ms intervals, for at most 5 seconds and 8 KiB of sample payload. Wait for final persistence, photograph sim:0, query captures_with_signals, and export a new mixed-bundle folder with a 1 MiB limit.' \
-  --camera sim:0 --source sim-signal://line1 --allow-data \
-  --mode autonomous --approvals deny --max-sources 1 --max-samples 12 \
-  --max-signal-time 5s --max-data-size 3MiB --max-captures 1 --json
-```
-
-Omit `--camera` for a data-only task. Fresh network reads and browses require approval; the simulator can run within the displayed bounds. `list_data_sources` uses cached status and never connects. Other source tools use references returned by that observation, bound to the endpoints approved during setup.
-
-`start_signal_capture` requires interval, duration, sample and serialized-payload byte limits. The coordinator enforces those limits after the client disconnects. `wait_for_data` with `samples:null` waits for completion and final flush; check `persistence_complete`, `written`, `dropped`, `helper_dropped` and errors before using the dataset. A stopped helper alone does not prove its samples were saved. Cleanup uses the acknowledged capture identity and preserves a person's replacement of the same source.
-
-Queries accept one read-only SELECT, return at most 1,000 rows and 16 KiB including metadata, and mark omitted rows with `truncated` and `truncation_reason`. Before built-in assistant SQL runs, Capturefab copies the six standard tables into a private snapshot. Stored camera serials become null, URLs lose private credentials and paths, and the current home-directory prefix becomes `~`; SQL aliases and transforms cannot recover the originals. Consented sensor values, tags, notes and file names remain data. The complete snapshot is limited to 100,000 rows, 16 MiB of Arrow transfers and 8 MiB per batch. The same timeout covers setup, copying and SQL. Large or modified-schema datasets fail explicitly; use local CLI analysis for those datasets. Builds without the `parquet` feature cannot provide this model-query boundary and refuse the operation. Direct trusted CLI dataset queries retain local catalog contents.
-
-Exports write selected tables and an inclusive time range to a new folder, with manifest, loading examples and checksums. CSV, Parquet, JSON and JSON Lines are available when compiled; Parquet and JSON require the `parquet` feature. The complete generated export bundle, including its staged data and metadata, must fit its declared byte limit. The dataset remains open for review after a successful task.
-
-Signal byte limits count serialized sample payload. Each export reserves **twice its bundle limit** for staged files and published copies. Both reservations consume `--max-data-size` and `--max-size`; failed attempts retain their charges. For example, a 16 MiB bundle needs a 32 MiB reservation. The model receives `remaining.export_bundle_bytes`, the largest bundle allowed by the remaining reservations. This covers combined logical file sizes during export publication, including retained staged files; it does not cap physical DuckDB/WAL growth, shared query scratch, filesystem overhead or ledger files. Dataset size checks and the session's separate scratch policy still apply; full per-task storage isolation remains an implementation limitation.
-
-For native sensor-only tasks, **Separate dataset for this task** creates an isolated catalog with
-the logical file extent cap shown in setup. Its full reservation remains charged after completion.
-The option is available on supported Unix builds with Parquet; mixed image/data tasks and external
-capture tools use the shared dataset workflow above.
-
-Use **Retained datasets…** in Quick Command to review previous work, including after starting a new
-task or restarting Capturefab. **Show in Finder/folder** reveals the original workspace. **Save a copy…**
-writes `task.duckdb` and any `task.duckdb.wal` into a new folder, charged separately to the storage
-budget. Keep those files together and open the copied database for analysis or crash recovery.
-Copying does not modify the retained original. **Remove…** asks for confirmation before permanently
-deleting that workspace; its reservation is released only after anchored deletion is acknowledged.
-An active owner, changed directory, extra hard links or uncertain close blocks removal and keeps
-the reservation visible. All inventory, copy and removal work runs off the UI thread.
-
-External tools can recover orphan workspaces through the local CLI:
-
-```sh
-capturefab storage task-data list --json
-capturefab storage task-data copy RESERVATION_ID recovered-data --json
-# Only after the user approves deleting this exact workspace:
-capturefab storage task-data remove RESERVATION_ID --confirmed-by-user --json
-```
-
-Use the reservation ID returned by the inventory. A live session retains ownership; close its task
-and use the GUI's retained-data controls, or exit the owning session before CLI recovery. Paths,
-action logs and actor labels cannot authorize removal. A failed copy can leave a partial output
-folder; inspect it before retrying with a new folder name.
+Select an open camera dataset and enable **Read dataset rows** to let the assistant query captures, recordings and notes. CLI tasks use `--dataset SLOT_ID --allow-data`. Dataset queries and exports stay within the selected dataset and allowed output folder.
 
 ## Images and vision
 
@@ -287,10 +228,7 @@ Previews are JPEG or PNG, at most 1.5 MiB each and at most 1,568 pixels per dime
 | Data reservation | 2 GiB | Remaining storage budget and free disk | `--max-size` |
 | File recordings | 2 | 32 | `--max-recordings` |
 | Each recording or stream duration | 30 minutes | 7 days; CLI also enforces the task deadline | `--max-recording` |
-| Source capture attempts | 8 | 256 | `--max-sources` |
-| Reserved signal samples | 1,000,000 | 100,000,000 | `--max-samples` |
-| Signal payload and export peak reservations | 512 MiB | Remaining storage budget; exports reserve twice their bundle limit | `--max-data-size` |
-| Cumulative signal capture duration | 30 minutes | 7 days; CLI also enforces the task deadline | `--max-signal-time` |
+| Dataset export peak reservations | 512 MiB | Remaining storage budget; exports reserve twice their bundle limit | `--max-data-size` |
 | Setting assignments | 300 | 10,000 | Settings file |
 | Consecutive tool errors | 5 | 5 | Settings file |
 | Identical consecutive calls | 3 | 3 | Settings file |
@@ -313,7 +251,7 @@ The runtime's Restore proposal contains baseline assignments only where the same
 
 ## Settings and logs
 
-Assistant settings and action logs live in the persistent state directory reported by `doctor --json`; `CAPTUREFAB_SESSION_DIR` overrides it together with the runtime directory. Existing Linux settings migrate from the old session directory on first use; inactive action logs move without overwriting an existing run, while active logs stay readable in their original directory until their writer closes.
+Assistant settings and action logs live in the persistent state directory reported by `doctor --json`; `CAPTUREFAB_SESSION_DIR` overrides it together with the runtime directory.
 
 `<state_dir>/assistant.json` is version 1, at most 64 KiB, written atomically under a lock. On Unix it has mode 0600. It is a regular private file, not a symlink. Invalid entries are ignored with a warning on load. It contains provider selection, non-secret fields, a saved-key hint, autonomy defaults and optional prices:
 
@@ -336,7 +274,7 @@ capturefab assistant runs --json
 capturefab assistant log RUN_ID --json
 ```
 
-Action logs are private JSONL files under `<state_dir>/assistant/runs/<run_id>.jsonl`. Each record has `v`, `run`, `seq`, `t` (UTC Unix milliseconds) and `kind`. Kinds are `start`, `request`, `text`, `tool`, `observation`, `approval`, `human_change`, `rollover`, `limit`, `stop`, `task_data` and `end`. Logs exclude keys, passwords, raw provider thinking, image bytes and full provider response bodies. Observation records can include image dimensions, byte counts and SHA-256 values. Native separate-dataset receipts record local recovery paths, reserved bytes and acknowledged shutdown state; these receipts do not go to the provider. A quit record may show closure still pending. If a dataset is open, state-changing tools also add a dataset note.
+Action logs are private JSONL files under `<state_dir>/assistant/runs/<run_id>.jsonl`. Each record has `v`, `run`, `seq`, `t` (UTC Unix milliseconds) and `kind`. Kinds are `start`, `request`, `text`, `tool`, `observation`, `approval`, `human_change`, `rollover`, `limit`, `stop` and `end`. Logs exclude keys, passwords, raw provider thinking, image bytes and full provider response bodies. Observation records can include image dimensions, byte counts and SHA-256 values. If a dataset is open, state-changing tools also add a dataset note.
 
 `--events FILE` tails the exact action-log records to a new file. `--events -` writes them to stderr, leaving stdout for the result envelope. Logs have a 16 MiB per-run cap; retention keeps at most 100 runs and 256 MiB. A run without an end record can be reported as interrupted on the next open; a currently locked live log is not a crash.
 

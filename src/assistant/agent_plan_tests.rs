@@ -26,7 +26,7 @@ fn revoked_data_consent_withholds_retained_plan_arguments() {
         tools::tests::{FakeHost, fixture_snapshot},
     };
 
-    const PRIVATE: &str = "sensor-private-plan-marker";
+    const PRIVATE: &str = "catalog-private-plan-marker";
     for next_provider in [ProviderId::Anthropic, ProviderId::DeepSeek] {
         let provider = ProviderId::Anthropic;
         let mut args = photo_args();
@@ -46,7 +46,7 @@ fn revoked_data_consent_withholds_retained_plan_arguments() {
             ..Default::default()
         });
         deps.host = Arc::new(FakeHost::new(snapshot));
-        let mut request = PlanRequest::new("Tag a photo with the current sensor value.");
+        let mut request = PlanRequest::new("Tag a photo with a capture catalog annotation.");
         request.allow_data = true;
         let first = plan_turn(request, &deps, &mut |_| {}, &AtomicBool::new(false)).unwrap();
         assert_eq!(first.plan.steps.len(), 1);

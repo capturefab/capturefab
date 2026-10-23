@@ -51,9 +51,7 @@ pub fn check(
             ToolKind::Capture => {
                 super::capture::check(ctx, &mut overlay, &mut checked, secrets_present)
             }
-            ToolKind::Configure => {
-                super::destinations::check(ctx, &mut overlay, &mut checked, secrets_present)
-            }
+            ToolKind::Configure => super::destinations::check(ctx, &mut overlay, &mut checked),
         }
     }
     if spec.kind != ToolKind::Read && spec.needs_session && !ctx.session {

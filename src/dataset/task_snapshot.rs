@@ -26,7 +26,7 @@ impl TaskDataset {
         )
     }
     /// Remove protected stored camera metadata before any arbitrary model SQL
-    /// can transform it. Sensor values/tags and usable camera/source IDs remain
+    /// can transform it. Capture values and camera IDs remain
     /// data. A SQL literal can still echo caller-provided text, as expected.
     /// Stored-row projection alone is not a complete provider-safe boundary:
     /// this on-disk engine still exposes task paths through engine metadata.
@@ -113,7 +113,7 @@ mod tests {
         )
         .unwrap();
         let source = slot.reader_if(status.slot_id.as_deref().unwrap()).unwrap();
-        source.conn.execute_batch("INSERT INTO captures(wall_ms,camera_id,format,bytes,path,file_name,origin) VALUES(1500,'sim:0','png',1,'/capture.png','capture.png','capture'); INSERT INTO signals(source_id,uri,tag) VALUES('sensor','sim-signal://snapshot','temperature'); INSERT INTO samples(ts_ms,source_id,tag,value_double,quality) VALUES(1400,'sensor','temperature',17.5,'good')").unwrap();
+        source.conn.execute_batch("INSERT INTO captures(wall_ms,camera_id,format,bytes,path,file_name,origin) VALUES(1500,'sim:0','png',1,'/capture.png','capture.png','capture')").unwrap();
         (root, slot, source)
     }
     fn limits() -> SnapshotLimits {
@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn one_source_snapshot_remains_consistent_while_writer_commits_and_asof_runs_locally() {
+    fn one_source_snapshot_remains_consistent_while_writer_commits_and_queries_run_locally() {
         let (root, slot, source) = fixture();
         let mut target = target(&root);
         let slot_id = source.status.slot_id.clone().unwrap();
@@ -171,7 +171,6 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.source_slot_id.as_deref(), Some(slot_id.as_str()));
         assert_eq!(receipt.tables["captures"], 1);
-        assert_eq!(receipt.tables["samples"], 1);
         assert!(receipt.arrow_bytes > 0);
         assert_eq!(
             target
@@ -197,15 +196,15 @@ mod tests {
         );
         let value = target
             .query_bounded(
-                "SELECT capture_id,value_double,sample_age_ms FROM captures_with_signals",
+                "SELECT id,camera_id,wall_ms FROM captures",
                 10,
                 1000,
                 4096,
                 &AtomicBool::new(false),
             )
             .unwrap();
-        assert_eq!(value["rows"][0][1], 17.5);
-        assert_eq!(value["rows"][0][2], 100);
+        assert_eq!(value["rows"][0][1], "sim:0");
+        assert_eq!(value["rows"][0][2], 1500);
         assert!(
             target
                 .query_bounded(
@@ -329,13 +328,13 @@ mod tests {
             // beginning another write transaction must succeed and roll back.
             source
                 .conn
-                .execute_batch("BEGIN TRANSACTION; UPDATE samples SET value_double=99; ROLLBACK")
+                .execute_batch("BEGIN TRANSACTION; UPDATE captures SET wall_ms=99; ROLLBACK")
                 .unwrap();
             assert_eq!(
                 source
-                    .query("SELECT value_double FROM samples", 1, 1000)
+                    .query("SELECT wall_ms FROM captures", 1, 1000)
                     .unwrap()["rows"][0][0],
-                17.5
+                1500
             );
         }
         drop(source);
@@ -390,7 +389,12 @@ mod tests {
     #[test]
     fn allowlisted_names_cannot_substitute_source_views_or_arbitrary_queries() {
         let (root, slot, source) = fixture();
-        source.conn.execute_batch("DROP VIEW captures_with_signals; DROP TABLE captures; CREATE VIEW captures AS SELECT * FROM range(1000000000000)").unwrap();
+        source
+            .conn
+            .execute_batch(
+                "DROP TABLE captures; CREATE VIEW captures AS SELECT * FROM range(1000000000000)",
+            )
+            .unwrap();
         let mut target = target(&root);
         let error = target
             .copy_snapshot(&source, limits(), &AtomicBool::new(false))
@@ -422,11 +426,6 @@ mod tests {
                 ],
             )
             .unwrap();
-        source.conn.execute("UPDATE signals SET uri=?",["mqtt://alice:private-password@broker.example/private/topic?client_id=private-client"]).unwrap();
-        source
-            .conn
-            .execute("UPDATE samples SET value_text=?", ["opaque-sensor-value"])
-            .unwrap();
         let cancel = AtomicBool::new(false);
         let mut lossless = target(&root);
         lossless.copy_snapshot(&source, limits(), &cancel).unwrap();
@@ -453,16 +452,7 @@ mod tests {
             SnapshotProjection::Model
         );
         let captures=model.query_bounded("SELECT serial,replace(source,'://','_'),replace(path,'/','|'),replace(remote_url,'://','_'),replace(object_key,'/','|'),camera_id FROM captures",10,1000,8192,&cancel).unwrap();
-        let sources = model
-            .query_bounded(
-                "SELECT replace(uri,'/','|'),source_id,tag FROM signals",
-                10,
-                1000,
-                8192,
-                &cancel,
-            )
-            .unwrap();
-        let combined = format!("{captures}{sources}");
+        let combined = captures.to_string();
         for private in [
             "hardware-private-serial",
             "private-password",
@@ -480,14 +470,6 @@ mod tests {
         }
         assert!(captures["rows"][0][0].is_null());
         assert_eq!(captures["rows"][0][5], "sim:0");
-        assert_eq!(sources["rows"][0][1], "sensor");
-        assert_eq!(sources["rows"][0][2], "temperature");
-        assert_eq!(
-            model
-                .query_bounded("SELECT value_text FROM samples", 1, 1000, 4096, &cancel)
-                .unwrap()["rows"][0][0],
-            "opaque-sensor-value"
-        );
         assert_eq!(
             model
                 .query_bounded(
