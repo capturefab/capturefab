@@ -382,14 +382,14 @@ def smoke(binary):
         # the builder's own folders.
         env['CAPTUREFAB_SESSION_DIR'] = str(Path(temp) / 'sessions')
         env['CAPTUREFAB_CACHE_DIR'] = str(Path(temp) / 'cache')
-        run([binary, '--version'], capture_output=True, text=True, env=env)
-        result = run([binary, '--json', 'ffmpeg'], capture_output=True, text=True, env=env)
+        run([binary, '--version'], stdout=subprocess.PIPE, text=True, env=env)
+        result = run([binary, '--json', 'ffmpeg'], stdout=subprocess.PIPE, text=True, env=env)
         media = json.loads(result.stdout)['result']
         if not media.get('embedded'):
             raise ValueError('release binary does not embed FFmpeg')
         if not srt_protocols(media.get('protocols', '')):
             raise ValueError('release FFmpeg does not expose SRT input and output')
-        run([binary, '--camera', 'sim:release', 'capture', '-n', '2', '-o', str(Path(temp) / 'frames')], env=env, capture_output=True)
+        run([binary, '--camera', 'sim:release', 'capture', '-n', '2', '-o', str(Path(temp) / 'frames')], env=env, stdout=subprocess.DEVNULL)
         if len(list((Path(temp) / 'frames').glob('*.png'))) != 2:
             raise ValueError('release capture smoke did not produce two PNGs')
 
