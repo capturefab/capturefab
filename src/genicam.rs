@@ -1474,11 +1474,20 @@ impl NodeMap {
                     u
                 };
                 let raw = if n.kind == "MaskedIntReg" {
-                    self.access(io, name, false, depth)?;
-                    let old = io.read_memory(addr, len)?;
-                    ensure!(old.len() == len, "short masked register read");
-                    (decode_integer(&old, n.big_endian()) & !(bit_mask(bits) << shift))
-                        | (raw << shift)
+                    // A write-only register cannot be read back, so its other
+                    // bits are written as zero, as GenApi implementations do.
+                    let old = if ["AccessMode", "ImposedAccessMode"]
+                        .into_iter()
+                        .any(|key| n.prop(key) == Some("WO"))
+                    {
+                        0
+                    } else {
+                        self.access(io, name, false, depth)?;
+                        let old = io.read_memory(addr, len)?;
+                        ensure!(old.len() == len, "short masked register read");
+                        decode_integer(&old, n.big_endian())
+                    };
+                    (old & !(bit_mask(bits) << shift)) | (raw << shift)
                 } else {
                     raw
                 };
@@ -2688,6 +2697,28 @@ mod tests {
         m.set(&mut io, "Enabled", "true").unwrap();
         assert_eq!(io.read_memory(0, 4).unwrap(), [0x89, 0, 0, 0]);
         assert_eq!(m.get(&mut io, "Enabled").unwrap(), true);
+    }
+    #[test]
+    fn write_only_masked_registers_are_written_without_reading() {
+        struct WriteOnly(Memory);
+        impl RegisterIo for WriteOnly {
+            fn read_memory(&mut self, a: u64, _: usize) -> Result<Vec<u8>> {
+                bail!("GVCP status access denied reading {a:#x}")
+            }
+            fn write_memory(&mut self, a: u64, b: &[u8]) -> Result<()> {
+                self.0.write_memory(a, b)
+            }
+        }
+        let m = map(concat!(
+            "<Command Name='TriggerSoftware'><pValue>TriggerSoftwareBit</pValue><CommandValue>1</CommandValue></Command>",
+            "<StructReg Comment='Control'><Address>0x0c</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>BigEndian</Endianess>",
+            "<StructEntry Name='TriggerSoftwareBit'><Bit>31</Bit></StructEntry><StructEntry Name='ResetBit'><Bit>0</Bit></StructEntry></StructReg>",
+        ));
+        let mut io = WriteOnly(Memory::default());
+        m.execute(&mut io, "TriggerSoftware").unwrap();
+        assert_eq!(io.0.read_memory(0x0c, 4).unwrap(), [0, 0, 0, 1]);
+        m.set(&mut io, "ResetBit", "1").unwrap();
+        assert_eq!(io.0.read_memory(0x0c, 4).unwrap(), [0x80, 0, 0, 0]);
     }
     #[test]
     fn big_endian_masks_follow_genapi_bit_order() {
