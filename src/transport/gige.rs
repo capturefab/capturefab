@@ -1657,7 +1657,11 @@ impl Assembler {
             return Ok(self.ready.pop_front());
         }
         if packet.status >= 0x8000 {
-            self.discard(block);
+            // A resend the camera cannot serve yet (packet not yet or
+            // temporarily unavailable) is retried on the normal schedule.
+            if !matches!(packet.status, 0x8010 | 0x8014) {
+                self.discard(block);
+            }
         } else if let Err(error) = self.insert(index, packet, now) {
             self.discard(block);
             return Err(error);
@@ -2614,6 +2618,24 @@ mod tests {
         let mut unknown = gvsp(2, 1, 3, false, &[1; 8]);
         unknown[..2].copy_from_slice(&0x0001u16.to_be_bytes());
         assert!(assembler.push(&unknown).is_err());
+
+        for status in [0x8010u16, 0x8014] {
+            let mut assembler = Assembler::new(16, 44, 0);
+            let mut later = gvsp(4, 1, 3, false, &[]);
+            later[..2].copy_from_slice(&status.to_be_bytes());
+            assembler.push(&later).unwrap();
+            assert!(assembler.frames.is_empty() && assembler.closed.is_empty());
+            for packet in [
+                gvsp(4, 0, 1, false, &leader(8, 2, MONO8)),
+                gvsp(4, 2, 3, false, &[2; 8]),
+                gvsp(4, 3, 2, false, &trailer(2)),
+                later,
+            ] {
+                assert!(assembler.push(&packet).unwrap().is_none());
+            }
+            let frame = assembler.push(&gvsp(4, 1, 3, false, &[1; 8])).unwrap();
+            assert!(frame.is_some(), "{status:04x}");
+        }
     }
     #[test]
     fn delivery_never_goes_backwards() {
@@ -3450,23 +3472,26 @@ mod tests {
     }
     #[test]
     fn fake_camera_unavailable_packets_abandon_the_frame() {
-        let (fake, mut gige) = streaming(|camera| {
-            camera.registers.insert(GVCP_CAPABILITY, 0x4);
-            camera.resend_status = 0x800c;
-        });
-        fake.send(1, false, &[3, 7]);
-        assert!(gige.next_frame(Duration::from_millis(300)).is_err());
-        assert!(gige.next_frame(Duration::from_millis(100)).is_err());
-        assert_eq!(fake.camera.lock().unwrap().requests.len(), 2);
-        let stats = gige.stats().unwrap();
-        assert_eq!(
-            (
-                stats.resend_requested,
-                stats.resend_recovered,
-                stats.incomplete_frames
-            ),
-            (2, 0, 1)
-        );
+        // Gone packets end recovery; not yet available ones are retried.
+        for (status, requests) in [(0x800c, 2), (0x8014, 6)] {
+            let (fake, mut gige) = streaming(|camera| {
+                camera.registers.insert(GVCP_CAPABILITY, 0x4);
+                camera.resend_status = status;
+            });
+            fake.send(1, false, &[3, 7]);
+            assert!(gige.next_frame(Duration::from_millis(300)).is_err());
+            assert!(gige.next_frame(Duration::from_millis(100)).is_err());
+            assert_eq!(fake.camera.lock().unwrap().requests.len(), requests);
+            let stats = gige.stats().unwrap();
+            assert_eq!(
+                (
+                    stats.resend_requested,
+                    stats.resend_recovered,
+                    stats.incomplete_frames
+                ),
+                (requests as u64, 0, 1)
+            );
+        }
     }
     #[test]
     fn unsupported_payloads_fail_without_waiting_for_the_timeout() {
