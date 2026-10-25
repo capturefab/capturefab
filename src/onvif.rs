@@ -386,13 +386,7 @@ impl Write for DeadlineStream {
         self.stream.flush()
     }
 }
-fn request(
-    url: &HttpUrl,
-    action: &str,
-    body: &str,
-    authorization: Option<&str>,
-    timeout: Duration,
-) -> Result<HttpResponse> {
+fn open_tcp(url: &HttpUrl, timeout: Duration) -> Result<DeadlineStream> {
     validate_timeout(timeout)?;
     let addresses = (url.host.as_str(), url.port)
         .to_socket_addrs()
@@ -424,7 +418,15 @@ fn request(
         .max(Duration::from_millis(1));
     stream.set_read_timeout(Some(remaining))?;
     stream.set_write_timeout(Some(remaining))?;
-    let mut stream = DeadlineStream { stream, deadline };
+    Ok(DeadlineStream { stream, deadline })
+}
+fn exchange(
+    mut stream: DeadlineStream,
+    url: &HttpUrl,
+    action: &str,
+    body: &str,
+    authorization: Option<&str>,
+) -> Result<HttpResponse> {
     let auth = authorization
         .map(|a| format!("Authorization: {a}\r\n"))
         .unwrap_or_default();
@@ -440,6 +442,15 @@ fn request(
     stream.write_all(header.as_bytes())?;
     stream.write_all(body.as_bytes())?;
     parse_http(BufReader::new(stream))
+}
+fn request(
+    url: &HttpUrl,
+    action: &str,
+    body: &str,
+    authorization: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpResponse> {
+    exchange(open_tcp(url, timeout)?, url, action, body, authorization)
 }
 fn utc_timestamp(seconds: u64) -> String {
     let days = (seconds / 86400) as i64;
@@ -462,11 +473,74 @@ fn utc_timestamp(seconds: u64) -> String {
         day_seconds % 60
     )
 }
-fn security(credentials: &Credentials) -> Result<String> {
+/// Seconds since the Unix epoch of a UTC civil date and time.
+fn unix_seconds(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let doy = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146097 + doe - 719468) * 86400 + hour * 3600 + minute * 60 + second
+}
+fn now_seconds() -> Result<i64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64)
+}
+/// The device clock minus the host clock, in seconds, from the device's
+/// UTCDateTime in an unauthenticated GetSystemDateAndTime (Core 8.3.6,
+/// PRE_AUTH). A device that answers without it gives `None`; one that cannot
+/// be reached is an error.
+fn clock_offset(device: &str, timeout: Duration) -> Result<Option<i64>> {
+    let url = parse_url(device)?;
+    let stream = open_tcp(&url, timeout)?;
+    let Ok(response) = exchange(
+        stream,
+        &url,
+        &format!("{DEVICE_NS}/GetSystemDateAndTime"),
+        &envelope("", "<tds:GetSystemDateAndTime/>"),
+        None,
+    ) else {
+        return Ok(None);
+    };
+    let now = now_seconds()?;
+    if !(200..300).contains(&response.status) {
+        return Ok(None);
+    }
+    let Ok(doc) = xml_document(&response.body) else {
+        return Ok(None);
+    };
+    let Some(utc) = doc
+        .descendants()
+        .find(|n| n.is_element() && n.tag_name().name() == "UTCDateTime")
+    else {
+        return Ok(None);
+    };
+    let field = |name: &str, range: std::ops::RangeInclusive<i64>| {
+        child_text(utc, name)
+            .and_then(|v| v.parse::<i64>().ok())
+            .filter(|v| range.contains(v))
+    };
+    let (Some(year), Some(month), Some(day), Some(hour), Some(minute), Some(second)) = (
+        field("Year", 1970..=9999),
+        field("Month", 1..=12),
+        field("Day", 1..=31),
+        field("Hour", 0..=23),
+        field("Minute", 0..=59),
+        field("Second", 0..=60),
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        unix_seconds(year, month, day, hour, minute, second) - now,
+    ))
+}
+/// A WS-Security UsernameToken with a new nonce, created at the device's
+/// time: devices reject a token whose Created is outside their own clock's
+/// freshness window.
+fn security(credentials: &Credentials, clock_offset: i64) -> Result<String> {
     validate_credentials(credentials)?;
     let mut nonce = [0u8; 20];
     getrandom::fill(&mut nonce).map_err(|e| anyhow!("cannot generate ONVIF nonce: {e}"))?;
-    let created = utc_timestamp(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs());
+    let created = utc_timestamp(now_seconds()?.saturating_add(clock_offset).max(0) as u64);
     let mut hash = Sha1::new();
     hash.update(nonce);
     hash.update(created.as_bytes());
@@ -726,63 +800,124 @@ fn digest_authorization(
     }
     auth
 }
-fn soap(
-    endpoint: &str,
-    namespace: &str,
-    operation: &str,
-    content: &str,
-    credentials: Option<&Credentials>,
-    timeout: Duration,
-) -> Result<String> {
-    let url = parse_url(endpoint)?;
-    let header = credentials.map(security).transpose()?.unwrap_or_default();
-    let body = format!(
+fn envelope(header: &str, content: &str) -> String {
+    format!(
         "<?xml version='1.0' encoding='UTF-8'?><s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:tds='{DEVICE_NS}' xmlns:trt='{MEDIA_NS}' xmlns:tt='http://www.onvif.org/ver10/schema'><s:Header>{header}</s:Header><s:Body>{content}</s:Body></s:Envelope>"
-    );
-    let action = format!("{namespace}/{operation}");
-    let first = request(&url, &action, &body, None, timeout)?;
-    // Named by the SOAP endpoint here; `connect_with` re-keys the error to
-    // the ONVIF address a sign-in is saved under.
-    let refused = |sent: bool| {
-        crate::logins::auth_error(
-            &format!("onvif:{}", crate::media::redact_url(endpoint)),
-            sent,
-        )
-    };
-    let response = if first.status == 401 {
-        let Some(credentials) = credentials else {
-            return Err(refused(false));
+    )
+}
+/// A SOAP fault refusing the sign-in (ter:NotAuthorized). Devices send it
+/// with 400, 500 or even 200.
+fn not_authorized(response: &HttpResponse) -> bool {
+    response.status != 401
+        && response.body.contains("NotAuthorized")
+        && xml_document(&response.body).is_err()
+}
+/// SOAP calls to one device, which learn how it takes a sign-in.
+struct Soap<'a> {
+    /// The device service, which reports the device clock.
+    device: &'a str,
+    credentials: Option<&'a Credentials>,
+    timeout: Duration,
+    clock_offset: Option<i64>,
+    /// The device refused WS-Security and accepted HTTP authentication.
+    http_auth: bool,
+}
+impl<'a> Soap<'a> {
+    fn new(device: &'a str, credentials: Option<&'a Credentials>, timeout: Duration) -> Self {
+        Self {
+            device,
+            credentials,
+            timeout,
+            clock_offset: None,
+            http_auth: false,
+        }
+    }
+    fn token(&mut self, credentials: &Credentials) -> Result<String> {
+        let offset = match self.clock_offset {
+            Some(offset) => offset,
+            None => *self
+                .clock_offset
+                .insert(clock_offset(self.device, self.timeout)?.unwrap_or(0)),
         };
+        security(credentials, offset)
+    }
+    /// Send a WS-Security UsernameToken first, which most cameras take.
+    /// When the device refuses it, answer its HTTP Digest (or Basic)
+    /// challenge without a token (Core 5.9.1: not both at once), and keep
+    /// using HTTP authentication for later calls once it works.
+    fn call(
+        &mut self,
+        endpoint: &str,
+        namespace: &str,
+        operation: &str,
+        content: &str,
+    ) -> Result<String> {
+        let url = parse_url(endpoint)?;
+        let action = format!("{namespace}/{operation}");
+        let timeout = self.timeout;
+        // Named by the SOAP endpoint here; `connect_with` re-keys the error to
+        // the ONVIF address a sign-in is saved under.
+        let refused = |sent: bool| {
+            crate::logins::auth_error(
+                &format!("onvif:{}", crate::media::redact_url(endpoint)),
+                sent,
+            )
+        };
+        let plain = envelope("", content);
+        let Some(credentials) = self.credentials else {
+            let response = request(&url, &action, &plain, None, timeout)?;
+            if response.status == 401 {
+                return Err(refused(false));
+            }
+            return finish(response, || refused(false));
+        };
+        let mut challenge = None;
+        if !self.http_auth {
+            let token = self.token(credentials)?;
+            let first = request(&url, &action, &envelope(&token, content), None, timeout)?;
+            if first.status != 401 && !not_authorized(&first) {
+                return finish(first, || refused(true));
+            }
+            if first.status == 401 {
+                challenge = Some(first);
+            }
+        }
+        let challenge = match challenge {
+            Some(challenge) => challenge,
+            None => request(&url, &action, &plain, None, timeout)?,
+        };
+        if challenge.status != 401 {
+            // No HTTP challenge: the device takes only the token it refused.
+            return finish(challenge, || refused(true));
+        }
         ensure!(
-            !first.challenges.is_empty(),
+            !challenge.challenges.is_empty(),
             "ONVIF authentication challenge is missing"
         );
         let authorization = http_authorization(
-            &first.challenges,
+            &challenge.challenges,
             credentials,
             "POST",
             &url.path,
             &random_hex()?,
         )?;
-        let second = request(&url, &action, &body, Some(&authorization), timeout)?;
-        if second.status == 401 {
+        let response = request(&url, &action, &plain, Some(&authorization), timeout)?;
+        if response.status == 401 {
             return Err(refused(true));
         }
-        second
-    } else {
-        first
-    };
+        self.http_auth |= (200..300).contains(&response.status);
+        finish(response, || refused(true))
+    }
+}
+fn finish(response: HttpResponse, refused: impl Fn() -> anyhow::Error) -> Result<String> {
+    // Many cameras answer GetCapabilities anonymously and refuse GetProfiles
+    // with a NotAuthorized fault.
+    if not_authorized(&response) {
+        return Err(refused());
+    }
     if !(200..300).contains(&response.status) {
         if !response.body.is_empty() {
-            // Many cameras answer GetCapabilities anonymously and refuse
-            // GetProfiles with a NotAuthorized fault and a 400 or 500.
-            if let Err(error) = xml_document(&response.body) {
-                // A fault's subcode (ter:NotAuthorized) or its text.
-                if response.body.contains("NotAuthorized") {
-                    return Err(refused(credentials.is_some()));
-                }
-                return Err(error);
-            }
+            xml_document(&response.body)?;
         }
         bail!("ONVIF HTTP request failed with status {}", response.status)
     }
@@ -806,13 +941,12 @@ pub fn resolve(
             "ONVIF profile token needs 1..1024 bytes without control characters"
         );
     }
-    let capabilities = soap(
+    let mut soap = Soap::new(endpoint, credentials, timeout);
+    let capabilities = soap.call(
         endpoint,
         DEVICE_NS,
         "GetCapabilities",
         "<tds:GetCapabilities><tds:Category>Media</tds:Category></tds:GetCapabilities>",
-        credentials,
-        timeout,
     )?;
     let doc = xml_document(&capabilities)?;
     let media = doc
@@ -821,14 +955,7 @@ pub fn resolve(
         .and_then(|n| child_text(n, "XAddr"))
         .context("ONVIF device exposes no Media1 service endpoint")?
         .to_string();
-    let profiles = soap(
-        &media,
-        MEDIA_NS,
-        "GetProfiles",
-        "<trt:GetProfiles/>",
-        credentials,
-        timeout,
-    )?;
+    let profiles = soap.call(&media, MEDIA_NS, "GetProfiles", "<trt:GetProfiles/>")?;
     let doc = xml_document(&profiles)?;
     let mut result = Vec::new();
     let mut names = BTreeSet::new();
@@ -867,14 +994,7 @@ pub fn resolve(
         // ones. A failed profile must not hide the remaining streams. Explicit
         // selection still reports that profile's original error.
         let uri = (|| -> Result<String> {
-            let stream = soap(
-                &media,
-                MEDIA_NS,
-                "GetStreamUri",
-                &content,
-                credentials,
-                timeout,
-            )?;
+            let stream = soap.call(&media, MEDIA_NS, "GetStreamUri", &content)?;
             let stream = xml_document(&stream)?;
             let uri = stream
                 .descendants()
@@ -1242,10 +1362,16 @@ mod tests {
     fn ws_security_and_timestamps() {
         assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
         assert_eq!(utc_timestamp(951782400), "2000-02-29T00:00:00Z");
-        let token = security(&Credentials {
-            username: "a<b".into(),
-            password: "never-print-me".into(),
-        })
+        for seconds in [0, 951782400, 981173106, 4102444799] {
+            assert_eq!(created_seconds(&utc_timestamp(seconds)), seconds as i64);
+        }
+        let token = security(
+            &Credentials {
+                username: "a<b".into(),
+                password: "never-print-me".into(),
+            },
+            0,
+        )
         .unwrap();
         assert!(token.contains("a&lt;b"));
         assert!(!token.contains("never-print-me"));
@@ -1434,6 +1560,62 @@ mod tests {
         assert_eq!(password_digest, STANDARD.encode(digest.finalize()));
         assert!(!body.contains(password));
     }
+    fn token_field<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+        let start = body.find(&format!(":{name}"))?;
+        let start = start + body[start..].find('>')? + 1;
+        Some(&body[start..start + body[start..].find('<')?])
+    }
+    fn created_seconds(created: &str) -> i64 {
+        let field = |range: std::ops::Range<usize>| created[range].parse::<i64>().unwrap();
+        unix_seconds(
+            field(0..4),
+            field(5..7),
+            field(8..10),
+            field(11..13),
+            field(14..16),
+            field(17..19),
+        )
+    }
+    fn http_reply(status: &str, headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+    fn date_and_time(seconds: i64) -> String {
+        let text = utc_timestamp(seconds as u64);
+        let field = |range: std::ops::Range<usize>| text[range].parse::<u32>().unwrap();
+        format!(
+            "<Envelope><Body><GetSystemDateAndTimeResponse><SystemDateAndTime><DateTimeType>Manual</DateTimeType><DaylightSavings>false</DaylightSavings><UTCDateTime><Time><Hour>{}</Hour><Minute>{}</Minute><Second>{}</Second></Time><Date><Year>{}</Year><Month>{}</Month><Day>{}</Day></Date></UTCDateTime></SystemDateAndTime></GetSystemDateAndTimeResponse></Body></Envelope>",
+            field(11..13),
+            field(14..16),
+            field(17..19),
+            field(0..4),
+            field(5..7),
+            field(8..10)
+        )
+    }
+    /// Serve `count` requests, answering each from its SOAP operation,
+    /// headers and body.
+    fn serve(
+        count: usize,
+        mut reply: impl FnMut(&str, &BTreeMap<String, String>, &str) -> String + Send + 'static,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let (_, headers, body) = mock_request(&stream);
+                let action = headers["soapaction"].trim_matches('"');
+                let operation = action.rsplit('/').next().unwrap().to_owned();
+                stream
+                    .write_all(reply(&operation, &headers, &body).as_bytes())
+                    .unwrap();
+            }
+        });
+        (address.to_string(), server)
+    }
     #[test]
     fn soap_http_digest_roundtrip_resolves_media_profile() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1448,12 +1630,27 @@ mod tests {
         let server = std::thread::spawn(move || {
             let challenge =
                 "Digest realm=\"Camera\", nonce=\"fixed-nonce\", qop=\"auth\", algorithm=MD5";
+            let (mut stream, _) = listener.accept().unwrap();
+            let (_, headers, body) = mock_request(&stream);
+            assert!(headers["soapaction"].contains("GetSystemDateAndTime"));
+            assert!(!body.contains("UsernameToken") && !headers.contains_key("authorization"));
+            stream
+                .write_all(
+                    http_reply("200 OK", "", &date_and_time(now_seconds().unwrap())).as_bytes(),
+                )
+                .unwrap();
             for operation in ["GetCapabilities", "GetProfiles", "GetStreamUri"] {
                 for authenticated in [false, true] {
                     let (mut stream, _) = listener.accept().unwrap();
                     let (path, headers, body) = mock_request(&stream);
-                    assert_username_token(&body, &server_credentials.password);
                     assert!(headers["soapaction"].contains(operation));
+                    // The token goes once; after the device asks for HTTP
+                    // Digest, requests carry Digest alone.
+                    if operation == "GetCapabilities" && !authenticated {
+                        assert_username_token(&body, &server_credentials.password);
+                    } else {
+                        assert!(!body.contains("Security"), "{body}");
+                    }
                     if authenticated {
                         let supplied = &headers["authorization"];
                         let expected = http_authorization(
@@ -1493,6 +1690,113 @@ mod tests {
             (streams[0].width, streams[0].height),
             (Some(640), Some(480))
         );
+    }
+    #[test]
+    fn ws_security_tokens_use_the_device_clock_and_a_new_nonce() {
+        // A camera without NTP whose clock reset to 2001, which rejects
+        // tokens more than five seconds from its own time.
+        let skew = unix_seconds(2001, 2, 3, 4, 5, 6) - now_seconds().unwrap();
+        let credentials = Credentials {
+            username: "admin".into(),
+            password: "pw".into(),
+        };
+        let password = credentials.password.clone();
+        let mut nonces = Vec::new();
+        let (address, server) = serve(3, move |operation, _, body| {
+            let device_now = now_seconds().unwrap() + skew;
+            if operation == "GetSystemDateAndTime" {
+                assert!(!body.contains("UsernameToken"));
+                return http_reply("200 OK", "", &date_and_time(device_now));
+            }
+            assert_username_token(body, &password);
+            let nonce = token_field(body, "Nonce").unwrap().to_owned();
+            assert!(!nonces.contains(&nonce), "nonce reused");
+            nonces.push(nonce);
+            let created = created_seconds(token_field(body, "Created").unwrap());
+            if (created - device_now).abs() > 5 {
+                let fault = "<Envelope><Body><Fault><Code><Value>env:Sender</Value><Subcode><Value>ter:NotAuthorized</Value></Subcode></Code><Reason><Text>Sender not Authorized</Text></Reason></Fault></Body></Envelope>";
+                return http_reply("400 Bad Request", "", fault);
+            }
+            http_reply(
+                "200 OK",
+                "",
+                "<Envelope><Body><Response/></Body></Envelope>",
+            )
+        });
+        let endpoint = format!("http://{address}/onvif/device_service");
+        let mut soap = Soap::new(&endpoint, Some(&credentials), Duration::from_secs(2));
+        for _ in 0..2 {
+            soap.call(
+                &endpoint,
+                DEVICE_NS,
+                "GetDeviceInformation",
+                "<tds:GetDeviceInformation/>",
+            )
+            .unwrap();
+        }
+        server.join().unwrap();
+    }
+    #[test]
+    fn a_refused_token_falls_back_to_http_digest_alone() {
+        let credentials = Credentials {
+            username: "admin".into(),
+            password: "pw".into(),
+        };
+        let challenge =
+            "WWW-Authenticate: Digest realm=\"cam\", nonce=\"n\", qop=\"auth\", algorithm=MD5\r\n";
+        let fault = "<Envelope><Body><Fault><Code><Value>env:Sender</Value><Subcode><Value>ter:NotAuthorized</Value></Subcode></Code><Reason><Text>Sender not Authorized</Text></Reason></Fault></Body></Envelope>";
+        let mut step = 0;
+        let (address, server) = serve(6, move |operation, headers, body| {
+            step += 1;
+            let token = body.contains("UsernameToken");
+            let digest = headers
+                .get("authorization")
+                .is_some_and(|a| a.starts_with("Digest "));
+            match step {
+                // A device that authenticates even its clock (some Axis
+                // firmware) leaves the host clock in the token.
+                1 => {
+                    assert_eq!(operation, "GetSystemDateAndTime");
+                    http_reply("401 Unauthorized", challenge, "")
+                }
+                2 => {
+                    assert!(token && !digest);
+                    http_reply("400 Bad Request", "", fault)
+                }
+                3 | 5 => {
+                    assert!(!token && !digest);
+                    http_reply("401 Unauthorized", challenge, "")
+                }
+                _ => {
+                    assert!(!token && digest);
+                    http_reply(
+                        "200 OK",
+                        "",
+                        "<Envelope><Body><Response/></Body></Envelope>",
+                    )
+                }
+            }
+        });
+        let endpoint = format!("http://{address}/onvif/device_service");
+        let mut soap = Soap::new(&endpoint, Some(&credentials), Duration::from_secs(2));
+        for _ in 0..2 {
+            soap.call(&endpoint, MEDIA_NS, "GetProfiles", "<trt:GetProfiles/>")
+                .unwrap();
+        }
+        server.join().unwrap();
+        // A device with no HTTP challenge refused the only sign-in it takes.
+        let (address, server) = serve(3, move |operation, _, _| match operation {
+            "GetSystemDateAndTime" => {
+                http_reply("200 OK", "", &date_and_time(now_seconds().unwrap()))
+            }
+            _ => http_reply("400 Bad Request", "", fault),
+        });
+        let endpoint = format!("http://{address}/onvif/device_service");
+        let error = Soap::new(&endpoint, Some(&credentials), Duration::from_secs(2))
+            .call(&endpoint, MEDIA_NS, "GetProfiles", "<trt:GetProfiles/>")
+            .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(code(&error), Some("auth_rejected"), "{error:#}");
     }
     #[test]
     fn connection_tries_streams_until_one_decodes() {
@@ -1617,41 +1921,36 @@ mod tests {
     }
     #[test]
     fn soap_http_basic_and_timeout() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}/service", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            for authenticated in [false, true] {
-                let (mut stream, _) = listener.accept().unwrap();
-                let (_, headers, _) = mock_request(&stream);
-                if authenticated {
-                    assert_eq!(
-                        headers["authorization"],
-                        format!("Basic {}", STANDARD.encode("user:secret"))
-                    );
-                    let body = "<Envelope><Body><Response/></Body></Envelope>";
-                    write!(
-                        stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .unwrap();
-                } else {
-                    write!(stream,"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"camera\"\r\nContent-Length: 0\r\n\r\n").unwrap();
-                }
+        let (address, server) = serve(3, |operation, headers, body| match operation {
+            "GetSystemDateAndTime" => {
+                http_reply("200 OK", "", &date_and_time(now_seconds().unwrap()))
             }
+            _ if headers.contains_key("authorization") => {
+                assert_eq!(
+                    headers["authorization"],
+                    format!("Basic {}", STANDARD.encode("user:secret"))
+                );
+                assert!(!body.contains("UsernameToken"));
+                http_reply(
+                    "200 OK",
+                    "",
+                    "<Envelope><Body><Response/></Body></Envelope>",
+                )
+            }
+            _ => http_reply(
+                "401 Unauthorized",
+                "WWW-Authenticate: Basic realm=\"camera\"\r\n",
+                "",
+            ),
         });
-        soap(
-            &endpoint,
-            DEVICE_NS,
-            "Test",
-            "<Test/>",
-            Some(&Credentials {
-                username: "user".into(),
-                password: "secret".into(),
-            }),
-            Duration::from_secs(1),
-        )
-        .unwrap();
+        let endpoint = format!("http://{address}/service");
+        let credentials = Credentials {
+            username: "user".into(),
+            password: "secret".into(),
+        };
+        Soap::new(&endpoint, Some(&credentials), Duration::from_secs(1))
+            .call(&endpoint, DEVICE_NS, "Test", "<Test/>")
+            .unwrap();
         server.join().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}/service", listener.local_addr().unwrap());
@@ -1661,15 +1960,9 @@ mod tests {
         });
         let start = Instant::now();
         assert!(
-            soap(
-                &endpoint,
-                DEVICE_NS,
-                "Test",
-                "<Test/>",
-                None,
-                Duration::from_millis(50)
-            )
-            .is_err()
+            Soap::new(&endpoint, None, Duration::from_millis(50))
+                .call(&endpoint, DEVICE_NS, "Test", "<Test/>")
+                .is_err()
         );
         assert!(start.elapsed() < Duration::from_secs(1));
         server.join().unwrap();
@@ -1706,8 +1999,9 @@ mod tests {
             text.contains(&format!("onvif:http://{address}/onvif/device_service")),
             "{text}"
         );
-        // Credentials refused after the Digest challenge: auth_rejected.
-        let (address, server) = answer(vec![challenge.clone(), challenge]);
+        // Credentials refused after the Digest challenge: auth_rejected. The
+        // device authenticates its clock too.
+        let (address, server) = answer(vec![challenge.clone(), challenge.clone(), challenge]);
         let login = crate::logins::CameraLogin::new("admin", "onvif-secret-pw").unwrap();
         let error = connect_with(&format!("onvif://{address}"), Some(&login), timeout)
             .err()
