@@ -1182,7 +1182,9 @@ fn v4l2_devices(
         .flatten()
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|node| node.starts_with("video") && captures(&PathBuf::from("/dev").join(node)))
+        .filter(|node| {
+            node.starts_with("video") && captures(std::path::Path::new(&format!("/dev/{node}")))
+        })
         .collect::<Vec<_>>();
     nodes.sort_by_key(|node| (node.len(), node.clone()));
     nodes
