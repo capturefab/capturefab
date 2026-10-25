@@ -1152,15 +1152,7 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
         let devices = if backend == "avfoundation" {
             avfoundation_devices(&listing)
         } else {
-            listing
-                .lines()
-                .filter(|line| line.contains("(video)"))
-                .filter_map(|line| {
-                    let (_, remaining) = line.split_once('"')?;
-                    let (name, _) = remaining.split_once('"')?;
-                    Some(json!({"id":format!("dshow:video={name}"),"name":name,"backend":backend}))
-                })
-                .collect()
+            dshow_devices(&listing)
         };
         return Ok(json!({"platform":std::env::consts::OS,"devices":devices,"diagnostic":listing}));
     }
@@ -1252,6 +1244,63 @@ fn avfoundation_devices(listing: &str) -> Vec<Value> {
         .map(|&(index, name)| {
             let id = if selectable(name) { name } else { index };
             json!({"id":format!("avfoundation:{id}"),"name":name,"backend":"avfoundation"})
+        })
+        .collect()
+}
+
+/// The video input devices in FFmpeg's DirectShow listing. FFmpeg lists the
+/// video category before the audio one, each device as its friendly name,
+/// the media types of its capture pins ("(none)" when it could not read
+/// them, as for some virtual cameras) and its moniker ("Alternative name").
+/// The moniker selects a device whose friendly name another device shares
+/// or FFmpeg cannot parse; its `?` is written `%3F`, since `?` starts the
+/// locator's options.
+#[cfg(any(test, target_os = "macos", target_os = "windows"))]
+fn dshow_devices(listing: &str) -> Vec<Value> {
+    const AUDIO_CATEGORY: &str = "{33D9A762-90C8-11D0-BD43-00A0C911CE86}";
+    let mut found: Vec<(&str, bool, Option<&str>)> = Vec::new();
+    let (mut kept, mut audio) = (false, false);
+    for line in listing.lines() {
+        let text = match line.strip_prefix('[') {
+            Some(rest) => rest.split_once("] ").map_or(line, |(_, text)| text),
+            None => line,
+        };
+        if let Some(moniker) = text
+            .trim_start()
+            .strip_prefix("Alternative name \"")
+            .and_then(|rest| rest.strip_suffix('"'))
+        {
+            if kept && let Some(device) = found.last_mut() {
+                device.2 = Some(moniker);
+            }
+        } else if let Some((name, types)) = text
+            .strip_prefix('"')
+            .and_then(|rest| rest.rsplit_once('"'))
+        {
+            let types = types.trim().trim_start_matches('(').trim_end_matches(')');
+            let none = types == "none";
+            kept = types.split(", ").any(|kind| kind == "video") || none && !audio;
+            audio |= types == "audio";
+            if kept {
+                found.push((name, none, None));
+            }
+        }
+    }
+    found.retain(|&(_, none, moniker)| {
+        !(none
+            && moniker.is_some_and(|moniker| moniker.to_ascii_uppercase().contains(AUDIO_CATEGORY)))
+    });
+    found
+        .iter()
+        .map(|&(name, _, moniker)| {
+            let unique = found.iter().filter(|(other, ..)| *other == name).count() == 1
+                && !name.contains([':', '?'])
+                && !name.starts_with("@device");
+            let id = match moniker {
+                Some(moniker) if !unique => moniker.replace('?', "%3F"),
+                _ => name.to_owned(),
+            };
+            json!({"id":format!("dshow:video={id}"),"name":name,"backend":"dshow"})
         })
         .collect()
 }
@@ -1806,11 +1855,20 @@ fn native_input(source: &str) -> Result<Option<(&'static str, String)>> {
                 name.starts_with("video="),
                 "DirectShow URI must begin dshow:video="
             );
-            ("dshow", name.into())
+            ("dshow", dshow_input(name))
         } else {
             return Ok(None);
         },
     ))
+}
+/// FFmpeg's DirectShow input for a `dshow:` locator, with the `?` restored
+/// in a moniker as `dshow_devices` lists it.
+fn dshow_input(name: &str) -> String {
+    if name.starts_with("video=@device") {
+        name.replace("%3F", "?")
+    } else {
+        name.into()
+    }
 }
 /// A V4L2 device node, or a persistent link udev makes to one, which stays
 /// bound to the same camera when node numbers change across reboots and
@@ -2312,7 +2370,7 @@ fn ffmpeg_words(line: &str) -> String {
         .join(" ")
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct NativeOptions {
     size: Option<(u32, u32)>,
     fps: Option<f64>,
@@ -2334,6 +2392,10 @@ fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
     ensure!(
         !base.split_once(':').unwrap().1.trim().is_empty(),
         "native media source needs a device name or index"
+    );
+    ensure!(
+        !(base.ends_with('\\') && query.starts_with('\\')),
+        "write the ? of a DirectShow alternative name as %3F, as capturefab native lists it"
     );
     let mut options = NativeOptions::default();
     for pair in query.split('&').filter(|s| !s.is_empty()) {
@@ -8080,6 +8142,58 @@ Error opening input files: Input/output error
                 "camera device not found: {by_path}; reconnect the device and run capturefab native to obtain its current locator"
             )
         );
+    }
+    #[test]
+    fn dshow_devices_keep_video_sources_and_tell_identical_cameras_apart() {
+        let devices = dshow_devices(concat!(
+            "[dshow @ 000001eb780baf00] \"HD Pro Webcam C920\" (video)\n",
+            "[dshow @ 000001eb780baf00]   Alternative name \"@device_pnp_\\\\?\\usb#vid_046d&pid_082d&mi_00#7&1d6d0b0e&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global\"\n",
+            "[dshow @ 000001eb780baf00] \"HD Pro Webcam C920\" (video)\n",
+            "[dshow @ 000001eb780baf00]   Alternative name \"@device_pnp_\\\\?\\usb#vid_046d&pid_082d&mi_00#7&3a1e7f3&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global\"\n",
+            "[dshow @ 000001eb780baf00] \"USB Capture HDMI\" (video)\n",
+            "[dshow @ 000001eb780baf00]   Alternative name \"@device_pnp_\\\\?\\usb#vid_2935&pid_0006&mi_00#8&3027539&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global\"\n",
+            "[dshow @ 000001eb780baf00] \"Game Capture HD60 S\" (audio, video)\n",
+            "[dshow @ 000001eb780baf00]   Alternative name \"@device_pnp_\\\\?\\usb#vid_0fd9&pid_004e&mi_00#7&2bc4c6a&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\\global\"\n",
+            "[dshow @ 000001eb780baf00] \"OBS Virtual Camera\" (none)\n",
+            "[dshow @ 000001eb780baf00]   Alternative name \"@device_sw_{860BB310-5D01-11D0-BD3B-00A0C911CE86}\\{A3FCE0F5-3493-419F-958A-ABA1250EC20B}\"\n",
+            "[dshow @ 000001eb780baf00] \"Studio: Left\" (video)\n",
+            "[dshow @ 000001eb780baf00]   Alternative name \"@device_sw_{860BB310-5D01-11D0-BD3B-00A0C911CE86}\\{5C2CD55C-92AD-4999-8666-912BD3E70010}\"\n",
+            "[dshow @ 000001eb780baf00] \"VoiceMeeter Aux Output (VB-Audio VoiceMeeter AUX VAIO)\" (audio)\n",
+            "[dshow @ 000001eb780baf00]   Alternative name \"@device_cm_{33D9A762-90C8-11D0-BD43-00A0C911CE86}\\wave_{024F58BD-C3C7-401F-B905-455306BF3F33}\"\n",
+            "[dshow @ 000001eb780baf00] \"Line In (Realtek Audio)\" (none)\n",
+            "[dshow @ 000001eb780baf00]   Alternative name \"@device_cm_{33D9A762-90C8-11D0-BD43-00A0C911CE86}\\wave_{0881BEEB-1C3E-4C22-997E-C1A757D757DF}\"\n",
+            "dummy: Immediate exit requested\n",
+        ));
+        let ids = devices
+            .iter()
+            .map(|device| device["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                r"dshow:video=@device_pnp_\\%3F\usb#vid_046d&pid_082d&mi_00#7&1d6d0b0e&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global",
+                r"dshow:video=@device_pnp_\\%3F\usb#vid_046d&pid_082d&mi_00#7&3a1e7f3&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global",
+                "dshow:video=USB Capture HDMI",
+                "dshow:video=Game Capture HD60 S",
+                "dshow:video=OBS Virtual Camera",
+                r"dshow:video=@device_sw_{860BB310-5D01-11D0-BD3B-00A0C911CE86}\{5C2CD55C-92AD-4999-8666-912BD3E70010}",
+            ]
+        );
+        assert_eq!(devices[1]["name"], "HD Pro Webcam C920");
+        assert_eq!(devices[5]["name"], "Studio: Left");
+        let (base, options) = native_source(&format!("{}?size=1280x720&fps=30", ids[1])).unwrap();
+        assert_eq!(base, ids[1]);
+        assert_eq!(options.unwrap().size, Some((1280, 720)));
+        assert_eq!(
+            dshow_input(base.strip_prefix("dshow:").unwrap()),
+            r"video=@device_pnp_\\?\usb#vid_046d&pid_082d&mi_00#7&3a1e7f3&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global"
+        );
+        assert_eq!(
+            dshow_input("video=HD Pro Webcam C920"),
+            "video=HD Pro Webcam C920"
+        );
+        let pasted = native_source(r"dshow:video=@device_pnp_\\?\usb#vid_046d&pid_082d&mi_00#7&3a1e7f3&0&0000#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global").unwrap_err();
+        assert!(format!("{pasted}").contains("%3F"), "{pasted}");
     }
     #[test]
     fn native_devices_prefer_names_and_failures_are_concise() {
