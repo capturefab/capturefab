@@ -58,7 +58,7 @@ PAGE = '''<!doctype html>
         <h1 id="downloads-title">All downloads</h1>
         <p class="lead">Every app download includes the desktop app and the CLI. Latest release: {status}.</p>
         <p>Choose your operating system and processor. Apple silicon Macs and 64-bit ARM systems use ARM64. Intel and AMD computers use x64.</p>
-        <p>Check the file's SHA-256 with the command under each download, then extract the archive before you open the app. The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
+        <p>Check the file's SHA-256 with the command under each download. On macOS, open the .dmg and drag Capturefab to Applications, or extract the .zip of an earlier release. On Windows and Linux, extract the archive before you open the app. The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
         <p>Read the <a href="docs.html#installation">installation instructions</a> for system requirements, command-line setup and use without a display.</p>
       </section>
 {install}{body}    </main>

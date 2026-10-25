@@ -287,7 +287,7 @@ impl Workbench {
     }
 
     /// Whether an error notice shows and is not fading out.
-    fn error_showing(&self) -> bool {
+    pub(super) fn error_showing(&self) -> bool {
         self.notice
             .as_ref()
             .is_some_and(|n| n.level == Level::Error)

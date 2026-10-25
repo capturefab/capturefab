@@ -21,7 +21,7 @@ curl -fsSL https://capturefab.com/install.sh | sh     # macOS and Linux: ~/Appli
 irm https://capturefab.com/install.ps1 | iex          # Windows PowerShell: %LOCALAPPDATA%\Programs\Capturefab, on your user PATH
 ```
 
-To read the script before it runs, download it first: `curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh`. `--dry-run` prints the file, URL and checksum it would use. Or download the matching binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases) or the [project site](https://capturefab.com/downloads.html), which selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links. The [first-launch steps](https://capturefab.com/docs.html#first-launch) cover SmartScreen, firewall, WinUSB and macOS Local Network prompts.
+To read the script before it runs, download it first: `curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh`. `--dry-run` prints the file, URL and checksum it would use. Or download the matching binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases) or the [project site](https://capturefab.com/downloads.html), which selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links. Newer macOS downloads are a disk image: drag Capturefab to Applications. The [first-launch steps](https://capturefab.com/docs.html#first-launch) cover SmartScreen, firewall, WinUSB and macOS Local Network prompts.
 
 First session, with the built-in simulator and no camera hardware:
 
@@ -399,7 +399,7 @@ Recovery refuses a running owner. Copies preserve the database and any WAL toget
 
 ## Save to drives and folders
 
-Captures, schedules and local recordings can go to a saved **destination**: a folder on your disk, an external or removable drive, or a mounted network drive. In the GUI, **Save to** in the Capture and Video panels lists saved folders and connected external drives. Choosing a drive saves to its `Capturefab` folder. **Manage…** adds a folder with the system folder picker and tests access.
+Captures, schedules and local recordings can go to a saved **destination**: a folder on your disk, an external or removable drive, or a mounted network drive. In the GUI, **Save to** in the Capture and Video panels lists saved folders and connected external drives. Choosing a drive saves to its `Capturefab` folder. **Manage…** adds a folder with the system folder picker and tests access. On macOS and Linux, `capturefab volumes` omits read-only volumes, such as mounted disk images.
 
 ```sh
 capturefab volumes --json

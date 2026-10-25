@@ -616,6 +616,17 @@ pub fn pill(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
+/// A message block tinted with `color`, like the warning that the app runs
+/// from its disk image.
+pub fn callout(color: Color) -> impl Fn(&Theme) -> container::Style {
+    move |theme| container::Style {
+        background: Some(alpha(color, 0.14).into()),
+        border: hairline(alpha(color, 0.45), RADIUS_MEDIUM),
+        text_color: Some(Palette::from(theme).text),
+        ..container::Style::default()
+    }
+}
+
 /// The fill of a `well`.
 fn well_fill(p: &Palette) -> Color {
     if p.dark { p.field } else { rgb(0xF7F7F9) }

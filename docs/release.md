@@ -31,12 +31,21 @@ Each target builds one executable with the default features. There is no separat
 
 There is no 32-bit ARM target: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS and the ARM64 build. Releases before 0.2.2 listed Linux ARMv7 as unavailable.
 
-macOS ZIPs store the executable once inside `Capturefab.app`. The small
-`capturefab` shell launcher beside the app forwards CLI arguments to that same
-executable; keep the two together when using the launcher. After moving the app
-to Applications, run `/Applications/Capturefab.app/Contents/MacOS/capturefab`
-for CLI access. Repackaging for
-signing reads the executable from the app bundle.
+From the release after 0.4.0, macOS releases are a read-only disk image (`.dmg`) whose root holds
+exactly `Capturefab.app`, an `Applications` link to `/Applications` and
+`README.txt`; users drag the app to Applications and eject the image. The
+executable is stored once, at `Capturefab.app/Contents/MacOS/capturefab`, which
+is also the CLI (`/Applications/Capturefab.app/Contents/MacOS/capturefab` after
+installing). There is no `./capturefab` shell launcher any more, since it could
+not work from a read-only image or after the drag. The license files are in
+`Capturefab.app/Contents/Resources/licenses/`, written before signing so the
+signature seals them and they travel with the app. The image is `ULFO` (LZFSE),
+which needs macOS 10.11 while the oldest supported macOS is 10.15; the fallback
+would be `UDZO` with `-imagekey zlib-level=9`. Packaging macOS requires
+`hdiutil`, so it runs only on macOS, and every image is verified (`hdiutil
+verify`) and mounted read-only to check its root and that its executable matches
+the packaged one. Repackaging for signing reads the executable through `hdiutil
+attach`. Releases up to 0.4.0 were ZIPs with the launcher beside the app.
 
 ## One-time repository setup
 
@@ -63,7 +72,7 @@ python3 scripts/site-release.py --merge /tmp/capturefab-v0.3.0/releases.json
 python3 scripts/test-site.py
 ```
 
-A release contains, per target, `capturefab-VERSION-OS-ARCH` archives (`.tar.gz` on Linux, `.zip` elsewhere; macOS adds `Capturefab.app`) and `capturefab-VERSION-OS-ARCH-media-sources.tar.gz`, plus `capturefab-VERSION-source.tar.gz` (the exact committed tree, all `Cargo.lock` dependency sources in `vendor/`, and an offline Cargo configuration), `releases.json`, `capturefab-VERSION-sbom.cdx.json` (a CycloneDX bill of materials: the Rust crates linked into the executable with their `Cargo.lock` checksums, and the pinned FFmpeg, x264, SRT, OpenSSL and GPU header versions with their source checksums), and `SHA256SUMS` covering every file. Assembly refuses uncommitted changes and missing or modified corresponding-source archives. The FFmpeg source archives must match the build recipe's pinned checksums, including enabled GPU headers. Each package holds `LICENSE`, `THIRD-PARTY-LICENSES.txt` (license texts of the Rust crates compiled into that executable), `media-licenses/` and the FFmpeg build manifest.
+A release contains, per target, `capturefab-VERSION-OS-ARCH` archives (`.tar.gz` on Linux, `.zip` on Windows, `.dmg` holding `Capturefab.app` on macOS) and `capturefab-VERSION-OS-ARCH-media-sources.tar.gz`, plus `capturefab-VERSION-source.tar.gz` (the exact committed tree, all `Cargo.lock` dependency sources in `vendor/`, and an offline Cargo configuration), `releases.json`, `capturefab-VERSION-sbom.cdx.json` (a CycloneDX bill of materials: the Rust crates linked into the executable with their `Cargo.lock` checksums, and the pinned FFmpeg, x264, SRT, OpenSSL and GPU header versions with their source checksums), and `SHA256SUMS` covering every file. Assembly refuses uncommitted changes and missing or modified corresponding-source archives. The FFmpeg source archives must match the build recipe's pinned checksums, including enabled GPU headers. Each Linux and Windows package holds `LICENSE`, `THIRD-PARTY-LICENSES.txt` (license texts of the Rust crates compiled into that executable), `media-licenses/` and the FFmpeg build manifest; on macOS these are in `Capturefab.app/Contents/Resources/licenses/`.
 
 ## Agent iteration
 
@@ -90,14 +99,14 @@ Releases require Apple signing and notarization: without the `MACOS_CERTIFICATE_
 
 | Secret | Effect |
 | --- | --- |
-| `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_P12_PASSWORD` | Imports a Developer ID Application certificate into a temporary keychain and signs the executable and `Capturefab.app` with the hardened runtime and the camera entitlement |
+| `MACOS_CERTIFICATE_P12_BASE64`, `MACOS_CERTIFICATE_P12_PASSWORD` | Imports a Developer ID Application certificate into a temporary keychain and signs the executable and `Capturefab.app` with the hardened runtime and the camera entitlement, and the disk image |
 | `MACOS_NOTARY_KEY`, `MACOS_NOTARY_KEY_ID`, `MACOS_NOTARY_ISSUER` | App Store Connect API key (`.p8` contents) for `notarytool`; the desktop app is stapled |
 | `WINDOWS_CERTIFICATE_PFX_BASE64`, `WINDOWS_CERTIFICATE_PASSWORD` | Optional legacy Authenticode signing with `signtool` and a DigiCert RFC 3161 timestamp when `CAPTUREFAB_WINDOWS_SIGNING` is empty. Requires a certificate with an exportable key. Azure signing does not use these secrets |
 | `RELEASE_GPG_PRIVATE_KEY`, `RELEASE_GPG_PASSPHRASE` | Detached OpenPGP signature `SHA256SUMS.asc`. Publish the public key separately |
 
 The workflow compiles, smoke-tests and packages before signing. Apple and legacy PFX signing use `build --repackage` to verify and reuse each target's existing archive without invoking a compiler. Azure signing runs separately on Windows x64 after both native Windows builds, preserving their smoke-test results and corresponding-source archives; it can sign ARM64 executables without executing them. The prepare/finish steps verify the input archives, replace only the signed executable and signature description, then refresh package hashes. No application code runs after Azure login. Assembly uses only the signed Windows replacements, and a signing failure cannot fall back to unsigned artifacts. Rerunning a draft removes generated platform archives that are no longer available and an obsolete checksum signature, then uploads the newly verified files. Unrelated draft attachments are preserved. Platform signatures appear per artifact as `unsigned`, `apple-developer-id`, `apple-notarized` or `authenticode`.
 
-On macOS the signing pass signs the executable and `Capturefab.app` with the hardened runtime, a secure timestamp and the camera entitlement, verifies them with `codesign --verify --strict`, submits each archive to the notary service and fails unless the submission is `Accepted` (printing the notary log otherwise). The desktop app is then stapled and must pass `stapler validate` and `spctl --assess`, the same Gatekeeper check a downloaded copy faces, before the archive is rebuilt. Stapling and ticket validation each allow at most three attempts, five seconds apart, only for the observed Apple CloudKit connection-loss error: exit 68 with `NSURLErrorDomain Code=-1005` and an `https://api.apple-cloudkit.com/` URL. Both operations must succeed; invalid tickets, other errors and a rejected Gatekeeper assessment stop immediately. A bare command-line executable cannot hold a stapled ticket, so Gatekeeper looks up its notarization online the first time it runs.
+On macOS the signing pass signs the executable and `Capturefab.app` with the hardened runtime, a secure timestamp and the camera entitlement and verifies them with `codesign --verify --strict`. Notarization then runs twice, and each submission fails unless it is `Accepted` (printing the notary log otherwise). First the app goes to the notary service in a temporary `ditto` ZIP that never ships; it is stapled and must pass `stapler validate` and `spctl --assess --type execute`, so the copy dragged to Applications carries its own ticket and opens offline. Only then are `README.txt` (which reports the app's signature) and the disk image built. The image is signed (`codesign --timestamp`, no entitlements), notarized, stapled and must pass `spctl --assess --type open --context context:primary-signature`. Stapling the app after notarizing the image would change the image, hence the order. Every `hdiutil` call has a 600 s timeout that fails the build with a recorded failure; `hdiutil create` is retried at most three times, five seconds apart, only for `Resource busy`. Stapling and ticket validation each allow at most three attempts, five seconds apart, only for the observed Apple CloudKit connection-loss error: exit 68 with `NSURLErrorDomain Code=-1005` and an `https://api.apple-cloudkit.com/` URL. Both operations must succeed; invalid tickets, other errors and a rejected Gatekeeper assessment stop immediately. A bare command-line executable cannot hold a stapled ticket, so Gatekeeper looks up its notarization online the first time it runs.
 
 ### Setting up Azure Artifact Signing for Windows
 
@@ -140,7 +149,7 @@ gh secret set MACOS_NOTARY_ISSUER --repo capturefab/capturefab --body ISSUER-UUI
 
 Successful candidates are promoted automatically after all validation passes. Set `CAPTUREFAB_PUBLISH_SITE=true` and the `CLOUDFLARE_API_TOKEN` secret so the downloads page deploys after publishing.
 
-To check notarization locally before relying on CI: `xcrun notarytool store-credentials capturefab-notary --key AuthKey_KEYID.p8 --key-id KEYID --issuer ISSUER-UUID`, then run `release.py build` with `MACOS_SIGN_IDENTITY` set to the identity hash and `MACOS_NOTARY_PROFILE=capturefab-notary`. After downloading a release, `spctl --assess --type execute -vv Capturefab.app` should report `source=Notarized Developer ID`.
+To check notarization locally before relying on CI: `xcrun notarytool store-credentials capturefab-notary --key AuthKey_KEYID.p8 --key-id KEYID --issuer ISSUER-UUID`, then run `release.py build` with `MACOS_SIGN_IDENTITY` set to the identity hash and `MACOS_NOTARY_PROFILE=capturefab-notary`. After downloading a release, `spctl --assess --type open --context context:primary-signature -vv capturefab-VERSION-macos-ARCH.dmg` and, once installed, `spctl --assess --type execute -vv /Applications/Capturefab.app` should report `source=Notarized Developer ID`; `xcrun stapler validate` should pass on both the `.dmg` and `/Applications/Capturefab.app`. Without credentials, `release.py build` on a Mac produces an unsigned image with the same layout and checks; `codesign --sign -` gives an ad-hoc signature for rehearsing the commands, which Gatekeeper rejects.
 
 Every release is attested by default: GitHub build provenance and an SBOM attestation (the CycloneDX file above) for every file in `SHA256SUMS`, verifiable with `gh attestation verify FILE --repo OWNER/REPO`, adding `--predicate-type https://cyclonedx.org/bom` for the SBOM. Dry runs are not attested. In a public repository the attestations, including the repository identity, are recorded in the public Sigstore transparency log; set the repository variable `CAPTUREFAB_ATTEST=false` to turn them off. Private repositories need a GitHub plan that supports attestations, or that variable.
 

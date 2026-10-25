@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build/package real binaries and assemble an honest, checksummed release."""
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import io
@@ -422,14 +423,172 @@ def stapler(action, app):
         print(f'Retrying stapler {action} after Apple CloudKit connection loss (attempt {attempt + 2}/3).')
         time.sleep(5)
 
-def gatekeeper(app):
+def gatekeeper(app, kind='execute'):
     # spctl accepts a Developer ID app only when it is notarized, so this is
     # the check a downloaded copy will face; stapler proves offline validity.
+    # A disk image is assessed as a document opened by its primary signature.
     stapler('staple', app)
     stapler('validate', app)
-    run(['spctl', '--assess', '--type', 'execute', '--verbose', app])
+    context = ['--context', 'context:primary-signature'] if kind == 'open' else []
+    run(['spctl', '--assess', '--type', kind, *context, '--verbose', app])
+
+# LZFSE (ULFO) needs macOS 10.11; the oldest supported macOS is 10.15.
+DMG_FORMAT = 'ULFO'
+HDIUTIL_TIMEOUT = 600
+DMG_ROOT = {'Capturefab.app', 'Applications', 'README.txt'}
+APP_EXECUTABLE = 'Capturefab.app/Contents/MacOS/capturefab'
+
+def hdiutil(*args):
+    # Only the subcommand is named in errors; paths and volume names stay out.
+    try:
+        result = subprocess.run(['hdiutil', *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, timeout=HDIUTIL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'hdiutil {args[0]} timed out after {HDIUTIL_TIMEOUT} s') from None
+    print(result.stdout, end='')
+    return result
+
+def make_dmg(source, output, volume):
+    for attempt in range(3):
+        result = hdiutil('create', '-volname', volume, '-srcfolder', source, '-fs', 'HFS+', '-format', DMG_FORMAT, '-ov', output)
+        if result.returncode == 0:
+            break
+        # Runners sometimes hold the new device briefly; retry only that.
+        if 'Resource busy' not in result.stdout or attempt == 2:
+            raise RuntimeError(f'hdiutil create exited with status {result.returncode}')
+        print(f'Retrying hdiutil create after a busy device (attempt {attempt + 2}/3).')
+        time.sleep(5)
+    result = hdiutil('verify', output)
+    if result.returncode != 0:
+        raise RuntimeError(f'hdiutil verify exited with status {result.returncode}')
+
+def detach(mountpoint):
+    """Detach an image, forcing it when a plain detach fails or times out.
+    Returns whether the image is detached."""
+    for force in ([], ['-force']):
+        try:
+            if hdiutil('detach', mountpoint, *force).returncode == 0:
+                return True
+        except RuntimeError as error:
+            print(f'warning: {error}', file=sys.stderr)
+    return False
+
+@contextlib.contextmanager
+def attached(dmg):
+    # The folder is removed only once nothing is mounted in it: removing a
+    # mounted image's folder would fail and hide the error that matters.
+    temp = Path(tempfile.mkdtemp(prefix='capturefab-dmg-'))
+    mountpoint = temp / 'mount'
+    mountpoint.mkdir()
+    # -nobrowse keeps the image out of Finder and Capturefab's volume list.
+    result = hdiutil('attach', '-readonly', '-nobrowse', '-noautoopen', '-mountpoint', mountpoint, dmg)
+    if result.returncode != 0:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise RuntimeError(f'hdiutil attach exited with status {result.returncode}')
+    try:
+        yield mountpoint
+    except BaseException:
+        if detach(mountpoint):
+            shutil.rmtree(temp, ignore_errors=True)
+        raise
+    if not detach(mountpoint):
+        raise RuntimeError(f'hdiutil detach failed; the image is still mounted at {mountpoint}')
+    shutil.rmtree(temp, ignore_errors=True)
+
+def dmg_extract(dmg, member, dest):
+    with attached(dmg) as mountpoint:
+        shutil.copy2(mountpoint / member, dest)
+
+def check_dmg(dmg, expected_app_binary):
+    with attached(dmg) as mountpoint:
+        root = {p.name for p in mountpoint.iterdir() if not p.name.startswith('.')}
+        if root != DMG_ROOT:
+            raise RuntimeError(f'disk image root holds {sorted(root)}, expected {sorted(DMG_ROOT)}')
+        applications = mountpoint / 'Applications'
+        if not applications.is_symlink() or os.readlink(applications) != '/Applications':
+            raise RuntimeError('disk image Applications entry is not a link to /Applications')
+        contents = mountpoint / 'Capturefab.app' / 'Contents'
+        if digest(mountpoint / APP_EXECUTABLE) != digest(expected_app_binary):
+            raise RuntimeError('disk image executable differs from the packaged executable')
+        for required in ['Info.plist', 'Resources/licenses/THIRD-PARTY-LICENSES.txt']:
+            if not (contents / required).is_file():
+                raise RuntimeError(f'disk image app is missing Contents/{required}')
+
+def codesign_dmg(path):
+    run(['codesign', '--force', '--timestamp', '--sign', os.environ['MACOS_SIGN_IDENTITY'], path])
+    run(['codesign', '--verify', '--strict', path])
+
+def macos_readme(version, arch, app_signed, browser):
+    text = (f'Capturefab {version} (macOS {arch})\n'
+            'Install: drag Capturefab to the Applications folder, then open it from Applications. Eject this disk image afterwards.\n'
+            'Command line: the app contains the CLI. Run\n'
+            f'  /Applications/{APP_EXECUTABLE} --help\n'
+            'To type just capturefab, add it to PATH once (zsh):\n'
+            '  echo \'export PATH="/Applications/Capturefab.app/Contents/MacOS:$PATH"\' >> ~/.zprofile\n'
+            'then open a new terminal and run capturefab doctor.\n'
+            'FFmpeg is embedded; no separately installed media executable or camera SDK is required.\n'
+            f'App signature: {app_signed}. Verify the downloaded disk image against the release SHA256SUMS.\n'
+            'Licenses: Capturefab.app/Contents/Resources/licenses (Finder: Control-click the app, Show Package Contents).\n'
+            'Corresponding source: the release source and media-sources archives.\n')
+    return text + (BROWSER_README if browser else '')
+
+BROWSER_README = 'Remote browser: capturefab serve --name line1 --listen TAILNET-IP:8787 serves the browser interface. Anyone who can reach that address can control the cameras; bind it to a Tailscale or loopback address.\n'
+
+def licenses(args, browser, folder):
+    shutil.copy2(ROOT / 'LICENSE', folder / 'LICENSE')
+    shutil.copytree(Path(args.ffmpeg_bundle) / 'licenses', folder / 'media-licenses')
+    shutil.copy2(Path(args.ffmpeg_bundle) / 'build-manifest.txt', folder / 'media-build-manifest.txt')
+    (folder / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, browser), encoding='utf-8')
+
+def package_macos(args, binary, browser, output, stem, temp):
+    stage = Path(temp) / stem
+    app = stage / 'Capturefab.app'
+    contents = app / 'Contents'
+    (contents / 'MacOS').mkdir(parents=True)
+    (contents / 'Resources' / 'licenses').mkdir(parents=True)
+    app_binary = contents / 'MacOS' / 'capturefab'
+    shutil.copy2(binary, app_binary)
+    app_binary.chmod(0o755)
+    shutil.copy2(ROOT / 'assets/icons/capturefab.icns', contents / 'Resources/capturefab.icns')
+    info = plistlib.loads((ROOT / 'assets' / 'Info.plist').read_bytes())
+    short = '.'.join(SEMVER.fullmatch(args.version).groups()[:3])
+    info.update(CFBundlePackageType='APPL', CFBundleShortVersionString=short, CFBundleVersion=short)
+    (contents / 'Info.plist').write_bytes(plistlib.dumps(info))
+    # Resources are sealed by the signature, so the licenses go in first; they
+    # then stay with the executable after the drag to Applications.
+    licenses(args, browser, contents / 'Resources' / 'licenses')
+    os.symlink('/Applications', stage / 'Applications')
+    signed = 'unsigned'
+    notary = os.environ.get('MACOS_NOTARY_PROFILE')
+    if os.environ.get('MACOS_SIGN_IDENTITY'):
+        entitlements = Path(temp) / 'entitlements.plist'
+        entitlements.write_bytes(plistlib.dumps({'com.apple.security.device.camera': True}))
+        codesign(app_binary, entitlements)
+        codesign(app, entitlements)
+        signed = 'apple-developer-id'
+        if notary:
+            # Notarize and staple the app itself so the copy dragged out of the
+            # image opens offline; this zip is only the submission.
+            submission = Path(temp) / 'app.zip'
+            run(['ditto', '-c', '-k', '--keepParent', app, submission])
+            notarize(submission)
+            gatekeeper(app)
+            signed = 'apple-notarized'
+    # The README reports the app's state; the image is signed after it exists.
+    (stage / 'README.txt').write_text(macos_readme(args.version, args.arch, signed, browser), encoding='utf-8')
+    dmg = output / f'{stem}.dmg'
+    make_dmg(stage, dmg, f'Capturefab {args.version}')
+    if signed != 'unsigned':
+        codesign_dmg(dmg)
+        if notary:
+            notarize(dmg)
+            gatekeeper(dmg, 'open')
+    check_dmg(dmg, app_binary)
+    return dmg, signed
 
 def package(args, binary):
+    if args.os == 'macos' and shutil.which('hdiutil') is None:
+        raise ValueError('macOS disk images need hdiutil; package macOS builds on macOS')
     inspect_binary(binary, args.os, args.arch)
     ffmpeg = Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')
     inspect_binary(ffmpeg, args.os, args.arch)
@@ -445,58 +604,27 @@ def package(args, binary):
     output.mkdir(parents=True, exist_ok=True)
     stem = f'capturefab-{args.version}-{args.os}-{args.arch}'
     signed = 'unsigned'
+    extra = dict(target=args.target, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed', **(dict(browser_client=True) if browser else {}))
     with tempfile.TemporaryDirectory(prefix='capturefab-package-') as temp:
+        if args.os == 'macos':
+            path, signed = package_macos(args, binary, browser, output, stem, temp)
+            return record(path, args.os, args.arch, platform_signature=signed, **extra)
         stage = Path(temp) / stem
         stage.mkdir()
         executable = stage / ('capturefab.exe' if args.os == 'windows' else 'capturefab')
         shutil.copy2(binary, executable)
         executable.chmod(0o755)
-        entitlements = Path(temp) / 'entitlements.plist'
-        if args.os == 'macos' and os.environ.get('MACOS_SIGN_IDENTITY'):
-            entitlements.write_bytes(plistlib.dumps({'com.apple.security.device.camera': True}))
-            codesign(executable, entitlements)
-            signed = 'apple-developer-id'
-        elif args.os == 'windows' and os.environ.get('WINDOWS_CERTIFICATE_PFX'):
+        if args.os == 'windows' and os.environ.get('WINDOWS_CERTIFICATE_PFX'):
             tool = os.environ.get('WINDOWS_SIGNTOOL', 'signtool.exe')
             run([tool, 'sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', os.environ['WINDOWS_CERTIFICATE_PFX'], '/p', os.environ.get('WINDOWS_CERTIFICATE_PASSWORD', ''), executable])
             signed = 'authenticode'
-        shutil.copy2(ROOT / 'LICENSE', stage / 'LICENSE')
-        shutil.copytree(Path(args.ffmpeg_bundle) / 'licenses', stage / 'media-licenses')
-        shutil.copy2(Path(args.ffmpeg_bundle) / 'build-manifest.txt', stage / 'media-build-manifest.txt')
-        (stage / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, browser), encoding='utf-8')
+        licenses(args, browser, stage)
         readme = f'Capturefab {args.version}\n{args.os}/{args.arch}\nRun capturefab --help for CLI usage. With no arguments it opens the GUI, or lists the CLI commands when no display is available. capturefab doctor checks this computer.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n'
         if browser:
-            readme += 'Remote browser: capturefab serve --name line1 --listen TAILNET-IP:8787 serves the browser interface. Anyone who can reach that address can control the cameras; bind it to a Tailscale or loopback address.\n'
+            readme += BROWSER_README
         if args.os == 'linux':
             readme += f'Run it as a service on a Raspberry Pi, Jetson or industrial PC: {LINE_COMPUTER}\n'
         (stage / 'README.txt').write_text(readme)
-        if args.os == 'macos':
-            app = stage / 'Capturefab.app' / 'Contents'
-            (app / 'MacOS').mkdir(parents=True)
-            (app / 'Resources').mkdir()
-            # Store the signed Mach-O once. A tiny launcher keeps ./capturefab
-            # available for CLI use while Finder opens the same app executable,
-            # and still works after the app is moved to Applications.
-            executable.rename(app / 'MacOS' / 'capturefab')
-            executable.write_text(
-                '#!/bin/sh\n'
-                'd=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\n'
-                'for a in "$d" "$HOME/Applications" /Applications; do\n'
-                '  b="$a/Capturefab.app/Contents/MacOS/capturefab"; [ -x "$b" ] && exec "$b" "$@"\n'
-                'done\n'
-                'echo "capturefab: Capturefab.app not found beside this launcher or in Applications" >&2; exit 127\n',
-                encoding='utf-8',
-            )
-            executable.chmod(0o755)
-            with (stage / 'README.txt').open('a', encoding='utf-8') as readme:
-                readme.write('macOS: move Capturefab.app to Applications. ./capturefab --help runs the app beside it or in Applications.\nTo use capturefab anywhere: mkdir -p ~/.local/bin && ln -sf /Applications/Capturefab.app/Contents/MacOS/capturefab ~/.local/bin/capturefab\n')
-            shutil.copy2(ROOT / 'assets/icons/capturefab.icns', app / 'Resources/capturefab.icns')
-            info = plistlib.loads((ROOT / 'assets' / 'Info.plist').read_bytes())
-            short = '.'.join(SEMVER.fullmatch(args.version).groups()[:3])
-            info.update(CFBundlePackageType='APPL', CFBundleShortVersionString=short, CFBundleVersion=short)
-            (app / 'Info.plist').write_bytes(plistlib.dumps(info))
-            if signed == 'apple-developer-id':
-                codesign(app.parent, entitlements)
         if args.os == 'linux':
             applications = stage / 'share/applications'
             applications.mkdir(parents=True)
@@ -510,16 +638,9 @@ def package(args, binary):
                 'then copy the contents of share/ into ~/.local/share/ (or /usr/local/share/\n'
                 'for all users). Keep the applications/ and icons/ subdirectories intact.\n'
             )
-        path = output / (stem + ('.zip' if args.os in ['macos', 'windows'] else '.tar.gz'))
+        path = output / (stem + ('.zip' if args.os == 'windows' else '.tar.gz'))
         archive_tree(stage, path, stem)
-        if args.os == 'macos' and signed == 'apple-developer-id' and os.environ.get('MACOS_NOTARY_PROFILE'):
-            notarize(path)
-            # Staple the app, then recreate the archive with its ticket included.
-            gatekeeper(app.parent)
-            archive_tree(stage, path, stem)
-            signed = 'apple-notarized'
-    extra = dict(browser_client=True) if browser else {}
-    return record(path, args.os, args.arch, target=args.target, platform_signature=signed, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed', **extra)
+    return record(path, args.os, args.arch, platform_signature=signed, **extra)
 
 def media_sources(args):
     output = Path(args.output)
@@ -577,14 +698,13 @@ def repackage(args):
     name = 'capturefab.exe' if args.os == 'windows' else 'capturefab'
     with tempfile.TemporaryDirectory(prefix='capturefab-repackage-') as temp:
         binary = Path(temp) / name
-        if archive_path.suffix == '.zip':
+        if args.os == 'macos':
+            if archive_path.suffix != '.dmg':
+                raise ValueError('existing package has an unexpected format')
+            dmg_extract(archive_path, APP_EXECUTABLE, binary)
+        elif archive_path.suffix == '.zip':
             with zipfile.ZipFile(archive_path) as archive:
-                member = f'{stem}/{name}'
-                if args.os == 'macos':
-                    app_binary = f'{stem}/Capturefab.app/Contents/MacOS/capturefab'
-                    if app_binary in archive.namelist():
-                        member = app_binary
-                binary.write_bytes(archive.read(member))
+                binary.write_bytes(archive.read(f'{stem}/{name}'))
         else:
             with tarfile.open(archive_path) as archive:
                 with archive.extractfile(f'{stem}/{name}') as stream:
@@ -671,12 +791,15 @@ def assemble(args):
     unavailable = [f'- {a["os"]} {a["arch"]}: {a["reason"]}' for a in assets if not a['available']]
     notes = [f'Capturefab {ver}', '', 'One executable per platform: it opens the GUI with no arguments (or lists the CLI commands when no display is available) and provides the CLI and authenticated session automation.', '', 'Build artifacts:']
     notes += [f'- {key[0]} {key[1]}: {item["validation"]}, platform signature {item["platform_signature"]}' for key, item in successes.items()]
+    if any(key[0] == 'macos' for key in successes):
+        notes += ['- macOS: open the .dmg and drag Capturefab to Applications. Where the platform signature says apple-notarized, both the disk image and the app inside are notarized and stapled.',
+                  '', 'Upgrade note:', '- The macOS download no longer includes the ./capturefab launcher; use /Applications/Capturefab.app/Contents/MacOS/capturefab or add that folder to PATH.']
     notes += ['', 'Unavailable targets:'] + unavailable if unavailable else []
     notes += ['', 'Verification:', '- Check downloads against SHA256SUMS, for example `sha256sum --check --ignore-missing SHA256SUMS`.']
     notes += [f'- SHA256SUMS.asc is an OpenPGP signature by key {args.gpg_key}: `gpg --verify SHA256SUMS.asc SHA256SUMS`.'] if signature else []
     notes += [f'- GitHub build provenance and an SBOM attestation cover every file in SHA256SUMS: `gh attestation verify FILE --repo {args.repository}` (add `--predicate-type https://cyclonedx.org/bom` for the SBOM).'] if args.provenance else []
     notes += [f'- {bill.name} is a CycloneDX software bill of materials: the Rust crates linked into the executable, with Cargo.lock checksums, and the pinned media components.']
-    notes += ['- Apple Developer ID, notarization and Windows Authenticode apply only where the platform signature above says so.', '', f'Corresponding source: {source.name} contains the exact Capturefab commit and vendored Cargo.lock dependency sources with an offline build configuration; each *-media-sources.tar.gz holds the verified FFmpeg, x264, SRT, OpenSSL, zlib and enabled header archives with their build manifest. Packages list Rust crate licenses in THIRD-PARTY-LICENSES.txt.']
+    notes += ['- Apple Developer ID, notarization and Windows Authenticode apply only where the platform signature above says so.', '', f'Corresponding source: {source.name} contains the exact Capturefab commit and vendored Cargo.lock dependency sources with an offline build configuration; each *-media-sources.tar.gz holds the verified FFmpeg, x264, SRT, OpenSSL, zlib and enabled header archives with their build manifest. Packages list Rust crate licenses in THIRD-PARTY-LICENSES.txt (on macOS inside Capturefab.app/Contents/Resources/licenses).']
     (output / 'release-notes.md').write_text('\n'.join(notes) + '\n')
     print(f'Prepared {ver}: {len(successes)} platform assets; {len(assets) - len(successes)} unavailable selections.')
 

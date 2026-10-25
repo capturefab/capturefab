@@ -147,6 +147,8 @@ struct Facts {
     working_directory: Place,
     /// The default capture folder's disk, where `storage --json` measures.
     captures: Place,
+    /// macOS: this executable runs from the disk image or a translocated copy.
+    install: Option<crate::volumes::InstallLocation>,
 }
 /// Where a service started without XDG_RUNTIME_DIR keeps sessions, out of
 /// this login's sight, the login runtime directory it passes over and why,
@@ -190,6 +192,9 @@ impl Facts {
             usb: usb_cameras(),
             working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
             captures: capture_place(),
+            install: std::env::current_exe()
+                .ok()
+                .and_then(|exe| crate::volumes::install_location(&exe)),
         }
     }
 }
@@ -318,6 +323,7 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks.push(session_check(&facts.state, facts.session_dir_set));
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
+    checks.extend(facts.install.map(install_check));
     checks.extend(
         facts
             .used
@@ -483,6 +489,24 @@ fn login_dir_problem(login: &Path, why: LoginDir) -> (String, String) {
 /// Informational rather than a warning: by default state is on disk, so
 /// memory means the user chose it, and only they know whether it must
 /// outlive a reboot.
+/// The app runs from a path that goes away: the mounted disk image, or a
+/// copy macOS made of a quarantined app.
+fn install_check(location: crate::volumes::InstallLocation) -> Check {
+    let message = match location {
+        crate::volumes::InstallLocation::DiskImage => {
+            "Capturefab is running from the disk image; its path stops working once you eject it."
+        }
+        crate::volumes::InstallLocation::Translocated => {
+            "Capturefab is running from a temporary copy macOS made; its path changes on every launch."
+        }
+    };
+    Check::warn(
+        "install_location",
+        message.into(),
+        "Drag Capturefab.app to /Applications and open it from there.".into(),
+    )
+}
+
 fn session_check(state: &Place, session_dir_set: bool) -> Check {
     if !state.ram_backed {
         return Check::ok(
@@ -919,6 +943,22 @@ mod tests {
             total_bytes: Some(free * 2),
             free_bytes: Some(free),
         }
+    }
+
+    #[test]
+    fn running_from_the_disk_image_warns() {
+        use crate::volumes::InstallLocation;
+        for location in [InstallLocation::DiskImage, InstallLocation::Translocated] {
+            let check = install_check(location);
+            assert_eq!(check.id, "install_location");
+            assert_eq!(check.level, Level::Warn);
+            assert!(check.fix.unwrap().contains("/Applications"));
+        }
+        assert!(
+            install_check(InstallLocation::DiskImage)
+                .message
+                .contains("disk image")
+        );
     }
 
     #[test]

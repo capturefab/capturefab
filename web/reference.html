@@ -351,7 +351,7 @@ capturefab --session bench status --json</code></pre></div>
 <tr><td><code>NAME</code></td><td>Name for this item.</td><td>Required</td></tr>
 </tbody></table></div>
 <h3 id="command-volumes"><code>capturefab volumes</code></h3>
-<p>List mounted external, removable and network volumes.</p>
+<p>List mounted external, removable and network volumes. On macOS and Linux, read-only volumes, such as mounted disk images, are omitted; Windows lists every drive.</p>
 </article>
 <article class="doc-section" id="cli-storage" data-doc-section data-doc-title="Storage and retention" data-doc-category="Command reference" data-doc-tags="storage,retention"><h2>Storage and retention</h2><p class="doc-summary">Set file retention limits and inspect storage usage.</p>
 <p>The default policy allows 10 GiB and 10,000 owned files, then stops new output. Reservations count toward these limits.</p><p>Delete-oldest affects eligible Capturefab-owned files. Existing unrelated files and modified files are not deleted.</p><p>Storage task workspaces contain a database and its write-ahead log. Copy both together before removing an orphan workspace.</p><p>Task guide: <a href="docs.html#storage">Storage and retention</a>.</p><h3 id="command-storage"><code>capturefab storage</code></h3>

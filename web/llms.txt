@@ -206,6 +206,7 @@ Network stream sources reconnect by themselves, backing off from 1 s to 30 s; fr
 Video file sources play at their frame rate in live view; captures that start acquisition read them as fast as they ask; `PlaybackSpeed=Fastest` decodes every frame as fast as possible.
 
 Saved destinations are folders on the user’s disk, removable drives or mounted network drives.
+On macOS and Linux, `volumes` omits read-only volumes, such as mounted disk images.
 Use `destination list --json` and `volumes --json` to inspect them.
 With `--destination NAME`, output is a relative name inside the selected folder.
 A missing external drive fails with exit code 3. Removing a destination leaves its files in place.
@@ -574,7 +575,7 @@ Release data determines the available downloads.
 An empty release array means that no binary downloads are published.
 Match the installed operating system and architecture.
 A Macintosh browser user-agent string does not identify Apple silicon or Intel reliably.
-See the installation guide for extraction steps and operating system minimums.
+See the installation guide for install steps (newer macOS releases: drag the app from the .dmg to Applications; the CLI is /Applications/Capturefab.app/Contents/MacOS/capturefab) and operating system minimums.
 
 Resource protection
 -------------------

@@ -93,6 +93,10 @@ jobs:
           cache-on-failure: true
       # Every test binary runs, so one failure does not hide the rest.
       - run: cargo test --locked --no-fail-fast
+      # The real hdiutil path, before the Release workflow depends on it.
+      - name: Disk image packaging (real hdiutil)
+        if: runner.os == 'macOS'
+        run: python3 -m unittest discover -s scripts -p test_release.py -k RealDiskImage -v
       # Which accelerators this runner exposes; informational, never fails.
       - name: Report hardware acceleration
         if: ${{ !cancelled() }}

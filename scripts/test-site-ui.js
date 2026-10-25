@@ -198,6 +198,18 @@ async function downloads() {
   assert.equal(page.ids.get('verify-box').hidden, true);
   assert.equal(page.ids.get('install-hint').hidden, true);
 
+  // A disk image release (after 0.4.0) gets drag-to-Applications steps.
+  const imaged = structuredClone(published);
+  imaged.releases.find((release) => release.version === imaged.latest).assets
+    .filter((asset) => asset.os === 'macos').forEach((asset) => { asset.name = asset.name.replace(/\.zip$/, '.dmg'); });
+  const dmg = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X', manifest: imaged });
+  await dmg.settle();
+  assert.match(dmg.ids.get('install-hint').textContent, /Drag Capturefab to the Applications folder/);
+  assert.doesNotMatch(dmg.ids.get('install-hint').textContent, /Extract/);
+  assert.ok(dmg.ids.get('install-hint').textContent.includes('/Applications/Capturefab.app/Contents/MacOS/capturefab --help'));
+  dmg.change('os-select', 'windows');
+  assert.ok(dmg.ids.get('install-hint').textContent.includes('.\\capturefab.exe --help'));
+
   page.change('os-select', 'linux');
   assert.match(page.ids.get('platform-hint').textContent, /dpkg --print-architecture/, 'Linux needs a check that tells a 32-bit OS from a 64-bit one');
   page.change('arch-select', 'aarch64');
@@ -342,7 +354,7 @@ async function guessedProcessor() {
 
 async function nextSteps() {
   const cases = [
-    ['macOS', 'arm', /Capturefab\.app/, 'macos', 'aarch64', './capturefab'],
+    ['macOS', 'arm', /Capturefab\.app/, 'macos', 'aarch64', '/Applications/Capturefab.app/Contents/MacOS/capturefab'],
     ['Windows', 'x86', /\.\\capturefab\.exe/, 'windows', 'x86_64', '.\\capturefab.exe'],
     ['Linux', 'x86', /\.\/capturefab/, 'linux', 'x86_64', './capturefab']
   ];

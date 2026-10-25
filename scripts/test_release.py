@@ -327,21 +327,38 @@ class ReleaseTests(unittest.TestCase):
     def test_info_plist_is_tracked_for_source_archives(self):
         subprocess.run(['git', 'ls-files', '--error-unmatch', 'assets/Info.plist'], cwd=release.ROOT, check=True, capture_output=True)
 
+    def macos_fixture(self, temp):
+        bundle = temp / 'bundle'
+        (bundle / 'bin').mkdir(parents=True)
+        (bundle / 'licenses').mkdir()
+        (bundle / 'licenses' / 'NOTICE.txt').write_text('notice')
+        (bundle / 'build-manifest.txt').write_text('manifest')
+        ffmpeg = self.macho((11, 0)) + os.urandom(70000)
+        (bundle / 'bin' / 'ffmpeg').write_bytes(ffmpeg)
+        binary = temp / 'capturefab'
+        binary.write_bytes(self.macho((11, 0)) + b'code' + ffmpeg)
+        args = SimpleNamespace(os='macos', arch='aarch64', target='aarch64-apple-darwin', version='1.2.3-rc.1', ffmpeg_bundle=bundle, output=temp / 'dist', skip_smoke=True)
+        return bundle, ffmpeg, binary, args
+
+    @staticmethod
+    def which(name):
+        return '/usr/bin/hdiutil' if name == 'hdiutil' else shutil.which(name)
+
     def test_package_layout_and_app_bundle(self):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
-            bundle = temp / 'bundle'
-            (bundle / 'bin').mkdir(parents=True)
-            (bundle / 'licenses').mkdir()
-            (bundle / 'licenses' / 'NOTICE.txt').write_text('notice')
-            (bundle / 'build-manifest.txt').write_text('manifest')
-            ffmpeg = self.macho((11, 0)) + os.urandom(70000)
-            (bundle / 'bin' / 'ffmpeg').write_bytes(ffmpeg)
-            binary = temp / 'capturefab'
-            binary.write_bytes(self.macho((11, 0)) + b'code' + ffmpeg)
-            args = SimpleNamespace(os='macos', arch='aarch64', target='aarch64-apple-darwin', version='1.2.3-rc.1', ffmpeg_bundle=bundle, output=temp / 'dist', skip_smoke=True)
-            with mock.patch.object(release, 'notices', return_value='crate licenses'), mock.patch.dict(os.environ, {'MACOS_SIGN_IDENTITY': ''}):
+            bundle, ffmpeg, binary, args = self.macos_fixture(temp)
+            inspect, volumes = temp / 'inspect', []
+            def make_dmg(source, output, volume):
+                shutil.rmtree(inspect, ignore_errors=True)
+                shutil.copytree(source, inspect, symlinks=True)
+                volumes.append(volume)
+                Path(output).write_bytes(b'dmg')
+            with mock.patch.object(release, 'notices', return_value='crate licenses'), mock.patch.dict(os.environ, {'MACOS_SIGN_IDENTITY': ''}), \
+                    mock.patch.object(release, 'make_dmg', side_effect=make_dmg), mock.patch.object(release, 'check_dmg') as check, \
+                    mock.patch.object(release.shutil, 'which', side_effect=self.which):
                 item = release.package(args, binary)
+                self.assertEqual(check.call_count, 1)
                 (bundle / 'bin' / 'ffmpeg').write_bytes(self.macho((11, 0)) + os.urandom(70000))
                 with self.assertRaisesRegex(ValueError, 'does not embed'):
                     release.package(args, binary)
@@ -350,50 +367,160 @@ class ReleaseTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'requires macOS'):
                     release.package(args, binary)
             path = temp / 'dist' / item['name']
+            self.assertTrue(item['name'].endswith('-macos-aarch64.dmg'))
             self.assertEqual((item['validation'], item['platform_signature'], item['sha256']), ('cross-compiled', 'unsigned', release.digest(path)))
-            with zipfile.ZipFile(path) as archive:
-                stem = 'capturefab-1.2.3-rc.1-macos-aarch64'
-                info = plistlib.loads(archive.read(f'{stem}/Capturefab.app/Contents/Info.plist'))
-                self.assertEqual(info['CFBundleIconFile'], 'capturefab.icns')
-                self.assertEqual(archive.read(f'{stem}/Capturefab.app/Contents/Resources/capturefab.icns'),
-                                 (release.ROOT / 'assets/icons/capturefab.icns').read_bytes())
-                self.assertEqual(archive.read(f'{stem}/THIRD-PARTY-LICENSES.txt'), b'crate licenses')
-                self.assertTrue(archive.getinfo(f'{stem}/capturefab').external_attr >> 16 & 0o100)
-                app_binary = f'{stem}/Capturefab.app/Contents/MacOS/capturefab'
-                self.assertEqual(archive.read(app_binary), binary.read_bytes())
-                self.assertTrue(archive.getinfo(app_binary).external_attr >> 16 & 0o100)
-                launcher = archive.read(f'{stem}/capturefab')
-                self.assertTrue(launcher.startswith(b'#!/bin/sh\n'))
-                self.assertLess(len(launcher), 512)
-                self.assertEqual(sum(archive.read(n).count(ffmpeg) for n in archive.namelist()), 1)
-                if os.name != 'nt':
-                    extracted = temp / 'directory with spaces'
-                    archive.extractall(extracted)
-                    installed = extracted / app_binary
-                    installed.write_text('#!/bin/sh\nprintf "%s\\n" "$PWD" "$@"\nexit 23\n')
-                    installed.chmod(0o755)
-                    cli = extracted / stem / 'capturefab'
-                    cli.chmod(0o755)
-                    result = subprocess.run([str(cli), '--help', 'argument with spaces', '*'],
-                                            cwd=temp, capture_output=True, text=True)
-                    self.assertEqual(result.returncode, 23)
-                    self.assertEqual(result.stdout.splitlines(), [str(temp.resolve()), '--help', 'argument with spaces', '*'])
-                    # Moved to ~/Applications: the launcher falls back to it.
-                    home = temp / 'home'
-                    (home / 'Applications').mkdir(parents=True)
-                    (extracted / stem / 'Capturefab.app').rename(home / 'Applications' / 'Capturefab.app')
-                    moved = subprocess.run([str(cli), 'moved'], cwd=temp, capture_output=True, text=True, env=dict(os.environ, HOME=str(home)))
-                    self.assertEqual((moved.returncode, moved.stdout.splitlines()[1:]), (23, ['moved']))
-                    # With no app anywhere it says so instead of running something else.
-                    shutil.rmtree(home / 'Applications')
-                    missing = subprocess.run([str(cli)], cwd=temp, capture_output=True, text=True, env=dict(os.environ, HOME=str(home)))
-                    if not Path('/Applications/Capturefab.app').exists():
-                        self.assertEqual(missing.returncode, 127)
-                        self.assertIn('Capturefab.app not found', missing.stderr)
-                self.assertIn(f'{stem}/media-licenses/NOTICE.txt', archive.namelist())
+            self.assertEqual(volumes, ['Capturefab 1.2.3-rc.1'])
+            self.assertEqual({p.name for p in inspect.iterdir()}, {'Capturefab.app', 'Applications', 'README.txt'})
+            self.assertEqual(os.readlink(inspect / 'Applications'), '/Applications')
+            contents = inspect / 'Capturefab.app' / 'Contents'
+            info = plistlib.loads((contents / 'Info.plist').read_bytes())
+            self.assertEqual(info['CFBundleIconFile'], 'capturefab.icns')
+            self.assertEqual((contents / 'Resources/capturefab.icns').read_bytes(), (release.ROOT / 'assets/icons/capturefab.icns').read_bytes())
+            app_binary = contents / 'MacOS' / 'capturefab'
+            self.assertEqual(app_binary.read_bytes(), binary.read_bytes())
+            self.assertTrue(app_binary.stat().st_mode & 0o100)
+            licenses = contents / 'Resources' / 'licenses'
+            self.assertEqual((licenses / 'THIRD-PARTY-LICENSES.txt').read_text(), 'crate licenses')
+            self.assertEqual((licenses / 'LICENSE').read_bytes(), (release.ROOT / 'LICENSE').read_bytes())
+            self.assertEqual((licenses / 'media-licenses' / 'NOTICE.txt').read_text(), 'notice')
+            self.assertEqual((licenses / 'media-build-manifest.txt').read_text(), 'manifest')
+            files = [f for f in inspect.rglob('*') if f.is_file() and not f.is_symlink()]
+            self.assertEqual(sum(f.read_bytes().count(ffmpeg) for f in files), 1)
+            self.assertFalse((inspect / 'capturefab').exists())
+            readme = (inspect / 'README.txt').read_text()
+            for wanted in ['/Applications/Capturefab.app/Contents/MacOS/capturefab', 'export PATH=', 'App signature: unsigned', 'Contents/Resources/licenses']:
+                self.assertIn(wanted, readme)
+            for unwanted in ['.local/bin', 'disk image signature', './capturefab']:
+                self.assertNotIn(unwanted, readme)
             source = plistlib.loads((release.ROOT / 'assets' / 'Info.plist').read_bytes())
             self.assertEqual(info['CFBundleIdentifier'], source['CFBundleIdentifier'])
             self.assertEqual((info['CFBundleShortVersionString'], info['CFBundlePackageType']), ('1.2.3', 'APPL'))
+
+    def test_macos_package_requires_hdiutil(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, binary, args = self.macos_fixture(Path(temp))
+            fail = AssertionError('the hdiutil guard must run first')
+            with mock.patch.object(release.shutil, 'which', return_value=None), mock.patch.object(release, 'inspect_binary', side_effect=fail) as inspect, \
+                    mock.patch.object(release, 'smoke', side_effect=fail) as smoke, mock.patch.object(release, 'notices', side_effect=fail) as notices:
+                with self.assertRaisesRegex(ValueError, 'need hdiutil'):
+                    release.package(args, binary)
+            for patched in (inspect, smoke, notices):
+                patched.assert_not_called()
+            self.assertFalse((Path(temp) / 'dist').exists())
+
+    def test_signed_notarized_macos_order(self):
+        for profile, expected_signature in [('p', 'apple-notarized'), ('', 'apple-developer-id')]:
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temp:
+                temp = Path(temp)
+                _, _, binary, args = self.macos_fixture(temp)
+                calls, readmes = [], []
+                def runner(command, **kwargs):
+                    command = [str(c) for c in command]
+                    if command[0] == 'codesign' and '--verify' not in command:
+                        calls.append(('codesign', Path(command[-1]).name))
+                    elif command[0] == 'ditto':
+                        calls.append(('ditto',))
+                def make_dmg(source, output, volume):
+                    readmes.append((Path(source) / 'README.txt').read_text())
+                    calls.append(('make_dmg',))
+                    Path(output).write_bytes(b'dmg')
+                with mock.patch.dict(os.environ, {'MACOS_SIGN_IDENTITY': 'ID', 'MACOS_NOTARY_PROFILE': profile}), \
+                        mock.patch.object(release, 'notices', return_value='crate licenses'), mock.patch.object(release.shutil, 'which', side_effect=self.which), \
+                        mock.patch.object(release, 'run', side_effect=runner), \
+                        mock.patch.object(release, 'notarize', side_effect=lambda path: calls.append(('notarize', Path(path).suffix))), \
+                        mock.patch.object(release, 'gatekeeper', side_effect=lambda path, kind='execute': calls.append(('gatekeeper', Path(path).suffix, kind))), \
+                        mock.patch.object(release, 'make_dmg', side_effect=make_dmg), \
+                        mock.patch.object(release, 'codesign_dmg', side_effect=lambda path: calls.append(('codesign_dmg',))), \
+                        mock.patch.object(release, 'check_dmg', side_effect=lambda dmg, app: calls.append(('check_dmg',))):
+                    item = release.package(args, binary)
+                notarized = [('ditto',), ('notarize', '.zip'), ('gatekeeper', '.app', 'execute')] if profile else []
+                after = [('notarize', '.dmg'), ('gatekeeper', '.dmg', 'open')] if profile else []
+                self.assertEqual(calls, [('codesign', 'capturefab'), ('codesign', 'Capturefab.app'), *notarized,
+                                         ('make_dmg',), ('codesign_dmg',), *after, ('check_dmg',)])
+                self.assertEqual(item['platform_signature'], expected_signature)
+                self.assertIn(f'App signature: {expected_signature}.', readmes[0])
+
+    def test_gatekeeper_open_assessment(self):
+        good = SimpleNamespace(returncode=0, stdout='ok\n')
+        with mock.patch.object(release.subprocess, 'run', side_effect=[good, good]) as run, \
+                mock.patch.object(release, 'run') as assess, contextlib.redirect_stdout(io.StringIO()):
+            release.gatekeeper(Path('capturefab.dmg'), 'open')
+        self.assertEqual([c.args[0][:3] for c in run.call_args_list], [['xcrun', 'stapler', 'staple'], ['xcrun', 'stapler', 'validate']])
+        self.assertEqual(assess.call_args.args[0][:6], ['spctl', '--assess', '--type', 'open', '--context', 'context:primary-signature'])
+
+    def test_make_dmg_retries_only_resource_busy(self):
+        busy = SimpleNamespace(returncode=1, stdout='hdiutil: create failed - Resource busy\n')
+        other = SimpleNamespace(returncode=1, stdout='hdiutil: create failed - No space left on device\n')
+        good = SimpleNamespace(returncode=0, stdout='created\n')
+        for replies, subcommands, error in [([busy, good, good], ['create', 'create', 'verify'], None),
+                                             ([other], ['create'], 'hdiutil create exited with status 1'),
+                                             ([busy] * 3, ['create'] * 3, 'hdiutil create exited with status 1'),
+                                             ([good, other], ['create', 'verify'], 'hdiutil verify exited with status 1')]:
+            with self.subTest(subcommands=subcommands, error=error), \
+                    mock.patch.object(release.subprocess, 'run', side_effect=replies) as run, \
+                    mock.patch.object(release.time, 'sleep') as sleep, contextlib.redirect_stdout(io.StringIO()):
+                if error:
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        release.make_dmg(Path('stage'), Path('out.dmg'), 'Capturefab 1.2.3')
+                else:
+                    release.make_dmg(Path('stage'), Path('out.dmg'), 'Capturefab 1.2.3')
+                self.assertEqual([c.args[0][1] for c in run.call_args_list], subcommands)
+                for c in run.call_args_list:
+                    self.assertEqual((c.kwargs['stderr'], c.kwargs['timeout']), (subprocess.STDOUT, release.HDIUTIL_TIMEOUT))
+                self.assertEqual(sleep.call_count, subcommands.count('create') - 1)
+                create = run.call_args_list[0].args[0]
+                self.assertEqual(create[create.index('-format') + 1], 'ULFO')
+
+    def test_attached_forces_a_stuck_detach_and_keeps_a_mounted_folder(self):
+        good = SimpleNamespace(returncode=0, stdout='')
+        bad = SimpleNamespace(returncode=1, stdout='hdiutil: detach failed - Resource busy\n')
+        timeout = subprocess.TimeoutExpired(['hdiutil', 'detach'], release.HDIUTIL_TIMEOUT)
+        for replies, error in [([good, good], None),
+                               ([good, timeout, good], None),
+                               ([good, bad, good], None),
+                               ([good, bad, timeout], 'hdiutil detach failed; the image is still mounted')]:
+            with self.subTest(replies=replies), \
+                    mock.patch.object(release.subprocess, 'run', side_effect=replies) as run, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                if error:
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        with release.attached(Path('image.dmg')) as mountpoint:
+                            pass
+                    self.assertTrue(mountpoint.is_dir(), 'a mounted folder must not be removed')
+                    shutil.rmtree(mountpoint.parent)
+                else:
+                    with release.attached(Path('image.dmg')) as mountpoint:
+                        pass
+                    self.assertFalse(mountpoint.parent.exists())
+                self.assertEqual([c.args[0][1] for c in run.call_args_list], ['attach'] + ['detach'] * (len(replies) - 1))
+        # An error inside the block is the one reported, even when detach fails.
+        with mock.patch.object(release.subprocess, 'run', side_effect=[good, bad, bad]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'disk image root'):
+                with release.attached(Path('image.dmg')) as mountpoint:
+                    raise RuntimeError('disk image root holds []')
+        shutil.rmtree(mountpoint.parent)
+
+    def test_hdiutil_timeout_is_runtime_error(self):
+        timeout = subprocess.TimeoutExpired(['hdiutil', 'create'], release.HDIUTIL_TIMEOUT)
+        with mock.patch.object(release.subprocess, 'run', side_effect=timeout):
+            with self.assertRaisesRegex(RuntimeError, 'hdiutil create timed out') as raised:
+                release.hdiutil('create', '-volname', 'secret volume')
+        self.assertNotIn('secret', str(raised.exception))
+        with tempfile.TemporaryDirectory() as temp:
+            temp = Path(temp)
+            source = temp / 'media-sources.tar.gz'
+            source.write_bytes(b'source')
+            args = SimpleNamespace(version=release.version(), target='aarch64-apple-darwin', os='macos', arch='aarch64',
+                                   ffmpeg_bundle=temp / 'bundle', binary=str(temp / 'capturefab'), repackage=False, output=temp / 'out')
+            def package(args, binary):
+                release.hdiutil('create')
+            with mock.patch.object(release.subprocess, 'run', side_effect=timeout), mock.patch.object(release, 'package', side_effect=package), \
+                    mock.patch.object(release, 'media_sources', return_value=source), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'build\\(s\\) failed'):
+                    release.build(args)
+            report = json.loads((temp / 'out' / 'build-macos-aarch64.json').read_text())
+            self.assertEqual(report['failures'], [dict(os='macos', arch='aarch64', error=f'hdiutil create timed out after {release.HDIUTIL_TIMEOUT} s')])
 
     def test_gatekeeper_retries_only_cloudkit_connection_loss(self):
         lost = SimpleNamespace(returncode=68, stdout='NSURLErrorDomain Code=-1005 network connection lost\n'
@@ -563,23 +690,38 @@ class ReleaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)
             stem = 'capturefab-1.2.3-macos-aarch64'
-            archive_path = output / f'{stem}.zip'
-            with zipfile.ZipFile(archive_path, 'w') as archive:
-                archive.writestr(f'{stem}/capturefab', b'CLI launcher')
-                archive.writestr(f'{stem}/Capturefab.app/Contents/MacOS/capturefab', b'desktop')
+            archive_path = output / f'{stem}.dmg'
+            archive_path.write_bytes(b'disk image')
             item = release.record(archive_path, 'macos', 'aarch64')
             report_path = output / 'build-macos-aarch64.json'
             report_path.write_text(json.dumps(dict(version='1.2.3', assets=[item])))
             args = SimpleNamespace(version='1.2.3', os='macos', arch='aarch64', output=output)
+            def extract(dmg, member, dest):
+                self.assertEqual((Path(dmg), member), (archive_path, 'Capturefab.app/Contents/MacOS/capturefab'))
+                Path(dest).write_bytes(b'desktop')
             def package(args, binary):
-                self.assertEqual(binary.read_bytes(), b'desktop')
+                self.assertEqual(binary.read_bytes(), b'desktop' if args.os == 'macos' else b'windows')
                 self.assertTrue(binary.stat().st_mode & 0o100)
                 return 'packaged'
-            with mock.patch.object(release, 'package', side_effect=package), mock.patch.object(release, 'run', side_effect=AssertionError('repackaging must not compile')):
+            with mock.patch.object(release, 'package', side_effect=package), mock.patch.object(release, 'dmg_extract', side_effect=extract), \
+                    mock.patch.object(release, 'run', side_effect=AssertionError('repackaging must not compile')):
                 self.assertEqual(release.repackage(args), 'packaged')
                 archive_path.write_bytes(b'modified')
                 with self.assertRaisesRegex(ValueError, 'missing or modified'):
                     release.repackage(args)
+                with self.subTest('windows zip'):
+                    stem = 'capturefab-1.2.3-windows-x86_64'
+                    archive_path = output / f'{stem}.zip'
+                    with zipfile.ZipFile(archive_path, 'w') as archive:
+                        archive.writestr(f'{stem}/capturefab.exe', b'windows')
+                    (output / 'build-windows-x86_64.json').write_text(json.dumps(dict(version='1.2.3', assets=[release.record(archive_path, 'windows', 'x86_64')])))
+                    self.assertEqual(release.repackage(SimpleNamespace(version='1.2.3', os='windows', arch='x86_64', output=output)), 'packaged')
+                with self.subTest('macos zip'):
+                    old = output / 'capturefab-1.2.3-macos-aarch64.zip'
+                    old.write_bytes(b'zip')
+                    report_path.write_text(json.dumps(dict(version='1.2.3', assets=[release.record(old, 'macos', 'aarch64')])))
+                    with self.assertRaisesRegex(ValueError, 'unexpected format'):
+                        release.repackage(args)
 
     def test_assemble_lists_every_target_and_checksums_every_file(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -629,6 +771,39 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(json.loads((output / 'releases.json').read_text())['releases'][0]['checksums_signature_url'], 'https://example.invalid/v1.2.3/SHA256SUMS.asc')
             self.assertNotIn('SHA256SUMS.asc', (output / 'SHA256SUMS').read_text())
             subprocess.run(['gpgconf', '--homedir', home, '--kill', 'all'], capture_output=True)
+
+
+@unittest.skipUnless(sys.platform == 'darwin' and shutil.which('hdiutil'), 'needs macOS hdiutil')
+class RealDiskImage(unittest.TestCase):
+    def stage(self, root):
+        stage = root / 'stage'
+        contents = stage / 'Capturefab.app' / 'Contents'
+        (contents / 'MacOS').mkdir(parents=True)
+        (contents / 'Resources' / 'licenses').mkdir(parents=True)
+        binary = contents / 'MacOS' / 'capturefab'
+        binary.write_bytes(b'#!/bin/sh\necho capturefab\n' + os.urandom(4096))
+        binary.chmod(0o755)
+        (contents / 'Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': 'test.capturefab'}))
+        (contents / 'Resources' / 'licenses' / 'THIRD-PARTY-LICENSES.txt').write_text('licenses')
+        (stage / 'README.txt').write_text('readme')
+        os.symlink('/Applications', stage / 'Applications')
+        return stage, binary
+
+    def test_make_check_and_extract_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp, contextlib.redirect_stdout(io.StringIO()):
+            temp = Path(temp)
+            stage, binary = self.stage(temp)
+            dmg = temp / 'capturefab-test.dmg'
+            release.make_dmg(stage, dmg, 'Capturefab test')
+            release.check_dmg(dmg, binary)
+            extracted = temp / 'extracted'
+            release.dmg_extract(dmg, release.APP_EXECUTABLE, extracted)
+            self.assertEqual(extracted.read_bytes(), binary.read_bytes())
+            (stage / 'extra.txt').write_text('extra')
+            extra = temp / 'extra.dmg'
+            release.make_dmg(stage, extra, 'Capturefab extra')
+            with self.assertRaisesRegex(RuntimeError, 'disk image root'):
+                release.check_dmg(extra, binary)
 
 
 class SiteTests(unittest.TestCase):
