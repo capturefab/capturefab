@@ -1,7 +1,9 @@
 //! Analysis bundles: DuckDB writes each table into the private staging
 //! folder, then every file is copied into a new export folder through the
-//! storage ledger, with `manifest.json` and `README.md` beside them.
+//! storage ledger, with `manifest.json` and `README.md` beside them. With
+//! `media`, the cataloged images (and recordings) are copied in as well.
 pub(super) mod bounded;
+mod media;
 use super::{
     ExportFormat, Reader, TABLES,
     db::{file_label, now_ms},
@@ -33,6 +35,10 @@ pub struct ExportRequest {
     pub since_ms: Option<u64>,
     pub until_ms: Option<u64>,
     pub storage: StoragePolicy,
+    /// Copy the saved files into `images/` and `videos/`.
+    pub media: super::MediaExport,
+    /// With `media`, one folder per value of this capture tag.
+    pub group_by: Option<String>,
 }
 
 impl ExportFormat {
@@ -166,6 +172,10 @@ impl Reader {
         let (staged, fired) =
             with_timeout(&self.conn, EXPORT_TIMEOUT, || self.stage(request, &formats));
         let metadata = staged.as_ref().ok().map(|_| self.metadata(request));
+        let media_rows = staged
+            .as_ref()
+            .ok()
+            .map(|_| self.export_source().media_rows(request));
         let _ = self.conn.execute_batch("ROLLBACK");
         let staged = match staged {
             Err(_) if fired => {
@@ -184,7 +194,12 @@ impl Reader {
         }
         let _cleanup = Cleanup(&staged);
         let metadata = metadata.unwrap_or_else(|| Ok(Metadata::default()))?;
-        self.preflight(&staged, &request.storage)?;
+        let media_rows = media_rows.unwrap_or_else(|| Ok(Vec::new()))?;
+        let extensions: Vec<&'static str> = formats.iter().map(|f| f.extension()).collect();
+        let mut media = (!request.media.is_none())
+            .then(|| media::Plan::new(media_rows, request.group_by.as_deref(), &extensions));
+        let extra = media.as_ref().map_or((0, 0), media::Plan::needs);
+        self.preflight(&staged, extra, &request.storage)?;
         fs::create_dir_all(output.parent().context("export folder needs a parent")?)?;
         fs::create_dir(output).map_err(|e| match e.kind() {
             std::io::ErrorKind::AlreadyExists => anyhow!(
@@ -213,11 +228,41 @@ impl Reader {
                 }
             }
         }
+        let stopped = |e: anyhow::Error, files: &[Value]| {
+            let written: Vec<_> = files.iter().map(|f| f["path"].clone()).collect();
+            e.context(format!(
+                "export stopped; files already written stay in {}: {}",
+                output.display(),
+                serde_json::to_string(&written).unwrap_or_default()
+            ))
+        };
+        let media = match media.as_mut() {
+            Some(plan) => {
+                let copied = plan
+                    .copy(output, &request.storage)
+                    .map_err(|e| stopped(e, &files))?;
+                let mut index = Vec::new();
+                for format in plan.index_formats() {
+                    let written = self
+                        .media_index(output, format, &copied.rows, &request.storage)
+                        .map_err(|e| stopped(e, &files))?;
+                    index.push(written.clone());
+                    files.push(written);
+                }
+                let mut summary = plan.summary(request, &copied);
+                summary["index"] = json!(index);
+                Some(summary)
+            }
+            None => None,
+        };
         let mut tables = BTreeMap::new();
         for item in &staged {
             tables.insert(item.table.clone(), item.rows);
         }
-        let manifest = self.manifest(request, &formats, &files, &metadata);
+        let mut manifest = self.manifest(request, &formats, &files, &metadata);
+        if let Some(media) = &media {
+            manifest["media"] = media.clone();
+        }
         let readme = self.readme(&manifest, &metadata);
         for (name, text) in [
             ("manifest.json", serde_json::to_string_pretty(&manifest)?),
@@ -226,11 +271,65 @@ impl Reader {
             let (bytes, sha256) = write_new(&output.join(name), text.as_bytes(), &request.storage)?;
             files.push(json!({"path": name, "bytes": bytes, "sha256": sha256}));
         }
-        Ok(json!({
+        let mut result = json!({
             "output": output,
             "files": files,
             "tables": tables,
             "formats": formats,
+        });
+        if let Some(mut media) = media {
+            if let Some(media) = media.as_object_mut() {
+                media.remove("index");
+            }
+            result["media"] = media;
+        }
+        Ok(result)
+    }
+
+    /// Write `media.<format>` for the copied files; returns its file entry.
+    fn media_index(
+        &self,
+        output: &Path,
+        format: &str,
+        rows: &[Value],
+        policy: &StoragePolicy,
+    ) -> Result<Value> {
+        let name = format!("media.{format}");
+        let (bytes, sha256) = match format {
+            "json" | "jsonl" => write_new(
+                &output.join(&name),
+                media::json_text(rows, format == "jsonl")?.as_bytes(),
+                policy,
+            )?,
+            "parquet" => {
+                // DuckDB turns a staged CSV into Parquet in the staging folder.
+                let prefix = super::db::random_name()?;
+                let csv = self.staging.dir.join(format!("{prefix}-media.csv"));
+                let parquet = self.staging.dir.join(format!("{prefix}-media.parquet"));
+                let result = (|| {
+                    fs::write(&csv, media::csv(rows))?;
+                    let dir = self.staging.sql();
+                    self.conn
+                        .execute(
+                            &format!(
+                                "COPY ({}) TO '{dir}/{prefix}-media.parquet' ({})",
+                                media::parquet_select(&format!("{dir}/{prefix}-media.csv")),
+                                ExportFormat::Parquet.options()
+                            ),
+                            [],
+                        )
+                        .map_err(|e| super::db::explain(e, &self.path, "export"))?;
+                    copy_into_ledger(&parquet, &output.join(&name), policy)
+                })();
+                let _ = fs::remove_file(&csv);
+                let _ = fs::remove_file(&parquet);
+                result?
+            }
+            _ => write_new(&output.join(&name), media::csv(rows).as_bytes(), policy)?,
+        };
+        Ok(json!({
+            "path": name, "table": "media", "format": format,
+            "rows": rows.len(), "bytes": bytes, "sha256": sha256,
         }))
     }
 
@@ -324,9 +423,15 @@ impl Reader {
 
     /// Fail before writing anything when the storage budget cannot hold the
     /// export; retention never evicts captures to make room for one.
-    fn preflight(&self, staged: &[Staged], policy: &StoragePolicy) -> Result<()> {
-        let needed: u64 = staged.iter().map(|s| s.bytes).sum::<u64>() + METADATA_RESERVE;
-        let count = staged.len() as u64 + 2;
+    /// `extra` is the bytes and files the copied media and its index need.
+    fn preflight(
+        &self,
+        staged: &[Staged],
+        extra: (u64, u64),
+        policy: &StoragePolicy,
+    ) -> Result<()> {
+        let needed: u64 = staged.iter().map(|s| s.bytes).sum::<u64>() + METADATA_RESERVE + extra.0;
+        let count = staged.len() as u64 + 2 + extra.1;
         let status = crate::storage::quota_status()?;
         let configured: StoragePolicy =
             serde_json::from_value(status["policy"].clone()).unwrap_or_default();
@@ -336,7 +441,7 @@ impl Reader {
         let files = status["files"].as_u64().unwrap_or(0);
         ensure!(
             allocated.saturating_add(needed) <= max_bytes && files + count <= max_files,
-            "Storage full: export needs {needed} bytes and {count} files, but the storage budget has {} bytes and {} files left; raise --max-storage or remove old captures",
+            "Storage full: export needs {needed} bytes and {count} files, but the storage budget has {} bytes and {} files left; raise --max-space or --max-files, or remove old captures",
             max_bytes.saturating_sub(allocated),
             max_files.saturating_sub(files)
         );
@@ -597,11 +702,19 @@ impl ExportSource<'_> {
                 .unwrap_or_else(|| "none".into())
         };
         out.push_str(&format!("# {name}: Capturefab dataset export\n\n"));
-        out.push_str(
-            "Images and recordings captured with Capturefab, exported for analysis.\n\
-             The files below describe what was saved and when; the images and videos themselves stay at the\n\
-             paths listed in `captures.path` and `recordings.path`.\n\n",
-        );
+        let media = manifest.get("media").filter(|m| m.is_object());
+        out.push_str(match media {
+            Some(_) => {
+                "Images and recordings captured with Capturefab, exported for analysis.\n\
+                 The files below describe what was saved and when, and the saved files themselves are copied\n\
+                 into `images/` (and `videos/`) in this folder.\n\n"
+            }
+            None => {
+                "Images and recordings captured with Capturefab, exported for analysis.\n\
+                 The files below describe what was saved and when; the images and videos themselves stay at the\n\
+                 paths listed in `captures.path` and `recordings.path`.\n\n"
+            }
+        });
         out.push_str("## Time base\n\nEvery `*_ms` column is UTC Unix milliseconds from the capturing computer's clock. \
             `timestamp_ns` and `source_ts_ms` come from device clocks and may differ.\n\n");
         out.push_str("## Files\n\n| File | Table | Rows | Bytes |\n|---|---|---|---|\n");
@@ -658,10 +771,59 @@ impl ExportSource<'_> {
                 "SELECT * FROM {duck_reader}('{path}') LIMIT 10;\n"
             ));
         }
+        if media.is_some() {
+            pandas.push_str("media = pd.read_csv('media.csv')\n");
+            if manifest["tables"]
+                .as_array()
+                .is_some_and(|t| t.iter().any(|t| t["name"] == "captures"))
+            {
+                pandas.push_str(
+                    "images = captures.merge(media[media.table == 'captures'], on='id', suffixes=('', '_export'))\n",
+                );
+            }
+            polars.push_str("media = pl.read_csv('media.csv')\n");
+            sql.push_str("SELECT * FROM read_csv_auto('media.csv') LIMIT 10;\n");
+        }
         out.push_str(&format!("\n## Loading\n\npandas:\n\n```python\n{pandas}```\n\nDuckDB:\n\n```sql\n{sql}```\n\npolars:\n\n```python\n{polars}```\n\n"));
-        out.push_str(
-            "## Notes on paths\n\nMedia paths are absolute paths on the capturing computer. Files are saved on the local or selected mounted drive.\n\n",
-        );
+        match media {
+            Some(media) => {
+                let videos = media["mode"] == "all";
+                let layout = match media["group_by"].as_str() {
+                    Some(key) => format!(
+                        "`images/<{key}>/<file>`{}, one folder per value of the `{key}` tag; files without it are in `images/{}/`",
+                        if videos {
+                            format!(" and `videos/<{key}>/<file>`")
+                        } else {
+                            String::new()
+                        },
+                        media::UNLABELED
+                    ),
+                    None if videos => "`images/<file>` and `videos/<file>`".into(),
+                    None => "`images/<file>`".into(),
+                };
+                out.push_str(&format!(
+                    "## Images and videos\n\n{} files ({} bytes) are copied into this folder as {layout}. \
+                     `media.csv` lists each copy's `export_path` (relative, with forward slashes) and SHA-256, \
+                     and joins to `captures` or `recordings` on `table` and `id`. The folder can be moved or zipped \
+                     as a whole.\n\n",
+                    media["copied"], media["bytes"]
+                ));
+                if media["skipped"].as_u64().is_some_and(|n| n > 0) {
+                    out.push_str(&format!(
+                        "{} cataloged files were not copied because they were missing or had changed since capture; \
+                         `manifest.json` lists them under `media.skipped_files`.\n\n",
+                        media["skipped"]
+                    ));
+                }
+                out.push_str(
+                    "## Notes on paths\n\n`captures.path` and `recordings.path` still hold the absolute paths on the capturing computer; use `media.csv` for the copies here.\n\n",
+                );
+            }
+            None => out.push_str(
+                "## Notes on paths\n\nMedia paths are absolute paths on the capturing computer. Files are saved on the local or selected mounted drive. \
+                 Re-run with `--media images` to copy the files into this folder.\n\n",
+            ),
+        }
         out.push_str(&self.summary(meta, &iso));
         out
     }

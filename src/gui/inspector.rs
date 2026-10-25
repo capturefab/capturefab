@@ -2673,9 +2673,13 @@ impl Workbench {
             "Next file",
             &self.output_preview(),
             &self.fixed_folder(&self.output).unwrap_or_default(),
-            "{camera}, {date}, {time}, {datetime} and {frame} fill in when saving; {seq} becomes the next free number",
+            "{camera}, {date}, {time}, {datetime}, {frame} and {tag:KEY} fill in when saving; {seq} becomes the next free number",
             p,
         ));
+        // A pattern that names a folder after a tag needs the tag filled in.
+        if let Some(hint) = super::tags::missing_hint(&self.output, &self.tags) {
+            action = action.push(text(hint).size(style::CAPTION).color(p.ink(p.warn)));
+        }
         let mut head = column![section(capture_title(kind), None, p)].spacing(8);
         if let Some(guidance) = capture_guidance(kind) {
             head = head.push(reason(guidance, p));
@@ -2843,6 +2847,10 @@ impl Workbench {
             .err()
             .map(|error| error.to_string());
             if field.as_deref() == Some(error.to_string().as_str()) {
+                return None;
+            }
+            // An empty tag in the file names is asked for under Next file.
+            if super::tags::missing_hint(&self.output, &self.tags).is_some() {
                 return None;
             }
             return Some(error_caption(error.to_string(), false, p));

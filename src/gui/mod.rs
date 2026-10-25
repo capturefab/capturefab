@@ -1253,6 +1253,7 @@ impl Workbench {
             tags: self.tags.clone(),
             dataset_path: self.dataset.path.clone(),
             dataset_auto: self.dataset.auto,
+            dataset_export_images: self.dataset.export_images,
             open_sections: self.open_section_keys(),
             // Not yet mirrored on the workbench: keep what was loaded.
         }
@@ -2331,7 +2332,7 @@ impl Workbench {
             .connected
             .as_ref()
             .map_or_else(|| "camera".to_owned(), crate::naming::camera_label);
-        let preview = crate::naming::preview(template, &camera, now);
+        let preview = crate::naming::preview(template, &camera, &tags::context(&self.tags), now);
         let home = prefs::capture_root();
         match home
             .parent()
@@ -2925,6 +2926,7 @@ impl Workbench {
                 self.adopt(&prefs);
                 self.dataset.path = prefs.dataset_path.clone();
                 self.dataset.auto = prefs.dataset_auto;
+                self.dataset.export_images = prefs.dataset_export_images;
                 self.video_analytics.preferences = prefs.video_analytics.clone();
                 self.saved = self.saved.take().map(|saved| (*prefs).with_layout(&saved));
             }

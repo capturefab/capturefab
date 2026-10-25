@@ -317,6 +317,8 @@ capturefab --session bench status --json</code></pre></div>
 <tr><td><code>--output / -o</code></td><td>New folder for the export bundle. Existing folders are refused.</td><td>Required</td></tr>
 <tr><td><code>--format</code></td><td>Export format. Multiple values use commas.</td><td>Choices: csv, parquet, json, jsonl. Accepts multiple values</td></tr>
 <tr><td><code>--tables</code></td><td>Table names to export. Multiple names use commas.</td><td>Accepts multiple values</td></tr>
+<tr><td><code>--media</code></td><td>Copy saved files into the export: <code>images</code> copies captures into <code>images/</code>, <code>all</code> also copies recordings into <code>videos/</code>. <code>media.csv</code> lists each copy.</td><td>Choices: none, images, all. Default: none</td></tr>
+<tr><td><code>--group-by</code></td><td>With <code>--media</code>, one folder per value of this capture tag, such as <code>images/A-100/</code>; untagged files go in <code>_unlabeled</code>.</td><td>—</td></tr>
 <tr><td><code>--since</code></td><td>Only rows at or after this time (RFC 3339 with timezone).</td><td>—</td></tr>
 <tr><td><code>--until</code></td><td>Only rows at or before this time (RFC 3339 with timezone).</td><td>—</td></tr>
 <tr><td><code>--max-space</code></td><td>Maximum owned bytes across outputs. Default: saved policy, initially 10GiB.</td><td>—</td></tr>

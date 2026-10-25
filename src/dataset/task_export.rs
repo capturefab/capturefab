@@ -689,6 +689,8 @@ mod tests {
                 since_ms: None,
                 until_ms: None,
                 storage: crate::storage::StoragePolicy::default(),
+                media: Default::default(),
+                group_by: None,
             }
         }
     }

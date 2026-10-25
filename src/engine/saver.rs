@@ -135,6 +135,7 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<String> {
         camera: &save.camera,
         now: save.now,
         index: save.index,
+        context: &save.context,
     };
     let (path, stored) = crate::naming::save_named(
         &h.names,

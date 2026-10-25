@@ -779,6 +779,7 @@ fn name_recording(
     config: &ForwardConfig,
     camera: &str,
     on_exists: crate::naming::OnExists,
+    context: &crate::context::Context,
 ) -> Result<(
     PathBuf,
     crate::destination::Resolved,
@@ -799,6 +800,7 @@ fn name_recording(
         camera,
         now: chrono::Local::now(),
         index: 0,
+        context,
     };
     let first = h
         .names
@@ -1110,7 +1112,8 @@ fn process_plain(
             let f = if named {
                 config.validate()?;
                 let label = crate::naming::camera_label(&camera_mut(camera)?.info);
-                let (path, resolved, reserved) = name_recording(h, &config, &label, on_exists)?;
+                let (path, resolved, reserved) =
+                    name_recording(h, &config, &label, on_exists, &context)?;
                 config.output = path.to_string_lossy().into_owned();
                 config.destination = None;
                 Forwarder::with_resolved(
@@ -1532,6 +1535,7 @@ fn process_plain(
                         camera: &label,
                         now: chrono::Local::now(),
                         index,
+                        context: &context,
                     };
                     let first = if output == "-" {
                         None
@@ -1654,6 +1658,7 @@ impl Scheduled {
             camera: &self.camera,
             now,
             index: self.info.captured,
+            context: &self.info.context,
         }
     }
     /// This job's file for the frame being shot, at the name picked for it.

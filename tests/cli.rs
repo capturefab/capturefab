@@ -5669,3 +5669,134 @@ fn resource_limits_are_automatic_persisted_and_reject_invalid_values_without_cam
     assert!(reset["policy"].get("upload_bytes_per_second").is_none());
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// `{tag:KEY}` sorts captures into tag folders, a missing tag is a usage
+/// error, and `dataset export --media images --group-by` copies the
+/// cataloged images into a self-contained folder.
+#[test]
+fn tag_folders_and_dataset_export_with_images() {
+    let root = naming_root("tag-export");
+    let dir = root.join("sessions");
+    let out = root.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let dataset = root.join("parts.duckdb");
+    let template = out.join("{tag:label}/{seq}.png");
+    let template = template.to_str().unwrap();
+    let capture = |label: Option<&str>| {
+        let mut args = vec![
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            template,
+            "--dataset",
+            dataset.to_str().unwrap(),
+        ];
+        let context;
+        if let Some(label) = label {
+            context = format!("label={label}");
+            args.extend(["--context", context.as_str()]);
+        }
+        cmd(&dir, &args)
+    };
+    for (label, folder) in [
+        ("good", "good"),
+        ("defect", "defect"),
+        ("good", "good"),
+        ("../x", "_.._x"),
+    ] {
+        let output = capture(Some(label));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let file = std::path::PathBuf::from(v["result"]["files"][0].as_str().unwrap());
+        assert_eq!(
+            file.parent().unwrap().file_name().unwrap(),
+            folder,
+            "{file:?}"
+        );
+        assert!(file.is_file());
+    }
+    assert!(out.join("good/0002.png").is_file());
+    let missing = capture(None);
+    assert_eq!(missing.status.code(), Some(2));
+    let v: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "usage");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("{tag:label}"),
+        "{v}"
+    );
+    // --group-by needs --media.
+    let export = root.join("export");
+    let refused = cmd(
+        &dir,
+        &[
+            "--json",
+            "dataset",
+            "export",
+            "--file",
+            dataset.to_str().unwrap(),
+            "-o",
+            export.to_str().unwrap(),
+            "--group-by",
+            "label",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(!export.exists());
+    let result = json(
+        &dir,
+        &[
+            "--json",
+            "dataset",
+            "export",
+            "--file",
+            dataset.to_str().unwrap(),
+            "-o",
+            export.to_str().unwrap(),
+            "--format",
+            "csv",
+            "--media",
+            "images",
+            "--group-by",
+            "label",
+        ],
+    );
+    let media = &result["media"];
+    assert_eq!(media["mode"], "images");
+    assert_eq!(media["group_by"], "label");
+    assert_eq!(media["copied"], 4);
+    assert_eq!(media["skipped"], 0);
+    assert!(media["bytes"].as_u64().unwrap() > 0);
+    for copy in [
+        "images/good/0001.png",
+        "images/good/0002.png",
+        "images/defect/0001.png",
+        "images/_.._x/0001.png",
+        "media.csv",
+    ] {
+        assert!(export.join(copy).is_file(), "{copy}");
+    }
+    assert!(
+        result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "media.csv" && f["rows"] == 4)
+    );
+    let help = cmd(&dir, &["dataset", "export", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("New folder to create; must not exist"),
+        "{help}"
+    );
+    assert!(help.contains("--media"), "{help}");
+    let _ = std::fs::remove_dir_all(root);
+}

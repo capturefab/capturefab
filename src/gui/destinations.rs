@@ -1917,7 +1917,8 @@ fn single_edit(before: &str, after: &str) -> bool {
 }
 
 /// What an output template may hold, in full, for tooltips.
-const PLACEHOLDERS: &str = "Placeholders: {camera} {date} {time} {datetime} {frame} {seq}";
+const PLACEHOLDERS: &str =
+    "Placeholders: {camera} {date} {time} {datetime} {frame} {seq} {tag:KEY}, such as {tag:label}";
 /// The template field's height (13 px text at 1.3 lines, 3 px padding each
 /// side), which the line under "File names" keeps in every mode.
 const FIELD_HEIGHT: f32 = 23.0;

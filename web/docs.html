@@ -134,12 +134,12 @@ capturefab --camera sim:0 capture -n 10 -o first-frames</code></pre><button clas
 
         <article class="doc-section" id="plant-data" data-doc-section data-doc-title="Camera data for analysis" data-doc-category="Start here" data-doc-tags="images,video,capture,tags,dataset,export,analysis">
           <p class="eyebrow">Start here</p><h2>Camera data for analysis</h2>
-          <p class="doc-summary">Capture images and video with camera identity, timestamps and tags. Export their catalog for analysis.</p>
-          <ol><li>Connect a camera and choose a capture folder.</li><li>Fill in Capture tags and select Capture or Record.</li><li>Open Dataset to review or export the saved-file catalog.</li></ol>
+          <p class="doc-summary">Capture images and video with camera identity, timestamps and tags. Export the catalog, with the images, as a folder you can train from.</p>
+          <ol><li>Connect a camera and choose a capture folder.</li><li>Fill in Capture tags and select Capture or Record. With <strong>File names › One folder per label</strong>, each Label gets its own folder.</li><li>Open Dataset to review the saved-file catalog, or select <strong>Export…</strong> to copy it and the images to a new folder.</li></ol>
           <div class="code-wrap"><pre><code>capturefab serve --name line1 --dataset plant.duckdb
-capturefab --session line1 --camera sim:0 capture -o 'line1/{camera}-{seq}.png' --context line=L1
+capturefab --session line1 --camera sim:0 capture -o 'line1/{tag:part}/{camera}-{seq}.png' --context part=A-100
 capturefab --session line1 dataset query "SELECT camera_id, path, wall_ms FROM captures LIMIT 20"
-capturefab --session line1 dataset export -o exports/shift-b --format csv</code></pre><button class="copy-button" type="button" aria-label="Copy camera dataset commands">Copy</button></div>
+capturefab --session line1 dataset export -o exports/shift-b --media images --group-by part</code></pre><button class="copy-button" type="button" aria-label="Copy camera dataset commands">Copy</button></div>
         </article>
 
         <article class="doc-section" id="upgrade-040" data-doc-section data-doc-title="Upgrade to version 0.4.0" data-doc-category="Start here" data-doc-tags="upgrade,migrate,migration,0.4.0,breaking changes,s3,ftp,sftp,uploads,signals,folders">
@@ -429,17 +429,21 @@ capturefab --camera sim:0 capture -o - --format ppm &gt; frame.ppm</code></pre><
             <tr><td><code>{datetime}</code></td><td><code>YYYYMMDD-HHMMSS</code></td></tr>
             <tr><td><code>{seq}</code></td><td>The next free number for that folder and pattern, with 4 or more digits.</td></tr>
             <tr><td><code>{frame}</code></td><td>The frame number in a multi-frame capture, with 6 digits.</td></tr>
+            <tr><td><code>{tag:KEY}</code></td><td>The capture tag <code>KEY</code>, such as <code>{tag:label}</code>, made into one safe folder or file name.</td></tr>
           </tbody></table></div>
           <div class="code-wrap"><pre><code>capturefab --camera sim:0 capture -o 'line1/{date}/{camera}-{datetime}-{seq}.png'
 capturefab --camera sim:0 capture -o shot.png --on-exists number
 capturefab --camera sim:0 record -o 'video/{camera}-{seq}.mp4' --duration 30s
 capturefab --camera sim:0 capture -o 'qa/{camera}-{seq}.png' \
-  --context line=L1 --context station=S2 --context part=A-100</code></pre><button class="copy-button" type="button" aria-label="Copy naming and tag commands">Copy</button></div>
-          <p>Times use the local clock when Capturefab requests the frame. Use <code>{seq}</code> only once and only in the file name. Do not put a digit or another time placeholder directly after <code>{seq}</code>. Other names in braces cause a usage error.</p>
+  --context line=L1 --context station=S2 --context part=A-100
+capturefab --camera sim:0 capture -o 'dataset/{tag:label}/{camera}-{datetime}-{seq}.png' \
+  --context label=defect</code></pre><button class="copy-button" type="button" aria-label="Copy naming and tag commands">Copy</button></div>
+          <p>Times use the local clock when Capturefab requests the frame. Use <code>{seq}</code> only once and only in the file name. Do not put a digit, a time placeholder or a tag directly after <code>{seq}</code>. Other names in braces cause a usage error.</p>
+          <p><code>{tag:KEY}</code> sorts captures into a folder per class or condition, each with its own <code>{seq}</code> numbers. Capturefab trims the value, replaces <code>/ \ &lt; &gt; : " | ? *</code> with <code>_</code>, removes trailing dots and spaces, adds <code>_</code> before a leading dot or a Windows device name such as <code>CON</code>, and keeps at most 128 bytes. An empty or missing tag is a usage error that names the tag. A schedule keeps the tags it was created with; changing a tag later does not move its files.</p>
           <p>Capturefab never overwrites a file. Without <code>{seq}</code>, an existing name causes an error. <code>--on-exists number</code> adds <code>-0001</code>, <code>-0002</code> and the subsequent numbers to the name. A directory output continues after its highest <code>frame-NNNNNN</code> number. A multi-frame template must contain <code>{frame}</code> or <code>{seq}</code>, or use <code>--on-exists number</code>.</p>
           <p>The desktop app always adds a number to an existing name. Its default recording output is <code>~/Capturefab/{date}/{camera}-{datetime}-{seq}.mp4</code>. Read the saved names in <code>result.files</code> and <code>result.frames[].file</code>. A recording result gives the file in <code>path</code>.</p>
           <h3>Capture tags</h3>
-          <p>In <strong>Capture</strong>, expand <strong>Capture tags</strong>. Enter <strong>Line</strong>, <strong>Station</strong>, <strong>Part</strong>, <strong>Lot</strong> and <strong>Note</strong> as necessary. The app sends them with each capture and recording as the context keys <code>line</code>, <code>station</code>, <code>part</code>, <code>lot</code> and <code>note</code>. An open dataset keeps them in each row. Without a dataset, the section says so and links to <strong>Dataset</strong>.</p>
+          <p>In <strong>Capture</strong>, expand <strong>Capture tags</strong>. Enter <strong>Label</strong>, <strong>Line</strong>, <strong>Station</strong>, <strong>Part</strong>, <strong>Lot</strong> and <strong>Note</strong> as necessary. The app sends them with each capture and recording as the context keys <code>label</code>, <code>line</code>, <code>station</code>, <code>part</code>, <code>lot</code> and <code>note</code>. Choose <strong>File names › One folder per label</strong> to save each Label, such as <code>good</code> or <code>defect</code>, in its own folder; <strong>Next file</strong> asks for a Label while it is empty. An open dataset keeps them in each row. Without a dataset, the section says so and links to <strong>Dataset</strong>.</p>
           <p>From the CLI, use <code>--context KEY=VALUE</code> once for each tag. A key starts with a lowercase letter and contains a maximum of 32 lowercase letters, digits and underscores. A capture accepts a maximum of 16 tags, with 256 bytes for each value.</p>
           <h3>Metadata in saved images</h3>
           <p>Each saved PNG and JPEG records where it came from, with or without a dataset. PNG files hold compact JSON in an iTXt chunk named <code>capturefab</code>, and the tags as <code>key=value; …</code> in the standard <code>Description</code>. JPEG files hold the same JSON in a comment (COM) segment. The JSON has the frame ID, timestamps, size, pixel format name, camera vendor and model, the tags under <code>context</code>, and under <code>settings</code> the current values of acquisition features such as <code>ExposureTime</code>, <code>Gain</code> and <code>AcquisitionFrameRate</code> when the camera has them. It never contains a serial number, address or source URL. Tags, including <code>note</code>, travel with the file, so leave out anything you would not share with it. Raw, PGM and PPM files have no metadata.</p>
@@ -473,9 +477,9 @@ capturefab --session bench capture --at 2026-12-01T09:00:00-05:00 \
 
         <article class="doc-section" id="datasets" data-doc-section data-doc-title="Catalog and export datasets" data-doc-category="Capture and save" data-doc-tags="dataset,duckdb,catalog,export,parquet,csv,json,manifest,readme,query,sql,note,analysis,ai,pandas,polars,camera metadata">
           <p class="eyebrow">Capture &amp; save</p><h2>Catalog and export datasets</h2>
-          <p class="doc-summary">Catalog saved images, recordings and notes in one DuckDB file. Export their metadata for analysis.</p>
+          <p class="doc-summary">Catalog saved images, recordings and notes in one DuckDB file. Export their metadata, and optionally the images, for analysis and training.</p>
 
-          <ol><li>In <strong>Capture</strong>, expand <strong>Dataset</strong>.</li><li>Select <strong>New…</strong> or <strong>Open…</strong>, or keep <strong>Catalog captures automatically</strong> on.</li><li>Capture and record as usual.</li><li>Select <strong>Export…</strong> and select a folder.</li><li>Open the <code>README.md</code> that the app shows after the export.</li></ol>
+          <ol><li>In <strong>Capture</strong>, expand <strong>Dataset</strong>.</li><li>Select <strong>New…</strong> or <strong>Open…</strong>, or keep <strong>Catalog captures automatically</strong> on.</li><li>Capture and record as usual.</li><li>Keep <strong>Include captured images</strong> on to copy the images into the export, then select <strong>Export…</strong> and select a folder.</li><li>Open the <code>README.md</code> that the app shows after the export.</li></ol>
           <p>The automatic dataset is <code>~/Capturefab/capturefab.duckdb</code>. The app opens the same dataset at the next start. The section summary shows the file name and the number of captures and recordings. Use <strong>Show in Finder</strong> to find the file. Use <strong>Close</strong> before you copy it.</p>
           <div class="code-wrap"><pre><code>capturefab --camera sim:0 capture -o 'line1/{camera}-{seq}.png' --dataset plant.duckdb
 capturefab --session line1 dataset open plant.duckdb
@@ -484,6 +488,7 @@ capturefab --session line1 dataset status
 capturefab --session line1 dataset query \
   "SELECT camera_id, path, wall_ms FROM captures LIMIT 20"
 capturefab --session line1 dataset export -o exports/shift-b
+capturefab --session line1 dataset export -o exports/shift-b-images --media images --group-by part
 capturefab --session line1 dataset close
 
 # A dataset that no session holds
@@ -499,7 +504,8 @@ capturefab dataset export --file plant.duckdb -o exports/csv-only --format csv</
           </tbody></table></div>
           <p>Each <code>*_ms</code> column is UTC Unix milliseconds from the computer clock. The <code>context</code> column contains JSON text. A query accepts one read-only <code>SELECT</code> or <code>WITH</code> statement. It returns a maximum of 10,000 rows and stops after 30 seconds. A query cannot read or write other files.</p>
           <p>An export writes into a new folder; an existing folder is refused. Default formats are Parquet and CSV. JSON and JSONL are also available. The export includes <code>manifest.json</code> and <code>README.md</code>.</p>
-          <p>The README explains timestamps, lists files and provides loading examples and a summary for AI tools. Images and videos stay at the paths recorded in the tables.</p>
+          <p>The README explains timestamps, lists files and provides loading examples and a summary for AI tools. By default, images and videos stay at the paths recorded in the tables.</p>
+          <p><code>--media images</code> copies the captured images into <code>images/</code> in the export, and <code>--media all</code> also copies recordings into <code>videos/</code>. <code>--group-by KEY</code> puts them in one folder per value of that tag, such as <code>images/A-100/</code>, with untagged files in <code>images/_unlabeled/</code>. <code>media.csv</code> lists each copy's relative <code>export_path</code>, SHA-256 and group and joins to the tables on <code>table</code> and <code>id</code>, so you can move or zip the folder. Copies count against the storage budget and never overwrite. Capturefab checks each copy against the cataloged SHA-256 and skips files that are missing or changed; <code>manifest.json</code> lists them.</p>
           <p>A session keeps the dataset file open. To read the file from another command, use <code>--session NAME</code>. With <code>--file</code>, a held file causes exit code 3. The default size limit is 8 GiB. Writes stop with exit code 6 when less than 512 MiB of disk space is free. An export that does not fit the storage budget stops before it writes a file.</p>
         </article>
 

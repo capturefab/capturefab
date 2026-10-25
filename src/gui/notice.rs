@@ -332,6 +332,29 @@ pub(super) fn command_notice(
     }
 }
 
+/// "Exported 12 rows and 10 images to shift-b-export", from the export's
+/// result.
+fn exported(value: &Value) -> String {
+    let rows: u64 = value["tables"]
+        .as_object()
+        .map_or(0, |tables| tables.values().filter_map(Value::as_u64).sum());
+    let folder = value["output"]
+        .as_str()
+        .and_then(|output| std::path::Path::new(output).file_name())
+        .map(|name| name.to_string_lossy().into_owned());
+    let mut text = format!("Exported {}", plural(rows, "row", "rows"));
+    if let Some(copied) = value["media"]["copied"].as_u64() {
+        text.push_str(&format!(" and {}", plural(copied, "image", "images")));
+    }
+    if let Some(folder) = folder {
+        text.push_str(&format!(" to {folder}"));
+    }
+    if let Some(skipped) = value["media"]["skipped"].as_u64().filter(|n| *n > 0) {
+        text.push_str(&format!(" · {skipped} missing or changed files skipped"));
+    }
+    text
+}
+
 fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> {
     let done = |text: String| Some((text, None, Level::Done));
     match job {
@@ -373,7 +396,7 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
         Job::DatasetOpen => done("Dataset opened".into()),
         Job::DatasetClose => done("Dataset closed".into()),
         Job::DatasetNote => done("Note added".into()),
-        Job::DatasetExport => done("Dataset exported".into()),
+        Job::DatasetExport => done(exported(value)),
         Job::Set(feature) => {
             let name = value["name"].as_str().unwrap_or(feature);
             let mut text = match value.get("value") {
@@ -593,6 +616,17 @@ mod tests {
                 Job::Capture,
                 json!({"files": ["c.png"], "destination": "nas"}),
                 "Saved c.png",
+            ),
+            (
+                Job::DatasetExport,
+                json!({"output": "/d/shift-b", "tables": {"captures": 3, "events": 2},
+                       "media": {"copied": 3, "skipped": 0}}),
+                "Exported 5 rows and 3 images to shift-b",
+            ),
+            (
+                Job::DatasetExport,
+                json!({"output": "/d/shift-b", "tables": {"captures": 1}}),
+                "Exported 1 row to shift-b",
             ),
             (
                 Job::Connect,

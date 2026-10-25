@@ -236,6 +236,12 @@ pub enum SessionCommand {
         until_ms: Option<u64>,
         #[serde(default)]
         storage: crate::storage::StoragePolicy,
+        /// Copy captured images (and recordings) into the export.
+        #[serde(default, skip_serializing_if = "crate::dataset::MediaExport::is_none")]
+        media: crate::dataset::MediaExport,
+        /// Group copied files in folders named after this capture tag.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        group_by: Option<String>,
     },
     /// Open only while the coordinator still has the approved dataset slot.
     DatasetOpenIf {

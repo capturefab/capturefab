@@ -110,8 +110,10 @@ file; the same CLI source reads it from the terminal's current directory.
 
 Use a directory for a frame sequence, or a template such as
 `run-1/frame-{frame}.png` or `line1/{date}/{camera}-{datetime}-{seq}.png`.
-Templates accept `{camera}`, `{date}`, `{time}`, `{datetime}`, `{seq}` and
-`{frame}`; `{seq}` picks the next free number, so a rerun saves new files.
+Templates accept `{camera}`, `{date}`, `{time}`, `{datetime}`, `{seq}`,
+`{frame}` and `{tag:KEY}`; `{seq}` picks the next free number, so a rerun saves
+new files, and `{tag:KEY}` is the capture's `context` value for KEY as one safe
+folder or file name (an empty or missing tag is a usage error).
 Captures never overwrite existing files. A fixed filename fails when it exists
 unless the command has `"on_exists": "number"`; a directory continues its
 `frame-NNNNNN` numbering. A `"context"` object such as `{"line": "L1"}` tags

@@ -244,6 +244,7 @@ impl Workbench {
     ///   `timed` (with `recording`: the session stops it after 1 h)
     /// - `tags`: the capture tags filled in and open; `dataset`: the Dataset
     ///   section open; `catalog`: Catalog captures automatically ticked;
+    ///   `by-label`: "One folder per label" file names, one folder per Label tag;
     ///   `side-hub`: cameras from saved hubs in the camera
     ///   list (with `welcome`, on the welcome cards)
     /// - review fixtures: `network`, `network-empty`, `network-error`,
@@ -360,6 +361,7 @@ impl Workbench {
                 }
                 "tags" => {
                     self.tags = prefs::CaptureTags {
+                        label: "good".into(),
                         line: "L1".into(),
                         station: "Inspection 2".into(),
                         part: "A-100".into(),
@@ -369,6 +371,14 @@ impl Workbench {
                     let _ = self.handle_message(Message::InspectorDisclosure(
                         inspector::Section::CaptureTags,
                     ));
+                }
+                // The "One folder per label" file names, one folder per Label tag.
+                "by-label" => {
+                    self.output = prefs::capture_root()
+                        .join("{tag:label}")
+                        .join("{camera}-{datetime}-{seq}.png")
+                        .to_string_lossy()
+                        .into_owned();
                 }
                 "dataset" => {
                     let _ = self
@@ -460,6 +470,7 @@ impl Workbench {
                     let path = crate::naming::preview(
                         &prefs::default_record_output(),
                         "Sim-SIM0",
+                        &Default::default(),
                         chrono::Local::now(),
                     )
                     .replace("####", "0001");

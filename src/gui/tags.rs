@@ -1,5 +1,6 @@
-//! Capture tags: line, station, part, lot and note, sent with every capture
-//! and recording as its context.
+//! Capture tags: label, line, station, part, lot and note, sent with every
+//! capture and recording as its context. File name patterns can use them as
+//! {tag:KEY}, so the "One folder per label" naming puts each label in its own folder.
 use super::*;
 use iced::widget::column;
 use prefs::CaptureTags;
@@ -7,6 +8,7 @@ use prefs::CaptureTags;
 /// One capture tag. Its key is the context key it is sent as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TagField {
+    Label,
     Line,
     Station,
     Part,
@@ -15,7 +17,8 @@ pub(super) enum TagField {
 }
 
 impl TagField {
-    pub(super) const ALL: [TagField; 5] = [
+    pub(super) const ALL: [TagField; 6] = [
+        TagField::Label,
         TagField::Line,
         TagField::Station,
         TagField::Part,
@@ -24,6 +27,7 @@ impl TagField {
     ];
     pub(super) fn key(self) -> &'static str {
         match self {
+            TagField::Label => "label",
             TagField::Line => "line",
             TagField::Station => "station",
             TagField::Part => "part",
@@ -33,6 +37,7 @@ impl TagField {
     }
     pub(super) fn label(self) -> &'static str {
         match self {
+            TagField::Label => "Label",
             TagField::Line => "Line",
             TagField::Station => "Station",
             TagField::Part => "Part",
@@ -42,6 +47,7 @@ impl TagField {
     }
     fn placeholder(self) -> &'static str {
         match self {
+            TagField::Label => "good / defect",
             TagField::Line => "L1",
             TagField::Station => "Inspection 2",
             TagField::Part => "A-100",
@@ -51,6 +57,7 @@ impl TagField {
     }
     pub(super) fn get(self, tags: &CaptureTags) -> &str {
         match self {
+            TagField::Label => &tags.label,
             TagField::Line => &tags.line,
             TagField::Station => &tags.station,
             TagField::Part => &tags.part,
@@ -60,6 +67,7 @@ impl TagField {
     }
     pub(super) fn set(self, tags: &mut CaptureTags, value: String) {
         *match self {
+            TagField::Label => &mut tags.label,
             TagField::Line => &mut tags.line,
             TagField::Station => &mut tags.station,
             TagField::Part => &mut tags.part,
@@ -78,6 +86,28 @@ pub(super) fn context(tags: &CaptureTags) -> crate::context::Context {
             (!value.is_empty()).then(|| (field.key().to_owned(), value.to_owned()))
         })
         .collect()
+}
+
+/// What to fill in when `output` names files after a tag that is empty,
+/// such as "Fill in Label in Capture tags to choose the folder".
+pub(super) fn missing_hint(output: &str, tags: &CaptureTags) -> Option<String> {
+    let key = crate::naming::missing_tags(output, &context(tags))
+        .into_iter()
+        .next()?;
+    let what = match TagField::ALL.into_iter().find(|field| field.key() == key) {
+        Some(field) => format!("Fill in {} in Capture tags", field.label()),
+        None => format!("Add the {key} tag (--context {key}=VALUE)"),
+    };
+    let target = if output
+        .rsplit(std::path::is_separator)
+        .next()
+        .is_some_and(|name| name.contains(&format!("{{tag:{key}}}")))
+    {
+        "the file name"
+    } else {
+        "the folder"
+    };
+    Some(format!("{what} to choose {target}"))
 }
 
 /// Where the tags go: into each saved still, and into the dataset `file`
@@ -189,8 +219,26 @@ mod tests {
     }
 
     #[test]
+    fn missing_label_says_what_to_fill_in() {
+        let output = "/tmp/shots/{tag:label}/{camera}-{datetime}-{seq}.png";
+        let mut tags = CaptureTags::default();
+        assert_eq!(
+            missing_hint(output, &tags).as_deref(),
+            Some("Fill in Label in Capture tags to choose the folder")
+        );
+        tags.label = "good".into();
+        assert_eq!(missing_hint(output, &tags), None);
+        assert_eq!(missing_hint("/tmp/{seq}.png", &tags), None);
+        assert_eq!(
+            missing_hint("/tmp/{tag:shift}-{seq}.png", &tags).as_deref(),
+            Some("Add the shift tag (--context shift=VALUE) to choose the file name")
+        );
+    }
+
+    #[test]
     fn context_drops_empty_tags_and_trims() {
         let tags = CaptureTags {
+            label: " defect ".into(),
             line: " L1 ".into(),
             part: "A-100".into(),
             note: "   ".into(),
@@ -199,6 +247,7 @@ mod tests {
         assert_eq!(
             context(&tags),
             crate::context::Context::from([
+                ("label".into(), "defect".into()),
                 ("line".into(), "L1".into()),
                 ("part".into(), "A-100".into()),
             ])
