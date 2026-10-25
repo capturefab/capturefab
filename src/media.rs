@@ -2220,6 +2220,12 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
             _ => "allow this app in System Settings > Privacy & Security > Camera",
         };
         Some(format!("{CAMERA_ACCESS_DENIED}: {guidance}"))
+    } else if platform.as_deref() == Some("dshow") && log.contains("Could not run graph") {
+        // DirectShow reports a device another app holds and one Windows
+        // camera privacy blocks alike, without the underlying error.
+        Some(format!(
+            "camera is in use by another application, or {CAMERA_ACCESS_DENIED} by Windows privacy settings: close other apps using the camera, or allow desktop apps to access the camera in Windows Settings > Privacy & security > Camera"
+        ))
     } else if log.contains("Cannot Use ")
         || ["device or resource busy", "already in use"]
             .iter()
@@ -8442,6 +8448,17 @@ Error opening input files: Input/output error
         assert!(!is_camera_access_denied(
             "camera is in use by another application"
         ));
+        let blocked = native_failure(
+            "[dshow @ 000001b5e2a6c3c0] Could not run graph (sometimes caused by a device already in use by other application)\n[in#0 @ 000001b5e2a6c000] Error opening input: I/O error\n",
+            false,
+            "dshow:video=Integrated Webcam",
+            timeout,
+        )
+        .unwrap();
+        assert!(is_camera_access_denied(&blocked), "{blocked}");
+        assert!(blocked.contains("in use by another application"));
+        assert!(blocked.contains("Privacy & security > Camera"));
+        assert_eq!(crate::cli::error_code(&anyhow!(blocked)).1, 3);
         assert!(!is_camera_access_denied("timed out\ncamera access denied"));
         assert_eq!(
             failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot Use FaceTime HD Camera").unwrap(),
