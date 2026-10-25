@@ -173,6 +173,7 @@ pub struct Caps {
     pub target: Option<f64>,
     pub frame_rate: Option<&'static str>,
     pub frame_rate_enable: Option<&'static str>,
+    pub frame_rate_auto: Option<&'static str>,
     pub resulting_fps: Option<&'static str>,
     pub throughput: Option<&'static str>,
     pub throughput_mode: Option<&'static str>,
@@ -659,10 +660,12 @@ impl AutoController {
         if camera.has("PayloadSize") {
             self.caps.payload = camera.get("PayloadSize")?.as_f64();
         }
-        self.caps.exposure = self
-            .find(camera, &[["ExposureTime"], ["ExposureTimeAbs"]])
-            .map(|[f]| f);
-        self.caps.gain = self.find(camera, &[["Gain"], ["GainAbs"]]).map(|[f]| f);
+        self.caps.exposure = self.find_unlockable(
+            camera,
+            &["ExposureTime", "ExposureTimeAbs"],
+            &[("ExposureAuto", "Off")],
+        );
+        self.caps.gain = self.find_unlockable(camera, &["Gain", "GainAbs"], &[("GainAuto", "Off")]);
         if camera.get("GainSelector").is_ok_and(|v| v != "All") {
             let choices = camera.choices("GainSelector").unwrap_or_default();
             self.caps.gain_selector = ["All", "AnalogAll"]
@@ -740,18 +743,33 @@ impl AutoController {
             (high > low).then(|| (v - low) / (high - low))
         });
         if !media {
-            self.caps.frame_rate = self
-                .find(
-                    camera,
-                    &[["AcquisitionFrameRate"], ["AcquisitionFrameRateAbs"]],
-                )
-                .map(|[f]| f);
             self.caps.frame_rate_enable = self
                 .find(
                     camera,
-                    &[["AcquisitionFrameRateEnable"], ["AcquisitionFrameRateMode"]],
+                    &[
+                        ["AcquisitionFrameRateEnable"],
+                        ["AcquisitionFrameRateEnabled"],
+                        ["AcquisitionFrameRateMode"],
+                    ],
                 )
                 .map(|[f]| f);
+            // Point Grey cameras before the Blackfly S drive the rate
+            // themselves while AcquisitionFrameRateAuto is Continuous.
+            self.caps.frame_rate_auto = Some("AcquisitionFrameRateAuto")
+                .filter(|f| camera.is_writable(f) && has_choice(camera, f, "Off"));
+            let mut releases = vec![("AcquisitionFrameRateAuto", "Off")];
+            if let Some(enable) = self.caps.frame_rate_enable {
+                let on = match enable {
+                    "AcquisitionFrameRateMode" => "On",
+                    _ => "true",
+                };
+                releases.push((enable, on));
+            }
+            self.caps.frame_rate = self.find_unlockable(
+                camera,
+                &["AcquisitionFrameRate", "AcquisitionFrameRateAbs"],
+                &releases,
+            );
         }
         let rate_max = ["AcquisitionFrameRate", "AcquisitionFrameRateAbs"]
             .into_iter()
@@ -820,6 +838,24 @@ impl AutoController {
             };
         self.status.strategy = strategy.into();
         Ok(())
+    }
+    /// The first of `options` that is writable, or that the camera locks
+    /// only until one of `releases` is written, such as ExposureTime while
+    /// ExposureAuto runs or AcquisitionFrameRate while its enable is off.
+    fn find_unlockable(
+        &mut self,
+        camera: &mut Camera,
+        options: &[&'static str],
+        releases: &[(&str, &str)],
+    ) -> Option<&'static str> {
+        let found = options
+            .iter()
+            .copied()
+            .find(|f| camera.has(f) && (camera.is_writable(f) || unlockable(camera, f, releases)));
+        found.or_else(|| {
+            let options: Vec<_> = options.iter().map(|f| [*f]).collect();
+            self.find(camera, &options).map(|[f]| f)
+        })
     }
     fn find<const N: usize>(
         &mut self,
@@ -1052,29 +1088,18 @@ impl AutoController {
         if camera.network_budget_bytes_per_second().is_some() && !c.triggered {
             if let Some(f) = c.frame_rate {
                 let cap = policy(c, self.status.balance).fps_max;
+                self.rate_on(camera, c, "scanned network budget active");
                 self.apply(
                     camera,
                     f,
                     json!(cap),
                     "frame rate within scanned network budget",
                 );
-                if let Some(enable) = c.frame_rate_enable {
-                    let on = if enable == "AcquisitionFrameRateMode" {
-                        json!("On")
-                    } else {
-                        json!(true)
-                    };
-                    self.apply(camera, enable, on, "scanned network budget active");
-                }
             }
             return;
         }
         if let Some(f) = c.frame_rate_enable {
-            let off = match f {
-                "AcquisitionFrameRateMode" => json!("Off"),
-                _ => json!(false),
-            };
-            self.apply(camera, f, off, "frame-rate limiter off");
+            self.apply(camera, f, switch(f, false), "frame-rate limiter off");
         } else if let Some(f) = c.frame_rate
             && let Some(max) = bounds(camera, Some(f)).max
         {
@@ -1123,14 +1148,8 @@ impl AutoController {
                 "throughput within the link budget",
             );
         } else if limit < cap || camera.network_budget_bytes_per_second().is_some() {
+            self.rate_on(camera, c, "preserve bandwidth backoff");
             self.apply(camera, feature, json!(limit), "preserve bandwidth backoff");
-            if let Some(enable) = c.frame_rate_enable {
-                let on = match enable {
-                    "AcquisitionFrameRateMode" => json!("On"),
-                    _ => json!(true),
-                };
-                self.apply(camera, enable, on, "preserve bandwidth backoff");
-            }
         }
         self.own(feature);
         let aimd = match previous {
@@ -1151,6 +1170,16 @@ impl AutoController {
             base: TransportStats::default(),
             frames: 0,
         });
+    }
+    /// Switch the frame-rate limiter on before writing a rate: SFNC
+    /// cameras keep AcquisitionFrameRate read-only while it is off.
+    fn rate_on(&mut self, camera: &mut Camera, c: &Caps, reason: &'static str) {
+        if let Some(auto) = c.frame_rate_auto {
+            self.apply(camera, auto, json!("Off"), reason);
+        }
+        if let Some(enable) = c.frame_rate_enable {
+            self.apply(camera, enable, switch(enable, true), reason);
+        }
     }
     fn apply(
         &mut self,
@@ -1750,14 +1779,17 @@ impl AutoController {
             .frame_rate_enable
             .context("frame-rate limiter has no enable feature")?;
         let on = limit < cap || camera.network_budget_bytes_per_second().is_some();
-        if on {
-            self.write(camera, feature, json!(limit), Some(why))?;
+        if !on {
+            return self
+                .write(camera, enable, switch(enable, false), Some(why))
+                .map(drop);
         }
-        let value = match enable {
-            "AcquisitionFrameRateMode" => json!(if on { "On" } else { "Off" }),
-            _ => json!(on),
-        };
-        self.write(camera, enable, value, Some(why)).map(drop)
+        if let Some(auto) = self.caps.frame_rate_auto {
+            self.write(camera, auto, json!("Off"), Some(why))?;
+        }
+        self.write(camera, enable, switch(enable, true), Some(why))?;
+        self.write(camera, feature, json!(limit), Some(why))
+            .map(drop)
     }
     fn limit(&mut self, key: &str, text: &str) {
         self.note(key, text);
@@ -1856,6 +1888,27 @@ pub(crate) fn frame_triggered(camera: &mut Camera) -> bool {
     let triggered = on(camera);
     let _ = camera.set("TriggerSelector", &selected);
     triggered
+}
+
+/// The value that turns a frame-rate limiter enable on or off.
+fn switch(enable: &str, on: bool) -> Value {
+    match enable {
+        "AcquisitionFrameRateMode" => json!(if on { "On" } else { "Off" }),
+        _ => json!(on),
+    }
+}
+
+/// Whether `feature` is locked only until one of `releases`, a control and
+/// the value that unlocks it, is written: the control is writable, holds
+/// another value now, and feeds the feature's lock condition.
+fn unlockable(camera: &mut Camera, feature: &str, releases: &[(&str, &str)]) -> bool {
+    camera.is_locked(feature)
+        && releases.iter().any(|(control, value)| {
+            camera.has(control)
+                && camera.is_writable(control)
+                && camera.get(control).is_ok_and(|v| text(&v) != *value)
+                && camera.lock_released_by(feature, &[control])
+        })
 }
 
 fn bounds(camera: &mut Camera, feature: Option<&str>) -> Bounds {
@@ -2596,6 +2649,103 @@ mod tests {
         fake.set_u32(176, 0);
         fake.set_u32(180, 1);
         assert!(!frame_triggered(&mut camera));
+    }
+
+    /// Lock ExposureTime and Gain while their autos run and the frame rate
+    /// while its enable is off, as a Blackfly S does.
+    fn locked_by_autos(fake: &mut Fake) {
+        for (feature, register, formula) in [
+            ("ExposureTime", "ExposureAutoReg", "V!=0"),
+            ("Gain", "GainAutoReg", "V!=0"),
+            ("AcquisitionFrameRate", "EnableReg", "V=0"),
+        ] {
+            let node = format!("<Float Name='{feature}'>");
+            fake.xml = fake
+                .xml
+                .replace(&node, &format!("{node}<pIsLocked>{feature}Lock</pIsLocked>"))
+                .replace(
+                    "</RegisterDescription>",
+                    &format!("<IntSwissKnife Name='{feature}Lock'><pVariable Name='V'>{register}</pVariable><Formula>{formula}</Formula></IntSwissKnife></RegisterDescription>"),
+                );
+        }
+        fake.set_u32(EXPOSURE_AUTO, 2);
+        fake.set_u32(GAIN_AUTO, 2);
+        fake.set_u32(ENABLE, 0);
+    }
+
+    #[test]
+    fn controls_locked_by_the_cameras_own_autos_are_still_managed() {
+        let mut fake = Fake::new(true);
+        locked_by_autos(&mut fake);
+        let before = fake.memory.lock().unwrap().clone();
+        let mut camera = fake.camera();
+        assert!(camera.is_locked("ExposureTime") && camera.is_locked("AcquisitionFrameRate"));
+        camera.set_network_budget_bytes_per_second(40_000_000);
+        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        assert_eq!(auto.status().strategy, "firmware");
+        assert_eq!(
+            (auto.caps.exposure, auto.caps.gain, auto.caps.frame_rate),
+            (
+                Some("ExposureTime"),
+                Some("Gain"),
+                Some("AcquisitionFrameRate")
+            )
+        );
+        assert!(auto.failed.is_empty());
+        assert_eq!(fake.u32(ENABLE), 1);
+        assert!(fake.f64(RATE) > 1.0);
+        auto.invalidate();
+        auto.tick(&mut camera, Instant::now());
+        assert_eq!(auto.status().strategy, "firmware");
+        assert_eq!(auto.caps.exposure, Some("ExposureTime"));
+        auto.release(&mut camera, true).unwrap();
+        assert_eq!(
+            &fake.memory.lock().unwrap()[..ACQUISITION as usize],
+            &before[..ACQUISITION as usize]
+        );
+
+        let mut fake = Fake::new(false);
+        locked_by_autos(&mut fake);
+        fake.xml = fake
+            .xml
+            .replace("AutoExposureTimeLowerLimit", "UnusedLowerLimit")
+            .replace("AutoExposureTimeUpperLimit", "UnusedUpperLimit");
+        let mut camera = fake.camera();
+        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        assert_eq!(auto.status().strategy, "software");
+        assert_eq!(auto.caps.exposure, Some("ExposureTime"));
+        assert_eq!((fake.u32(EXPOSURE_AUTO), fake.u32(GAIN_AUTO)), (0, 0));
+    }
+
+    #[test]
+    fn point_grey_frame_rate_auto_is_off_before_the_enabled_limiter_runs() {
+        let mut fake = Fake::new(true);
+        fake.xml = fake
+            .xml
+            .replace("DeviceLinkThroughputLimit", "UnusedThroughputLimit")
+            .replace("AcquisitionFrameRateEnable", "AcquisitionFrameRateEnabled")
+            .replace(
+                "</RegisterDescription>",
+                "<Enumeration Name='AcquisitionFrameRateAuto'><EnumEntry Name='Off'><Value>0</Value></EnumEntry><EnumEntry Name='Continuous'><Value>2</Value></EnumEntry><pValue>RateAutoReg</pValue></Enumeration><IntReg Name='RateAutoReg'><Address>208</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg></RegisterDescription>",
+            );
+        fake.set_u32(ENABLE, 0);
+        fake.set_u32(208, 2);
+        let mut camera = fake.camera();
+        camera.set_network_budget_bytes_per_second(40_000_000);
+        let auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        assert_eq!(
+            auto.caps.frame_rate_enable,
+            Some("AcquisitionFrameRateEnabled")
+        );
+        let writes = fake.writes.lock().unwrap().clone();
+        let at = |a: u64| writes.iter().position(|w| *w == a).unwrap();
+        assert!(at(208) < at(ENABLE) && at(ENABLE) < at(RATE));
+        assert_eq!((fake.u32(208), fake.u32(ENABLE)), (0, 1));
+        auto.release(&mut camera, true).unwrap();
+        assert_eq!(
+            (fake.u32(208), fake.u32(ENABLE), fake.f64(RATE)),
+            (2, 0, 1.0)
+        );
     }
 
     #[test]
