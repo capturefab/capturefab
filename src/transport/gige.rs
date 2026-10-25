@@ -671,6 +671,7 @@ struct GigE {
     heartbeat_timeout: u32,
     resend: bool,
     big_endian_mono16: bool,
+    stream_source: Option<Option<SocketAddr>>,
     packet_size: Option<Option<u32>>,
     stats: TransportStats,
     stream: Option<Stream>,
@@ -763,6 +764,7 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         heartbeat_timeout,
         resend,
         big_endian_mono16: false,
+        stream_source: None,
         packet_size: None,
         stats: TransportStats::default(),
         stream: None,
@@ -834,7 +836,9 @@ impl Backend for GigE {
         let result = (|| -> Result<(u32, bool, bool)> {
             control.write_register(STREAM_ADDRESS, u32::from(self.host_ip))?;
             control.write_register(STREAM_PORT, port as u32)?;
-            source = stream_source(&mut control, self.camera_ip);
+            source = *self
+                .stream_source
+                .get_or_insert_with(|| stream_source(&mut control, self.camera_ip));
             traverse(&socket, source);
             let original = control.read_register(STREAM_PACKET_SIZE)?;
             let mut test =
@@ -949,7 +953,10 @@ impl Backend for GigE {
             let tuned = (|| -> Result<(u32, Option<u32>)> {
                 control.write_register(STREAM_ADDRESS, u32::from(self.host_ip))?;
                 control.write_register(STREAM_PORT, port as u32)?;
-                traverse(&socket, stream_source(&mut control, self.camera_ip));
+                let source = self
+                    .stream_source
+                    .get_or_insert_with(|| stream_source(&mut control, self.camera_ip));
+                traverse(&socket, *source);
                 let negotiated = ladder(
                     |size| {
                         probe_packet_size(
@@ -1055,7 +1062,7 @@ impl Backend for GigE {
             if remaining.is_zero() {
                 break;
             }
-            let wait = stream.wait(remaining);
+            let wait = stream.wait(remaining, now);
             if wait != stream.timeout {
                 stream.socket.set_read_timeout(Some(wait))?;
                 stream.timeout = wait;
@@ -1352,7 +1359,13 @@ impl Stream {
     /// assembler polled every `POLL` for resends and expiry; with none, the
     /// socket waits out the caller's timeout instead of waking every `POLL`.
     /// Each change is a system call, so a timeout close enough is kept.
-    fn wait(&self, remaining: Duration) -> Duration {
+    fn wait(&self, remaining: Duration, now: Instant) -> Duration {
+        // The firewall path is refreshed from the poll, which a long wait
+        // would delay.
+        let remaining = match self.source {
+            Some(_) => remaining.min(self.next_traversal.saturating_duration_since(now).max(POLL)),
+            None => remaining,
+        };
         if !self.assembler.in_flight() {
             if self.timeout.abs_diff(remaining) <= POLL {
                 self.timeout
@@ -3484,7 +3497,7 @@ mod tests {
     fn stream_setup_opens_the_firewall_path_from_the_stream_source_port() {
         for supported in [true, false] {
             let fake = Fake::new(|camera| {
-                camera.path_mtu = 1500;
+                camera.path_mtu = 9000;
                 camera.test_packets = true;
                 if supported {
                     camera.registers.insert(STREAM_CAPABILITY, 0x8000_0000);
@@ -3515,6 +3528,33 @@ mod tests {
                 );
             }
             assert_eq!(gige.stats().unwrap().packet_size, Some(1500));
+            // A wait longer than the refresh interval does not delay it.
+            let stream = gige.stream.as_mut().unwrap();
+            stream.next_traversal = Instant::now() + Duration::from_millis(50);
+            thread::scope(|scope| {
+                scope.spawn(|| assert!(gige.next_frame(Duration::from_millis(500)).is_err()));
+                let received = fake.stream.recv_from(&mut buffer);
+                assert_eq!(
+                    received.ok().map(|(_, from)| from.port()),
+                    supported.then_some(port)
+                );
+            });
+            // The network test opens the path too; the source port is read
+            // once per connection.
+            gige.stop().unwrap();
+            gige.start(8000).unwrap();
+            gige.stop().unwrap();
+            gige.optimize_network(8000).unwrap();
+            for _ in 0..2 {
+                let received = fake.stream.recv_from(&mut buffer);
+                assert_eq!(
+                    received.ok().map(|(length, _)| length),
+                    supported.then_some(4)
+                );
+            }
+            let camera = fake.camera.lock().unwrap();
+            let reads = camera.register_reads.iter();
+            assert_eq!(reads.filter(|read| **read == STREAM_CAPABILITY).count(), 1);
         }
     }
     #[test]
