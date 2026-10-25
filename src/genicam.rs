@@ -989,17 +989,24 @@ impl NodeMap {
             }
             "Enumeration" => {
                 let value = self.raw_value(io, n, depth)?;
+                // Availability limits the choices, not the reading: a value
+                // set before its entry became unavailable still decodes.
+                let mut matched = None;
                 for entry in self.enum_entries(n) {
                     let en = self.node(entry, depth + 1)?;
-                    if self.available(io, en, depth + 1).is_ok()
-                        && numeric_equal(&self.raw_value(io, en, depth + 1)?, &value)?
-                    {
-                        return Ok(json!(en.prop("Symbolic").unwrap_or_else(|| {
-                            entry.strip_prefix(&format!("{name}_")).unwrap_or(entry)
-                        })));
+                    if numeric_equal(&self.raw_value(io, en, depth + 1)?, &value)? {
+                        if self.available(io, en, depth + 1).is_ok() {
+                            matched = Some((entry, en));
+                            break;
+                        }
+                        matched.get_or_insert((entry, en));
                     }
                 }
-                bail!("{name} contains unknown enumeration value {value}")
+                let (entry, en) = matched
+                    .ok_or_else(|| anyhow!("{name} contains unknown enumeration value {value}"))?;
+                Ok(json!(en.prop("Symbolic").unwrap_or_else(|| {
+                    entry.strip_prefix(&format!("{name}_")).unwrap_or(entry)
+                })))
             }
             "IntSwissKnife" => Ok(json!(self.formula::<i64>(io, n, "Formula", None, depth)?)),
             "SwissKnife" => Ok(json!(self.formula::<f64>(io, n, "Formula", None, depth)?)),
@@ -2590,6 +2597,20 @@ mod tests {
         assert_eq!(m.get(&mut io, "Floating").unwrap(), true);
         m.set(&mut io, "Floating", "false").unwrap();
         assert_eq!(m.get(&mut io, "Floating").unwrap(), false);
+    }
+    #[test]
+    fn enumeration_reads_a_current_entry_that_became_unavailable() {
+        let m = map(concat!(
+            "<Enumeration Name='PixelFormat'><EnumEntry Name='Mono8'><Value>0x01080001</Value></EnumEntry>",
+            "<EnumEntry Name='Mono12'><Value>0x01100005</Value><pIsAvailable>Deep</pIsAvailable></EnumEntry>",
+            "<pValue>Format</pValue></Enumeration>",
+            "<Integer Name='Format'><Value>0x01100005</Value></Integer>",
+            "<Integer Name='Deep'><Value>0</Value></Integer>",
+        ));
+        let mut io = Memory::default();
+        assert_eq!(m.get(&mut io, "PixelFormat").unwrap(), "Mono12");
+        assert_eq!(m.choices(&mut io, "PixelFormat").unwrap(), ["Mono8"]);
+        assert!(m.set(&mut io, "PixelFormat", "Mono12").is_err());
     }
     #[test]
     fn missing_restrictions_fall_back_to_the_value_target() {
