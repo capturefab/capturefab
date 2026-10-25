@@ -592,10 +592,15 @@ pub(crate) fn explain_probe_failure(
     waited: Duration,
     error: anyhow::Error,
 ) -> anyhow::Error {
+    // Windows reports the ICMP port-unreachable answer to a UDP probe as a
+    // connection reset (WSAECONNRESET) rather than a refusal.
     let refused = error.chain().any(|cause| {
-        cause
-            .downcast_ref::<std::io::Error>()
-            .is_some_and(|io| io.kind() == std::io::ErrorKind::ConnectionRefused)
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(
+                io.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+            )
+        })
     });
     let unanswered = error
         .chain()

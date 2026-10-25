@@ -1880,7 +1880,17 @@ mod tests {
             assert_eq!(fetcher().get(&url), Err(UpdateError::Timeout));
             assert!(started.elapsed() < Duration::from_secs(1));
             let closed = Url::parse("http://127.0.0.1:9/releases.json").unwrap();
-            assert_eq!(fetcher().get(&closed), Err(UpdateError::Unreachable));
+            // Windows retries a refused connect for longer than this client's
+            // short connect timeout, so it may report a timeout instead.
+            let answer = fetcher().get(&closed);
+            if cfg!(windows) {
+                assert!(
+                    matches!(answer, Err(UpdateError::Unreachable | UpdateError::Timeout)),
+                    "{answer:?}"
+                );
+            } else {
+                assert_eq!(answer, Err(UpdateError::Unreachable));
+            }
         }
     }
 }
