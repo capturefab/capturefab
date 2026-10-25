@@ -34,6 +34,7 @@ const SCPS_FIRE: u32 = 0x8000_0000;
 const SCPS_NO_FRAGMENT: u32 = 0x4000_0000;
 const SCPS_BIG_ENDIAN: u32 = 0x2000_0000;
 const PACKET_SIZE_MAX: u32 = 9000;
+const MONO16: u32 = 0x0110_0007;
 const MEMORY_CHUNK: usize = 512;
 const MAX_XML: usize = 16 * 1024 * 1024;
 const MAX_PAYLOAD: usize = 128 * 1024 * 1024;
@@ -666,6 +667,7 @@ struct GigE {
     timestamp_frequency: u64,
     heartbeat_timeout: u32,
     resend: bool,
+    big_endian_mono16: bool,
     packet_size: Option<Option<u32>>,
     stats: TransportStats,
     stream: Option<Stream>,
@@ -681,10 +683,15 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         .context("GigE camera has no address")?
         .parse()
         .context("invalid camera IPv4 address")?;
-    Ok(Box::new(connect(
-        SocketAddrV4::new(ip, GVCP_PORT),
-        timeout,
-    )?))
+    let mut camera = connect(SocketAddrV4::new(ip, GVCP_PORT), timeout)?;
+    camera.big_endian_mono16 = big_endian_mono16(&info.vendor, &info.model);
+    Ok(Box::new(camera))
+}
+/// First-generation Point Grey Blackfly GigE models send Mono16 big-endian
+/// even with GevSCPSBigEndian clear (Aravis keeps the same list).
+fn big_endian_mono16(vendor: &str, model: &str) -> bool {
+    vendor == "Point Grey Research"
+        && ["Blackfly BFLY-PGE-31S4M", "Blackfly BFLY-PGE-14S2C"].contains(&model)
 }
 fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
     let mut control = Control::connect(address, timeout)?;
@@ -752,6 +759,7 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         timestamp_frequency,
         heartbeat_timeout,
         resend,
+        big_endian_mono16: false,
         packet_size: None,
         stats: TransportStats::default(),
         stream: None,
@@ -819,13 +827,12 @@ impl Backend for GigE {
             .lock()
             .map_err(|_| anyhow!("GVCP mutex poisoned"))?;
         let gvcp = control.socket.peer_addr()?;
-        let result = (|| -> Result<(u32, bool)> {
+        let result = (|| -> Result<(u32, bool, bool)> {
             control.write_register(STREAM_ADDRESS, u32::from(self.host_ip))?;
             control.write_register(STREAM_PORT, port as u32)?;
             let original = control.read_register(STREAM_PACKET_SIZE)?;
-            let mut test = |size| {
-                probe_packet_size(&mut control, &socket, &mut buffer, camera, original, size)
-            };
+            let mut test =
+                |size| probe_packet_size(&mut control, &socket, &mut buffer, camera, size);
             let negotiated = match self.packet_size {
                 Some(None) => None,
                 cached => cached
@@ -834,22 +841,27 @@ impl Backend for GigE {
                     .or_else(|| ladder(&mut test, cap, mtu.is_some())),
             };
             self.packet_size = Some(negotiated);
+            // Pixels are decoded little-endian, the GigE Vision default.
             control.write_register(
                 STREAM_PACKET_SIZE,
-                (original & (SCPS_NO_FRAGMENT | SCPS_BIG_ENDIAN))
-                    | negotiated.unwrap_or(cap.min(1500)),
+                (original & SCPS_NO_FRAGMENT) | negotiated.unwrap_or(cap.min(1500)),
             )?;
-            let packet_size = control.read_register(STREAM_PACKET_SIZE)? & 0xffff;
+            let scps = control.read_register(STREAM_PACKET_SIZE)?;
+            let packet_size = scps & 0xffff;
             ensure!(
                 (576..=PACKET_SIZE_MAX).contains(&packet_size),
                 "camera selected unsupported stream packet size {packet_size}"
             );
             drain(&socket, &mut buffer);
             socket.set_read_timeout(Some(POLL))?;
-            Ok((packet_size, negotiated.is_some()))
+            Ok((
+                packet_size,
+                negotiated.is_some(),
+                scps & SCPS_BIG_ENDIAN != 0,
+            ))
         })();
         match result {
-            Ok((packet_size, negotiated)) => {
+            Ok((packet_size, negotiated, big_endian)) => {
                 let mut notes: Vec<String> = receive_buffer
                     .and_then(|bytes| receive_buffer_note(bytes, payload_size))
                     .into_iter()
@@ -863,6 +875,8 @@ impl Backend for GigE {
                 let mut assembler =
                     Assembler::new(payload_size, packet_size as usize, self.timestamp_frequency);
                 assembler.resend = self.resend;
+                assembler.big_endian = big_endian;
+                assembler.big_endian_mono16 = self.big_endian_mono16;
                 assembler.stats = TransportStats {
                     packet_size: Some(packet_size),
                     receive_buffer_bytes: receive_buffer.map(|bytes| bytes as u64),
@@ -934,7 +948,6 @@ impl Backend for GigE {
                             &socket,
                             &mut buffer,
                             IpAddr::V4(self.camera_ip),
-                            original,
                             size,
                         )
                     },
@@ -942,10 +955,8 @@ impl Backend for GigE {
                     mtu.is_some(),
                 );
                 let selected = negotiated.unwrap_or(cap.min(1500));
-                control.write_register(
-                    STREAM_PACKET_SIZE,
-                    (original & (SCPS_NO_FRAGMENT | SCPS_BIG_ENDIAN)) | selected,
-                )?;
+                control
+                    .write_register(STREAM_PACKET_SIZE, (original & SCPS_NO_FRAGMENT) | selected)?;
                 let actual = control.read_register(STREAM_PACKET_SIZE)? & 0xffff;
                 ensure!(
                     (576..=selected).contains(&actual)
@@ -1144,14 +1155,13 @@ fn probe_packet_size(
     socket: &UdpSocket,
     buffer: &mut [u8],
     camera: IpAddr,
-    original: u32,
     size: u32,
 ) -> Option<u32> {
     let control_peer = control.socket.peer_addr().ok()?;
     let mut readback = None;
     for _ in 0..3 {
         drain(socket, buffer);
-        let value = (original & SCPS_BIG_ENDIAN) | SCPS_FIRE | SCPS_NO_FRAGMENT | size;
+        let value = SCPS_FIRE | SCPS_NO_FRAGMENT | size;
         control.write_register(STREAM_PACKET_SIZE, value).ok()?;
         let tested = control.read_register(STREAM_PACKET_SIZE).ok()? & 0xffff;
         if !(576..=size).contains(&tested) || readback.is_some_and(|previous| previous != tested) {
@@ -1598,6 +1608,9 @@ struct Assembler {
     limits: [Option<(usize, usize)>; 2],
     timestamp_frequency: u64,
     resend: bool,
+    /// The camera kept GevSCPSBigEndian set: 16-bit samples arrive swapped.
+    big_endian: bool,
+    big_endian_mono16: bool,
     budget: Budget,
     blocks: Blocks,
     stats: TransportStats,
@@ -1618,6 +1631,8 @@ impl Assembler {
             }),
             timestamp_frequency,
             resend: false,
+            big_endian: false,
+            big_endian_mono16: false,
             budget: Budget {
                 tokens: RESEND_BUDGET,
                 at: Instant::now(),
@@ -1950,6 +1965,15 @@ impl Assembler {
             }
         }
         data.truncate((leader.row_bytes * height as usize).min(frame.end));
+        // One or three 16-bit samples per pixel.
+        let sixteen_bit = matches!(leader.pixel_format >> 16, 0x0110 | 0x0230);
+        if (self.big_endian && sixteen_bit)
+            || (self.big_endian_mono16 && leader.pixel_format == MONO16)
+        {
+            for sample in data.as_chunks_mut::<2>().0 {
+                sample.swap(0, 1);
+            }
+        }
         let timestamp_ns = if self.timestamp_frequency == 0 {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2059,6 +2083,7 @@ mod tests {
         register_reads: Vec<u32>,
         register_writes: Vec<(u32, u32)>,
         resend_status: u16,
+        sticky_flags: u32,
         frames: HashMap<u64, Vec<Vec<u8>>>,
         requests: Vec<(Vec<u8>, u16)>,
         scps_writes: Vec<u32>,
@@ -2118,7 +2143,8 @@ mod tests {
                 } else {
                     0x7fff_0000
                 };
-            self.registers.insert(address, flags | size);
+            self.registers
+                .insert(address, flags | size | self.sticky_flags);
             0
         }
         fn resend(
@@ -2300,16 +2326,15 @@ mod tests {
             .write_register(STREAM_ADDRESS, u32::from(Ipv4Addr::LOCALHOST))
             .unwrap();
         control.write_register(STREAM_PORT, port as u32).unwrap();
-        let original = control.read_register(STREAM_PACKET_SIZE).unwrap();
         let mut buffer = vec![0; 65_536];
         let camera = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let size = ladder(
-            |size| probe_packet_size(&mut control, &socket, &mut buffer, camera, original, size),
+            |size| probe_packet_size(&mut control, &socket, &mut buffer, camera, size),
             cap,
             mtu_known,
         );
         let writes = fake.camera.lock().unwrap().scps_writes.clone();
-        let fired = SCPS_FIRE | SCPS_NO_FRAGMENT | (original & SCPS_BIG_ENDIAN);
+        let fired = SCPS_FIRE | SCPS_NO_FRAGMENT;
         assert!(writes.iter().all(|value| value & 0xffff_0000 == fired));
         size
     }
@@ -3221,7 +3246,7 @@ mod tests {
         );
         assert_eq!(fake.register(STREAM_ADDRESS), saved_address);
         assert_eq!(fake.register(STREAM_PORT), 7123);
-        assert_eq!(fake.register(STREAM_PACKET_SIZE), flags | 1500);
+        assert_eq!(fake.register(STREAM_PACKET_SIZE), SCPS_NO_FRAGMENT | 1500);
         assert!(gige.stream.is_none());
     }
     #[test]
@@ -3283,15 +3308,17 @@ mod tests {
         });
         let mut gige = connect(fake.address, Duration::from_millis(200)).unwrap();
         gige.start(8000).unwrap();
+        let kept = SCPS_NO_FRAGMENT;
         assert_eq!(
             fake.camera.lock().unwrap().scps_writes,
             [
-                SCPS_FIRE | flags | 9000,
-                SCPS_FIRE | flags | 9000,
-                SCPS_FIRE | flags | 9000,
-                flags | 9000
+                SCPS_FIRE | kept | 9000,
+                SCPS_FIRE | kept | 9000,
+                SCPS_FIRE | kept | 9000,
+                kept | 9000
             ]
         );
+        assert!(!gige.stream.as_ref().unwrap().assembler.big_endian);
         let socket = &gige.stream.as_ref().unwrap().socket;
         socket.set_nonblocking(true).unwrap();
         assert!(socket.recv(&mut vec![0; 65_536]).is_err());
@@ -3510,6 +3537,67 @@ mod tests {
             crate::types::error_transport_code(&error),
             Some("unsupported")
         );
+    }
+    #[test]
+    fn big_endian_samples_are_swapped_to_little_endian() {
+        // A camera that keeps GevSCPSBigEndian set sends 16-bit samples MSB
+        // first.
+        let (fake, mut gige) = streaming(|camera| camera.sticky_flags = SCPS_BIG_ENDIAN);
+        let writes = fake.camera.lock().unwrap().scps_writes.clone();
+        assert!(writes.iter().all(|value| value & SCPS_BIG_ENDIAN == 0));
+        let destination = fake.camera.lock().unwrap().destination();
+        let mut packets = frame_packets(1, false, WIDTH, HEIGHT, 1464);
+        packets[0] = gvsp(1, 0, 1, false, &leader(WIDTH / 2, HEIGHT, MONO16));
+        for packet in &packets {
+            fake.stream.send_to(packet, destination).unwrap();
+        }
+        let mut expected = image(WIDTH, HEIGHT);
+        for sample in expected.as_chunks_mut::<2>().0 {
+            sample.swap(0, 1);
+        }
+        assert_eq!(
+            gige.next_frame(Duration::from_secs(1)).unwrap().data,
+            expected
+        );
+
+        assert!(big_endian_mono16(
+            "Point Grey Research",
+            "Blackfly BFLY-PGE-31S4M"
+        ));
+        assert!(big_endian_mono16(
+            "Point Grey Research",
+            "Blackfly BFLY-PGE-14S2C"
+        ));
+        assert!(!big_endian_mono16(
+            "Point Grey Research",
+            "Blackfly BFLY-PGE-23S6C"
+        ));
+        assert!(!big_endian_mono16("FLIR", "Blackfly BFLY-PGE-31S4M"));
+        let mono12 = 0x0110_0005;
+        let rgb16 = 0x0230_0033;
+        let yuv422 = 0x0210_0032;
+        for (pixel, width, big_endian, mono16, swapped) in [
+            (MONO16, 6, false, true, true),
+            (mono12, 6, false, true, false),
+            (mono12, 6, true, false, true),
+            (rgb16, 2, true, false, true),
+            (MONO8, 12, true, true, false),
+            (yuv422, 6, true, false, false),
+        ] {
+            let mut assembler = Assembler::new(12, 48, 0);
+            assembler.big_endian = big_endian;
+            assembler.big_endian_mono16 = mono16;
+            let wire: Vec<u8> = (1..=12).collect();
+            assembler
+                .push(&gvsp(1, 0, 1, false, &leader(width, 1, pixel)))
+                .unwrap();
+            assembler.push(&gvsp(1, 1, 3, false, &wire)).unwrap();
+            let frame = assembler
+                .push(&gvsp(1, 2, 2, false, &trailer(1)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(frame.data[..2] == [2, 1], swapped, "{pixel:08x}");
+        }
     }
     #[test]
     fn fake_camera_without_resend_capability_gets_no_requests() {
