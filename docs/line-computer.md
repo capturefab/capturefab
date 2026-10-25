@@ -51,7 +51,7 @@ With a camera plugged in that it cannot open, `capturefab doctor` names it and p
 
 `TAG+="uaccess"` covers someone logged in at the computer; a service has no seat, so it relies on the `plugdev` group. A new group applies to new logins and to the service once it restarts. Unplugging and replugging the camera also applies the rule.
 
-Linux charges every USB transfer against the kernel's usbfs memory, 16 MB by default and shared by all USB cameras on the computer. Capturefab queues at most 8 MB of transfers per camera, whatever the frame size, and each plugged-in USB3 Vision camera takes an equal share of half the limit, so the default suits one or two cameras. When other USB software uses up the limit, frames stop and the service log says `usbfs memory is exhausted`. `doctor --json` reports the limit in `limits.usbfs_memory_mb`; to give several cameras the full queue each, raise it now and at every boot, for example to 256 MB:
+Linux charges every USB transfer against the kernel's usbfs memory, 16 MB by default and shared by all USB cameras on the computer. Capturefab queues at most 8 MB of transfers per camera, whatever the frame size, and when several USB3 Vision cameras are plugged in, each queues an equal share of half the limit. If other USB software uses up the limit, frames stop and the service log says `usbfs memory is exhausted`. `doctor --json` reports the limit in `limits.usbfs_memory_mb`; to give several cameras a full queue each, raise it now and at every boot, for example to 256 MB:
 
 ```sh
 echo 256 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb
