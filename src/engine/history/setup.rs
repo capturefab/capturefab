@@ -884,11 +884,8 @@ mod tests {
 
     fn connected(selector: &str) -> WorkerHandle {
         let h = WorkerHandle::new();
-        h.request(SessionCommand::Connect {
-            camera: selector.into(),
-            timeout_ms: 100,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect(selector.into(), 100))
+            .unwrap();
         h
     }
     fn get(h: &WorkerHandle, feature: &str) -> Value {
