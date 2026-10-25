@@ -13,6 +13,7 @@ use std::{
 
 const MAX_XML: usize = 32 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
+const MAX_FORMULA_DEPTH: usize = 128;
 
 /// Features a camera cannot change while it streams: the image's geometry
 /// and format.
@@ -248,6 +249,33 @@ impl NodeMap {
     }
     pub fn has(&self, name: &str) -> bool {
         self.nodes.contains_key(name)
+    }
+
+    /// Whether the `pIsLocked` link of `name` reads `target`, directly or
+    /// through the nodes its formula references.
+    pub(crate) fn locked_by(&self, name: &str, target: &str) -> bool {
+        let Some(link) = self.nodes.get(name).and_then(|node| node.prop("pIsLocked")) else {
+            return false;
+        };
+        let mut pending = vec![link.trim()];
+        let mut seen = BTreeSet::new();
+        while let Some(next) = pending.pop() {
+            if next == target {
+                return true;
+            }
+            if seen.len() >= 256 || !seen.insert(next) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(next) {
+                pending.extend(
+                    node.props
+                        .iter()
+                        .filter(|prop| prop.tag.starts_with('p'))
+                        .map(|prop| prop.text.trim()),
+                );
+            }
+        }
+        false
     }
 
     /// The node's GenICam kind, such as `Float` or `IntReg`.
@@ -512,7 +540,11 @@ impl NodeMap {
             return Bounds {
                 min: own("Min"),
                 max: own("Max"),
-                inc: own("Inc"),
+                inc: if n.kind == "IntConverter" {
+                    Some(1.0)
+                } else {
+                    own("Inc")
+                },
             };
         }
         let inner = self
@@ -526,18 +558,36 @@ impl NodeMap {
             return inner;
         }
         let mut from = |v: Option<f64>| {
-            v.and_then(|v| {
+            let v = v?;
+            if n.kind == "IntConverter" {
+                let to = i64::variable(&json!(v)).ok()?;
+                self.formula::<i64>(io, n, "FormulaFrom", Some(("TO", to)), depth)
+                    .ok()
+                    .map(|v| v as f64)
+            } else {
                 self.formula(io, n, "FormulaFrom", Some(("TO", v)), depth)
                     .ok()
-            })
+            }
         };
+        let inc = (n.kind == "IntConverter").then_some(1.0);
+        // A Varying formula is not monotonic, so its endpoints say nothing
+        // about its range. Increasing, Decreasing and Automatic map them.
+        if n.prop("Slope") == Some("Varying") {
+            return Bounds {
+                inc,
+                ..Bounds::default()
+            };
+        }
         match (from(inner.min), from(inner.max)) {
             (Some(a), Some(b)) => Bounds {
                 min: Some(a.min(b)),
                 max: Some(a.max(b)),
-                inc: None,
+                inc,
             },
-            _ => Bounds::default(),
+            _ => Bounds {
+                inc,
+                ..Bounds::default()
+            },
         }
     }
     fn node(&self, name: &str, depth: usize) -> Result<&Node> {
@@ -880,22 +930,27 @@ impl NodeMap {
                 }
                 bail!("{name} contains unknown enumeration value {value}")
             }
-            "IntSwissKnife" | "SwissKnife" => {
-                let value = self.formula(io, n, "Formula", None, depth)?;
-                if n.kind == "IntSwissKnife" {
-                    integer_formula(value)
-                } else {
-                    Ok(json!(value))
-                }
+            "IntSwissKnife" => Ok(json!(self.formula::<i64>(io, n, "Formula", None, depth)?)),
+            "SwissKnife" => Ok(json!(self.formula::<f64>(io, n, "Formula", None, depth)?)),
+            "IntConverter" => {
+                let input = i64::variable(&self.raw_value(io, n, depth)?)?;
+                Ok(json!(self.formula(
+                    io,
+                    n,
+                    "FormulaFrom",
+                    Some(("TO", input)),
+                    depth
+                )?))
             }
-            "IntConverter" | "Converter" => {
+            "Converter" => {
                 let input = self.value_number(io, n, depth)?;
-                let value = self.formula(io, n, "FormulaFrom", Some(("TO", input)), depth)?;
-                if n.kind == "IntConverter" {
-                    integer_formula(value)
-                } else {
-                    Ok(json!(value))
-                }
+                Ok(json!(self.formula(
+                    io,
+                    n,
+                    "FormulaFrom",
+                    Some(("TO", input)),
+                    depth
+                )?))
             }
             "Command" => Ok(Value::Null),
             other => bail!("unsupported GenApi node type {other} ({name})"),
@@ -920,12 +975,16 @@ impl NodeMap {
         }
     }
     fn number(&self, io: &mut dyn RegisterIo, name: &str, depth: usize) -> Result<f64> {
+        number(&self.numeric_value(io, name, depth)?)
+    }
+    /// A node's value as a number; an enumeration yields its entry's value.
+    fn numeric_value(&self, io: &mut dyn RegisterIo, name: &str, depth: usize) -> Result<Value> {
         let n = self.node(name, depth)?;
         if n.kind == "Enumeration" {
             self.access(io, name, false, depth)?;
-            self.value_number(io, n, depth)
+            self.raw_value(io, n, depth)
         } else {
-            number(&self.get_inner(io, name, depth)?)
+            self.get_inner(io, name, depth)
         }
     }
     /// Integer value multiplexers are distinct from register address indexing.
@@ -1170,41 +1229,25 @@ impl NodeMap {
             }
             "Enumeration" => {
                 let symbol = value.as_str().context("expected enumeration symbol")?;
-                let entry = self
-                    .enum_entries(n)
-                    .into_iter()
-                    .find(|entry| {
-                        self.nodes.get(*entry).is_some_and(|en| {
-                            symbol == *entry
-                                || symbol
-                                    == en.prop("Symbolic").unwrap_or_else(|| {
-                                        entry.strip_prefix(&format!("{name}_")).unwrap_or(entry)
-                                    })
-                        })
-                    })
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "unknown {name} choice {symbol:?}; choose one of: {}",
-                            self.entry_names(io, name, n).join(", ")
-                        )
-                    })?;
+                let entry = self.find_entry(name, n, symbol).ok_or_else(|| {
+                    anyhow!(
+                        "unknown {name} choice {symbol:?}; choose one of: {}",
+                        self.entry_names(io, name, n).join(", ")
+                    )
+                })?;
                 let en = self.node(entry, depth + 1)?;
                 self.available(io, en, depth + 1).with_context(|| {
                     format!("{name} choice {symbol:?} is currently unavailable")
                 })?;
-                if let Some(link) = en.prop("pValue") {
-                    self.get_inner(io, link, depth + 1)?
-                } else {
-                    literal(en.prop("Value").context("enumeration entry has no value")?)?
-                }
+                self.entry_value(io, en, depth + 1)?
             }
-            "IntConverter" | "Converter" => {
-                let v = self.formula(io, n, "FormulaTo", Some(("FROM", number(value)?)), depth)?;
-                if n.kind == "IntConverter" {
-                    integer_formula(v)?
-                } else {
-                    json!(v)
-                }
+            "IntConverter" => {
+                let from = i64::try_from(exact_integer(value)?)
+                    .context("integer converter input exceeds the signed 64-bit range")?;
+                json!(self.formula(io, n, "FormulaTo", Some(("FROM", from)), depth)?)
+            }
+            "Converter" => {
+                json!(self.formula(io, n, "FormulaTo", Some(("FROM", number(value)?)), depth)?)
             }
             _ => value.clone(),
         };
@@ -1395,43 +1438,107 @@ impl NodeMap {
             true,
         )
     }
-    fn formula(
+    /// A pVariable's value. The `.Min`, `.Max` and `.Inc` name extensions read
+    /// the linked node's bounds, `.Entry.<Name>` the value of one of its
+    /// enumeration entries, and `.Value` or no extension its value.
+    fn variable(
+        &self,
+        io: &mut dyn RegisterIo,
+        var: &str,
+        link: &str,
+        depth: usize,
+    ) -> Result<Value> {
+        let Some((_, extension)) = var.split_once('.') else {
+            return self.numeric_value(io, link, depth);
+        };
+        let node = self.node(link, depth)?;
+        match extension {
+            "Value" => self.numeric_value(io, link, depth),
+            "Min" | "Max" | "Inc" => {
+                if let Some(value) = self.property_value(io, node, extension, depth)? {
+                    return Ok(value);
+                }
+                let bounds = self.range(io, node, depth);
+                match extension {
+                    "Min" => bounds.min,
+                    "Max" => bounds.max,
+                    _ => bounds.inc,
+                }
+                .map(|v| json!(v))
+                .with_context(|| format!("{link} has no {extension}"))
+            }
+            _ => {
+                let symbol = extension
+                    .strip_prefix("Entry.")
+                    .with_context(|| format!("unsupported formula variable {var}"))?;
+                ensure!(
+                    node.kind == "Enumeration",
+                    "formula variable {var} needs an enumeration"
+                );
+                let entry = self
+                    .find_entry(link, node, symbol)
+                    .with_context(|| format!("{link} has no entry {symbol}"))?;
+                self.entry_value(io, self.node(entry, depth + 1)?, depth + 1)
+            }
+        }
+    }
+    fn find_entry<'a>(&'a self, name: &str, n: &'a Node, symbol: &str) -> Option<&'a str> {
+        self.enum_entries(n).into_iter().find(|entry| {
+            self.nodes.get(*entry).is_some_and(|en| {
+                symbol == *entry
+                    || symbol
+                        == en.prop("Symbolic").unwrap_or_else(|| {
+                            entry.strip_prefix(&format!("{name}_")).unwrap_or(entry)
+                        })
+            })
+        })
+    }
+    fn entry_value(&self, io: &mut dyn RegisterIo, en: &Node, depth: usize) -> Result<Value> {
+        if let Some(link) = en.prop("pValue") {
+            self.get_inner(io, link, depth)
+        } else {
+            literal(en.prop("Value").context("enumeration entry has no value")?)
+        }
+    }
+    /// Evaluate one of the node's formulas: as `f64` for SwissKnife and
+    /// Converter nodes, as `i64` for IntSwissKnife and IntConverter nodes.
+    fn formula<T: Operand>(
         &self,
         io: &mut dyn RegisterIo,
         n: &Node,
         key: &str,
-        special: Option<(&str, f64)>,
+        special: Option<(&str, T)>,
         depth: usize,
-    ) -> Result<f64> {
+    ) -> Result<T> {
         let mut vars = BTreeMap::new();
+        let mut expressions = BTreeMap::new();
         for p in &n.props {
             if matches!(p.tag.as_str(), "pVariable" | "Constant" | "Expression") {
                 let name = p
                     .attrs
                     .get("Name")
                     .context("formula variable missing Name")?;
-                let v = if p.tag == "pVariable" {
-                    self.number(io, &p.text, depth + 1)?
-                } else if p.tag == "Constant" {
-                    number(&literal(&p.text)?)?
-                } else {
-                    evaluate(&p.text, &vars)?
-                };
-                if matches!(n.kind.as_str(), "IntSwissKnife" | "IntConverter") {
-                    ensure!(
-                        v.abs() <= (1u64 << 53) as f64,
-                        "integer formula exceeds exact arithmetic range"
-                    );
+                match p.tag.as_str() {
+                    "pVariable" => {
+                        let value = self.variable(io, name, &p.text, depth + 1)?;
+                        vars.insert(name.clone(), T::variable(&value)?);
+                    }
+                    "Constant" => {
+                        vars.insert(name.clone(), T::literal(&literal(&p.text)?)?);
+                    }
+                    _ => {
+                        expressions.insert(name.clone(), p.text.clone());
+                    }
                 }
-                vars.insert(name.clone(), v);
             }
         }
         if let Some((name, value)) = special {
             vars.insert(name.into(), value);
         }
-        evaluate(
+        evaluate_with(
             n.prop(key).ok_or_else(|| anyhow!("node missing {key}"))?,
             &vars,
+            &expressions,
         )
     }
 }
@@ -1708,32 +1815,25 @@ fn literal(s: &str) -> Result<Value> {
     );
     Ok(json!(n))
 }
-fn integer_formula(v: f64) -> Result<Value> {
-    ensure!(
-        v.is_finite() && v.fract() == 0.0 && v.abs() <= (1u64 << 53) as f64,
-        "integer formula result cannot be represented exactly"
-    );
-    Ok(json!(v as i64))
-}
-
 /// Decode a raw XML file or an in-memory ZIP, without writing device-provided paths.
 pub fn decode_xml(data: &[u8]) -> Result<String> {
     ensure!(data.len() <= MAX_XML, "GenICam file exceeds 32 MiB limit");
     let bytes = if data.starts_with(b"PK\x03\x04") {
         let mut archive = zip::ZipArchive::new(Cursor::new(data)).context("invalid GenICam ZIP")?;
-        let indices = (0..archive.len())
-            .filter(|i| {
-                archive
-                    .by_index(*i)
-                    .map(|f| f.name().to_ascii_lowercase().ends_with(".xml") && !f.is_dir())
-                    .unwrap_or(false)
+        // Like the reference implementation, take the first file, preferring
+        // one named *.xml when the archive also holds other files.
+        let files = (0..archive.len())
+            .filter_map(|i| {
+                let file = archive.by_index(i).ok()?;
+                (!file.is_dir()).then(|| (i, file.name().to_ascii_lowercase().ends_with(".xml")))
             })
             .collect::<Vec<_>>();
-        ensure!(
-            indices.len() == 1,
-            "GenICam ZIP must contain exactly one XML file"
-        );
-        let index = indices[0];
+        let (index, _) = files
+            .iter()
+            .find(|(_, xml)| *xml)
+            .or(files.first())
+            .copied()
+            .context("GenICam ZIP contains no file")?;
         let file = archive.by_index(index)?;
         ensure!(
             file.size() <= MAX_XML as u64,
@@ -1758,16 +1858,239 @@ pub fn decode_xml(data: &[u8]) -> Result<String> {
 
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
-    Num(f64),
+    Num(Value),
     Name(String),
     Op(String),
     L,
     R,
     Q,
     Colon,
+    Comma,
     End,
 }
-fn evaluate(expression: &str, vars: &BTreeMap<String, f64>) -> Result<f64> {
+/// Formula arithmetic. GenApi evaluates SwissKnife and Converter formulas in
+/// `f64`, and IntSwissKnife and IntConverter formulas in 64-bit integers.
+trait Operand: Copy + Default {
+    const INTEGER: bool;
+    fn literal(value: &Value) -> Result<Self>;
+    fn variable(value: &Value) -> Result<Self>;
+    fn truth(self) -> bool;
+    fn finite(self) -> bool;
+    fn boolean(value: bool) -> Self;
+    fn constant(name: &str) -> Option<Self>;
+    fn unary(op: &str, value: Self) -> Result<Self>;
+    fn binary(op: &str, lhs: Self, rhs: Self) -> Result<Self>;
+    fn call(name: &str, args: &[Self]) -> Result<Self>;
+}
+impl Operand for f64 {
+    const INTEGER: bool = false;
+    fn literal(value: &Value) -> Result<f64> {
+        number(value)
+    }
+    fn variable(value: &Value) -> Result<f64> {
+        number(value)
+    }
+    fn truth(self) -> bool {
+        self != 0.0
+    }
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    fn boolean(value: bool) -> f64 {
+        value as u8 as f64
+    }
+    fn constant(name: &str) -> Option<f64> {
+        match name {
+            "PI" => Some(std::f64::consts::PI),
+            "E" => Some(std::f64::consts::E),
+            _ => None,
+        }
+    }
+    fn unary(op: &str, value: f64) -> Result<f64> {
+        Ok(match op {
+            "+" => value,
+            "-" => -value,
+            "!" => f64::boolean(value == 0.0),
+            _ => (!bits(value)?) as f64,
+        })
+    }
+    fn binary(op: &str, lhs: f64, rhs: f64) -> Result<f64> {
+        let value = match op {
+            "+" => lhs + rhs,
+            "-" => lhs - rhs,
+            "*" => lhs * rhs,
+            "/" => {
+                ensure!(rhs != 0.0, "formula division by zero");
+                lhs / rhs
+            }
+            "%" => {
+                ensure!(rhs != 0.0, "formula modulo by zero");
+                lhs % rhs
+            }
+            "**" => lhs.powf(rhs),
+            "&" | "|" | "^" | "<<" | ">>" => i64::binary(op, bits(lhs)?, bits(rhs)?)? as f64,
+            _ => f64::boolean(comparison(op, lhs, rhs)),
+        };
+        ensure!(value.is_finite(), "non-finite formula result");
+        Ok(value)
+    }
+    fn call(name: &str, args: &[f64]) -> Result<f64> {
+        let x = args[0];
+        Ok(match name {
+            "SGN" => f64::boolean(x > 0.0) - f64::boolean(x < 0.0),
+            "NEG" => -x,
+            "ABS" => x.abs(),
+            "EXP" => x.exp(),
+            "LN" => x.ln(),
+            "LG" => x.log10(),
+            "SQRT" => x.sqrt(),
+            "SIN" => x.sin(),
+            "COS" => x.cos(),
+            "TAN" => x.tan(),
+            "ASIN" => x.asin(),
+            "ACOS" => x.acos(),
+            "ATAN" => x.atan(),
+            "FLOOR" => x.floor(),
+            "CEIL" => x.ceil(),
+            "TRUNC" => x.trunc(),
+            "ROUND" => match args.get(1) {
+                Some(&precision) => {
+                    let digits =
+                        i32::try_from(bits(precision)?).context("invalid ROUND precision")?;
+                    let scale = 10f64.powi(digits);
+                    (x * scale).round() / scale
+                }
+                None => x.round(),
+            },
+            _ => bail!("unsupported formula function {name}"),
+        })
+    }
+}
+/// Integer formulas wrap on overflow like the C `int64_t` arithmetic of
+/// GenApi implementations, and divide with truncation toward zero.
+impl Operand for i64 {
+    const INTEGER: bool = true;
+    fn literal(value: &Value) -> Result<i64> {
+        if value.is_f64() {
+            ensure!(
+                number(value)?.fract() == 0.0,
+                "integer formula cannot use fractional literal {value}"
+            );
+        }
+        i64::variable(value)
+    }
+    /// Unsigned 64-bit registers keep their bit pattern, and Float values round
+    /// to the nearest integer, as GenApi's integer references do.
+    fn variable(value: &Value) -> Result<i64> {
+        if let Some(v) = value.as_i64() {
+            return Ok(v);
+        }
+        if let Some(v) = value.as_u64() {
+            return Ok(v as i64);
+        }
+        let v = number(value)?.round();
+        ensure!(
+            v >= i64::MIN as f64 && v < i64::MAX as f64,
+            "integer formula value {v} exceeds the 64-bit range"
+        );
+        Ok(v as i64)
+    }
+    fn truth(self) -> bool {
+        self != 0
+    }
+    fn finite(self) -> bool {
+        true
+    }
+    fn boolean(value: bool) -> i64 {
+        value.into()
+    }
+    fn constant(_: &str) -> Option<i64> {
+        None
+    }
+    fn unary(op: &str, value: i64) -> Result<i64> {
+        Ok(match op {
+            "+" => value,
+            "-" => value.wrapping_neg(),
+            "!" => i64::boolean(value == 0),
+            _ => !value,
+        })
+    }
+    fn binary(op: &str, lhs: i64, rhs: i64) -> Result<i64> {
+        Ok(match op {
+            "+" => lhs.wrapping_add(rhs),
+            "-" => lhs.wrapping_sub(rhs),
+            "*" => lhs.wrapping_mul(rhs),
+            "/" => {
+                ensure!(rhs != 0, "formula division by zero");
+                lhs.wrapping_div(rhs)
+            }
+            "%" => {
+                ensure!(rhs != 0, "formula modulo by zero");
+                lhs.wrapping_rem(rhs)
+            }
+            "**" => u32::try_from(rhs)
+                .ok()
+                .and_then(|exponent| lhs.checked_pow(exponent))
+                .context("integer formula power overflows or has a negative exponent")?,
+            "&" => lhs & rhs,
+            "|" => lhs | rhs,
+            "^" => lhs ^ rhs,
+            "<<" | ">>" => {
+                ensure!((0..64).contains(&rhs), "invalid formula shift");
+                if op == "<<" { lhs << rhs } else { lhs >> rhs }
+            }
+            _ => i64::boolean(comparison(op, lhs, rhs)),
+        })
+    }
+    fn call(name: &str, args: &[i64]) -> Result<i64> {
+        let x = args[0];
+        Ok(match name {
+            "SGN" => x.signum(),
+            "NEG" => x.wrapping_neg(),
+            "ABS" => x.wrapping_abs(),
+            _ => bail!("unsupported formula function {name}"),
+        })
+    }
+}
+/// The standard formula functions and how many arguments each takes. Only SGN
+/// and NEG are standard in integer formulas; ABS is also accepted there
+/// because vendor XMLs use it in IntSwissKnife nodes.
+fn function(name: &str, integer: bool) -> Result<std::ops::RangeInclusive<usize>> {
+    let arity = match name {
+        "SGN" | "NEG" | "ABS" => return Ok(1..=1),
+        "ROUND" => 1..=2,
+        "EXP" | "LN" | "LG" | "SQRT" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN"
+        | "FLOOR" | "CEIL" | "TRUNC" => 1..=1,
+        _ => bail!("unsupported formula function {name}"),
+    };
+    ensure!(
+        !integer,
+        "formula function {name} is not available in integer formulas"
+    );
+    Ok(arity)
+}
+fn comparison<T: PartialOrd>(op: &str, lhs: T, rhs: T) -> bool {
+    match op {
+        "==" | "=" => lhs == rhs,
+        "!=" | "<>" => lhs != rhs,
+        "<" => lhs < rhs,
+        ">" => lhs > rhs,
+        "<=" => lhs <= rhs,
+        ">=" => lhs >= rhs,
+        _ => unreachable!(),
+    }
+}
+fn evaluate<T: Operand>(expression: &str, vars: &BTreeMap<String, T>) -> Result<T> {
+    evaluate_with(expression, vars, &BTreeMap::new())
+}
+/// Named `Expression` sub-formulas are evaluated where the formula uses them,
+/// with every variable bound, including a converter's TO or FROM. As the
+/// standard requires, they cannot refer to other sub-formulas.
+fn evaluate_with<T: Operand>(
+    expression: &str,
+    vars: &BTreeMap<String, T>,
+    expressions: &BTreeMap<String, String>,
+) -> Result<T> {
     ensure!(expression.len() <= 16384, "formula exceeds size limit");
     ensure!(
         expression.is_ascii(),
@@ -1803,12 +2126,16 @@ fn evaluate(expression: &str, vars: &BTreeMap<String, f64>) -> Result<f64> {
                     }
                 }
             }
-            tokens.push(Token::Num(number(&literal(&expression[start..i])?)?));
+            tokens.push(Token::Num(literal(&expression[start..i])?));
             continue;
         }
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             i += 1;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || bytes[i] == b'_'
+                    || bytes[i] == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_alphabetic))
+            {
                 i += 1;
             }
             tokens.push(Token::Name(expression[start..i].into()));
@@ -1829,6 +2156,7 @@ fn evaluate(expression: &str, vars: &BTreeMap<String, f64>) -> Result<f64> {
             b')' => Token::R,
             b'?' => Token::Q,
             b':' => Token::Colon,
+            b',' => Token::Comma,
             b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!' | b'<' | b'>'
             | b'=' => Token::Op((bytes[i] as char).to_string()),
             _ => bail!("unsupported formula syntax at byte {i}"),
@@ -1840,62 +2168,76 @@ fn evaluate(expression: &str, vars: &BTreeMap<String, f64>) -> Result<f64> {
         tokens,
         pos: 0,
         vars,
+        expressions,
         depth: 0,
+        skip: 0,
     };
     let value = parser.expr(0)?;
     ensure!(
         parser.tokens[parser.pos] == Token::End,
         "unsupported trailing formula syntax"
     );
-    ensure!(value.is_finite(), "formula produced non-finite result");
+    ensure!(value.finite(), "formula produced non-finite result");
     Ok(value)
 }
-struct Expr<'a> {
+struct Expr<'a, T> {
     tokens: Vec<Token>,
     pos: usize,
-    vars: &'a BTreeMap<String, f64>,
+    vars: &'a BTreeMap<String, T>,
+    expressions: &'a BTreeMap<String, String>,
     depth: usize,
+    /// Nonzero while parsing an operand whose value is discarded: the untaken
+    /// branch of `?:` or the short-circuited side of `&&` and `||`. Its syntax
+    /// is still checked, but its arithmetic cannot fail the formula.
+    skip: usize,
 }
-impl Expr<'_> {
-    fn expr(&mut self, min: u8) -> Result<f64> {
-        self.depth += 1;
-        ensure!(self.depth <= MAX_DEPTH, "formula nesting exceeds limit");
+impl<T: Operand> Expr<'_, T> {
+    fn compute(&self, value: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.skip > 0 {
+            Ok(T::default())
+        } else {
+            value()
+        }
+    }
+    fn discard(&mut self, skip: bool, min: u8) -> Result<T> {
+        self.skip += usize::from(skip);
+        let value = self.expr(min);
+        self.skip -= usize::from(skip);
+        value
+    }
+    fn operand(&mut self) -> Result<T> {
         let token = self.tokens[self.pos].clone();
         self.pos += 1;
-        let mut lhs = match token {
-            Token::Num(n) => n,
+        Ok(match token {
+            Token::Num(n) => T::literal(&n)?,
             Token::Name(n) => {
                 if self.tokens[self.pos] == Token::L {
                     self.pos += 1;
-                    let arg = self.expr(0)?;
+                    let name = n.to_ascii_uppercase();
+                    let arity = function(&name, T::INTEGER)?;
+                    let mut args = vec![self.expr(0)?];
+                    while self.tokens[self.pos] == Token::Comma {
+                        self.pos += 1;
+                        args.push(self.expr(0)?);
+                    }
                     ensure!(
                         self.tokens[self.pos] == Token::R,
                         "unclosed formula function"
                     );
                     self.pos += 1;
-                    match n.as_str() {
-                        "ABS" => arg.abs(),
-                        "EXP" => arg.exp(),
-                        "LN" => arg.ln(),
-                        "LOG" => arg.log10(),
-                        "SQRT" => arg.sqrt(),
-                        "SIN" => arg.sin(),
-                        "COS" => arg.cos(),
-                        "TAN" => arg.tan(),
-                        "ASIN" => arg.asin(),
-                        "ACOS" => arg.acos(),
-                        "ATAN" => arg.atan(),
-                        "FLOOR" => arg.floor(),
-                        "CEIL" => arg.ceil(),
-                        "ROUND" => arg.round(),
-                        "TRUNC" => arg.trunc(),
-                        _ => bail!("unsupported formula function {n}"),
-                    }
+                    ensure!(
+                        arity.contains(&args.len()),
+                        "wrong number of arguments for formula function {name}"
+                    );
+                    self.compute(|| T::call(&name, &args))?
+                } else if let Some(&value) = self.vars.get(&n) {
+                    value
+                } else if let Some(text) = self.expressions.get(&n) {
+                    self.compute(|| {
+                        evaluate(text, self.vars).with_context(|| format!("formula expression {n}"))
+                    })?
                 } else {
-                    *self
-                        .vars
-                        .get(&n)
-                        .ok_or_else(|| anyhow!("unknown formula variable {n}"))?
+                    T::constant(&n).ok_or_else(|| anyhow!("unknown formula variable {n}"))?
                 }
             }
             Token::L => {
@@ -1909,26 +2251,38 @@ impl Expr<'_> {
             }
             Token::Op(op) if matches!(op.as_str(), "+" | "-" | "!" | "~") => {
                 let v = self.expr(12)?;
-                match op.as_str() {
-                    "+" => v,
-                    "-" => -v,
-                    "!" => (v == 0.0) as u8 as f64,
-                    _ => (!exact_i64(v)?) as f64,
-                }
+                self.compute(|| T::unary(&op, v))?
             }
             _ => bail!("expected formula operand"),
-        };
+        })
+    }
+    /// Each nested sub-expression counts toward the depth limit, but the else
+    /// branch of `?:` continues in the same frame, so long right-nested
+    /// selector chains such as `(F=1)?(A):((F=2)?(B):(...))` stay shallow.
+    fn expr(&mut self, min: u8) -> Result<T> {
+        self.depth += 1;
+        ensure!(
+            self.depth <= MAX_FORMULA_DEPTH,
+            "formula nesting exceeds limit"
+        );
+        let skip = self.skip;
+        let mut chosen = None;
+        let mut lhs = self.operand()?;
         loop {
             if self.tokens[self.pos] == Token::Q && min == 0 {
                 self.pos += 1;
-                let yes = self.expr(0)?;
+                let taken = self.skip == 0 && lhs.truth();
+                let yes = self.discard(!taken, 0)?;
                 ensure!(
                     self.tokens[self.pos] == Token::Colon,
                     "expected ':' in formula"
                 );
                 self.pos += 1;
-                let no = self.expr(0)?;
-                lhs = if lhs != 0.0 { yes } else { no };
+                if taken {
+                    chosen = Some(yes);
+                    self.skip += 1;
+                }
+                lhs = self.operand()?;
                 continue;
             }
             let Token::Op(op) = &self.tokens[self.pos] else {
@@ -1953,56 +2307,30 @@ impl Expr<'_> {
             }
             let op = op.clone();
             self.pos += 1;
-            let rhs = self.expr(if op == "**" { prec } else { prec + 1 })?;
-            lhs = match op.as_str() {
-                "+" => lhs + rhs,
-                "-" => lhs - rhs,
-                "*" => lhs * rhs,
-                "/" => {
-                    ensure!(rhs != 0.0, "formula division by zero");
-                    lhs / rhs
-                }
-                "%" => {
-                    ensure!(rhs != 0.0, "formula modulo by zero");
-                    lhs % rhs
-                }
-                "**" => lhs.powf(rhs),
-                "&" => (exact_i64(lhs)? & exact_i64(rhs)?) as f64,
-                "|" => (exact_i64(lhs)? | exact_i64(rhs)?) as f64,
-                "^" => (exact_i64(lhs)? ^ exact_i64(rhs)?) as f64,
-                "<<" | ">>" => {
-                    let shift = exact_i64(rhs)?;
-                    ensure!((0..64).contains(&shift), "invalid formula shift");
-                    if op == "<<" {
-                        exact_i64(lhs)?
-                            .checked_shl(shift as u32)
-                            .context("formula shift overflow")? as f64
-                    } else {
-                        (exact_i64(lhs)? >> shift) as f64
-                    }
-                }
-                "==" | "=" => (lhs == rhs) as u8 as f64,
-                "!=" | "<>" => (lhs != rhs) as u8 as f64,
-                "<" => (lhs < rhs) as u8 as f64,
-                ">" => (lhs > rhs) as u8 as f64,
-                "<=" => (lhs <= rhs) as u8 as f64,
-                ">=" => (lhs >= rhs) as u8 as f64,
-                "&&" => (lhs != 0.0 && rhs != 0.0) as u8 as f64,
-                "||" => (lhs != 0.0 || rhs != 0.0) as u8 as f64,
-                _ => unreachable!(),
+            let decided = match op.as_str() {
+                "&&" => !lhs.truth(),
+                "||" => lhs.truth(),
+                _ => false,
             };
-            ensure!(lhs.is_finite(), "non-finite formula result");
+            let rhs = self.discard(decided, if op == "**" { prec } else { prec + 1 })?;
+            lhs = match op.as_str() {
+                "&&" | "||" => T::boolean(if decided { op == "||" } else { rhs.truth() }),
+                _ => self.compute(|| T::binary(&op, lhs, rhs))?,
+            };
         }
+        self.skip = skip;
         self.depth -= 1;
-        Ok(lhs)
+        Ok(chosen.unwrap_or(lhs))
     }
 }
-fn exact_i64(v: f64) -> Result<i64> {
+/// Bitwise operators truncate a floating-point operand toward zero, like the
+/// C conversion to `int64_t` in GenApi implementations.
+fn bits(v: f64) -> Result<i64> {
     ensure!(
-        v.fract() == 0.0 && v.abs() <= (1u64 << 53) as f64,
-        "bitwise formula operand outside exact integer range"
+        v >= i64::MIN as f64 && v < i64::MAX as f64,
+        "bitwise formula operand outside the 64-bit integer range"
     );
-    Ok(v as i64)
+    Ok(v.trunc() as i64)
 }
 
 #[cfg(test)]
@@ -2115,7 +2443,7 @@ mod tests {
         assert_eq!(io.read_memory(0, 4).unwrap(), [1, 2, 170, 4]);
     }
     #[test]
-    fn zip_xml_limits_and_ambiguity() {
+    fn zip_xml_selects_the_first_xml_file() {
         use std::io::Write;
         let archive = |names: &[&str]| {
             let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -2130,8 +2458,32 @@ mod tests {
             decode_xml(&archive(&["model.xml"])).unwrap(),
             "<RegisterDescription/>"
         );
-        assert!(decode_xml(&archive(&["a.xml", "b.xml"])).is_err());
-        assert!(decode_xml(&archive(&["readme.txt"])).is_err());
+        let first = |names: &[(&str, &str)]| {
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, body) in names {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            decode_xml(&zip.finish().unwrap().into_inner())
+        };
+        assert_eq!(
+            first(&[("a.xml", "<A/>"), ("b.xml", "<B/>")]).unwrap(),
+            "<A/>"
+        );
+        assert_eq!(
+            first(&[("readme.txt", "notes"), ("Camera.XML", "<C/>")]).unwrap(),
+            "<C/>"
+        );
+        assert_eq!(first(&[("Camera_1_0", "<D/>")]).unwrap(), "<D/>");
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.add_directory("xml/", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.start_file("xml/Camera.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"<E/>").unwrap();
+        let nested = zip.finish().unwrap().into_inner();
+        assert_eq!(decode_xml(&nested).unwrap(), "<E/>");
     }
     #[test]
     fn unavailable_and_locked_features_fail_closed() {
@@ -2210,6 +2562,48 @@ mod tests {
         assert_eq!(m.bounds(&mut io, "Loop").unwrap(), Bounds::default());
     }
     #[test]
+    fn formula_expressions_are_evaluated_where_they_are_used() {
+        let m = map(concat!(
+            "<Float Name='Exposure'><pValue>C</pValue></Float>",
+            "<Converter Name='C'><Expression Name='SCALED'>FROM*1000</Expression><pVariable Name='STEP'>Step</pVariable><Expression Name='BROKEN'>STEP/0</Expression>",
+            "<FormulaTo>SCALED/STEP</FormulaTo><FormulaFrom>TO*STEP/1000</FormulaFrom><pValue>R</pValue></Converter>",
+            "<Integer Name='Step'><Value>4</Value></Integer>",
+            "<IntReg Name='R'><Address>0</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
+            "<IntSwissKnife Name='Half'><Expression Name='HALF'>X/2</Expression><pVariable Name='X'>Step2</pVariable><Formula>HALF*2</Formula></IntSwissKnife>",
+            "<Integer Name='Step2'><Value>7</Value></Integer>",
+            "<IntSwissKnife Name='Nested'><Expression Name='A'>1</Expression><Expression Name='B'>A+1</Expression><Formula>B</Formula></IntSwissKnife>",
+        ));
+        let mut io = Memory::default();
+        m.set(&mut io, "Exposure", "2").unwrap();
+        assert_eq!(io.read_memory(0, 4).unwrap(), 500u32.to_le_bytes());
+        assert_eq!(m.get(&mut io, "Exposure").unwrap(), 2.0);
+        assert_eq!(m.get(&mut io, "Half").unwrap(), 6);
+        let error = format!("{:#}", m.get(&mut io, "Nested").unwrap_err());
+        assert!(error.contains("unknown formula variable A"), "{error}");
+    }
+    #[test]
+    fn formula_variable_extensions_read_bounds_and_entries() {
+        let m = map(concat!(
+            "<SwissKnife Name='MidRange'><pVariable Name='Gain.Max'>Gain</pVariable><pVariable Name='Gain.Min'>Gain</pVariable><Formula> (Gain.Max - Gain.Min) / 2 </Formula></SwissKnife>",
+            "<Float Name='Gain'><pValue>GainRaw</pValue><Min>1.5</Min><pMax>GainMax</pMax></Float>",
+            "<FloatReg Name='GainRaw'><Address>0</Address><Length>8</Length><AccessMode>RW</AccessMode></FloatReg>",
+            "<Integer Name='GainMax'><Value>24</Value></Integer>",
+            "<IntSwissKnife Name='Aligned'><pVariable Name='W.Value'>Width</pVariable><pVariable Name='W.Inc'>Width</pVariable><pVariable Name='MODE'>Mode</pVariable><pVariable Name='Mode.Entry.Fast'>Mode</pVariable>",
+            "<Formula>MODE = Mode.Entry.Fast ? W.Value / W.Inc * W.Inc : W.Value</Formula></IntSwissKnife>",
+            "<Integer Name='Width'><Value>1001</Value><Inc>16</Inc></Integer>",
+            "<Enumeration Name='Mode'><EnumEntry Name='Slow'><Value>3</Value></EnumEntry><EnumEntry Name='Fast'><pValue>FastCode</pValue></EnumEntry><Value>7</Value></Enumeration>",
+            "<Integer Name='FastCode'><Value>7</Value></Integer>",
+            "<IntSwissKnife Name='Bad'><pVariable Name='Mode.Entry.Missing'>Mode</pVariable><Formula>Mode.Entry.Missing</Formula></IntSwissKnife>",
+        ));
+        let mut io = Memory::default();
+        assert_eq!(m.get(&mut io, "MidRange").unwrap(), 11.25);
+        assert_eq!(m.get(&mut io, "Aligned").unwrap(), 992);
+        m.set(&mut io, "Mode", "Slow").unwrap();
+        assert_eq!(m.get(&mut io, "Aligned").unwrap(), 1001);
+        let error = format!("{:#}", m.get(&mut io, "Bad").unwrap_err());
+        assert!(error.contains("Mode has no entry Missing"), "{error}");
+    }
+    #[test]
     fn formula_fail_closed() {
         let vars = BTreeMap::from([("X".into(), 7.0)]);
         assert_eq!(
@@ -2220,6 +2614,222 @@ mod tests {
         assert_eq!(evaluate("X=7 ? EXP(LN(1)) : 0", &vars).unwrap(), 1.0);
         assert!(evaluate("X / 0", &vars).is_err());
         assert!(evaluate("X + ", &vars).is_err());
+    }
+    #[test]
+    fn standard_formula_functions_and_constants() {
+        let none = BTreeMap::new();
+        for (expression, expected) in [
+            ("ROUND(10.11, 1)", 10.1),
+            ("ROUND(10.99, 1)", 11.0),
+            ("ROUND(-20.11, 1)", -20.1),
+            ("ROUND(-20.99, 1)", -21.0),
+            ("ROUND(1234, -2)", 1200.0),
+            ("ROUND(10.5)", 11.0),
+            ("LN(E)", 1.0),
+            ("LG(10)", 1.0),
+            ("COS(PI)", -1.0),
+            ("SIN(-PI/2)", -1.0),
+            ("SGN(-2.0)", -1.0),
+            ("SGN(0)", 0.0),
+            ("SGN(2)", 1.0),
+            ("NEG(-2.5)", 2.5),
+            ("exp(0) + Abs(-1)", 2.0),
+        ] {
+            assert_eq!(
+                evaluate::<f64>(expression, &none).unwrap(),
+                expected,
+                "{expression}"
+            );
+        }
+        let shadowed = BTreeMap::from([("E".into(), 2.0)]);
+        assert_eq!(
+            evaluate::<f64>("E * PI", &shadowed).unwrap(),
+            2.0 * std::f64::consts::PI
+        );
+        for invalid in [
+            "LOG(10)",
+            "ROUND(1, 2, 3)",
+            "SGN(1, 2)",
+            "SGN()",
+            "1, 2",
+            "(1, 2)",
+        ] {
+            assert!(evaluate::<f64>(invalid, &none).is_err(), "{invalid}");
+        }
+        let integers = BTreeMap::from([("X".into(), -7i64)]);
+        assert_eq!(evaluate::<i64>("SGN(X) * NEG(X)", &integers).unwrap(), -7);
+        assert!(evaluate::<i64>("PI", &integers).is_err());
+        assert!(evaluate::<i64>("X > 0 ? LG(X) : 0", &integers).is_err());
+
+        let m = map(concat!(
+            "<Float Name='ShutterTemperature'><pValue>ShutterTemperatureValConv</pValue><Unit>K</Unit></Float>",
+            "<Converter Name='ShutterTemperatureValConv'><FormulaTo>(FROM - 273) * 100</FormulaTo><FormulaFrom>ROUND(((TO &gt; 32767 ? (TO - 65536) : TO) / 100),0) + 273</FormulaFrom><pValue>ShutterTempInternalReg</pValue><Slope>Varying</Slope></Converter>",
+            "<IntReg Name='ShutterTempInternalReg'><Address>0xE868</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Signed</Sign><Endianess>BigEndian</Endianess></IntReg>",
+            "<Float Name='AutoExposureTimeAbsLowerLimit'><pValue>N871</pValue></Float>",
+            "<Converter Name='N871'><pVariable Name='P1'>N1803</pVariable><FormulaTo>ROUND(FROM/P1,0)*P1</FormulaTo><FormulaFrom>TO</FormulaFrom><pValue>N1804</pValue><Slope>Increasing</Slope></Converter>",
+            "<Integer Name='N1803'><Value>35</Value></Integer>",
+            "<IntReg Name='N1804'><Address>0x100</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>BigEndian</Endianess></IntReg>",
+        ));
+        let mut io = Memory::default();
+        io.write_memory(0xe868, &2_549u32.to_be_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "ShutterTemperature").unwrap(), 298.0);
+        io.write_memory(0xe868, &65_036u32.to_be_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "ShutterTemperature").unwrap(), 268.0);
+        m.set(&mut io, "AutoExposureTimeAbsLowerLimit", "1000")
+            .unwrap();
+        assert_eq!(io.read_memory(0x100, 4).unwrap(), 1015u32.to_be_bytes());
+    }
+    #[test]
+    fn long_selector_chains_do_not_exhaust_the_nesting_limit() {
+        let m = map(concat!(
+            "<Enumeration Name='PixelFormat'><pValue>N195</pValue><EnumEntry Name='Mono8'><Value>0x01080001</Value></EnumEntry><EnumEntry Name='BayerRG8'><Value>0x01080009</Value></EnumEntry><EnumEntry Name='YUV422Packed'><Value>0x0210001f</Value></EnumEntry></Enumeration>",
+            "<IntConverter Name='N195'><FormulaTo>(FROM=0x01080001)?(1):((FROM=0x01100003)?(3):((FROM=0x010a0046)?(4):((FROM=0x01100005)?(5):((FROM=0x010C0006)?(6):((FROM=0x01080008)?(10):((FROM=0x01080009)?(11):((FROM=0x0108000a)?(12):((FROM=0x0108000b)?(13):((FROM=0x0110000c)?(14):((FROM=0x0110000d)?(15):((FROM=0x0110000e)?(16):((FROM=0x0110000f)?(17):((FROM=0x010a0056)?(51):((FROM=0x010a0058)?(52):((FROM=0x010a0052)?(54):((FROM=0x010a0054)?(53):((FROM=0x01100010)?(18):((FROM=0x01100011)?(20):((FROM=0x01100012)?(22):((FROM=0x01100013)?(24):((FROM=0x010c002a)?(19):((FROM=0x010c002b)?(21):((FROM=0x010c002c)?(23):((FROM=0x010c002d)?(25):((FROM=0x0210001f)?(43):((FROM=0x02100032)?(44):((FROM=0x02180014)?(30):((FROM=0x02180015)?(31):((FROM=0x02200017)?(33):(0xffffffff))))))))))))))))))))))))))))))</FormulaTo>",
+            "<FormulaFrom>(TO=1)?(0x01080001):((TO=3)?(0x01100003):((TO=4)?(0x010a0046):((TO=5)?(0x01100005):((TO=6)?(0x010C0006):((TO=10)?(0x01080008):((TO=11)?(0x01080009):((TO=12)?(0x0108000a):((TO=13)?(0x0108000b):((TO=14)?(0x0110000c):((TO=15)?(0x0110000d):((TO=16)?(0x0110000e):((TO=17)?(0x0110000f):((TO=51)?(0x010a0056):((TO=52)?(0x010a0058):((TO=54)?(0x010a0052):((TO=53)?(0x010a0054):((TO=18)?(0x01100010):((TO=20)?(0x01100011):((TO=22)?(0x01100012):((TO=24)?(0x01100013):((TO=19)?(0x010c002a):((TO=21)?(0x010c002b):((TO=23)?(0x010c002c):((TO=25)?(0x010c002d):((TO=43)?(0x0210001f):((TO=44)?(0x02100032):((TO=30)?(0x02180014):((TO=31)?(0x02180015):((TO=33)?(0x02200017):(0xffffffff))))))))))))))))))))))))))))))</FormulaFrom>",
+            "<pValue>N1528</pValue><Slope>Varying</Slope></IntConverter>",
+            "<IntReg Name='N1528'><Address>0x30024</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>BigEndian</Endianess></IntReg>",
+        ));
+        let mut io = Memory::default();
+        io.write_memory(0x30024, &11u32.to_be_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "PixelFormat").unwrap(), "BayerRG8");
+        m.set(&mut io, "PixelFormat", "YUV422Packed").unwrap();
+        assert_eq!(io.read_memory(0x30024, 4).unwrap(), 43u32.to_be_bytes());
+
+        let chain = |levels: usize| {
+            let mut formula = "(0)".to_string();
+            for level in (1..=levels).rev() {
+                formula = format!("(TO={level})?({level}):({formula})");
+            }
+            formula
+        };
+        let vars = BTreeMap::from([("TO".to_string(), 90i64)]);
+        assert_eq!(evaluate(&chain(100), &vars).unwrap(), 90);
+        assert_eq!(
+            evaluate(&chain(100).replace(['(', ')'], ""), &vars).unwrap(),
+            90
+        );
+        let flat = (1..=1000)
+            .map(|level| format!("TO={level}?{level}:"))
+            .collect::<String>()
+            + "0";
+        assert_eq!(evaluate(&flat, &vars).unwrap(), 90);
+        for deep in [
+            format!("{}1{}", "(".repeat(200), ")".repeat(200)),
+            format!("{}1", "-".repeat(200)),
+            format!("2{}", "**2".repeat(200)),
+            chain(200),
+        ] {
+            let error = evaluate::<i64>(&deep, &vars).unwrap_err().to_string();
+            assert!(error.contains("nesting"), "{error}");
+        }
+    }
+    #[test]
+    fn untaken_formula_branches_cannot_fail() {
+        let int = |expression: &str, vars: &[(&str, i64)]| {
+            let vars = vars.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+            evaluate::<i64>(expression, &vars)
+        };
+        let range = " ( ( MONO <> 1 ) ? 255 : ( ( BPP > 12 ) && ( ISPE = 1 ) ? ( 0xFFF << ( BPP - 12 ) ) : ( ( BPP > 16 ) && ( ISPE = 0 ) ? ( 0xFFFF << ( BPP - 16 ) ) : ( ( 1 << BPP) -1 ) ) ) ) ";
+        for (bpp, isp, max) in [(8, 1, 255), (12, 0, 4095), (16, 1, 65520)] {
+            let vars = [("MONO", 1), ("BPP", bpp), ("ISPE", isp)];
+            assert_eq!(int(range, &vars).unwrap(), max, "BPP={bpp}");
+        }
+        let option = "(FEAT<32)?((GEVOPT>>FEAT)&0x1):((FEAT<64)?((IPOPT>>(FEAT-32))&0x1) : ((FEAT=65)?MCCB:((FEAT=66)?SCCB:0)))";
+        for (feature, supported) in [(0, 0), (5, 1), (31, 1), (33, 1), (65, 1), (66, 0), (70, 0)] {
+            let vars = [
+                ("FEAT", feature),
+                ("GEVOPT", 0x8000_0020),
+                ("IPOPT", 0b10),
+                ("MCCB", 1),
+                ("SCCB", 0),
+            ];
+            assert_eq!(int(option, &vars).unwrap(), supported, "FEAT={feature}");
+        }
+        assert_eq!(int("(X <> 0) && (10 / X > 1)", &[("X", 0)]).unwrap(), 0);
+        assert_eq!(int("(X = 0) || (10 / X > 1)", &[("X", 0)]).unwrap(), 1);
+        let none = BTreeMap::new();
+        assert_eq!(evaluate::<f64>("0 ? LN(-1) * 2 : 3", &none).unwrap(), 3.0);
+        assert!(int("1 ? 1 / 0 : 0", &[]).is_err());
+        assert!(int("0 ? UNKNOWN : 0", &[]).is_err());
+        assert!(int("0 ? (1 : 0", &[]).is_err());
+    }
+    #[test]
+    fn float_bitwise_operands_truncate_toward_zero() {
+        let none = BTreeMap::new();
+        assert_eq!(evaluate::<f64>("~2.7", &none).unwrap(), -3.0);
+        assert_eq!(evaluate::<f64>("-2.5 & 0xFF", &none).unwrap(), 254.0);
+        assert!(evaluate::<f64>("1e19 & 1", &none).is_err());
+        let m = map(concat!(
+            "<Float Name='StrobeDelay'><pValue>StrobeDelayVal_Float</pValue><Unit>us</Unit></Float>",
+            "<Converter Name='StrobeDelayVal_Float'><pVariable Name='OLD'>StrobeLineDelay_Reg</pVariable><FormulaTo>( FROM * 1.024 ) &amp; 0x0000FFFF</FormulaTo><FormulaFrom>( TO / 1.024 + 0.5 ) &amp; 0x0000FFFF</FormulaFrom><pValue>StrobeLineDelay_Reg</pValue><Slope>Increasing</Slope></Converter>",
+            "<MaskedIntReg Name='StrobeLineDelay_Reg'><Address>0x1000</Address><Length>4</Length><AccessMode>RW</AccessMode><LSB>15</LSB><MSB>0</MSB><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></MaskedIntReg>",
+            "<Float Name='ContrastAbs'><pValue>N907</pValue></Float>",
+            "<Converter Name='N907'><FormulaTo>((FROM-1)*255)&gt;&gt;1</FormulaTo><FormulaFrom>((TO&lt;&lt;1)/255)+1</FormulaFrom><pValue>N908</pValue><Slope>Increasing</Slope></Converter>",
+            "<Integer Name='N908'><pValue>N1753</pValue></Integer>",
+            "<IntReg Name='N1753'><Address>0x2000</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>BigEndian</Endianess></IntReg>",
+        ));
+        let mut io = Memory::default();
+        io.write_memory(0x1000, &[0, 102, 0, 0]).unwrap();
+        assert_eq!(m.get(&mut io, "StrobeDelay").unwrap(), 100.0);
+        m.set(&mut io, "StrobeDelay", "100").unwrap();
+        assert_eq!(io.read_memory(0x1000, 4).unwrap(), [0, 102, 0, 0]);
+        m.set(&mut io, "ContrastAbs", "1.5").unwrap();
+        assert_eq!(io.read_memory(0x2000, 4).unwrap(), 63u32.to_be_bytes());
+    }
+    #[test]
+    fn integer_formulas_use_64_bit_integer_arithmetic() {
+        let int = |expression: &str, vars: &[(&str, i64)]| {
+            let vars = vars.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+            evaluate::<i64>(expression, &vars)
+        };
+        assert_eq!(int("10/4", &[]).unwrap(), 2);
+        assert_eq!(int("-7/2", &[]).unwrap(), -3);
+        assert_eq!(int("-7%3", &[]).unwrap(), -1);
+        assert_eq!(int("FROM * 4.0", &[("FROM", 5)]).unwrap(), 20);
+        assert_eq!(int("0xFFFFFFFFFFFFFFFF", &[]).unwrap(), -1);
+        assert_eq!(
+            int("ABS(MAXIMUM - INDEX-1)", &[("MAXIMUM", 4), ("INDEX", 10)]).unwrap(),
+            7
+        );
+        assert_eq!(int("X * 2", &[("X", i64::MAX)]).unwrap(), -2);
+        for invalid in [
+            "SQRT(16)", "ROUND(1)", "2.5*4", "1/0", "1%0", "1 << 64", "2**-1",
+        ] {
+            assert!(int(invalid, &[]).is_err(), "{invalid}");
+        }
+        assert_eq!(evaluate::<f64>("10/4", &BTreeMap::new()).unwrap(), 2.5);
+
+        let m = map(concat!(
+            "<Integer Name='RThg'><pValue>RThgValExpr</pValue><Min>1</Min><Max>4294959104</Max><Inc>1</Inc></Integer>",
+            "<IntSwissKnife Name='RThgValExpr'><pVariable Name='VAR_RTHGINTERNAL'>RThgInternalReg</pVariable><Formula>VAR_RTHGINTERNAL / 8192</Formula></IntSwissKnife>",
+            "<IntReg Name='RThgInternalReg'><Address>0xEA10</Address><Length>4</Length><AccessMode>RO</AccessMode><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>",
+            "<IntSwissKnife Name='CurrentWidthMax'><pVariable Name='REGWIDTHMAX'>RegWidthMax</pVariable><pVariable Name='REGOFFSETX'>RegOffsetX</pVariable><pVariable Name='REGWIDTHINC'>RegWidthInc</pVariable><Formula>((REGWIDTHMAX - REGOFFSETX)/REGWIDTHINC)*REGWIDTHINC</Formula></IntSwissKnife>",
+            "<Integer Name='RegWidthMax'><Value>2848</Value></Integer><Integer Name='RegOffsetX'><Value>10</Value></Integer><Integer Name='RegWidthInc'><Value>8</Value></Integer>",
+            "<IntSwissKnife Name='RegTimestampValue64'><pVariable Name='LO'>RegTimestampValueLo</pVariable><pVariable Name='HI'>RegTimestampValueHi</pVariable><Formula> (HI &lt;&lt; 32) | LO </Formula></IntSwissKnife>",
+            "<IntReg Name='RegTimestampValueHi'><Address>0x948</Address><Length>4</Length><AccessMode>RO</AccessMode><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>",
+            "<IntReg Name='RegTimestampValueLo'><Address>0x94C</Address><Length>4</Length><AccessMode>RO</AccessMode><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>",
+            "<IntSwissKnife Name='Low'><pVariable Name='TS'>Counter</pVariable><Formula>TS &amp; 0xFF</Formula></IntSwissKnife>",
+            "<IntReg Name='Counter'><Address>0x100</Address><Length>8</Length></IntReg>",
+            "<Integer Name='OffsetValue'><pValue>RegOffsetValueInt</pValue></Integer>",
+            "<IntConverter Name='RegOffsetValueInt'><FormulaTo> FROM * 4.0 </FormulaTo><FormulaFrom> TO / 4.0 </FormulaFrom><pValue>RegOffsetValue</pValue><Slope>Increasing</Slope></IntConverter>",
+            "<IntReg Name='RegOffsetValue'><Address>0x141D0</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>",
+        ));
+        let mut io = Memory::default();
+        io.write_memory(0xea10, &123_456u32.to_be_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "RThg").unwrap(), 15);
+        assert_eq!(m.get(&mut io, "CurrentWidthMax").unwrap(), 2832);
+        io.write_memory(0x948, &396_000_000u32.to_be_bytes())
+            .unwrap();
+        io.write_memory(0x94c, &12_345u32.to_be_bytes()).unwrap();
+        assert_eq!(
+            m.get(&mut io, "RegTimestampValue64").unwrap(),
+            json!(1_700_807_049_216_012_345i64)
+        );
+        io.write_memory(0x100, &u64::MAX.to_le_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "Low").unwrap(), 255);
+        io.write_memory(0x141d0, &7u32.to_be_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "OffsetValue").unwrap(), 1);
+        m.set(&mut io, "OffsetValue", "5").unwrap();
+        assert_eq!(io.read_memory(0x141d0, 4).unwrap(), 20u32.to_be_bytes());
     }
     #[test]
     fn unsigned_64_and_signed_registers() {
@@ -2527,6 +3137,32 @@ mod tests {
         indexed.set(&mut io, "M", "11").unwrap();
         assert_eq!(indexed.get(&mut io, "M").unwrap(), 11);
         assert_eq!(indexed.get(&mut io, "A").unwrap(), 0);
+    }
+    #[test]
+    fn converter_bounds_follow_the_slope_and_integer_increment() {
+        let m = map(concat!(
+            "<Integer Name='Temperature'><pValue>T</pValue></Integer>",
+            "<IntConverter Name='T'><FormulaTo>FROM &lt; 0 ? FROM + 65536 : FROM</FormulaTo><FormulaFrom>TO &gt; 32767 ? TO - 65536 : TO</FormulaFrom><pValue>Raw</pValue><Slope>Varying</Slope></IntConverter>",
+            "<Integer Name='Raw'><pValue>R</pValue><Min>0</Min><Max>65535</Max></Integer>",
+            "<IntReg Name='R'><Address>0</Address><Length>2</Length><AccessMode>RW</AccessMode></IntReg>",
+            "<Integer Name='Offset'><pValue>O</pValue></Integer>",
+            "<IntConverter Name='O'><FormulaTo>FROM * 4</FormulaTo><FormulaFrom>TO / 4.0</FormulaFrom><pValue>Raw</pValue><Slope>Increasing</Slope></IntConverter>",
+            "<Float Name='Scaled'><pValue>S</pValue></Float>",
+            "<Converter Name='S'><FormulaTo>FROM * 2</FormulaTo><FormulaFrom>TO / 2</FormulaFrom><pValue>Raw</pValue><Slope>Varying</Slope></Converter>",
+        ));
+        let mut io = Memory::default();
+        let full = Bounds {
+            inc: Some(1.0),
+            ..Bounds::default()
+        };
+        assert_eq!(m.bounds(&mut io, "Temperature").unwrap(), full);
+        m.set(&mut io, "Temperature", "-40").unwrap();
+        assert_eq!(m.get(&mut io, "Temperature").unwrap(), -40);
+        assert_eq!(
+            m.bounds(&mut io, "Offset").unwrap(),
+            bounds(0.0, 16383.0, Some(1.0))
+        );
+        assert_eq!(m.bounds(&mut io, "Scaled").unwrap(), Bounds::default());
     }
     #[test]
     fn dynamic_minimum_follows_the_lower_limit() {

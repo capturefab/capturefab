@@ -1432,9 +1432,14 @@ impl Decoder {
         };
         cmd.args(options);
         if matches!(scheme(source).as_deref(), Some("rtsp" | "rtsps")) {
+            // RTP interleaved over TCP first. A camera that answers SETUP with
+            // 461 Unsupported Transport gets RTP over UDP, the transport ONVIF
+            // requires of every camera; FFmpeg keeps rtsps on TCP.
             cmd.args([
+                "-rtsp_flags",
+                "prefer_tcp",
                 "-rtsp_transport",
-                "tcp",
+                "tcp+udp",
                 "-timeout",
                 &timeout.as_micros().max(1).to_string(),
             ]);
@@ -2809,8 +2814,33 @@ pub fn open_url_with(
         }
     })
 }
+/// FFmpeg's RTSP client copies the user name and password, as written in the
+/// address, into a 128-byte buffer and silently cuts what does not fit
+/// (`av_url_split` in `ff_rtsp_connect`), so the camera refuses a cut-off
+/// password.
+fn check_rtsp_userinfo(source: &str) -> Result<()> {
+    const MAX: usize = 127;
+    let Some((_, rest)) = source.split_once("://") else {
+        return Ok(());
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    match authority.rsplit_once('@') {
+        Some((userinfo, _)) if userinfo.len() > MAX => Err(Categorized::error(
+            ErrorKind::Unsupported,
+            format!(
+                "the user name and password for {} take {} bytes in the address, but FFmpeg's RTSP client keeps only {MAX}; use a shorter password (symbols and non-ASCII letters take 3 bytes or more when percent-encoded)",
+                redact_url(&crate::logins::strip_userinfo(source)),
+                userinfo.len()
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
 fn open_source(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
     validate_source(source)?;
+    if matches!(scheme(source).as_deref(), Some("rtsp" | "rtsps")) {
+        check_rtsp_userinfo(source)?;
+    }
     ensure!(
         !timeout.is_zero() && Instant::now().checked_add(timeout).is_some(),
         "media timeout must be positive and fit in the monotonic clock"
@@ -5579,6 +5609,11 @@ exit 1"#,
         let (kind, text) = code(open_url("rtsp://cam.local/live", timeout));
         assert_eq!(kind, Some("auth_required"), "{text}");
         assert!(text.contains("rtsp://cam.local/live"), "{text}");
+        // TCP first, then UDP for a camera that answers 461 to TCP.
+        assert_eq!(
+            fake.launches(&["-rtsp_flags prefer_tcp -rtsp_transport tcp+udp -timeout"]),
+            1
+        );
         let login = crate::logins::CameraLogin::new("ad min", "s3cret:pw").unwrap();
         let (kind, text) = code(open_url_with(
             "rtsp://cam.local/live",
@@ -5591,6 +5626,30 @@ exit 1"#,
         let (kind, text) = code(open_url("rtsp://admin:typed-pw@cam.local/live", timeout));
         assert_eq!(kind, Some("auth_rejected"), "{text}");
         assert!(!text.contains("typed-pw"), "{text}");
+        // FFmpeg keeps 127 bytes of `user:password`, percent-encoded.
+        let fits = format!("{}a", "!".repeat(40));
+        let login = crate::logins::CameraLogin::new("admin", &fits).unwrap();
+        let (kind, _) = code(open_url_with(
+            "rtsp://cam.local/live",
+            Some(&login),
+            timeout,
+        ));
+        assert_eq!(kind, Some("auth_rejected"));
+        assert_eq!(
+            fake.launches(&[&format!("admin:{}a@", "%21".repeat(40))]),
+            1
+        );
+        let long = format!("{}ab", "!".repeat(40));
+        let login = crate::logins::CameraLogin::new("admin", &long).unwrap();
+        let (kind, text) = code(open_url_with(
+            "rtsp://cam.local/live",
+            Some(&login),
+            timeout,
+        ));
+        assert_eq!(kind, Some("unsupported"), "{text}");
+        assert!(text.contains("rtsp://cam.local/live") && text.contains("128 bytes"));
+        assert!(!text.contains("%21"), "{text}");
+        assert_eq!(fake.launches(&["ab@cam.local"]), 0);
         for other in ["rtsp://cam.local/missing", "rtsp://cam.local/blocked"] {
             // Not a sign-in problem; the connection diagnosis may still
             // categorize it (a 404 is unavailable).

@@ -14,24 +14,26 @@ use std::{
 };
 
 const XML: &str = r#"<?xml version="1.0"?>
-<RegisterDescription ModelName="Replay camera" VendorName="Capturefab" StandardNameSpace="None">
+<RegisterDescription ModelName="Replay_camera" VendorName="Capturefab" StandardNameSpace="None" SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="0" MajorVersion="1" MinorVersion="0" SubMinorVersion="0" ProductGuid="acaec8d1-d871-4718-ad13-0fb687777a0f" VersionGuid="19078b75-ec62-42ff-a6db-16bc54a206fc" xmlns="http://www.genicam.org/GenApi/Version_1_1">
  <Category Name="Root"><pFeature>DeviceControl</pFeature><pFeature>ImageFormatControl</pFeature><pFeature>AcquisitionControl</pFeature></Category>
  <Category Name="DeviceControl"><pFeature>DeviceScanType</pFeature></Category>
- <Enumeration Name="DeviceScanType"><Value>0</Value><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Areascan"><Value>0</Value></EnumEntry></Enumeration>
+ <Enumeration Name="DeviceScanType"><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Areascan"><Value>0</Value></EnumEntry><Value>0</Value></Enumeration>
  <Category Name="ImageFormatControl"><pFeature>Width</pFeature><pFeature>Height</pFeature><pFeature>PixelFormat</pFeature><pFeature>PayloadSize</pFeature></Category>
  <Integer Name="Width"><Description>Output width; test data is scaled to fit with black borders. Stop acquisition before changing.</Description><pValue>WidthReg</pValue><Min>64</Min><Max>1920</Max><Inc>1</Inc></Integer>
- <IntReg Name="WidthReg"><Address>0x100</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
+ <IntReg Name="WidthReg"><Address>0x100</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
  <Integer Name="Height"><Description>Output height. Stop acquisition before changing.</Description><pValue>HeightReg</pValue><Min>64</Min><Max>1080</Max><Inc>1</Inc></Integer>
- <IntReg Name="HeightReg"><Address>0x104</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
- <Enumeration Name="PixelFormat"><Value>0x02180014</Value><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="RGB8"><Value>0x02180014</Value></EnumEntry></Enumeration>
+ <IntReg Name="HeightReg"><Address>0x104</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Enumeration Name="PixelFormat"><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="RGB8"><Value>0x02180014</Value></EnumEntry><Value>0x02180014</Value></Enumeration>
  <Integer Name="PayloadSize"><pValue>PayloadReg</pValue></Integer>
- <IntReg Name="PayloadReg"><Address>0x128</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
- <Category Name="AcquisitionControl"><pFeature>AcquisitionFrameRate</pFeature><pFeature>AcquisitionStart</pFeature><pFeature>AcquisitionStop</pFeature></Category>
+ <IntReg Name="PayloadReg"><Address>0x128</Address><Length>4</Length><AccessMode>RO</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Category Name="AcquisitionControl"><pFeature>AcquisitionMode</pFeature><pFeature>AcquisitionFrameRate</pFeature><pFeature>AcquisitionStart</pFeature><pFeature>AcquisitionStop</pFeature></Category>
  <Float Name="AcquisitionFrameRate"><Description>Playback frames per second. Videos are resampled; each still filename supplies one frame. Stop acquisition before changing.</Description><pValue>RateReg</pValue><Min>1</Min><Max>120</Max><Unit>Hz</Unit></Float>
  <FloatReg Name="RateReg"><Address>0x120</Address><Length>8</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></FloatReg>
+ <Enumeration Name="AcquisitionMode"><EnumEntry Name="Continuous"><Value>0</Value></EnumEntry><Value>0</Value></Enumeration>
  <Command Name="AcquisitionStart"><pValue>AcqReg</pValue><CommandValue>1</CommandValue></Command>
  <Command Name="AcquisitionStop"><pValue>AcqReg</pValue><CommandValue>0</CommandValue></Command>
- <IntReg Name="AcqReg"><Address>0x130</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
+ <IntReg Name="AcqReg"><Address>0x130</Address><Length>4</Length><AccessMode>WO</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Integer Name="TLParamsLocked"><Visibility>Invisible</Visibility><Value>0</Value><Min>0</Min><Max>1</Max></Integer>
 </RegisterDescription>"#;
 
 fn extension(path: &Path) -> String {

@@ -12,7 +12,7 @@ network streams as well as industrial cameras. Run `capturefab doctor --json` an
 | Document scanner | SANE `scanner:sane:DEVICE` on Linux, WIA `scanner:wia:ID` on Windows, ImageCaptureCore `scanner:ica:UUID` on macOS | On-demand page capture with resolution, mode and source settings; installed scanner driver and `scanner` build feature required; physical scanner compatibility has not been validated |
 | Built-in laptop camera or USB webcam/UVC capture device | AVFoundation on macOS, V4L2 on Linux, DirectShow on Windows | Capture; configure native size/frame rate and advertised `VideoMode` choices before acquisition; host device exposure/focus controls are not currently exposed |
 | Driver-backed Linux CSI camera | A usable `v4l2:/dev/videoN` endpoint | Same host capture path when the node delivers a format FFmpeg's V4L2 input supports; Raspberry Pi camera modules and Jetson Bayer sensors usually need a libcamera or Argus stream instead |
-| ONVIF camera | `onvif:http://HOST/onvif/device_service` or authenticated locator | Discovery and Media1 profile/RTSP URI resolution; ONVIF PTZ and imaging configuration are not implemented |
+| ONVIF camera | `onvif:http://HOST/onvif/device_service` or authenticated locator | Discovery and Media1/Media2 profile/RTSP URI resolution; ONVIF PTZ and imaging configuration are not implemented |
 | Camera on a Home Assistant, Frigate, go2rtc or UniFi Protect server | `hub:NAME/CAMERA` after `capturefab hub add-…` saves the server | Read-only frames from the hub's MJPEG stream, snapshots or RTSP restream; camera settings stay in the hub; `hubs` build feature required; not validated against physical cameras or particular hub versions |
 | RTSP, SRT, HTTP, RTMP, UDP, or supported video file | Direct URL or file path | Decode and capture; source configuration belongs to its camera/server |
 | DSLR/mirrorless clean HDMI | HDMI capture device visible to the operating system | Capture the HDMI video; camera menus configure exposure, focus, and HDMI output |
@@ -193,8 +193,9 @@ actually exposed by that model and operating system.
 
 ## ONVIF stream profiles
 
-Automatic ONVIF resolution tries every advertised Media1 profile and returns the
-ones with usable stream URIs. A failed profile does not prevent connection through
+Automatic ONVIF resolution tries every advertised Media1 profile, or Media2
+profile when the camera has no working Media1 service, and returns the ones with
+usable stream URIs. A failed profile does not prevent connection through
 another profile. When inspecting a specific profile with `capturefab onvif resolve
 http://HOST/onvif/device_service --profile TOKEN`, its failure is reported directly. If no profile resolves, the
 error includes the last stream-resolution failure. Connecting automatically tries

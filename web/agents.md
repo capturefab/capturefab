@@ -1034,7 +1034,7 @@ ONVIF credentials use `onvif://USER:PASS@HOST[:PORT]/onvif/device_service`.
 Percent-encode reserved characters in the username and password.
 Published session metadata redacts credentials.
 ONVIF SOAP supports HTTP, WS UsernameToken PasswordDigest and HTTP Basic/Digest authentication.
-HTTPS SOAP and Media2-only devices are unsupported.
+HTTPS SOAP is unsupported.
 
 ### Password-protected cameras
 
