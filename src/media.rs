@@ -1901,10 +1901,20 @@ struct Mode {
     /// bottom of `fps`: FFmpeg only opens a capability whose interval range
     /// holds the interval it derives from `-framerate`.
     intervals: Option<(u32, u32)>,
+    /// The smallest size of a DirectShow capability that takes any size up
+    /// to this mode's.
+    min_size: Option<(u32, u32)>,
 }
 impl Mode {
     fn size(&self) -> (u32, u32) {
         (self.width, self.height)
+    }
+    fn fits(&self, (width, height): (u32, u32)) -> bool {
+        self.size() == (width, height)
+            || self.min_size.is_some_and(|(low_width, low_height)| {
+                (low_width..=self.width).contains(&width)
+                    && (low_height..=self.height).contains(&height)
+            })
     }
     fn honors(&self, fps: f64) -> bool {
         self.fps
@@ -1956,6 +1966,7 @@ fn merge(mut modes: Vec<Mode>, mode: Mode) -> Vec<Mode> {
                 .intervals
                 .zip(mode.intervals)
                 .map(|((a, c), (b, d))| (a.max(b), c.max(d)));
+            m.min_size = m.min_size.or(mode.min_size);
         }
         None => modes.push(mode),
     }
@@ -2007,6 +2018,7 @@ fn avfoundation_modes(log: &str) -> Vec<Mode> {
                     fps: Some((high, high)),
                     input_format: None,
                     intervals: None,
+                    min_size: None,
                 });
             }
         }
@@ -2021,7 +2033,7 @@ fn dshow_modes(log: &str) -> Vec<Mode> {
                 let (size, fps) = text.split_once(" fps=")?;
                 Some((size, fps.split([' ', '(']).next()?))
             }
-            let ((_, slowest), (size, fastest)) = (caps(min)?, caps(max)?);
+            let ((smallest, slowest), (size, fastest)) = (caps(min)?, caps(max)?);
             let (low, high) = (rate(slowest)?, rate(fastest)?);
             let (width, height) = dimensions(size)?;
             let (fast, slow) = (dshow_intervals(fastest), dshow_intervals(slowest));
@@ -2036,6 +2048,11 @@ fn dshow_modes(log: &str) -> Vec<Mode> {
                 fps: Some((low.min(high), high)),
                 input_format: None,
                 intervals: intervals.filter(|(fast, slow)| fast <= slow),
+                min_size: dimensions(smallest).filter(|&(low_width, low_height)| {
+                    (low_width, low_height) != (width, height)
+                        && low_width <= width
+                        && low_height <= height
+                }),
             })
         })
         .fold(Vec::new(), merge)
@@ -2141,6 +2158,7 @@ fn v4l2_modes(
                     fps,
                     input_format,
                     intervals: None,
+                    min_size: None,
                 });
             }
         }
@@ -2762,7 +2780,7 @@ impl MediaBackend {
             return Ok(());
         }
         let index = best(&self.modes, |m| {
-            options.size.is_none_or(|size| m.size() == size)
+            options.size.is_none_or(|size| m.fits(size))
                 && options.fps.is_none_or(|fps| m.honors(fps))
         })
         .ok_or_else(|| {
@@ -2773,6 +2791,9 @@ impl MediaBackend {
         })?;
         let index = options.fps.map_or(index, |fps| self.raw_first(index, fps));
         self.select(index, options.fps);
+        if let Some(size) = options.size {
+            (self.width, self.height) = size;
+        }
         Ok(())
     }
     /// The first listed V4L2 mode of the size at `index` that reaches `fps`.
@@ -2848,10 +2869,8 @@ impl MediaBackend {
             _ => self.fps.to_string(),
         };
         let mut options = vec!["-framerate".to_string(), rate];
-        if let Some((width, height)) = self
-            .mode
-            .map(|i| self.modes[i].size())
-            .or(self.requested_size.then_some((self.width, self.height)))
+        if let Some((width, height)) =
+            (self.mode.is_some() || self.requested_size).then_some((self.width, self.height))
         {
             options.extend(["-video_size".into(), format!("{width}x{height}")]);
         }
@@ -3189,15 +3208,16 @@ impl RegisterIo for MediaBackend {
                         .iter()
                         .enumerate()
                         .filter(|(_, m)| {
+                            let (low_width, low_height) = m.min_size.unwrap_or(m.size());
                             if address == 0 {
-                                m.width == w
+                                (low_width..=m.width).contains(&w)
                             } else {
-                                m.height == h
+                                (low_height..=m.height).contains(&h)
                             }
                         })
                         .max_by_key(|&(index, m)| {
                             let current = self.mode == Some(index);
-                            (m.size() == (w, h), m.honors(self.fps), current, m.rank())
+                            (m.fits((w, h)), m.honors(self.fps), current, m.rank())
                         })
                         .map(|(index, _)| index)
                         .ok_or_else(|| self.unsupported(w, h, self.fps))?;
@@ -3207,6 +3227,9 @@ impl RegisterIo for MediaBackend {
                         self.raw_first(index, self.fps)
                     };
                     self.select(index, Some(self.fps));
+                    if self.modes[index].fits((w, h)) {
+                        (self.width, self.height) = (w, h);
+                    }
                 }
             }
             (20, 8) => {
@@ -3221,13 +3244,14 @@ impl RegisterIo for MediaBackend {
                     let size = (self.width, self.height);
                     let index = self
                         .mode
-                        .filter(|&i| self.modes[i].size() == size && self.modes[i].honors(value))
+                        .filter(|&i| self.modes[i].fits(size) && self.modes[i].honors(value))
                         .or_else(|| {
-                            best(&self.modes, |m| m.size() == size && m.honors(value))
+                            best(&self.modes, |m| m.fits(size) && m.honors(value))
                                 .map(|i| self.raw_first(i, value))
                         })
                         .ok_or_else(|| self.unsupported(size.0, size.1, value))?;
                     self.select(index, Some(value));
+                    (self.width, self.height) = size;
                 }
             }
             (28, 4) => {
@@ -7750,6 +7774,7 @@ Error opening input files: Input/output error
                     fps: Some((fps, fps)),
                     input_format: None,
                     intervals: None,
+                    min_size: None,
                 }
             });
         assert_eq!(slow[best(&slow, |_| true).unwrap()].label(), "640x480@15");
@@ -7818,6 +7843,7 @@ Error opening input files: Input/output error
                     fps: Some((5.0, 60.0)),
                     input_format: None,
                     intervals: None,
+                    min_size: None,
                 })
                 .collect(),
         );
@@ -7983,6 +8009,45 @@ Error opening input files: Input/output error
             })
             .unwrap();
         assert_eq!(camera.input_options()[..2], ["-framerate", "15"]);
+    }
+    #[test]
+    fn dshow_size_ranges_take_the_sizes_inside_them() {
+        let modes = dshow_modes(concat!(
+            "[dshow @ 000002a3c8b4e0c0]   vcodec=mjpeg  min s=1920x1080 fps=5 max s=1920x1080 fps=30\n",
+            "[dshow @ 000002a3c8b4e0c0]   pixel_format=bgr24  min s=320x240 fps=1 max s=1920x1080 fps=60\n",
+        ));
+        assert_eq!(modes[0].min_size, None);
+        assert_eq!(modes[1].min_size, Some((320, 240)));
+        let mut camera = native("dshow:video=Capture Filter", modes);
+        camera
+            .configure(NativeOptions {
+                size: Some((1280, 720)),
+                fps: Some(30.0),
+            })
+            .unwrap();
+        assert_eq!(camera.mode, Some(1));
+        assert_eq!(
+            camera.input_options(),
+            ["-framerate", "30", "-video_size", "1280x720"]
+        );
+        let nodes = crate::genicam::NodeMap::parse(&camera.xml().unwrap()).unwrap();
+        nodes.set(&mut camera, "Width", "640").unwrap();
+        nodes.set(&mut camera, "Height", "480").unwrap();
+        nodes
+            .set(&mut camera, "AcquisitionFrameRate", "15")
+            .unwrap();
+        assert_eq!(
+            camera.input_options(),
+            ["-framerate", "15", "-video_size", "640x480"]
+        );
+        assert!(
+            camera
+                .configure(NativeOptions {
+                    size: Some((160, 120)),
+                    fps: None,
+                })
+                .is_err()
+        );
     }
     #[test]
     fn v4l2_modes_take_a_compressed_format_where_raw_cannot_reach_the_rate() {
