@@ -101,6 +101,7 @@ This includes Linux sessions without `DISPLAY` or `WAYLAND_DISPLAY`.
 A source build without the `gui` feature exits 5 when run without a subcommand.
 
 Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported` and 6 `storage_full`.
+Argument-parsing usage errors add `error.details` with `kind`, `invalid`, `suggestions` (best first), `valid_values` and `usage` when known.
 Capturefab rejects malformed supplied fields before connection and before capture/forward `--set` or `--auto` changes.
 RPC and workflow commands reject unknown fields.
 Valid feature writes run in order; a later live failure does not reverse earlier writes.
@@ -126,7 +127,9 @@ capturefab --session bench status --json
 `--camera ID` targets a camera and keeps each desktop or browser participant's local selection.
 `select ID` sets the default for CLI calls without `--camera`.
 Persistent `start` and `auto` controls act on a connected camera; use `connect ID` first.
-Binary stdout captures use a temporary worker and cannot use `--session`.
+`connect` and `select` take the camera as an argument or from `--camera`/`CAPTUREFAB_CAMERA`.
+A selector matches an exact ID, serial or address first. A bare name such as `C920` that matches exactly one local camera's model or name, ignoring case, also opens it, and stderr names the camera chosen; several matches fail with exit 3 and list them. Hub cameras need their exact selector. Scripts should use the IDs from `discover`.
+Binary stdout captures use a temporary worker and cannot use `--session`; they refuse an interactive terminal (exit 2), so redirect or pipe them.
 Camera control can be exclusive, so use the existing session for an open camera.
 
 RPC `{"op":"frame","fresh":1,"max_dimension":1024}` returns a camera's newest frame with exposure and focus measurements and a base64 JPEG preview.

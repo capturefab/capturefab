@@ -128,6 +128,8 @@ Keep credentials out of logs, command transcripts and generated configuration fi
 | 5 | `unsupported` |
 | 6 | `storage_full` |
 
+An argument-parsing usage error (exit 2) has a one-line `message` and `error.details` with `kind` (such as `invalid_subcommand`, `unknown_argument` or `invalid_value`) and, when known, `invalid`, `suggestions` (best match first), `valid_values` and `usage`.
+
 `--timeout-ms` sets each frame or transport timeout from 1 to 60000 ms.
 `--request-timeout 5m` sets the session request deadline.
 Its default depends on the capture count.
@@ -258,7 +260,7 @@ With several sessions, specify `--session NAME`; otherwise the CLI returns `usag
 Use `sessions` to find the visible workspace.
 Use `--direct --camera ID` for a separate temporary worker.
 
-Binary stdout capture uses a temporary worker and cannot use `--session`.
+Binary stdout capture uses a temporary worker and cannot use `--session`; it refuses an interactive terminal (exit 2), so redirect or pipe it.
 Use `--direct` to override an environment session.
 Camera control can be exclusive.
 
@@ -278,6 +280,8 @@ Use the session name returned by `sessions`; it can differ from `gui`.
 Inspection, feature writes, capture, recording, XML and memory commands connect a missing `--camera` source to the session.
 Persistent controls such as `start` and `auto` act on connected cameras.
 Use `connect ID` first.
+`connect` and `select` take the camera as an argument or from `--camera`/`CAPTUREFAB_CAMERA`.
+A selector matches an exact ID, serial or address first. A bare name such as `C920` that matches exactly one local camera's model or name, ignoring case, also opens it, and stderr names the camera chosen; several matches fail with exit 3 and list them. Hub cameras need their exact selector. Scripts should use the IDs from `discover`.
 Desktop and browser camera selection stays local to each participant.
 `select ID` sets the default for CLI calls without `--camera`.
 Use explicit targets when sharing a session.

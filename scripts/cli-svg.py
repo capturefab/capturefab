@@ -29,8 +29,10 @@ def transcript(binary):
         lines = []
         for args in COMMANDS:
             result = subprocess.run([str(binary), *args], cwd=temp, env=env, capture_output=True, text=True, timeout=120)
-            if result.returncode or result.stderr:
-                raise SystemExit(f'capturefab {shlex.join(args)} exited {result.returncode}: {result.stderr.strip()}')
+            # Discovery suggests a next step on stderr; anything else there is a failure.
+            stderr = '\n'.join(line for line in result.stderr.splitlines() if not line.startswith(('Next: ', 'No GigE/USB3 Vision cameras answered')))
+            if result.returncode or stderr:
+                raise SystemExit(f'capturefab {shlex.join(args)} exited {result.returncode}: {stderr.strip()}')
             if 'discover' in args and not simulated_only(result.stdout):
                 raise SystemExit('discovery found real cameras; render on a machine without cameras so only the simulator appears')
             lines += ['$ capturefab ' + shlex.join(args)] + result.stdout.splitlines()

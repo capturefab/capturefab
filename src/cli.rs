@@ -1,4 +1,5 @@
 pub(crate) mod assistant;
+mod human;
 mod resources;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
@@ -29,7 +30,7 @@ use std::{
     version,
     about = "Discover, configure, capture and record cameras. No command opens the GUI.",
     long_about = "Capturefab is a camera workbench for people and automation. Camera commands use the only running GUI or headless session automatically. Use --session NAME to choose one, or --direct --camera ID for a temporary camera worker. Local output paths are relative to this terminal, including when controlling the GUI.",
-    after_help = "Quick start:\n  capturefab                                  Open the visible workbench\n  capturefab discover --simulate --json        Find sources (including a test camera)\n  capturefab --camera sim:0 capture -o shot.png Capture in the running workbench\n  capturefab --direct -c sim:0 capture -o shot.png\n  capturefab --session gui set ExposureTime=5000\n  capturefab workflow validate workflow.json\n  capturefab --session gui workflow apply workflow.json\n\nExplore: <command> --help, schema --json, doctor --json, completions <shell>.\nPersistent work: start/stop, auto/manual, capture --interval, record, jobs/cancel.\nUse --json for one versioned result; progress and diagnostics go to stderr."
+    after_help = "Quick start:\n  capturefab                                        Open the visible workbench\n  capturefab discover --simulate                    Find sources (including a test camera)\n  capturefab --camera sim:0 capture -o shot.png     Capture via the running workbench, or a temporary worker if none\n  capturefab --direct -c sim:0 capture -o shot.png  Always use a temporary worker\n  capturefab --session gui set ExposureTime=5000    Change a setting in the workbench\n  capturefab workflow validate workflow.json        Check a plan without cameras\n  capturefab --session gui workflow apply workflow.json\n\nExplore: <command> --help, schema --json, doctor --json, completions <shell>.\nPersistent work: start/stop, auto/manual, capture --interval, record, jobs/cancel.\nUse --json for one versioned result; progress and diagnostics go to stderr."
 )]
 pub struct Cli {
     /// Emit one versioned JSON result on stdout; diagnostics stay on stderr
@@ -427,6 +428,9 @@ pub enum Command {
         command: ToolsCommand,
     },
     /// Validate and apply repeatable multi-camera setup, capture and recording plans
+    #[command(
+        after_help = "Examples:\n  capturefab workflow validate line1.json                Check every step without cameras\n  capturefab --session bench workflow apply line1.json   Run the steps in a session\n  capturefab --session bench workflow apply --dry-run line1.json"
+    )]
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -444,7 +448,10 @@ pub enum Command {
         dataset: DatasetArg,
     },
     /// Discover GigE Vision, USB3 Vision, ONVIF, host cameras, document scanners and cameras on saved hubs
-    #[command(visible_aliases=["list","cameras"])]
+    #[command(
+        visible_aliases=["list","cameras"],
+        after_help = "Examples:\n  capturefab discover                      List cameras on this computer and network\n  capturefab discover --simulate           Include the built-in test camera sim:0\n  capturefab --json discover               One versioned JSON result for scripts\n  capturefab --timeout-ms 5000 discover    Wait longer for slow networks"
+    )]
     Discover,
     /// Host virtual GigE Vision, RTSP or ONVIF cameras using looping test data
     Simulate {
@@ -468,7 +475,11 @@ pub enum Command {
         features: Vec<String>,
     },
     /// Set one or more FEATURE=VALUE assignments (in the given order)
+    #[command(
+        after_help = "Examples:\n  capturefab -c sim:0 set ExposureTime=5000\n  capturefab -c sim:0 set Width=640 Height=480     Applied in order\n  capturefab -c sim:0 features --filter Exposure   Find feature names and bounds"
+    )]
     Set {
+        /// FEATURE=VALUE, e.g. ExposureTime=5000; see `features` for names
         #[arg(required = true)]
         assignments: Vec<String>,
     },
@@ -481,9 +492,20 @@ pub enum Command {
     /// Execute a GenICam command such as TriggerSoftware
     Execute { feature: String },
     /// Connect a camera in an existing persistent session
-    Connect { camera: String },
+    #[command(
+        after_help = "Examples:\n  capturefab discover                       List camera IDs\n  capturefab connect sim:0                  Connect the test camera\n  capturefab --camera 'avfoundation:HD Pro Webcam C920' connect\n  capturefab connect C920                   A unique model or name match also works"
+    )]
+    Connect {
+        /// Camera ID, serial, IP, media URI, hub:NAME/CAMERA or sim:0 (default: --camera / CAPTUREFAB_CAMERA)
+        #[arg(value_name = "CAMERA")]
+        target: Option<String>,
+    },
     /// Set the session's default camera for CLI calls without --camera
-    Select { camera: String },
+    Select {
+        /// Connected camera to make the default (default: --camera / CAPTUREFAB_CAMERA)
+        #[arg(value_name = "CAMERA")]
+        target: Option<String>,
+    },
     /// Observe all participants' actions, optionally waiting for a revision change
     Activity {
         /// Revision from a previous activity result; omit for immediate history
@@ -512,17 +534,24 @@ pub enum Command {
         revert: bool,
     },
     /// Record bounded video or forward frames to MediaMTX/NVR (RTSP, SRT, RTMP, UDP)
-    #[command(visible_alias = "record")]
+    #[command(
+        visible_alias = "record",
+        after_help = "Examples:\n  capturefab -c sim:0 record -o clip.mp4 --duration 30s\n  capturefab -c sim:0 record -o clip.mkv --codec h265 --fps 15 --duration 5m\n  capturefab -c sim:0 forward -o rtsp://localhost:8554/cam\n  capturefab --session bench record -o clip.mp4 --duration 1m --on-exists number"
+    )]
     Forward {
+        /// Local file (.mp4, .mov, .mkv, .ts, or .webm with av1) or a stream URL (rtsp://, srt://, rtmp://, udp://)
         #[arg(short = 'o', long)]
         output: String,
+        /// Video codec: h264, h265/hevc or av1
         #[arg(long, default_value = "h264")]
         codec: String,
         /// FFmpeg encoder name (e.g. libx264, h264_nvenc), or auto to probe available encoders
         #[arg(long, default_value = "auto")]
         encoder: String,
+        /// Output frame rate
         #[arg(long, default_value_t = 30.0)]
         fps: f64,
+        /// Target bitrate, e.g. 4M or 800k
         #[arg(long, default_value = "4M")]
         bitrate: String,
         /// Stop after this duration, e.g. 30s or 5m; the session ends the recording itself and the CLI waits for it. Omitted runs until Ctrl-C in direct mode
@@ -559,10 +588,14 @@ pub enum Command {
     /// Inspect bundled FFmpeg, codecs and supported protocols
     Ffmpeg,
     /// Capture complete frames to files; existing files are never overwritten
+    #[command(
+        after_help = "Examples:\n  capturefab -c sim:0 capture -o shot.png\n  capturefab -c sim:0 capture -n 50 --interval 2s -o 'line1/{camera}-{seq}.jpg'\n  capturefab -c sim:0 capture -n 10 -o frames/            A folder of frame-NNNNNN.png files\n  capturefab --direct -c sim:0 capture -o - > frame.png   One image to a pipe or file"
+    )]
     Capture {
         /// File, directory, or template with {camera} {date} {time} {datetime} {seq} {frame}; '-' writes one image to stdout
         #[arg(short = 'o', long)]
         output: String,
+        /// Number of frames (1-100000). With more than 1, a plain file name becomes a folder of frame-NNNNNN files; use {seq} or {frame} in a template to name them yourself
         #[arg(short='n',long,default_value_t=1,value_parser=clap::value_parser!(u32).range(1..=100_000))]
         count: u32,
         /// Image format; inferred from a single file/template extension, otherwise PNG
@@ -632,9 +665,14 @@ pub enum Command {
     /// Show the state of an existing persistent session
     Status,
     /// Run a persistent headless camera session in the foreground
+    #[command(
+        after_help = "Examples:\n  capturefab serve --name bench --camera sim:0      Keep a camera open for other commands\n  capturefab --session bench capture -o shot.png    Use it from another terminal\n  capturefab serve --name bench --listen 127.0.0.1:8787   Also serve the browser workbench"
+    )]
     Serve {
+        /// Session name other commands pass to --session
         #[arg(long, default_value = "bench")]
         name: String,
+        /// Start live acquisition as soon as the camera connects
         #[arg(long)]
         stream: bool,
         /// Serve the WASM remote workbench on this address (e.g. 100.64.0.1:8787)
@@ -818,6 +856,7 @@ impl<'a> Client<'a> {
                         request_timeout(cli, &SessionCommand::Status)?,
                         Some(&c.actor),
                     )?;
+                    note_loose_match(cli, selector, &result);
                     c.target = result["connected"]["id"].as_str().map(str::to_owned);
                 }
             } else {
@@ -831,10 +870,11 @@ impl<'a> Client<'a> {
         if cli.session.is_none()
             && let Some(selector) = &cli.camera
         {
-            c.call(SessionCommand::Connect {
+            let result = c.call(SessionCommand::Connect {
                 camera: selector.clone(),
                 timeout_ms: cli.timeout_ms,
             })?;
+            note_loose_match(cli, selector, &result);
         }
         Ok(c)
     }
@@ -880,6 +920,31 @@ impl<'a> Client<'a> {
         }
         Ok(result)
     }
+}
+
+/// Say on stderr which camera a loose name such as "C920" opened.
+fn note_loose_match(cli: &Cli, selector: &str, result: &Value) {
+    let connected = &result["connected"];
+    let Some(id) = connected["id"].as_str() else {
+        return;
+    };
+    if cli.json
+        || crate::camera::is_explicit_selector(selector)
+        || [
+            &connected["id"],
+            &connected["serial"],
+            &connected["address"],
+        ]
+        .iter()
+        .any(|value| value.as_str() == Some(selector))
+    {
+        return;
+    }
+    eprintln!(
+        "capturefab: using {} for '{}'",
+        crate::media::redact_url(id),
+        crate::media::redact_url(selector)
+    );
 }
 
 fn request_timeout(cli: &Cli, command: &SessionCommand) -> Result<Duration> {
@@ -1031,6 +1096,40 @@ fn input<T>(result: Result<T>) -> Result<T> {
             InvalidInput(format!("{error:#}")).into()
         }
     })
+}
+
+/// Refuse to dump image bytes into an interactive terminal, as curl does.
+fn binary_stdout_allowed(output: &str, stdout_is_terminal: bool) -> Result<()> {
+    ensure!(
+        output != "-" || !stdout_is_terminal,
+        "refusing to write a binary image to the terminal; redirect it (capture -o - > frame.png), pipe it, or use -o frame.png"
+    );
+    Ok(())
+}
+
+/// The camera `connect`/`select` name: their argument, else --camera or
+/// CAPTUREFAB_CAMERA. Two different cameras are a usage error.
+fn connect_target(cli: &Cli, target: &Option<String>) -> Result<String> {
+    match (target, &cli.camera) {
+        (Some(target), Some(camera)) => {
+            ensure!(
+                target == camera,
+                "two cameras given ({} and --camera {}); name one",
+                crate::media::redact_url(target),
+                crate::media::redact_url(camera)
+            );
+            Ok(target.clone())
+        }
+        (Some(camera), None) | (None, Some(camera)) => Ok(camera.clone()),
+        (None, None) => anyhow::bail!(
+            "{} needs a camera: capturefab {0} ID (find IDs with capturefab discover)",
+            if matches!(cli.command, Some(Command::Select { .. })) {
+                "select"
+            } else {
+                "connect"
+            }
+        ),
+    }
 }
 
 /// Prepare all command arguments before connecting or applying --set/--auto.
@@ -1185,12 +1284,12 @@ fn prepare_with(
         Some(Command::Execute { feature }) => Some(SessionCommand::Execute {
             feature: feature.clone(),
         }),
-        Some(Command::Connect { camera }) => Some(SessionCommand::Connect {
-            camera: camera.clone(),
+        Some(Command::Connect { target }) => Some(SessionCommand::Connect {
+            camera: connect_target(cli, target)?,
             timeout_ms: cli.timeout_ms,
         }),
-        Some(Command::Select { camera }) => Some(SessionCommand::Select {
-            camera: camera.clone(),
+        Some(Command::Select { target }) => Some(SessionCommand::Select {
+            camera: connect_target(cli, target)?,
         }),
         Some(Command::Capture {
             output,
@@ -1210,6 +1309,10 @@ fn prepare_with(
                 output != "-" || (cli.session.is_none() && !cli.json && *count == 1),
                 "binary stdout needs one frame, a direct --camera, and no --json"
             );
+            {
+                use std::io::IsTerminal;
+                binary_stdout_allowed(output, io::stdout().is_terminal())?;
+            }
             for setting in settings {
                 assignment(setting)?;
             }
@@ -1387,7 +1490,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
     {
         input(crate::workflow::resolve_selector(camera, &base))?;
     }
-    if let Some(Command::Connect { camera } | Command::Select { camera }) = &mut cli.command {
+    if let Some(Command::Connect { target } | Command::Select { target }) = &mut cli.command
+        && let Some(camera) = target
+    {
         input(crate::workflow::resolve_selector(camera, &base))?;
     }
     let mut prepared_tools = None;
@@ -1871,13 +1976,15 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Command::Execute { feature } => client.call(SessionCommand::Execute {
             feature: feature.clone(),
         })?,
-        Command::Connect { camera } => client.call(SessionCommand::Connect {
-            camera: camera.clone(),
-            timeout_ms: cli.timeout_ms,
-        })?,
-        Command::Select { camera } => client.call(SessionCommand::Select {
-            camera: camera.clone(),
-        })?,
+        Command::Connect { .. } => {
+            let command = prepared.clone().unwrap();
+            let result = client.call(command.clone())?;
+            if let SessionCommand::Connect { camera, .. } = &command {
+                note_loose_match(&cli, camera, &result);
+            }
+            result
+        }
+        Command::Select { .. } => client.call(prepared.clone().unwrap())?,
         Command::Forward {
             output: destination,
             duration,
@@ -2161,6 +2268,83 @@ pub fn run(mut cli: Cli) -> Result<()> {
     output(&cli, result)
 }
 
+/// The `--json` error for an argument-parsing failure: clap's first line
+/// as the message, and what an agent needs to fix it as `details`.
+pub fn clap_error_envelope(error: &clap::Error) -> Value {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let rendered = error.render().to_string();
+    let message = rendered
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("invalid usage");
+    let message = message.strip_prefix("error: ").unwrap_or(message);
+    let kind = match error.kind() {
+        ErrorKind::InvalidValue => "invalid_value".to_owned(),
+        ErrorKind::UnknownArgument => "unknown_argument".to_owned(),
+        ErrorKind::InvalidSubcommand => "invalid_subcommand".to_owned(),
+        ErrorKind::NoEquals => "no_equals".to_owned(),
+        ErrorKind::ValueValidation => "value_validation".to_owned(),
+        ErrorKind::TooManyValues => "too_many_values".to_owned(),
+        ErrorKind::TooFewValues => "too_few_values".to_owned(),
+        ErrorKind::WrongNumberOfValues => "wrong_number_of_values".to_owned(),
+        ErrorKind::ArgumentConflict => "argument_conflict".to_owned(),
+        ErrorKind::MissingRequiredArgument => "missing_required_argument".to_owned(),
+        ErrorKind::MissingSubcommand => "missing_subcommand".to_owned(),
+        ErrorKind::InvalidUtf8 => "invalid_utf8".to_owned(),
+        other => {
+            let mut name = String::new();
+            for (index, c) in format!("{other:?}").chars().enumerate() {
+                if c.is_ascii_uppercase() && index > 0 {
+                    name.push('_');
+                }
+                name.push(c.to_ascii_lowercase());
+            }
+            name
+        }
+    };
+    let strings = |kind: ContextKind| -> Vec<String> {
+        match error.get(kind) {
+            Some(ContextValue::String(value)) => vec![value.clone()],
+            Some(ContextValue::Strings(values)) => values.clone(),
+            Some(ContextValue::StyledStr(value)) => vec![value.to_string()],
+            Some(ContextValue::StyledStrs(values)) => {
+                values.iter().map(ToString::to_string).collect()
+            }
+            _ => Vec::new(),
+        }
+    };
+    let mut details = json!({"kind": kind});
+    // clap lists the closest match last; agents read the first.
+    let mut suggestions = strings(ContextKind::SuggestedSubcommand);
+    suggestions.extend(strings(ContextKind::SuggestedArg));
+    suggestions.extend(strings(ContextKind::SuggestedValue));
+    suggestions.reverse();
+    if !suggestions.is_empty() {
+        details["suggestions"] = json!(suggestions);
+    }
+    let invalid = [
+        ContextKind::InvalidSubcommand,
+        ContextKind::InvalidValue,
+        ContextKind::InvalidArg,
+    ]
+    .into_iter()
+    .flat_map(strings)
+    .find(|value| !value.is_empty());
+    if let Some(invalid) = invalid {
+        details["invalid"] = json!(invalid);
+    }
+    let valid = strings(ContextKind::ValidValue);
+    if !valid.is_empty() {
+        details["valid_values"] = json!(valid);
+    }
+    if let Some(usage) = strings(ContextKind::Usage).first() {
+        let usage = usage.trim();
+        details["usage"] = json!(usage.strip_prefix("Usage: ").unwrap_or(usage).trim());
+    }
+    json!({"version":1,"ok":false,"error":{"code":"usage","message":message,"details":details}})
+}
+
 pub fn write_json(value: &Value) -> Result<()> {
     let mut out = io::stdout().lock();
     serde_json::to_writer(&mut out, value)?;
@@ -2295,7 +2479,7 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             if cameras.is_empty() {
                 writeln!(
                     out,
-                    "No cameras connected. Use connect ID or --camera ID capture -o frame.png."
+                    "No cameras connected. Use capturefab connect ID, or add --camera ID to capture/record commands."
                 )?;
             }
         } else if let Some(camera) = value["connected"]["id"].as_str() {
@@ -2372,36 +2556,65 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             writeln!(out, "  {}", file.as_str().unwrap_or(""))?;
         }
     } else if let Some(devices) = value["devices"].as_array() {
-        if devices.is_empty() {
-            writeln!(
-                out,
-                "No cameras found. Try --simulate or a direct --camera IPv4 address."
-            )?;
-        } else {
-            writeln!(
-                out,
-                "{:<28} {:<10} {:<24} SERIAL",
-                "ID", "TRANSPORT", "MODEL"
-            )?;
-            for d in devices {
-                writeln!(
-                    out,
-                    "{:<28} {:<10} {:<24} {}",
-                    d["id"].as_str().unwrap_or(""),
-                    d["transport"].as_str().unwrap_or(""),
-                    d["model"]
-                        .as_str()
-                        .or_else(|| d["name"].as_str())
-                        .unwrap_or(""),
-                    d["serial"].as_str().unwrap_or("")
-                )?;
-            }
-        }
+        let kind = match &cli.command {
+            Some(Command::Native) => human::DeviceList::Native,
+            Some(Command::Scanners) => human::DeviceList::Scanners,
+            Some(Command::Onvif { .. }) => human::DeviceList::Onvif,
+            _ => human::DeviceList::Discover,
+        };
+        human::write_device_table(&mut out, devices, kind)?;
+        out.flush()?;
         if let Some(w) = value["warnings"].as_array() {
             for w in w {
                 eprintln!("capturefab: {}", w.as_str().unwrap_or(""));
             }
         }
+        for hint in human::next_steps(devices, kind) {
+            eprintln!("{hint}");
+        }
+    } else if let Some(scan) = value
+        .get("network_scan")
+        .filter(|_| matches!(&cli.command, Some(Command::NetworkScan)))
+        .and_then(|scan| serde_json::from_value::<crate::network::NetworkScan>(scan.clone()).ok())
+    {
+        crate::network::write_human(&scan, &mut out)?;
+        out.flush()?;
+        for warning in &scan.warnings {
+            eprintln!("capturefab: {warning}");
+        }
+    } else if matches!(&cli.command, Some(Command::Connect { .. }))
+        && let Some(id) = value["connected"]["id"].as_str()
+    {
+        let connected = &value["connected"];
+        let id = crate::media::redact_url(id);
+        let serial = connected["serial"]
+            .as_str()
+            .filter(|serial| !serial.is_empty() && *serial != connected["id"])
+            .map(|serial| format!(", S/N {serial}"))
+            .unwrap_or_default();
+        let session = cli
+            .session
+            .as_deref()
+            .map(|name| format!(" in session {name}"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "Connected {} ({id}{serial}){session}.",
+            connected["model"].as_str().unwrap_or("camera")
+        )?;
+        let camera = crate::hint::shell_quote(&id);
+        writeln!(
+            out,
+            "Next: capturefab --camera {camera} capture -o shot.png  ·  capturefab --camera {camera} start"
+        )?;
+    } else if matches!(&cli.command, Some(Command::Select { .. })) {
+        writeln!(
+            out,
+            "CLI calls without --camera now use {}.",
+            crate::media::redact_url(value["active_camera"].as_str().unwrap_or("no camera"))
+        )?;
+    } else if matches!(&cli.command, Some(Command::Disconnect)) {
+        writeln!(out, "Disconnected.")?;
     } else if let Some(features) = value["features"].as_array() {
         if let Some(camera) = value.get("camera") {
             writeln!(out, "{}", serde_json::to_string_pretty(camera)?)?;
@@ -2487,7 +2700,7 @@ fn command_schema(command: &clap::Command) -> Value {
     })
 }
 fn schema() -> Value {
-    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder; see destination list and volumes"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
+    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json; stdout must be a pipe or file, not a terminal","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder; see destination list and volumes"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     contract["tools"] = tools::schema_contract();
     contract["assistant"] = assistant::schema_contract();
@@ -3314,6 +3527,65 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn binary_images_never_go_to_an_interactive_terminal() {
+        let error = binary_stdout_allowed("-", true).unwrap_err();
+        assert!(error.to_string().contains("terminal"), "{error:#}");
+        binary_stdout_allowed("-", false).unwrap();
+        binary_stdout_allowed("frame.png", true).unwrap();
+    }
+    #[test]
+    fn connect_takes_its_argument_or_the_global_camera() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap();
+        let target = |cli: &Cli| match &cli.command {
+            Some(Command::Connect { target } | Command::Select { target }) => {
+                connect_target(cli, target)
+            }
+            _ => unreachable!(),
+        };
+        let cli = parse(&["capturefab", "connect", "sim:0"]);
+        assert_eq!(target(&cli).unwrap(), "sim:0");
+        let cli = parse(&["capturefab", "connect", "--camera", "sim:1"]);
+        assert_eq!(target(&cli).unwrap(), "sim:1");
+        let cli = parse(&["capturefab", "--camera", "sim:1", "select", "sim:1"]);
+        assert_eq!(target(&cli).unwrap(), "sim:1");
+        let cli = parse(&["capturefab", "connect", "sim:0", "--camera", "sim:1"]);
+        assert!(
+            target(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("two cameras")
+        );
+        let cli = parse(&["capturefab", "select"]);
+        assert!(
+            target(&cli)
+                .unwrap_err()
+                .to_string()
+                .starts_with("select needs a camera")
+        );
+    }
+    #[test]
+    fn clap_errors_become_one_line_with_details() {
+        let error = Cli::try_parse_from(["capturefab", "discovr"]).unwrap_err();
+        let envelope = clap_error_envelope(&error);
+        assert_eq!(envelope["error"]["code"], "usage");
+        assert_eq!(
+            envelope["error"]["message"],
+            "unrecognized subcommand 'discovr'"
+        );
+        assert_eq!(envelope["error"]["details"]["suggestions"][0], "discover");
+        assert_eq!(envelope["error"]["details"]["invalid"], "discovr");
+        let error = Cli::try_parse_from(["capturefab", "capture"]).unwrap_err();
+        let details = &clap_error_envelope(&error)["error"]["details"];
+        assert_eq!(details["kind"], "missing_required_argument");
+        assert!(
+            details["usage"]
+                .as_str()
+                .unwrap()
+                .starts_with("capturefab capture"),
+            "{details}"
+        );
+    }
     #[test]
     fn capture_contract_omits_retired_sensor_commands() {
         for command in ["signals", "log"] {

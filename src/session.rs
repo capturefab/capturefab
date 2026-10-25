@@ -1923,6 +1923,34 @@ impl SessionHandle {
         self.allow_hub_connect = false;
         self
     }
+    fn loose_camera(&self, camera: String) -> String {
+        if crate::camera::is_explicit_selector(&camera) {
+            return camera;
+        }
+        let resolution = crate::camera::resolve_selector(
+            &camera,
+            &self
+                .inner
+                .state
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .devices,
+        );
+        match resolution {
+            crate::camera::Resolution::Loose { info, matched_on } => {
+                locked(&self.inner.log).note(LogEntry::now_local(
+                    "info",
+                    format!(
+                        "Using {} for '{}' (matched its {matched_on})",
+                        crate::media::redact_url(&info.id),
+                        crate::media::redact_url(&camera)
+                    ),
+                ));
+                info.id
+            }
+            _ => camera,
+        }
+    }
     fn check_hub_connect(&self, camera: &str) -> Result<()> {
         ensure!(
             self.allow_hub_connect || !crate::hubs::is_source(camera),
@@ -2866,6 +2894,10 @@ impl SessionHandle {
                         .map(|device| device.address.clone().unwrap_or_else(|| device.id.clone()))
                         .unwrap_or(camera)
                 };
+                // A unique loose name ("C920") among cached cameras becomes
+                // that camera's ID, so connected workers and the permission
+                // check below see one identity. Hub cameras never match.
+                let camera = self.loose_camera(camera);
                 // Discovery and queued commands can change aliases after
                 // the HTTP server validates a request. Enforce the client's
                 // permission on the identity actually being connected.
@@ -3495,6 +3527,28 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("--allow-hubs"), "{error:#}");
         assert!(handle.workers().is_empty());
+        handle.shutdown();
+    }
+    #[test]
+    fn loose_names_resolve_to_one_local_camera_id_never_a_hub() {
+        let handle = SessionHandle::new();
+        let mut webcam = crate::transport::simulator::info_named("sim:0");
+        webcam.id = "avfoundation:HD Pro Webcam C920".into();
+        webcam.model = "HD Pro Webcam C920".into();
+        webcam.serial = webcam.id.clone();
+        let mut hub = crate::transport::simulator::info_named("sim:1");
+        hub.id = "hub:home/camera.front_door".into();
+        hub.model = "Front door".into();
+        hub.serial = "home/camera.front_door".into();
+        handle.inner.state.write().unwrap().devices = vec![webcam, hub];
+        assert_eq!(
+            handle.loose_camera("c920".into()),
+            "avfoundation:HD Pro Webcam C920"
+        );
+        // A hub camera keeps its exact selector, so the remote permission
+        // check always sees the hub identity.
+        assert_eq!(handle.loose_camera("front door".into()), "front door");
+        assert_eq!(handle.loose_camera("sim:3".into()), "sim:3");
         handle.shutdown();
     }
     #[test]

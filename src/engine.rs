@@ -1117,6 +1117,7 @@ fn process_plain(
                 && !crate::media::is_source(&selector)
                 && !crate::onvif::is_source(&selector)
                 && !crate::hubs::is_source(&selector)
+                && !crate::camera::needs_no_discovery(&selector)
                 && selector
                     .trim_start_matches("gige:")
                     .parse::<std::net::Ipv4Addr>()
@@ -1128,6 +1129,19 @@ fn process_plain(
                     h.log("warn", w);
                 }
                 h.state.write().unwrap_or_else(|e| e.into_inner()).devices = known.clone();
+            }
+            if !crate::camera::is_explicit_selector(&selector)
+                && let crate::camera::Resolution::Loose { info, matched_on } =
+                    crate::camera::resolve_selector(&selector, &known)
+            {
+                h.log(
+                    "info",
+                    format!(
+                        "Using {} for '{}' (matched its {matched_on})",
+                        crate::media::redact_url(&info.id),
+                        crate::media::redact_url(&selector)
+                    ),
+                );
             }
             *camera = Some(Camera::open(&selector, &known, duration)?);
             *h.frame.write().unwrap_or_else(|e| e.into_inner()) = None;

@@ -422,26 +422,94 @@ fn check_private_dir(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+/// No descriptor exists for this name. Only [`read_descriptor`] turns it
+/// into advice, so internal lookups never probe other sessions.
+#[derive(Debug)]
+struct MissingSession(String);
+impl std::fmt::Display for MissingSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = &self.0;
+        write!(
+            f,
+            "session '{name}' not found; run capturefab gui --name {name} or capturefab serve --name {name}"
+        )
+    }
+}
+impl std::error::Error for MissingSession {}
+
+/// Why `--session NAME` found nothing, naming the sessions that do run and
+/// the one a typo most likely meant.
+fn missing_session_error(name: &str, active: &[Descriptor]) -> anyhow::Error {
+    let message = if active.is_empty() {
+        format!(
+            "session '{name}' is not running, and no sessions are running; start one with capturefab gui --name {name} or capturefab serve --name {name}"
+        )
+    } else {
+        let running = active
+            .iter()
+            .map(|session| format!("{} ({})", session.name, kind_name(session.kind)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let close: Vec<_> = active
+            .iter()
+            .filter(|session| {
+                crate::hint::edit_distance(name, &session.name) <= 2 || {
+                    let (typed, candidate) = (name.to_lowercase(), session.name.to_lowercase());
+                    typed.len() >= 2
+                        && (candidate.starts_with(&typed) || typed.starts_with(&candidate))
+                }
+            })
+            .collect();
+        let guess = match close.as_slice() {
+            [session] => format!("; did you mean --session {}?", session.name),
+            _ => String::new(),
+        };
+        format!("session '{name}' is not running. Running sessions: {running}{guess}")
+    };
+    crate::types::Categorized::error(crate::types::ErrorKind::Unavailable, message)
+}
+fn kind_name(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Gui => "gui",
+        SessionKind::Serve => "serve",
+    }
+}
 pub fn read_descriptor(name: &str) -> Result<Descriptor> {
     let dir = runtime_dir();
     read_descriptor_in(&dir, name).map_err(|error| {
+        if !error.is::<MissingSession>() {
+            return error;
+        }
         let absent = |dir: &Path| {
             descriptor_path_in(dir, name).is_ok_and(|path| fs::symlink_metadata(path).is_err())
         };
         match service_runtime_dir() {
             Some((service, ..)) if service != dir && absent(&dir) && !absent(&service) => {
-                anyhow::anyhow!(
-                    "{error:#}; a session named {name} is in {}, where a service started without XDG_RUNTIME_DIR keeps it and this login does not look: `capturefab doctor` shows the fix under runtime_dir",
-                    service.display()
+                crate::types::Categorized::error(
+                    crate::types::ErrorKind::Unavailable,
+                    format!(
+                        "{error}; a session named {name} is in {}, where a service started without XDG_RUNTIME_DIR keeps it and this login does not look: `capturefab doctor` shows the fix under runtime_dir",
+                        service.display()
+                    ),
                 )
             }
-            _ => error,
+            _ => missing_session_error(name, &active_sessions().unwrap_or_default()),
         }
     })
 }
 fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
     let path = descriptor_path_in(dir, name)?;
-    let meta=fs::symlink_metadata(&path).with_context(||format!("session '{name}' not found; run capturefab gui --name {name} or capturefab serve --name {name}"))?;
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(MissingSession(name.into()).into());
+        }
+        Err(error) => {
+            return Err(anyhow::Error::from(error).context(format!(
+                "session '{name}' not found; run capturefab gui --name {name} or capturefab serve --name {name}"
+            )));
+        }
+    };
     ensure!(
         meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 4096,
         "invalid session descriptor"
@@ -615,11 +683,19 @@ impl Server {
         ensure_private_dir(dir)?;
         let path = descriptor_path_in(dir, name)?;
         let name_lock = lock_file(&dir.join(format!("{name}.session.lock")))?;
-        name_lock.try_lock_exclusive().with_context(|| {
-            format!(
-                "session '{name}' already exists; choose another --name or use --session {name}"
-            )
-        })?;
+        if let Err(error) = name_lock.try_lock_exclusive() {
+            if error.raw_os_error() != fs2::lock_contended_error().raw_os_error() {
+                return Err(anyhow::Error::from(error).context(format!(
+                    "session '{name}' already exists; choose another --name or use --session {name}"
+                )));
+            }
+            let owner = read_descriptor_in(dir, name)
+                .map(|owner| format!(" ({}, pid {})", kind_name(owner.kind), owner.pid))
+                .unwrap_or_default();
+            anyhow::bail!(
+                "session '{name}' is already running{owner}; use --session {name} to talk to it or choose another --name"
+            );
+        }
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         let address = listener.local_addr()?;
         let mut random = [0u8; 32];
@@ -639,7 +715,9 @@ impl Server {
         if let Ok(existing) = read_descriptor_in(dir, name) {
             ensure!(
                 !descriptor_active(&existing),
-                "session '{name}' already exists; choose another --name or use --session {name}"
+                "session '{name}' is already running ({}, pid {}); use --session {name} to talk to it or choose another --name",
+                kind_name(existing.kind),
+                existing.pid
             );
             fs::remove_file(&path)?;
         }
@@ -1153,6 +1231,57 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_session_names_the_running_ones_and_the_likely_typo() {
+        let address = "127.0.0.1:1".parse().unwrap();
+        let none = missing_session_error("bnech", &[]);
+        let bench = test_descriptor("bench", address);
+        let mut lab = test_descriptor("lab", address);
+        lab.kind = SessionKind::Gui;
+        let typo = missing_session_error("bnech", &[bench.clone(), lab.clone()]);
+        let unrelated = missing_session_error("factory", &[bench, lab]);
+        assert!(
+            none.to_string().contains("no sessions are running"),
+            "{none}"
+        );
+        assert!(
+            typo.to_string().contains(
+                "Running sessions: bench (serve), lab (gui); did you mean --session bench?"
+            ),
+            "{typo}"
+        );
+        assert!(
+            unrelated.to_string().contains("bench (serve)"),
+            "{unrelated}"
+        );
+        assert!(
+            !unrelated.to_string().contains("did you mean"),
+            "{unrelated}"
+        );
+        for error in [none, typo, unrelated] {
+            assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+            assert!(!format!("{error:#}").contains("os error"), "{error:#}");
+        }
+        let dir = TestDir::new();
+        let error = read_descriptor_in(&dir.0, "bnech").unwrap_err();
+        assert!(error.is::<MissingSession>(), "{error:#}");
+    }
+
+    #[test]
+    fn a_second_server_with_the_same_name_says_it_is_running() {
+        let dir = TestDir::new();
+        let handle = SessionHandle::new();
+        let _server =
+            Server::start_in(handle.clone(), "bench", SessionKind::Serve, &dir.0).unwrap();
+        let error = match Server::start_in(handle.clone(), "bench", SessionKind::Serve, &dir.0) {
+            Ok(_) => panic!("a second bench started"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("is already running (serve, pid"), "{error}");
+        assert!(!error.contains("os error"), "{error}");
+        handle.shutdown();
+    }
+
+    #[test]
     fn authenticated_probes_do_not_change_camera_state_or_activity() {
         let dir = TestDir::new();
         let handle = SessionHandle::new();
@@ -1468,7 +1597,9 @@ mod tests {
             .collect();
         assert_eq!(claims.iter().filter(|claim| claim.is_ok()).count(), 1);
         for error in claims.iter().filter_map(|claim| claim.as_ref().err()) {
-            assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+            let error = format!("{error:#}");
+            assert!(error.contains("already running"), "{error}");
+            assert!(!error.contains("os error"), "{error}");
         }
         let owner = read_descriptor_in(&dir.0, "stale").unwrap();
         assert_ne!(owner.token, descriptor.token);

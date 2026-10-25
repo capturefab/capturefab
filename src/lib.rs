@@ -35,6 +35,7 @@ pub mod frame;
 pub mod genicam;
 #[cfg(feature = "gui")]
 pub mod gui;
+pub mod hint;
 pub mod hubs;
 pub mod inspect;
 pub mod ipc;

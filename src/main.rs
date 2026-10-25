@@ -55,9 +55,7 @@ fn main() {
                 return;
             }
             if json_mode {
-                let _ = cli::write_json(
-                    &json!({"version":1,"ok":false,"error":{"code":"usage","message":e.to_string()}}),
-                );
+                let _ = cli::write_json(&cli::clap_error_envelope(&e));
             } else {
                 let _ = e.print();
             }

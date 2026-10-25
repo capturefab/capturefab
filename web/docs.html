@@ -225,7 +225,7 @@ capturefab --session gui start</code></pre><button class="copy-button" type="but
           <div class="table-scroll"><table><caption>Source examples</caption><thead><tr><th scope="col">Source</th><th scope="col">Locator</th><th scope="col">What to check</th></tr></thead><tbody>
             <tr><td>Simulator</td><td><code>sim:0</code>, <code>sim:1</code></td><td>Built in; useful for learning and scripts.</td></tr>
             <tr><td>GigE / USB3 Vision</td><td>Discovered ID, serial or <code>192.168.1.10</code></td><td>Network reachability or USB access.</td></tr>
-            <tr><td>macOS webcam</td><td><code>avfoundation:0</code></td><td>Use the ID returned by <code>native</code>.</td></tr>
+            <tr><td>macOS webcam</td><td><code>'avfoundation:FaceTime HD Camera'</code></td><td>Use the ID returned by <code>native</code> or <code>discover</code>; quote IDs that contain spaces. The index form <code>avfoundation:0</code> also works.</td></tr>
             <tr><td>Linux webcam</td><td><code>v4l2:/dev/video0</code></td><td>A supported host video driver and permission.</td></tr>
             <tr><td>Windows webcam</td><td><code>dshow:video=Camera Name</code></td><td>Use the exact device name.</td></tr>
             <tr><td>Network stream</td><td><code>rtsp://camera/live</code>, <code>srt://host:8890</code></td><td>Reachable stream and protocol support in FFmpeg.</td></tr>

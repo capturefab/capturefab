@@ -6,8 +6,8 @@
 <text x="600" y="25" text-anchor="middle" fill="#98989f" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="13">capturefab</text>
 <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace" font-size="15">
 <text x="28" y="83" xml:space="preserve" fill="#6aa1fa">$ <tspan fill="#ededf0">capturefab --simulate discover</tspan></text>
-<text x="28" y="105" xml:space="preserve" fill="#98989f">ID                           TRANSPORT  MODEL                    SERIAL</text>
-<text x="28" y="127" xml:space="preserve" fill="#98989f">sim:0                        simulator  Pattern camera           SIM0</text>
+<text x="28" y="105" xml:space="preserve" fill="#98989f">ID     TRANSPORT  MODEL           SERIAL</text>
+<text x="28" y="127" xml:space="preserve" fill="#98989f">sim:0  Simulator  Pattern camera  SIM0</text>
 <text x="28" y="149" xml:space="preserve" fill="#6aa1fa">$ <tspan fill="#ededf0">capturefab --camera sim:0 get Width Height PixelFormat</tspan></text>
 <text x="28" y="171" xml:space="preserve" fill="#98989f">Width                              640</text>
 <text x="28" y="193" xml:space="preserve" fill="#98989f">Height                             480</text>

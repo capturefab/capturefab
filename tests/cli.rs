@@ -1767,7 +1767,7 @@ fn stale_session_descriptor_is_replaced_but_live_one_is_kept() {
         dir: dir.clone(),
     };
     let (mut third, refused) = serve();
-    assert!(refused.contains("already exists"), "{refused}");
+    assert!(refused.contains("is already running"), "{refused}");
     third.wait().unwrap();
 }
 
@@ -5632,5 +5632,311 @@ fn resource_limits_are_automatic_persisted_and_reject_invalid_values_without_cam
     assert!(reset["policy"]["cpu_threads"].is_null());
     assert!(reset["policy"]["buffer_bytes"].is_null());
     assert!(reset["policy"].get("upload_bytes_per_second").is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn failure(out: &std::process::Output) -> Value {
+    serde_json::from_slice::<Value>(&out.stdout).unwrap_or_else(|_| {
+        panic!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })["error"]
+        .clone()
+}
+
+#[test]
+fn discover_prints_aligned_plain_rows_and_a_next_step() {
+    let root = temp_root("discover-table");
+    let out = cmd(
+        &root,
+        &["--direct", "--simulate", "--timeout-ms", "300", "discover"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.starts_with("ID "), "{stdout}");
+    let row = stdout
+        .lines()
+        .find(|line| line.starts_with("sim:0 "))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(
+        row.contains("Simulator") && row.contains("Pattern camera"),
+        "{row}"
+    );
+    assert!(!stdout.contains("Next:"), "hints stay off stdout: {stdout}");
+    assert!(stderr.contains("Next: capturefab --camera "), "{stderr}");
+    let result = json(
+        &root,
+        &[
+            "--json",
+            "--direct",
+            "--simulate",
+            "--timeout-ms",
+            "300",
+            "discover",
+        ],
+    );
+    let sim = result["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "sim:0")
+        .cloned()
+        .unwrap();
+    assert_eq!(sim["transport"], "simulator");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn camera_selectors_explain_what_did_not_match() {
+    let root = temp_root("selector-hints");
+    let out = cmd(
+        &root,
+        &[
+            "--json",
+            "--direct",
+            "--timeout-ms",
+            "300",
+            "--camera",
+            "sim0",
+            "info",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let error = failure(&out);
+    assert_eq!(error["code"], "unavailable");
+    assert!(
+        error["message"].as_str().unwrap().contains("sim:0"),
+        "{error}"
+    );
+    let out = cmd(
+        &root,
+        &["--json", "--direct", "--camera", "./missing.mp4", "info"],
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let error = failure(&out);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("file not found"),
+        "{error}"
+    );
+    let out = cmd(
+        &root,
+        &["--json", "--direct", "--camera", "192.168.1.300", "info"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        failure(&out)["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a valid IPv4 address")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn connect_takes_a_camera_argument_or_flag_and_reads_like_prose() {
+    let base = temp_root("connect-forms");
+    let root = base.join("sessions");
+    let cwd = base.join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&root, &cwd, "conn"),
+        dir: base.clone(),
+    };
+    let flag = json(
+        &root,
+        &[
+            "--json",
+            "--session",
+            "conn",
+            "connect",
+            "--camera",
+            "sim:0",
+        ],
+    );
+    assert_eq!(flag["connected"]["id"], "sim:0");
+    let global = json(
+        &root,
+        &[
+            "--json",
+            "--session",
+            "conn",
+            "--camera",
+            "sim:1",
+            "connect",
+        ],
+    );
+    assert_eq!(global["connected"]["id"], "sim:1");
+    let env = json_env(
+        &root,
+        &[("CAPTUREFAB_CAMERA", "sim:2")],
+        &["--json", "--session", "conn", "connect"],
+    );
+    assert_eq!(env["connected"]["id"], "sim:2");
+    let missing = cmd(&root, &["--json", "--session", "conn", "connect"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert_eq!(failure(&missing)["code"], "usage");
+    let both = cmd(
+        &root,
+        &[
+            "--json",
+            "--session",
+            "conn",
+            "connect",
+            "sim:0",
+            "--camera",
+            "sim:1",
+        ],
+    );
+    assert_eq!(both.status.code(), Some(2));
+    let human = cmd(&root, &["--session", "conn", "connect", "sim:3"]);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(!text.starts_with('{'), "{text}");
+    assert!(
+        text.contains("Connected ") && text.contains("(sim:3"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Next: capturefab --camera sim:3 capture"),
+        "{text}"
+    );
+    let selected = json(
+        &root,
+        &["--json", "--session", "conn", "select", "--camera", "sim:0"],
+    );
+    assert_eq!(selected["active_camera"], "sim:0");
+    let human = cmd(&root, &["--session", "conn", "select", "sim:1"]);
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout),
+        "CLI calls without --camera now use sim:1.\n"
+    );
+    // A session name typo points at the running session.
+    let typo = cmd(&root, &["--json", "--session", "conx", "status"]);
+    assert_eq!(typo.status.code(), Some(3));
+    let error = failure(&typo);
+    assert_eq!(error["code"], "unavailable");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("did you mean --session conn?"),
+        "{message}"
+    );
+    assert!(!message.contains("os error"), "{message}");
+}
+
+#[test]
+fn json_usage_errors_carry_structured_details() {
+    let root = temp_root("usage-details");
+    let out = cmd(&root, &["--json", "captur"]);
+    assert_eq!(out.status.code(), Some(2));
+    let error = failure(&out);
+    assert_eq!(error["code"], "usage");
+    assert_eq!(error["message"], "unrecognized subcommand 'captur'");
+    assert_eq!(error["details"]["kind"], "invalid_subcommand");
+    assert_eq!(error["details"]["suggestions"][0], "capture");
+    let out = cmd(&root, &["--json", "capture", "--bogus"]);
+    assert_eq!(out.status.code(), Some(2));
+    let error = failure(&out);
+    assert_eq!(error["details"]["invalid"], "--bogus");
+    assert!(
+        error["details"]["usage"]
+            .as_str()
+            .unwrap()
+            .starts_with("capturefab capture"),
+        "{error}"
+    );
+    assert!(
+        !error["message"].as_str().unwrap().contains('\n'),
+        "{error}"
+    );
+    let out = cmd(
+        &root,
+        &[
+            "--json",
+            "capture",
+            "-c",
+            "sim:0",
+            "-o",
+            "x.png",
+            "--on-exists",
+            "nope",
+        ],
+    );
+    let error = failure(&out);
+    assert_eq!(error["details"]["invalid"], "nope");
+    assert!(
+        !error["details"]["valid_values"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let human = cmd(&root, &["captur"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(human.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&human.stderr).contains("tip:"));
+}
+
+#[test]
+fn subcommand_help_shows_examples_and_describes_every_option() {
+    let root = temp_root("help-examples");
+    for command in [
+        "capture", "record", "discover", "set", "serve", "workflow", "connect",
+    ] {
+        let out = cmd(&root, &[command, "--help"]);
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Examples:"),
+            "{command}"
+        );
+    }
+    let schema = json(&root, &["--json", "schema"]);
+    let command = |name: &str| {
+        schema["cli"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    for (name, args) in [
+        ("capture", &["output", "count", "format"][..]),
+        ("forward", &["output", "codec", "fps", "bitrate"][..]),
+        ("connect", &["target"][..]),
+    ] {
+        let command = command(name);
+        for arg in command["arguments"].as_array().unwrap() {
+            if args.contains(&arg["name"].as_str().unwrap()) {
+                assert!(arg["description"].is_string(), "{name} {arg}");
+            }
+        }
+    }
+}
+
+#[test]
+fn network_scan_prints_a_readable_summary() {
+    let root = temp_root("network-human");
+    let out = cmd(&root, &["--direct", "--timeout-ms", "300", "network-scan"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("Adapters\n"), "{text}");
+    assert!(text.contains("GigE cameras"), "{text}");
     let _ = std::fs::remove_dir_all(root);
 }
