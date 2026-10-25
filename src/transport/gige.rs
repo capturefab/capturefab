@@ -388,17 +388,24 @@ impl Control {
             little_endian: false,
         })
     }
+    /// Wait for the device's advertised response time before retrying, so
+    /// slow commands are not retransmitted while they execute.
+    fn retry_wait(&self) -> Duration {
+        (self.timeout / 3)
+            .max(self.response + self.response.min(Duration::from_millis(100)))
+            .max(Duration::from_millis(1))
+    }
+    /// The time for three attempts, before any PENDING_ACK extension.
+    fn command_time(&self) -> Duration {
+        self.timeout.max(self.retry_wait() * 3)
+    }
     fn transact(&mut self, command: u16, payload: &[u8]) -> Result<Vec<u8>> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let packet = command_packet(command, id, 1, payload);
-        // Wait for the device's advertised response time before retrying, so
-        // slow commands are not retransmitted while they execute.
-        let retry_wait = (self.timeout / 3)
-            .max(self.response + self.response.min(Duration::from_millis(100)))
-            .max(Duration::from_millis(1));
+        let retry_wait = self.retry_wait();
         let start = Instant::now();
-        let mut deadline = start + self.timeout.max(retry_wait);
+        let mut deadline = start + self.command_time();
         let limit = self
             .pending_limit
             .map_or(deadline, |limit| deadline.max(start + limit));
@@ -827,10 +834,10 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
             control.restore_configuration = Some(configuration);
         }
         let heartbeat_timeout = control.read_register(HEARTBEAT_TIMEOUT)?;
-        let command_ms = control.timeout.max(response * 2).as_millis() as u32;
+        control.response = response;
+        let command_ms = control.command_time().as_millis() as u32;
         let heartbeat_ms = heartbeat_timeout.max(3000).max(command_ms * 2 + 1000);
         control.write_register(HEARTBEAT_TIMEOUT, heartbeat_ms)?;
-        control.response = response;
         // The command in flight holds the heartbeat back, so pending commands
         // must finish well within the heartbeat timeout.
         control.pending_limit = Some(Duration::from_millis(heartbeat_ms as u64 * 2 / 3));
@@ -2791,6 +2798,12 @@ mod tests {
         control.response = Duration::from_millis(400);
         assert_eq!(control.read_register(0x100).unwrap(), 42);
         assert_eq!(camera.join().unwrap(), 1);
+        // A lost acknowledgement is still retried within the command time.
+        let (address, camera) = slow_camera(None, Duration::from_millis(700));
+        let mut control = Control::connect(address, Duration::from_millis(150)).unwrap();
+        control.response = Duration::from_millis(400);
+        assert_eq!(control.read_register(0x100).unwrap(), 42);
+        assert_eq!(camera.join().unwrap(), 2);
     }
     #[test]
     fn connect_enables_pending_acks_and_restores_the_configuration() {
@@ -2802,12 +2815,13 @@ mod tests {
             });
             let gige = connect(fake.address, Duration::from_millis(200)).unwrap();
             assert_eq!(fake.register(GVCP_CONFIGURATION), configuration);
-            // Commands may take twice the response time, so the heartbeat
-            // timeout covers two of them.
-            assert_eq!(fake.register(HEARTBEAT_TIMEOUT), 9000);
+            // Three attempts each wait the response time plus a margin, and
+            // the heartbeat timeout covers two such commands.
+            assert_eq!(fake.register(HEARTBEAT_TIMEOUT), 13_600);
             let control = gige.control.lock().unwrap();
             assert_eq!(control.response, Duration::from_secs(2));
-            assert_eq!(control.pending_limit, Some(Duration::from_secs(6)));
+            assert_eq!(control.command_time(), Duration::from_millis(6300));
+            assert_eq!(control.pending_limit, Some(Duration::from_millis(9066)));
             drop(control);
             drop(gige);
             assert_eq!(fake.register(GVCP_CONFIGURATION), 0x1);
