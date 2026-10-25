@@ -110,6 +110,8 @@ pub struct FieldSpec {
 pub enum FieldKind {
     Camera,
     Destination,
+    /// A saved camera setup's name.
+    Setup,
     Duration,
     Time,
     Integer {

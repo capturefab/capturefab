@@ -1276,6 +1276,7 @@ mod tests {
             command: command.clone(),
             changes: 3,
             features: vec!["ExposureTime".into(), "Gain".into(), "Width".into()],
+            banked: Vec::new(),
             auto: false,
         });
         let impact = ToolImpact::from_checked(&checked, 0, 100);

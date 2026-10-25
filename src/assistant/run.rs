@@ -552,6 +552,34 @@ fn values(ctx: &Context, scope: &BTreeSet<String>) -> BTreeMap<(String, String),
         .collect()
 }
 
+/// Values a restore applied beyond the change count its check charged.
+fn setup_overrun(checked: &Checked, outcome: &tools::StepOutcome) -> u32 {
+    let charged: u64 = checked
+        .ops
+        .iter()
+        .map(|op| match op {
+            tools::Op::ApplySetup { changes, .. } => *changes as u64,
+            _ => 0,
+        })
+        .sum();
+    if !checked
+        .ops
+        .iter()
+        .any(|op| matches!(op, tools::Op::ApplySetup { .. }))
+    {
+        return 0;
+    }
+    let applied: u64 = outcome
+        .results
+        .iter()
+        .filter_map(|result| result["applied"].as_u64())
+        .sum();
+    applied
+        .saturating_sub(charged)
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
 fn auto_managed(snapshot: &SessionSnapshot, camera: &str, feature: &str) -> bool {
     let Some(camera) = snapshot
         .cameras
@@ -2227,6 +2255,18 @@ impl Runtime<'_> {
             Ok(outcome) => {
                 self.track(&checked, &before, &outcome, executor)?;
                 self.log("tool",json!({"call_id":call.id,"name":call.name,"risk":checked.risk,"args":checked.call.args,"outcome":"ok","summary":outcome.summary,"commands":outcome.results}))?;
+                // The worker compares a restore with the live camera and can
+                // write more values than the check charged; charge them, and
+                // stop the task when that exceeds its settings budget.
+                let overrun = setup_overrun(&checked, &outcome);
+                if overrun > 0 {
+                    self.limiter.record_tool(ToolImpact {
+                        setting_changes: overrun,
+                        ..ToolImpact::default()
+                    });
+                    self.limiter
+                        .check_tool(self.now(), &ToolImpact::default())?;
+                }
                 if let Some(slot_id) = self.facts.dataset.clone().filter(|slot| {
                     self.context
                         .snapshot
@@ -2668,7 +2708,12 @@ impl Runtime<'_> {
                         }
                     }
                 }
-                if checked.call.tool == "set_auto_exposure" {
+                // A restore turns Capturefab's auto exposure on or off as
+                // its setup says, so it owns or releases it the same way.
+                if matches!(
+                    checked.call.tool.as_str(),
+                    "set_auto_exposure" | "apply_camera_setup"
+                ) {
                     if state.auto.as_ref().is_some_and(|auto| auto.state != "off") {
                         self.owned_auto.insert(camera.clone());
                     } else {
@@ -2706,9 +2751,12 @@ impl Runtime<'_> {
             for result in &outcome.results {
                 read_after(result, &mut after);
             }
+            // A restore's result lists a bounded number of values, and the
+            // worker compares the live camera again, so read every value it
+            // changed back, as for auto and undo.
             if matches!(
                 checked.call.tool.as_str(),
-                "set_auto_exposure" | "undo_camera_change"
+                "set_auto_exposure" | "undo_camera_change" | "apply_camera_setup"
             ) || checked.call.tool == "run_camera_command"
                 && checked.call.args["command"]
                     .as_str()
@@ -2733,9 +2781,22 @@ impl Runtime<'_> {
                             .is_some_and(|feature| feature.ends_with("Selector"))
                     })
                 });
+            // Features a restore writes at a selector bank: putting back the
+            // value the camera reports restores only the selected bank.
+            let setup_banked: BTreeSet<&str> = checked
+                .ops
+                .iter()
+                .flat_map(|op| match op {
+                    tools::Op::ApplySetup { banked, .. } => banked.as_slice(),
+                    _ => &[],
+                })
+                .map(String::as_str)
+                .collect();
             let old_values = values(before, &self.facts.scope);
             for (feature, last) in after {
                 let key = (camera.clone(), feature.clone());
+                let needs_review = banked && !feature.ends_with("Selector")
+                    || setup_banked.contains(feature.as_str());
                 if let Some(previous) = old_values.get(&key) {
                     if let Some(row) = self
                         .record
@@ -2744,14 +2805,14 @@ impl Runtime<'_> {
                         .find(|row| row.camera == *camera && row.feature == feature)
                     {
                         row.last = last.clone();
-                        row.needs_review |= banked && !feature.ends_with("Selector");
+                        row.needs_review |= needs_review;
                     } else {
                         self.record.settings.push(SettingChange {
                             camera: camera.clone(),
                             feature: feature.clone(),
                             before: previous.clone(),
                             last: last.clone(),
-                            needs_review: banked && !feature.ends_with("Selector"),
+                            needs_review,
                         });
                     }
                     self.experiments.push(format!(
@@ -3064,6 +3125,14 @@ mod tests {
         sent: Arc<Mutex<Vec<SentCommand>>>,
         actor: Option<SessionActor>,
         fail_start: Arc<AtomicBool>,
+        restore: Arc<Mutex<Option<RestoreEffect>>>,
+    }
+    /// What the fixture worker does for `apply_setup`.
+    #[derive(Clone, Default)]
+    struct RestoreEffect {
+        values: Vec<(String, Value)>,
+        /// Turn Capturefab's auto exposure on.
+        auto: bool,
     }
     impl Host {
         fn new() -> Self {
@@ -3095,6 +3164,7 @@ mod tests {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 actor: None,
                 fail_start: Arc::new(AtomicBool::new(false)),
+                restore: Arc::default(),
             }
         }
         fn gain(&self, value: u32) {
@@ -3215,6 +3285,35 @@ mod tests {
                     Ok(json!({"streaming":state.streaming}))
                 }
                 SessionCommand::Status => Ok(serde_json::to_value(&*snapshot)?),
+                SessionCommand::ApplySetup { name, .. } => {
+                    let effect = self.restore.lock().unwrap().clone().unwrap_or_default();
+                    let state = snapshot
+                        .cameras
+                        .iter_mut()
+                        .find(|state| Some(state.info.id.as_str()) == camera)
+                        .unwrap();
+                    let mut changes = Vec::new();
+                    for (name, value) in &effect.values {
+                        let feature = Arc::make_mut(&mut state.features)
+                            .iter_mut()
+                            .find(|feature| feature.name == *name)
+                            .unwrap();
+                        changes.push(json!({"feature":name,"saved":value,"current":feature.value,"risk":"reversible"}));
+                        feature.value = Some(value.clone());
+                    }
+                    if effect.auto {
+                        state.auto = Some(crate::auto::AutoStatus {
+                            state: "converging".into(),
+                            managed: vec!["ExposureTime".into(), "Gain".into()],
+                            ..Default::default()
+                        });
+                    }
+                    Ok(json!({
+                        "setup":name,"match":"same_camera","warnings":[],"changes":changes,
+                        "unchanged":0,"not_applied":[],"applied":effect.values.len(),
+                        "auto":effect.auto,"camera_change":{"token":"change:setup","label":"Restore setup"},
+                    }))
+                }
                 SessionCommand::Execute { feature } if feature == "GainAutoOnce" => {
                     let state = snapshot
                         .cameras
@@ -3234,11 +3333,18 @@ mod tests {
     }
     struct Contexts {
         root: PathBuf,
+        setups: Vec<crate::setup::Setup>,
     }
     impl ContextSource for Contexts {
         fn gather(&self, host: &dyn ToolHost) -> Result<Context> {
             let mut ctx = fixture_context(host.snapshot()?);
             ctx.capture_root = self.root.clone();
+            ctx.setups = self
+                .setups
+                .iter()
+                .cloned()
+                .map(tools::context::SavedSetup::new)
+                .collect();
             Ok(ctx)
         }
     }
@@ -3261,7 +3367,10 @@ mod tests {
         let root = deps.log_directory.join("captures");
         std::fs::create_dir(&root).unwrap();
         deps.host = Arc::new(host.clone());
-        deps.context = Arc::new(Contexts { root });
+        deps.context = Arc::new(Contexts {
+            root,
+            setups: Vec::new(),
+        });
         deps.clock = Arc::new(ClockStub(AtomicU64::new(NOW)));
         (deps, script, host)
     }
@@ -3858,6 +3967,241 @@ mod tests {
                 .settings
                 .iter()
                 .any(|row| row.feature == "Gain" && row.last == "2")
+        );
+        cleanup(deps);
+    }
+
+    /// A setup saved from sim:0 with `values`.
+    fn saved_setup(values: Vec<(&str, Value)>, auto: bool) -> crate::setup::Setup {
+        let info = crate::transport::simulator::info_named("sim:0");
+        crate::setup::Setup {
+            version: 1,
+            name: "bench".into(),
+            saved_at: "2026-10-18T10:00:00Z".into(),
+            note: None,
+            camera: crate::setup::SavedCamera::from_info(&info),
+            auto: auto.then_some(crate::setup::SavedAuto { balance: 0.5 }),
+            values: values
+                .into_iter()
+                .map(|(feature, value)| crate::setup::SetupValue {
+                    feature: feature.into(),
+                    value: serde_json::from_value(value).unwrap(),
+                    at: Vec::new(),
+                })
+                .collect(),
+            skipped: Vec::new(),
+        }
+    }
+    fn restore_fixture(
+        setup: crate::setup::Setup,
+        effect: RestoreEffect,
+        extra: usize,
+    ) -> (Deps, Host) {
+        let (mut deps, _, host) = fixture(vec![
+            reply(
+                "restore",
+                "apply_camera_setup",
+                json!({"camera":"sim:0","name":"bench","allow_other_model":false}),
+            ),
+            finished(),
+        ]);
+        {
+            let mut snapshot = host.snapshot.lock().unwrap();
+            let camera = snapshot
+                .cameras
+                .iter_mut()
+                .find(|camera| camera.info.id == "sim:0")
+                .unwrap();
+            let mut features = camera.features.to_vec();
+            features.extend((0..extra).map(|i| {
+                crate::tools::tests::feature(&format!("Setting{i}"), "Integer", json!(0))
+            }));
+            camera.features = features.into();
+        }
+        *host.restore.lock().unwrap() = Some(effect);
+        deps.context = Arc::new(Contexts {
+            root: deps.log_directory.join("captures"),
+            setups: vec![setup],
+        });
+        (deps, host)
+    }
+
+    #[test]
+    fn a_restore_records_every_value_it_changed_and_none_as_a_persons() {
+        // 50 values change; the restore result lists only 40.
+        let values: Vec<(String, Value)> =
+            (0..50).map(|i| (format!("Setting{i}"), json!(1))).collect();
+        let setup = saved_setup(
+            values
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect(),
+            false,
+        );
+        let (deps, host) = restore_fixture(
+            setup,
+            RestoreEffect {
+                values,
+                auto: false,
+            },
+            50,
+        );
+        let mut req = request();
+        req.on_human_change = OnHumanChange::Pause;
+        let report = run_blocking(
+            req,
+            &deps,
+            Arc::new(Approvals::new(ApprovalScope::Once)),
+            &RunControl::default(),
+            &mut |event| {
+                assert!(
+                    !matches!(
+                        event,
+                        RunEvent::State(RunSnapshot {
+                            state: RunState::Paused,
+                            ..
+                        })
+                    ),
+                    "The run must recognize its own restore."
+                )
+            },
+        )
+        .unwrap();
+        assert_eq!(report.outcome, Outcome::Finished, "{}", report.summary);
+        assert_eq!(host.count("apply_setup"), 1);
+        let settings: Vec<_> = report
+            .restore
+            .settings
+            .iter()
+            .filter(|row| row.feature.starts_with("Setting") && row.last == "1")
+            .collect();
+        assert_eq!(settings.len(), 50);
+        assert_eq!(report.totals.setting_changes, 50);
+        cleanup(deps);
+    }
+
+    #[test]
+    fn a_restore_charges_values_the_worker_wrote_beyond_its_check() {
+        // The check sees every value already saved, so it charges none; the
+        // worker, comparing the live camera, writes five.
+        let values: Vec<(String, Value)> =
+            (0..5).map(|i| (format!("Setting{i}"), json!(0))).collect();
+        let setup = saved_setup(
+            values
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect(),
+            false,
+        );
+        for limit in [3, 5] {
+            let (deps, host) = restore_fixture(
+                setup.clone(),
+                RestoreEffect {
+                    values: values.clone(),
+                    auto: false,
+                },
+                5,
+            );
+            let mut req = request();
+            req.limits.max_setting_changes = limit;
+            let report = run(&deps, req, Arc::new(Approvals::new(ApprovalScope::Once)));
+            assert_eq!(host.count("apply_setup"), 1);
+            assert_eq!(report.totals.setting_changes, 5);
+            assert_eq!(
+                report.outcome,
+                if limit < 5 {
+                    Outcome::Limit
+                } else {
+                    Outcome::Finished
+                },
+                "{}",
+                report.summary
+            );
+            cleanup(deps);
+        }
+    }
+
+    #[test]
+    fn a_restore_marks_values_it_wrote_at_a_selector_bank_for_review() {
+        let mut setup = saved_setup(vec![("TriggerMode", json!("On"))], false);
+        setup.values[0].at = vec![crate::setup::Bank {
+            selector: "TriggerSelector".into(),
+            value: "FrameStart".into(),
+        }];
+        let (deps, host) = restore_fixture(
+            setup,
+            RestoreEffect {
+                values: vec![("TriggerMode".into(), json!("On"))],
+                auto: false,
+            },
+            0,
+        );
+        {
+            let mut snapshot = host.snapshot.lock().unwrap();
+            let camera = &mut snapshot.cameras[0];
+            let mut features = camera.features.to_vec();
+            features.push(crate::tools::tests::feature(
+                "TriggerSelector",
+                "Enumeration",
+                json!("FrameStart"),
+            ));
+            features.push(crate::tools::tests::feature(
+                "TriggerMode",
+                "Enumeration",
+                json!("Off"),
+            ));
+            camera.features = features.into();
+        }
+        let report = run(
+            &deps,
+            request(),
+            Arc::new(Approvals::new(ApprovalScope::Once)),
+        );
+        assert_eq!(report.outcome, Outcome::Finished, "{}", report.summary);
+        let row = report
+            .restore
+            .settings
+            .iter()
+            .find(|row| row.feature == "TriggerMode")
+            .unwrap();
+        assert_eq!((row.before.as_str(), row.last.as_str()), ("Off", "On"));
+        assert!(row.needs_review, "{row:?}");
+        cleanup(deps);
+    }
+
+    #[test]
+    fn a_restore_that_turns_on_auto_exposure_owns_it_and_records_exposure() {
+        let setup = saved_setup(vec![("ExposureTime", json!(5000.0))], true);
+        let (deps, _host) = restore_fixture(
+            setup,
+            RestoreEffect {
+                values: vec![("ExposureTime".into(), json!(5000.0))],
+                auto: true,
+            },
+            0,
+        );
+        let report = run(
+            &deps,
+            request(),
+            Arc::new(Approvals::new(ApprovalScope::Once)),
+        );
+        assert_eq!(report.outcome, Outcome::Finished, "{}", report.summary);
+        assert!(
+            report
+                .leftovers
+                .iter()
+                .any(|leftover| leftover.kind == "auto" && leftover.camera == "sim:0"),
+            "{:?}",
+            report.leftovers
+        );
+        assert!(
+            report
+                .restore
+                .settings
+                .iter()
+                .any(|row| row.feature == "ExposureTime" && row.last == "5000.0"),
+            "{:?}",
+            report.restore.settings
         );
         cleanup(deps);
     }

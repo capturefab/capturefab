@@ -48,7 +48,7 @@ const fn field(
 const NAME_FIELD: FieldSpec = field(
     "name",
     "Setup",
-    FieldKind::Text,
+    FieldKind::Setup,
     false,
     "A saved setup's name, from list_camera_setups.",
 );
@@ -105,9 +105,10 @@ pub const PREVIEW_CAMERA_SETUP: ToolSpec = ToolSpec {
          the values a restore would change (feature, saved, current, risk reversible or \
          disruptive, stream_locked), how many already match, values the camera cannot take \
          (not_applied with a reason), the model match and warnings, restarts_stream, and \
-         blocked when a recording or scheduled captures prevent the restore. At most 40 \
-         changes and 20 not-applied rows are listed, with truncated true; `capturefab setup \
-         diff` shows all. Read-only.",
+         blocked when a recording or scheduled captures prevent the restore, and approval \
+         (reversible or human_only, with approval_reason): what apply_camera_setup would \
+         need. At most 40 changes and 20 not-applied rows are listed, with truncated true; \
+         `capturefab setup diff` shows all. Read-only.",
     schema: setup_schema,
     fields: SETUP_FIELDS,
 };
@@ -179,22 +180,25 @@ fn find<'a>(ctx: &'a Context, name: &str) -> Option<&'a SavedSetup> {
 }
 
 fn not_found(ctx: &Context, name: &str) -> Issue {
-    let suggestion = ctx
-        .setups
-        .iter()
-        .map(|saved| saved.setup.name.as_str())
-        .filter(|candidate| crate::hint::is_close(name, candidate))
-        .min_by_key(|candidate| crate::hint::edit_distance(name, candidate))
-        .map(|close| format!(" Did you mean {close}?"))
-        .unwrap_or_default();
-    Issue::error(
-        Some("name"),
+    let name = name.trim();
+    let message = if let Some(problem) = &ctx.setups_problem {
+        format!("No readable setup is named {name}. {problem}")
+    } else if ctx.setups.is_empty() {
         format!(
-            "No saved setup is named {}.{suggestion} Choose one from list_camera_setups.",
-            name.trim()
-        ),
-        IssueCode::Unavailable,
-    )
+            "No saved setup is named {name}: no setups are saved. The user saves one with capturefab setup save NAME."
+        )
+    } else {
+        let suggestion = ctx
+            .setups
+            .iter()
+            .map(|saved| saved.setup.name.as_str())
+            .filter(|candidate| crate::hint::is_close(name, candidate))
+            .min_by_key(|candidate| crate::hint::edit_distance(name, candidate))
+            .map(|close| format!(" Did you mean {close}?"))
+            .unwrap_or_default();
+        format!("No saved setup is named {name}.{suggestion} Choose one from list_camera_setups.")
+    };
+    Issue::error(Some("name"), message, IssueCode::Unavailable)
 }
 
 /// Warnings for a match, without the serial number another camera has.
@@ -268,6 +272,13 @@ pub(crate) fn read(
         )
         .map_err(|error| vec![Issue::failed(&error, &call.args, origin)])?;
     let mut summary = summary(report);
+    // What apply_camera_setup's check would ask for, from the same
+    // comparison, so preview and restore agree.
+    let assessed = assess(&saved.setup, camera);
+    summary["approval"] = json!(assessed.risk());
+    if let Some(reason) = assessed.reasons().into_iter().next() {
+        summary["approval_reason"] = json!(reason);
+    }
     // The diff names the setup the store holds now; say so when it is no
     // longer the one this context loaded.
     if summary["digest"].as_str() != Some(saved.digest.as_str()) {
@@ -311,6 +322,9 @@ fn list_setups(ctx: &Context, camera: Option<&CameraSnapshot>) -> Value {
     });
     if let Some(camera) = camera {
         result["camera"] = json!(camera.info.id);
+    }
+    if let Some(problem) = &ctx.setups_problem {
+        result["warnings"] = json!([problem]);
     }
     result
 }
@@ -390,22 +404,42 @@ enum Preview {
     Unknown,
 }
 
-fn preview(value: &SetupValue, camera: &CameraSnapshot) -> Preview {
-    if !value.at.is_empty() {
-        return Preview::Unknown;
+/// The text of a reported value, as a fact shows it.
+fn text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
-    let Some(feature) = camera.features.iter().find(|f| f.name == value.feature) else {
-        return Preview::Unknown;
+}
+
+/// Compare `value` with the snapshot, with the current value's text when
+/// the snapshot reports it. A banked value compares when every bank's
+/// selector currently reports that bank, since the snapshot reads features
+/// at the selected bank; other banks stay unknown.
+fn preview(value: &SetupValue, camera: &CameraSnapshot) -> (Preview, Option<String>) {
+    let reported = |name: &str| {
+        camera
+            .features
+            .iter()
+            .find(|f| f.name == name)
+            .and_then(|f| f.value.as_ref().map(|value| (f, value)))
     };
-    let Some(live) = feature.value.as_ref() else {
-        return Preview::Unknown;
+    let selected = value.at.iter().all(|bank| {
+        reported(&bank.selector).is_some_and(|(_, selected)| text(selected) == bank.value)
+    });
+    if !selected {
+        return (Preview::Unknown, None);
+    }
+    let Some((feature, live)) = reported(&value.feature) else {
+        return (Preview::Unknown, None);
     };
-    match (&value.value, live) {
+    let current = Some(text(live));
+    let preview = match (&value.value, live) {
         (Scalar::Bool(saved), Value::Bool(live)) => same(saved == live),
         (Scalar::String(saved), Value::String(live)) => same(saved == live),
         (Scalar::Number(saved), Value::Number(live)) => {
             let (Some(saved), Some(live)) = (saved.as_f64(), live.as_f64()) else {
-                return Preview::Unknown;
+                return (Preview::Unknown, current);
             };
             let tolerance = match feature.inc.filter(|inc| inc.is_finite() && *inc > 0.0) {
                 Some(inc) => inc / 2.0,
@@ -414,13 +448,105 @@ fn preview(value: &SetupValue, camera: &CameraSnapshot) -> Preview {
             same((saved - live).abs() <= tolerance)
         }
         _ => Preview::Unknown,
-    }
+    };
+    (preview, current)
 }
 fn same(equal: bool) -> Preview {
     if equal {
         Preview::Same
     } else {
         Preview::Change
+    }
+}
+
+/// A setup compared with a camera's last reading: the values that differ
+/// and those the reading cannot answer. The restore check and the
+/// preview's `approval` both use it, so they agree.
+struct Assessed<'a> {
+    /// Values that may change, in setup order, with the current value
+    /// when the snapshot reports it.
+    rows: Vec<(&'a SetupValue, Preview, Option<String>)>,
+}
+
+fn assess<'a>(setup: &'a crate::setup::Setup, camera: &CameraSnapshot) -> Assessed<'a> {
+    Assessed {
+        rows: setup
+            .values
+            .iter()
+            .filter_map(|value| {
+                let (preview, current) = preview(value, camera);
+                (preview != Preview::Same).then_some((value, preview, current))
+            })
+            .collect(),
+    }
+}
+
+impl Assessed<'_> {
+    fn features(&self) -> BTreeSet<String> {
+        self.rows.iter().map(|(v, ..)| v.feature.clone()).collect()
+    }
+    /// Features outside the image-quality allowlist that may change.
+    fn disruptive(&self) -> Vec<String> {
+        self.features()
+            .into_iter()
+            .filter(|feature| !risk::image_quality(feature))
+            .collect()
+    }
+    fn uncompared(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|(_, preview, _)| *preview == Preview::Unknown)
+            .count()
+    }
+    fn risk(&self) -> Risk {
+        if self.disruptive().is_empty() {
+            Risk::Reversible
+        } else {
+            Risk::HumanOnly
+        }
+    }
+    /// Why a person must approve: the values outside the allowlist that
+    /// differ, then those the last reading could not compare.
+    fn reasons(&self) -> Vec<String> {
+        let outside = |preview: Preview| {
+            let mut labels = Vec::new();
+            for (value, row, _) in &self.rows {
+                if *row == preview && !risk::image_quality(&value.feature) {
+                    let label = if preview == Preview::Change {
+                        value.feature.clone()
+                    } else {
+                        label(value)
+                    };
+                    if !labels.contains(&label) {
+                        labels.push(label);
+                    }
+                }
+            }
+            labels
+        };
+        let named = |labels: Vec<String>| {
+            let shown: Vec<&str> = labels.iter().take(3).map(String::as_str).collect();
+            match labels.len().saturating_sub(shown.len()) {
+                0 => list(&shown),
+                more => format!("{} and {} more", shown.join(", "), grouped(more as u64)),
+            }
+        };
+        let mut reasons = Vec::new();
+        let changed = outside(Preview::Change);
+        if !changed.is_empty() {
+            reasons.push(format!(
+                "Changes {}, outside the image-quality allowlist.",
+                named(changed)
+            ));
+        }
+        let unknown = outside(Preview::Unknown);
+        if !unknown.is_empty() {
+            reasons.push(format!(
+                "Could not compare {} from the last reading; preview_camera_setup shows the exact difference.",
+                named(unknown)
+            ));
+        }
+        reasons
     }
 }
 
@@ -466,24 +592,16 @@ pub(crate) fn check(ctx: &Context, plan: &mut PlanState, checked: &mut Checked) 
     if matched == Match::OtherModel && !args.allow_other_model {
         checked.issue(Issue::error(
             Some("allow_other_model"),
-            sentence(&crate::setup::other_model_message(setup, &snapshot.info)),
+            crate::setup::other_model_message(setup, &snapshot.info),
             IssueCode::Unsupported,
         ));
     }
     for warning in match_warnings(matched, saved, &snapshot.info) {
         checked.warning("name", warning);
     }
-    let changes: Vec<&SetupValue> = setup
-        .values
-        .iter()
-        .filter(|value| preview(value, snapshot) != Preview::Same)
-        .collect();
-    let features: BTreeSet<String> = changes.iter().map(|v| v.feature.clone()).collect();
-    let disruptive: Vec<String> = features
-        .iter()
-        .filter(|feature| !risk::image_quality(feature))
-        .cloned()
-        .collect();
+    let assessed = assess(setup, snapshot);
+    let features = assessed.features();
+    let disruptive = assessed.disruptive();
     let locked: Vec<&str> = features
         .iter()
         .map(String::as_str)
@@ -528,19 +646,19 @@ pub(crate) fn check(ctx: &Context, plan: &mut PlanState, checked: &mut Checked) 
     } else if auto_on {
         checked.warning("name", "Restoring turns auto exposure off.");
     }
-    if !disruptive.is_empty() {
+    // A restore that cannot run is refused with its own error before any
+    // approval is asked for.
+    if !checked.ready() {
+        return;
+    }
+    if assessed.risk() == Risk::HumanOnly {
         // Each such restore needs its own approval: a grant for one setup
         // never covers another that changes how the camera triggers or
         // signals other equipment.
         checked.risk = checked.risk.max(Risk::HumanOnly);
-        checked.reasons.push(format!(
-            "May change {}, outside the image-quality allowlist.",
-            list(&disruptive.iter().map(String::as_str).collect::<Vec<_>>())
-        ));
+        checked.reasons.extend(assessed.reasons());
     }
-    if !checked.ready() {
-        return;
-    }
+    let changes = &assessed.rows;
     checked.facts.push((
         "Setup".into(),
         format!(
@@ -554,22 +672,38 @@ pub(crate) fn check(ctx: &Context, plan: &mut PlanState, checked: &mut Checked) 
     checked
         .facts
         .push(("Match".into(), matched.as_str().replace('_', " ")));
+    let uncompared = assessed.uncompared();
+    let differ = changes.len() - uncompared;
     checked.facts.push((
         "Changes".into(),
         if changes.is_empty() {
             "None: the camera already reports every saved value.".into()
         } else {
             format!(
-                "{} of {} values may change; the camera compares them again before writing.",
-                grouped(changes.len() as u64),
+                "{} of {} values differ from the last reading; the camera compares them again before writing.",
+                grouped(differ as u64),
                 grouped(setup.values.len() as u64)
             )
         },
     ));
-    for value in changes.iter().take(MAX_FACTS) {
-        checked
-            .facts
-            .push((label(value), format!("→ {}", value.value.text())));
+    if uncompared > 0 {
+        checked.facts.push((
+            "Not compared".into(),
+            format!(
+                "{} values at other selector banks or not in the last reading may also change.",
+                grouped(uncompared as u64)
+            ),
+        ));
+    }
+    for (value, _, current) in changes.iter().take(MAX_FACTS) {
+        checked.facts.push((
+            label(value),
+            format!(
+                "{} → {}",
+                current.as_deref().unwrap_or("not compared"),
+                value.value.text()
+            ),
+        ));
     }
     if changes.len() > MAX_FACTS {
         checked.facts.push((
@@ -597,11 +731,20 @@ pub(crate) fn check(ctx: &Context, plan: &mut PlanState, checked: &mut Checked) 
         .entry(selector)
         .or_default()
         .extend(features.iter().cloned());
+    let banked = setup
+        .values
+        .iter()
+        .filter(|value| !value.at.is_empty() && features.contains(&value.feature))
+        .map(|value| value.feature.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
     checked.ops.push(Op::ApplySetup {
         camera,
         command,
         changes: changes.len(),
         features: features.into_iter().collect(),
+        banked,
         auto: setup.auto.is_some(),
     });
 }
@@ -818,9 +961,210 @@ mod tests {
             SessionCommand::ApplySetup { confirmed_disruptive: Some(confirmed), .. }
                 if confirmed == &["TriggerMode"]
         ));
+        // The fixture lists no TriggerSelector, so the bank is not compared.
+        assert!(
+            checked.reasons.iter().any(|r| r
+                == "Could not compare TriggerMode [TriggerSelector=FrameStart] from the last reading; preview_camera_setup shows the exact difference."),
+            "{:?}",
+            checked.reasons
+        );
         assert!(checked.facts.iter().any(|(name, value)| name
             == "TriggerMode [TriggerSelector=FrameStart]"
-            && value == "→ On"));
+            && value == "not compared → On"));
+        assert!(
+            checked
+                .facts
+                .iter()
+                .any(|(name, value)| name == "Not compared" && value.starts_with("1 values")),
+            "{:?}",
+            checked.facts
+        );
+        // Facts show what each value changes from.
+        assert!(
+            checked
+                .facts
+                .iter()
+                .any(|(name, value)| name == "ExposureTime" && value == "10000.0 → 5000.0"),
+            "{:?}",
+            checked.facts
+        );
+    }
+
+    /// sim:0 as a GenICam camera reports its trigger: TriggerMode at the
+    /// selected TriggerSelector bank.
+    fn with_trigger_features(ctx: &mut Context, selected: &str, mode: &str) {
+        let features = std::sync::Arc::make_mut(&mut ctx.snapshot.cameras[0].features);
+        let mut features = features.to_vec();
+        features.retain(|f| f.name != "TriggerSelector" && f.name != "TriggerMode");
+        features.push(crate::tools::tests::feature(
+            "TriggerSelector",
+            "Enumeration",
+            json!(selected),
+        ));
+        features.push(crate::tools::tests::feature(
+            "TriggerMode",
+            "Enumeration",
+            json!(mode),
+        ));
+        ctx.snapshot.cameras[0].features = features.into();
+    }
+    fn at_bank(feature: &str, value: &str, selector: &str, bank: &str) -> SetupValue {
+        SetupValue {
+            feature: feature.into(),
+            value: Scalar::String(value.into()),
+            at: vec![Bank {
+                selector: selector.into(),
+                value: bank.into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_fresh_setup_with_its_trigger_on_the_selected_bank_is_reversible() {
+        // Saved just now: every value matches, including TriggerMode at the
+        // FrameStart bank the camera has selected.
+        let mut fresh = setup(
+            "line",
+            vec![
+                value("ExposureTime", number(10000.0)),
+                at_bank("TriggerMode", "Off", "TriggerSelector", "FrameStart"),
+                value("TriggerSelector", Scalar::String("FrameStart".into())),
+            ],
+        );
+        let mut ctx = context(vec![fresh.clone()]);
+        with_trigger_features(&mut ctx, "FrameStart", "Off");
+        let checked = apply(&ctx, "line");
+        assert!(checked.ready(), "{checked:?}");
+        assert_eq!(checked.risk, Risk::Reversible, "{:?}", checked.reasons);
+        let Op::ApplySetup {
+            changes, banked, ..
+        } = &checked.ops[0]
+        else {
+            panic!();
+        };
+        assert_eq!(*changes, 0);
+        assert!(banked.is_empty());
+        // A selected bank that differs is a known change that needs a person.
+        with_trigger_features(&mut ctx, "FrameStart", "On");
+        let changed = apply(&ctx, "line");
+        assert_eq!(changed.risk, Risk::HumanOnly);
+        assert_eq!(
+            changed.reasons[0],
+            "Changes TriggerMode, outside the image-quality allowlist."
+        );
+        assert!(changed.facts.iter().any(|(name, value)| name
+            == "TriggerMode [TriggerSelector=FrameStart]"
+            && value == "On → Off"));
+        let Op::ApplySetup { banked, .. } = &changed.ops[0] else {
+            panic!();
+        };
+        assert_eq!(banked, &["TriggerMode"]);
+        // A bank the camera has not selected cannot be compared.
+        fresh.values.push(at_bank(
+            "TriggerMode",
+            "Off",
+            "TriggerSelector",
+            "LineStart",
+        ));
+        let mut ctx = context(vec![fresh]);
+        with_trigger_features(&mut ctx, "FrameStart", "Off");
+        let other_bank = apply(&ctx, "line");
+        assert_eq!(other_bank.risk, Risk::HumanOnly);
+        assert_eq!(
+            other_bank.reasons[0],
+            "Could not compare TriggerMode [TriggerSelector=LineStart] from the last reading; preview_camera_setup shows the exact difference."
+        );
+    }
+
+    #[test]
+    fn preview_reports_the_approval_the_restore_would_need() {
+        let report = |setup: &Setup| {
+            json!({"setup":setup.name,"digest":crate::setup::digest(setup),
+                "match":"same_camera","warnings":[],"changes":[],"unchanged":3,"not_applied":[]})
+        };
+        let preview_of = |ctx: &Context, setup: &Setup| {
+            let host = FakeHost::new(ctx.snapshot.clone()).reply("setup_diff", Ok(report(setup)));
+            read(
+                &host,
+                ctx,
+                &call(
+                    "preview_camera_setup",
+                    json!({"camera":"sim:0","name":setup.name,"allow_other_model":false}),
+                ),
+                Origin::Assistant,
+            )
+            .unwrap()
+        };
+        let ctx = context(vec![image_only()]);
+        let reversible = preview_of(&ctx, &image_only());
+        assert_eq!(reversible["approval"], "reversible");
+        assert!(reversible.get("approval_reason").is_none());
+        assert_eq!(apply(&ctx, "bench").risk, Risk::Reversible);
+        let ctx = context(vec![with_trigger()]);
+        let human = preview_of(&ctx, &with_trigger());
+        assert_eq!(human["approval"], "human_only");
+        assert!(
+            human["approval_reason"]
+                .as_str()
+                .unwrap()
+                .starts_with("Could not compare TriggerMode"),
+            "{human}"
+        );
+        assert_eq!(apply(&ctx, "line").risk, Risk::HumanOnly);
+    }
+
+    #[test]
+    fn an_unreadable_store_or_no_setups_is_said_instead_of_a_missing_name() {
+        let mut ctx = context(Vec::new());
+        let none = apply(&ctx, "bench");
+        assert_eq!(none.issues[0].code, IssueCode::Unavailable);
+        assert!(
+            none.issues[0].message.contains(
+                "no setups are saved. The user saves one with capturefab setup save NAME."
+            ),
+            "{:?}",
+            none.issues
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-tool-setups-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = crate::setup::Store::at(&dir);
+        store.save(&image_only(), false).unwrap();
+        std::fs::write(dir.join("broken.json"), b"{").unwrap();
+        let (setups, problem) = crate::tools::context::setups_in(&store);
+        assert_eq!(setups.len(), 1);
+        let problem = problem.unwrap();
+        assert!(problem.starts_with("broken.json in "), "{problem}");
+        ctx.setups = setups.into_iter().map(SavedSetup::new).collect();
+        ctx.setups_problem = Some(problem.clone());
+        let host = FakeHost::new(ctx.snapshot.clone());
+        let listed = read(
+            &host,
+            &ctx,
+            &call("list_camera_setups", json!({"camera":null})),
+            Origin::Assistant,
+        )
+        .unwrap();
+        assert_eq!(listed["count"], 1);
+        assert_eq!(listed["warnings"], json!([problem]));
+        let missing = apply(&ctx, "broken");
+        assert!(
+            missing.issues[0].message.contains("broken.json in "),
+            "{:?}",
+            missing.issues
+        );
+        // A store folder that cannot be listed.
+        let file = dir.join("not-a-folder");
+        std::fs::write(&file, b"").unwrap();
+        let (setups, problem) = crate::tools::context::setups_in(&crate::setup::Store::at(&file));
+        assert!(setups.is_empty());
+        assert!(problem.unwrap().starts_with("The setup store "));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -844,6 +1188,20 @@ mod tests {
             refused.issues[0].field.as_deref(),
             Some("allow_other_model")
         );
+        // The user's own name, as saved, and no approval for a refused step.
+        assert!(
+            refused.issues[0]
+                .message
+                .starts_with("bench was saved from "),
+            "{:?}",
+            refused.issues
+        );
+        assert_eq!(refused.risk, Risk::Reversible);
+        let mut other_line = with_trigger();
+        other_line.camera.model = "Another model".into();
+        let refused = apply(&context(vec![other_line]), "line");
+        assert_eq!(refused.issues[0].code, IssueCode::Unsupported);
+        assert_eq!(refused.risk, Risk::Reversible, "{:?}", refused.reasons);
         let allowed = crate::tools::check(
             &ctx,
             &mut PlanState::new(&ctx),

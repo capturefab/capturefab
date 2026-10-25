@@ -814,11 +814,11 @@ capturefab --session bench --actor codex --actor-kind agent tools call preview_c
 capturefab --session bench --actor codex --actor-kind agent tools call apply_camera_setup --args '{"camera":"sim:0","name":"bench","allow_other_model":false}' --dry-run --json
 ```
 
-`list_camera_setups` returns `{count, setups:[{name, saved_from, transport, saved_at, values, auto_exposure, note?, match?, warnings?}]}`; `camera` is optional and adds `match`.
-`preview_camera_setup` is read-only and returns the diff summary: `change_count`, `not_applied_count`, `unchanged`, `match`, `warnings`, `restarts_stream`, `blocked`, at most 40 `changes` and 20 `not_applied` rows, and `truncated`; `setup diff` lists every row.
+`list_camera_setups` returns `{count, setups:[{name, saved_from, transport, saved_at, values, auto_exposure, note?, match?, warnings?}], warnings?}`; `camera` is optional and adds `match`. The top-level `warnings` names a setup store or setup files that could not be read.
+`preview_camera_setup` is read-only and returns the diff summary: `change_count`, `not_applied_count`, `unchanged`, `match`, `warnings`, `restarts_stream`, `blocked`, at most 40 `changes` and 20 `not_applied` rows, and `truncated`; `setup diff` lists every row. `approval` (`reversible` or `human_only`, with `approval_reason`) is what `apply_camera_setup` would need, from the same comparison with the camera's last reading.
 `apply_camera_setup` sends `apply_setup` with the setup's `name` and `digest`, so a setup edited after the check is refused, and with `confirmed_disruptive` set to the reviewed non-image features.
-It is `reversible` when every value that may change is an image-quality setting; otherwise it is `human_only` and needs `--confirmed-by-user` after the person approved that exact restore.
-A restore that must restart live view is refused (exit 3) while a recording or scheduled captures run; a missing setup exits 3; another model without `allow_other_model` exits 5.
+It is `reversible` when every value that may change is an image-quality setting; otherwise it is `human_only` and needs `--confirmed-by-user` after the person approved that exact restore. A value at a selector bank is compared when the camera has that bank selected; others count as values that may change.
+A restore that must restart live view is refused (exit 3) while a recording or scheduled captures run; a missing setup exits 3; another model without `allow_other_model` exits 5. These refusals come before the approval check, so they need no `--confirmed-by-user`.
 The result has `before` and `after` values, `applied` and `camera_change.token` for `undo_camera_change`.
 
 ## Discover, inspect, configure, acquire

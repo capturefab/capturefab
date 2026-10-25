@@ -715,6 +715,24 @@ impl Store {
         summaries.sort_by_key(|summary| summary.name.to_ascii_lowercase());
         Ok(summaries)
     }
+    /// Every saved setup in name order, with the names of the files that
+    /// could not be read, which `list` leaves out without saying.
+    pub fn load(&self) -> Result<(Vec<Setup>, Vec<String>)> {
+        let mut setups = Vec::new();
+        let mut unreadable = Vec::new();
+        for path in self.files()? {
+            match read_file(&path) {
+                Ok(setup) => setups.push(setup),
+                Err(_) => unreadable.push(
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+            }
+        }
+        setups.sort_by_key(|setup| setup.name.to_ascii_lowercase());
+        Ok((setups, unreadable))
+    }
     /// The saved setup, or an `unavailable` error suggesting a close name.
     pub fn get(&self, name: &str) -> Result<Setup> {
         validate_name(name)?;

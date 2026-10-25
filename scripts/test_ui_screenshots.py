@@ -18,7 +18,7 @@ SPEC.loader.exec_module(REVIEW)
 
 class ReviewMatrixTests(unittest.TestCase):
     def test_camera_kind_matrix_is_opt_in_and_marks_real_and_display_profiles(self):
-        self.assertEqual(len(list(REVIEW.matrix())), 104)
+        self.assertEqual(len(list(REVIEW.matrix())), 106)
         cases = list(REVIEW.matrix(True))
         self.assertEqual(len(cases), 26)
         self.assertEqual(len({case[0] for case in cases}), len(cases))
@@ -37,8 +37,8 @@ class ReviewMatrixTests(unittest.TestCase):
 
     def test_all_matrix_combines_both_complete_matrices_without_duplicate_artifacts(self):
         cases = REVIEW.select_cases(all_screens=True)
-        self.assertEqual(len(cases), 139)
-        self.assertEqual(len({case[0] for case in cases}), 139)
+        self.assertEqual(len(cases), 141)
+        self.assertEqual(len({case[0] for case in cases}), 141)
         self.assertEqual({case[0] for case in cases}, {case[0] for case in REVIEW.matrix()} | {case[0] for case in REVIEW.matrix(True)} | {case[0] for case in REVIEW.extra_state_matrix()})
         self.assertEqual(len(REVIEW.select_cases(only=["welcome-light", "line-features-light"], all_screens=True)), 2)
 
@@ -72,6 +72,7 @@ class ReviewMatrixTests(unittest.TestCase):
             "settings-credential-error", "settings-assistant", "settings-assistant-error",
             "quick-command", "quick-command-data-consent", "quick-command-plan", "quick-command-invalid",
             "quick-command-running", "quick-command-done", "quick-command-setup", "quick-command-exported",
+            "quick-command-setup-restore",
             "quick-command-task-setup", "quick-command-task-running", "quick-command-task-approval",
             "quick-command-task-paused-human", "quick-command-task-limit", "quick-command-task-done",
             "analytics-measurements", "analytics-measurements-populated",

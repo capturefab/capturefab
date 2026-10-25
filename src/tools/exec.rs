@@ -45,6 +45,9 @@ pub enum Op {
         command: SessionCommand,
         changes: usize,
         features: Vec<String>,
+        /// Features the setup writes at a selector bank: a task's restore
+        /// proposal can put back only the selected bank's value.
+        banked: Vec<String>,
         /// The setup turns on Capturefab's auto exposure.
         auto: bool,
     },
@@ -92,9 +95,10 @@ impl Serialize for Op {
                 command,
                 changes,
                 features,
+                banked,
                 auto,
             } => {
-                json!({"op":"apply_setup","camera":camera.selector(),"command":command,"changes":changes,"features":features,"auto":auto})
+                json!({"op":"apply_setup","camera":camera.selector(),"command":command,"changes":changes,"features":features,"banked":banked,"auto":auto})
             }
             Self::StopForward {
                 camera,
@@ -1880,6 +1884,7 @@ mod tests {
             },
             changes: 2,
             features: vec!["ExposureTime".into(), "Gain".into()],
+            banked: Vec::new(),
             auto,
         }
     }

@@ -53,6 +53,7 @@ BASELINE = (
     Scene("settings-assistant", "settings-assistant,noscopes", "AI assistant provider, model and credential setup with synthetic status"),
     Scene("quick-command", "quick-command,noscopes", "Quick command before a request, with local suggestions", 2),
     Scene("quick-command-plan", "quick-command-plan,noscopes", "Reviewable assistant plan and editable camera-tool cards", 2),
+    Scene("quick-command-setup-restore", "quick-command-setup-restore,noscopes", "Human-only restore of a saved setup with trigger and line values", 2),
     Scene("quick-command-invalid", "quick-command-invalid,noscopes", "Assistant plan with invalid fields and a blocking reason", 2),
     Scene("quick-command-running", "quick-command-running,noscopes", "Assistant plan execution with synthetic progress", 2),
     Scene("quick-command-done", "quick-command-done,noscopes", "Completed assistant plan and outcome rows", 2),

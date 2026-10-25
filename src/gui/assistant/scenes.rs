@@ -13,10 +13,11 @@ use crate::{
 use serde_json::json;
 use std::sync::Arc;
 
-pub(in crate::gui) const WORDS: [&str; 10] = [
+pub(in crate::gui) const WORDS: [&str; 11] = [
     "quick-command",
     "quick-command-data-consent",
     "quick-command-plan",
+    "quick-command-setup-restore",
     "quick-command-invalid",
     "quick-command-running",
     "quick-command-done",
@@ -81,6 +82,10 @@ pub(in crate::gui) fn fixture(word: &str, snapshot: SessionSnapshot) -> quick::S
         return state;
     }
     if word == "quick-command" {
+        return state;
+    }
+    if word == "quick-command-setup-restore" {
+        setup_restore(&mut state);
         return state;
     }
     state.transcript.push(quick::TranscriptEntry::User(
@@ -164,6 +169,101 @@ pub(in crate::gui) fn fixture(word: &str, snapshot: SessionSnapshot) -> quick::S
     state
 }
 
+/// A restore of a saved conveyor setup that changes trigger and line
+/// settings: a human-only step with more facts than the card lists, banked
+/// labels and the reasons a person must approve it.
+fn setup_restore(state: &mut quick::State) {
+    state.transcript.push(quick::TranscriptEntry::User(
+        "Put the camera back on the conveyor-line setup.".into(),
+    ));
+    let context = state.context.as_mut().unwrap();
+    let camera = &mut context.snapshot.cameras[0];
+    let feature = |name: &str, kind: &str, value: serde_json::Value| crate::genicam::FeatureInfo {
+        name: name.into(),
+        display_name: name.into(),
+        kind: kind.into(),
+        value: Some(value),
+        writable: true,
+        description: String::new(),
+        unit: None,
+        min: None,
+        max: None,
+        inc: None,
+        choices: Vec::new(),
+        error: None,
+    };
+    camera.features = vec![
+        feature("ExposureTime", "Float", json!(12000.0)),
+        feature("Gain", "Float", json!(0.0)),
+        feature("TriggerSelector", "Enumeration", json!("FrameStart")),
+        feature("TriggerMode", "Enumeration", json!("Off")),
+        feature("TriggerSource", "Enumeration", json!("Software")),
+        feature("TriggerActivation", "Enumeration", json!("RisingEdge")),
+        feature("LineSelector", "Enumeration", json!("Line0")),
+        feature("LineMode", "Enumeration", json!("Input")),
+        feature("LineInverter", "Boolean", json!(false)),
+    ]
+    .into();
+    let id = camera.info.id.clone();
+    let mut plan = Plan::default();
+    plan.propose(
+        ToolCall {
+            tool: "apply_camera_setup".into(),
+            args: json!({"camera":id,"name":"conveyor-line","allow_other_model":false}),
+        },
+        None,
+    )
+    .unwrap();
+    plan.recheck(context, None, &crate::tools::EmptySecrets);
+    state.plan = plan;
+}
+
+/// The setups the scene context lists: a conveyor setup saved from the
+/// scene's camera, with trigger and line values at several banks.
+fn fixture_setups(info: &crate::types::CameraInfo) -> Vec<crate::tools::context::SavedSetup> {
+    use crate::setup::{Bank, SavedCamera, Scalar, Setup, SetupValue};
+    let value = |feature: &str, value: Scalar, at: &[(&str, &str)]| SetupValue {
+        feature: feature.into(),
+        value,
+        at: at
+            .iter()
+            .map(|(selector, value)| Bank {
+                selector: (*selector).into(),
+                value: (*value).into(),
+            })
+            .collect(),
+    };
+    let text = |value: &str| Scalar::String(value.into());
+    let number = |value: f64| Scalar::Number(serde_json::Number::from_f64(value).unwrap());
+    let mut values = vec![
+        value("ExposureTime", number(4000.0), &[]),
+        value("Gain", number(6.0), &[]),
+    ];
+    for bank in ["FrameStart", "LineStart", "ExposureActive"] {
+        let at = [("TriggerSelector", bank)];
+        values.push(value("TriggerMode", text("On"), &at));
+        values.push(value("TriggerSource", text("Line1"), &at));
+        values.push(value("TriggerActivation", text("FallingEdge"), &at));
+    }
+    for line in ["Line0", "Line1", "Line2"] {
+        let at = [("LineSelector", line)];
+        values.push(value("LineMode", text("Output"), &at));
+        values.push(value("LineInverter", Scalar::Bool(true), &at));
+    }
+    values.push(value("TriggerSelector", text("FrameStart"), &[]));
+    values.push(value("LineSelector", text("Line0"), &[]));
+    vec![crate::tools::context::SavedSetup::new(Setup {
+        version: 1,
+        name: "conveyor-line".into(),
+        saved_at: "2026-10-18T10:00:00Z".into(),
+        note: Some("Encoder-triggered line, strobe on Line0".into()),
+        camera: SavedCamera::from_info(info),
+        auto: None,
+        values,
+        skipped: Vec::new(),
+    })]
+}
+
 pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
     if snapshot.cameras.is_empty() {
         let mut info = crate::transport::simulator::info();
@@ -180,6 +280,11 @@ pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
         );
     }
     let policy = StoragePolicy::default();
+    let setups = snapshot
+        .cameras
+        .first()
+        .map(|camera| fixture_setups(&camera.info))
+        .unwrap_or_default();
     Context {
         now_ms: 1_792_344_960_000,
         zone: Zone::Fixed(-14_400),
@@ -214,7 +319,8 @@ pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
         }),
         compiled: Compiled::current(),
         defaults: RecordingDefaults::default(),
-        setups: Vec::new(),
+        setups,
+        setups_problem: None,
     }
 }
 

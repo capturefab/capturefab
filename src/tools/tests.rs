@@ -441,6 +441,7 @@ pub(crate) fn fixture_context(snapshot: SessionSnapshot) -> Context {
         compiled: Compiled::current(),
         defaults: RecordingDefaults::default(),
         setups: Vec::new(),
+        setups_problem: None,
     }
 }
 
@@ -1689,8 +1690,8 @@ impl Sources for FakeSources {
         (!path.starts_with("/Volumes/Gone")).then_some(42)
     }
 
-    fn setups(&self) -> Result<Vec<crate::setup::Setup>> {
-        Ok(Vec::new())
+    fn setups(&self) -> (Vec<crate::setup::Setup>, Option<String>) {
+        (Vec::new(), None)
     }
 
     fn volume_problem(&self, path: &Path) -> Option<String> {

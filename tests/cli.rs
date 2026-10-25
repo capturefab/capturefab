@@ -3586,6 +3586,34 @@ fn tools_list_preview_and_restore_saved_setups() {
     );
     assert_eq!(missing.status.code(), Some(3));
     assert_eq!(tools_response(&missing)["error"]["code"], "unavailable");
+
+    // Another model's setup is refused (exit 5) before anyone is asked to
+    // approve it, and the message keeps the name as saved.
+    let other = tools_output(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "tools",
+            "call",
+            "apply_camera_setup",
+            "--args",
+            r#"{"camera":"sim:0","name":"line","allow_other_model":false}"#,
+        ],
+        None,
+    );
+    let response = tools_response(&other);
+    assert_eq!(other.status.code(), Some(5), "{response}");
+    assert_eq!(response["error"]["code"], "unsupported");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("line was saved from"),
+        "{response}"
+    );
 }
 
 #[test]

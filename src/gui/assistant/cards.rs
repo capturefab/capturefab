@@ -449,7 +449,7 @@ fn field_view<'a>(
             );
             out.into()
         }
-        FieldKind::Camera | FieldKind::Destination | FieldKind::Choice(_) => {
+        FieldKind::Camera | FieldKind::Destination | FieldKind::Setup | FieldKind::Choice(_) => {
             choice_field(state, step, field, first, p)
         }
         FieldKind::Bool => {
@@ -688,6 +688,16 @@ fn choice_field<'a>(
                     choices.push(Choice {
                         value: name.into(),
                         label: format!("{name} (planned)"),
+                    });
+                }
+            }
+        }
+        FieldKind::Setup => {
+            if let Some(context) = &state.context {
+                for saved in &context.setups {
+                    choices.push(Choice {
+                        value: saved.setup.name.clone(),
+                        label: format!("{} · {}", saved.setup.name, saved.setup.camera.label()),
                     });
                 }
             }
