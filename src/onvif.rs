@@ -935,8 +935,9 @@ struct Soap<'a> {
     credentials: Option<&'a Credentials>,
     timeout: Duration,
     clock_offset: Option<i64>,
-    /// The device refused WS-Security and accepted HTTP authentication.
-    http_auth: bool,
+    /// Service endpoints that refused WS-Security and accepted HTTP
+    /// authentication; a device's services may each take a different one.
+    http_auth: std::collections::BTreeSet<String>,
 }
 impl<'a> Soap<'a> {
     fn new(device: &'a str, credentials: Option<&'a Credentials>, timeout: Duration) -> Self {
@@ -945,7 +946,7 @@ impl<'a> Soap<'a> {
             credentials,
             timeout,
             clock_offset: None,
-            http_auth: false,
+            http_auth: Default::default(),
         }
     }
     fn token(&mut self, credentials: &Credentials) -> Result<String> {
@@ -960,7 +961,7 @@ impl<'a> Soap<'a> {
     /// Send a WS-Security UsernameToken first, which most cameras take.
     /// When the device refuses it, answer its HTTP Digest (or Basic)
     /// challenge without a token (Core 5.9.1: not both at once), and keep
-    /// using HTTP authentication for later calls once it works.
+    /// using HTTP authentication for later calls to that endpoint once it works.
     fn call(
         &mut self,
         endpoint: &str,
@@ -988,7 +989,7 @@ impl<'a> Soap<'a> {
             return finish(response, || refused(false));
         };
         let mut challenge = None;
-        if !self.http_auth {
+        if !self.http_auth.contains(endpoint) {
             let token = self.token(credentials)?;
             let first = request(&url, &action, &envelope(&token, content), None, timeout)?;
             if first.status != 401 && !not_authorized(&first) {
@@ -1021,7 +1022,9 @@ impl<'a> Soap<'a> {
         if response.status == 401 {
             return Err(refused(true));
         }
-        self.http_auth |= (200..300).contains(&response.status);
+        if (200..300).contains(&response.status) {
+            self.http_auth.insert(endpoint.to_owned());
+        }
         finish(response, || refused(true))
     }
 }
@@ -2201,9 +2204,9 @@ mod tests {
                     let (mut stream, _) = listener.accept().unwrap();
                     let (path, headers, body) = mock_request(&stream);
                     assert!(headers["soapaction"].contains(operation));
-                    // The token goes once; after the device asks for HTTP
-                    // Digest, requests carry Digest alone.
-                    if operation == "GetServices" && !authenticated {
+                    // The token goes once per service; after a service asks
+                    // for HTTP Digest, its requests carry Digest alone.
+                    if operation != "GetStreamUri" && !authenticated {
                         assert_username_token(&body, &server_credentials.password);
                     } else {
                         assert!(!body.contains("Security"), "{body}");
@@ -2303,7 +2306,7 @@ mod tests {
             "WWW-Authenticate: Digest realm=\"cam\", nonce=\"n\", qop=\"auth\", algorithm=MD5\r\n";
         let fault = "<Envelope><Body><Fault><Code><Value>env:Sender</Value><Subcode><Value>ter:NotAuthorized</Value></Subcode></Code><Reason><Text>Sender not Authorized</Text></Reason></Fault></Body></Envelope>";
         let mut step = 0;
-        let (address, server) = serve(6, move |operation, headers, body| {
+        let (address, server) = serve(7, move |operation, headers, body| {
             step += 1;
             let token = body.contains("UsernameToken");
             let digest = headers
@@ -2324,6 +2327,15 @@ mod tests {
                     assert!(!token && !digest);
                     http_reply("401 Unauthorized", challenge, "")
                 }
+                // Another service of the same device still gets a token first.
+                7 => {
+                    assert!(token && !digest);
+                    http_reply(
+                        "200 OK",
+                        "",
+                        "<Envelope><Body><Response/></Body></Envelope>",
+                    )
+                }
                 _ => {
                     assert!(!token && digest);
                     http_reply(
@@ -2340,6 +2352,9 @@ mod tests {
             soap.call(&endpoint, MEDIA_NS, "GetProfiles", "<trt:GetProfiles/>")
                 .unwrap();
         }
+        let media = format!("http://{address}/onvif/media_service");
+        soap.call(&media, MEDIA_NS, "GetProfiles", "<trt:GetProfiles/>")
+            .unwrap();
         server.join().unwrap();
         // A device with no HTTP challenge refused the only sign-in it takes.
         let (address, server) = serve(3, move |operation, _, _| match operation {
