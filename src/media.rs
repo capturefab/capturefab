@@ -1897,6 +1897,10 @@ struct Mode {
     height: u32,
     fps: Option<(f64, f64)>,
     input_format: Option<usize>,
+    /// The DirectShow frame intervals, in 100 ns, to request at the top and
+    /// bottom of `fps`: FFmpeg only opens a capability whose interval range
+    /// holds the interval it derives from `-framerate`.
+    intervals: Option<(u32, u32)>,
 }
 impl Mode {
     fn size(&self) -> (u32, u32) {
@@ -1947,7 +1951,11 @@ fn merge(mut modes: Vec<Mode>, mode: Mode) -> Vec<Mode> {
             m.fps = m
                 .fps
                 .zip(mode.fps)
-                .map(|((a, high), (b, _))| (a.min(b), high))
+                .map(|((a, high), (b, _))| (a.min(b), high));
+            m.intervals = m
+                .intervals
+                .zip(mode.intervals)
+                .map(|((a, c), (b, d))| (a.max(b), c.max(d)));
         }
         None => modes.push(mode),
     }
@@ -1964,6 +1972,7 @@ fn avfoundation_modes(log: &str) -> Vec<Mode> {
             height,
             fps: Some((high, high)),
             input_format: None,
+            intervals: None,
         })
     }) {
         if modes
@@ -1980,20 +1989,68 @@ fn dshow_modes(log: &str) -> Vec<Mode> {
     log.lines()
         .filter_map(|line| {
             let (min, max) = line.split_once(" min s=")?.1.split_once(" max s=")?;
-            let caps = |text: &str| {
+            fn caps(text: &str) -> Option<(&str, &str)> {
                 let (size, fps) = text.split_once(" fps=")?;
-                Some((dimensions(size), rate(fps.split([' ', '(']).next()?)?))
+                Some((size, fps.split([' ', '(']).next()?))
+            }
+            let ((_, slowest), (size, fastest)) = (caps(min)?, caps(max)?);
+            let (low, high) = (rate(slowest)?, rate(fastest)?);
+            let (width, height) = dimensions(size)?;
+            let (fast, slow) = (dshow_intervals(fastest), dshow_intervals(slowest));
+            let intervals = if fastest == slowest {
+                dshow_nominal(&fast).map(|interval| (interval, interval))
+            } else {
+                fast.last().copied().zip(slow.first().copied())
             };
-            let ((_, low), (size, high)) = (caps(min)?, caps(max)?);
-            let (width, height) = size?;
             Some(Mode {
                 width,
                 height,
                 fps: Some((low.min(high), high)),
                 input_format: None,
+                intervals: intervals.filter(|(fast, slow)| fast <= slow),
             })
         })
         .fold(Vec::new(), merge)
+}
+/// The frame intervals, in 100 ns, that FFmpeg's DirectShow listing prints
+/// as the rate `text`, in ascending order. It prints `1e7 / interval` to six
+/// significant digits, so 24 fps can stand for 416666 or 416667. Taking the
+/// largest at the top of a range and the smallest at its bottom stays inside
+/// it.
+fn dshow_intervals(text: &str) -> Vec<u32> {
+    let six = |fps: f64| format!("{fps:.5e}").parse::<f64>().ok();
+    let Some(fps) = text.parse::<f64>().ok().filter(|fps| *fps >= 0.1) else {
+        return Vec::new();
+    };
+    let center = 1e7 / fps;
+    let spread = (center * 6e-6).ceil() + 2.0;
+    ((center - spread).max(1.0) as u32..=(center + spread) as u32)
+        .filter(|&interval| six(1e7 / interval as f64) == six(fps))
+        .collect()
+}
+/// The interval a device with a single listed rate most likely uses: the
+/// whole or NTSC rate it approximates, truncated to 100 ns as UVC cameras
+/// (15 fps as 666666) and Blackmagic cards (60 fps as 166666) do.
+fn dshow_nominal(intervals: &[u32]) -> Option<u32> {
+    let &first = intervals.first()?;
+    let fps = 1e7 / first as f64;
+    let whole = fps.round().max(1.0);
+    let ntsc = (fps * 1.001).round() / 1.001;
+    let nominal = 1e7
+        / if (whole - fps).abs() <= (ntsc - fps).abs() {
+            whole
+        } else {
+            ntsc
+        };
+    let truncated = nominal.floor() as u32;
+    if intervals.contains(&truncated) {
+        return Some(truncated);
+    }
+    intervals.iter().copied().min_by(|a, b| {
+        (*a as f64 - nominal)
+            .abs()
+            .total_cmp(&(*b as f64 - nominal).abs())
+    })
 }
 /// Modes from FFmpeg's V4L2 format listing, with the frame rate bounds
 /// `rates` reports for a format's listed description and a size.
@@ -2055,6 +2112,7 @@ fn v4l2_modes(
                     height,
                     fps,
                     input_format,
+                    intervals: None,
                 });
             }
         }
@@ -2743,7 +2801,19 @@ impl MediaBackend {
         if !self.native {
             return Vec::new();
         }
-        let mut options = vec!["-framerate".to_string(), self.fps.to_string()];
+        let rate = match self.mode.map(|index| self.modes[index]) {
+            Some(Mode {
+                fps: Some((low, high)),
+                intervals: Some((fast, slow)),
+                ..
+            }) if self.fps >= high || self.fps <= low => {
+                // A rate FFmpeg turns back into exactly this interval.
+                let interval = if self.fps >= high { fast } else { slow };
+                format!("{:.9}", 1e7 / (interval as f64 + 0.5))
+            }
+            _ => self.fps.to_string(),
+        };
+        let mut options = vec!["-framerate".to_string(), rate];
         if let Some((width, height)) = self
             .mode
             .map(|i| self.modes[i].size())
@@ -7623,6 +7693,7 @@ Error opening input files: Input/output error
                     height,
                     fps: Some((fps, fps)),
                     input_format: None,
+                    intervals: None,
                 }
             });
         assert_eq!(slow[best(&slow, |_| true).unwrap()].label(), "640x480@15");
@@ -7690,6 +7761,7 @@ Error opening input files: Input/output error
                     height: 90 * i,
                     fps: Some((5.0, 60.0)),
                     input_format: None,
+                    intervals: None,
                 })
                 .collect(),
         );
@@ -7795,6 +7867,66 @@ Error opening input files: Input/output error
                 "yuyv422"
             ]
         );
+    }
+    #[test]
+    fn dshow_rates_are_requested_as_the_listed_frame_intervals() {
+        // A Blackmagic DeckLink listing from FFmpeg's capture wiki: each
+        // capability has a single frame interval, which the requested rate
+        // must reproduce exactly.
+        let decklink = dshow_modes(concat!(
+            "[dshow @ 0000007201cda8a0]   pixel_format=uyvy422  min s=1920x1080 fps=23.976 max s=1920x1080 fps=23.976\n",
+            "[dshow @ 0000007201cda8a0]   pixel_format=uyvy422  min s=1920x1080 fps=24 max s=1920x1080 fps=24\n",
+            "[dshow @ 0000007201cda8a0]   pixel_format=uyvy422  min s=1920x1080 fps=29.97 max s=1920x1080 fps=29.97\n",
+            "[dshow @ 0000007201cda8a0]   pixel_format=uyvy422  min s=1920x1080 fps=60.0002 max s=1920x1080 fps=60.0002\n",
+        ));
+        assert_eq!(
+            decklink.iter().map(|m| m.intervals).collect::<Vec<_>>(),
+            [
+                Some((417083, 417083)),
+                Some((416666, 416666)),
+                Some((333667, 333667)),
+                Some((166666, 166666))
+            ]
+        );
+        let mut camera = native("dshow:video=Decklink Video Capture", decklink);
+        for (fps, rate, interval) in [
+            (23.976, "23.976014395", 417083),
+            (24.0, "24.000009600", 416666),
+            (60.0, "60.000060000", 166666),
+        ] {
+            camera
+                .configure(NativeOptions {
+                    size: Some((1920, 1080)),
+                    fps: Some(fps),
+                })
+                .unwrap();
+            assert_eq!(camera.input_options()[..2], ["-framerate", rate]);
+            // FFmpeg floors 1e7 / rate into 100 ns units.
+            assert_eq!((1e7 / rate.parse::<f64>().unwrap()) as u32, interval);
+        }
+        // A webcam whose fastest interval is 333334 rather than 333333:
+        // asking for 30 fps would fall outside its range.
+        let webcam = dshow_modes(
+            "[dshow @ 000001b5e2a6c3c0]   pixel_format=yuyv422  min s=1280x720 fps=5 max s=1280x720 fps=29.9999\n",
+        );
+        assert_eq!(webcam[0].intervals, Some((333335, 1999999)));
+        let mut camera = native("dshow:video=USB Camera", webcam);
+        camera.configure(NativeOptions::default()).unwrap();
+        assert_eq!(camera.input_options()[..2], ["-framerate", "29.999805001"]);
+        camera
+            .configure(NativeOptions {
+                size: None,
+                fps: Some(5.0),
+            })
+            .unwrap();
+        assert_eq!(camera.input_options()[..2], ["-framerate", "5.000001250"]);
+        camera
+            .configure(NativeOptions {
+                size: None,
+                fps: Some(15.0),
+            })
+            .unwrap();
+        assert_eq!(camera.input_options()[..2], ["-framerate", "15"]);
     }
     #[test]
     fn v4l2_modes_take_a_compressed_format_where_raw_cannot_reach_the_rate() {
