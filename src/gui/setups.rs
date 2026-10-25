@@ -131,6 +131,11 @@ impl State {
                 .confirm_at
                 .is_some_and(|at| now.saturating_duration_since(at) >= CONFIRM_ARM)
     }
+
+    /// Why the chosen setup's file cannot be restored, when the list says so.
+    fn chosen_status(&self) -> Option<store::FileStatus> {
+        self.summary(self.chosen.as_deref()?)?.status
+    }
 }
 
 /// Run `work` on its own thread; `failed` stands in when it cannot run.
@@ -376,6 +381,10 @@ impl Workbench {
         else {
             return;
         };
+        if self.setups.chosen_status().is_some() {
+            // Nothing to compare: the page offers to delete it instead.
+            return;
+        }
         self.setups.diff_key = Some(self.setup_key());
         self.setups.disarm();
         // The preview always shows what both cameras share; restoring to
@@ -441,7 +450,15 @@ impl Workbench {
                 state.name_error = None;
                 state.taken = false;
             }
-            Input::Note(note) => state.note = note.chars().take(store::MAX_NOTE).collect(),
+            Input::Note(note) => {
+                // A note stays on one line: pasted line breaks and escapes
+                // are dropped rather than failing the save.
+                state.note = note
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(store::MAX_NOTE)
+                    .collect()
+            }
             Input::Save(replace) => {
                 let name = state.name.trim().to_owned();
                 if let Err(error) = store::validate_name(&name) {
@@ -812,18 +829,31 @@ impl Workbench {
                 let live = self.setup_camera_info();
                 let mut rows = column![].spacing(6);
                 for summary in list {
-                    let other = live.is_some_and(|live| {
-                        !(summary
-                            .vendor
-                            .trim()
-                            .eq_ignore_ascii_case(live.vendor.trim())
-                            && summary.model.trim().eq_ignore_ascii_case(live.model.trim()))
-                    });
-                    let mut detail = vec![
-                        camera_label(&summary.vendor, &summary.model),
-                        format!("saved {}", saved_on(&summary.saved_at)),
-                        plural(summary.values as u64, "setting", "settings"),
-                    ];
+                    let other = summary.readable()
+                        && live.is_some_and(|live| {
+                            !(summary
+                                .vendor
+                                .trim()
+                                .eq_ignore_ascii_case(live.vendor.trim())
+                                && summary.model.trim().eq_ignore_ascii_case(live.model.trim()))
+                        });
+                    let mut detail = match summary.status {
+                        None => vec![
+                            camera_label(&summary.vendor, &summary.model),
+                            format!("saved {}", saved_on(&summary.saved_at)),
+                            plural(summary.values as u64, "setting", "settings"),
+                        ],
+                        Some(store::FileStatus::NewerVersion) => {
+                            vec![
+                                "Saved by a newer Capturefab; update Capturefab to restore it"
+                                    .into(),
+                            ]
+                        }
+                        Some(store::FileStatus::Unreadable) => vec![format!(
+                            "Cannot be read: {}",
+                            summary.reason.as_deref().unwrap_or("damaged file")
+                        )],
+                    };
                     if other {
                         detail.push("another model".into());
                     }
@@ -1058,6 +1088,25 @@ impl Workbench {
             && let Some(diff) = state.diff()
         {
             body = body.push(confirm_banner(diff, p));
+        }
+        if let Some(status) = state.chosen_status() {
+            let reason = state
+                .chosen
+                .as_deref()
+                .and_then(|name| state.summary(name))
+                .and_then(|summary| summary.reason.clone())
+                .unwrap_or_else(|| "damaged file".into());
+            let message = match status {
+                store::FileStatus::NewerVersion => {
+                    "This setup was saved by a newer version of Capturefab. Update Capturefab to restore it.".to_owned()
+                }
+                store::FileStatus::Unreadable => format!(
+                    "This file cannot be read ({reason}). Delete it, or save the camera again under this name."
+                ),
+            };
+            return body
+                .push(text(message).size(style::BODY).color(p.text))
+                .into();
         }
         let diff = match &state.diff {
             None => {
@@ -1309,6 +1358,8 @@ impl Workbench {
         }
         let label = if applying {
             "Restoring…".to_owned()
+        } else if state.chosen_status().is_some() {
+            "Restore".to_owned()
         } else if count == 0 {
             "Nothing to Change".to_owned()
         } else {
@@ -1475,24 +1526,38 @@ fn scene_list() -> Vec<Summary> {
     vec![
         Summary {
             name: "bench-basler".into(),
-            transport: crate::types::Transport::GigE,
+            transport: Some(crate::types::Transport::GigE),
             vendor: "Basler".into(),
             model: "acA1920-40gm".into(),
             serial: Some("23456789".into()),
             saved_at: "2026-09-14T09:12:00Z".into(),
             values: 42,
             note: Some("Tuned for the inspection bench".into()),
+            status: None,
+            reason: None,
         },
         Summary {
             name: "line-2-mono".into(),
-            transport: crate::types::Transport::Simulator,
+            transport: Some(crate::types::Transport::Simulator),
             vendor: "Capturefab".into(),
             model: "Pattern camera".into(),
             serial: Some("SIM0".into()),
             saved_at: "2026-10-25T14:03:11Z".into(),
             values: 6,
             note: Some("Ring light at 60%".into()),
+            status: None,
+            reason: None,
         },
+        Summary::unreadable(
+            "line-3-copy",
+            store::FileStatus::Unreadable,
+            "line-3-copy.json holds a setup named line-3, not line-3-copy",
+        ),
+        Summary::unreadable(
+            "night-shift",
+            store::FileStatus::NewerVersion,
+            "setup version 2 was written by a newer Capturefab; this one reads version 1",
+        ),
     ]
 }
 
@@ -2158,6 +2223,23 @@ mod tests {
         );
         let _ = bench.setups_input(Input::Name("ok".into()));
         assert!(bench.setups.name_error.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_setup_is_not_compared_and_offers_delete() {
+        for name in ["line-3-copy", "night-shift"] {
+            let mut bench = bench("setups");
+            // As a live sheet, so choosing would submit a comparison.
+            bench.setups.scene = false;
+            let _ = bench.setups_input(Input::Choose(name.into()));
+            assert_eq!(bench.setups.page, Page::Restore);
+            assert!(!bench.pending(Job::SetupDiff), "{name}");
+            assert!(bench.setups.diff.is_none(), "{name}");
+            bench.tick_setups();
+            assert!(!bench.pending(Job::SetupDiff), "{name}");
+            assert!(!enabled(&bench, "Restore"));
+            assert!(enabled(&bench, &format!("Delete setup {name}…")));
+        }
     }
 
     #[test]

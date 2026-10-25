@@ -94,7 +94,11 @@ pub enum SessionCommand {
     SetupDiff {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::setup::deserialize_inline"
+        )]
         setup: Option<crate::setup::Setup>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_other_model: bool,
@@ -104,7 +108,11 @@ pub enum SessionCommand {
     ApplySetup {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "crate::setup::deserialize_inline"
+        )]
         setup: Option<crate::setup::Setup>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         digest: Option<String>,

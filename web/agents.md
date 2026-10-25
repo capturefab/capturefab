@@ -802,7 +802,8 @@ Human hints after a save or restore (`Restore with:`, `Undo with:`) name the ses
 `apply_setup` with the `digest` from a reviewed diff refuses a setup edited since that review.
 The CLI also sends the reviewed disruptive changes as `confirmed_disruptive`, each `{feature, at}`; the restore is refused (exit 2), changing nothing, if the camera changed since and the restore would now make another disruptive change, at any bank. A bare feature name confirms only a value without banks.
 
-RPC `read_setup` takes no arguments (`{"op":"read_setup"}`) and returns the writable values a new setup would save; `setup_diff` and `apply_setup` take a setup `name` or an inline `setup` document.
+RPC `read_setup` takes no arguments (`{"op":"read_setup"}`) and returns the writable values a new setup would save; `setup_diff` and `apply_setup` take a setup `name` or an inline `setup` document, bare or inside the `setup show NAME --json` envelope.
+`setup list --json` rows with `status` (`unreadable` or `newer_version`) and `reason` are files this Capturefab cannot read; they have no camera, date or values. A `newer_version` file is a good setup that needs a newer Capturefab: `setup show|diff|apply` of it, or `setup import` of such a file, exits 5 (`unsupported`), so update Capturefab rather than delete it. An `unreadable` one exits 3 (`unavailable`), and `setup delete NAME` removes it.
 Workflows restore a setup with the step `{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}}`.
 RPC and workflow callers skip the `--yes` confirmation, as `set_many` does, but the model, node-kind and recording checks always apply.
 A failed restore puts every value back and says so ("Restoring setup NAME failed; every value was put back", and whether a stopped stream was restarted); exit 1.

@@ -79,11 +79,7 @@ pub(super) fn prepare(command: &SetupCommand) -> Result<()> {
         SetupCommand::Save { name, note, .. } => {
             setups::validate_name(name)?;
             if let Some(note) = note {
-                ensure!(
-                    note.chars().count() <= setups::MAX_NOTE,
-                    "a setup note is at most {} characters",
-                    setups::MAX_NOTE
-                );
+                setups::validate_note(note)?;
             }
         }
         SetupCommand::Show { name } | SetupCommand::Delete { name } => setups::validate_name(name)?,
@@ -102,6 +98,24 @@ pub(super) fn prepare(command: &SetupCommand) -> Result<()> {
         SetupCommand::List => {}
     }
     Ok(())
+}
+
+/// A setup file given on the command line: a newer document is
+/// unsupported, anything else wrong with it is usage.
+fn document_input<T>(result: Result<T>) -> Result<T> {
+    match result {
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<setups::NewerVersion>()) =>
+        {
+            Err(crate::types::Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                format!("{error:#}"),
+            ))
+        }
+        result => input(result),
+    }
 }
 
 fn taken(error: anyhow::Error) -> anyhow::Error {
@@ -150,7 +164,7 @@ pub(super) fn run_store(command: &SetupCommand) -> Result<Value> {
             name,
             replace,
         } => {
-            let setup = input(setups::read_file(file))?;
+            let setup = document_input(setups::read_file(file))?;
             let mut setup = setup;
             if let Some(name) = name {
                 setup.name = name.clone();
@@ -177,7 +191,7 @@ fn summary(setup: &Setup, path: &Path) -> Value {
 /// session loads it) or a file (sent inline).
 fn load(name: &Option<String>, file: &Option<PathBuf>) -> Result<(Option<String>, Setup)> {
     match file {
-        Some(file) => Ok((None, input(setups::read_file(file))?)),
+        Some(file) => Ok((None, document_input(setups::read_file(file))?)),
         None => {
             let name = name.clone().context("name a setup or pass --file")?;
             let setup = Store::session().get(&name)?;
@@ -752,6 +766,22 @@ pub(super) fn print_human(cli: &Cli, command: &SetupCommand, value: &Value) -> R
                     .max(4);
                 writeln!(out, "{:width$}  SAVED       SETTINGS  CAMERA", "NAME")?;
                 for setup in &setups {
+                    if let Some(status) = setup["status"].as_str() {
+                        let name = setup["name"].as_str().unwrap_or_default();
+                        let reason = setup["reason"].as_str().unwrap_or_default();
+                        // A newer file is a good setup: never suggest
+                        // deleting it.
+                        let row = if status == "newer_version" {
+                            "saved by a newer Capturefab; update Capturefab to use it".to_owned()
+                        } else {
+                            format!(
+                                "cannot be read: {reason}. Remove it with: capturefab setup delete {}",
+                                crate::hint::shell_quote(name)
+                            )
+                        };
+                        writeln!(out, "{name:width$}  {:10}  {:>8}  {row}", "-", "-")?;
+                        continue;
+                    }
                     let saved = setup["saved_at"].as_str().unwrap_or_default();
                     writeln!(
                         out,
@@ -826,7 +856,7 @@ pub(super) fn extend_schema(contract: &mut Value) {
     contract["setup"] = json!({
         "cli":"setup save NAME [--note TEXT] [--replace] | list | show NAME | diff NAME [--file PATH] [--allow-other-model] | apply NAME [--file PATH] [--dry-run] [--strict] [--allow-other-model] [--yes] | delete NAME | import FILE [--name NAME] [--replace]; save, diff and apply need --camera or --session",
         "purpose":"A setup is a named, host-side snapshot of one camera's writable configuration values. It is previewed as a diff against a connected camera and restored as one camera change with one undo token. Camera user sets are never read or written.",
-        "store":{"dir":"setups/ in the state directory (setup list --json reports dir); one <lowercase name>.json per setup, private (0700 directory, 0600 files)","backup":"setup show NAME --json > FILE writes the document inside the --json envelope; setup import FILE and setup diff|apply --file FILE accept that file or the bare document (the envelope's result). An inline setup field (RPC, workflows) takes the bare document","names":"1-64 ASCII letters, digits, '.', '-' and '_'; not starting or ending with '.'; not a reserved Windows device name such as con or nul; unique ignoring case"},
+        "store":{"dir":"setups/ in the state directory (setup list --json reports dir); one <lowercase name>.json per setup, private (0700 directory, 0600 files)","backup":"setup show NAME --json > FILE writes the document inside the --json envelope; setup import FILE and setup diff|apply --file FILE accept that file or the bare document (the envelope's result). An inline setup field (RPC, workflows) takes either form","unreadable":"setup list lists a file it cannot read, or one holding a setup named differently from its file, under its file name with status unreadable or newer_version and a reason, and no camera, date or values. A newer_version file needs a newer Capturefab: using or importing one exits 5 (unsupported). Using an unreadable one exits 3 (unavailable); setup delete NAME removes it without reading it","names":"1-64 ASCII letters, digits, '.', '-' and '_'; not starting or ending with '.'; not a reserved Windows device name such as con or nul; unique ignoring case"},
         "limits":{"bytes":crate::setup::MAX_SETUP_BYTES,"values":crate::setup::MAX_SETUP_VALUES,"setups":crate::setup::MAX_SETUPS,"note_chars":crate::setup::MAX_NOTE,"string_bytes":crate::setup::MAX_STRING,"selectors_per_value":crate::setup::MAX_BANKS},
         "document":{"version":1,"name":"bench","saved_at":"2026-10-25T14:03:11Z","note":"Ring light at 60%","camera":{"transport":"simulator","vendor":"Capturefab","model":"Pattern camera","serial":"SIM0","kind":"area_scan"},"auto":null,"values":[{"feature":"PixelFormat","value":"Mono8"},{"feature":"Width","value":640},{"feature":"Gain","value":2.5,"at":[{"selector":"GainSelector","value":"All"}]},{"feature":"ExposureTime","value":10000.0}],"skipped":[{"feature":"BalanceRatio","reason":"set by BalanceWhiteAuto = Continuous"}]},
         "captured":"Every writable configuration value at the selected bank, and every bank of GainSelector, BlackLevelSelector, BalanceRatioSelector, TriggerSelector, LineSelector, UserOutputSelector, CounterSelector and TimerSelector, including values unavailable at the selected bank (an output line's source while an input line is selected). Never: transport, network, stream-channel (DeviceStreamChannel*), user-set, file, chunk and event settings, commands, registers, DeviceUserID, values a firmware auto drives, values Capturefab auto exposure manages (auto records its balance instead), stream state, capture settings, credentials or addresses. Banks that cannot be read are listed in skipped; banks that are read-only or not available are listed only when another bank of the value was saved. Media sources store only transport and model.",
