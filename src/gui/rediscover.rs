@@ -346,6 +346,7 @@ mod tests {
             save: None,
             outcome: Default::default(),
             sequence: scene::ScreenshotSequence::parse(None, None).unwrap(),
+            video: None,
         });
         bench.now += SLOW;
         bench.tick_rediscover();
