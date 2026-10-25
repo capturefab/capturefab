@@ -673,6 +673,7 @@ fn return_in_every_generic_text_editor_and_on_remove_never_runs_a_plan() {
             let value = match field.kind {
                 FieldKind::Camera => json!("sim:0"),
                 FieldKind::Destination => Value::Null,
+                FieldKind::Setup => json!("bench"),
                 FieldKind::Duration => json!("30s"),
                 FieldKind::Time => json!("17:00"),
                 FieldKind::Integer { .. } | FieldKind::Number { .. } => json!(1),
@@ -775,4 +776,59 @@ fn compact_plan_keeps_every_keyboard_control_reachable_in_both_directions() {
         );
         assert_focus_traversal_reveals(&mut view, &mut tree, &node, &renderer);
     }
+}
+
+#[test]
+fn a_setup_restore_card_lists_its_facts_and_picks_saved_setups() {
+    let renderer = renderer();
+    let mut state = scenes::fixture("quick-command-setup-restore", SessionSnapshot::default());
+    let step = &state.plan.steps[0];
+    let checked = step.checked.as_ref().unwrap();
+    assert_eq!(checked.risk, crate::tools::Risk::HumanOnly);
+    assert!(checked.facts.iter().any(|(name, _)| name == "More"));
+    assert!(
+        checked
+            .reasons
+            .iter()
+            .any(|reason| reason.starts_with("Could not compare TriggerMode"))
+    );
+    let id = step.id;
+    state.options_open.insert(id);
+    let combo_values = |state: &quick::State| {
+        let mut view = view(state, Palette::of(false), 900.0);
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(720.0, 900.0)),
+        );
+        let (snapshot, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        snapshot
+            .nodes
+            .iter()
+            .filter(|(_, node)| {
+                node.role() == accessibility::Role::ComboBox
+                    && node.label() == Some(&format!("Step {} Setup", id.0)[..])
+            })
+            .filter_map(|(_, node)| node.value().map(str::to_owned))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        combo_values(&state),
+        ["conveyor-line · Capturefab Workbench camera"]
+    );
+    let mut call = state.plan.steps[0].call.clone();
+    call.args["name"] = json!("conveyr-line");
+    state.plan.edit(id, call, false).unwrap();
+    state.plan.recheck(
+        state.context.as_ref().unwrap(),
+        None,
+        &crate::tools::EmptySecrets,
+    );
+    assert_eq!(combo_values(&state), ["conveyr-line (not available)"]);
 }

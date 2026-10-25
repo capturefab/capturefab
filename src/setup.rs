@@ -1064,6 +1064,25 @@ impl Store {
         }
         Ok(setup)
     }
+    /// Every saved setup `get` would open, in name order, with the names
+    /// of the files it would refuse.
+    pub fn load(&self) -> Result<(Vec<Setup>, Vec<String>)> {
+        let mut setups = Vec::new();
+        let mut unreadable = Vec::new();
+        for path in self.files()? {
+            match stem(&path).map(|name| self.read_named(&path, name)) {
+                Some(Ok(setup)) => setups.push(setup),
+                None => continue,
+                Some(Err(_)) => unreadable.push(
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ),
+            }
+        }
+        setups.sort_by_key(|setup| setup.name.to_ascii_lowercase());
+        Ok((setups, unreadable))
+    }
     /// The saved setup, or an `unavailable` error suggesting a close name.
     pub fn get(&self, name: &str) -> Result<Setup> {
         validate_name(name)?;

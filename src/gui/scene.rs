@@ -370,6 +370,7 @@ impl Workbench {
     ///   `quick-command`, `quick-command-plan`, `quick-command-invalid`,
     ///   `quick-command-running`, `quick-command-done`, `quick-command-setup`,
     ///   `quick-command-thinking`, `quick-command-error`,
+    ///   `quick-command-setup-restore` (a human-only setup restore),
     ///   `quick-command-task-setup`, `quick-command-task-running`,
     ///   `quick-command-task-approval`, `quick-command-task-paused-human`,
     ///   `quick-command-task-limit`, `quick-command-task-done`,

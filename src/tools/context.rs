@@ -237,6 +237,28 @@ pub struct Context {
     pub capture_root: PathBuf,
     pub compiled: Compiled,
     pub defaults: RecordingDefaults,
+    /// Saved camera setups (`setup::Store`), in name order. Unreadable
+    /// files are left out, as `setup list` leaves them out.
+    pub setups: Vec<SavedSetup>,
+    /// Why the setup store, or some of its files, could not be read: the
+    /// setup tools report it instead of claiming no setup is saved.
+    pub setups_problem: Option<String>,
+}
+
+/// A saved setup as checks read it, with the digest that pins its content.
+#[derive(Clone, Debug)]
+pub struct SavedSetup {
+    pub setup: Arc<crate::setup::Setup>,
+    pub digest: String,
+}
+
+impl SavedSetup {
+    pub fn new(setup: crate::setup::Setup) -> Self {
+        Self {
+            digest: crate::setup::digest(&setup),
+            setup: Arc::new(setup),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -423,6 +445,9 @@ pub(crate) trait Sources {
     /// Why `path` cannot be written now: an external volume that is not
     /// mounted.
     fn volume_problem(&self, path: &Path) -> Option<String>;
+    /// Every readable saved setup, and why the store or some of its files
+    /// could not be read.
+    fn setups(&self) -> (Vec<crate::setup::Setup>, Option<String>);
 }
 
 /// This computer.
@@ -456,6 +481,37 @@ impl Sources for System {
         crate::volumes::ensure_present(path)
             .err()
             .map(|error| format!("{error:#}"))
+    }
+
+    fn setups(&self) -> (Vec<crate::setup::Setup>, Option<String>) {
+        let store = crate::setup::Store::session();
+        setups_in(&store)
+    }
+}
+
+/// The setups `store` holds, and a problem naming the store's folder when
+/// it or some of its files cannot be read.
+pub(crate) fn setups_in(store: &crate::setup::Store) -> (Vec<crate::setup::Setup>, Option<String>) {
+    let dir = store.dir().display();
+    match store.load() {
+        Ok((setups, unreadable)) if unreadable.is_empty() => (setups, None),
+        Ok((setups, unreadable)) => {
+            let names: Vec<&str> = unreadable.iter().map(String::as_str).collect();
+            (
+                setups,
+                Some(format!(
+                    "{} in {dir} could not be read and {} left out; run capturefab setup list.",
+                    super::list(&names),
+                    if names.len() == 1 { "is" } else { "are" }
+                )),
+            )
+        }
+        Err(error) => (
+            Vec::new(),
+            Some(format!(
+                "The setup store {dir} could not be read: {error:#}; run capturefab setup list."
+            )),
+        ),
     }
 }
 
@@ -493,6 +549,10 @@ pub(crate) fn gather_with(
         files: count("files"),
         free_disk: sources.free_space(&capture_root),
     };
+    // A setup store that cannot be read leaves only the setup tools without
+    // setups, and they say why; every other tool still works.
+    let (setups, setups_problem) = sources.setups();
+    let setups = setups.into_iter().map(SavedSetup::new).collect();
     let media = match sources.encoders() {
         Ok(names) => MediaInfo::from_names(&names),
         Err(error) => MediaInfo::unavailable(format!("{error:#}")),
@@ -510,6 +570,8 @@ pub(crate) fn gather_with(
         capture_root,
         compiled,
         defaults,
+        setups,
+        setups_problem,
     })
 }
 

@@ -222,8 +222,8 @@ impl ToolImpact {
                         .setting_changes
                         .saturating_add(values.len().try_into().unwrap_or(u32::MAX))
                 }
-                // No checked tool records a setup's change count yet, so a
-                // raw restore counts as the most a setup can change.
+                // A checked restore (`Op::ApplySetup`) records its change
+                // count; a raw restore counts as the most a setup can change.
                 SessionCommand::ApplySetup { .. } => {
                     impact.setting_changes = impact.setting_changes.saturating_add(
                         crate::setup::MAX_SETUP_VALUES
@@ -260,6 +260,12 @@ impl ToolImpact {
                     for cmd in commands {
                         command(&mut impact, cmd, now_ms, recording);
                     }
+                }
+                Op::ApplySetup { changes, .. } => {
+                    impact.setting_changes = impact
+                        .setting_changes
+                        .saturating_add((*changes).try_into().unwrap_or(u32::MAX));
+                    impact.blocking_ms = impact.blocking_ms.saturating_add(240_000);
                 }
                 _ => {}
             }
@@ -1246,6 +1252,43 @@ mod tests {
             100 + 2 + 46 * 35
         );
         assert_eq!(project_input(100, 6, &[large], Protocol::Chat), 1702);
+    }
+
+    #[test]
+    fn a_checked_restore_counts_its_recorded_changes() {
+        let mut checked = Checked::new(
+            StepId(1),
+            &ToolCall {
+                tool: "apply_camera_setup".into(),
+                args: json!({}),
+            },
+        );
+        let command = SessionCommand::ApplySetup {
+            name: Some("bench".into()),
+            setup: None,
+            digest: None,
+            allow_other_model: false,
+            strict: false,
+            confirmed_disruptive: Some(Vec::new()),
+        };
+        checked.ops.push(Op::ApplySetup {
+            camera: CameraRef::Connected("sim:0".into()),
+            command: command.clone(),
+            changes: 3,
+            features: vec!["ExposureTime".into(), "Gain".into(), "Width".into()],
+            banked: Vec::new(),
+            auto: false,
+        });
+        let impact = ToolImpact::from_checked(&checked, 0, 100);
+        assert_eq!(impact.setting_changes, 3);
+        assert_eq!(impact.blocking_ms, 240_000);
+        // A raw restore has no reviewed count and fails closed.
+        checked.ops = vec![Op::Command {
+            camera: CameraRef::Connected("sim:0".into()),
+            command,
+        }];
+        let raw = ToolImpact::from_checked(&checked, 0, 100);
+        assert_eq!(raw.setting_changes, crate::setup::MAX_SETUP_VALUES as u32);
     }
 
     #[test]
