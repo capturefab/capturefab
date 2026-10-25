@@ -1913,7 +1913,7 @@ impl Assembler {
                         && now.saturating_duration_since(frame.requested_at) >= RESEND_RETRY))
         }) {
             let frame = &self.frames[index];
-            if idle(frame) >= FRAME_IDLE || frame.rounds >= RESEND_ROUNDS {
+            if idle(frame) >= FRAME_IDLE {
                 self.abandon(index);
             } else if frame.due {
                 self.request(index, now);
@@ -1932,15 +1932,37 @@ impl Assembler {
         }
     }
     fn request(&mut self, index: usize, now: Instant) {
-        let frame = &self.frames[index];
-        let runs = missing(&frame.received, frame.packets);
-        let total: u32 = runs.iter().map(|(first, last)| last - first + 1).sum();
+        let frame = &mut self.frames[index];
+        let mut runs = missing(&frame.received, frame.packets);
         let limit = (frame.packets.unwrap_or(frame.count) / 8).max(16);
-        if frame.rounds == 0 && (runs.len() > RESEND_RUNS || total as usize > limit) {
+        let excessive = |runs: &[(u32, u32)]| {
+            runs.len() > RESEND_RUNS
+                || runs
+                    .iter()
+                    .map(|(first, last)| (last - first + 1) as usize)
+                    .sum::<usize>()
+                    > limit
+        };
+        // Until the trailer arrives, the packets above the highest one received
+        // may not have been sent yet: line-scan cameras pause between lines and
+        // can end a frame early. That run is requested only while it is short,
+        // and then the frame waits for its data or `FRAME_IDLE`.
+        if frame.trailer.is_none()
+            && frame.packets.is_some()
+            && (frame.rounds >= RESEND_ROUNDS || excessive(&runs))
+        {
+            runs.pop();
+        }
+        if (frame.rounds == 0 && excessive(&runs))
+            || (frame.rounds >= RESEND_ROUNDS && !runs.is_empty())
+        {
             self.abandon(index);
             return;
         }
-        let frame = &mut self.frames[index];
+        if runs.is_empty() {
+            frame.rounds = 0;
+            return;
+        }
         if frame.requested.is_empty() {
             frame.requested = vec![0; frame.received.len()];
         }
@@ -3032,6 +3054,59 @@ mod tests {
                 .try_for_each(|packet| assembler.push(packet).map(drop));
             assert!(result.is_err(), "{height} {last}");
         }
+    }
+    #[test]
+    fn frames_that_pause_mid_stream_wait_for_their_lines() {
+        // The same line-scan camera pauses after 137 full packets (or after
+        // 434, close to the leader's 1000 lines) until its line timeout ends
+        // the frame. Resend is on; only a short unsent tail is requested.
+        let (width, block) = (4096, 8964);
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        let resending = || {
+            let mut assembler = Assembler::new(4_096_000, 9000, 0);
+            assembler.resend = true;
+            assembler
+        };
+        for (lines, full, resumed, requests) in [
+            (300, 137, 100, Vec::new()),
+            (950, 434, 150, vec![(7, false, 435, 458); 3]),
+        ] {
+            let pixels = image(width, lines);
+            let mut packets = vec![gvsp(7, 0, 1, false, &leader(width, 1000, MONO8))];
+            for chunk in pixels.chunks(block) {
+                packets.push(gvsp(7, packets.len() as u32, 3, false, chunk));
+            }
+            assert_eq!(packets.len(), full + 2);
+            packets.push(gvsp(7, full as u32 + 2, 2, false, &trailer(lines)));
+            let mut assembler = resending();
+            for packet in &packets[..=full] {
+                assembler.push_at(packet, at(0)).unwrap();
+            }
+            for ms in (10..=resumed).step_by(10) {
+                assembler.poll(at(ms));
+            }
+            assert_eq!(assembler.requests, requests, "{lines}");
+            let frame = packets[full + 1..]
+                .iter()
+                .find_map(|packet| assembler.push_at(packet, at(resumed)).unwrap())
+                .unwrap();
+            assert_eq!((frame.height, frame.data), (lines, pixels));
+            assert_eq!(assembler.stats.incomplete_frames, 0);
+        }
+        // A pause longer than FRAME_IDLE still loses the frame.
+        let mut assembler = resending();
+        assembler
+            .push_at(&gvsp(7, 0, 1, false, &leader(width, 1000, MONO8)), at(0))
+            .unwrap();
+        assembler
+            .push_at(&gvsp(7, 1, 3, false, &image(width, 3)[..block]), at(0))
+            .unwrap();
+        for ms in (10..=250).step_by(10) {
+            assembler.poll(at(ms));
+        }
+        assert!(assembler.frames.is_empty() && assembler.requests.is_empty());
+        assert_eq!(assembler.stats.incomplete_frames, 1);
     }
     #[test]
     fn packed_rows_may_be_padded_per_line_or_per_image() {
