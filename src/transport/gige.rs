@@ -1376,6 +1376,10 @@ impl ImageLeader {
             wire_bytes: wire_bytes as usize,
         })
     }
+    /// Bytes that hold `height` lines.
+    fn image_bytes(&self, height: u32) -> usize {
+        (self.row_bytes + self.x_padding) * height as usize
+    }
 }
 
 struct GvspPacket<'a> {
@@ -1425,7 +1429,13 @@ struct PartialFrame {
 }
 impl PartialFrame {
     fn ready(&self) -> bool {
-        self.leader.is_some() && Some(self.count) == self.packets
+        // A frame can end early; without its trailer only a full-height
+        // frame is known to be complete.
+        self.leader.as_ref().is_some_and(|leader| {
+            Some(self.count) == self.packets
+                && (self.trailer.is_some()
+                    || self.end >= leader.image_bytes(leader.height) + leader.y_padding)
+        })
     }
 }
 fn bit(bits: &[u64], id: u32) -> bool {
@@ -1449,39 +1459,21 @@ fn missing(received: &[u64], packets: Option<usize>) -> Vec<(u32, u32)> {
     }
     runs
 }
-fn validate_fragment(
-    leader: &ImageLeader,
-    block_size: usize,
-    id: u32,
-    length: usize,
-) -> Result<()> {
-    let packet_count = leader.wire_bytes.div_ceil(block_size);
+/// The leader gives the most lines a frame can have; line-scan cameras end a
+/// frame early (frame active triggers, line timeout) and report the lines
+/// they sent in the trailer.
+fn check_trailer(leader: &ImageLeader, block_size: usize, (id, height): (u32, u32)) -> Result<()> {
     ensure!(
-        id > 0 && id as usize <= packet_count,
-        "GVSP payload packet lies beyond image"
+        (1..=leader.height).contains(&height),
+        "GVSP trailer height {height} does not fit the leader's {}",
+        leader.height
     );
-    // The last packet may be padded up to a full block; the padding is not
-    // part of the image.
-    let last = id as usize == packet_count;
-    let expected = if last {
-        leader.wire_bytes - (packet_count - 1) * block_size
-    } else {
-        block_size
-    };
+    let packets = id as usize - 1;
+    let most = (leader.row_bytes + leader.x_padding) * height as usize + leader.y_padding;
     ensure!(
-        length == expected || (last && length > expected),
-        "GVSP payload packet has wrong length ({length} != {expected})"
-    );
-    Ok(())
-}
-fn check_trailer(leader: &ImageLeader, packets: usize, (id, height): (u32, u32)) -> Result<()> {
-    ensure!(
-        id as usize == packets + 1,
+        packets * block_size >= leader.image_bytes(height)
+            && packets <= most.min(leader.wire_bytes).div_ceil(block_size),
         "GVSP trailer packet ID does not match image size"
-    );
-    ensure!(
-        height == leader.height,
-        "GVSP trailer height differs from leader"
     );
     Ok(())
 }
@@ -1663,18 +1655,15 @@ impl Assembler {
                         "GVSP image requires too many packets"
                     );
                     // Only the highest packet can be short, so the highest
-                    // received ID and its end describe every packet so far.
+                    // received ID describes every packet so far.
                     ensure!(
-                        frame.end.div_ceil(block_size) <= packets
-                            && frame.packets.is_none_or(|known| known == packets)
-                            && (!bit(&frame.received, packets as u32)
-                                || frame.end >= leader.wire_bytes),
+                        frame.end.div_ceil(block_size) <= packets,
                         "GVSP payload packets do not match the image leader"
                     );
                     if let Some(trailer) = frame.trailer {
-                        check_trailer(&leader, packets, trailer)?;
+                        check_trailer(&leader, block_size, trailer)?;
                     }
-                    frame.packets = Some(packets);
+                    frame.packets.get_or_insert(packets);
                     frame.leader = Some(leader);
                     set_bit(&mut frame.received, 0);
                 }
@@ -1689,10 +1678,16 @@ impl Assembler {
                 if let Some(previous) = frame.trailer {
                     ensure!(previous == trailer, "conflicting duplicate GVSP trailer");
                 } else {
-                    if let (Some(leader), Some(packets)) = (&frame.leader, frame.packets) {
-                        check_trailer(leader, packets, trailer)?;
+                    let packets = packet.id as usize - 1;
+                    ensure!(
+                        frame.packets.is_none_or(|known| packets <= known)
+                            && frame.end.div_ceil(block_size) <= packets,
+                        "GVSP trailer packet ID does not match image size"
+                    );
+                    if let Some(leader) = &frame.leader {
+                        check_trailer(leader, block_size, trailer)?;
                     }
-                    frame.packets.get_or_insert(packet.id as usize - 1);
+                    frame.packets = Some(packets);
                     frame.trailer = Some(trailer);
                     set_bit(&mut frame.received, packet.id);
                 }
@@ -1714,9 +1709,6 @@ impl Assembler {
                     offset < self.payload_limit,
                     "GVSP payload exceeds configured bounds"
                 );
-                if let Some(leader) = &frame.leader {
-                    validate_fragment(leader, block_size, packet.id, length)?;
-                }
                 // Padding in a last packet may run past the payload size;
                 // only bytes inside it are kept.
                 let range = offset..(offset + length).min(self.payload_limit);
@@ -1750,6 +1742,15 @@ impl Assembler {
                     }
                 }
             }
+        }
+        if let (Some(leader), Some((_, height)), Some(packets)) =
+            (&frame.leader, frame.trailer, frame.packets)
+            && bit(&frame.received, packets as u32)
+        {
+            ensure!(
+                frame.end >= leader.image_bytes(height),
+                "GVSP payload ends before the trailer's {height} lines"
+            );
         }
         let complete = frame.due && frame.ready();
         if packet.kind == 2 {
@@ -1862,17 +1863,18 @@ impl Assembler {
         self.close(frame.block);
         self.stats.lost_frames += self.blocks.delivered(frame.block, frame.extended);
         let leader = frame.leader.expect("complete frames have a leader");
+        let height = frame.trailer.map_or(leader.height, |(_, height)| height);
         let mut data = frame.data;
         let stride = leader.row_bytes + leader.x_padding;
         if leader.x_padding > 0 {
-            for row in 1..leader.height as usize {
+            for row in 1..height as usize {
                 data.copy_within(
                     row * stride..row * stride + leader.row_bytes,
                     row * leader.row_bytes,
                 );
             }
         }
-        data.truncate(leader.row_bytes * leader.height as usize);
+        data.truncate(leader.row_bytes * height as usize);
         let timestamp_ns = if self.timestamp_frequency == 0 {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1886,7 +1888,7 @@ impl Assembler {
         self.ready.push_back(Frame {
             id: frame.block,
             width: leader.width,
-            height: leader.height,
+            height,
             pixel_format: leader.pixel_format,
             timestamp_ns,
             data,
@@ -2788,7 +2790,75 @@ mod tests {
         let mut assembler = Assembler::new(396_744, 1500, 0);
         assembler.push(&packets[0]).unwrap();
         let short = gvsp(1, 271, 3, false, &pixels[270 * block..][..700]);
-        assert!(assembler.push(&short).is_err());
+        assembler.push(&short).unwrap();
+        assert!(assembler.push(&packets[272]).is_err());
+    }
+    #[test]
+    fn short_frames_end_at_the_trailer_height() {
+        // A 4096-pixel Mono8 line-scan camera configured for 1000 lines at a
+        // 9000-byte packet size ends a frame after 300 lines (frame active
+        // trigger or line timeout): 137 full 8964-byte blocks, a 732-byte
+        // last packet and a trailer with ID 139 and size_y 300.
+        let (width, block) = (4096, 8964);
+        let lines = image(width, 300);
+        let mut packets = vec![gvsp(7, 0, 1, false, &leader(width, 1000, MONO8))];
+        for chunk in lines.chunks(block) {
+            packets.push(gvsp(7, packets.len() as u32, 3, false, chunk));
+        }
+        assert_eq!((packets.len(), packets[138].len()), (139, 8 + 732));
+        packets.push(gvsp(7, 139, 2, false, &trailer(300)));
+        for order in [
+            (0..140).collect::<Vec<_>>(),
+            (1..140).chain([0]).collect(),
+            [0, 139].into_iter().chain(1..139).collect(),
+        ] {
+            let mut assembler = Assembler::new(4_096_000, 9000, 0);
+            let delivered: Vec<_> = order
+                .iter()
+                .filter_map(|id| assembler.push(&packets[*id]).unwrap())
+                .collect();
+            assert_eq!(delivered.len(), 1, "{order:?}");
+            assert_eq!((delivered[0].height, &delivered[0].data), (300, &lines));
+        }
+        let start = Instant::now();
+        let mut assembler = Assembler::new(4_096_000, 9000, 0);
+        for packet in &packets[..139] {
+            assembler.push_at(packet, start).unwrap();
+        }
+        assembler.poll(start + RESEND_IDLE);
+        assert!(assembler.ready.is_empty());
+
+        // A cut on a packet boundary has no short packet, and padded rows
+        // are compacted for the delivered height only.
+        let mut assembler = Assembler::new(48, 44, 0);
+        let mut metadata = leader(5, 8, MONO8);
+        metadata[32..34].copy_from_slice(&1u16.to_be_bytes());
+        let rows: Vec<u8> = (1..=24).collect();
+        for (id, chunk) in rows.chunks(8).enumerate() {
+            assembler
+                .push(&gvsp(1, id as u32 + 1, 3, false, chunk))
+                .unwrap();
+        }
+        assembler.push(&gvsp(1, 0, 1, false, &metadata)).unwrap();
+        let frame = assembler
+            .push(&gvsp(1, 4, 2, false, &trailer(4)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.height, 4);
+        assert_eq!(frame.data.len(), 20);
+        assert_eq!(frame.data[5..10], [7, 8, 9, 10, 11]);
+
+        for (height, last) in [(1001, 732), (0, 732), (200, 732), (300, 700)] {
+            let mut assembler = Assembler::new(4_096_000, 9000, 0);
+            let result = packets[..138]
+                .iter()
+                .chain([
+                    &gvsp(7, 138, 3, false, &lines[137 * block..][..last]),
+                    &gvsp(7, 139, 2, false, &trailer(height)),
+                ])
+                .try_for_each(|packet| assembler.push(packet).map(drop));
+            assert!(result.is_err(), "{height} {last}");
+        }
     }
     #[test]
     fn receive_buffer_requests_halve_on_errors_and_note_small_buffers() {
