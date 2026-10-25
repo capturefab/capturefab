@@ -158,6 +158,9 @@ pub struct Caps {
     pub exposure_floor: Option<f64>,
     pub gain: Option<&'static str>,
     pub gain_bounds: Bounds,
+    /// Gain is a linear multiplier, as on IDS, JAI and Teledyne DALSA
+    /// cameras; the controller still works in dB.
+    pub gain_linear: bool,
     pub sensor_fps: Option<f64>,
     pub link: Option<f64>,
     pub payload: Option<f64>,
@@ -181,6 +184,35 @@ pub struct Caps {
     pub gain_selector: Option<&'static str>,
     pub video_mode: bool,
     pub color: bool,
+}
+
+impl Caps {
+    /// A gain reading in dB.
+    fn gain_db(&self, raw: f64) -> f64 {
+        match self.gain_linear {
+            true => 20.0 * raw.log10(),
+            false => raw,
+        }
+    }
+    /// The camera's gain value for `db`.
+    fn gain_raw(&self, db: f64) -> f64 {
+        match self.gain_linear {
+            true => 10f64.powf(db / 20.0),
+            false => db,
+        }
+    }
+    /// Gain bounds in dB. A multiplier's step has no fixed size in dB.
+    fn gain_bounds_db(&self, camera: &mut Camera) -> Bounds {
+        let b = bounds(camera, self.gain);
+        match self.gain_linear {
+            true => Bounds {
+                min: b.min.map(|v| self.gain_db(v)).and_then(finite),
+                max: b.max.map(|v| self.gain_db(v)).and_then(finite),
+                inc: None,
+            },
+            false => b,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -666,17 +698,47 @@ impl AutoController {
             &[("ExposureAuto", "Off")],
         );
         self.caps.gain = self.find_unlockable(camera, &["Gain", "GainAbs"], &[("GainAuto", "Off")]);
-        if camera.get("GainSelector").is_ok_and(|v| v != "All") {
+        if let Ok(Value::String(current)) = camera.get("GainSelector")
+            && current != "All"
+        {
             let choices = camera.choices("GainSelector").unwrap_or_default();
-            self.caps.gain_selector = ["All", "AnalogAll"]
+            self.caps.gain_selector = ["All", "AnalogAll", "SensorAll"]
                 .into_iter()
                 .find(|c| choices.iter().any(|v| v == c));
+            let partial = current.starts_with("Digital")
+                || current.contains("Tap")
+                || ["Red", "Green", "Blue"]
+                    .iter()
+                    .any(|c| current.ends_with(c));
+            if self.caps.gain_selector.is_none() && partial && self.caps.gain.is_some() {
+                self.note(
+                    "gain",
+                    format!("GainSelector {current} is not a sensor-wide gain, so auto mode leaves gain unchanged"),
+                );
+                self.caps.gain = None;
+            }
+        }
+        if let Some(gain) = self.caps.gain {
+            let unit = camera.feature_unit(gain).unwrap_or("").trim().to_owned();
+            let positive = bounds(camera, Some(gain)).min.is_some_and(|m| m > 0.0);
+            match unit.as_str() {
+                u if u.eq_ignore_ascii_case("dB") => {}
+                "" | "x" | "X" | "times" | "-" if positive => self.caps.gain_linear = true,
+                "" => {}
+                _ => {
+                    self.note(
+                        "gain",
+                        format!("{gain} unit {unit} is neither dB nor a multiplier, so auto mode leaves gain unchanged"),
+                    );
+                    self.caps.gain = None;
+                }
+            }
         }
         for f in [self.caps.exposure, self.caps.gain].into_iter().flatten() {
             self.read(camera, f)?;
         }
         self.caps.exposure_bounds = bounds(camera, self.caps.exposure);
-        self.caps.gain_bounds = bounds(camera, self.caps.gain);
+        self.caps.gain_bounds = self.caps.gain_bounds_db(camera);
         for f in AUTOS {
             if let Ok(v) = camera.get(f) {
                 self.remember(camera, f);
@@ -897,9 +959,9 @@ impl AutoController {
                 camera,
                 "GainSelector",
                 json!(choice),
-                "gain in dB for all channels",
+                "gain for all channels",
             );
-            self.caps.gain_bounds = bounds(camera, self.caps.gain);
+            self.caps.gain_bounds = self.caps.gain_bounds_db(camera);
             if let Some(gain) = self.caps.gain
                 && let Err(e) = self.read(camera, gain)
             {
@@ -971,8 +1033,8 @@ impl AutoController {
             self.write_pair(
                 camera,
                 pair,
-                p.gain_min,
-                p.gain_cap,
+                c.gain_raw(p.gain_min),
+                c.gain_raw(p.gain_cap),
                 "gain range for the balance",
             );
         }
@@ -998,7 +1060,7 @@ impl AutoController {
                     self.apply(
                         camera,
                         g,
-                        json!(start),
+                        json!(c.gain_raw(start)),
                         "gain within the range for the balance",
                     );
                 }
@@ -1285,7 +1347,7 @@ impl AutoController {
             self.status.exposure_us = number;
         }
         if self.caps.gain == Some(feature) {
-            self.status.gain_db = number;
+            self.status.gain_db = number.map(|g| self.caps.gain_db(g)).and_then(finite);
         }
         self.values.insert(feature.into(), value);
     }
@@ -1502,7 +1564,7 @@ impl AutoController {
             self.write(
                 camera,
                 f,
-                json!(value),
+                json!(self.caps.gain_raw(value)),
                 Some("gain adjusted for brightness"),
             )?;
         }
@@ -1559,7 +1621,10 @@ impl AutoController {
         }
         let e = self.read(camera, ef)?;
         let g = match self.caps.gain {
-            Some(f) => self.read(camera, f)?,
+            Some(f) => {
+                let raw = self.read(camera, f)?;
+                self.caps.gain_db(raw)
+            }
             None => 0.0,
         };
         let settled = self
@@ -1636,7 +1701,7 @@ impl AutoController {
             && self.fw.dark >= 2
             && g < p.gain_cap - 0.1
         {
-            let raised = json!((g + 3.0).min(p.gain_cap));
+            let raised = json!(self.caps.gain_raw((g + 3.0).min(p.gain_cap)));
             return self
                 .write(
                     camera,
@@ -1650,7 +1715,7 @@ impl AutoController {
             && e < 0.5 * p.exposure_cap
             && g > p.gain_min + 0.1
         {
-            let lowered = json!((g - 3.0).max(p.gain_min));
+            let lowered = json!(self.caps.gain_raw((g - 3.0).max(p.gain_min)));
             return self
                 .write(
                     camera,
@@ -2776,6 +2841,76 @@ mod tests {
         assert_eq!(fake.u32(MODE), 0);
         auto.release(&mut camera, true).unwrap();
         assert_eq!(fake.u32(MODE), 1);
+    }
+
+    #[test]
+    fn multiplier_gain_is_controlled_in_db() {
+        // IDS, JAI and Teledyne DALSA Gain is a unitless factor from 1x.
+        let mut fake = Fake::new(false);
+        fake.xml = fake
+            .xml
+            .replace(
+                "<Float Name='Gain'><pValue>GainReg</pValue><Min>0</Min><Max>48</Max>",
+                "<Float Name='Gain'><pValue>GainReg</pValue><Min>1</Min><Max>14.5</Max>",
+            )
+            .replace("AutoExposureTimeLowerLimit", "UnusedLowerLimit")
+            .replace("AutoExposureTimeUpperLimit", "UnusedUpperLimit");
+        fake.set_f64(GAIN, 2.0);
+        let mut camera = fake.camera();
+        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        assert!(auto.caps.gain_linear);
+        assert_eq!(auto.status().gain_limits_db, Some([0.0, 15.0]));
+        fake.set_f64(EXPOSURE, auto.policy.exposure_cap);
+        fake.set_f64(GAIN, 1.0);
+        auto.read(&mut camera, "ExposureTime").unwrap();
+        auto.read(&mut camera, "Gain").unwrap();
+        assert_eq!(auto.status().gain_db, Some(0.0));
+        auto.step(&mut camera, 1.0, Instant::now()).unwrap();
+        assert!(near(fake.f64(GAIN), 0.6f64.exp2()));
+        assert!(near(
+            auto.status().gain_db.unwrap(),
+            20.0 * 0.6f64.exp2().log10()
+        ));
+        auto.release(&mut camera, true).unwrap();
+        assert_eq!(fake.f64(GAIN), 2.0);
+
+        let mut fake = Fake::new(false);
+        fake.xml = fake.xml.replace(
+            "<Float Name='Gain'><pValue>GainReg</pValue>",
+            "<Float Name='Gain'><Unit>DN</Unit><pValue>GainReg</pValue>",
+        );
+        let mut camera = fake.camera();
+        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        assert_eq!(auto.caps.gain, None);
+    }
+
+    #[test]
+    fn digital_gain_selector_is_not_driven_as_the_master_gain() {
+        let mut fake = Fake::new(false);
+        let selector = |entries: &str| {
+            format!(
+                "<Enumeration Name='GainSelector'>{entries}<pValue>GainSelectorReg</pValue></Enumeration><IntReg Name='GainSelectorReg'><Address>176</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg></RegisterDescription>"
+            )
+        };
+        let base = fake.xml.clone();
+        fake.xml = base.replace(
+            "</RegisterDescription>",
+            &selector("<EnumEntry Name='DigitalAll'><Value>0</Value></EnumEntry><EnumEntry Name='SensorAll'><Value>1</Value></EnumEntry>"),
+        );
+        let mut camera = fake.camera();
+        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        assert_eq!(auto.caps.gain_selector, Some("SensorAll"));
+        assert_eq!(fake.u32(176), 1);
+
+        fake.xml = base.replace(
+            "</RegisterDescription>",
+            &selector("<EnumEntry Name='DigitalAll'><Value>0</Value></EnumEntry>"),
+        );
+        fake.set_u32(176, 0);
+        let mut camera = fake.camera();
+        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        assert_eq!(auto.caps.gain, None);
+        assert!(auto.status().notes.iter().any(|n| n.contains("DigitalAll")));
     }
 
     #[test]
