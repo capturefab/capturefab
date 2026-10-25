@@ -1819,9 +1819,13 @@ impl Assembler {
                 let range = offset..(offset + length).min(self.payload_limit);
                 let kept = &packet.data[..range.len()];
                 if bit(&frame.received, packet.id) {
+                    // A resent last packet may add or drop padding; the bytes
+                    // both copies hold must match.
+                    let held = (frame.end - offset).min(block_size);
+                    let common = held.min(kept.len());
                     ensure!(
-                        length == (frame.end - offset).min(block_size)
-                            && frame.data[range] == *kept,
+                        (length == held || frame.end <= offset + block_size)
+                            && frame.data[offset..offset + common] == kept[..common],
                         "conflicting duplicate GVSP payload packet"
                     );
                 } else {
@@ -2981,7 +2985,26 @@ mod tests {
                 assert_eq!(delivered.len(), 1, "{payload} {late_leader}");
                 assert_eq!(delivered[0].data, pixels);
             }
+            // A resend of the last packet may drop or add the padding.
+            let unpadded = gvsp(1, 271, 3, false, &pixels[270 * block..]);
+            for (first, again) in [(&packets[271], &unpadded), (&unpadded, &packets[271])] {
+                let mut assembler = Assembler::new(payload, 1500, 0);
+                for packet in packets[..271].iter().chain([first, again]) {
+                    assert!(assembler.push(packet).unwrap().is_none());
+                }
+                let frame = assembler.push(&packets[272]).unwrap().unwrap();
+                assert_eq!(frame.data, pixels);
+            }
         }
+        let mut assembler = Assembler::new(396_744, 1500, 0);
+        for packet in &packets[..=271] {
+            assembler.push(packet).unwrap();
+        }
+        assert!(
+            assembler
+                .push(&gvsp(1, 270, 3, false, &pixels[269 * block..][..752]))
+                .is_err()
+        );
         let mut assembler = Assembler::new(396_744, 1500, 0);
         assembler.push(&packets[0]).unwrap();
         let short = gvsp(1, 271, 3, false, &pixels[270 * block..][..700]);
