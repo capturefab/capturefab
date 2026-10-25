@@ -100,9 +100,13 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
     );
     if selector.starts_with("sim:") {
         crate::transport::simulator::validate_selector_shape(selector)?;
-    } else if let Some(ip) = selector.strip_prefix("gige:") {
-        ip.parse::<Ipv4Addr>()
-            .context("GigE selector needs an IPv4 address, for example gige:192.168.1.10")?;
+    } else if let Some(address) = selector.strip_prefix("gige:") {
+        // Discovery names GigE cameras by their 48-bit MAC address.
+        let discovered_id = address.len() == 12 && address.bytes().all(|b| b.is_ascii_hexdigit());
+        ensure!(
+            discovered_id || address.parse::<Ipv4Addr>().is_ok(),
+            "GigE selector needs an IPv4 address or a discovered ID, for example gige:192.168.1.10"
+        );
     } else if crate::scanner::is_source(selector) {
         crate::scanner::validate_selector_shape(selector)?;
     } else if crate::onvif::is_source(selector) {
@@ -473,6 +477,16 @@ mod tests {
             assert!(Camera::open(selector, &[], Duration::from_millis(1)).is_err());
         }
         assert!(Camera::open("sim:named camera", &[], Duration::from_millis(1)).is_ok());
+        for selector in ["gige:00305311aabb", "gige:00305311AABB", "gige:192.0.2.1"] {
+            validate_selector_shape(selector).unwrap();
+        }
+        for selector in [
+            "gige:00305311aab",
+            "gige:00305311aabbc",
+            "gige:00305311aabg",
+        ] {
+            assert!(validate_selector_shape(selector).is_err(), "{selector:?}");
+        }
     }
 
     #[test]

@@ -667,6 +667,19 @@ mod tests {
         camera.start().unwrap();
         assert_eq!(camera.next_frame(Duration::from_secs(2)).unwrap().width, 96);
         drop(camera);
+        // A discovered camera opens by the MAC-based ID discovery reports.
+        let info = crate::transport::gige::probe(ip, Duration::from_secs(2)).unwrap();
+        assert!(
+            info.id
+                .strip_prefix("gige:")
+                .unwrap()
+                .parse::<Ipv4Addr>()
+                .is_err()
+        );
+        let id = info.id.clone();
+        let camera = Camera::open(&id, &[info], Duration::from_secs(2)).unwrap();
+        assert_eq!(camera.info.id, id);
+        drop(camera);
         drop(server);
     }
 }
