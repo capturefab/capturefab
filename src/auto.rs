@@ -1029,7 +1029,7 @@ impl AutoController {
                 "exposure range for the balance",
             );
         }
-        if let Some(pair) = c.gain_limits {
+        if let (Some(pair), Some(_)) = (c.gain_limits, c.gain) {
             self.write_pair(
                 camera,
                 pair,
@@ -1040,6 +1040,15 @@ impl AutoController {
         }
         if let Some([f, v]) = c.profile {
             self.apply(camera, f, json!(v), "prefer exposure over gain");
+        }
+        // Basler ace Classic GigE has only an integer GainRaw, whose dB scale
+        // is model specific: its own auto gain, bounded by the camera's
+        // limits, follows the profile, which needs both autos Continuous.
+        if c.gain.is_none()
+            && camera.has("GainRaw")
+            && let (Some(auto), Some(_)) = (c.gain_auto, c.profile)
+        {
+            self.apply(camera, auto, json!("Continuous"), "camera auto gain");
         }
         if let Some(g) = c.gain {
             self.own(g);
@@ -2911,6 +2920,25 @@ mod tests {
         let auto = AutoController::enter(&mut camera, 0.5).unwrap();
         assert_eq!(auto.caps.gain, None);
         assert!(auto.status().notes.iter().any(|n| n.contains("DigitalAll")));
+    }
+
+    #[test]
+    fn raw_gain_follows_the_auto_function_profile() {
+        let mut fake = Fake::new(true);
+        fake.xml = fake.xml.replace(
+            "<Float Name='Gain'><pValue>GainReg</pValue>",
+            "<Float Name='GainRaw'><pValue>GainReg</pValue>",
+        );
+        let mut camera = fake.camera();
+        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        assert_eq!(
+            (auto.status().strategy.as_str(), auto.caps.gain),
+            ("firmware", None)
+        );
+        assert_eq!([PROFILE, GAIN_AUTO].map(|a| fake.u32(a)), [0, 2]);
+        assert_eq!(fake.f64(GAIN_UPPER), 24.0);
+        auto.release(&mut camera, true).unwrap();
+        assert_eq!(fake.u32(GAIN_AUTO), 0);
     }
 
     #[test]
