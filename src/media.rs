@@ -1107,14 +1107,14 @@ pub fn native_devices() -> Result<Value> {
     native_devices_with_timeout(Duration::from_secs(8))
 }
 pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let _ = timeout;
     #[cfg(target_os = "linux")]
     {
-        let devices = v4l2_devices(
-            std::path::Path::new("/sys/class/video4linux"),
-            v4l2::captures_video,
-        );
+        let deadline = Instant::now() + timeout;
+        let devices = v4l2_devices(std::path::Path::new("/sys/class/video4linux"), |path| {
+            captures_by(deadline, path, v4l2::captures_video)
+        });
         return Ok(json!({"platform":"linux","devices":devices}));
     }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1192,6 +1192,22 @@ fn v4l2_devices(
             json!({"id":format!("v4l2:/dev/{node}"),"name":name.trim(),"backend":"v4l2"})
         })
         .collect()
+}
+/// Whether `captures` accepts the node at `path`, or `true` when it has not
+/// answered by `deadline`: opening a node can wait on a USB camera resuming
+/// from autosuspend.
+#[cfg(any(test, target_os = "linux"))]
+fn captures_by(
+    deadline: Instant,
+    path: &std::path::Path,
+    captures: fn(&std::path::Path) -> bool,
+) -> bool {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let path = path.to_owned();
+    thread::spawn(move || sender.send(captures(&path)));
+    receiver
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap_or(true)
 }
 #[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn avfoundation_devices(listing: &str) -> Vec<Value> {
@@ -7954,6 +7970,16 @@ Error opening input files: Input/output error
             ]
         );
         fs::remove_dir_all(class).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(!captures_by(deadline, "/dev/video1".as_ref(), |_| false));
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(100);
+        let wedged = |_: &std::path::Path| {
+            thread::sleep(Duration::from_secs(5));
+            false
+        };
+        assert!(captures_by(deadline, "/dev/video0".as_ref(), wedged));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
     #[test]
     fn v4l2_locators_accept_persistent_udev_links() {
