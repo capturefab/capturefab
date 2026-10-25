@@ -47,6 +47,9 @@ while [ $# -gt 0 ]; do
     *) fail "unknown option: $1 (use --prefix DIR, --bin-dir DIR or --dry-run)" ;;
   esac
 done
+# The command symlink must name an absolute target: a relative one would
+# resolve against the bin directory, not the directory the user ran this in.
+case "$prefix" in ''|/*) ;; *) prefix="$PWD/$prefix" ;; esac
 
 [ -n "$VERSION" ] || fail "no published release is available yet; see ${SITE}downloads.html or build from source"
 

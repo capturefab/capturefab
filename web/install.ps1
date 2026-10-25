@@ -89,6 +89,12 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
   if ($entries -notcontains $dest -or $stale) {
     $kept = @($entries | Where-Object { $stale -notcontains $_ -and $_ -ne $dest }) + $dest
     New-ItemProperty -Path $envKey -Name 'Path' -PropertyType ExpandString -Value ($kept -join ';') -Force | Out-Null
+    # Tell Explorer the environment changed, so terminals it starts see the new PATH.
+    try {
+      Add-Type -Namespace Capturefab -Name Env -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+      $result = [UIntPtr]::Zero
+      [void][Capturefab.Env]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
+    } catch {}
     "Added $dest to your user PATH. Open a new terminal to use capturefab."
   }
   if (($env:Path -split ';') -notcontains $dest) { $env:Path = "$dest;$env:Path" }

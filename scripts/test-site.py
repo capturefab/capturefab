@@ -571,14 +571,15 @@ def check_installer_runs(errors):
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(served)))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
-            def install(name):
+            def install(name, prefix=None):
                 home = temp / name
                 home.mkdir()
                 env = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / "share"), CAPTUREFAB_INSTALL_BASE_URL=f"http://127.0.0.1:{server.server_port}")
-                result = subprocess.run(["sh", str(script), "--prefix", str(home / "apps"), "--bin-dir", str(home / "bin")],
-                                        capture_output=True, text=True, env=env, timeout=60)
+                result = subprocess.run(["sh", str(script), "--prefix", prefix or str(home / "apps"), "--bin-dir", str(home / "bin")],
+                                        capture_output=True, text=True, env=env, timeout=60, cwd=home)
                 return home, result
-            home, result = install("good")
+            # A relative prefix must still leave a working command symlink.
+            home, result = install("good", "apps")
             command = home / "bin" / "capturefab"
             if result.returncode or not command.is_symlink():
                 errors.append(f"install.sh: fixture install failed: {result.stderr.strip() or result.stdout.strip()}")
