@@ -23,13 +23,17 @@ pub(super) struct SignIn {
     pub(super) user: String,
     pub(super) password: SecretDraft,
     pub(super) remember: bool,
-    pub(super) error: Option<&'static str>,
+    pub(super) error: Option<String>,
     /// A sign-in saved on this computer stopped working.
     pub(super) saved_rejected: bool,
     /// A connect with this sign-in is on its way.
     pub(super) pending: bool,
     /// Focus a field on the next tick, as the sheet opens.
     pub(super) focus: bool,
+    /// The password field was edited since the sheet opened or the last
+    /// attempt. After a failure Sign in waits for it, so a stray Return
+    /// never resends an empty password to a camera that may lock the account.
+    pub(super) password_touched: bool,
 }
 
 impl SignIn {
@@ -43,10 +47,12 @@ impl SignIn {
             saved_rejected: false,
             pending: false,
             focus: true,
+            password_touched: false,
         }
     }
     pub(super) fn ready(&self) -> bool {
-        !self.user.trim().is_empty() && !self.pending
+        let retry = self.error.is_some() || self.saved_rejected;
+        !self.user.trim().is_empty() && !self.pending && (!retry || self.password_touched)
     }
 }
 
@@ -68,6 +74,9 @@ pub(super) enum Reply {
     },
     Forgotten {
         address: String,
+        /// Forgotten with its recent on the welcome screen, not only the
+        /// sign-in from Settings.
+        from_recent: bool,
         result: Result<bool, String>,
     },
 }
@@ -80,6 +89,15 @@ fn store_caption() -> &'static str {
         "Saved in Windows Credential Manager."
     } else {
         "Saved in your system keyring."
+    }
+}
+
+/// The camera as the sheet names it: without scheme, default port or the
+/// default ONVIF path, and never with credentials.
+fn sign_in_place(target: &str) -> String {
+    match logins::key(target) {
+        Ok(key) => logins::short(&key.address),
+        Err(_) => short_address(&crate::media::redact_url(target)),
     }
 }
 
@@ -163,11 +181,14 @@ impl Workbench {
         let rejected = code == "auth_rejected";
         let user = match self.sign_in.take() {
             Some(open) if open.target == target => Some(open.user),
-            _ => self.suggested_user(&target),
+            _ => pending
+                .sent_user
+                .clone()
+                .or_else(|| self.suggested_user(&target)),
         };
         let mut sheet = SignIn::new(target, user);
         sheet.saved_rejected = rejected && !pending.sent_login;
-        sheet.error = (rejected && pending.sent_login).then_some(REJECTED);
+        sheet.error = (rejected && pending.sent_login).then(|| REJECTED.to_owned());
         self.sign_in = Some(sheet);
     }
 
@@ -177,12 +198,16 @@ impl Workbench {
         };
         match input {
             Input::User(user) if !sheet.pending => sheet.user = user,
-            Input::Password(password) if !sheet.pending => sheet.password = password,
+            Input::Password(password) if !sheet.pending => {
+                sheet.password = password;
+                sheet.password_touched = true;
+            }
             Input::Remember(remember) if !sheet.pending => sheet.remember = remember,
             Input::Submit if sheet.ready() => {
                 let login = CameraLogin::new(sheet.user.trim(), sheet.password.as_str());
                 // The draft is consumed here, whatever comes next.
                 sheet.password = SecretDraft::default();
+                sheet.password_touched = false;
                 match login {
                     Ok(login) => {
                         sheet.pending = true;
@@ -194,12 +219,34 @@ impl Workbench {
                         self.connect_with(target, Some(login), remember);
                     }
                     Err(_) => {
-                        sheet.error =
-                            Some("User names and passwords can't contain control characters.")
+                        sheet.error = Some(
+                            "User names and passwords can't contain control characters.".into(),
+                        )
                     }
                 }
             }
-            Input::Cancel => self.sign_in = None,
+            Input::Cancel => {
+                // Cancelling while signing in lets the connect finish, but
+                // drops the copy to remember and keeps the sheet closed.
+                if sheet.pending {
+                    let target = sheet.target.clone();
+                    let mine: Vec<usize> = (0..self.pending.len())
+                        .filter(|&i| {
+                            let pending = &self.pending[i];
+                            pending.job == Job::Connect
+                                && pending
+                                    .target
+                                    .as_deref()
+                                    .is_some_and(|t| self.login_target(t) == target)
+                        })
+                        .collect();
+                    for i in mine {
+                        self.pending[i].login = None;
+                        self.pending[i].sign_in_cancelled = true;
+                    }
+                }
+                self.sign_in = None;
+            }
             _ => {}
         }
         Task::none()
@@ -236,12 +283,16 @@ impl Workbench {
     }
 
     /// Forget a saved sign-in off the event loop.
-    pub(super) fn forget_sign_in(&mut self, address: String) {
+    pub(super) fn forget_sign_in(&mut self, address: String, from_recent: bool) {
         let job = spawn(move || {
             let result = Logins::system()
                 .forget(&address)
                 .map_err(|error| format!("{error:#}"));
-            Reply::Forgotten { address, result }
+            Reply::Forgotten {
+                address,
+                from_recent,
+                result,
+            }
         });
         if let Ok(job) = job {
             self.login_jobs.push(job);
@@ -286,14 +337,22 @@ impl Workbench {
                     None,
                     Level::Warning,
                 ),
-                Reply::Forgotten { address, result } => {
+                Reply::Forgotten {
+                    address,
+                    from_recent,
+                    result,
+                } => {
                     self.saved_logins.remove(&address);
                     match result {
                         Ok(_) => {
                             let host = logins::short(&address);
                             let host = host.split('/').next().unwrap_or(&host).to_owned();
                             self.set_notice(
-                                format!("Forgot {host} and its saved sign-in."),
+                                if from_recent {
+                                    format!("Forgot {host} and its saved sign-in.")
+                                } else {
+                                    format!("Removed the saved sign-in for {host}.")
+                                },
                                 None,
                                 Level::Done,
                             );
@@ -315,7 +374,7 @@ impl Workbench {
         debug_assert!(logins::can_remember(), "every GUI build has the keychain");
         let pending = sheet.pending;
         let send = |input| Message::SignIn(input);
-        let place = short_address(&crate::media::redact_url(&sheet.target));
+        let place = sign_in_place(&sheet.target);
         let bold = |value: String| iced::widget::span(value).font(style::SEMIBOLD);
         let plain = |value: &'static str| iced::widget::span(value.to_owned());
         let spans: Vec<iced::widget::text::Span<'_, ()>> = if sheet.saved_rejected {
@@ -334,7 +393,8 @@ impl Workbench {
             .size(style::BODY)
             .color(p.text)
             .width(Fill);
-        let user = text_input("User name", &sheet.user)
+        // Labels sit above the fields, so no placeholder repeats them.
+        let user = text_input("", &sheet.user)
             .id("sign-in-user")
             .name("User name")
             .on_input_maybe((!pending).then_some(|value| Message::SignIn(Input::User(value))))
@@ -342,7 +402,7 @@ impl Workbench {
             .padding([6, 10])
             .size(style::BODY)
             .style(style::input);
-        let password = text_input("Password", sheet.password.as_str())
+        let password = text_input("", sheet.password.as_str())
             .id("sign-in-password")
             .name("Password")
             .description("Sent only to this camera. Never saved in app preferences.")
@@ -376,8 +436,12 @@ impl Workbench {
             field("Password", password.into(), p),
         ]
         .spacing(14);
-        if let Some(error) = sheet.error {
-            body = body.push(text(error).size(style::SMALL).color(Level::Error.color(p)));
+        if let Some(error) = &sheet.error {
+            body = body.push(
+                text(error.as_str())
+                    .size(style::SMALL)
+                    .color(Level::Error.color(p)),
+            );
         }
         if prefs::storable(&sheet.target) {
             body = body.push(
@@ -387,7 +451,13 @@ impl Workbench {
                         sheet.remember,
                         (!pending).then_some(|value| Message::SignIn(Input::Remember(value))),
                     ),
-                    text(store_caption()).size(style::SMALL).color(p.secondary),
+                    text(if sheet.remember {
+                        store_caption()
+                    } else {
+                        "Used for this connection only."
+                    })
+                    .size(style::SMALL)
+                    .color(p.secondary),
                 ]
                 .spacing(4),
             );
@@ -458,7 +528,22 @@ impl Workbench {
                 .into();
         }
         for (address, user) in &self.saved_logins {
-            let place = short_address(address);
+            let place = logins::short(address);
+            // The recent's label, when one maps to this sign-in, is what
+            // the person knows the camera by.
+            let label = self
+                .recent
+                .iter()
+                .find(|recent| {
+                    logins::key(&self.login_target(&recent.target))
+                        .is_ok_and(|key| &key.address == address)
+                })
+                .map(|recent| recent.label.clone())
+                .filter(|label| !label.trim().is_empty() && *label != place);
+            let (title, caption) = match label {
+                Some(label) => (label, format!("{place} · Signed in as {user}")),
+                None => (place.clone(), format!("Signed in as {user}")),
+            };
             let forget = button(text("Forget").size(style::BODY))
                 .name(format!("Forget the sign-in for {place}"))
                 .padding([4, 12])
@@ -467,14 +552,8 @@ impl Workbench {
             section = section.push(
                 row![
                     column![
-                        one_line(place, style::BODY, style::MEDIUM, p.text).width(Fill),
-                        one_line(
-                            format!("User {user}"),
-                            style::CAPTION,
-                            style::SANS,
-                            p.secondary
-                        )
-                        .width(Fill),
+                        one_line(title, style::BODY, style::MEDIUM, p.text).width(Fill),
+                        one_line(caption, style::CAPTION, style::SANS, p.secondary).width(Fill),
                     ]
                     .spacing(2)
                     .width(Fill),
@@ -546,7 +625,7 @@ impl Workbench {
                     (word != "sign-in").then(|| "admin".to_owned()),
                 );
                 match word {
-                    "sign-in-rejected" => sheet.error = Some(REJECTED),
+                    "sign-in-rejected" => sheet.error = Some(REJECTED.into()),
                     "sign-in-saved-rejected" => sheet.saved_rejected = true,
                     "sign-in-pending" => {
                         sheet.pending = true;
@@ -595,8 +674,12 @@ mod tests {
         bench.sign_in.as_mut().unwrap().user = "admin".into();
         bench.settle(&connecting(TARGET, true), &Err(rejected()));
         let sheet = bench.sign_in.as_ref().unwrap();
-        assert_eq!(sheet.error, Some(REJECTED));
+        assert_eq!(sheet.error.as_deref(), Some(REJECTED));
         assert_eq!(sheet.user, "admin", "the user name stays");
+        // After a refusal, Return waits for the password to be edited.
+        assert!(!sheet.ready());
+        let _ = bench.sign_in_input(Input::Password(SecretDraft::default()));
+        assert!(bench.sign_in.as_ref().unwrap().ready());
 
         bench.sign_in = None;
         bench
@@ -704,6 +787,87 @@ mod tests {
             "{prefs}"
         );
         bench.handle.shutdown();
+    }
+
+    #[test]
+    fn other_urls_keep_their_credentials_for_ffmpeg() {
+        let mut bench = bench();
+        let typed = "http://u:p@cam.local/mjpg/video.mjpg";
+        bench.address = typed.into();
+        bench.connect(typed.into());
+        assert_eq!(bench.address, typed);
+        let pending = bench.pending.pop().expect("a Connect is sent");
+        assert_eq!(pending.target.as_deref(), Some(typed));
+        assert!(!pending.sent_login && pending.sent_user.is_none());
+        assert!(bench.side.connect_failures.is_empty());
+        bench.handle.shutdown();
+    }
+
+    #[test]
+    fn a_refused_typed_address_keeps_only_its_user_name() {
+        let mut bench = bench();
+        bench.connect("rtsp://admin:wrong@cam.local/live".into());
+        let pending = bench.pending.pop().unwrap();
+        assert_eq!(pending.sent_user.as_deref(), Some("admin"));
+        bench.settle(&pending, &Err(logins::auth_error(TARGET, true)));
+        let sheet = bench.sign_in.as_ref().unwrap();
+        assert_eq!(sheet.user, "admin");
+        assert!(sheet.password.as_str().is_empty());
+        bench.handle.shutdown();
+    }
+
+    #[test]
+    fn other_failures_show_in_the_open_sheet() {
+        let mut bench = bench();
+        bench.sign_in = Some(SignIn::new(TARGET.into(), Some("admin".into())));
+        let _ = bench.sign_in_input(Input::Submit);
+        let pending = bench.pending.pop().unwrap();
+        bench.settle(&pending, &Err(anyhow::anyhow!("camera timed out")));
+        let sheet = bench.sign_in.as_ref().expect("the sheet stays");
+        assert!(!sheet.pending);
+        assert!(sheet.error.as_deref().unwrap().contains("timed out"));
+        bench.handle.shutdown();
+    }
+
+    #[test]
+    fn cancelling_while_signing_in_saves_nothing_and_stays_closed() {
+        let mut bench = bench();
+        for refused in [false, true] {
+            bench.sign_in = Some(SignIn::new(TARGET.into(), Some("admin".into())));
+            let _ = bench.sign_in_input(Input::Submit);
+            assert!(bench.pending.last().unwrap().login.is_some());
+            let _ = bench.sign_in_input(Input::Cancel);
+            assert!(bench.sign_in.is_none());
+            let mut pending = bench.pending.pop().unwrap();
+            assert!(pending.sign_in_cancelled && pending.login.is_none());
+            let (sender, receiver) = mpsc::channel();
+            sender
+                .send(if refused {
+                    Err(logins::auth_error(TARGET, true))
+                } else {
+                    Ok(serde_json::json!({"connected": null}))
+                })
+                .unwrap();
+            pending.receiver = receiver;
+            bench.pending.push(pending);
+            bench.poll();
+            assert!(bench.login_jobs.is_empty(), "nothing is saved");
+            assert!(bench.sign_in.is_none(), "the sheet does not come back");
+        }
+        bench.handle.shutdown();
+    }
+
+    #[test]
+    fn sign_in_addresses_read_the_same_everywhere() {
+        assert_eq!(
+            sign_in_place("rtsp://192.168.10.60:554/Streaming/Channels/101"),
+            "192.168.10.60/Streaming/Channels/101"
+        );
+        assert_eq!(sign_in_place("onvif://192.168.10.61"), "192.168.10.61");
+        assert_eq!(
+            logins::short("onvif:http://192.168.10.61:80/onvif/device_service"),
+            "192.168.10.61"
+        );
     }
 
     #[test]

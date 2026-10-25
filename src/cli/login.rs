@@ -72,8 +72,14 @@ pub fn prepare(command: &LoginCommand) -> Result<()> {
 /// The address a sign-in is saved under; with a session, a bare name may be
 /// the ID or serial of an ONVIF camera it discovered or connected.
 fn resolve(address: &str, session: Option<&str>, timeout: Duration) -> Result<String> {
-    if let Ok(key) = logins::key(address) {
-        return Ok(key.address);
+    Ok(logins::key(&target(address, session, timeout)?)?.address)
+}
+
+/// The credential-free address to connect, as given (query and all), or the
+/// ID of the discovered ONVIF camera it names.
+fn target(address: &str, session: Option<&str>, timeout: Duration) -> Result<String> {
+    if logins::key(address).is_ok() {
+        return Ok(address.trim().to_owned());
     }
     if let Some(name) = session
         && !address.contains("://")
@@ -91,11 +97,13 @@ fn resolve(address: &str, session: Option<&str>, timeout: Duration) -> Result<St
             if crate::onvif::is_source(id)
                 && (id == address || device["serial"].as_str() == Some(address))
             {
-                return Ok(logins::key(id)?.address);
+                logins::key(id)?;
+                return Ok(id.to_owned());
             }
         }
     }
-    Ok(logins::key(address)?.address)
+    logins::key(address)?;
+    Ok(address.to_owned())
 }
 
 fn password(stdin: bool) -> Result<zeroize::Zeroizing<String>> {
@@ -134,14 +142,17 @@ pub fn run(command: &LoginCommand, session: Option<&str>, timeout: Duration) -> 
             if !logins::can_remember() {
                 return Err(unsupported());
             }
-            let address = resolve(address, session, timeout)?;
+            // The check opens the address as given; the key only names
+            // the saved entry.
+            let target = target(address, session, timeout)?;
+            let address = logins::key(&target)?.address;
             let password = password(*password_stdin)?;
             let login = CameraLogin::new(user.clone().unwrap_or_default(), password.as_str())?;
             drop(password);
             let check = if *no_check {
                 None
             } else {
-                Some(check(&address, &login, timeout)?)
+                Some(check(&target, &login, timeout)?)
             };
             let saved = Logins::system().save(&address, &login)?;
             let mut result = json!({"login": saved.entry, "replaced": saved.replaced});
@@ -215,5 +226,32 @@ pub fn human(command: &LoginCommand, value: &Value) -> String {
             "Forgot the sign-in for {}\n",
             value["removed"].as_str().unwrap_or_default()
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_check_opens_the_address_as_given_and_the_key_names_the_entry() {
+        let timeout = Duration::from_secs(1);
+        for (given, key) in [
+            (
+                "rtsp://cam.local/cam/realmonitor?channel=1&subtype=0",
+                "rtsp://cam.local:554/cam/realmonitor",
+            ),
+            (
+                " rtsps://Cam.local:8322/live#x ",
+                "rtsps://cam.local:8322/live",
+            ),
+        ] {
+            let target = target(given, None, timeout).unwrap();
+            assert_eq!(target, given.trim(), "the query reaches the camera");
+            assert_eq!(resolve(given, None, timeout).unwrap(), key);
+        }
+        let onvif = "onvif://cam.local?mode=media";
+        assert_eq!(target(onvif, None, timeout).unwrap(), onvif);
+        assert!(target("http://cam.local/x", None, timeout).is_err());
     }
 }

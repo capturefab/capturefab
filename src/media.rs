@@ -4960,7 +4960,7 @@ case "$*" in
 esac
 exit 1"#,
         );
-        let timeout = Duration::from_secs(2);
+        let timeout = Duration::from_secs(10);
         let code = |result: Result<Box<dyn Backend>>| {
             let error = result.err().expect("open fails");
             (

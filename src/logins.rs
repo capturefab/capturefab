@@ -132,22 +132,32 @@ pub fn account(user: &str, address: &str) -> String {
     format!("{}@{address}", crate::hubs::encode(user))
 }
 
-/// A short form for messages and the UI: the address without its scheme and
-/// default port, for example `cam.local/live`.
+/// A short form for messages and the UI: the address without its scheme,
+/// the scheme's default port or the default ONVIF path, for example
+/// `cam.local/live` or `cam.local` for `onvif:http://cam.local:80/onvif/device_service`.
 pub fn short(address: &str) -> String {
     let address = crate::media::redact_url(address);
-    let rest = address
-        .strip_prefix("onvif:")
-        .unwrap_or(&address)
-        .split_once("://")
-        .map_or(address.as_str(), |(_, rest)| rest);
+    let onvif = address.strip_prefix("onvif:");
+    let inner = onvif.unwrap_or(&address);
+    let (scheme, rest) = inner.split_once("://").unwrap_or(("", inner));
+    let default_port = match scheme.to_ascii_lowercase().as_str() {
+        "rtsp" => ":554",
+        "rtsps" => ":322",
+        "http" => ":80",
+        "https" => ":443",
+        _ => "",
+    };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
-    let authority = [":554", ":322", ":80"]
-        .iter()
-        .find_map(|port| authority.strip_suffix(port))
+    let authority = (!default_port.is_empty())
+        .then(|| authority.strip_suffix(default_port))
+        .flatten()
         .unwrap_or(authority);
-    let tail = if tail == "/" { "" } else { tail };
+    let tail = match tail {
+        "/" => "",
+        "/onvif/device_service" if onvif.is_some() => "",
+        tail => tail,
+    };
     format!("{authority}{tail}")
 }
 
@@ -508,6 +518,10 @@ impl Logins {
     fn path(&self) -> PathBuf {
         self.dir.join(INDEX)
     }
+    /// The non-secret index file, for messages.
+    pub fn index_path(&self) -> PathBuf {
+        self.path()
+    }
     fn read(&self) -> Result<File> {
         let path = self.path();
         let input = match fs::File::open(&path) {
@@ -805,10 +819,13 @@ mod tests {
         );
         assert_eq!(short("rtsp://cam:554/live"), "cam/live");
         assert_eq!(short("rtsp://cam:8554/"), "cam:8554");
+        assert_eq!(short("onvif:http://cam:80/onvif/device_service"), "cam");
         assert_eq!(
-            short("onvif:http://cam:80/onvif/device_service"),
-            "cam/onvif/device_service"
+            short("onvif:http://cam:8080/onvif/other"),
+            "cam:8080/onvif/other"
         );
+        assert_eq!(short("rtsp://cam:80/live"), "cam:80/live");
+        assert_eq!(short("rtsps://cam:322/live"), "cam/live");
     }
 
     #[test]
@@ -941,7 +958,15 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         assert_eq!(logins.list().unwrap().len(), 1);
-        logins.touch(&address);
+        // Best effort: a child forked elsewhere in the test process may
+        // briefly hold the lock descriptor before it execs, so retry.
+        for _ in 0..100 {
+            logins.touch(&address);
+            if logins.list().unwrap()[0].last_used_at.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(logins.list().unwrap()[0].last_used_at.is_some());
         assert!(logins.forget(&address).unwrap());
         assert!(store.secrets.lock().unwrap().is_empty());

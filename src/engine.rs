@@ -1160,7 +1160,27 @@ fn process_plain(
                 && saved_login
                 && let Some(key) = &key
             {
-                match h.logins.remembered(&key.address)? {
+                // An unreadable sign-in list must not break every camera:
+                // go on without a saved sign-in, as when there is none. A
+                // camera that needs one still answers auth_required.
+                let listed = match h.logins.entry(&key.address) {
+                    Ok(entry) => entry.is_some(),
+                    Err(error) => {
+                        h.log(
+                            "warn",
+                            format!(
+                                "ignoring saved camera sign-ins; fix or remove {}: {error:#}",
+                                h.logins.index_path().display()
+                            ),
+                        );
+                        false
+                    }
+                };
+                match if listed {
+                    h.logins.remembered(&key.address)?
+                } else {
+                    crate::logins::Remembered::None
+                } {
                     crate::logins::Remembered::Login(saved) => {
                         login = Some(saved);
                         remembered = Some(key.address.clone());
@@ -4633,6 +4653,7 @@ esac"#;
         ));
         let store = Arc::new(MemoryStore::default());
         let logins = Logins::with(dir, store.clone());
+        let index = logins.index_path();
         let address = "rtsp://127.0.0.1:9/live";
         logins
             .save(
@@ -4662,6 +4683,21 @@ esac"#;
             "{error:#}"
         );
         assert!(!format!("{error:#}").contains("engine-test-pw"));
+        // A corrupt sign-in list is skipped with a warning, not an error
+        // that breaks every camera.
+        store.fail.store(false, Ordering::SeqCst);
+        std::fs::write(index, b"not json").unwrap();
+        let reads = store.reads.load(Ordering::SeqCst);
+        let error = h.request(connect(true)).unwrap_err();
+        assert!(!format!("{error:#}").contains("sign-in list"), "{error:#}");
+        assert_eq!(store.reads.load(Ordering::SeqCst), reads);
+        assert!(
+            h.snapshot()
+                .logs
+                .iter()
+                .any(|log| log.message.contains("camera-logins.json")),
+            "a warning names the file"
+        );
         h.shutdown();
     }
 }

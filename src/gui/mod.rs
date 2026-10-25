@@ -368,6 +368,12 @@ struct Pending {
     history_token: Option<String>,
     /// A connect sent a sign-in (typed in the sheet or the address).
     sent_login: bool,
+    /// The user name typed into the address, never its password, to
+    /// prefill the sheet should the camera refuse it.
+    sent_user: Option<String>,
+    /// The person cancelled the sign-in sheet while this was on its way:
+    /// nothing is saved and the sheet does not come back.
+    sign_in_cancelled: bool,
     /// The sign-in to save once the connect succeeds, only when the person
     /// asked to remember it; dropped, and zeroized, with this entry.
     login: Option<crate::logins::CameraLogin>,
@@ -388,6 +394,8 @@ impl Pending {
             history_replay: None,
             history_token: None,
             sent_login: false,
+            sent_user: None,
+            sign_in_cancelled: false,
             login: None,
         }
     }
@@ -1945,6 +1953,7 @@ impl Workbench {
                 .insert(feature.to_owned(), full.clone());
         }
         if pending.job == Job::Connect
+            && !pending.sign_in_cancelled
             && let Some(code @ ("auth_required" | "auth_rejected")) =
                 crate::types::error_transport_code(error)
         {
@@ -1952,11 +1961,14 @@ impl Workbench {
             self.sign_in_needed(pending, code);
             return;
         }
+        let login_target = pending.target.as_deref().map(|t| self.login_target(t));
         if pending.job == Job::Connect
             && let Some(sheet) = &mut self.sign_in
-            && pending.target.as_deref() == Some(sheet.target.as_str())
+            && login_target.as_deref() == Some(sheet.target.as_str())
         {
+            // Any other failure shows in the sheet, which hides the card.
             sheet.pending = false;
+            sheet.error = Some(full.clone());
         }
         if let Some(target) = &pending.target {
             self.side.connect_failed(target, full, self.now);
@@ -2291,8 +2303,14 @@ impl Workbench {
         remember: bool,
     ) {
         let typed = camera;
+        // Only an address a sign-in can go with has its credentials split
+        // out; any other URL (http, srt, ...) goes as typed, for FFmpeg,
+        // and `prefs::storable` keeps it out of recents.
+        let signs_in = |address: &str| crate::logins::key(address).is_ok();
         let (camera, inline) = match crate::logins::split_userinfo(&typed) {
+            Ok((stripped, Some(_))) if !signs_in(&stripped) => (typed.clone(), None),
             Ok(split) => split,
+            Err(_) if !signs_in(&crate::logins::strip_userinfo(&typed)) => (typed.clone(), None),
             Err(error) => {
                 let camera = crate::logins::strip_userinfo(&typed);
                 if self.address.trim() == typed.trim() {
@@ -2303,6 +2321,7 @@ impl Workbench {
                 return;
             }
         };
+        let sent_user = inline.as_ref().map(|login| login.user.clone());
         if inline.is_some() && self.address.trim() == typed.trim() {
             self.address = camera.clone();
         }
@@ -2329,6 +2348,7 @@ impl Workbench {
         if let Some(pending) = self.submit(None, Job::Connect, command) {
             pending.target = Some(camera);
             pending.sent_login = sent_login;
+            pending.sent_user = sent_user;
             pending.login = saved;
             self.edits.clear();
             self.edit_sources.clear();
@@ -3356,11 +3376,11 @@ impl Workbench {
                     .saved_login_user(&target)
                     .and_then(|_| crate::logins::key(&self.login_target(&target)).ok())
                 {
-                    self.forget_sign_in(key.address);
+                    self.forget_sign_in(key.address, true);
                 }
                 self.recent.retain(|recent| recent.target != target);
             }
-            Message::ForgetSignIn(address) => self.forget_sign_in(address),
+            Message::ForgetSignIn(address) => self.forget_sign_in(address, false),
             Message::SignIn(input) => return self.sign_in_input(input),
             Message::CameraRow(id) => {
                 if self.snapshot.cameras.iter().any(|c| c.info.id == id) {
@@ -3812,7 +3832,9 @@ impl Workbench {
             }
             Action::Undo => return self.replay_history(true),
             Action::Redo => return self.replay_history(false),
-            Action::Overview if self.sign_in.is_some() => self.sign_in = None,
+            Action::Overview if self.sign_in.is_some() => {
+                return self.sign_in_input(sign_in::Input::Cancel);
+            }
             Action::Overview if self.help_open => self.help_open = false,
             Action::Overview if self.assistant.quick.open => {
                 return self.update_assistant(assistant::Input::Quick(
