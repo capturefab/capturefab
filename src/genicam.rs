@@ -579,16 +579,34 @@ impl NodeMap {
         let specified = |key: &str| n.prop(key).is_some() || n.prop(&format!("p{key}")).is_some();
         if matches!(n.kind.as_str(), "Integer" | "Float") {
             // Each restriction not given falls back to the pValue target's.
-            let inner = if ["Min", "Max", "Inc"].into_iter().all(specified) {
-                Bounds::default()
-            } else {
-                self.resolve_value_link(io, n, depth)
-                    .ok()
-                    .flatten()
-                    .and_then(|link| self.node(link, depth + 1).ok())
-                    .map(|inner| self.range(io, inner, depth + 1))
-                    .unwrap_or_default()
-            };
+            // pValueCopy targets narrow them to a range all targets accept.
+            let mut inner = Bounds::default();
+            if !["Min", "Max", "Inc"].into_iter().all(specified) {
+                let link = self.resolve_value_link(io, n, depth).ok().flatten();
+                let copies = n.props.iter().filter(|p| p.tag == "pValueCopy");
+                for (i, target) in link
+                    .into_iter()
+                    .chain(copies.map(|p| p.text.as_str()))
+                    .enumerate()
+                {
+                    let Ok(node) = self.node(target, depth + 1) else {
+                        continue;
+                    };
+                    let target = self.range(io, node, depth + 1);
+                    if i == 0 {
+                        inner = target;
+                    } else {
+                        inner.min = match (inner.min, target.min) {
+                            (Some(a), Some(b)) => Some(a.max(b)),
+                            (a, b) => a.or(b),
+                        };
+                        inner.max = match (inner.max, target.max) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                }
+            }
             let mut bound = |key, inherited| {
                 if specified(key) {
                     self.property_number(io, n, key, depth).ok().flatten()
@@ -1302,6 +1320,46 @@ impl NodeMap {
         depth: usize,
         write: bool,
     ) -> Result<()> {
+        self.write_value(io, name, value, depth, write)?;
+        if write {
+            self.check_error(io, self.node(name, depth)?, depth)?;
+        }
+        Ok(())
+    }
+    /// After a write, a node's pError enumeration must read 0; another
+    /// value names the device's reason in its entry.
+    fn check_error(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Result<()> {
+        let Some(link) = n.prop("pError") else {
+            return Ok(());
+        };
+        let code = self.numeric_value(io, link, depth + 1)?;
+        if numeric_equal(&code, &json!(0))? {
+            return Ok(());
+        }
+        let node = self.node(link, depth + 1)?;
+        for entry in self.enum_entries(node) {
+            let en = self.node(entry, depth + 2)?;
+            if numeric_equal(&self.entry_value(io, en, depth + 2)?, &code)? {
+                let label = en
+                    .prop("DisplayName")
+                    .or_else(|| en.prop("Symbolic"))
+                    .unwrap_or(entry);
+                match en.prop("ToolTip").or_else(|| en.prop("Description")) {
+                    Some(detail) => bail!("camera reported {label}: {detail}"),
+                    None => bail!("camera reported {label}"),
+                }
+            }
+        }
+        bail!("camera reported error {code} in {link}")
+    }
+    fn write_value(
+        &self,
+        io: &mut dyn RegisterIo,
+        name: &str,
+        value: &Value,
+        depth: usize,
+        write: bool,
+    ) -> Result<()> {
         self.access_inner(io, name, true, depth, write)?;
         let n = self.node(name, depth)?;
         ensure!(
@@ -1425,7 +1483,19 @@ impl NodeMap {
             } else {
                 translated
             };
-            return self.set_inner(io, link, &translated, depth + 1, write);
+            // pValueCopy targets receive the same value, in document order.
+            // Check them all first so a refused copy writes nothing.
+            let copies = n.props.iter().filter(|p| p.tag == "pValueCopy");
+            if write {
+                for copy in copies.clone() {
+                    self.set_inner(io, &copy.text, &translated, depth + 1, false)?;
+                }
+            }
+            self.set_inner(io, link, &translated, depth + 1, write)?;
+            for copy in copies {
+                self.set_inner(io, &copy.text, &translated, depth + 1, write)?;
+            }
+            return Ok(());
         }
         if n.host_value() {
             let index = self
@@ -1571,7 +1641,8 @@ impl NodeMap {
         ensure!(n.kind == "Command", "{name} is not a command");
         let v = self.command_value(io, n)?;
         if let Some(target) = n.prop("pValue") {
-            return self.set_inner(io, target, &v, 1, true);
+            self.set_inner(io, target, &v, 1, true)?;
+            return self.check_error(io, n, 0);
         }
         // A floating command writes its host Value.
         let index = self
@@ -2661,6 +2732,31 @@ mod tests {
         assert_eq!(m.get(&mut io, "PixelFormat").unwrap(), "Mono12");
         assert_eq!(m.choices(&mut io, "PixelFormat").unwrap(), ["Mono8"]);
         assert!(m.set(&mut io, "PixelFormat", "Mono12").is_err());
+    }
+    #[test]
+    fn value_copies_are_written_and_bounded_and_errors_are_reported() {
+        let m = map(concat!(
+            "<Integer Name='Gain'><pValue>GainReg</pValue><pValueCopy>GainShadow</pValueCopy><pError>Status</pError></Integer>",
+            "<IntReg Name='GainReg'><Address>0</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
+            "<Integer Name='GainShadow'><pValue>ShadowReg</pValue><Min>0</Min><Max>100</Max></Integer>",
+            "<IntReg Name='ShadowReg'><Address>4</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
+            "<Enumeration Name='Status'><EnumEntry Name='Ok'><Value>0</Value></EnumEntry>",
+            "<EnumEntry Name='OutOfRange'><DisplayName>Out of range</DisplayName><ToolTip>The gain exceeds the sensor limit.</ToolTip><Value>1</Value></EnumEntry>",
+            "<pValue>StatusReg</pValue></Enumeration>",
+            "<IntReg Name='StatusReg'><Address>8</Address><Length>4</Length><AccessMode>RO</AccessMode></IntReg>",
+        ));
+        let mut io = Memory::default();
+        assert_eq!(m.bounds(&mut io, "Gain").unwrap().max, Some(100.0));
+        m.set(&mut io, "Gain", "42").unwrap();
+        assert_eq!(io.read_memory(0, 8).unwrap(), [42, 0, 0, 0, 42, 0, 0, 0]);
+        assert!(m.set(&mut io, "Gain", "101").is_err());
+        assert_eq!(io.read_memory(0, 4).unwrap(), [42, 0, 0, 0]);
+        io.write_memory(8, &[1, 0, 0, 0]).unwrap();
+        let error = format!("{:#}", m.set(&mut io, "Gain", "7").unwrap_err());
+        assert!(
+            error.contains("Out of range: The gain exceeds the sensor limit."),
+            "{error}"
+        );
     }
     #[test]
     fn missing_restrictions_fall_back_to_the_value_target() {
