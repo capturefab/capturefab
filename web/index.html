@@ -59,7 +59,6 @@
           <article class="demo-card"><div class="demo-heading"><span class="eyebrow">02 / Capture</span><h3>Save an image</h3><p>A CLI command saves three frames, then one PNG image. The desktop app shows the saved result.</p></div><figure><video class="product-video" controls muted loop playsinline preload="none" poster="media/capture-workflow.png" width="1100" height="700" aria-label="Image capture demonstration" aria-describedby="capture-caption"><source src="media/capture-workflow.mp4" type="video/mp4"><p><a href="media/capture-workflow.mp4">Download the image capture clip</a>.</p></video><figcaption id="capture-caption">8-second loop at the recorded speed. One simulator camera. <a href="docs.html#capture">Read about image capture →</a></figcaption></figure></article>
         </div>
         <div class="actions inline-cta"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↓</span></a><a href="#quickstart">Try the simulator first <span aria-hidden="true">→</span></a></div>
-        <p class="oneclick-alt" data-oneclick-alt hidden></p>
       </section>
       <section id="features" class="section" aria-labelledby="features-title">
         <div class="section-heading"><p class="eyebrow">Examine before you capture</p><h2 id="features-title">Keep the image and its controls together.</h2><p>Use camera features, image scopes and capture settings in the same app.</p></div>
@@ -80,7 +79,7 @@
       </section>
       <section id="automation" class="section" aria-labelledby="automation-title">
         <div class="section-heading"><p class="eyebrow">Desktop and CLI in one session</p><h2 id="automation-title">See what your agent does.</h2><p>Pin a named session and camera. Give the agent a recognizable name. Activity shows its actions, saved files and errors.</p></div>
-        <div class="automation-grid"><div><div class="code-wrap"><pre><code><span data-run-hint># Run from the extracted folder (./capturefab, or .\capturefab.exe on Windows). See Install.</span>
+        <div class="automation-grid"><div><div class="code-wrap"><pre><code><span data-run-hint># Not installed? Use the one-line installer under Download, or ./capturefab (.\capturefab.exe on Windows) from the extracted folder.</span>
 
 # Open a named desktop session
 capturefab gui --name bench
@@ -90,11 +89,12 @@ capturefab --session bench --actor capture-agent --actor-kind agent connect sim:
 capturefab --session bench --actor capture-agent --actor-kind agent --camera sim:0 capture -o 'shot-{seq}.png' --json
 capturefab --session bench status --json</code></pre><button class="copy-button" type="button" aria-label="Copy the session commands">Copy</button></div><div class="text-links"><a href="docs.html#sessions">Sessions and automation →</a><a href="docs.html#cli-reference">CLI reference →</a></div></div><figure><a class="screenshot-link" href="images/cli.svg" aria-label="Enlarge the real terminal example"><img src="images/cli.svg" alt="Capturefab terminal commands for simulator discovery, feature changes and image capture with JSON results" width="1200" height="712" loading="lazy"></a><figcaption>Actual command output from the simulator. The CLI supplies JSON results and exit codes for scripts.</figcaption></figure></div>
         <div class="actions inline-cta"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↓</span></a><a href="#quickstart">Try the simulator first <span aria-hidden="true">→</span></a></div>
-        <p class="oneclick-alt" data-oneclick-alt hidden></p>
       </section>
       <section id="beyond" class="section" aria-labelledby="beyond-title">
         <div class="section-heading"><p class="eyebrow">Capture, store and analyze</p><h2 id="beyond-title">Keep files and capture data together.</h2><p>Save capture times and tags with each cataloged image. Use saved destinations to save files on your disk, removable drives or mounted network folders.</p></div>
-        <div class="automation-grid dataset-recipe"><div><h3 id="recipe-title">Build an image dataset in three commands</h3><p>Capture tagged images into a DuckDB catalog, query it with SQL and export the tables for pandas, Polars or a notebook.</p><div class="code-wrap"><pre><code># Capture 3 tagged images, 500 ms apart, into a catalog
+        <div class="automation-grid dataset-recipe"><div><h3 id="recipe-title">Build an image dataset in three commands</h3><p>Capture tagged images into a DuckDB catalog, query it with SQL and export the tables for pandas, Polars or a notebook.</p><div class="code-wrap"><pre><code><span data-run-hint># Not installed? Use the one-line installer under Download, or ./capturefab (.\capturefab.exe on Windows) from the extracted folder.</span>
+
+# Capture 3 tagged images, 500 ms apart, into a catalog
 capturefab --camera sim:0 capture -n 3 --interval 500ms --context part=A-100 --dataset parts.duckdb -o 'parts/{camera}-{seq}.png'
 
 # Query the catalog with SQL
@@ -111,7 +111,7 @@ capturefab dataset export --file parts.duckdb -o export</code></pre><button clas
       </section>
       <section id="quickstart" class="section" aria-labelledby="quickstart-title">
         <div class="section-heading"><p class="eyebrow">Try it without a camera</p><h2 id="quickstart-title">Capture your first simulator image.</h2><p>The built-in simulator supplies test images. Use it to learn the app or test a script.</p></div>
-        <div class="first-frame"><ol class="simple-steps"><li><span>1</span><div><h3>Open Capturefab</h3><p>Extract the desktop download. Open the app. Select <strong>Try a simulated camera</strong> on the welcome screen.</p></div></li><li><span>2</span><div><h3>Connect a Pattern camera</h3><p>Select a simulator camera. Start its stream. Select the preview to open its settings.</p></div></li><li><span>3</span><div><h3>Capture an image</h3><p>Open <strong>Capture</strong>. Set an output name and image format. Capture a frame.</p></div></li></ol><div class="terminal-card"><div class="terminal-heading"><span><span class="brand-dot" aria-hidden="true"></span> Capture from the terminal</span><span>CLI</span></div><div class="code-wrap"><pre><code><span data-run-hint># Run from the extracted folder (./capturefab, or .\capturefab.exe on Windows). See Install.</span>
+        <div class="first-frame"><ol class="simple-steps"><li><span>1</span><div><h3>Open Capturefab</h3><p>Extract the desktop download. Open the app. Select <strong>Try a simulated camera</strong> on the welcome screen.</p></div></li><li><span>2</span><div><h3>Connect a Pattern camera</h3><p>Select a simulator camera. Start its stream. Select the preview to open its settings.</p></div></li><li><span>3</span><div><h3>Capture an image</h3><p>Open <strong>Capture</strong>. Set an output name and image format. Capture a frame.</p></div></li></ol><div class="terminal-card"><div class="terminal-heading"><span><span class="brand-dot" aria-hidden="true"></span> Capture from the terminal</span><span>CLI</span></div><div class="code-wrap"><pre><code><span data-run-hint># Not installed? Use the one-line installer under Download, or ./capturefab (.\capturefab.exe on Windows) from the extracted folder.</span>
 
 # Find cameras, including the built-in simulator
 capturefab discover --simulate

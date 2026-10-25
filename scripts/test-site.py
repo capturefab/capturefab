@@ -608,6 +608,17 @@ class QuietHandler(SimpleHTTPRequestHandler):
         pass
 
 
+def check_signature_labels(root, errors):
+    """The download card in app.js names each signature as downloads.html does."""
+    site = site_release()
+    script = (root / "app.js").read_text(encoding="utf-8")
+    found = re.search(r"const signatureNotes = \{(.*?)\};", script)
+    labels = dict(re.findall(r"'?([a-z-]+)'?: '([^']*)'", found[1])) if found else {}
+    expected = {key: site.NOTES[key] for key in ("apple-notarized", "apple-developer-id", "authenticode", "unsigned")}
+    if labels != expected:
+        errors.append(f"app.js: signatureNotes {labels} must match the signature labels of NOTES in site-release.py {expected}")
+
+
 def check_min_os(root, errors):
     """The download cards repeat docs.html's minimum operating system table."""
     site = site_release()
@@ -702,6 +713,7 @@ def validate(root=ROOT):
     check_generated(root, errors)
     check_installers(root, errors)
     check_min_os(root, errors)
+    check_signature_labels(root, errors)
     check_search_index(root, errors)
     check_theme_contrast(root, errors)
     return errors, versions

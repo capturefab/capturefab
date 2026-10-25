@@ -151,7 +151,14 @@ if [ "$os" = linux ] && [ -f "$installed/share/applications/capturefab.desktop" 
   # the entry names the command's full path.
   share=${XDG_DATA_HOME:-$HOME/.local/share}
   mkdir -p "$share/applications"
-  sed "s|^Exec=capturefab\$|Exec=\"$bin_dir/capturefab\"|" "$installed/share/applications/capturefab.desktop" > "$share/applications/capturefab.desktop"
+  # Only plain absolute paths go into Exec, so neither sed nor Desktop Entry
+  # quoting has to escape anything.
+  case $bin_dir in
+    /*[!A-Za-z0-9._/~+@\ -]*|[!/]*) exec_path=capturefab
+      say "Launcher entry runs plain capturefab: $bin_dir has characters a launcher entry cannot hold safely." ;;
+    *) exec_path=$bin_dir/capturefab ;;
+  esac
+  sed "s|^Exec=capturefab\$|Exec=\"$exec_path\"|" "$installed/share/applications/capturefab.desktop" > "$share/applications/capturefab.desktop"
   for icon in "$installed"/share/icons/hicolor/*/apps/capturefab.*; do
     [ -f "$icon" ] || continue
     size=$(basename "$(dirname "$(dirname "$icon")")")

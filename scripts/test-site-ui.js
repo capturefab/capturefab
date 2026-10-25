@@ -20,6 +20,9 @@ class Element {
     this.textContent = '';
     this.value = '';
   }
+  // As in the DOM, text set directly replaces the children, and children supply the text.
+  set textContent(value) { this.ownText = value; this.children = []; }
+  get textContent() { return this.children.length ? this.children.map((child) => child.textContent ?? '').join('') : this.ownText; }
   addEventListener(type, listener) {
     if (!this.listeners.has(type)) this.listeners.set(type, []);
     this.listeners.get(type).push(listener);
@@ -285,10 +288,10 @@ const assetFor = (manifest, osId, archId) => manifest.releases.find((release) =>
 async function signing() {
   const mac = openPage({ userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
   await mac.settle();
-  assert.match(mac.ids.get('asset-detail').textContent, /Notarized by Apple$/);
+  assert.match(mac.ids.get('asset-detail').textContent, /Apple notarized$/);
   assert.doesNotMatch(mac.ids.get('install-hint').textContent, /Control-click|SmartScreen/, 'A notarized Mac build needs no first-open workaround');
   mac.change('os-select', 'windows');
-  assert.match(mac.ids.get('asset-detail').textContent, /windows-aarch64\.zip · [0-9.]+ MiB · Not code-signed$/);
+  assert.match(mac.ids.get('asset-detail').textContent, /windows-aarch64\.zip · [0-9.]+ MiB · Unsigned$/);
   assert.match(mac.ids.get('install-hint').textContent, /SmartScreen.*More info → Run anyway/);
   assert.ok(mac.ids.get('install-hint').textContent.includes('.\\capturefab.exe --help'));
   mac.change('os-select', 'linux');
@@ -299,7 +302,7 @@ async function signing() {
   assetFor(signed, 'macos', 'x86_64').platform_signature = 'apple-developer-id';
   const page = openPage({ manifest: signed, userAgentData: { platform: 'Windows', getHighEntropyValues: async () => ({ architecture: 'x86', bitness: '64' }) } });
   await page.settle();
-  assert.match(page.ids.get('asset-detail').textContent, /Signed \(Authenticode\)$/);
+  assert.match(page.ids.get('asset-detail').textContent, /Authenticode$/);
   assert.doesNotMatch(page.ids.get('install-hint').textContent, /SmartScreen/, 'Signed Windows builds must not mention SmartScreen');
   page.change('os-select', 'macos');
   assert.match(page.ids.get('install-hint').textContent, /Control-click Capturefab\.app and choose Open/);
@@ -347,7 +350,7 @@ async function nextSteps() {
     const asset = assetFor(published, osId, archId);
     const page = openPage({ userAgentData: { platform, getHighEntropyValues: async () => ({ architecture, bitness: '64' }) } });
     await page.settle();
-    assert.ok(page.runHints.every((hint) => hint.textContent.endsWith(command)), `CLI examples name ${command}`);
+    assert.ok(page.runHints.every((hint) => hint.textContent.includes(` ${command} `)), `CLI examples name ${command}`);
     const [button] = page.oneclick;
     assert.equal(button.dataset.oneclickState, 'ready');
     const click = button.emit('click');
@@ -368,6 +371,26 @@ async function nextSteps() {
     page.change('os-select', osId === 'linux' ? 'macos' : 'linux');
     assert.equal(panel.hidden, true, 'A new selection hides steps for the previous build');
   }
+  const linux = openPage({ userAgentData: { platform: 'Linux', getHighEntropyValues: async () => ({ architecture: 'x86', bitness: '64' }) } });
+  await linux.settle();
+  linux.oneclick[0].emit('click');
+  const linuxSteps = linux.ids.get('next-steps-list').children.map((item) => item.textContent);
+  assert.equal(linuxSteps.filter((step) => /doctor/.test(step)).length, 1, 'Linux lists doctor once');
+  assert.ok(linuxSteps.every((step) => !/(^|\s)capturefab doctor/.test(step)), 'doctor runs from the extracted folder');
+
+  const mac = openPage({ userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
+  await mac.settle();
+  const hint = mac.ids.get('install-hint');
+  assert.ok(hint.children.some((child) => child.tagName === 'A' && child.href.endsWith('docs.html#cli-path')), 'The macOS CLI step links to the PATH setup');
+  mac.ids.get('primary-download').emit('click');
+  assert.equal(mac.ids.get('next-steps').hidden, false);
+  assert.equal(mac.ids.get('next-steps').placedBefore, hint);
+  assert.equal(hint.hidden, true, 'The panel replaces the install hint it would repeat');
+  const cliStep = mac.ids.get('next-steps-list').children.find((item) => /For the CLI/.test(item.textContent));
+  assert.ok(cliStep.children.some((child) => child.tagName === 'A' && child.href.endsWith('docs.html#cli-path')), 'The panel keeps the link');
+  mac.ids.get('next-steps-close').emit('click');
+  assert.equal(hint.hidden, false, 'Closing the panel shows the install hint again');
+
   const early = openPage({ fetchError: true, userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
   await early.settle();
   early.oneclick[0].emit('click');

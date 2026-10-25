@@ -328,7 +328,8 @@ main>.page-head+.section{padding-top:44px}
 /* Help beside the one-click buttons: a guessed processor and the steps after a download starts. */
 .oneclick-alt{margin:10px 0 0;font-size:13px;color:var(--muted);line-height:1.6}
 .oneclick-alt a{text-decoration:underline;text-underline-offset:3px}
-.download-banner .oneclick-alt{margin:0;max-width:22em}
+.download-banner .oneclick-alt{margin:0}
+.oneclick-alt a{white-space:nowrap}
 .next-steps{max-width:520px;margin:16px 0 0;padding:16px 18px;border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:10px;background:var(--panel);font-size:14px;color:var(--muted);text-align:left}
 .next-steps-head{display:flex;align-items:start;justify-content:space-between;gap:12px}
 .next-steps-title{margin:0;color:var(--text);font-weight:600;line-height:1.5}
@@ -336,8 +337,8 @@ main>.page-head+.section{padding-top:44px}
 .next-steps-close:hover{background:var(--field);color:var(--text)}
 .next-steps-list{margin:10px 0 0;padding-left:20px;display:grid;gap:4px;line-height:1.55}
 .next-steps-links{display:flex;flex-wrap:wrap;gap:6px 16px;margin:12px 0 0;font-size:13px}
-.next-steps-links>a{text-decoration:underline;text-underline-offset:3px}
-.download-section .next-steps{margin-inline:auto}
+.next-steps-links>a,.next-steps-list a{text-decoration:underline;text-underline-offset:3px}
+.download-card .next-steps{max-width:none}
 @media(prefers-reduced-motion:no-preference){.next-steps:not([hidden]){animation:next-steps-in .18s ease-out}}
 @keyframes next-steps-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
 
@@ -345,7 +346,6 @@ main>.page-head+.section{padding-top:44px}
 .dataset-recipe{margin-bottom:36px}
 .dataset-recipe h3{font-size:20px;margin:0 0 8px}
 .dataset-recipe>div>p{font-size:14px;color:var(--muted);margin:0 0 16px;max-width:36em}
-.dataset-recipe .code-wrap pre{white-space:pre-wrap;overflow-wrap:anywhere}
 .dataset-recipe .text-links,.terminal-card .text-links{display:flex;flex-wrap:wrap;gap:6px 20px;font-size:13px}
 .file-tree-figure{margin:0;padding:20px 22px;border:1px solid var(--line);border-radius:10px;background:var(--panel);min-width:0}
 .file-tree,.file-tree ul{list-style:none;margin:0;padding:0;font-family:var(--mono);font-size:13px;line-height:1.8;color:var(--code-text)}

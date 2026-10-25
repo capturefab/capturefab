@@ -16,12 +16,14 @@
   // The selected build, while one is matched and published.
   let current = null;
   const osNames = { macos: 'macOS', windows: 'Windows', linux: 'Linux' };
-  // Mirrors NOTES in scripts/site-release.py; the manifest decides, never the OS alone.
-  const signatureNotes = { 'apple-notarized': 'Notarized by Apple', 'apple-developer-id': 'Signed (Apple Developer ID)', authenticode: 'Signed (Authenticode)', unsigned: 'Not code-signed' };
+  // Matches the signature labels of NOTES in scripts/site-release.py (test-site.py
+  // compares them); the manifest decides, never the OS alone.
+  const signatureNotes = { 'apple-notarized': 'Apple notarized', 'apple-developer-id': 'Apple Developer ID', authenticode: 'Authenticode', unsigned: 'Unsigned' };
   // Steps after the download, shared by the install hint and the next-steps panel.
+  // A step is text, or { text, label, href, end } for one with a link.
   const installSteps = (osId, signature) => {
     const steps = {
-      macos: ['Extract the ZIP file.', 'Move Capturefab.app to Applications and open it.', 'Allow Local Network and Camera access when macOS asks, so network cameras and webcams appear.', 'For the CLI, see Install & verify.'],
+      macos: ['Extract the ZIP file.', 'Move Capturefab.app to Applications and open it.', 'Allow Local Network and Camera access when macOS asks, so network cameras and webcams appear.', { text: 'For the CLI, run ./capturefab from the extracted folder, or ', label: 'add it to your PATH', href: 'docs.html#cli-path', end: '.' }],
       windows: ['Extract all files from the ZIP archive.', 'Open capturefab.exe from the extracted folder, or run .\\capturefab.exe --help in PowerShell for the CLI.'],
       linux: ['Extract the .tar.gz archive.', 'From the extracted folder, run ./capturefab to open the desktop app, or ./capturefab --help for CLI options. On a computer with no display it lists the CLI commands.']
     }[osId] || [];
@@ -31,11 +33,16 @@
     if (osId === 'macos' && signature === 'apple-developer-id') steps.push('If macOS blocks it, Control-click Capturefab.app and choose Open.');
     return steps;
   };
-  const firstRunSteps = ['Select Try a simulated camera on the welcome screen, or connect your camera.', 'Optional: run capturefab doctor in a terminal to check this computer.'];
+  // Linux already runs doctor in its install steps.
+  const firstRunSteps = (osId) => ['Select “Try a simulated camera” on the welcome screen, or connect your camera.', ...{
+    macos: ['Optional: run ./capturefab doctor in Terminal, from the extracted folder, to check this computer.'],
+    windows: ['Optional: run .\\capturefab.exe doctor in PowerShell, from the extracted folder, to check this computer.']
+  }[osId] || []];
   // The first comment of each CLI example names the executable for the selected system.
   const runHints = [...document.querySelectorAll('[data-run-hint]')];
   runHints.forEach((hint) => { hint.dataset.fallback = hint.textContent; });
-  const runHintText = { macos: '# From the extracted folder: ./capturefab', windows: '# In PowerShell, from the extracted folder: .\\capturefab.exe', linux: '# From the extracted folder: ./capturefab' };
+  const unixHint = '# Not installed? curl -fsSL https://capturefab.com/install.sh | sh, or use ./capturefab from the extracted folder';
+  const runHintText = { macos: unixHint, windows: '# Not installed? irm https://capturefab.com/install.ps1 | iex, or use .\\capturefab.exe from the extracted folder', linux: unixHint };
   const archNames = { x86_64: 'x64', aarch64: 'ARM64' };
   const osAliases = { darwin: 'macos', mac: 'macos', win: 'windows', win32: 'windows' };
   const archAliases = { x64: 'x86_64', amd64: 'x86_64', arm64: 'aarch64' };
@@ -57,6 +64,8 @@
     link.textContent = label;
     return link;
   };
+  const stepNodes = (step) => typeof step === 'string' ? [document.createTextNode(step)]
+    : [document.createTextNode(step.text), makeLink(step.label, step.href), document.createTextNode(step.end || '')];
   // Page buttons that become a direct download once a build is matched.
   const oneclick = [...document.querySelectorAll('[data-oneclick]')];
   // Lines under the page buttons that offer the other processor when it was guessed.
@@ -125,21 +134,25 @@
     if (!panel || panel.hidden) return;
     panel.hidden = true;
     $('next-steps-list').replaceChildren();
+    // The panel stood in for the install hint below the main download button.
+    if (current && $('install-hint')) $('install-hint').hidden = false;
     if (restoreFocus && panelOpener?.focus) panelOpener.focus();
     panelOpener = null;
   }
   function showNextSteps(anchor, asset, opener) {
     if (!panel || !anchor) return;
     text('next-steps-title', `Downloading Capturefab ${release.version} for ${osNames[asset.os]} (${chipName(asset.os, asset.arch)})`);
-    $('next-steps-list').replaceChildren(...[...installSteps(asset.os, asset.platform_signature), ...firstRunSteps].map((step) => {
+    $('next-steps-list').replaceChildren(...[...installSteps(asset.os, asset.platform_signature), ...firstRunSteps(asset.os)].map((step) => {
       const item = document.createElement('li');
-      item.textContent = step;
+      item.append(...stepNodes(step));
       return item;
     }));
     const direct = $('direct-download');
     direct.href = safeUrl(asset.url);
     direct.setAttribute('download', asset.name);
     anchor.after(panel);
+    // Below the main button the panel repeats the hint's steps, so it replaces it.
+    if (anchor === $('install-hint')) anchor.hidden = true;
     panel.hidden = false;
     panelOpener = opener;
     panel.scrollIntoView?.({ block: 'nearest', behavior: motion.matches ? 'auto' : 'smooth' });
@@ -206,7 +219,7 @@
     armOneclick(selected);
     renderAlts(selected);
     if ($('install-hint')) {
-      text('install-hint', `${installSteps(os.value, selected.platform_signature).join(' ')} `);
+      $('install-hint').replaceChildren(...installSteps(os.value, selected.platform_signature).flatMap((step) => [...stepNodes(step), document.createTextNode(' ')]));
       // Each system's permission prompts are one row of the installation guide.
       $('install-hint').append(makeLink('First-launch steps for this system →', 'docs.html#first-launch'));
       $('install-hint').hidden = false;

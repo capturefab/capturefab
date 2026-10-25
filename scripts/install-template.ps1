@@ -43,7 +43,9 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
   }
 
   $base = if ($Prefix) { $Prefix } else { Join-Path $env:LOCALAPPDATA 'Programs\Capturefab' }
-  $work = Join-Path ([IO.Path]::GetTempPath()) ("capturefab-install-" + [Guid]::NewGuid().ToString('N'))
+  New-Item -ItemType Directory -Force -Path $base | Out-Null
+  # Stage beside the install so the final move stays on one volume.
+  $work = Join-Path $base (".install-" + [Guid]::NewGuid().ToString('N'))
   New-Item -ItemType Directory -Path $work | Out-Null
   try {
     $archive = Join-Path $work $asset.Name
@@ -57,21 +59,34 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
     $source = Join-Path $work "x\$stem"
     if (-not (Test-Path (Join-Path $source 'capturefab.exe'))) { Fail "$($asset.Name) has no capturefab.exe" }
     $dest = Join-Path $base $Version
-    New-Item -ItemType Directory -Force -Path $base | Out-Null
-    if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
-    Move-Item $source $dest
+    # Rename a same-version install aside first: the rename fails cleanly
+    # while its capturefab.exe is running, leaving that install intact.
+    $previous = "$dest.previous"
+    if (Test-Path $previous) { Remove-Item -Recurse -Force $previous }
+    if (Test-Path $dest) {
+      try { Rename-Item -Path $dest -NewName (Split-Path $previous -Leaf) }
+      catch { Fail "could not replace $dest; close any running Capturefab and try again. ($($_.Exception.Message))" }
+    }
+    try { Move-Item $source $dest }
+    catch {
+      if (Test-Path $previous) { Rename-Item -Path $previous -NewName (Split-Path $dest -Leaf) -ErrorAction SilentlyContinue }
+      throw
+    }
+    if (Test-Path $previous) { Remove-Item -Recurse -Force $previous -ErrorAction SilentlyContinue }
   } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
   }
   $exe = Join-Path $dest 'capturefab.exe'
 
-  # The user PATH only, and only when the folder is missing from it.
-  $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+  # The user PATH only, and only when the folder is missing from it. Read and
+  # write the registry value unexpanded so %VAR% entries stay as they are.
+  $envKey = 'HKCU:\Environment'
+  $userPath = (Get-Item $envKey).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
   $entries = @($userPath -split ';' | Where-Object { $_ })
   $stale = @($entries | Where-Object { $_ -like (Join-Path $base '*') -and $_ -ne $dest })
   if ($entries -notcontains $dest -or $stale) {
     $kept = @($entries | Where-Object { $stale -notcontains $_ -and $_ -ne $dest }) + $dest
-    [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'User')
+    New-ItemProperty -Path $envKey -Name 'Path' -PropertyType ExpandString -Value ($kept -join ';') -Force | Out-Null
     "Added $dest to your user PATH. Open a new terminal to use capturefab."
   }
   if (($env:Path -split ';') -notcontains $dest) { $env:Path = "$dest;$env:Path" }

@@ -195,7 +195,8 @@ install -Dm755 ./capturefab ~/.local/bin/capturefab</code></pre><button class="c
           <div class="code-wrap"><pre><code># Windows PowerShell, from the extracted folder
 $dir = "$env:LOCALAPPDATA\Programs\Capturefab"
 New-Item -ItemType Directory -Force $dir | Out-Null; Copy-Item -Recurse -Force .\* $dir
-[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ";$dir", 'User')</code></pre><button class="copy-button" type="button" aria-label="Copy the Windows command-line setup">Copy</button></div>
+$path = (Get-Item HKCU:\Environment).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+New-ItemProperty HKCU:\Environment Path -PropertyType ExpandString -Value "$path;$dir" -Force | Out-Null</code></pre><button class="copy-button" type="button" aria-label="Copy the Windows command-line setup">Copy</button></div>
           <p>Then open a new terminal and run <code>capturefab --version</code>. If it is not found on macOS or Linux, add <code>export PATH="$HOME/.local/bin:$PATH"</code> to <code>~/.zshrc</code> or <code>~/.profile</code>. On Linux, copy the extracted <code>share/</code> folder into <code>~/.local/share/</code> for a launcher entry, as <code>INSTALL-DESKTOP.txt</code> describes. For the current terminal only, run <code>export PATH="$PWD:$PATH"</code> in the extracted folder, or <code>$env:Path = "$PWD;$env:Path"</code> in PowerShell.</p>
           <p>Without a display, running the executable with no subcommand prints CLI help. This includes SSH sessions on Linux. Use an explicit subcommand such as <code>doctor --json</code> or <code>serve</code>.</p>
           <p>To run <code>serve</code> as a Linux service, follow the <a href="https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md">line computer guide</a>. It covers Raspberry Pi, Jetson, industrial PCs and access from a laptop browser.</p>
