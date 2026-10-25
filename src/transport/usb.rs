@@ -7,11 +7,13 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use nusb::{
     DeviceInfo, Endpoint, Interface, MaybeFuture,
-    descriptors::TransferType,
-    transfer::{Buffer, Bulk, In, Out, TransferError},
+    descriptors::{TransferType, language_id::US_ENGLISH},
+    transfer::{
+        Buffer, Bulk, Completion, ControlOut, ControlType, In, Out, Recipient, TransferError,
+    },
 };
 use std::{
-    collections::VecDeque,
+    num::NonZeroU8,
     time::{Duration, Instant},
 };
 
@@ -27,24 +29,92 @@ const SIRM_CONTROL: u64 = 0x04;
 fn is_u3v_interface(class: u8, subclass: u8, protocol: u8) -> bool {
     class == 0xef && subclass == 0x05 && protocol == 0
 }
+/// Names nusb could not take from the operating system's cache: Windows
+/// keeps no manufacturer string, and some cameras have no USB serial number.
+#[derive(Default)]
+struct DeviceNames {
+    vendor: Option<String>,
+    model: Option<String>,
+    serial: Option<String>,
+    guid: Option<String>,
+}
+/// The iDeviceGUID, iVendorName, iModelName and iSerialNumber string indexes
+/// of a USB3 Vision device info descriptor (type 0x24, subtype 1).
+fn name_indexes(descriptor: &[u8]) -> Option<[u8; 4]> {
+    match descriptor {
+        [_, 0x24, 0x01, ..] if descriptor.len() >= 18 => Some([
+            descriptor[11],
+            descriptor[12],
+            descriptor[13],
+            descriptor[17],
+        ]),
+        _ => None,
+    }
+}
+/// Read the strings the control interface's device info descriptor names,
+/// falling back to the device descriptor's, as Aravis does.
+fn device_names(d: &DeviceInfo) -> DeviceNames {
+    let Ok(device) = d.open().wait() else {
+        return DeviceNames::default();
+    };
+    let [guid, vendor, model, serial] = device
+        .configurations()
+        .find_map(|c| {
+            c.interface_alt_settings()
+                .filter(|i| is_u3v_interface(i.class(), i.subclass(), i.protocol()))
+                .find_map(|i| i.descriptors().find_map(|desc| name_indexes(&desc)))
+        })
+        .unwrap_or_default();
+    let descriptor = device.device_descriptor();
+    let read = |index: Option<NonZeroU8>| {
+        let text = device
+            .get_string_descriptor(index?, US_ENGLISH, Duration::from_millis(100))
+            .wait()
+            .ok()?;
+        Some(text.trim().to_string()).filter(|text| !text.is_empty())
+    };
+    DeviceNames {
+        vendor: read(NonZeroU8::new(vendor))
+            .or_else(|| read(descriptor.manufacturer_string_index())),
+        model: read(NonZeroU8::new(model)).or_else(|| read(descriptor.product_string_index())),
+        serial: read(NonZeroU8::new(serial))
+            .or_else(|| read(descriptor.serial_number_string_index())),
+        guid: read(NonZeroU8::new(guid)),
+    }
+}
+/// A camera's ID. One without a serial number is told apart by its GUID,
+/// and by its USB address only when it has neither, or when reading them
+/// failed, as while another program holds the camera.
+fn camera_id(vendor: u16, product: u16, names: &DeviceNames, location: &str) -> String {
+    let unique = names
+        .serial
+        .as_deref()
+        .or(names.guid.as_deref())
+        .unwrap_or(location);
+    format!("usb:{vendor:04x}:{product:04x}:{unique}")
+}
 fn camera_info(d: &DeviceInfo) -> CameraInfo {
     let location = format!("{}:{}", d.bus_id(), d.device_address());
-    let serial = d.serial_number().unwrap_or("").to_string();
+    let cached = |text: Option<&str>| text.filter(|text| !text.is_empty()).map(String::from);
+    let mut names = DeviceNames {
+        vendor: cached(d.manufacturer_string()),
+        model: cached(d.product_string()),
+        serial: cached(d.serial_number()),
+        guid: None,
+    };
+    if names.vendor.is_none() || names.model.is_none() || names.serial.is_none() {
+        let read = device_names(d);
+        names.vendor = names.vendor.or(read.vendor);
+        names.model = names.model.or(read.model);
+        names.serial = names.serial.or(read.serial);
+        names.guid = read.guid;
+    }
     CameraInfo {
-        id: format!(
-            "usb:{:04x}:{:04x}:{}",
-            d.vendor_id(),
-            d.product_id(),
-            if serial.is_empty() {
-                &location
-            } else {
-                &serial
-            }
-        ),
+        id: camera_id(d.vendor_id(), d.product_id(), &names, &location),
         transport: Transport::Usb3,
-        vendor: d.manufacturer_string().unwrap_or("Unknown").into(),
-        model: d.product_string().unwrap_or("USB3 Vision camera").into(),
-        serial,
+        vendor: names.vendor.unwrap_or_else(|| "Unknown".into()),
+        model: names.model.unwrap_or_else(|| "USB3 Vision camera".into()),
+        serial: names.serial.unwrap_or_default(),
         address: Some(location),
         profile: Default::default(),
     }
@@ -179,8 +249,13 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         info.transport == Transport::Usb3,
         "camera is not a USB3 Vision device"
     );
+    // Reading names may open a device, so only cameras of this model are.
     let device_info = nusb::list_devices()
         .wait()?
+        .filter(|d| {
+            let model = format!("usb:{:04x}:{:04x}:", d.vendor_id(), d.product_id());
+            info.id.starts_with(&model)
+        })
         .find(|d| camera_info(d).id == info.id)
         .context("USB3 Vision camera disconnected or its USB address changed; discover again")?;
     let name = display_name(
@@ -273,15 +348,15 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     if data.alternate != 0 {
         data_interface.set_alt_setting(data.alternate).wait()?;
     }
+    let channel = ControlEndpoints {
+        input: control_interface.endpoint::<Bulk, In>(control.input)?,
+        output: control_interface.endpoint::<Bulk, Out>(control.output.unwrap())?,
+    };
     let mut backend = UsbBackend {
-        control_in: control_interface.endpoint::<Bulk, In>(control.input)?,
-        control_out: control_interface.endpoint::<Bulk, Out>(control.output.unwrap())?,
+        control: Control::new(channel, timeout.max(Duration::from_millis(20))),
         stream_in: data_interface.endpoint::<Bulk, In>(data.input)?,
-        _interfaces: vec![control_interface, data_interface],
-        timeout: timeout.max(Duration::from_millis(20)),
-        id: 0,
-        max_command: 65548,
-        max_ack: 65548,
+        stream_interface: data_interface,
+        _control_interface: control_interface,
         sirm: 0,
         stream: None,
     };
@@ -290,16 +365,18 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         response_ms <= 60000,
         "camera reports an invalid maximum response time"
     );
-    backend.timeout = backend
-        .timeout
-        .max(Duration::from_millis(response_ms as u64));
+    let control = &mut backend.control;
+    control.response = Duration::from_millis(response_ms as u64);
+    control.timeout = control.timeout.max(control.response);
     let sbrm = backend.u64(0x01d8)?;
-    backend.max_command = backend.u32(sbrm + 0x14)? as usize;
-    backend.max_ack = backend.u32(sbrm + 0x18)? as usize;
+    let max_command = backend.u32(sbrm + 0x14)? as usize;
+    let max_ack = backend.u32(sbrm + 0x18)? as usize;
     ensure!(
-        (24..=65548).contains(&backend.max_command) && (16..=65548).contains(&backend.max_ack),
+        (24..=65548).contains(&max_command) && (16..=65548).contains(&max_ack),
         "invalid USB3 Vision control transfer limits"
     );
+    backend.control.max_command = max_command;
+    backend.control.max_ack = max_ack;
     backend.sirm = backend.u64(sbrm + 0x20)?;
     ensure!(
         backend.sirm != 0,
@@ -309,41 +386,149 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
 }
 
 struct UsbBackend {
-    control_in: Endpoint<Bulk, In>,
-    control_out: Endpoint<Bulk, Out>,
+    control: Control<ControlEndpoints>,
     stream_in: Endpoint<Bulk, In>,
-    _interfaces: Vec<Interface>,
-    timeout: Duration,
-    id: u16,
-    max_command: usize,
-    max_ack: usize,
+    stream_interface: Interface,
+    _control_interface: Interface,
     sirm: u64,
     stream: Option<Stream>,
 }
-#[derive(Debug, Clone, Copy)]
-enum Part {
-    Leader,
-    Payload,
-    Trailer,
+/// Longest stream transfer, as in Aravis: payload transfers are this long at
+/// most.
+const MAX_TRANSFER: usize = 1024 * 1024;
+/// Fewest stream transfers kept submitted.
+const MIN_TRANSFERS: usize = 4;
+/// Linux's errno when usbfs memory cannot cover another transfer.
+const ENOMEM: u32 = 12;
+const USBFS_EXHAUSTED: &str = "USB stream transfers cannot be submitted because usbfs memory is exhausted; raise /sys/module/usbcore/parameters/usbfs_memory_mb";
+
+/// Bytes of stream transfers to keep submitted, unbounded without a usbfs
+/// limit. Linux charges every usbfs transfer, mapped or copied, against one
+/// limit that all USB devices on the computer share, so each USB3 Vision
+/// camera takes an equal share of half of it.
+fn window(usbfs_memory_mb: Option<u64>, cameras: usize) -> usize {
+    match usbfs_memory_mb {
+        Some(mb) if mb > 0 => ((mb.min(4095) as usize) << 20) / 2 / cameras.max(1),
+        _ => usize::MAX,
+    }
 }
-#[derive(Debug, Clone, Copy)]
-struct Request {
-    part: Part,
-    size: usize,
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn usbfs_window() -> usize {
+    let limit = std::fs::read_to_string("/sys/module/usbcore/parameters/usbfs_memory_mb")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(16);
+    let cameras = nusb::list_devices().wait().map_or(1, |devices| {
+        devices
+            .filter(|d| {
+                d.interfaces()
+                    .any(|i| is_u3v_interface(i.class(), i.subclass(), i.protocol()))
+            })
+            .count()
+    });
+    window(Some(limit), cameras)
 }
-struct Stream {
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn usbfs_window() -> usize {
+    window(None, 1)
+}
+
+/// How the camera splits a frame's image into payload transfers, and the
+/// transfers kept submitted to receive it.
+struct Layout {
+    block: usize,
+    count: usize,
+    tail: usize,
+    /// Length every transfer requests.
+    request: usize,
+    transfers: usize,
+}
+fn layout(
     expected: usize,
-    schedule: Vec<Request>,
-    /// The submitted transfers, in the order they complete.
-    pending: VecDeque<Request>,
+    leader: usize,
+    trailer: usize,
+    alignment: usize,
+    window: usize,
+) -> Result<Layout> {
+    let block = aligned(
+        expected
+            .min(MAX_TRANSFER)
+            .min(window / MIN_TRANSFERS)
+            .max(1),
+        alignment,
+    )?;
+    let count = expected / block;
+    let tail = if expected.is_multiple_of(block) {
+        0
+    } else {
+        aligned(expected % block, alignment)?
+    };
+    let request = block.max(leader).max(trailer);
+    // At most two frames of transfers, as many as fit in the window.
+    let per_frame = count + usize::from(tail > 0) + 2;
+    Ok(Layout {
+        block,
+        count,
+        tail,
+        request,
+        transfers: (window / request).clamp(MIN_TRANSFERS, 2 * per_frame),
+    })
+}
+
+/// Whether Linux refused to submit a transfer for lack of usbfs memory. The
+/// transfer never reached the camera, so no data is missing.
+fn usbfs_refused(status: &Result<(), TransferError>) -> bool {
+    (cfg!(any(target_os = "linux", target_os = "android")) || cfg!(test))
+        && *status == Err(TransferError::Unknown(ENOMEM))
+}
+
+/// SET_FEATURE(ENDPOINT_HALT) for an endpoint.
+fn halt(endpoint: u8) -> ControlOut<'static> {
+    ControlOut {
+        control_type: ControlType::Standard,
+        recipient: Recipient::Endpoint,
+        request: 0x03,
+        value: 0,
+        index: endpoint.into(),
+        data: &[],
+    }
+}
+
+/// Whether a completed transfer holds one whole leader or trailer: the
+/// header's magic, and a size field the transfer covers.
+fn is_header(bytes: &[u8], magic: u32, min: usize, max: usize) -> bool {
+    bytes.len() <= max
+        && le32(bytes, 0).is_ok_and(|m| m == magic)
+        && le16(bytes, 6).is_ok_and(|size| (min..=bytes.len()).contains(&(size as usize)))
+}
+
+/// Receives frames through a bounded window of transfers that all request
+/// the same length. A payload transfer fills one exactly, while a leader,
+/// a trailer and a short last payload transfer each end theirs with a short
+/// packet, so a leader always starts a transfer. Frames are assembled from
+/// what each transfer holds rather than from its place in the queue, and
+/// the stream recovers at the next leader after any lost or extra data.
+struct Stream {
+    /// Image bytes in each frame.
+    expected: usize,
+    /// Longest leader and trailer the camera sends.
+    leader: usize,
+    trailer: usize,
+    /// Buffers not submitted.
+    idle: Vec<Buffer>,
+    /// Transfers submitted and not yet returned.
+    submitted: usize,
     frame: Option<Frame>,
-    /// Whether every transfer buffer is mapped for zero-copy transfers.
-    zero_copy: bool,
+    /// Linux refused a submit for lack of usbfs memory: hold buffers back
+    /// until a transfer completes and frees some.
+    starved: bool,
 }
 /// Where a stream's transfers are submitted: the camera's stream endpoint.
 trait Transfers {
     fn allocate(&mut self, len: usize) -> Buffer;
     fn submit(&mut self, buffer: Buffer);
+    fn wait(&mut self, timeout: Duration) -> Option<Completion>;
+    fn cancel_all(&mut self);
 }
 impl Transfers for Endpoint<Bulk, In> {
     fn allocate(&mut self, len: usize) -> Buffer {
@@ -352,83 +537,142 @@ impl Transfers for Endpoint<Bulk, In> {
     fn submit(&mut self, buffer: Buffer) {
         Endpoint::submit(self, buffer)
     }
+    fn wait(&mut self, timeout: Duration) -> Option<Completion> {
+        self.wait_next_complete(timeout)
+    }
+    fn cancel_all(&mut self) {
+        Endpoint::cancel_all(self)
+    }
 }
 impl Stream {
-    fn new(expected: usize, schedule: Vec<Request>) -> Self {
+    fn new(expected: usize, leader: usize, trailer: usize) -> Self {
         Self {
             expected,
-            schedule,
-            pending: VecDeque::new(),
+            leader,
+            trailer,
+            idle: Vec::new(),
+            submitted: 0,
             frame: None,
-            zero_copy: true,
+            starved: false,
         }
     }
-    /// Submit buffers for one whole frame, in schedule order. Allocating maps
+    /// Allocate and submit `count` transfers of `len` bytes. Allocating maps
     /// memory, so this happens only when acquisition starts.
-    fn queue(&mut self, transfers: &mut impl Transfers) {
-        for request in &self.schedule {
-            let buffer = transfers.allocate(request.size);
-            self.zero_copy &= buffer.is_zero_copy();
+    fn queue(&mut self, transfers: &mut impl Transfers, count: usize, len: usize) {
+        self.idle
+            .extend((0..count).map(|_| transfers.allocate(len)));
+        self.fill(transfers);
+    }
+    fn fill(&mut self, transfers: &mut impl Transfers) {
+        while let Some(buffer) = self.idle.pop() {
             transfers.submit(buffer);
-            self.pending.push_back(*request);
+            self.submitted += 1;
         }
     }
-    /// Take a completed transfer, then submit its buffer again for the same
-    /// part of a later frame, failed or not, so the queue keeps its order and
-    /// depth. Returns the frame a trailer completes.
-    fn receive(
-        &mut self,
-        transfers: &mut impl Transfers,
-        status: Result<(), TransferError>,
-        mut buffer: Buffer,
-    ) -> Result<Option<Frame>> {
-        let request = self
-            .pending
-            .pop_front()
-            .context("USB stream transfer queue exhausted")?;
-        let received = status
-            .context("USB stream transfer failed")
-            .and_then(|()| self.take(request, &buffer));
+    /// Wait for the next whole frame. A lost frame returns one error, and
+    /// the transfers after it go on to the next frame.
+    fn next(&mut self, transfers: &mut impl Transfers, deadline: Instant) -> Result<Frame> {
+        loop {
+            if self.submitted == 0 {
+                // Linux refused every submit: retry shortly, as Aravis does.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                ensure!(!remaining.is_zero(), USBFS_EXHAUSTED);
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                self.fill(transfers);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let completion = transfers
+                .wait(remaining)
+                .context("USB frame capture timed out")?;
+            self.submitted -= 1;
+            let received = self.receive(completion);
+            if !self.starved {
+                self.fill(transfers);
+            }
+            if let Some(frame) = received? {
+                return Ok(frame);
+            }
+        }
+    }
+    fn receive(&mut self, completion: Completion) -> Result<Option<Frame>> {
+        let Completion {
+            mut buffer, status, ..
+        } = completion;
+        let received = if usbfs_refused(&status) {
+            self.starved = true;
+            Ok(None)
+        } else if let Err(error) = status {
+            self.frame = None;
+            Err(error).context("USB stream transfer failed")
+        } else {
+            self.starved = false;
+            let full = buffer.len() == buffer.requested_len();
+            self.take(&buffer, full)
+        };
         buffer.clear();
-        buffer.set_requested_len(request.size);
-        transfers.submit(buffer);
-        self.pending.push_back(request);
+        self.idle.push(buffer);
         received
     }
-    fn take(&mut self, request: Request, bytes: &[u8]) -> Result<Option<Frame>> {
-        match request.part {
-            Part::Leader => {
-                ensure!(
-                    self.frame.is_none(),
-                    "unexpected USB leader while receiving an image"
-                );
-                let mut frame = parse_leader(bytes)?;
-                frame.data.reserve(self.expected);
-                self.frame = Some(frame);
-            }
-            Part::Payload => {
-                let frame = self
-                    .frame
-                    .as_mut()
-                    .context("USB payload arrived before image leader")?;
-                let remaining = self.expected - frame.data.len();
-                let valid = remaining.min(request.size);
-                ensure!(
-                    bytes.len() >= valid && bytes.len() <= request.size,
-                    "short USB image payload transfer"
-                );
-                frame.data.extend_from_slice(&bytes[..valid]);
-            }
-            Part::Trailer => {
-                let frame = self
-                    .frame
-                    .take()
-                    .context("USB trailer arrived before image leader")?;
-                validate_trailer(bytes, &frame, self.expected)?;
-                return Ok(Some(frame));
-            }
+    /// Returns the frame a trailer completes.
+    fn take(&mut self, bytes: &[u8], full: bool) -> Result<Option<Frame>> {
+        // Some cameras end the last payload transfer with a zero-length packet.
+        if bytes.is_empty() {
+            return Ok(None);
         }
-        Ok(None)
+        // A transfer holding exactly the rest of an open image is image data,
+        // even when its pixels start like a leader or trailer.
+        let rest = self
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.data.len() + bytes.len() == self.expected);
+        if !rest && is_header(bytes, LEADER_MAGIC, 52, self.leader) {
+            let open = self.frame.take().is_some();
+            let mut frame = parse_leader(bytes)?;
+            frame.data.reserve(self.expected);
+            self.frame = Some(frame);
+            ensure!(!open, "USB stream image ended without a trailer");
+            return Ok(None);
+        }
+        // Without an open image, the data belongs to one already dropped or
+        // was left over from before acquisition started.
+        let Some(frame) = self.frame.as_mut() else {
+            return Ok(None);
+        };
+        let trailer = if !rest && is_header(bytes, TRAILER_MAGIC, 28, self.trailer) {
+            bytes
+        } else {
+            let image = (self.expected - frame.data.len()).min(bytes.len());
+            frame.data.extend_from_slice(&bytes[..image]);
+            if image == bytes.len() {
+                if full || frame.data.len() == self.expected {
+                    return Ok(None);
+                }
+                self.frame = None;
+                bail!("short USB image payload transfer");
+            }
+            // The image ended on a packet boundary within the transfer, so
+            // the trailer followed in it.
+            &bytes[image..]
+        };
+        let frame = self.frame.take().context("USB stream frame missing")?;
+        validate_trailer(trailer, &frame, self.expected)?;
+        Ok(Some(frame))
+    }
+    /// Cancel every submitted transfer and take its buffer back.
+    fn drain(&mut self, transfers: &mut impl Transfers, deadline: Instant) -> Result<()> {
+        transfers.cancel_all();
+        while self.submitted > 0 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let mut completion = transfers
+                .wait(remaining)
+                .context("USB transfer cancellation timed out")?;
+            self.submitted -= 1;
+            completion.buffer.clear();
+            self.idle.push(completion.buffer);
+        }
+        self.frame = None;
+        self.starved = false;
+        Ok(())
     }
 }
 fn aligned(size: usize, alignment: usize) -> Result<usize> {
@@ -462,20 +706,36 @@ fn le64(data: &[u8], offset: usize) -> Result<u64> {
             .try_into()?,
     ))
 }
-fn command(cmd: u16, id: u16, payload: &[u8]) -> Result<Vec<u8>> {
+/// A command packet. Every command asks for an acknowledgement; a resend
+/// keeps the original request ID and sets the CommandResend flag.
+fn command(cmd: u16, id: u16, resend: bool, payload: &[u8]) -> Result<Vec<u8>> {
     ensure!(
         payload.len() <= u16::MAX as usize,
         "UVCP command payload exceeds 65535 bytes"
     );
+    let flags = if resend { 0xc000u16 } else { 0x4000 };
     let mut packet = Vec::with_capacity(12 + payload.len());
     packet.extend_from_slice(&MAGIC.to_le_bytes());
-    packet.extend_from_slice(&0x4000u16.to_le_bytes());
+    packet.extend_from_slice(&flags.to_le_bytes());
     packet.extend_from_slice(&cmd.to_le_bytes());
     packet.extend_from_slice(&(payload.len() as u16).to_le_bytes());
     packet.extend_from_slice(&id.to_le_bytes());
     packet.extend_from_slice(payload);
     Ok(packet)
 }
+/// An acknowledgement status of error severity.
+#[derive(Debug)]
+struct UvcpStatus(u16);
+impl std::fmt::Display for UvcpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "camera rejected USB3 Vision command with status 0x{:04x}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for UvcpStatus {}
 fn ack(packet: &[u8], id: u16) -> Result<(u16, &[u8])> {
     ensure!(
         le32(packet, 0)? == MAGIC,
@@ -483,10 +743,11 @@ fn ack(packet: &[u8], id: u16) -> Result<(u16, &[u8])> {
     );
     ensure!(le16(packet, 10)? == id, "unexpected UVCP request ID");
     let status = le16(packet, 4)?;
-    ensure!(
-        status == 0,
-        "camera rejected USB3 Vision command with status 0x{status:04x}"
-    );
+    // A warning or info status, with bit 15 clear, means GenCP executed the
+    // command, for example after rounding a written value.
+    if status & 0x8000 != 0 {
+        return Err(UvcpStatus(status).into());
+    }
     let length = le16(packet, 8)? as usize;
     ensure!(
         packet.len() >= 12 + length,
@@ -494,33 +755,156 @@ fn ack(packet: &[u8], id: u16) -> Result<(u16, &[u8])> {
     );
     Ok((le16(packet, 6)?, &packet[12..12 + length]))
 }
-impl UsbBackend {
+/// Check a WriteMem acknowledgement. GenCP lets it carry the written length
+/// only when the camera's Device Capability bit 11 is set; otherwise it is
+/// empty.
+fn write_acknowledged(response: &[u8], len: usize) -> Result<()> {
+    ensure!(
+        response.is_empty() || (response.len() == 4 && le16(response, 2)? as usize == len),
+        "camera returned invalid UVCP write acknowledgement"
+    );
+    Ok(())
+}
+/// The camera's control endpoints, which carry UVCP commands out and their
+/// acknowledgements back.
+trait Channel: Send {
+    /// Returns how many bytes were sent.
+    fn send(&mut self, packet: Vec<u8>, timeout: Duration) -> Result<usize, TransferError>;
+    fn receive(&mut self, len: usize, timeout: Duration) -> Result<Vec<u8>, TransferError>;
+    fn clear_halt(&mut self);
+}
+struct ControlEndpoints {
+    input: Endpoint<Bulk, In>,
+    output: Endpoint<Bulk, Out>,
+}
+impl Channel for ControlEndpoints {
+    fn send(&mut self, packet: Vec<u8>, timeout: Duration) -> Result<usize, TransferError> {
+        let completion = self.output.transfer_blocking(packet.into(), timeout);
+        completion.status.map(|()| completion.actual_len)
+    }
+    fn receive(&mut self, len: usize, timeout: Duration) -> Result<Vec<u8>, TransferError> {
+        let size = aligned(len, self.input.max_packet_size())
+            .map_err(|_| TransferError::InvalidArgument)?;
+        self.input
+            .transfer_blocking(Buffer::new(size), timeout)
+            .into_result()
+            .map(Buffer::into_vec)
+    }
+    fn clear_halt(&mut self) {
+        let _ = self.output.clear_halt().wait();
+        let _ = self.input.clear_halt().wait();
+    }
+}
+/// Sends per command: GenCP asks a sender to retry a failed command three
+/// times.
+const ATTEMPTS: u32 = 4;
+const STATUS_BUSY: u16 = 0x8007;
+const STATUS_RESEND_NOT_SUPPORTED: u16 = 0xa001;
+/// UVCP commands over a camera's control channel.
+struct Control<C> {
+    channel: C,
+    id: u16,
+    /// How long a command may take, at least the camera's maximum response
+    /// time.
+    timeout: Duration,
+    /// The camera's maximum response time, once read from it.
+    response: Duration,
+    max_command: usize,
+    max_ack: usize,
+}
+impl<C: Channel> Control<C> {
+    fn new(channel: C, timeout: Duration) -> Self {
+        Self {
+            channel,
+            id: 0,
+            timeout,
+            response: Duration::ZERO,
+            max_command: 65548,
+            max_ack: 65548,
+        }
+    }
+    /// Send a command and wait for its acknowledgement within the command
+    /// timeout. As GenCP describes, a lost or corrupt acknowledgement or a
+    /// failed transfer resends the command after the response time with the
+    /// same request ID and the CommandResend flag, so a late acknowledgement
+    /// still answers it. A busy camera, which did not run the command, gets
+    /// it again as a new command, as does one that cannot take a resend,
+    /// which may then run a write whose acknowledgement was lost twice.
     fn transact(&mut self, cmd: u16, payload: &[u8]) -> Result<Vec<u8>> {
-        self.id = self.id.wrapping_add(1).max(1);
-        let packet = command(cmd, self.id, payload)?;
         ensure!(
-            packet.len() <= self.max_command,
+            12 + payload.len() <= self.max_command,
             "UVCP command exceeds camera transfer limit"
         );
+        let started = Instant::now();
+        let deadline = started + self.timeout;
+        let hard_deadline = started + self.timeout.max(Duration::from_secs(60));
+        let window = self.response.max(self.timeout / ATTEMPTS);
+        self.id = self.id.wrapping_add(1).max(1);
+        let mut resend = false;
+        let mut sent = 0;
+        let mut failure = anyhow!("USB3 Vision command was not sent");
+        while sent < ATTEMPTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            sent += 1;
+            let window = window.min(remaining);
+            let error = match self.attempt(cmd, payload, resend, window, hard_deadline) {
+                Ok(data) => return Ok(data),
+                Err(error) => error,
+            };
+            match error.downcast_ref::<UvcpStatus>().map(|status| status.0) {
+                Some(STATUS_BUSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    self.id = self.id.wrapping_add(1).max(1);
+                    resend = false;
+                }
+                Some(STATUS_RESEND_NOT_SUPPORTED) if resend => {
+                    self.id = self.id.wrapping_add(1).max(1);
+                    resend = false;
+                }
+                Some(_) => return Err(error),
+                None if error
+                    .chain()
+                    .any(|cause| cause.downcast_ref() == Some(&TransferError::Disconnected)) =>
+                {
+                    return Err(error);
+                }
+                None => resend = true,
+            }
+            failure = error;
+        }
+        let plural = if sent == 1 { "" } else { "s" };
+        Err(failure.context(format!(
+            "USB3 Vision command failed after {sent} attempt{plural}"
+        )))
+    }
+    fn attempt(
+        &mut self,
+        cmd: u16,
+        payload: &[u8],
+        resend: bool,
+        window: Duration,
+        hard_deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        let packet = command(cmd, self.id, resend, payload)?;
+        let len = packet.len();
+        let sent = self.channel.send(packet, window);
         let sent = self
-            .control_out
-            .transfer_blocking(packet.clone().into(), self.timeout)
-            .into_result()
+            .unhalt(sent)
             .context("USB control write failed or timed out")?;
-        ensure!(sent.len() == packet.len(), "short USB control write");
-        let mut deadline = Instant::now() + self.timeout;
-        let hard_deadline = Instant::now() + self.timeout.max(Duration::from_secs(60));
+        ensure!(sent == len, "short USB control write");
+        let mut deadline = Instant::now() + window;
         for _ in 0..64 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             ensure!(
                 !remaining.is_zero(),
                 "USB camera control acknowledgement timed out"
             );
-            let size = aligned(self.max_ack, self.control_in.max_packet_size())?;
+            let response = self.channel.receive(self.max_ack, remaining);
             let response = self
-                .control_in
-                .transfer_blocking(Buffer::new(size), remaining)
-                .into_result()
+                .unhalt(response)
                 .context("USB control read failed or timed out")?;
             // A stale response may remain after a timed-out operation.
             if response.len() >= 12 && le16(&response, 10)? != self.id {
@@ -545,21 +929,15 @@ impl UsbBackend {
         }
         bail!("too many pending or stale UVCP acknowledgements")
     }
-    fn u32(&mut self, address: u64) -> Result<u32> {
-        le32(&self.read_memory(address, 4)?, 0)
-    }
-    fn u64(&mut self, address: u64) -> Result<u64> {
-        le64(&self.read_memory(address, 8)?, 0)
-    }
-    fn put32(&mut self, offset: u64, value: usize) -> Result<()> {
-        ensure!(
-            value <= u32::MAX as usize,
-            "stream register value exceeds u32"
-        );
-        self.write_memory(self.sirm + offset, &(value as u32).to_le_bytes())
+    /// Clear a halt the camera signalled before the command is sent again.
+    fn unhalt<T>(&mut self, result: Result<T, TransferError>) -> Result<T, TransferError> {
+        if let Err(TransferError::Stall) = result {
+            self.channel.clear_halt();
+        }
+        result
     }
 }
-impl RegisterIo for UsbBackend {
+impl<C: Channel> RegisterIo for Control<C> {
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
         ensure!(length <= MAX_FRAME, "USB memory request exceeds size limit");
         address
@@ -598,13 +976,120 @@ impl RegisterIo for UsbBackend {
             request.extend_from_slice(&(address + (i * size) as u64).to_le_bytes());
             request.extend_from_slice(chunk);
             let response = self.transact(WRITE_CMD, &request)?;
-            ensure!(
-                response.len() == 4 && le16(&response, 2)? as usize == chunk.len(),
-                "camera returned invalid UVCP write acknowledgement"
-            );
+            write_acknowledged(&response, chunk.len())?;
         }
         Ok(())
     }
+}
+impl UsbBackend {
+    fn u32(&mut self, address: u64) -> Result<u32> {
+        le32(&self.read_memory(address, 4)?, 0)
+    }
+    fn u64(&mut self, address: u64) -> Result<u64> {
+        le64(&self.read_memory(address, 8)?, 0)
+    }
+    fn put32(&mut self, offset: u64, value: usize) -> Result<()> {
+        ensure!(
+            value <= u32::MAX as usize,
+            "stream register value exceeds u32"
+        );
+        self.write_memory(self.sirm + offset, &(value as u32).to_le_bytes())
+    }
+    fn start_stream(&mut self) -> Result<()> {
+        // The stream registers must not change while the stream interface
+        // is enabled, as a program streaming from the camera may have left
+        // it when it ended abruptly.
+        self.put32(SIRM_CONTROL, 0)?;
+        let info = self.u32(self.sirm)?;
+        let alignment = 1usize
+            .checked_shl(info >> 24)
+            .context("invalid USB camera stream alignment")?
+            .max(self.stream_in.max_packet_size());
+        ensure!(
+            alignment.is_power_of_two() && alignment <= MAX_TRANSFER,
+            "unsupported USB camera stream alignment"
+        );
+        let expected = self.u64(self.sirm + 0x08)?;
+        ensure!(
+            expected > 0 && expected <= MAX_FRAME as u64,
+            "USB stream required payload is outside 1..256 MiB"
+        );
+        let expected = expected as usize;
+        let leader = aligned((self.u32(self.sirm + 0x10)? as usize).max(52), alignment)?;
+        let trailer = aligned((self.u32(self.sirm + 0x14)? as usize).max(28), alignment)?;
+        ensure!(
+            leader <= MAX_TRANSFER && trailer <= MAX_TRANSFER,
+            "USB stream header transfer is too large"
+        );
+        let layout = layout(expected, leader, trailer, alignment, usbfs_window())?;
+        self.put32(0x18, leader)?;
+        self.put32(0x2c, trailer)?;
+        self.put32(0x1c, layout.block)?;
+        self.put32(0x20, layout.count)?;
+        self.put32(0x24, layout.tail)?;
+        self.put32(0x28, 0)?;
+        self.reset_stream_endpoint()?;
+        // Submit the transfers before AcquisitionStart.
+        let mut stream = Stream::new(expected, leader, trailer);
+        stream.queue(&mut self.stream_in, layout.transfers, layout.request);
+        self.stream = Some(stream);
+        self.put32(SIRM_CONTROL, 1)
+    }
+    /// Halt the stream endpoint, then clear the halt, as Aravis and the NI
+    /// driver reset it, so the camera drops any partly sent block. A host
+    /// or camera may ignore the halt; clearing it still resets the endpoint.
+    fn reset_stream_endpoint(&mut self) -> Result<()> {
+        let _ = self
+            .stream_interface
+            .control_out(
+                halt(self.stream_in.endpoint_address()),
+                Duration::from_millis(500),
+            )
+            .wait();
+        self.stream_in
+            .clear_halt()
+            .wait()
+            .context("cannot reset USB stream endpoint")
+    }
+    /// Restart the stream after the camera halted its endpoint: disable the
+    /// stream interface, take back every transfer, reset the endpoint, and
+    /// submit the transfers again before enabling it.
+    fn restart_stream(&mut self) -> Result<()> {
+        self.put32(SIRM_CONTROL, 0)?;
+        let deadline = Instant::now() + self.control.timeout;
+        let stream = self.stream.as_mut().context("USB acquisition stopped")?;
+        stream.drain(&mut self.stream_in, deadline)?;
+        self.reset_stream_endpoint()?;
+        let stream = self.stream.as_mut().context("USB acquisition stopped")?;
+        stream.fill(&mut self.stream_in);
+        self.put32(SIRM_CONTROL, 1)
+    }
+}
+impl RegisterIo for UsbBackend {
+    fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+        self.control.read_memory(address, length)
+    }
+    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+        self.control.write_memory(address, data)
+    }
+}
+/// The address and size of each manifest entry for a raw or zipped device
+/// XML, newest version first. GenCP puts the file type in bits 0-2 of the
+/// entry's second word, where 1 is a Buffer XML holding only chunk nodes,
+/// and the 6-bit file format in bits 10-15.
+fn device_xml_entries(entries: &[u8]) -> Result<Vec<(u64, u64)>> {
+    let mut candidates = Vec::new();
+    for entry in entries.as_chunks::<64>().0 {
+        let schema = le32(entry, 4)?;
+        if schema & 7 == 0 && (schema >> 10) & 0x3f <= 1 {
+            candidates.push((le32(entry, 0)?, le64(entry, 8)?, le64(entry, 16)?));
+        }
+    }
+    candidates.sort_by_key(|e| std::cmp::Reverse(e.0));
+    Ok(candidates
+        .into_iter()
+        .map(|(_, address, size)| (address, size))
+        .collect())
 }
 fn parse_leader(bytes: &[u8]) -> Result<Frame> {
     ensure!(
@@ -674,16 +1159,8 @@ impl Backend for UsbBackend {
                 .context("manifest address overflow")?,
             count * 64,
         )?;
-        let mut candidates = Vec::new();
-        for entry in entries.as_chunks::<64>().0 {
-            let schema = (le32(entry, 4)? >> 10) & 31;
-            if schema <= 1 {
-                candidates.push((le32(entry, 0)?, le64(entry, 8)?, le64(entry, 16)?));
-            }
-        }
-        candidates.sort_by_key(|e| std::cmp::Reverse(e.0));
-        let mut last_error = anyhow!("USB manifest contains no raw or ZIP GenICam XML entry");
-        for (_, address, size) in candidates {
+        let mut last_error = anyhow!("USB manifest contains no raw or ZIP device XML entry");
+        for (address, size) in device_xml_entries(&entries)? {
             if size == 0 || size > 32 * 1024 * 1024 {
                 last_error = anyhow!("GenICam manifest XML size is outside 1..32 MiB");
                 continue;
@@ -703,98 +1180,39 @@ impl Backend for UsbBackend {
     }
     fn start(&mut self, _payload_size: usize) -> Result<()> {
         ensure!(self.stream.is_none(), "USB acquisition already started");
-        let info = self.u32(self.sirm)?;
-        let alignment = 1usize
-            .checked_shl(info >> 24)
-            .context("invalid USB camera stream alignment")?
-            .max(self.stream_in.max_packet_size());
-        ensure!(
-            alignment.is_power_of_two() && alignment <= 1024 * 1024,
-            "unsupported USB camera stream alignment"
-        );
-        let expected = self.u64(self.sirm + 0x08)?;
-        ensure!(
-            expected > 0 && expected <= MAX_FRAME as u64,
-            "USB stream required payload is outside 1..256 MiB"
-        );
-        let expected = expected as usize;
-        let leader = aligned((self.u32(self.sirm + 0x10)? as usize).max(52), alignment)?;
-        let trailer = aligned((self.u32(self.sirm + 0x14)? as usize).max(28), alignment)?;
-        ensure!(
-            leader <= 1024 * 1024 && trailer <= 1024 * 1024,
-            "USB stream header transfer is too large"
-        );
-        let block = aligned(expected.min(1024 * 1024), alignment)?;
-        let count = expected / block;
-        let tail = if !expected.is_multiple_of(block) {
-            aligned(expected % block, alignment)?
-        } else {
-            0
-        };
-        self.put32(0x18, leader)?;
-        self.put32(0x2c, trailer)?;
-        self.put32(0x1c, block)?;
-        self.put32(0x20, count)?;
-        self.put32(0x24, tail)?;
-        self.put32(0x28, 0)?;
-        self.stream_in
-            .clear_halt()
-            .wait()
-            .context("cannot reset USB stream endpoint")?;
-        let mut schedule = vec![Request {
-            part: Part::Leader,
-            size: leader,
-        }];
-        schedule.extend((0..count).map(|_| Request {
-            part: Part::Payload,
-            size: block,
-        }));
-        if tail > 0 {
-            schedule.push(Request {
-                part: Part::Payload,
-                size: tail,
-            });
-        }
-        schedule.push(Request {
-            part: Part::Trailer,
-            size: trailer,
-        });
-        // Queue two full frame requests before AcquisitionStart to keep the host
-        // controller supplied with buffers while the consumer processes a frame.
-        let mut stream = Stream::new(expected, schedule);
-        stream.queue(&mut self.stream_in);
-        stream.queue(&mut self.stream_in);
-        // Linux maps transfer buffers from usbfs memory, falling back to
-        // copies when its limit is reached; other systems always copy.
-        if cfg!(target_os = "linux") && !stream.zero_copy {
-            eprintln!(
-                "capturefab: USB transfers are copied because the kernel could not map usbfs memory for them; raise /sys/module/usbcore/parameters/usbfs_memory_mb (16 MB by default) above twice the frame size"
-            );
-        }
-        self.stream = Some(stream);
-        if let Err(error) = self.put32(SIRM_CONTROL, 1) {
+        // Take back transfers that a stop whose cancellation timed out left
+        // pending, so the new stream counts only its own.
+        self.stop()?;
+        let started = self.start_stream();
+        if started.is_err() {
+            if self.stream.is_none() {
+                let _ = self.put32(SIRM_CONTROL, 0);
+            }
             let _ = self.stop();
-            return Err(error);
         }
-        Ok(())
+        started
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
-        ensure!(self.stream.is_some(), "USB acquisition has not started");
         let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            ensure!(!remaining.is_zero(), "USB frame capture timed out");
-            let completed = self
-                .stream_in
-                .wait_next_complete(remaining)
-                .context("USB frame capture timed out")?;
-            let stream = self.stream.as_mut().unwrap();
-            if let Some(frame) =
-                stream.receive(&mut self.stream_in, completed.status, completed.buffer)?
-            {
-                return Ok(frame);
-            }
+        let stream = self
+            .stream
+            .as_mut()
+            .context("USB acquisition has not started")?;
+        let frame = stream.next(&mut self.stream_in, deadline);
+        if let Err(error) = &frame
+            && error
+                .chain()
+                .any(|cause| cause.downcast_ref() == Some(&TransferError::Stall))
+        {
+            // A control timeout during recovery must not read as a frame wait.
+            self.restart_stream().map_err(|restart| {
+                Categorized::error(
+                    ErrorKind::OperationFailed,
+                    format!("cannot recover the stalled USB stream endpoint: {restart:#}"),
+                )
+            })?;
         }
+        frame
     }
     fn stop(&mut self) -> Result<()> {
         let was_started = self.stream.take().is_some();
@@ -806,7 +1224,7 @@ impl Backend for UsbBackend {
         self.stream_in.cancel_all();
         // nusb cancellation completes outstanding requests asynchronously. Drain
         // them before allowing a later start to create a fresh ordered queue.
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.control.timeout;
         while self.stream_in.pending() != 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -828,6 +1246,7 @@ impl Drop for UsbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
 
     #[test]
     fn open_failures_name_the_fix_for_this_os() {
@@ -957,19 +1376,205 @@ mod tests {
         assert!(!is_u3v_interface(0xef, 5, 2));
     }
     #[test]
+    fn device_info_descriptor_names_its_strings() {
+        // bLength, type, subtype, GenCP 1.0, U3V 1.0, then iDeviceGUID,
+        // iVendorName, iModelName, iFamilyName, iDeviceVersion,
+        // iManufacturerInfo, iSerialNumber, iUserDefinedName, bmSpeedSupport.
+        let descriptor = [
+            0x14, 0x24, 0x01, 0, 0, 1, 0, 0, 0, 1, 0, 4, 1, 2, 0, 5, 0, 3, 6, 0x0c,
+        ];
+        assert_eq!(name_indexes(&descriptor), Some([4, 1, 2, 3]));
+        assert_eq!(name_indexes(&descriptor[..17]), None);
+        assert_eq!(name_indexes(&[7, 5, 0x81, 2, 0, 4, 0]), None);
+    }
+    #[test]
+    fn camera_id_prefers_the_serial_then_the_guid() {
+        let mut names = DeviceNames {
+            serial: Some("40012345".into()),
+            guid: Some("2676005E0A1B".into()),
+            ..DeviceNames::default()
+        };
+        let id = |names: &DeviceNames| camera_id(0x2676, 0xba02, names, "3:7");
+        assert_eq!(id(&names), "usb:2676:ba02:40012345");
+        names.serial = None;
+        assert_eq!(id(&names), "usb:2676:ba02:2676005E0A1B");
+        names.guid = None;
+        assert_eq!(id(&names), "usb:2676:ba02:3:7");
+    }
+    #[test]
     fn uvcp_little_endian_wire_packet() {
         let payload = [0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0];
-        let packet = command(READ_CMD, 7, &payload).unwrap();
+        let packet = command(READ_CMD, 7, false, &payload).unwrap();
         assert_eq!(
             &packet[..12],
             &[0x55, 0x33, 0x56, 0x43, 0, 0x40, 0, 8, 12, 0, 7, 0]
         );
-        let mut response = command(READ_CMD + 1, 7, &[1, 2, 3, 4]).unwrap();
+        let resend = command(READ_CMD, 7, true, &payload).unwrap();
+        assert_eq!(&resend[4..6], &[0, 0xc0]);
+        let mut response = command(READ_CMD + 1, 7, false, &[1, 2, 3, 4]).unwrap();
         response[4..6].fill(0);
         assert_eq!(ack(&response, 7).unwrap(), (0x0801, &[1, 2, 3, 4][..]));
         assert!(ack(&response, 8).is_err());
-        response[4] = 1;
-        assert!(ack(&response, 7).is_err());
+        // Warning severity: the command ran.
+        response[4..6].copy_from_slice(&0x4001u16.to_le_bytes());
+        assert_eq!(ack(&response, 7).unwrap(), (0x0801, &[1, 2, 3, 4][..]));
+        response[4..6].copy_from_slice(&0x8003u16.to_le_bytes());
+        let error = ack(&response, 7).unwrap_err();
+        assert_eq!(error.downcast_ref::<UvcpStatus>().unwrap().0, 0x8003);
+    }
+    #[test]
+    fn write_acknowledgement_may_omit_the_written_length() {
+        // WRITEMEM_ACK with an empty SCD, and with length_written = 4.
+        let empty = [0x55, 0x33, 0x56, 0x43, 0, 0, 0x03, 0x08, 0, 0, 7, 0];
+        let (command, scd) = ack(&empty, 7).unwrap();
+        assert_eq!(command, WRITE_CMD + 1);
+        write_acknowledged(scd, 4).unwrap();
+        let mut counted = empty.to_vec();
+        counted[8] = 4;
+        counted.extend([0, 0, 4, 0]);
+        write_acknowledged(ack(&counted, 7).unwrap().1, 4).unwrap();
+        assert!(write_acknowledged(ack(&counted, 7).unwrap().1, 8).is_err());
+        assert!(write_acknowledged(&[0, 0], 4).is_err());
+    }
+    #[test]
+    fn manifest_selects_the_device_xml_over_a_newer_buffer_xml() {
+        let entry = |version: u32, schema: u32, address: u64, size: u64| {
+            let mut entry = [0u8; 64];
+            entry[..4].copy_from_slice(&version.to_le_bytes());
+            entry[4..8].copy_from_slice(&schema.to_le_bytes());
+            entry[8..16].copy_from_slice(&address.to_le_bytes());
+            entry[16..24].copy_from_slice(&size.to_le_bytes());
+            entry
+        };
+        // Schema 1.1 in the top half; file type in bits 0-2, format at 10.
+        let schema = |file_type: u32, format: u32| 0x0101_0000 | format << 10 | file_type;
+        let manifest = [
+            entry(0x0200_0000, schema(1, 0), 0x1000, 100),
+            entry(0x0100_0002, schema(0, 1), 0x2000, 200),
+            entry(0x0100_0001, schema(0, 0), 0x3000, 300),
+            entry(0x0300_0000, schema(0, 33), 0x4000, 400),
+        ]
+        .concat();
+        assert_eq!(
+            device_xml_entries(&manifest).unwrap(),
+            [(0x2000, 200), (0x3000, 300)]
+        );
+    }
+    /// A camera's control endpoints, replying to each read from a script.
+    #[derive(Default)]
+    struct Script {
+        sent: Vec<Vec<u8>>,
+        replies: VecDeque<Result<Vec<u8>, TransferError>>,
+        halts_cleared: usize,
+        /// Whether a read with nothing to receive waits out its timeout.
+        slow: bool,
+    }
+    impl Channel for Script {
+        fn send(&mut self, packet: Vec<u8>, _timeout: Duration) -> Result<usize, TransferError> {
+            self.sent.push(packet);
+            Ok(self.sent.last().unwrap().len())
+        }
+        fn receive(&mut self, _len: usize, timeout: Duration) -> Result<Vec<u8>, TransferError> {
+            // A read with nothing to receive times out.
+            self.replies.pop_front().unwrap_or_else(|| {
+                if self.slow {
+                    std::thread::sleep(timeout);
+                }
+                Err(TransferError::Cancelled)
+            })
+        }
+        fn clear_halt(&mut self) {
+            self.halts_cleared += 1;
+        }
+    }
+    fn reply(status: u16, command: u16, id: u16, scd: &[u8]) -> Result<Vec<u8>, TransferError> {
+        let mut packet = MAGIC.to_le_bytes().to_vec();
+        packet.extend(status.to_le_bytes());
+        packet.extend(command.to_le_bytes());
+        packet.extend((scd.len() as u16).to_le_bytes());
+        packet.extend(id.to_le_bytes());
+        packet.extend(scd);
+        Ok(packet)
+    }
+    fn control(
+        replies: impl IntoIterator<Item = Result<Vec<u8>, TransferError>>,
+    ) -> Control<Script> {
+        let script = Script {
+            replies: replies.into_iter().collect(),
+            ..Script::default()
+        };
+        Control::new(script, Duration::from_secs(1))
+    }
+    /// The flags and request ID of each command sent.
+    fn sent(control: &Control<Script>) -> Vec<(u16, u16)> {
+        let field = |packet: &[u8], at| le16(packet, at).unwrap();
+        let sent = control.channel.sent.iter();
+        sent.map(|p| (field(p, 4), field(p, 10))).collect()
+    }
+    #[test]
+    fn lost_or_corrupt_acknowledgements_resend_the_command() {
+        let value = 2000u32.to_le_bytes();
+        // No acknowledgement: resend with the same ID and CommandResend.
+        let mut lost = control([Err(TransferError::Cancelled), reply(0, 0x0801, 1, &value)]);
+        assert_eq!(lost.read_memory(0x1cc, 4).unwrap(), value);
+        assert_eq!(sent(&lost), [(0x4000, 1), (0xc000, 1)]);
+        // A corrupt acknowledgement, then a stall the endpoint must clear.
+        let mut corrupt = reply(0, 0x0801, 1, &value).unwrap();
+        corrupt[0] = 0;
+        let mut flaky = control([
+            Ok(corrupt),
+            Err(TransferError::Stall),
+            reply(0, 0x0801, 1, &value),
+        ]);
+        assert_eq!(flaky.read_memory(0x1cc, 4).unwrap(), value);
+        assert_eq!(flaky.channel.sent.len(), 3);
+        assert_eq!(flaky.channel.halts_cleared, 1);
+        // A busy camera gets the command again under a new ID, as does one
+        // that cannot take a resend.
+        let mut busy = control([
+            reply(STATUS_BUSY, 0x0801, 1, &[]),
+            reply(0, 0x0801, 2, &value),
+        ]);
+        assert_eq!(busy.read_memory(0x1cc, 4).unwrap(), value);
+        assert_eq!(sent(&busy), [(0x4000, 1), (0x4000, 2)]);
+        let mut plain = control([
+            Err(TransferError::Cancelled),
+            reply(STATUS_RESEND_NOT_SUPPORTED, 0x0801, 1, &[]),
+            reply(0, 0x0801, 2, &value),
+        ]);
+        assert_eq!(plain.read_memory(0x1cc, 4).unwrap(), value);
+        assert_eq!(sent(&plain), [(0x4000, 1), (0xc000, 1), (0x4000, 2)]);
+        // A camera that writes without reporting the written length.
+        let mut write = control([reply(0, 0x0803, 1, &[])]);
+        write.write_memory(0x10_0004, &[1, 0, 0, 0]).unwrap();
+    }
+    #[test]
+    fn definite_failures_are_not_resent() {
+        let mut rejected = control([reply(0x8003, 0x0801, 1, &[])]);
+        let error = rejected.read_memory(0x1cc, 4).unwrap_err();
+        assert_eq!(error.downcast_ref::<UvcpStatus>().unwrap().0, 0x8003);
+        assert_eq!(rejected.channel.sent.len(), 1);
+        let mut gone = control([Err(TransferError::Disconnected)]);
+        assert!(gone.read_memory(0x1cc, 4).is_err());
+        assert_eq!(gone.channel.sent.len(), 1);
+        let mut silent = control([]);
+        let error = silent.read_memory(0x1cc, 4).unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+        assert_eq!(silent.channel.sent.len(), ATTEMPTS as usize);
+    }
+    #[test]
+    fn resends_stay_within_the_command_timeout() {
+        let script = Script {
+            slow: true,
+            ..Script::default()
+        };
+        // A camera whose maximum response time is most of the timeout gets
+        // one resend in the time that remains.
+        let mut slow = Control::new(script, Duration::from_millis(300));
+        slow.response = Duration::from_millis(200);
+        assert!(slow.read_memory(0x1cc, 4).is_err());
+        assert!(slow.channel.sent.len() <= 2);
+        assert_eq!(sent(&slow)[0], (0x4000, 1));
     }
     #[test]
     fn usb_leader_and_trailer_validation() {
@@ -995,114 +1600,310 @@ mod tests {
         leader[18] = 2;
         assert!(parse_leader(&leader).is_err());
     }
-    /// Stands in for the stream endpoint: buffers wait in submission order.
+    const MPS: usize = 1024;
+    /// Stands in for the stream endpoint and the camera behind it. The
+    /// camera's transfers queue as packets, and each submitted transfer in
+    /// turn takes packets until it is full or a short packet ends it.
     #[derive(Default)]
-    struct Queue {
+    struct Bus {
         allocated: usize,
-        submitted: VecDeque<Buffer>,
+        submitted: VecDeque<(Buffer, Option<TransferError>)>,
+        packets: VecDeque<Vec<u8>>,
+        /// Submits to refuse, as Linux does when usbfs memory runs out.
+        refuse: usize,
+        /// Whether the next transfer to complete loses its data.
+        fault: bool,
     }
-    impl Transfers for Queue {
+    impl Bus {
+        /// Queue one camera transfer, which ends with a short packet unless
+        /// its length is a multiple of the packet size.
+        fn send(&mut self, bytes: &[u8]) {
+            self.packets.extend(bytes.chunks(MPS).map(<[u8]>::to_vec));
+            if bytes.is_empty() {
+                self.packets.push_back(Vec::new());
+            }
+        }
+        /// Queue a whole frame as a camera sends it after SIRM setup.
+        fn frame(&mut self, id: u64, image: &[u8], block: usize) {
+            self.send(&leader(id, image.len() as u32, 1));
+            for chunk in image.chunks(block) {
+                self.send(chunk);
+            }
+            self.send(&trailer(id, image.len()));
+        }
+        fn stall(&mut self) {
+            for (_, status) in &mut self.submitted {
+                *status = Some(TransferError::Stall);
+            }
+        }
+    }
+    impl Transfers for Bus {
         fn allocate(&mut self, len: usize) -> Buffer {
             self.allocated += 1;
             Buffer::new(len)
         }
         fn submit(&mut self, buffer: Buffer) {
-            self.submitted.push_back(buffer);
+            assert!(buffer.requested_len().is_multiple_of(MPS));
+            let refused = self.refuse > 0;
+            self.refuse = self.refuse.saturating_sub(1);
+            let status = refused.then_some(TransferError::Unknown(ENOMEM));
+            self.submitted.push_back((buffer, status));
+        }
+        fn wait(&mut self, _timeout: Duration) -> Option<Completion> {
+            let (buffer, status) = self.submitted.front()?;
+            let status = match status {
+                Some(error) => Err(*error),
+                None => {
+                    let mut room = buffer.requested_len();
+                    let mut taken = 0;
+                    loop {
+                        let packet = self.packets.get(taken)?;
+                        assert!(packet.len() <= room, "babble");
+                        room -= packet.len();
+                        taken += 1;
+                        if packet.len() < MPS || room == 0 {
+                            break;
+                        }
+                    }
+                    let packets: Vec<_> = self.packets.drain(..taken).collect();
+                    if std::mem::take(&mut self.fault) {
+                        Err(TransferError::Fault)
+                    } else {
+                        let buffer = &mut self.submitted.front_mut().unwrap().0;
+                        packets.iter().for_each(|p| buffer.extend_from_slice(p));
+                        Ok(())
+                    }
+                }
+            };
+            let (buffer, _) = self.submitted.pop_front().unwrap();
+            Some(Completion {
+                actual_len: buffer.len(),
+                buffer,
+                status,
+            })
+        }
+        fn cancel_all(&mut self) {
+            for (_, status) in &mut self.submitted {
+                status.get_or_insert(TransferError::Cancelled);
+            }
         }
     }
-    impl Queue {
-        /// Complete the oldest transfer with `bytes` from the camera.
-        fn complete(&mut self, bytes: &[u8]) -> Buffer {
-            let mut buffer = self.submitted.pop_front().unwrap();
-            assert!(bytes.len() <= buffer.requested_len());
-            buffer.extend_from_slice(bytes);
-            buffer
-        }
-    }
-    fn leader(id: u64) -> Vec<u8> {
+    fn leader(id: u64, width: u32, height: u32) -> Vec<u8> {
         let mut leader = vec![0; 52];
         leader[..4].copy_from_slice(&LEADER_MAGIC.to_le_bytes());
         leader[6..8].copy_from_slice(&52u16.to_le_bytes());
         leader[8..16].copy_from_slice(&id.to_le_bytes());
         leader[18..20].copy_from_slice(&1u16.to_le_bytes());
         leader[28..32].copy_from_slice(&crate::types::MONO8.to_le_bytes());
-        leader[32..36].copy_from_slice(&4u32.to_le_bytes());
-        leader[36..40].copy_from_slice(&2u32.to_le_bytes());
+        leader[32..36].copy_from_slice(&width.to_le_bytes());
+        leader[36..40].copy_from_slice(&height.to_le_bytes());
         leader
     }
-    fn trailer(id: u64) -> Vec<u8> {
-        let mut trailer = vec![0; 28];
+    /// An image trailer with SizeY, as U3V 1.0 cameras send it.
+    fn trailer(id: u64, size: usize) -> Vec<u8> {
+        let mut trailer = vec![0; 32];
         trailer[..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
-        trailer[6..8].copy_from_slice(&28u16.to_le_bytes());
+        trailer[6..8].copy_from_slice(&32u16.to_le_bytes());
         trailer[8..16].copy_from_slice(&id.to_le_bytes());
-        trailer[20..28].copy_from_slice(&8u64.to_le_bytes());
+        trailer[20..28].copy_from_slice(&(size as u64).to_le_bytes());
+        trailer[28..32].copy_from_slice(&1u32.to_le_bytes());
         trailer
     }
+    /// A stream set up as `start` sets one up for `expected` bytes, through
+    /// four transfers of `block` bytes: fewer than one frame needs.
+    fn streaming(expected: usize, block: usize) -> (Stream, Bus) {
+        let mut stream = Stream::new(expected, MPS, MPS);
+        let mut bus = Bus::default();
+        stream.queue(&mut bus, 4, block);
+        (stream, bus)
+    }
+    fn next(stream: &mut Stream, bus: &mut Bus) -> Result<Frame> {
+        let frame = stream.next(bus, Instant::now() + Duration::from_secs(1));
+        assert!(bus.submitted.len() <= 4 && bus.allocated == 4);
+        frame
+    }
+    fn image(id: u64, len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i as u64 * 7 + id) as u8).collect()
+    }
     #[test]
-    fn streaming_resubmits_each_buffer_in_order_without_allocating() {
-        let request = |part, size| Request { part, size };
-        let schedule = vec![
-            request(Part::Leader, 64),
-            request(Part::Payload, 128),
-            request(Part::Trailer, 64),
-        ];
-        // The submitted buffers always match the pending requests one to
-        // one, as transfers complete in submission order.
-        let mirrored = |queue: &Queue, stream: &Stream| {
-            let submitted = queue.submitted.iter().map(Buffer::requested_len);
-            let pending = stream.pending.iter().map(|request| request.size);
-            submitted.eq(pending) && stream.pending.len() == 6
-        };
-        let mut queue = Queue::default();
-        let mut stream = Stream::new(8, schedule);
-        stream.queue(&mut queue);
-        stream.queue(&mut queue);
-        assert!(mirrored(&queue, &stream));
-        assert!(!stream.zero_copy, "Buffer::new copies");
-        for id in 1..=3 {
-            let parts = [leader(id), vec![id as u8; 8], trailer(id)];
-            for (index, bytes) in parts.iter().enumerate() {
-                let buffer = queue.complete(bytes);
-                let frame = stream.receive(&mut queue, Ok(()), buffer).unwrap();
-                assert_eq!(frame.is_some(), index == 2);
-                if let Some(frame) = frame {
-                    assert_eq!((frame.id, frame.data), (id, vec![id as u8; 8]));
-                }
-                assert!(mirrored(&queue, &stream));
+    fn stream_assembles_frames_larger_than_its_transfer_window() {
+        let block = 4 * MPS;
+        // An unaligned last transfer ends short; an aligned one shares its
+        // transfer with the trailer; an image of whole blocks has none.
+        for expected in [10 * MPS + 300, 10 * MPS, 12 * MPS] {
+            let (mut stream, mut bus) = streaming(expected, block);
+            for id in 1..=3 {
+                bus.frame(id, &image(id, expected), block);
+                let frame = next(&mut stream, &mut bus).unwrap();
+                assert_eq!((frame.id, frame.data), (id, image(id, expected)));
             }
         }
-        // A failed transfer keeps its place, and the stream resumes with the
-        // next frame's leader.
-        let buffer = queue.complete(&[]);
-        assert!(
-            stream
-                .receive(&mut queue, Err(TransferError::Fault), buffer)
-                .is_err()
-        );
-        for bytes in [vec![4; 8], trailer(4)] {
-            let buffer = queue.complete(&bytes);
-            assert!(stream.receive(&mut queue, Ok(()), buffer).is_err());
+        // Some cameras end the last payload transfer with a zero-length
+        // packet before the trailer.
+        let (mut stream, mut bus) = streaming(12 * MPS, block);
+        for id in 1..=3 {
+            bus.send(&leader(id, 12 * MPS as u32, 1));
+            for chunk in image(id, 12 * MPS).chunks(block) {
+                bus.send(chunk);
+            }
+            bus.send(&[]);
+            bus.send(&trailer(id, 12 * MPS));
+            assert_eq!(next(&mut stream, &mut bus).unwrap().id, id);
         }
-        for bytes in [leader(5), vec![5; 8]] {
-            let buffer = queue.complete(&bytes);
-            assert!(
-                stream
-                    .receive(&mut queue, Ok(()), buffer)
-                    .unwrap()
-                    .is_none()
+    }
+    #[test]
+    fn image_ending_like_a_header_is_image_data() {
+        let block = 4 * MPS;
+        // A short last transfer, and a tiny image in one transfer.
+        for expected in [8 * MPS + 64, 64] {
+            let (mut stream, mut bus) = streaming(expected, block);
+            for (id, header) in [(1, leader(9, 4, 2)), (2, trailer(9, 8))] {
+                let mut pixels = image(id, expected);
+                pixels[expected - 64..][..header.len()].copy_from_slice(&header);
+                bus.frame(id, &pixels, block);
+                let frame = next(&mut stream, &mut bus).unwrap();
+                assert_eq!((frame.id, frame.data), (id, pixels));
+            }
+        }
+    }
+    #[test]
+    fn stream_drops_one_frame_and_resumes_after_lost_or_extra_data() {
+        // Images of whole packets, which never realigned fixed transfer slots.
+        let (block, expected) = (4 * MPS, 8 * MPS);
+        let (mut stream, mut bus) = streaming(expected, block);
+        // A camera left streaming by an earlier program still holds the end
+        // of a frame.
+        bus.send(&[9; 4 * MPS]);
+        bus.send(&trailer(0, expected));
+        bus.frame(1, &image(1, expected), block);
+        assert_eq!(next(&mut stream, &mut bus).unwrap().id, 1);
+        // Each bad frame is one error, and the next frame arrives whole.
+        let lost = |stream: &mut Stream, bus: &mut Bus, id: u64| {
+            bus.frame(id, &image(id, expected), block);
+            assert!(next(stream, bus).is_err());
+            let frame = next(stream, bus).unwrap();
+            assert_eq!((frame.id, frame.data), (id, image(id, expected)));
+        };
+        // A truncated frame whose trailer arrives early.
+        bus.send(&leader(2, expected as u32, 1));
+        bus.send(&image(2, block));
+        bus.send(&trailer(2, block));
+        lost(&mut stream, &mut bus, 3);
+        // A truncated frame that keeps its transfer count.
+        bus.send(&leader(4, expected as u32, 1));
+        bus.send(&image(4, 1000));
+        bus.send(&[]);
+        bus.send(&trailer(4, 1000));
+        lost(&mut stream, &mut bus, 5);
+        // A frame without its trailer.
+        bus.send(&leader(6, expected as u32, 1));
+        bus.send(&image(6, expected));
+        lost(&mut stream, &mut bus, 7);
+        // A transfer error in the middle of a frame.
+        bus.send(&leader(8, expected as u32, 1));
+        bus.send(&image(8, block));
+        let waiting = next(&mut stream, &mut bus).unwrap_err();
+        assert!(format!("{waiting:#}").contains("timed out"));
+        bus.fault = true;
+        bus.send(&image(8, block));
+        bus.send(&trailer(8, expected));
+        lost(&mut stream, &mut bus, 9);
+    }
+    #[test]
+    fn refused_submits_hold_buffers_back_without_losing_data() {
+        let block = 4 * MPS;
+        let mut stream = Stream::new(10 * MPS, MPS, MPS);
+        let mut bus = Bus {
+            refuse: 2,
+            ..Bus::default()
+        };
+        stream.queue(&mut bus, 4, block);
+        for id in 1..=3 {
+            bus.refuse = 1;
+            bus.frame(id, &image(id, 10 * MPS), block);
+            let frame = next(&mut stream, &mut bus).unwrap();
+            assert_eq!((frame.id, frame.data), (id, image(id, 10 * MPS)));
+        }
+        // The transfers already submitted still complete a frame.
+        bus.refuse = usize::MAX;
+        bus.frame(4, &image(4, 10 * MPS), block);
+        assert_eq!(next(&mut stream, &mut bus).unwrap().id, 4);
+        bus.frame(5, &image(5, 10 * MPS), block);
+        let error = stream
+            .next(&mut bus, Instant::now() + Duration::from_millis(50))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("usbfs_memory_mb"));
+        assert!(!format!("{error:#}").contains("timed out"));
+    }
+    #[test]
+    fn stalled_stream_resumes_after_its_transfers_are_drained() {
+        let (block, expected) = (4 * MPS, 10 * MPS);
+        let (mut stream, mut bus) = streaming(expected, block);
+        bus.frame(1, &image(1, expected), block);
+        assert_eq!(next(&mut stream, &mut bus).unwrap().id, 1);
+        bus.send(&leader(2, expected as u32, 1));
+        bus.stall();
+        let error = next(&mut stream, &mut bus).unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref() == Some(&TransferError::Stall))
+        );
+        stream.drain(&mut bus, Instant::now()).unwrap();
+        assert_eq!((bus.submitted.len(), stream.idle.len()), (0, 4));
+        bus.packets.clear();
+        stream.fill(&mut bus);
+        bus.frame(3, &image(3, expected), block);
+        assert_eq!(next(&mut stream, &mut bus).unwrap().id, 3);
+    }
+    #[test]
+    fn transfer_window_stays_within_a_share_of_usbfs_memory() {
+        const MIB: usize = 1024 * 1024;
+        assert_eq!(window(Some(16), 1), 8 * MIB);
+        assert_eq!(window(Some(16), 2), 4 * MIB);
+        assert_eq!(window(Some(4), 1), 2 * MIB);
+        assert_eq!(window(Some(256), 1), 128 * MIB);
+        assert_eq!(window(Some(0), 1), usize::MAX);
+        assert_eq!(window(None, 4), usize::MAX);
+        let submitted = |layout: Layout| layout.request * layout.transfers;
+        // 4000x3000 Mono8 and 5472x3648 Mono8 at Linux's default limit.
+        for expected in [12_000_000, 19_961_856] {
+            let one = layout(expected, MPS, MPS, MPS, window(Some(16), 1)).unwrap();
+            assert_eq!((one.block, one.transfers), (MIB, 8));
+            let two = layout(expected, MPS, MPS, MPS, window(Some(16), 2)).unwrap();
+            assert_eq!(submitted(two), 4 * MIB);
+            let many = layout(expected, MPS, MPS, MPS, window(Some(16), 8)).unwrap();
+            assert_eq!((many.block, submitted(many)), (MIB / 4, MIB));
+        }
+        // Small frames keep two frames of transfers submitted.
+        let vga = layout(640 * 480, MPS, MPS, MPS, window(Some(16), 1)).unwrap();
+        assert_eq!(
+            (vga.block, vga.count, vga.tail, vga.transfers),
+            (307_200, 1, 0, 6)
+        );
+        let tail = layout(2_304_000, MPS, MPS, MPS, window(Some(16), 1)).unwrap();
+        assert_eq!((tail.count, tail.tail), (2, 206_848));
+        // Without a usbfs limit, or with a raised one, large frames keep two
+        // frames of transfers submitted too.
+        for limit in [None, Some(0), Some(256)] {
+            let unlimited = layout(12_000_000, MPS, MPS, MPS, window(limit, 1)).unwrap();
+            assert_eq!(
+                (unlimited.block, unlimited.count, unlimited.transfers),
+                (MIB, 11, 28)
             );
         }
-        let buffer = queue.complete(&trailer(5));
+    }
+    #[test]
+    fn stream_endpoint_reset_halts_it_first() {
+        // Aravis: LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_STANDARD |
+        // LIBUSB_RECIPIENT_ENDPOINT, SET_FEATURE, ENDPOINT_HALT, endpoint.
+        let request = halt(0x81);
+        let request_type = (request.control_type as u8) << 5 | request.recipient as u8;
+        assert_eq!(request_type, 0x02);
         assert_eq!(
-            stream
-                .receive(&mut queue, Ok(()), buffer)
-                .unwrap()
-                .unwrap()
-                .id,
-            5
+            (request.request, request.value, request.index, request.data),
+            (0x03, 0, 0x81, &[][..])
         );
-        assert!(mirrored(&queue, &stream));
-        assert_eq!(queue.allocated, 6);
     }
     #[test]
     fn malformed_packets_fail_without_panics() {
