@@ -759,7 +759,11 @@ impl NodeMap {
                     )
                     && n.prop("Visibility") != Some("Invisible")
             })
-            .map(|(name, node)| {
+            .filter_map(|(name, node)| {
+                // A feature this model does not implement is never shown.
+                if self.availability(io, name) == Availability::Absent {
+                    return None;
+                }
                 let result = self.get(io, name);
                 let (value, error) = match result {
                     Ok(v) => (Some(v), None),
@@ -768,7 +772,7 @@ impl NodeMap {
                 let writable = self.writable(io, name, 0).is_ok();
                 let choices = self.entry_names(io, name, node);
                 let bounds = self.bounds(io, name).unwrap_or_default();
-                FeatureInfo {
+                Some(FeatureInfo {
                     name: name.clone(),
                     display_name: node.prop("DisplayName").unwrap_or(name).into(),
                     kind: node.kind.clone(),
@@ -785,7 +789,7 @@ impl NodeMap {
                     inc: bounds.inc,
                     choices,
                     error,
-                }
+                })
             })
             .collect()
     }
@@ -2920,6 +2924,30 @@ mod tests {
         assert!(m.get(&mut io, "Feature").is_ok());
         assert!(m.set(&mut io, "Feature", "3").is_err());
         assert!(m.get(&mut io, "Unavailable").is_err());
+    }
+    #[test]
+    fn features_omit_what_the_model_does_not_implement() {
+        let m = map(concat!(
+            "<Integer Name='Gain'><pValue>GainReg</pValue><pIsImplemented>GainImpl</pIsImplemented></Integer>",
+            "<IntReg Name='GainReg'><Address>0</Address><Length>4</Length></IntReg>",
+            "<Integer Name='Shutter'><pValue>ShutterReg</pValue><pIsAvailable>GainImpl</pIsAvailable></Integer>",
+            "<IntReg Name='ShutterReg'><Address>8</Address><Length>4</Length></IntReg>",
+            "<MaskedIntReg Name='GainImpl'><Address>4</Address><Length>4</Length><Bit>0</Bit><AccessMode>RO</AccessMode></MaskedIntReg>",
+        ));
+        let mut io = Memory::default();
+        let names = |m: &NodeMap, io: &mut Memory| {
+            m.features(io)
+                .into_iter()
+                .map(|feature| feature.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&m, &mut io),
+            ["GainImpl", "GainReg", "Shutter", "ShutterReg"]
+        );
+        assert!(m.get(&mut io, "Gain").is_err());
+        io.write_memory(4, &[1, 0, 0, 0]).unwrap();
+        assert!(names(&m, &mut io).contains(&"Gain".to_string()));
     }
     #[test]
     fn availability_and_locks_are_told_apart_and_traced_to_their_inputs() {
