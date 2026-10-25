@@ -5408,8 +5408,13 @@ exit 1"#,
         assert_eq!(kind, Some("auth_rejected"), "{text}");
         assert!(!text.contains("typed-pw"), "{text}");
         for other in ["rtsp://cam.local/missing", "rtsp://cam.local/blocked"] {
+            // Not a sign-in problem; the connection diagnosis may still
+            // categorize it (a 404 is unavailable).
             let (kind, text) = code(open_url(other, timeout));
-            assert_eq!(kind, None, "{text}");
+            assert!(
+                !matches!(kind, Some("auth_required" | "auth_rejected")),
+                "{text}"
+            );
         }
     }
     #[test]
