@@ -417,8 +417,12 @@ impl GigEServer {
                                 Ok(payload[..4].to_vec())
                             }
                             0x0040 => {
+                                // Receivers request resends from their stream
+                                // socket, not the control socket.
                                 ensure!(
-                                    payload.len() == 12 && state.controller == Some(peer),
+                                    payload.len() == 12
+                                        && (state.controller.is_some_and(|c| c.ip() == peer.ip())
+                                            || state.destination().ip() == peer.ip()),
                                     "invalid resend request"
                                 );
                                 let block = be16(payload, 2);
@@ -435,6 +439,13 @@ impl GigEServer {
                                     {
                                         let _ = device.stream.send_to(packet, state.destination());
                                     }
+                                } else if state.reg(STREAM_PORT) != 0 {
+                                    // PACKET_UNAVAILABLE ends the receiver's
+                                    // wait for a block that left the cache.
+                                    let mut unavailable = packet(block, first & 0xff_ffff, 3, &[]);
+                                    unavailable[..2].copy_from_slice(&0x800cu16.to_be_bytes());
+                                    let _ =
+                                        device.stream.send_to(&unavailable, state.destination());
                                 }
                                 Ok(Vec::new())
                             }
@@ -1122,6 +1133,79 @@ mod tests {
             gvcp(&other, camera, 0x0086, 14, &[0, 1, 1, 0, 0x80, 0, 0, 0]).0,
             0x8006
         );
+        drop(server);
+    }
+
+    #[test]
+    fn stream_receiver_resend_requests_are_served() {
+        let (server, camera) = loopback_camera();
+        let (controller, receiver) = (client(), client());
+        let port = receiver.local_addr().unwrap().port();
+        // Control, SCP port and SCDA, then AcquisitionStart on the remapped
+        // little-endian acquisition register.
+        let mut setup = vec![0, 0, 0x0a, 0, 0, 0, 0, 2];
+        setup.extend([0, 0, 0x0d, 0, 0, 0]);
+        setup.extend(port.to_be_bytes());
+        setup.extend([0, 0, 0x0d, 0x18, 127, 0, 0, 1]);
+        assert_eq!(gvcp(&controller, camera, 0x0082, 1, &setup).0, 0);
+        let acquisition = [0, 1, 1, 0x30];
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0086,
+                2,
+                &[&acquisition[..], &[1, 0, 0, 0]].concat()
+            )
+            .0,
+            0
+        );
+        let mut packets = BTreeMap::new();
+        let mut buffer = [0u8; 2048];
+        let block = loop {
+            let length = receiver.recv(&mut buffer).unwrap();
+            let (block, id) = (be16(&buffer, 2), be32(&buffer, 4) & 0xff_ffff);
+            packets.insert((block, id), buffer[..length].to_vec());
+            // The trailer (format 2) completes a block.
+            if buffer[4] == 2 {
+                break block;
+            }
+        };
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0086,
+                3,
+                &[&acquisition[..], &[0, 0, 0, 0]].concat()
+            )
+            .0,
+            0
+        );
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        while receiver.recv(&mut buffer).is_ok() {}
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // PACKETRESEND_CMD from the stream socket for payload packet 1
+        // (arvgvstream.c sends it from the GVSP socket to port 3956).
+        let mut request = vec![0x42, 0x00, 0x00, 0x40, 0x00, 0x0c, 0x00, 0x07, 0, 0];
+        request.extend(block.to_be_bytes());
+        request.extend(1u32.to_be_bytes());
+        request.extend(1u32.to_be_bytes());
+        receiver.send_to(&request, camera).unwrap();
+        let length = receiver.recv(&mut buffer).unwrap();
+        assert_eq!(buffer[..length], packets[&(block, 1)]);
+        // A block that left the resend cache is reported unavailable.
+        request[10..12].copy_from_slice(&block.wrapping_add(0x7000).to_be_bytes());
+        receiver.send_to(&request, camera).unwrap();
+        let length = receiver.recv(&mut buffer).unwrap();
+        let mut unavailable = vec![0x80, 0x0c];
+        unavailable.extend(block.wrapping_add(0x7000).to_be_bytes());
+        unavailable.extend([3, 0, 0, 1]);
+        assert_eq!(buffer[..length], unavailable);
         drop(server);
     }
 
