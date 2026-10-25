@@ -10,7 +10,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -18,6 +18,12 @@ use std::{
 
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
+const NETWORK_NS: &str = "http://www.onvif.org/ver10/network/wsdl";
+/// ONVIF uses the 2005/04 WS-Discovery draft and 2004/08 WS-Addressing for
+/// its announcements; probes in the 2009/01 standard are answered in kind.
+const DISCOVERY_NS: &str = "http://schemas.xmlsoap.org/ws/2005/04/discovery";
+const ADDRESSING_NS: &str = "http://schemas.xmlsoap.org/ws/2004/08/addressing";
+const MODEL: &str = "Virtual test camera";
 const MAX_CLIENTS: usize = 16;
 /// A SOAP fault: its code, ONVIF subcodes and reason (ONVIF Core 5.11).
 #[derive(Debug)]
@@ -40,6 +46,10 @@ struct Service {
     snapshot: String,
     rtsp: String,
     uuid: String,
+    scopes: Vec<String>,
+    /// WS-Discovery AppSequence: the start time, and the last message number.
+    instance: u64,
+    messages: AtomicU64,
     width: u32,
     height: u32,
     fps: u32,
@@ -51,7 +61,8 @@ struct Service {
 pub(crate) struct OnvifServer {
     service: Arc<Service>,
     threads: Vec<JoinHandle<()>>,
-    discovery: bool,
+    /// The multicast socket that announces Hello and Bye.
+    announcer: Option<UdpSocket>,
 }
 impl OnvifServer {
     pub(crate) fn start(
@@ -77,7 +88,22 @@ impl OnvifServer {
             media: format!("{base}/onvif/media_service"),
             snapshot: format!("{base}/snapshot.jpg"),
             rtsp,
-            uuid: uuid()?,
+            // ONVIF Core 7.3.1: a stable endpoint reference across restarts.
+            uuid: stable_uuid(&format!("{base}\n{}", options.name)),
+            scopes: [
+                "Profile/Streaming".to_owned(),
+                "type/video_encoder".into(),
+                format!("hardware/{}", percent_encode(MODEL)),
+                format!("name/{}", percent_encode(&options.name)),
+                "location/test".into(),
+            ]
+            .iter()
+            .map(|scope| format!("onvif://www.onvif.org/{scope}"))
+            .collect(),
+            instance: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1, |elapsed| elapsed.as_secs()),
+            messages: AtomicU64::new(0),
             width,
             height,
             fps: options.fps.round() as u32,
@@ -89,7 +115,7 @@ impl OnvifServer {
         let mut server = Self {
             service: service.clone(),
             threads: Vec::new(),
-            discovery: false,
+            announcer: None,
         };
         server.threads.push(
             thread::Builder::new()
@@ -141,6 +167,7 @@ impl OnvifServer {
         // only when its advertised endpoint is reachable on the selected LAN.
         if !options.bind.is_loopback()
             && let Ok(socket) = discovery_socket(options.bind)
+            && let Ok(announcer) = socket.try_clone()
         {
             let service = server.service.clone();
             server.threads.push(
@@ -155,14 +182,15 @@ impl OnvifServer {
                             let Ok(xml) = std::str::from_utf8(&buffer[..length]) else {
                                 continue;
                             };
-                            if let Some(body) = probe_reply(xml, &service) {
+                            if let Some(body) = discovery_reply(xml, &service) {
                                 let _ = socket.send_to(body.as_bytes(), peer);
                             }
                         }
                     })
                     .context("starting virtual WS-Discovery")?,
             );
-            server.discovery = true;
+            let _ = announcer.send_to(announcement(&server.service, true).as_bytes(), MULTICAST);
+            server.announcer = Some(announcer);
         }
         Ok(server)
     }
@@ -173,11 +201,14 @@ impl OnvifServer {
         &self.service.snapshot
     }
     pub(crate) fn discovery_enabled(&self) -> bool {
-        self.discovery
+        self.announcer.is_some()
     }
 }
 impl Drop for OnvifServer {
     fn drop(&mut self) {
+        if let Some(announcer) = &self.announcer {
+            let _ = announcer.send_to(announcement(&self.service, false).as_bytes(), MULTICAST);
+        }
         self.service.shutdown.store(true, Ordering::Relaxed);
         for worker in self.threads.drain(..) {
             let _ = worker.join();
@@ -200,15 +231,18 @@ fn uuid() -> Result<String> {
         .map_err(|e| anyhow::anyhow!("generating virtual camera UUID: {e}"))?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format_uuid(&bytes))
+}
+fn format_uuid(bytes: &[u8; 16]) -> String {
     let h = bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    Ok(format!(
+    format!(
         "{}-{}-{}-{}-{}",
         &h[..8],
         &h[8..12],
         &h[12..16],
         &h[16..20],
         &h[20..]
-    ))
+    )
 }
 fn discovery_socket(interface: Ipv4Addr) -> Result<UdpSocket> {
     let socket = socket2::Socket::new(
@@ -218,19 +252,96 @@ fn discovery_socket(interface: Ipv4Addr) -> Result<UdpSocket> {
     )?;
     socket.set_reuse_address(true)?;
     socket.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, 3702)).into())?;
+    socket.set_multicast_if_v4(&interface)?;
     let socket: UdpSocket = socket.into();
-    socket.join_multicast_v4(&Ipv4Addr::new(239, 255, 255, 250), &interface)?;
+    socket.join_multicast_v4(&MULTICAST.0, &interface)?;
     socket.set_read_timeout(Some(Duration::from_millis(100)))?;
     Ok(socket)
 }
-fn probe_reply(xml: &str, service: &Service) -> Option<String> {
+const MULTICAST: (Ipv4Addr, u16) = (Ipv4Addr::new(239, 255, 255, 250), 3702);
+/// A name-based UUID (RFC 9562 version 8) from SHA-256.
+fn stable_uuid(name: &str) -> String {
+    use sha2::Digest;
+    let mut bytes: [u8; 16] = sha2::Sha256::digest(name.as_bytes())[..16]
+        .try_into()
+        .unwrap();
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format_uuid(&bytes)
+}
+/// Percent-encodes everything but RFC 3986 unreserved characters.
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                char::from(byte).to_string()
+            } else {
+                format!("%{byte:02X}")
+            }
+        })
+        .collect()
+}
+/// A WS-Discovery message with the AppSequence header ONVIF Core 7.3 requires.
+fn discovery_message(
+    s: &Service,
+    (addressing, discovery): (&str, &str),
+    to: &str,
+    action: &str,
+    relates: Option<&str>,
+    body: &str,
+) -> String {
+    let id = uuid().unwrap_or_else(|_| stable_uuid(&format!("{}{action}", s.uuid)));
+    let relates = relates.map_or(String::new(), |id| {
+        format!("<a:RelatesTo>{}</a:RelatesTo>", escape(id))
+    });
+    let number = s.messages.fetch_add(1, Ordering::Relaxed) + 1;
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:a=\"{addressing}\" xmlns:d=\"{discovery}\" xmlns:dn=\"{NETWORK_NS}\" xmlns:tds=\"{DEVICE_NS}\"><s:Header><a:MessageID>urn:uuid:{id}</a:MessageID>{relates}<a:To>{to}</a:To><a:Action>{discovery}/{action}</a:Action><d:AppSequence InstanceId=\"{}\" MessageNumber=\"{number}\"/></s:Header><s:Body>{body}</s:Body></s:Envelope>",
+        s.instance
+    )
+}
+/// The endpoint reference, types, scopes and address of a match or Hello.
+fn description(s: &Service) -> String {
+    format!(
+        "<a:EndpointReference><a:Address>urn:uuid:{}</a:Address></a:EndpointReference><d:Types>tds:Device dn:NetworkVideoTransmitter</d:Types><d:Scopes>{}</d:Scopes><d:XAddrs>{}</d:XAddrs><d:MetadataVersion>1</d:MetadataVersion>",
+        s.uuid,
+        escape(&s.scopes.join(" ")),
+        escape(&s.endpoint)
+    )
+}
+/// A multicast Hello on start or Bye on stop (ONVIF Core 7.3.5).
+fn announcement(s: &Service, hello: bool) -> String {
+    let (action, body) = if hello {
+        ("Hello", format!("<d:Hello>{}</d:Hello>", description(s)))
+    } else {
+        (
+            "Bye",
+            format!(
+                "<d:Bye><a:EndpointReference><a:Address>urn:uuid:{}</a:Address></a:EndpointReference></d:Bye>",
+                s.uuid
+            ),
+        )
+    };
+    discovery_message(
+        s,
+        (ADDRESSING_NS, DISCOVERY_NS),
+        "urn:schemas-xmlsoap-org:ws:2005:04:discovery",
+        action,
+        None,
+        &body,
+    )
+}
+/// Answers a Probe whose types and scopes this device matches, or a Resolve
+/// for its endpoint reference.
+fn discovery_reply(xml: &str, service: &Service) -> Option<String> {
     let doc = roxmltree::Document::parse(xml).ok()?;
-    let probe = doc
+    let request = doc
         .descendants()
-        .find(|n| n.is_element() && n.tag_name().name() == "Probe")?;
-    let discovery = probe.tag_name().namespace()?;
+        .find(|n| n.is_element() && ["Probe", "Resolve"].contains(&n.tag_name().name()))?;
+    let discovery = request.tag_name().namespace()?;
     if ![
-        "http://schemas.xmlsoap.org/ws/2005/04/discovery",
+        DISCOVERY_NS,
         "http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01",
     ]
     .contains(&discovery)
@@ -241,33 +352,109 @@ fn probe_reply(xml: &str, service: &Service) -> Option<String> {
         .descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "MessageID")?;
     let addressing = message.tag_name().namespace()?;
-    if ![
-        "http://schemas.xmlsoap.org/ws/2004/08/addressing",
-        "http://www.w3.org/2005/08/addressing",
-    ]
-    .contains(&addressing)
-    {
-        return None;
-    }
-    let types = probe
-        .children()
-        .find(|n| n.is_element() && n.tag_name().name() == "Types")
-        .and_then(|n| n.text())
-        .unwrap_or("");
-    if !types.is_empty()
-        && !types
-            .split_whitespace()
-            .any(|kind| kind.ends_with(":NetworkVideoTransmitter") || kind.ends_with(":Device"))
-    {
-        return None;
-    }
-    let relates = escape(message.text().unwrap_or(""));
-    let id = uuid().ok()?;
-    Some(format!(
-        "<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:a=\"{addressing}\" xmlns:d=\"{discovery}\" xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\"><s:Header><a:MessageID>urn:uuid:{id}</a:MessageID><a:RelatesTo>{relates}</a:RelatesTo><a:Action>{discovery}/ProbeMatches</a:Action></s:Header><s:Body><d:ProbeMatches><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:{}</a:Address></a:EndpointReference><d:Types>dn:NetworkVideoTransmitter</d:Types><d:Scopes>onvif://www.onvif.org/type/video_encoder onvif://www.onvif.org/name/Capturefab onvif://www.onvif.org/location/test</d:Scopes><d:XAddrs>{}</d:XAddrs><d:MetadataVersion>1</d:MetadataVersion></d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>",
-        service.uuid,
-        escape(&service.endpoint)
+    let anonymous = match addressing {
+        ADDRESSING_NS => "http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous",
+        "http://www.w3.org/2005/08/addressing" => "http://www.w3.org/2005/08/addressing/anonymous",
+        _ => return None,
+    };
+    let child = |name: &str| {
+        request
+            .children()
+            .find(|n| n.is_element() && n.tag_name().name() == name)
+    };
+    let (action, body) = if request.tag_name().name() == "Resolve" {
+        let address = child("EndpointReference")?
+            .descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == "Address")?
+            .text()?
+            .trim();
+        if address != format!("urn:uuid:{}", service.uuid) {
+            return None;
+        }
+        (
+            "ResolveMatches",
+            format!(
+                "<d:ResolveMatches><d:ResolveMatch>{}</d:ResolveMatch></d:ResolveMatches>",
+                description(service)
+            ),
+        )
+    } else {
+        // Every probed type must be one of ours (WS-Discovery 5.1).
+        if let Some(types) = child("Types") {
+            let ours = [
+                (DEVICE_NS, "Device"),
+                (NETWORK_NS, "NetworkVideoTransmitter"),
+            ];
+            for name in types.text().unwrap_or("").split_whitespace() {
+                let (prefix, local) = name
+                    .split_once(':')
+                    .map_or((None, name), |(p, l)| (Some(p), l));
+                let namespace = types.lookup_namespace_uri(prefix)?;
+                if !ours.contains(&(namespace, local)) {
+                    return None;
+                }
+            }
+        }
+        if let Some(scopes) = child("Scopes") {
+            let rule = scopes.attribute("MatchBy").unwrap_or("/rfc3986");
+            let rfc3986 = rule.ends_with("/rfc3986");
+            if !rfc3986 && !rule.ends_with("/strcmp0") {
+                return None;
+            }
+            let matched = scopes.text().unwrap_or("").split_whitespace().all(|probe| {
+                service
+                    .scopes
+                    .iter()
+                    .any(|scope| scope_matches(probe, scope, rfc3986))
+            });
+            if !matched {
+                return None;
+            }
+        }
+        (
+            "ProbeMatches",
+            format!(
+                "<d:ProbeMatches><d:ProbeMatch>{}</d:ProbeMatch></d:ProbeMatches>",
+                description(service)
+            ),
+        )
+    };
+    Some(discovery_message(
+        service,
+        (addressing, discovery),
+        anonymous,
+        action,
+        Some(message.text().unwrap_or("").trim()),
+        &body,
     ))
+}
+/// WS-Discovery scope matching: RFC 3986 compares the scheme and authority
+/// case-insensitively and the probe's path segments as a prefix of the
+/// scope's; strcmp0 compares the strings.
+fn scope_matches(probe: &str, scope: &str, rfc3986: bool) -> bool {
+    if !rfc3986 {
+        return probe == scope;
+    }
+    let split = |uri: &str| {
+        let (scheme, rest) = uri.split_once("://")?;
+        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+        let segments: Vec<_> = path
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        Some((
+            scheme.to_ascii_lowercase(),
+            authority.to_ascii_lowercase(),
+            segments,
+        ))
+    };
+    match (split(probe), split(scope)) {
+        (Some((scheme, authority, path)), Some((ours, host, segments))) => {
+            scheme == ours && authority == host && segments.starts_with(&path)
+        }
+        _ => false,
+    }
 }
 fn serve(stream: &mut TcpStream, service: &Service) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -443,13 +630,13 @@ fn soap_reply(request: &str, s: &Service) -> (u16, String) {
             Default::default()
         };
         Ok(match operation.tag_name().name() {
-            "GetDeviceInformation"=>format!("<tds:GetDeviceInformationResponse><tds:Manufacturer>Capturefab</tds:Manufacturer><tds:Model>Virtual test camera</tds:Model><tds:FirmwareVersion>{}</tds:FirmwareVersion><tds:SerialNumber>{}</tds:SerialNumber><tds:HardwareId>simulation</tds:HardwareId></tds:GetDeviceInformationResponse>",env!("CARGO_PKG_VERSION"),s.uuid),
+            "GetDeviceInformation"=>format!("<tds:GetDeviceInformationResponse><tds:Manufacturer>Capturefab</tds:Manufacturer><tds:Model>{MODEL}</tds:Model><tds:FirmwareVersion>{}</tds:FirmwareVersion><tds:SerialNumber>{}</tds:SerialNumber><tds:HardwareId>simulation</tds:HardwareId></tds:GetDeviceInformationResponse>",env!("CARGO_PKG_VERSION"),s.uuid),
             "GetSystemDateAndTime"=>{let now=chrono::Utc::now();format!("<tds:GetSystemDateAndTimeResponse><tds:SystemDateAndTime><tt:DateTimeType>Manual</tt:DateTimeType><tt:DaylightSavings>false</tt:DaylightSavings><tt:TimeZone><tt:TZ>UTC0</tt:TZ></tt:TimeZone><tt:UTCDateTime><tt:Time><tt:Hour>{}</tt:Hour><tt:Minute>{}</tt:Minute><tt:Second>{}</tt:Second></tt:Time><tt:Date><tt:Year>{}</tt:Year><tt:Month>{}</tt:Month><tt:Day>{}</tt:Day></tt:Date></tt:UTCDateTime></tds:SystemDateAndTime></tds:GetSystemDateAndTimeResponse>",now.hour(),now.minute(),now.second(),now.year(),now.month(),now.day())},
             "GetServices"=>format!("<tds:GetServicesResponse><tds:Service><tds:Namespace>{DEVICE_NS}</tds:Namespace><tds:XAddr>{endpoint}</tds:XAddr>{device_service}<tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service><tds:Service><tds:Namespace>{MEDIA_NS}</tds:Namespace><tds:XAddr>{media}</tds:XAddr>{media_service}<tds:Version><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service></tds:GetServicesResponse>"),
-            "GetCapabilities"=>format!("<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Device><tt:XAddr>{endpoint}</tt:XAddr><tt:Network><tt:IPFilter>false</tt:IPFilter><tt:ZeroConfiguration>false</tt:ZeroConfiguration><tt:IPVersion6>false</tt:IPVersion6><tt:DynDNS>false</tt:DynDNS></tt:Network><tt:System><tt:DiscoveryResolve>false</tt:DiscoveryResolve><tt:DiscoveryBye>false</tt:DiscoveryBye><tt:RemoteDiscovery>false</tt:RemoteDiscovery><tt:SystemBackup>false</tt:SystemBackup><tt:SystemLogging>false</tt:SystemLogging><tt:FirmwareUpgrade>false</tt:FirmwareUpgrade><tt:SupportedVersions><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tt:SupportedVersions></tt:System><tt:Security><tt:TLS1.1>false</tt:TLS1.1><tt:TLS1.2>false</tt:TLS1.2><tt:OnboardKeyGeneration>false</tt:OnboardKeyGeneration><tt:AccessPolicyConfig>false</tt:AccessPolicyConfig><tt:X.509Token>false</tt:X.509Token><tt:SAMLToken>false</tt:SAMLToken><tt:KerberosToken>false</tt:KerberosToken><tt:RELToken>false</tt:RELToken></tt:Security></tt:Device><tt:Media><tt:XAddr>{media}</tt:XAddr><tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"),
+            "GetCapabilities"=>format!("<tds:GetCapabilitiesResponse><tds:Capabilities><tt:Device><tt:XAddr>{endpoint}</tt:XAddr><tt:Network><tt:IPFilter>false</tt:IPFilter><tt:ZeroConfiguration>false</tt:ZeroConfiguration><tt:IPVersion6>false</tt:IPVersion6><tt:DynDNS>false</tt:DynDNS></tt:Network><tt:System><tt:DiscoveryResolve>true</tt:DiscoveryResolve><tt:DiscoveryBye>true</tt:DiscoveryBye><tt:RemoteDiscovery>false</tt:RemoteDiscovery><tt:SystemBackup>false</tt:SystemBackup><tt:SystemLogging>false</tt:SystemLogging><tt:FirmwareUpgrade>false</tt:FirmwareUpgrade><tt:SupportedVersions><tt:Major>2</tt:Major><tt:Minor>0</tt:Minor></tt:SupportedVersions></tt:System><tt:Security><tt:TLS1.1>false</tt:TLS1.1><tt:TLS1.2>false</tt:TLS1.2><tt:OnboardKeyGeneration>false</tt:OnboardKeyGeneration><tt:AccessPolicyConfig>false</tt:AccessPolicyConfig><tt:X.509Token>false</tt:X.509Token><tt:SAMLToken>false</tt:SAMLToken><tt:KerberosToken>false</tt:KerberosToken><tt:RELToken>false</tt:RELToken></tt:Security></tt:Device><tt:Media><tt:XAddr>{media}</tt:XAddr><tt:StreamingCapabilities><tt:RTPMulticast>false</tt:RTPMulticast><tt:RTP_TCP>true</tt:RTP_TCP><tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP></tt:StreamingCapabilities></tt:Media></tds:Capabilities></tds:GetCapabilitiesResponse>"),
             "GetServiceCapabilities" if operation.tag_name().namespace()==Some(MEDIA_NS)=>format!("<trt:GetServiceCapabilitiesResponse>{}</trt:GetServiceCapabilitiesResponse>",media_capabilities()),
             "GetServiceCapabilities"=>format!("<tds:GetServiceCapabilitiesResponse>{}</tds:GetServiceCapabilitiesResponse>",device_capabilities()),
-            "GetScopes"=>"<tds:GetScopesResponse><tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/name/Capturefab</tt:ScopeItem></tds:Scopes><tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/type/video_encoder</tt:ScopeItem></tds:Scopes></tds:GetScopesResponse>".into(),
+            "GetScopes"=>format!("<tds:GetScopesResponse>{}</tds:GetScopesResponse>",s.scopes.iter().map(|scope| format!("<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>{}</tt:ScopeItem></tds:Scopes>",escape(scope))).collect::<String>()),
             "GetHostname"=>format!("<tds:GetHostnameResponse><tds:HostnameInformation><tt:FromDHCP>false</tt:FromDHCP><tt:Name>{}</tt:Name></tds:HostnameInformation></tds:GetHostnameResponse>",escape(&s.name)),
             "GetNetworkInterfaces"=>format!("<tds:GetNetworkInterfacesResponse><tds:NetworkInterfaces token=\"simulation\"><tt:Enabled>true</tt:Enabled><tt:Info><tt:Name>simulation</tt:Name><tt:HwAddress>02:00:00:00:00:01</tt:HwAddress><tt:MTU>1500</tt:MTU></tt:Info><tt:IPv4><tt:Enabled>true</tt:Enabled><tt:Config><tt:Manual><tt:Address>{}</tt:Address><tt:PrefixLength>24</tt:PrefixLength></tt:Manual><tt:DHCP>false</tt:DHCP></tt:Config></tt:IPv4></tds:NetworkInterfaces></tds:GetNetworkInterfacesResponse>",s.address),
             "GetNetworkProtocols"=>format!("<tds:GetNetworkProtocolsResponse><tds:NetworkProtocols><tt:Name>HTTP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>{}</tt:Port></tds:NetworkProtocols><tds:NetworkProtocols><tt:Name>RTSP</tt:Name><tt:Enabled>true</tt:Enabled><tt:Port>{}</tt:Port></tds:NetworkProtocols></tds:GetNetworkProtocolsResponse>",port(&s.endpoint,80),port(&s.rtsp,554)),
@@ -509,7 +696,7 @@ fn port(url: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 fn device_capabilities() -> &'static str {
-    "<tds:Capabilities><tds:Network IPFilter=\"false\" ZeroConfiguration=\"false\" IPVersion6=\"false\" DynDNS=\"false\"/><tds:Security UsernameToken=\"false\" HttpDigest=\"false\"/><tds:System DiscoveryResolve=\"false\" DiscoveryBye=\"false\" RemoteDiscovery=\"false\" SystemBackup=\"false\" SystemLogging=\"false\" FirmwareUpgrade=\"false\"/></tds:Capabilities>"
+    "<tds:Capabilities><tds:Network IPFilter=\"false\" ZeroConfiguration=\"false\" IPVersion6=\"false\" DynDNS=\"false\"/><tds:Security UsernameToken=\"false\" HttpDigest=\"false\"/><tds:System DiscoveryResolve=\"true\" DiscoveryBye=\"true\" RemoteDiscovery=\"false\" SystemBackup=\"false\" SystemLogging=\"false\" FirmwareUpgrade=\"false\"/></tds:Capabilities>"
 }
 fn media_capabilities() -> String {
     format!(
@@ -710,6 +897,148 @@ mod tests {
             assert_eq!(status, 200, "{body}: {reply}");
             assert!(reply.contains(&expected), "{body}: {reply}");
         }
+    }
+
+    fn probe(types: &str, scopes: &str) -> String {
+        format!(
+            "<s:Envelope xmlns:a=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" xmlns:d=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\" xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:dn=\"http://www.onvif.org/ver10/network/wsdl\"><s:Header><a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action><a:MessageID>urn:uuid:5f6a1c2e-0d1b-4c43-9a49-3f0c2d5e7b11</a:MessageID><a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To></s:Header><s:Body><d:Probe>{types}{scopes}</d:Probe></s:Body></s:Envelope>"
+        )
+    }
+
+    #[test]
+    fn probe_matches_carry_onvif_types_scopes_and_app_sequence() {
+        let (server, _stop) = loopback();
+        let service = &server.service;
+        let uuid = &service.uuid;
+        assert_eq!(
+            uuid,
+            &stable_uuid(&format!(
+                "{}\nLobby",
+                service.endpoint.trim_end_matches("/onvif/device_service")
+            ))
+        );
+        assert_eq!(&uuid[14..15], "8");
+        // The probe Capturefab's own discovery sends.
+        let reply = discovery_reply(
+            &probe("<d:Types>dn:NetworkVideoTransmitter</d:Types>", ""),
+            service,
+        )
+        .unwrap();
+        roxmltree::Document::parse(&reply).unwrap();
+        assert!(reply.contains("<a:RelatesTo>urn:uuid:5f6a1c2e-0d1b-4c43-9a49-3f0c2d5e7b11</a:RelatesTo><a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To><a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</a:Action>"), "{reply}");
+        assert!(
+            reply.contains(&format!(
+                "<d:AppSequence InstanceId=\"{}\" MessageNumber=\"1\"/>",
+                service.instance
+            )),
+            "{reply}"
+        );
+        assert!(reply.contains(&format!("<d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:{uuid}</a:Address></a:EndpointReference><d:Types>tds:Device dn:NetworkVideoTransmitter</d:Types><d:Scopes>onvif://www.onvif.org/Profile/Streaming onvif://www.onvif.org/type/video_encoder onvif://www.onvif.org/hardware/Virtual%20test%20camera onvif://www.onvif.org/name/Lobby onvif://www.onvif.org/location/test</d:Scopes><d:XAddrs>{}</d:XAddrs><d:MetadataVersion>1</d:MetadataVersion></d:ProbeMatch>", service.endpoint)), "{reply}");
+        assert!(xmlns_declared(&reply, "tds", DEVICE_NS));
+        // python-ws-discovery qualifies types with its own prefixes.
+        for (types, scopes, matched) in [
+            (
+                "<d:Types xmlns:dp0=\"http://www.onvif.org/ver10/device/wsdl\">dp0:Device</d:Types>",
+                "",
+                true,
+            ),
+            (
+                "<d:Types xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">dn:NetworkVideoTransmitter tds:Device</d:Types>",
+                "",
+                true,
+            ),
+            (
+                "<d:Types xmlns:x=\"urn:example\">x:Device</d:Types>",
+                "",
+                false,
+            ),
+            (
+                "<d:Types xmlns:tds=\"http://www.onvif.org/ver10/device/wsdl\">tds:Device dn:Printer</d:Types>",
+                "",
+                false,
+            ),
+            (
+                "",
+                "<d:Scopes>onvif://www.onvif.org/Profile/Streaming</d:Scopes>",
+                true,
+            ),
+            (
+                "",
+                "<d:Scopes>ONVIF://WWW.ONVIF.ORG/Profile onvif://www.onvif.org/name/Lobby/</d:Scopes>",
+                true,
+            ),
+            (
+                "",
+                "<d:Scopes>onvif://www.onvif.org/Profile/G</d:Scopes>",
+                false,
+            ),
+            (
+                "",
+                "<d:Scopes MatchBy=\"http://schemas.xmlsoap.org/ws/2005/04/discovery/strcmp0\">onvif://www.onvif.org/name/Lobby</d:Scopes>",
+                true,
+            ),
+            (
+                "",
+                "<d:Scopes MatchBy=\"http://schemas.xmlsoap.org/ws/2005/04/discovery/strcmp0\">onvif://www.onvif.org/name</d:Scopes>",
+                false,
+            ),
+            (
+                "",
+                "<d:Scopes MatchBy=\"http://schemas.xmlsoap.org/ws/2005/04/discovery/ldap\">onvif://www.onvif.org/name</d:Scopes>",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                discovery_reply(&probe(types, scopes), service).is_some(),
+                matched,
+                "{types}{scopes}"
+            );
+        }
+        // A WS-Discovery 1.1 probe gets the W3C anonymous address.
+        let reply = discovery_reply("<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:a=\"http://www.w3.org/2005/08/addressing\" xmlns:d=\"http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01\"><s:Header><a:Action>http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01/Probe</a:Action><a:MessageID>urn:uuid:1</a:MessageID></s:Header><s:Body><d:Probe/></s:Body></s:Envelope>", service).unwrap();
+        assert!(reply.contains("<a:To>http://www.w3.org/2005/08/addressing/anonymous</a:To><a:Action>http://docs.oasis-open.org/ws-dd/ns/discovery/2009/01/ProbeMatches</a:Action>"), "{reply}");
+        // Resolve answers only for this endpoint reference.
+        let resolve = |address: &str| {
+            format!(
+                "<s:Envelope xmlns:s=\"http://www.w3.org/2003/05/soap-envelope\" xmlns:a=\"http://schemas.xmlsoap.org/ws/2004/08/addressing\" xmlns:d=\"http://schemas.xmlsoap.org/ws/2005/04/discovery\"><s:Header><a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Resolve</a:Action><a:MessageID>urn:uuid:2</a:MessageID><a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To></s:Header><s:Body><d:Resolve><a:EndpointReference><a:Address>{address}</a:Address></a:EndpointReference></d:Resolve></s:Body></s:Envelope>"
+            )
+        };
+        let reply = discovery_reply(&resolve(&format!("urn:uuid:{uuid}")), service).unwrap();
+        assert!(
+            reply.contains("/discovery/ResolveMatches</a:Action>")
+                && reply.contains("<d:ResolveMatch><a:EndpointReference>"),
+            "{reply}"
+        );
+        assert!(discovery_reply(&resolve("urn:uuid:other"), service).is_none());
+        // Hello and Bye announce to the discovery multicast group.
+        let hello = announcement(service, true);
+        roxmltree::Document::parse(&hello).unwrap();
+        assert!(hello.contains("<a:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To><a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Hello</a:Action>"), "{hello}");
+        assert!(hello.contains("<d:Hello><a:EndpointReference>"), "{hello}");
+        let bye = announcement(service, false);
+        assert!(
+            bye.contains(&format!(
+                "/discovery/Bye</a:Action><d:AppSequence InstanceId=\"{}\" MessageNumber=\"",
+                service.instance
+            )),
+            "{bye}"
+        );
+        assert!(bye.contains(&format!("<d:Bye><a:EndpointReference><a:Address>urn:uuid:{uuid}</a:Address></a:EndpointReference></d:Bye>")), "{bye}");
+        // GetScopes lists the advertised scopes.
+        let (status, scopes) = post(
+            server.endpoint(),
+            "/onvif/device_service",
+            "<tds:GetScopes/>",
+        );
+        assert_eq!(status, 200);
+        assert!(scopes.contains("<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem></tds:Scopes>"), "{scopes}");
+        assert!(
+            scopes.contains("<tt:ScopeItem>onvif://www.onvif.org/name/Lobby</tt:ScopeItem>"),
+            "{scopes}"
+        );
+    }
+    fn xmlns_declared(xml: &str, prefix: &str, namespace: &str) -> bool {
+        xml.contains(&format!("xmlns:{prefix}=\"{namespace}\""))
     }
 
     #[test]
