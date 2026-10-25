@@ -644,6 +644,19 @@ fn command(cmd: u16, id: u16, payload: &[u8]) -> Result<Vec<u8>> {
     packet.extend_from_slice(payload);
     Ok(packet)
 }
+/// An acknowledgement status of error severity.
+#[derive(Debug)]
+struct UvcpStatus(u16);
+impl std::fmt::Display for UvcpStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "camera rejected USB3 Vision command with status 0x{:04x}",
+            self.0
+        )
+    }
+}
+impl std::error::Error for UvcpStatus {}
 fn ack(packet: &[u8], id: u16) -> Result<(u16, &[u8])> {
     ensure!(
         le32(packet, 0)? == MAGIC,
@@ -651,10 +664,11 @@ fn ack(packet: &[u8], id: u16) -> Result<(u16, &[u8])> {
     );
     ensure!(le16(packet, 10)? == id, "unexpected UVCP request ID");
     let status = le16(packet, 4)?;
-    ensure!(
-        status == 0,
-        "camera rejected USB3 Vision command with status 0x{status:04x}"
-    );
+    // A warning or info status, with bit 15 clear, means GenCP executed the
+    // command, for example after rounding a written value.
+    if status & 0x8000 != 0 {
+        return Err(UvcpStatus(status).into());
+    }
     let length = le16(packet, 8)? as usize;
     ensure!(
         packet.len() >= 12 + length,
@@ -1158,8 +1172,12 @@ mod tests {
         response[4..6].fill(0);
         assert_eq!(ack(&response, 7).unwrap(), (0x0801, &[1, 2, 3, 4][..]));
         assert!(ack(&response, 8).is_err());
-        response[4] = 1;
-        assert!(ack(&response, 7).is_err());
+        // Warning severity: the command ran.
+        response[4..6].copy_from_slice(&0x4001u16.to_le_bytes());
+        assert_eq!(ack(&response, 7).unwrap(), (0x0801, &[1, 2, 3, 4][..]));
+        response[4..6].copy_from_slice(&0x8003u16.to_le_bytes());
+        let error = ack(&response, 7).unwrap_err();
+        assert_eq!(error.downcast_ref::<UvcpStatus>().unwrap().0, 0x8003);
     }
     #[test]
     fn write_acknowledgement_may_omit_the_written_length() {
