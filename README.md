@@ -14,7 +14,24 @@ Version 0.4.0 removes built-in S3, FTP and SFTP uploads and industrial signal so
 
 ## Start here
 
-Download the matching binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases). The [project site](https://capturefab.com/) selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links.
+Install the latest release for your account with one command. The script picks the build for this computer, downloads it from GitHub Releases, checks its SHA-256 before extracting and never uses `sudo` or administrator rights:
+
+```sh
+curl -fsSL https://capturefab.com/install.sh | sh     # macOS and Linux: ~/Applications or ~/.local/share/capturefab, command in ~/.local/bin
+irm https://capturefab.com/install.ps1 | iex          # Windows PowerShell: %LOCALAPPDATA%\Programs\Capturefab, on your user PATH
+```
+
+To read the script before it runs, download it first: `curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh`. `--dry-run` prints the file, URL and checksum it would use. Or download the matching binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases) or the [project site](https://capturefab.com/downloads.html), which selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links. The [first-launch steps](https://capturefab.com/docs.html#first-launch) cover SmartScreen, firewall, WinUSB and macOS Local Network prompts.
+
+First session, with the built-in simulator and no camera hardware:
+
+```sh
+capturefab discover --simulate                              # lists sim:0, sim:1 ... beside any real cameras
+capturefab --camera sim:0 features                          # Width, Height, PixelFormat ...
+capturefab --camera sim:0 capture -o 'shot-{seq}.png'       # shot-0001.png; run again for shot-0002.png
+capturefab --camera sim:0 record -o clip.mp4 --duration 2s  # a 2 s video; clip.mp4 must not exist yet
+capturefab storage                                          # usage counted against the storage budget
+```
 
 Choose how to drive the capture. Each route can share a visible desktop session for review and manual intervention.
 
@@ -32,7 +49,7 @@ Use `--json` for versioned machine-readable results. Human-readable output stays
 
 ```sh
 capturefab discover --json
-capturefab --direct --camera sim:0 capture --set Width=640 --set Height=480 -o - -f ppm > frame.ppm
+capturefab --direct --camera sim:0 capture -o 'shot-{seq}.png'
 capturefab completions fish > capturefab.fish
 capturefab schema > automation-contract.json
 capturefab doctor --json
@@ -311,6 +328,7 @@ capturefab --camera sim:0 capture -n 5 -o 'burst/{camera}-{seq}-{frame}.png'
 capturefab --camera sim:0 capture -o shot.png --on-exists number    # shot-0001.png, shot-0002.png, ...
 capturefab --camera sim:0 record -o 'video/{camera}-{seq}.mp4' --duration 30s --context line=L1
 capturefab --camera sim:0 capture -o 'qa/{camera}-{seq}.png' --context line=L1 --context part=A-100 --json
+capturefab --direct --camera sim:0 capture --set Width=640 --set Height=480 -o - -f ppm > frame.ppm   # image bytes on stdout
 ```
 
 `{seq}` may appear once, only in the file name, and never directly before a digit or `{date}`, `{time}`, `{datetime}` or `{frame}`. Any other `{name}` is a usage error (exit 2). With `-n` above 1, a template needs `{frame}` or `{seq}`, or `--on-exists number`. `--on-exists fail` (the CLI and RPC default) refuses an existing name; `number` writes `stem-0001.ext`, `stem-0002.ext` and so on. A directory output continues `frame-NNNNNN` after the highest existing number, so a rerun into the same folder adds files. If no free name is found after 64 attempts, the capture fails with exit 1.

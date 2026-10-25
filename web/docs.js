@@ -68,6 +68,45 @@
     if (text !== undefined) node.textContent = text;
     return node;
   };
+  // The downloads page loads only this script: recommend the build for this
+  // computer and make its copy buttons work. Without a match it stays as served.
+  const downloadGrid = document.querySelector('.platform-download-grid');
+  if (downloadGrid) {
+    document.documentElement.dataset.js = 'true';
+    document.querySelectorAll('.copy-button').forEach((button) => button.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(button.parentElement.querySelector('code').textContent); button.textContent = 'Copied'; button.dataset.state = 'success'; }
+      catch (_) { button.textContent = 'Select text'; button.dataset.state = 'warning'; }
+      window.setTimeout(() => { button.textContent = 'Copy'; button.removeAttribute('data-state'); }, 1800);
+    }));
+    const platform = navigator.userAgentData?.platform || navigator.platform || '';
+    // iPadOS reports MacIntel; a touch screen tells it apart from a Mac.
+    const system = /mac/i.test(platform) && !(navigator.maxTouchPoints > 1) ? 'macos'
+      : /win/i.test(platform) ? 'windows'
+      : /linux/i.test(platform) && !/android/i.test(navigator.userAgent || '') ? 'linux' : '';
+    const recommend = ([arch, exact]) => {
+      const item = arch && downloadGrid.querySelector(`li[data-os="${system}"][data-arch="${arch}"]`);
+      if (!item) return;
+      downloadGrid.querySelectorAll('.static-build-list .button.primary').forEach((button) => button.classList.remove('primary'));
+      item.querySelector('.button')?.classList.add('primary');
+      item.classList.add('is-recommended');
+      item.closest('.platform-download-card')?.classList.add('is-recommended');
+      item.querySelector('div')?.append(element('span', 'recommended', exact ? 'Recommended for this computer' : system === 'macos' ? 'Likely your Mac' : 'Likely your computer'));
+    };
+    if (system) {
+      // Only an explicit 64-bit report is exact; otherwise most Macs are Apple
+      // silicon and most PCs x64. 32-bit ARM has no build to recommend.
+      const ua = navigator.userAgent || '';
+      const guess = system === 'linux' && /\barmv[67]l?\b|\barmhf\b/i.test(ua) ? [null, false]
+        : [system === 'macos' ? 'aarch64' : system === 'linux' && /\baarch64\b|\barm64\b/i.test(ua) ? 'aarch64' : 'x86_64', false];
+      const reported = navigator.userAgentData?.getHighEntropyValues?.(['architecture', 'bitness']);
+      Promise.resolve(reported || {})
+        .then(({ architecture, bitness }) => architecture === 'arm' && bitness === '32' ? [null, false]
+          : bitness === '64' && architecture === 'arm' ? ['aarch64', true]
+            : bitness === '64' && architecture === 'x86' ? ['x86_64', true] : guess)
+        .catch(() => guess)
+        .then(recommend);
+    }
+  }
   const sections = [...document.querySelectorAll('[data-doc-section]')];
   let indexPromise;
   const readIndex = () => {

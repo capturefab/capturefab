@@ -21,11 +21,13 @@
   // Steps after the download, shared by the install hint and the next-steps panel.
   const installSteps = (osId, signature) => {
     const steps = {
-      macos: ['Extract the ZIP file.', 'Move Capturefab.app to Applications.', 'Open Capturefab.app.'],
+      macos: ['Extract the ZIP file.', 'Move Capturefab.app to Applications and open it.', 'Allow Local Network and Camera access when macOS asks, so network cameras and webcams appear.', 'For the CLI, see Install & verify.'],
       windows: ['Extract all files from the ZIP archive.', 'Open capturefab.exe from the extracted folder, or run .\\capturefab.exe --help in PowerShell for the CLI.'],
       linux: ['Extract the .tar.gz archive.', 'From the extracted folder, run ./capturefab to open the desktop app, or ./capturefab --help for CLI options. On a computer with no display it lists the CLI commands.']
     }[osId] || [];
     if (osId === 'windows' && signature === 'unsigned') steps.push('This build is not code-signed yet, so Windows SmartScreen may show "Windows protected your PC". Check the SHA-256 checksum first, then choose More info → Run anyway.');
+    if (osId === 'windows') steps.push('When Windows Defender Firewall asks, allow Capturefab on Private networks so GigE Vision streams arrive.');
+    if (osId === 'linux') steps.push('Run ./capturefab doctor for USB and network camera settings.');
     if (osId === 'macos' && signature === 'apple-developer-id') steps.push('If macOS blocks it, Control-click Capturefab.app and choose Open.');
     return steps;
   };
@@ -159,6 +161,17 @@
     panel.addEventListener('keydown', (event) => { if (event.key === 'Escape') hideNextSteps(true); });
     $('next-steps-verify').addEventListener('click', () => { $('verify-box').open = true; });
   }
+  // A command that checks the download and prints OK or a mismatch. A self-check
+  // against a placeholder name would always fail, so an unusual name gets the
+  // hash-only command instead. isPublished already limits the hash to 64 hex digits.
+  const checkCommand = (osId, asset) => {
+    const hash = asset.sha256.toLowerCase();
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(asset.name || '')) {
+      return osId === 'macos' ? 'shasum -a 256 DOWNLOADED_FILE' : osId === 'windows' ? 'Get-FileHash DOWNLOADED_FILE -Algorithm SHA256' : 'sha256sum DOWNLOADED_FILE';
+    }
+    if (osId === 'windows') return `cd $HOME\\Downloads; if ((Get-FileHash .\\${asset.name} -Algorithm SHA256).Hash -eq '${hash}') { 'OK: checksum matches' } else { 'MISMATCH: do not open this file' }`;
+    return `cd ~/Downloads && echo "${hash}  ${asset.name}" | ${osId === 'macos' ? 'shasum -a 256' : 'sha256sum'} -c`;
+  };
   const renderSelection = () => {
     clearDownload();
     if (!manifest) return;
@@ -193,12 +206,13 @@
     armOneclick(selected);
     renderAlts(selected);
     if ($('install-hint')) {
-      text('install-hint', installSteps(os.value, selected.platform_signature).join(' '));
+      text('install-hint', `${installSteps(os.value, selected.platform_signature).join(' ')} `);
+      // Each system's permission prompts are one row of the installation guide.
+      $('install-hint').append(makeLink('First-launch steps for this system →', 'docs.html#first-launch'));
       $('install-hint').hidden = false;
     }
     text('checksum-text', `SHA-256: ${selected.sha256}`);
-    const filename = /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(selected.name || '') ? selected.name : 'DOWNLOADED_FILE';
-    text('verify-command', os.value === 'macos' ? `shasum -a 256 ${filename}` : os.value === 'windows' ? `Get-FileHash ${filename} -Algorithm SHA256` : `sha256sum ${filename}`);
+    text('verify-command', checkCommand(os.value, selected));
     const links = $('verify-links');
     if (selected.signature_url) links.append(makeLink('Signature', selected.signature_url));
     if (selected.bundle_url && selected.bundle_url !== selected.url) links.append(makeLink('Application bundle', selected.bundle_url));

@@ -30,25 +30,20 @@ Use the built-in simulators to try commands without camera hardware.
 - [Remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md): Local browser interface and HTTP activity observation.
 - [Line computer guide](https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md): Headless `serve` as a Linux service on a Raspberry Pi, Jetson or industrial PC: archive choice, camera permissions, systemd, storage budget and efficiency mode.
 
-## Recover retained camera catalogs
+## Try it with the simulator
 
-Retained camera catalog workspaces use the storage budget until you remove them.
-List them by reservation ID.
-Copy a workspace into a new folder before removing it when its data is still useful.
+The built-in simulator needs no camera hardware or session.
+Each comment says what you should see.
 
 ```sh
-capturefab storage task-data list --json
-capturefab storage task-data copy RESERVATION_ID recovered-catalog --json
-# Only after approving deletion of this exact workspace:
-capturefab storage task-data remove RESERVATION_ID --confirmed-by-user --json
+capturefab discover --simulate --json                                       # devices include sim:0, sim:1 ...
+capturefab --camera sim:0 features --json                                   # Width, Height, PixelFormat ...
+capturefab --camera sim:0 capture -o 'shot-{seq}.png' --json                # shot-0001.png; rerun for shot-0002.png
+capturefab --camera sim:0 record -o 'clip-{seq}.mp4' --duration 2s --json   # clip-0001.mp4; `stopped` reports the deadline
+capturefab storage --json                                                   # usage counted against the budget
 ```
 
-Recovery refuses a workspace with a running owner.
-Copies preserve the database and its write-ahead log (WAL) together.
-Copies consume their own storage allowance.
-Keep `task.duckdb.wal` beside `task.duckdb`.
-Changed directory identities, extra hard links or uncertain shutdown keep the reservation charged.
-Failed copies can leave partial output; examine it before retrying.
+Without a running GUI or serve session, these commands use a temporary worker; see "Use an existing session" to share a visible workspace.
 
 ## Examine the installed version
 
@@ -118,7 +113,7 @@ capturefab gui --name bench
 # In another terminal:
 capturefab --session bench connect sim:0
 capturefab --session bench --camera sim:0 get Width Height --json
-capturefab --session bench --camera sim:0 capture -o first.png --json
+capturefab --session bench --camera sim:0 capture -o 'first-{seq}.png' --json
 capturefab --session bench status --json
 ```
 
@@ -226,6 +221,26 @@ Version 0.4.0 removes built-in S3, FTP and SFTP uploads and industrial signal so
 
 Only saved folder destinations are used in this version. Entries of other kinds from older versions are ignored.
 For network storage, mount a folder through the operating system and save that mounted path as a destination.
+
+## Recover retained camera catalogs
+
+Retained camera catalog workspaces use the storage budget until you remove them.
+List them by reservation ID.
+Copy a workspace into a new folder before removing it when its data is still useful.
+
+```sh
+capturefab storage task-data list --json
+capturefab storage task-data copy RESERVATION_ID recovered-catalog --json
+# Only after approving deletion of this exact workspace:
+capturefab storage task-data remove RESERVATION_ID --confirmed-by-user --json
+```
+
+Recovery refuses a workspace with a running owner.
+Copies preserve the database and its write-ahead log (WAL) together.
+Copies consume their own storage allowance.
+Keep `task.duckdb.wal` beside `task.duckdb`.
+Changed directory identities, extra hard links or uncertain shutdown keep the reservation charged.
+Failed copies can leave partial output; examine it before retrying.
 
 ## Name and tag captures
 
@@ -541,6 +556,18 @@ Driver compatibility has not been physically validated.
 Scanner sources do not provide PDF assembly, OCR, forwarding or auto exposure.
 
 ## Choose a release
+
+Install the latest release for the current user with one command:
+
+```sh
+curl -fsSL https://capturefab.com/install.sh | sh    # macOS and Linux; add `-s -- --dry-run` to only print the file, URL and checksum
+irm https://capturefab.com/install.ps1 | iex         # Windows PowerShell
+```
+
+The scripts select the build for this computer from the latest release, download it from GitHub Releases and check its SHA-256 before extracting.
+They install to `~/Applications` (macOS) or `~/.local/share/capturefab` (Linux) with the command linked in `~/.local/bin`, or to `%LOCALAPPDATA%\Programs\Capturefab` on the user `PATH` (Windows).
+They never use sudo or administrator rights.
+To read a script first: `curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh`.
 
 Release data determines the available downloads.
 An empty release array means that no binary downloads are published.

@@ -2,15 +2,26 @@
 """Validate static pages, documentation search, generated release pages, and published assets."""
 import hashlib
 import importlib.util
+import io
 import json
+import os
+import platform
 import re
+import shutil
 import struct
+import subprocess
 import sys
+import tarfile
+import tempfile
+import threading
+import zipfile
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import xml.etree.ElementTree as ET
 from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlsplit, unquote
+from urllib.parse import urljoin, urlsplit, unquote
 
 ROOT = Path(__file__).resolve().parents[1] / "web"
 ATOM = "{http://www.w3.org/2005/Atom}"
@@ -481,6 +492,145 @@ def check_generated(root, errors):
             errors.append(f"{path.name} is stale; run scripts/site-release.py")
 
 
+def site_release():
+    spec = importlib.util.spec_from_file_location("site_release", Path(__file__).with_name("site-release.py"))
+    site = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(site)
+    return site
+
+
+def check_installers(root, errors):
+    """The generated installers offer exactly the manifest's published builds, with their checksums."""
+    manifest = json.loads((root / "releases.json").read_text(encoding="utf-8"))
+    canonical = re.search(r'<link rel="canonical" href="([^"]+)"', (root / "index.html").read_text(encoding="utf-8"))
+    site = canonical[1].rstrip("/") + "/" if canonical else ""
+    latest = [r for r in manifest["releases"] if r["version"] == manifest.get("latest")]
+    available = [a for r in latest for a in r["assets"] if a.get("available")]
+    for name, systems, pattern in (("install.sh", {"macos", "linux"}, r"url='([^']+)' expected='([0-9a-f]{64})'"),
+                                   ("install.ps1", {"windows"}, r"Url = '([^']+)'; Sha256 = '([0-9a-f]{64})'")):
+        path = root / name
+        if not path.is_file():
+            errors.append(f"{name}: missing; run scripts/site-release.py")
+            continue
+        offered = set(re.findall(pattern, path.read_text(encoding="utf-8")))
+        expected = {(urljoin(site, a.get("url", "")), a.get("sha256", "").lower()) for a in available if a["os"] in systems}
+        if offered != expected:
+            errors.append(f"{name}: offers {sorted(offered - expected)} and omits {sorted(expected - offered)}")
+    script = root / "install.sh"
+    if script.is_file() and shutil.which("sh"):
+        result = subprocess.run(["sh", "-n", str(script)], capture_output=True, text=True)
+        if result.returncode:
+            errors.append(f"install.sh: shell syntax error: {result.stderr.strip()}")
+        if shutil.which("shellcheck"):
+            result = subprocess.run(["shellcheck", "-s", "sh", str(script)], capture_output=True, text=True)
+            if result.returncode:
+                errors.append(f"install.sh: shellcheck: {result.stdout.strip()}")
+    if "sudo" in re.sub(r"#.*", "", script.read_text(encoding="utf-8") if script.is_file() else ""):
+        errors.append("install.sh: must never run sudo")
+
+
+def fixture_archive(directory, system, arch):
+    """A release archive whose capturefab prints a version, laid out like scripts/release.py's."""
+    stem = f"capturefab-9.9.9-{system}-{arch}"
+    stub = b"#!/bin/sh\necho 'capturefab 9.9.9'\n"
+    if system == "macos":
+        path = directory / f"{stem}.zip"
+        with zipfile.ZipFile(path, "w") as archive:
+            info = zipfile.ZipInfo(f"{stem}/Capturefab.app/Contents/MacOS/capturefab")
+            info.external_attr = 0o100755 << 16
+            archive.writestr(info, stub)
+    else:
+        path = directory / f"{stem}.tar.gz"
+        with tarfile.open(path, "w:gz") as archive:
+            for name, data, mode in ((f"{stem}/capturefab", stub, 0o755),
+                                     (f"{stem}/share/applications/capturefab.desktop", b"[Desktop Entry]\nExec=capturefab\n", 0o644)):
+                info = tarfile.TarInfo(name)
+                info.size, info.mode = len(data), mode
+                archive.addfile(info, io.BytesIO(data))
+    return path
+
+
+def check_installer_runs(errors):
+    """Install from a local server, then refuse a corrupted download and an empty release."""
+    system = {"Darwin": "macos", "Linux": "linux"}.get(platform.system())
+    if not system or not shutil.which("sh") or (system == "macos" and not shutil.which("ditto")):
+        return
+    site = site_release()
+    with tempfile.TemporaryDirectory() as temp:
+        temp = Path(temp)
+        served = temp / "served"
+        served.mkdir()
+        assets = []
+        for arch in ("x86_64", "aarch64"):
+            path = fixture_archive(served, system, arch)
+            assets.append(dict(name=path.name, os=system, arch=arch, available=True, size=path.stat().st_size,
+                               sha256=hashlib.sha256(path.read_bytes()).hexdigest(), url=f"https://example.invalid/{path.name}"))
+        manifest = dict(schema_version=1, latest="9.9.9", releases=[dict(version="9.9.9", date="2026-01-01", assets=assets)])
+        script = temp / "install.sh"
+        script.write_text(site.installers(manifest, "https://capturefab.example/")[0], encoding="utf-8")
+        server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(served)))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            def install(name):
+                home = temp / name
+                home.mkdir()
+                env = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / "share"), CAPTUREFAB_INSTALL_BASE_URL=f"http://127.0.0.1:{server.server_port}")
+                result = subprocess.run(["sh", str(script), "--prefix", str(home / "apps"), "--bin-dir", str(home / "bin")],
+                                        capture_output=True, text=True, env=env, timeout=60)
+                return home, result
+            home, result = install("good")
+            command = home / "bin" / "capturefab"
+            if result.returncode or not command.is_symlink():
+                errors.append(f"install.sh: fixture install failed: {result.stderr.strip() or result.stdout.strip()}")
+            elif "capturefab 9.9.9" not in result.stdout:
+                errors.append("install.sh: did not run the installed capturefab --version")
+            elif system == "linux" and 'Exec="' not in (home / "share/applications/capturefab.desktop").read_text():
+                errors.append("install.sh: the launcher entry must name the installed command")
+            for path in served.iterdir():
+                path.write_bytes(path.read_bytes() + b"tampered")
+            home, result = install("corrupt")
+            if result.returncode == 0 or "checksum mismatch" not in result.stderr:
+                errors.append("install.sh: a corrupted download must fail with a checksum mismatch")
+            if (home / "bin").exists() or (home / "apps").exists():
+                errors.append("install.sh: a corrupted download must install nothing")
+        finally:
+            server.shutdown()
+            server.server_close()
+        empty = temp / "empty.sh"
+        empty.write_text(site.installers(dict(schema_version=1, latest=None, releases=[]), "https://capturefab.example/")[0], encoding="utf-8")
+        result = subprocess.run(["sh", str(empty)], capture_output=True, text=True, env=dict(os.environ, HOME=str(temp)), timeout=30)
+        if result.returncode == 0 or "no published release" not in result.stderr:
+            errors.append("install.sh: without a release it must fail with 'no published release'")
+
+
+class QuietHandler(SimpleHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
+def check_min_os(root, errors):
+    """The download cards repeat docs.html's minimum operating system table."""
+    site = site_release()
+    docs = (root / "docs.html").read_text(encoding="utf-8")
+    table = re.search(r"<caption>Minimum operating system versions</caption>(.*?)</table>", docs, re.S)
+    rows = {plain_text(build): plain_text(minimum) for build, minimum in re.findall(r"<tr><td>(.*?)</td><td>(.*?)</td></tr>", table[1] if table else "", re.S)}
+    names = {("macos", "aarch64"): "macOS ARM64", ("macos", "x86_64"): "macOS x64", ("windows", "x86_64"): "Windows x64",
+             ("windows", "aarch64"): "Windows ARM64", ("linux", "x86_64"): "Linux x64 and ARM64", ("linux", "aarch64"): "Linux x64 and ARM64"}
+    for key, card in site.MIN_OS.items():
+        documented = rows.get(names[key], "")
+        # The card's leading version must appear in the docs row (macOS 11+ ↔ macOS 11.0, glibc 2.28+ ↔ glibc 2.28).
+        version = re.search(r"[\d.]+|Windows 11 on ARM", card)[0]
+        if not documented or version not in documented:
+            errors.append(f"site-release.py: MIN_OS {key} says '{card}', but docs.html#installation says '{documented}'")
+    downloads = (root / "downloads.html").read_text(encoding="utf-8")
+    mac = re.search(r'<article class="platform-download-card" data-os="macos">.*?</article>', downloads, re.S)
+    if mac and mac[0].find("Apple silicon") > mac[0].find("Intel Mac"):
+        errors.append("downloads.html: the macOS card must list Apple silicon before Intel")
+    for card in re.findall(r"<li data-os=.*?</li>", downloads, re.S):
+        if "Unsigned" in card and 'href="docs.html#first-launch"' not in card:
+            errors.append("downloads.html: an unsigned build must link to its first-launch steps")
+
+
 def check_search_index(root, errors):
     spec = importlib.util.spec_from_file_location("docs_search", Path(__file__).with_name("docs-search.py"))
     search = importlib.util.module_from_spec(spec)
@@ -550,6 +700,8 @@ def validate(root=ROOT):
     check_processors(root, errors)
     check_feed(root, versions, errors)
     check_generated(root, errors)
+    check_installers(root, errors)
+    check_min_os(root, errors)
     check_search_index(root, errors)
     check_theme_contrast(root, errors)
     return errors, versions
@@ -557,6 +709,7 @@ def validate(root=ROOT):
 
 def main():
     errors, versions = validate()
+    check_installer_runs(errors)
     spec = importlib.util.spec_from_file_location("docs_coverage", Path(__file__).with_name("docs-coverage.py"))
     coverage = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(coverage)
@@ -567,7 +720,7 @@ def main():
         errors.append(f"cannot validate documentation coverage: {error}")
     if errors:
         sys.exit("\n".join(errors))
-    print(f"Static site validated; source-based documentation coverage, accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
+    print(f"Static site validated; installers checked and run against a local release, source-based documentation coverage, accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
 
 
 if __name__ == "__main__":

@@ -179,11 +179,16 @@ async function downloads() {
   assert.equal(page.ids.get('primary-download').href, desktop.url);
   assert.equal(page.ids.get('primary-download').hidden, false);
   assert.match(page.ids.get('primary-download').getAttribute('aria-label'), /macOS ARM64/);
-  assert.equal(page.ids.get('verify-command').textContent, `shasum -a 256 ${desktop.name}`);
+  assert.equal(page.ids.get('verify-command').textContent, `cd ~/Downloads && echo "${desktop.sha256.toLowerCase()}  ${desktop.name}" | shasum -a 256 -c`, 'The Mac check prints OK or FAILED by itself');
   assert.match(page.ids.get('checksum-text').textContent, new RegExp(desktop.sha256));
-  assert.match(page.ids.get('install-hint').textContent, /Extract.*Capturefab\.app/);
+  assert.match(page.ids.get('install-hint').textContent, /Extract.*Move Capturefab\.app to Applications.*Local Network.*CLI/, 'One macOS story: move the app, allow Local Network, then set up the CLI');
+  const firstLaunch = (hint) => hint.children.find((child) => child.tagName === 'A' && child.href === 'https://capturefab.example/docs.html#first-launch');
+  assert.ok(firstLaunch(page.ids.get('install-hint')), 'The install hint links to the first-launch steps');
   page.change('os-select', 'windows');
   assert.ok(page.ids.get('install-hint').textContent.includes('.\\capturefab.exe --help'), 'PowerShell instructions must retain the relative-path backslash');
+  assert.match(page.ids.get('install-hint').textContent, /Run anyway.*Private networks/, 'Windows warns about SmartScreen and the firewall prompt');
+  const windowsArm = latest.assets.find((asset) => asset.os === 'windows' && asset.arch === 'aarch64');
+  assert.equal(page.ids.get('verify-command').textContent, `cd $HOME\\Downloads; if ((Get-FileHash .\\${windowsArm.name} -Algorithm SHA256).Hash -eq '${windowsArm.sha256.toLowerCase()}') { 'OK: checksum matches' } else { 'MISMATCH: do not open this file' }`);
   page.change('arch-select', 'x86_64');
   assert.equal(page.ids.get('primary-download').hidden, true, 'Unavailable selections must clear a previous link');
   assert.equal(page.ids.get('primary-download').href, '');
@@ -192,6 +197,20 @@ async function downloads() {
 
   page.change('os-select', 'linux');
   assert.match(page.ids.get('platform-hint').textContent, /dpkg --print-architecture/, 'Linux needs a check that tells a 32-bit OS from a 64-bit one');
+  page.change('arch-select', 'aarch64');
+  const linuxArm = latest.assets.find((asset) => asset.os === 'linux' && asset.arch === 'aarch64');
+  assert.match(page.ids.get('verify-command').textContent, new RegExp(`echo "${linuxArm.sha256.toLowerCase()}  ${linuxArm.name.replace(/\./g, '\\.')}" \\| sha256sum -c$`));
+
+  // A name that fails the file name check keeps the hash-only command, since a self-check against a placeholder always fails.
+  const oddName = structuredClone(published);
+  const odd = assetFor(oddName, 'linux', 'x86_64');
+  odd.name = 'capturefab linux.tar.gz';
+  odd.sha256 = odd.sha256.toUpperCase();
+  const fallback = openPage({ manifest: oddName });
+  await fallback.settle();
+  fallback.change('os-select', 'linux');
+  fallback.change('arch-select', 'x86_64');
+  assert.equal(fallback.ids.get('verify-command').textContent, 'sha256sum DOWNLOADED_FILE');
   assert.doesNotMatch(page.ids.get('platform-hint').textContent, /ARMv7/);
 
   for (const options of [
