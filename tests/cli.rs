@@ -6779,6 +6779,99 @@ fn login_add_saves_in_the_real_credential_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Damaged and newer setup files are listed and deletable, notes stay on
+/// one line, and an inline workflow setup takes the `setup show` envelope.
+#[test]
+fn unreadable_setups_list_and_delete_and_inline_setups_take_the_envelope() {
+    let root = temp_root("setup-store");
+    let dir = root.join("sessions");
+    let cwd = root.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let run = |args: &[&str]| {
+        let out = cmd(&dir, args);
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+        (out.status.code().unwrap(), value)
+    };
+    json(
+        &dir,
+        &[
+            "--json", "--direct", "--camera", "sim:0", "setup", "save", "low",
+        ],
+    );
+    let setups = dir.join("setups");
+    std::fs::write(setups.join("broken.json"), br#"{"name":"broken","#).unwrap();
+    let mut future: Value =
+        serde_json::from_slice(&std::fs::read(setups.join("low.json")).unwrap()).unwrap();
+    future["version"] = serde_json::json!(2);
+    future["name"] = serde_json::json!("future");
+    future["lens"] = serde_json::json!("25mm");
+    std::fs::write(
+        setups.join("future.json"),
+        serde_json::to_vec(&future).unwrap(),
+    )
+    .unwrap();
+    let list = json(&dir, &["--json", "setup", "list"]);
+    let rows = list["setups"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{list}");
+    assert_eq!(rows[0]["name"], "broken");
+    assert_eq!(rows[0]["status"], "unreadable");
+    assert!(rows[0]["reason"].is_string());
+    assert_eq!(rows[1]["status"], "newer_version");
+    assert!(rows[2].get("status").is_none());
+    let text = String::from_utf8_lossy(&cmd(&dir, &["setup", "list"]).stdout).into_owned();
+    assert!(text.contains("cannot be read"), "{text}");
+    assert!(text.contains("capturefab setup delete broken"), "{text}");
+    let (code, error) = run(&["--json", "setup", "show", "future"]);
+    assert_ne!(code, 0);
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("newer Capturefab"), "{message}");
+    let removed = json(&dir, &["--json", "setup", "delete", "broken"]);
+    assert_eq!(removed["removed"], "broken");
+    json(&dir, &["--json", "setup", "delete", "future"]);
+    assert_eq!(
+        json(&dir, &["--json", "setup", "list"])["setups"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // Notes cannot carry line breaks or terminal escapes.
+    let (code, error) = run(&[
+        "--json", "--direct", "--camera", "sim:0", "setup", "save", "x", "--note", "a\nb",
+    ]);
+    assert_eq!((code, error["error"]["code"].as_str()), (2, Some("usage")));
+    let shown = cmd(&dir, &["--json", "setup", "show", "low"]);
+    assert!(shown.status.success());
+    let envelope: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let mut evil = envelope["result"].clone();
+    evil["name"] = serde_json::json!("evil");
+    evil["note"] = serde_json::json!("\u{1b}]0;x\u{7}\nFAKE  2026-01-01  99  line");
+    let evil_file = cwd.join("evil.json");
+    std::fs::write(&evil_file, serde_json::to_vec(&evil).unwrap()).unwrap();
+    let (code, error) = run(&["--json", "setup", "import", evil_file.to_str().unwrap()]);
+    assert_eq!(code, 2);
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("control characters"), "{message}");
+    // An inline workflow setup takes the whole `setup show --json` output
+    // or its result.
+    let workflow = cwd.join("restore.json");
+    for setup in [envelope.clone(), envelope["result"].clone()] {
+        std::fs::write(
+            &workflow,
+            serde_json::to_vec(&serde_json::json!({"version":1,"steps":[
+                {"camera":"sim:0","command":{"op":"apply_setup","setup":setup}}
+            ]}))
+            .unwrap(),
+        )
+        .unwrap();
+        json(
+            &dir,
+            &["--json", "workflow", "validate", workflow.to_str().unwrap()],
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Save a simulator's settings, change them, preview and restore the setup
 /// in a session, undo it, and move it between files and workflows.
 #[test]

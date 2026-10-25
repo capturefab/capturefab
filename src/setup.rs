@@ -209,11 +209,24 @@ pub struct Reading {
     pub skipped: Vec<Skipped>,
 }
 
-/// One row of `setup list`.
+/// Why `setup list` cannot read a file in the setups folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileStatus {
+    /// Damaged, edited by hand, or named differently from its file.
+    Unreadable,
+    /// Written by a newer Capturefab.
+    NewerVersion,
+}
+
+/// One row of `setup list`. A file the store cannot read is listed under
+/// its file name with `status` and `reason`, and no camera, date or values,
+/// so it can be seen and deleted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Summary {
     pub name: String,
-    pub transport: Transport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Transport>,
     pub vendor: String,
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +235,45 @@ pub struct Summary {
     pub values: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<FileStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+impl Summary {
+    /// The row for a file the store cannot read.
+    fn unreadable(name: &str, status: FileStatus, reason: &str) -> Self {
+        Self {
+            name: name.into(),
+            transport: None,
+            vendor: String::new(),
+            model: String::new(),
+            serial: None,
+            saved_at: String::new(),
+            values: 0,
+            note: None,
+            status: Some(status),
+            reason: Some(printable(reason)),
+        }
+    }
+    /// True for a setup the store can read.
+    pub fn readable(&self) -> bool {
+        self.status.is_none()
+    }
+}
+
+/// `text` without control characters, bounded, for a reason taken from a
+/// file the store cannot read.
+fn printable(text: &str) -> String {
+    const MAX_REASON: usize = 240;
+    let mut text = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect::<String>();
+    if text.chars().count() > MAX_REASON {
+        text = text.chars().take(MAX_REASON - 1).collect::<String>() + "…";
+    }
+    text
 }
 
 /// How a saved setup's camera compares with a connected one.
@@ -384,6 +436,19 @@ pub fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check a setup note: bounded, on one line, with no terminal escapes.
+pub fn validate_note(note: &str) -> Result<()> {
+    ensure!(
+        note.chars().count() <= MAX_NOTE,
+        "a setup note is at most {MAX_NOTE} characters"
+    );
+    ensure!(
+        !note.chars().any(char::is_control),
+        "a setup note cannot contain control characters such as line breaks or escapes"
+    );
+    Ok(())
+}
+
 fn validate_text(what: &str, text: &str) -> Result<()> {
     ensure!(
         text.len() <= MAX_STRING,
@@ -413,17 +478,10 @@ fn validate_bank(feature: &str, bank: &Bank) -> Result<()> {
 /// Check a setup without a camera: limits, names and values. Node kinds are
 /// checked by the camera worker.
 pub fn validate(setup: &Setup) -> Result<()> {
-    ensure!(
-        setup.version == 1,
-        "setup version {} is not supported; this Capturefab reads version 1",
-        setup.version
-    );
+    check_version(setup.version.into())?;
     validate_name(&setup.name)?;
     if let Some(note) = &setup.note {
-        ensure!(
-            note.chars().count() <= MAX_NOTE,
-            "a setup note is at most {MAX_NOTE} characters"
-        );
+        validate_note(note)?;
     }
     ensure!(
         !setup.values.is_empty(),
@@ -506,8 +564,41 @@ pub fn validate(setup: &Setup) -> Result<()> {
         }
     }
     ensure!(
-        serde_json::to_vec(setup)?.len() <= MAX_SETUP_BYTES,
+        stored_bytes(setup)?.len() <= MAX_SETUP_BYTES,
         "a setup is at most 256 KiB"
+    );
+    Ok(())
+}
+
+/// The bytes the store writes for `setup`. Sizes are checked on these, the
+/// largest form, so every valid setup can be saved, sent and imported.
+fn stored_bytes(setup: &Setup) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(setup)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// A document version this Capturefab cannot read.
+#[derive(Debug)]
+pub struct NewerVersion(pub u64);
+impl std::fmt::Display for NewerVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "setup version {} was written by a newer Capturefab; this one reads version 1",
+            self.0
+        )
+    }
+}
+impl std::error::Error for NewerVersion {}
+
+fn check_version(version: u64) -> Result<()> {
+    if version > 1 {
+        return Err(NewerVersion(version).into());
+    }
+    ensure!(
+        version == 1,
+        "setup version {version} is not supported; this Capturefab reads version 1"
     );
     Ok(())
 }
@@ -516,6 +607,22 @@ pub fn validate(setup: &Setup) -> Result<()> {
 /// `setup show NAME --json` prints, `{"version":1,"ok":true,"result":DOCUMENT}`,
 /// is accepted too, so its output can be imported or applied as is.
 pub fn parse(bytes: &[u8]) -> Result<Setup> {
+    ensure!(bytes.len() <= MAX_SETUP_BYTES, "a setup is at most 256 KiB");
+    let value = serde_json::from_slice(bytes).context("not a valid setup document")?;
+    from_value(value)
+}
+
+/// A setup document, or the `setup show NAME --json` envelope around one,
+/// checked strictly and validated. A newer version is reported as such
+/// before any field it may have added.
+pub fn from_value(value: serde_json::Value) -> Result<Setup> {
+    let setup = document(value)?;
+    validate(&setup)?;
+    Ok(setup)
+}
+
+/// `from_value` without `validate`, which session commands run later.
+fn document(value: serde_json::Value) -> Result<Setup> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Envelope {
@@ -523,20 +630,40 @@ pub fn parse(bytes: &[u8]) -> Result<Setup> {
         ok: bool,
         result: serde_json::Value,
     }
-    ensure!(bytes.len() <= MAX_SETUP_BYTES, "a setup is at most 256 KiB");
-    let setup = match serde_json::from_slice::<Setup>(bytes) {
-        Ok(setup) => setup,
-        Err(error) => match serde_json::from_slice::<Envelope>(bytes) {
+    let document = if value.get("ok").is_some() {
+        match serde_json::from_value::<Envelope>(value) {
             Ok(Envelope {
                 version: 1,
                 ok: true,
                 result,
-            }) => serde_json::from_value(result).context("not a valid setup document")?,
-            _ => return Err(anyhow::Error::new(error).context("not a valid setup document")),
-        },
+            }) => result,
+            _ => bail!(
+                "not a valid setup document: pass the setup itself or the whole output of a successful capturefab setup show NAME --json (version 1, ok true)"
+            ),
+        }
+    } else {
+        value
     };
-    validate(&setup)?;
-    Ok(setup)
+    if let Some(version) = document.get("version").and_then(serde_json::Value::as_u64) {
+        check_version(version)?;
+    }
+    serde_json::from_value(document).context("not a valid setup document")
+}
+
+/// Deserialize an inline `setup` field, as `from_value` reads it: either
+/// the document or the `setup show NAME --json` envelope around it. The
+/// command's `validate` checks its values.
+pub fn deserialize_inline<'de, D>(deserializer: D) -> Result<Option<Setup>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(value) => document(value)
+            .map(Some)
+            .map_err(|error| D::Error::custom(format!("{error:#}"))),
+    }
 }
 
 /// Read and validate a setup file, reading at most `MAX_SETUP_BYTES`.
@@ -591,7 +718,7 @@ pub fn from_read(name: &str, note: Option<String>, mut reading: Reading) -> Resu
     sort_values(&mut reading.values);
     reading.values.truncate(MAX_SETUP_VALUES);
     reading.skipped.truncate(MAX_SKIPPED);
-    let setup = Setup {
+    let mut setup = Setup {
         version: 1,
         name: name.into(),
         saved_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -601,8 +728,52 @@ pub fn from_read(name: &str, note: Option<String>, mut reading: Reading) -> Resu
         values: reading.values,
         skipped: reading.skipped,
     };
+    fit_skipped(&mut setup)?;
     validate(&setup)?;
     Ok(setup)
+}
+
+/// Drop skipped entries from the end until the setup fits its size limit,
+/// noting how many were left out, so a large camera still saves.
+fn fit_skipped(setup: &mut Setup) -> Result<()> {
+    let fits =
+        |setup: &Setup| -> Result<bool> { Ok(stored_bytes(setup)?.len() <= MAX_SETUP_BYTES) };
+    if fits(setup)? {
+        return Ok(());
+    }
+    let mut dropped = 0usize;
+    while !setup.skipped.is_empty() && !fits(setup)? {
+        setup.skipped.pop();
+        dropped += 1;
+    }
+    if !fits(setup)? {
+        return Err(Categorized::error(
+            ErrorKind::Unsupported,
+            format!(
+                "This camera's {} settings do not fit in one setup (at most {} KiB).",
+                setup.values.len(),
+                MAX_SETUP_BYTES / 1024
+            ),
+        ));
+    }
+    loop {
+        setup.skipped.push(Skipped {
+            feature: "(more)".into(),
+            at: Vec::new(),
+            reason: format!("{dropped} more skipped values not listed"),
+        });
+        if fits(setup)? {
+            break;
+        }
+        // The note does not fit either: drop one more entry for it, or go
+        // without it when nothing is left to drop.
+        setup.skipped.pop();
+        if setup.skipped.pop().is_none() {
+            break;
+        }
+        dropped += 1;
+    }
+    Ok(())
 }
 
 /// The name closest to `name` among plausible typos, for "did you mean".
@@ -626,6 +797,20 @@ impl std::fmt::Display for NameTaken {
     }
 }
 impl std::error::Error for NameTaken {}
+
+/// What `Store::remove` deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removed {
+    /// The setup's name, or the file's when it could not be read.
+    pub name: String,
+    pub readable: bool,
+}
+
+/// A file's name without `.json`, when it could be a setup's.
+fn stem(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?.strip_suffix(".json")?;
+    validate_name(name).is_ok().then_some(name)
+}
 
 /// The setups directory: one `<lowercase name>.json` per setup.
 pub struct Store {
@@ -673,63 +858,91 @@ impl Store {
         files.sort();
         Ok(files)
     }
-    /// Saved setups by name; unreadable files are left out.
+    /// Saved setups by name. A file the store cannot read, or one holding
+    /// a setup named differently from its file, is listed with a `status`
+    /// and `reason` under its file name, so it can be deleted. Files whose
+    /// names no setup could have are not setups and are left out.
     pub fn list(&self) -> Result<Vec<Summary>> {
-        #[derive(Deserialize)]
-        struct Head {
-            name: String,
-            saved_at: String,
-            #[serde(default)]
-            note: Option<String>,
-            camera: SavedCamera,
-            values: Vec<serde::de::IgnoredAny>,
-        }
         let mut summaries = Vec::new();
         for path in self.files()? {
-            let mut bytes = Vec::new();
-            let Ok(file) = fs::File::open(&path) else {
+            let Some(name) = stem(&path) else {
                 continue;
             };
-            if file
-                .take(MAX_SETUP_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-                .is_err()
-                || bytes.len() > MAX_SETUP_BYTES
-            {
-                continue;
-            }
-            let Ok(head) = serde_json::from_slice::<Head>(&bytes) else {
-                continue;
-            };
-            summaries.push(Summary {
-                name: head.name,
-                transport: head.camera.transport,
-                vendor: head.camera.vendor,
-                model: head.camera.model,
-                serial: head.camera.serial,
-                saved_at: head.saved_at,
-                values: head.values.len(),
-                note: head.note,
+            summaries.push(match self.read_named(&path, name) {
+                Ok(setup) => Summary {
+                    name: setup.name,
+                    transport: Some(setup.camera.transport),
+                    vendor: setup.camera.vendor,
+                    model: setup.camera.model,
+                    serial: setup.camera.serial,
+                    saved_at: setup.saved_at,
+                    values: setup.values.len(),
+                    note: setup.note,
+                    status: None,
+                    reason: None,
+                },
+                Err(error) => {
+                    let status = if error.chain().any(|cause| cause.is::<NewerVersion>()) {
+                        FileStatus::NewerVersion
+                    } else {
+                        FileStatus::Unreadable
+                    };
+                    Summary::unreadable(name, status, &format!("{:#}", error.root_cause()))
+                }
             });
         }
         summaries.sort_by_key(|summary| summary.name.to_ascii_lowercase());
         Ok(summaries)
+    }
+    /// The setup in `path`, which `get(name)` opens, refusing one that is
+    /// named differently: a copied or renamed file.
+    fn read_named(&self, path: &Path, name: &str) -> Result<Setup> {
+        if self.path(name).file_name() != path.file_name() {
+            return Err(Categorized::error(
+                ErrorKind::Unavailable,
+                format!(
+                    "{} has capital letters; Capturefab names setup files in lower case. Rename it to {}.json",
+                    path.display(),
+                    name.to_ascii_lowercase()
+                ),
+            ));
+        }
+        let setup = read_file(path)?;
+        if !setup.name.eq_ignore_ascii_case(name) {
+            return Err(Categorized::error(
+                ErrorKind::Unavailable,
+                format!(
+                    "{} holds a setup named {}, not {name}; rename the file, or run capturefab setup import {} --name {name}",
+                    path.display(),
+                    printable(&setup.name),
+                    path.display()
+                ),
+            ));
+        }
+        Ok(setup)
     }
     /// The saved setup, or an `unavailable` error suggesting a close name.
     pub fn get(&self, name: &str) -> Result<Setup> {
         validate_name(name)?;
         let path = self.path(name);
         if !path.exists() {
-            let names = self.list().unwrap_or_default();
-            let suggestion = closest(name, names.iter().map(|s| s.name.as_str()))
-                .map(|close| format!(" Did you mean {close}?"))
-                .unwrap_or_default();
-            return Err(Categorized::error(
-                ErrorKind::Unavailable,
-                format!("No saved setup named {name}.{suggestion} See capturefab setup list"),
-            ));
+            return Err(self.missing(name));
         }
-        read_file(&path)
+        self.read_named(&path, name).with_context(|| {
+            format!(
+                "Setup {name} cannot be read; save it again with --replace or remove it with capturefab setup delete {name}"
+            )
+        })
+    }
+    fn missing(&self, name: &str) -> anyhow::Error {
+        let names = self.list().unwrap_or_default();
+        let suggestion = closest(name, names.iter().map(|s| s.name.as_str()))
+            .map(|close| format!(" Did you mean {close}?"))
+            .unwrap_or_default();
+        Categorized::error(
+            ErrorKind::Unavailable,
+            format!("No saved setup named {name}.{suggestion} See capturefab setup list"),
+        )
     }
     /// Save `setup`, refusing an existing name unless `replace`. Returns
     /// the file written.
@@ -769,12 +982,11 @@ impl Store {
             options.mode(0o600);
         }
         let result = (|| -> Result<()> {
-            let bytes = serde_json::to_vec_pretty(setup)?;
+            let bytes = stored_bytes(setup)?;
             ensure!(bytes.len() <= MAX_SETUP_BYTES, "a setup is at most 256 KiB");
             let _ = fs::remove_file(&temp);
             let mut output = options.open(&temp)?;
             output.write_all(&bytes)?;
-            output.write_all(b"\n")?;
             output.sync_all()?;
             fs::rename(&temp, path)?;
             #[cfg(unix)]
@@ -788,12 +1000,26 @@ impl Store {
         }
         result
     }
-    /// Delete a saved setup.
-    pub fn remove(&self, name: &str) -> Result<Setup> {
+    /// Delete a saved setup's file without parsing it, so a damaged or
+    /// newer file can be removed too. A file name with capital letters,
+    /// which `list` shows as unreadable, is deleted when named exactly.
+    pub fn remove(&self, name: &str) -> Result<Removed> {
+        validate_name(name)?;
         let _lock = self.lock()?;
-        let setup = self.get(name)?;
-        fs::remove_file(self.path(name))?;
-        Ok(setup)
+        let mut path = self.path(name);
+        if !path.exists() {
+            let exact = self.dir.join(format!("{name}.json"));
+            if !exact.is_file() {
+                return Err(self.missing(name));
+            }
+            path = exact;
+        }
+        let shown = self.read_named(&path, name).ok().map(|setup| setup.name);
+        fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+        Ok(Removed {
+            readable: shown.is_some(),
+            name: shown.unwrap_or_else(|| name.into()),
+        })
     }
     /// Save a setup document from a file, optionally under another name.
     pub fn import(&self, path: &Path, rename: Option<&str>, replace: bool) -> Result<Setup> {
@@ -1300,6 +1526,256 @@ mod tests {
         fs::write(&file, vec![b' '; MAX_SETUP_BYTES + 1]).unwrap();
         assert!(format!("{:#}", read_file(&file).unwrap_err()).contains("256 KiB"));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn damaged_and_newer_files_are_listed_and_can_be_deleted() {
+        let store = Store::at(temp("unreadable"));
+        store.save(&setup("good"), false).unwrap();
+        fs::write(store.dir().join("broken.json"), br#"{"name":"broken","#).unwrap();
+        let mut future = serde_json::to_value(setup("future")).unwrap();
+        future["version"] = serde_json::json!(2);
+        future["lens"] = serde_json::json!("25mm");
+        let future = serde_json::to_vec_pretty(&future).unwrap();
+        fs::write(store.dir().join("future.json"), &future).unwrap();
+        // A newer document says so, not that a field is unknown.
+        let error = format!("{:#}", parse(&future).unwrap_err());
+        assert!(
+            error.contains("version 2 was written by a newer Capturefab"),
+            "{error}"
+        );
+        let error = format!("{:#}", store.get("future").unwrap_err());
+        assert!(error.contains("newer Capturefab"), "{error}");
+        assert!(error.contains("setup delete future"), "{error}");
+        let list = store.list().unwrap();
+        let rows = list
+            .iter()
+            .map(|row| (row.name.as_str(), row.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            [
+                ("broken", Some(FileStatus::Unreadable)),
+                ("future", Some(FileStatus::NewerVersion)),
+                ("good", None),
+            ]
+        );
+        assert!(
+            list[0].reason.as_deref().unwrap().contains("EOF"),
+            "{list:?}"
+        );
+        assert!(list[0].transport.is_none() && list[0].values == 0);
+        let json = serde_json::to_value(&list).unwrap();
+        assert_eq!(json[0]["status"], "unreadable");
+        assert_eq!(json[1]["status"], "newer_version");
+        assert!(json[2].get("status").is_none());
+        assert_eq!(json[2]["transport"], serde_json::json!(Transport::GigE));
+        // Neither blocks its name silently, and both delete.
+        assert!(
+            store
+                .save(&setup("broken"), false)
+                .unwrap_err()
+                .is::<NameTaken>()
+        );
+        assert_eq!(
+            store.remove("broken").unwrap(),
+            Removed {
+                name: "broken".into(),
+                readable: false
+            }
+        );
+        assert_eq!(store.remove("FUTURE").unwrap().name, "FUTURE");
+        assert_eq!(store.remove("good").unwrap().name, "good");
+        assert!(store.list().unwrap().is_empty());
+        let missing = store.remove("good").unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&missing),
+            Some("unavailable")
+        );
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn a_copied_or_renamed_file_is_not_another_setup() {
+        let store = Store::at(temp("renamed"));
+        let bench = store.save(&setup("bench"), false).unwrap();
+        fs::copy(&bench, store.dir().join("other.json")).unwrap();
+        let list = store.list().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].name.as_str(), list[0].status), ("bench", None));
+        assert_eq!(list[1].name, "other");
+        assert_eq!(list[1].status, Some(FileStatus::Unreadable));
+        assert!(
+            list[1]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("named bench, not other"),
+            "{list:?}"
+        );
+        let error = store.get("other").unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&error),
+            Some("unavailable")
+        );
+        // Deleting other removes other.json and says so; bench stays.
+        assert_eq!(store.remove("other").unwrap().name, "other");
+        assert!(bench.exists());
+        assert_eq!(store.list().unwrap().len(), 1);
+        // A file name with capitals is flagged, and deletes by that name.
+        let mut shelf = setup("shelf");
+        shelf.name = "shelf".into();
+        fs::write(
+            store.dir().join("Shelf.json"),
+            serde_json::to_vec_pretty(&shelf).unwrap(),
+        )
+        .unwrap();
+        let list = store.list().unwrap();
+        let row = list.iter().find(|row| row.name == "Shelf").unwrap();
+        assert_eq!(row.status, Some(FileStatus::Unreadable));
+        assert!(row.reason.as_deref().unwrap().contains("capital letters"));
+        store.remove("Shelf").unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        // Files no setup could be named are not setups.
+        fs::write(store.dir().join("my notes.json"), b"{}").unwrap();
+        assert_eq!(store.list().unwrap().len(), 1);
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn notes_reject_control_characters() {
+        for bad in ["a\x1b[2Jb", "a\nb", "\x1b]0;pwned\x07", "tab\there"] {
+            let mut note = setup("note");
+            note.note = Some(bad.into());
+            let error = format!("{:#}", validate(&note).unwrap_err());
+            assert!(error.contains("control characters"), "{bad:?}: {error}");
+            assert!(validate_note(bad).is_err());
+            assert!(parse(&serde_json::to_vec(&note).unwrap()).is_err());
+        }
+        validate_note("Ring light at 60% · überall").unwrap();
+    }
+
+    #[test]
+    fn sizes_are_measured_as_stored_and_large_readings_still_save() {
+        let banks = || {
+            [
+                "GainSelector",
+                "LineSelector",
+                "TriggerSelector",
+                "CounterSelector",
+            ]
+            .map(|selector| Bank {
+                selector: selector.into(),
+                value: "Line0".into(),
+            })
+            .to_vec()
+        };
+        let reading = Reading {
+            camera: setup("x").camera,
+            auto: None,
+            values: (0..MAX_SETUP_VALUES)
+                .map(|i| SetupValue {
+                    at: banks(),
+                    ..value(&format!("Feature{i}"), serde_json::json!(i))
+                })
+                .collect(),
+            skipped: (0..MAX_SKIPPED)
+                .map(|i| Skipped {
+                    feature: format!("Skipped{i}"),
+                    at: banks(),
+                    reason: "r".repeat(240),
+                })
+                .collect(),
+        };
+        let big = from_read("big", None, reading.clone()).unwrap();
+        assert!(stored_bytes(&big).unwrap().len() <= MAX_SETUP_BYTES);
+        assert!(big.skipped.len() < MAX_SKIPPED);
+        let last = big.skipped.last().unwrap();
+        assert_eq!(last.feature, "(more)");
+        let listed = big.skipped.len() - 1;
+        assert_eq!(
+            last.reason,
+            format!("{} more skipped values not listed", MAX_SKIPPED - listed)
+        );
+        // It saves and imports back as written.
+        let dir = temp("size");
+        let store = Store::at(dir.join("setups"));
+        let path = store.save(&big, false).unwrap();
+        assert_eq!(
+            store.import(&path, Some("again"), false).unwrap().values,
+            big.values
+        );
+        assert_eq!(store.get("again").unwrap().skipped, big.skipped);
+        // Values that cannot fit at all are unsupported, not a bare limit.
+        let mut huge = reading;
+        for value in &mut huge.values {
+            value.value = Scalar::String("x".repeat(600));
+        }
+        let error = from_read("huge", None, huge).unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&error),
+            Some("unsupported")
+        );
+        // A document small when compact but over the limit as stored is
+        // refused when read, not only when saved.
+        let mut document = setup("pretty");
+        let mut i = 0;
+        while stored_bytes(&document).unwrap().len() <= MAX_SETUP_BYTES {
+            document.skipped.push(Skipped {
+                feature: format!("Skipped{i}"),
+                at: banks(),
+                reason: "r".into(),
+            });
+            i += 1;
+        }
+        let compact = serde_json::to_vec(&document).unwrap();
+        assert!(compact.len() <= MAX_SETUP_BYTES);
+        let error = format!("{:#}", parse(&compact).unwrap_err());
+        assert!(error.contains("256 KiB"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn inline_setups_accept_the_show_envelope() {
+        let bench = setup("bench");
+        let bare = serde_json::json!({"op":"apply_setup","setup":bench});
+        let wrapped = serde_json::json!({
+            "op":"apply_setup",
+            "setup":{"version":1,"ok":true,"result":bench}
+        });
+        let parse_command =
+            |json: &serde_json::Value| SessionCommand::from_json_slice(json.to_string().as_bytes());
+        let expected = parse_command(&bare).unwrap();
+        assert_eq!(
+            serde_json::to_value(parse_command(&wrapped).unwrap()).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let diff = serde_json::json!({
+            "op":"setup_diff",
+            "setup":{"version":1,"ok":true,"result":bench}
+        });
+        assert!(parse_command(&diff).is_ok());
+        for bad in [
+            serde_json::json!({"version":1,"ok":false,"result":bench}),
+            serde_json::json!({"version":2,"ok":true,"result":bench}),
+            serde_json::json!({"version":1,"ok":true,"result":bench,"extra":1}),
+        ] {
+            let error =
+                parse_command(&serde_json::json!({"op":"apply_setup","setup":bad})).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("setup show NAME --json"),
+                "{error:#}"
+            );
+        }
+        let mut newer = serde_json::to_value(&bench).unwrap();
+        newer["version"] = serde_json::json!(2);
+        newer["lens"] = serde_json::json!(1);
+        let error =
+            parse_command(&serde_json::json!({"op":"setup_diff","setup":newer})).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("newer Capturefab"),
+            "{error:#}"
+        );
     }
 
     #[test]

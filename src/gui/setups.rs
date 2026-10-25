@@ -364,7 +364,15 @@ impl Workbench {
                 state.name_error = None;
                 state.taken = false;
             }
-            Input::Note(note) => state.note = note.chars().take(store::MAX_NOTE).collect(),
+            Input::Note(note) => {
+                // A note stays on one line: pasted line breaks and escapes
+                // are dropped rather than failing the save.
+                state.note = note
+                    .chars()
+                    .filter(|c| !c.is_control())
+                    .take(store::MAX_NOTE)
+                    .collect()
+            }
             Input::Save(replace) => {
                 let name = state.name.trim().to_owned();
                 if let Err(error) = store::validate_name(&name) {
@@ -712,18 +720,28 @@ impl Workbench {
                 let live = self.setup_camera_info();
                 let mut rows = column![].spacing(6);
                 for summary in list {
-                    let other = live.is_some_and(|live| {
-                        !(summary
-                            .vendor
-                            .trim()
-                            .eq_ignore_ascii_case(live.vendor.trim())
-                            && summary.model.trim().eq_ignore_ascii_case(live.model.trim()))
-                    });
-                    let mut detail = vec![
-                        camera_label(&summary.vendor, &summary.model),
-                        format!("saved {}", saved_on(&summary.saved_at)),
-                        plural(summary.values as u64, "setting", "settings"),
-                    ];
+                    let other = summary.readable()
+                        && live.is_some_and(|live| {
+                            !(summary
+                                .vendor
+                                .trim()
+                                .eq_ignore_ascii_case(live.vendor.trim())
+                                && summary.model.trim().eq_ignore_ascii_case(live.model.trim()))
+                        });
+                    let mut detail = match summary.status {
+                        None => vec![
+                            camera_label(&summary.vendor, &summary.model),
+                            format!("saved {}", saved_on(&summary.saved_at)),
+                            plural(summary.values as u64, "setting", "settings"),
+                        ],
+                        Some(store::FileStatus::NewerVersion) => {
+                            vec!["Saved by a newer Capturefab; open it to delete it".into()]
+                        }
+                        Some(store::FileStatus::Unreadable) => vec![format!(
+                            "Cannot be read: {}",
+                            summary.reason.as_deref().unwrap_or("damaged file")
+                        )],
+                    };
                     if other {
                         detail.push("another model".into());
                     }
@@ -1290,23 +1308,27 @@ fn scene_list() -> Vec<Summary> {
     vec![
         Summary {
             name: "bench-basler".into(),
-            transport: crate::types::Transport::GigE,
+            transport: Some(crate::types::Transport::GigE),
             vendor: "Basler".into(),
             model: "acA1920-40gm".into(),
             serial: Some("23456789".into()),
             saved_at: "2026-09-14T09:12:00Z".into(),
             values: 42,
             note: Some("Tuned for the inspection bench".into()),
+            status: None,
+            reason: None,
         },
         Summary {
             name: "line-2-mono".into(),
-            transport: crate::types::Transport::Simulator,
+            transport: Some(crate::types::Transport::Simulator),
             vendor: "Capturefab".into(),
             model: "Pattern camera".into(),
             serial: Some("SIM0".into()),
             saved_at: "2026-10-25T14:03:11Z".into(),
             values: 6,
             note: Some("Ring light at 60%".into()),
+            status: None,
+            reason: None,
         },
     ]
 }

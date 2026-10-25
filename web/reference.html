@@ -365,11 +365,11 @@ capturefab --session bench status --json</code></pre></div>
 <p>Save the camera's current writable settings under a name. Values a firmware auto drives, network and user-set settings are left out and listed under <code>skipped</code>.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>NAME</code></td><td>Setup name: 1–64 letters, digits, <code>.</code>, <code>-</code> and <code>_</code>.</td><td>Required</td></tr>
-<tr><td><code>--note</code></td><td>A short note, such as the lighting it was tuned for.</td><td>None</td></tr>
+<tr><td><code>--note</code></td><td>A short note, such as the lighting it was tuned for: one line, at most 512 characters.</td><td>None</td></tr>
 <tr><td><code>--replace</code></td><td>Overwrite a saved setup with the same name.</td><td>Off</td></tr>
 </tbody></table></div>
 <h3 id="command-setup-list"><code>capturefab setup list</code></h3>
-<p>List saved setups with their camera, date and value count, and the folder that holds them (<code>dir</code>).</p>
+<p>List saved setups with their camera, date and value count, and the folder that holds them (<code>dir</code>). A file that cannot be read, such as a damaged one, one from a newer Capturefab or a copy named differently from its file, is listed under its file name with <code>status</code> (<code>unreadable</code> or <code>newer_version</code>) and <code>reason</code>.</p>
 <h3 id="command-setup-show"><code>capturefab setup show</code></h3>
 <p>Show a saved setup's values. With <code>--json</code> it prints the setup document; redirect it to a file to back up or share the setup.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
@@ -393,7 +393,7 @@ capturefab --session bench status --json</code></pre></div>
 <tr><td><code>--yes</code></td><td>Confirm disruptive changes, such as trigger and I/O line settings.</td><td>Off</td></tr>
 </tbody></table></div>
 <h3 id="command-setup-delete"><code>capturefab setup delete</code></h3>
-<p>Delete a saved setup. The camera is not changed.</p>
+<p>Delete a saved setup, including one <code>setup list</code> shows as unreadable. The camera is not changed.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>NAME</code></td><td>Saved setup name.</td><td>Required</td></tr>
 </tbody></table></div>
