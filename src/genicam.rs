@@ -2015,6 +2015,7 @@ fn evaluate<T: Operand>(expression: &str, vars: &BTreeMap<String, T>) -> Result<
         pos: 0,
         vars,
         depth: 0,
+        skip: 0,
     };
     let value = parser.expr(0)?;
     ensure!(
@@ -2029,8 +2030,25 @@ struct Expr<'a, T> {
     pos: usize,
     vars: &'a BTreeMap<String, T>,
     depth: usize,
+    /// Nonzero while parsing an operand whose value is discarded: the untaken
+    /// branch of `?:` or the short-circuited side of `&&` and `||`. Its syntax
+    /// is still checked, but its arithmetic cannot fail the formula.
+    skip: usize,
 }
 impl<T: Operand> Expr<'_, T> {
+    fn compute(&self, value: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.skip > 0 {
+            Ok(T::default())
+        } else {
+            value()
+        }
+    }
+    fn discard(&mut self, skip: bool, min: u8) -> Result<T> {
+        self.skip += usize::from(skip);
+        let value = self.expr(min);
+        self.skip -= usize::from(skip);
+        value
+    }
     fn expr(&mut self, min: u8) -> Result<T> {
         self.depth += 1;
         ensure!(self.depth <= MAX_DEPTH, "formula nesting exceeds limit");
@@ -2047,7 +2065,7 @@ impl<T: Operand> Expr<'_, T> {
                         "unclosed formula function"
                     );
                     self.pos += 1;
-                    T::call(&n, arg)?
+                    self.compute(|| T::call(&n, arg))?
                 } else {
                     *self
                         .vars
@@ -2066,21 +2084,22 @@ impl<T: Operand> Expr<'_, T> {
             }
             Token::Op(op) if matches!(op.as_str(), "+" | "-" | "!" | "~") => {
                 let v = self.expr(12)?;
-                T::unary(&op, v)?
+                self.compute(|| T::unary(&op, v))?
             }
             _ => bail!("expected formula operand"),
         };
         loop {
             if self.tokens[self.pos] == Token::Q && min == 0 {
                 self.pos += 1;
-                let yes = self.expr(0)?;
+                let taken = lhs.truth();
+                let yes = self.discard(!taken, 0)?;
                 ensure!(
                     self.tokens[self.pos] == Token::Colon,
                     "expected ':' in formula"
                 );
                 self.pos += 1;
-                let no = self.expr(0)?;
-                lhs = if lhs.truth() { yes } else { no };
+                let no = self.discard(taken, 0)?;
+                lhs = if taken { yes } else { no };
                 continue;
             }
             let Token::Op(op) = &self.tokens[self.pos] else {
@@ -2105,11 +2124,15 @@ impl<T: Operand> Expr<'_, T> {
             }
             let op = op.clone();
             self.pos += 1;
-            let rhs = self.expr(if op == "**" { prec } else { prec + 1 })?;
+            let decided = match op.as_str() {
+                "&&" => !lhs.truth(),
+                "||" => lhs.truth(),
+                _ => false,
+            };
+            let rhs = self.discard(decided, if op == "**" { prec } else { prec + 1 })?;
             lhs = match op.as_str() {
-                "&&" => T::boolean(lhs.truth() && rhs.truth()),
-                "||" => T::boolean(lhs.truth() || rhs.truth()),
-                _ => T::binary(&op, lhs, rhs)?,
+                "&&" | "||" => T::boolean(if decided { op == "||" } else { rhs.truth() }),
+                _ => self.compute(|| T::binary(&op, lhs, rhs))?,
             };
         }
         self.depth -= 1;
@@ -2341,6 +2364,36 @@ mod tests {
         assert_eq!(evaluate("X=7 ? EXP(LN(1)) : 0", &vars).unwrap(), 1.0);
         assert!(evaluate("X / 0", &vars).is_err());
         assert!(evaluate("X + ", &vars).is_err());
+    }
+    #[test]
+    fn untaken_formula_branches_cannot_fail() {
+        let int = |expression: &str, vars: &[(&str, i64)]| {
+            let vars = vars.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+            evaluate::<i64>(expression, &vars)
+        };
+        let range = " ( ( MONO <> 1 ) ? 255 : ( ( BPP > 12 ) && ( ISPE = 1 ) ? ( 0xFFF << ( BPP - 12 ) ) : ( ( BPP > 16 ) && ( ISPE = 0 ) ? ( 0xFFFF << ( BPP - 16 ) ) : ( ( 1 << BPP) -1 ) ) ) ) ";
+        for (bpp, isp, max) in [(8, 1, 255), (12, 0, 4095), (16, 1, 65520)] {
+            let vars = [("MONO", 1), ("BPP", bpp), ("ISPE", isp)];
+            assert_eq!(int(range, &vars).unwrap(), max, "BPP={bpp}");
+        }
+        let option = "(FEAT<32)?((GEVOPT>>FEAT)&0x1):((FEAT<64)?((IPOPT>>(FEAT-32))&0x1) : ((FEAT=65)?MCCB:((FEAT=66)?SCCB:0)))";
+        for (feature, supported) in [(0, 0), (5, 1), (31, 1), (33, 1), (65, 1), (66, 0), (70, 0)] {
+            let vars = [
+                ("FEAT", feature),
+                ("GEVOPT", 0x8000_0020),
+                ("IPOPT", 0b10),
+                ("MCCB", 1),
+                ("SCCB", 0),
+            ];
+            assert_eq!(int(option, &vars).unwrap(), supported, "FEAT={feature}");
+        }
+        assert_eq!(int("(X <> 0) && (10 / X > 1)", &[("X", 0)]).unwrap(), 0);
+        assert_eq!(int("(X = 0) || (10 / X > 1)", &[("X", 0)]).unwrap(), 1);
+        let none = BTreeMap::new();
+        assert_eq!(evaluate::<f64>("0 ? LN(-1) * 2 : 3", &none).unwrap(), 3.0);
+        assert!(int("1 ? 1 / 0 : 0", &[]).is_err());
+        assert!(int("0 ? UNKNOWN : 0", &[]).is_err());
+        assert!(int("0 ? (1 : 0", &[]).is_err());
     }
     #[test]
     fn float_bitwise_operands_truncate_toward_zero() {
