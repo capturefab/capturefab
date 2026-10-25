@@ -6779,6 +6779,36 @@ fn login_add_saves_in_the_real_credential_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Split a command line printed with `hint::shell_quote`.
+fn shell_words(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for c in line.chars() {
+        match c {
+            '\'' => {
+                quoted = !quoted;
+                started = true;
+            }
+            ' ' if !quoted => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            c => {
+                word.push(c);
+                started = true;
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    words
+}
+
 /// Damaged and newer setup files are listed and deletable, notes stay on
 /// one line, and an inline workflow setup takes the `setup show` envelope.
 #[test]
@@ -6821,10 +6851,65 @@ fn unreadable_setups_list_and_delete_and_inline_setups_take_the_envelope() {
     let text = String::from_utf8_lossy(&cmd(&dir, &["setup", "list"]).stdout).into_owned();
     assert!(text.contains("cannot be read"), "{text}");
     assert!(text.contains("capturefab setup delete broken"), "{text}");
-    let (code, error) = run(&["--json", "setup", "show", "future"]);
-    assert_ne!(code, 0);
+    // A newer file is a good setup: the row never suggests deleting it.
+    let future_row = text
+        .lines()
+        .find(|line| line.starts_with("future"))
+        .unwrap();
+    assert!(
+        future_row.contains("saved by a newer Capturefab; update Capturefab to use it"),
+        "{text}"
+    );
+    assert!(!future_row.contains("delete"), "{text}");
+    // Using it is unsupported here, from the store or from a file; a
+    // damaged one is unavailable.
+    for args in [
+        &["--json", "setup", "show", "future"][..],
+        &["--json", "--camera", "sim:0", "setup", "diff", "future"],
+        &["--json", "--camera", "sim:0", "setup", "apply", "future"],
+    ] {
+        let (code, error) = run(args);
+        assert_eq!(
+            (code, error["error"]["code"].as_str()),
+            (5, Some("unsupported")),
+            "{args:?}: {error}"
+        );
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(message.contains("update Capturefab"), "{message}");
+        assert!(!message.contains("delete"), "{message}");
+    }
+    let future_file = cwd.join("future.json");
+    std::fs::write(&future_file, serde_json::to_vec(&future).unwrap()).unwrap();
+    let (code, error) = run(&["--json", "setup", "import", future_file.to_str().unwrap()]);
+    assert_eq!(
+        (code, error["error"]["code"].as_str()),
+        (5, Some("unsupported")),
+        "{error}"
+    );
+    let (code, error) = run(&["--json", "setup", "show", "broken"]);
+    assert_eq!(
+        (code, error["error"]["code"].as_str()),
+        (3, Some("unavailable")),
+        "{error}"
+    );
+    // A copied file's suggested command works as printed.
+    std::fs::copy(setups.join("low.json"), setups.join("copy.json")).unwrap();
+    let (code, error) = run(&["--json", "setup", "show", "copy"]);
+    assert_eq!(code, 3, "{error}");
     let message = error["error"]["message"].as_str().unwrap();
-    assert!(message.contains("newer Capturefab"), "{message}");
+    let (_, command) = message
+        .split_once("Save it under this name with: capturefab ")
+        .unwrap();
+    let (command, _) = command.split_once(", or remove").unwrap();
+    let args = shell_words(command);
+    let mut args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    args.insert(0, "--json");
+    json(&dir, &args);
+    assert_eq!(
+        json(&dir, &["--json", "setup", "show", "copy"])["name"],
+        "copy"
+    );
+    json(&dir, &["--json", "setup", "delete", "copy"]);
     let removed = json(&dir, &["--json", "setup", "delete", "broken"]);
     assert_eq!(removed["removed"], "broken");
     json(&dir, &["--json", "setup", "delete", "future"]);

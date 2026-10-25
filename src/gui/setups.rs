@@ -107,6 +107,11 @@ impl State {
     fn diff(&self) -> Option<&Value> {
         self.diff.as_ref()?.as_ref().ok()
     }
+
+    /// Why the chosen setup's file cannot be restored, when the list says so.
+    fn chosen_status(&self) -> Option<store::FileStatus> {
+        self.summary(self.chosen.as_deref()?)?.status
+    }
 }
 
 /// Run `work` on its own thread; `failed` stands in when it cannot run.
@@ -299,6 +304,10 @@ impl Workbench {
         else {
             return;
         };
+        if self.setups.chosen_status().is_some() {
+            // Nothing to compare: the page offers to delete it instead.
+            return;
+        }
         self.setups.diff_key = Some(self.setup_key());
         self.setups.confirm = false;
         // The preview always shows what both cameras share; restoring to
@@ -735,7 +744,10 @@ impl Workbench {
                             plural(summary.values as u64, "setting", "settings"),
                         ],
                         Some(store::FileStatus::NewerVersion) => {
-                            vec!["Saved by a newer Capturefab; open it to delete it".into()]
+                            vec![
+                                "Saved by a newer Capturefab; update Capturefab to restore it"
+                                    .into(),
+                            ]
                         }
                         Some(store::FileStatus::Unreadable) => vec![format!(
                             "Cannot be read: {}",
@@ -975,6 +987,25 @@ impl Workbench {
                 p,
             ));
         }
+        if let Some(status) = state.chosen_status() {
+            let reason = state
+                .chosen
+                .as_deref()
+                .and_then(|name| state.summary(name))
+                .and_then(|summary| summary.reason.clone())
+                .unwrap_or_else(|| "damaged file".into());
+            let message = match status {
+                store::FileStatus::NewerVersion => {
+                    "This setup was saved by a newer version of Capturefab. Update Capturefab to restore it.".to_owned()
+                }
+                store::FileStatus::Unreadable => format!(
+                    "This file cannot be read ({reason}). Delete it, or save the camera again under this name."
+                ),
+            };
+            return body
+                .push(text(message).size(style::BODY).color(p.text))
+                .into();
+        }
         let diff = match &state.diff {
             None => {
                 return body
@@ -1178,6 +1209,8 @@ impl Workbench {
         let applying = self.pending(Job::ApplySetup);
         let label = if applying {
             "Restoring…".to_owned()
+        } else if state.chosen_status().is_some() {
+            "Restore".to_owned()
         } else if state.confirm {
             "Confirm Restore".to_owned()
         } else if count == 0 {
@@ -1330,6 +1363,16 @@ fn scene_list() -> Vec<Summary> {
             status: None,
             reason: None,
         },
+        Summary::unreadable(
+            "line-3-copy",
+            store::FileStatus::Unreadable,
+            "line-3-copy.json holds a setup named line-3, not line-3-copy",
+        ),
+        Summary::unreadable(
+            "night-shift",
+            store::FileStatus::NewerVersion,
+            "setup version 2 was written by a newer Capturefab; this one reads version 1",
+        ),
     ]
 }
 
@@ -1710,6 +1753,23 @@ mod tests {
         );
         let _ = bench.setups_input(Input::Name("ok".into()));
         assert!(bench.setups.name_error.is_none());
+    }
+
+    #[test]
+    fn an_unreadable_setup_is_not_compared_and_offers_delete() {
+        for name in ["line-3-copy", "night-shift"] {
+            let mut bench = bench("setups");
+            // As a live sheet, so choosing would submit a comparison.
+            bench.setups.scene = false;
+            let _ = bench.setups_input(Input::Choose(name.into()));
+            assert_eq!(bench.setups.page, Page::Restore);
+            assert!(!bench.pending(Job::SetupDiff), "{name}");
+            assert!(bench.setups.diff.is_none(), "{name}");
+            bench.tick_setups();
+            assert!(!bench.pending(Job::SetupDiff), "{name}");
+            assert!(!enabled(&bench, "Restore"));
+            assert!(enabled(&bench, &format!("Delete setup {name}…")));
+        }
     }
 
     #[test]

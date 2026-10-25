@@ -242,7 +242,7 @@ pub struct Summary {
 }
 impl Summary {
     /// The row for a file the store cannot read.
-    fn unreadable(name: &str, status: FileStatus, reason: &str) -> Self {
+    pub fn unreadable(name: &str, status: FileStatus, reason: &str) -> Self {
         Self {
             name: name.into(),
             transport: None,
@@ -668,6 +668,28 @@ where
 
 /// Read and validate a setup file, reading at most `MAX_SETUP_BYTES`.
 pub fn read_file(path: &Path) -> Result<Setup> {
+    parse(&read_bytes(path)?).with_context(|| format!("read setup {}", path.display()))
+}
+
+/// Read a file in the store. A note with control characters, which older
+/// versions stored, is put on one line instead of making the setup
+/// unreadable; new notes are refused by `validate_note`.
+fn read_stored(path: &Path) -> Result<Setup> {
+    let bytes = read_bytes(path)?;
+    let mut setup =
+        document(serde_json::from_slice(&bytes).context("not a valid setup document")?)?;
+    if let Some(note) = &mut setup.note {
+        *note = note
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+    }
+    validate(&setup)?;
+    Ok(setup)
+}
+
+/// A file's bytes, refusing one larger than any setup.
+fn read_bytes(path: &Path) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     fs::File::open(path)
         .with_context(|| format!("open {}", path.display()))?
@@ -677,9 +699,16 @@ pub fn read_file(path: &Path) -> Result<Setup> {
     ensure!(
         bytes.len() <= MAX_SETUP_BYTES,
         "{} is larger than 256 KiB; it is not a setup",
-        path.display()
+        file_name(path)
     );
-    parse(&bytes).with_context(|| format!("read setup {}", path.display()))
+    Ok(bytes)
+}
+
+/// The file name alone, for messages: the folder is shown elsewhere.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
 }
 
 /// "sha256:" over the compact JSON of the document.
@@ -717,7 +746,15 @@ pub fn from_read(name: &str, note: Option<String>, mut reading: Reading) -> Resu
     }
     sort_values(&mut reading.values);
     reading.values.truncate(MAX_SETUP_VALUES);
-    reading.skipped.truncate(MAX_SKIPPED);
+    // Past the limit, keep room for the entry that counts the rest.
+    let over = if reading.skipped.len() > MAX_SKIPPED {
+        let keep = MAX_SKIPPED - 1;
+        let over = reading.skipped.len() - keep;
+        reading.skipped.truncate(keep);
+        over
+    } else {
+        0
+    };
     let mut setup = Setup {
         version: 1,
         name: name.into(),
@@ -728,20 +765,20 @@ pub fn from_read(name: &str, note: Option<String>, mut reading: Reading) -> Resu
         values: reading.values,
         skipped: reading.skipped,
     };
-    fit_skipped(&mut setup)?;
+    fit_skipped(&mut setup, over)?;
     validate(&setup)?;
     Ok(setup)
 }
 
 /// Drop skipped entries from the end until the setup fits its size limit,
-/// noting how many were left out, so a large camera still saves.
-fn fit_skipped(setup: &mut Setup) -> Result<()> {
+/// noting how many were left out, with the `dropped` already left out, so a
+/// large camera still saves.
+fn fit_skipped(setup: &mut Setup, mut dropped: usize) -> Result<()> {
     let fits =
         |setup: &Setup| -> Result<bool> { Ok(stored_bytes(setup)?.len() <= MAX_SETUP_BYTES) };
-    if fits(setup)? {
+    if dropped == 0 && fits(setup)? {
         return Ok(());
     }
-    let mut dropped = 0usize;
     while !setup.skipped.is_empty() && !fits(setup)? {
         setup.skipped.pop();
         dropped += 1;
@@ -786,17 +823,49 @@ fn closest<'a>(name: &str, names: impl IntoIterator<Item = &'a str>) -> Option<&
 
 /// A setup name was taken and `replace` was not given.
 #[derive(Debug)]
-pub struct NameTaken(pub String);
+pub struct NameTaken {
+    /// The saved setup's name, or the requested one when its file cannot
+    /// be read or holds another setup.
+    pub name: String,
+    /// Why the existing file is not a usable setup, if it is not.
+    pub problem: Option<&'static str>,
+}
 impl std::fmt::Display for NameTaken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "A setup named {} exists; pass --replace to overwrite it",
-            self.0
+            "A setup named {} exists{}; pass --replace to overwrite it",
+            self.name,
+            self.problem
+                .map(|problem| format!(" but {problem}"))
+                .unwrap_or_default()
         )
     }
 }
 impl std::error::Error for NameTaken {}
+
+/// A file in the store holding a setup named differently: a copy or a
+/// renamed file.
+#[derive(Debug)]
+struct Misnamed {
+    file: String,
+    holds: String,
+    name: String,
+}
+impl std::fmt::Display for Misnamed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} holds a setup named {}, not {}",
+            self.file, self.holds, self.name
+        )
+    }
+}
+impl std::error::Error for Misnamed {}
+
+fn newer(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<NewerVersion>())
+}
 
 /// What `Store::remove` deleted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -850,8 +919,9 @@ impl Store {
         let mut files = Vec::new();
         for entry in entries {
             let path = entry?.path();
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.ends_with(".json") && !name.starts_with('.') {
+            // Only files a setup could be named: `list` shows these, and
+            // the limit counts them.
+            if stem(&path).is_some() {
                 files.push(path);
             }
         }
@@ -882,7 +952,7 @@ impl Store {
                     reason: None,
                 },
                 Err(error) => {
-                    let status = if error.chain().any(|cause| cause.is::<NewerVersion>()) {
+                    let status = if newer(&error) {
                         FileStatus::NewerVersion
                     } else {
                         FileStatus::Unreadable
@@ -896,28 +966,23 @@ impl Store {
     }
     /// The setup in `path`, which `get(name)` opens, refusing one that is
     /// named differently: a copied or renamed file.
+    /// Its messages name the file alone, so a listed reason stays short.
     fn read_named(&self, path: &Path, name: &str) -> Result<Setup> {
         if self.path(name).file_name() != path.file_name() {
-            return Err(Categorized::error(
-                ErrorKind::Unavailable,
-                format!(
-                    "{} has capital letters; Capturefab names setup files in lower case. Rename it to {}.json",
-                    path.display(),
-                    name.to_ascii_lowercase()
-                ),
-            ));
+            bail!(
+                "{} has capital letters; Capturefab names setup files in lower case. Rename it to {}.json",
+                file_name(path),
+                name.to_ascii_lowercase()
+            );
         }
-        let setup = read_file(path)?;
+        let setup = read_stored(path)?;
         if !setup.name.eq_ignore_ascii_case(name) {
-            return Err(Categorized::error(
-                ErrorKind::Unavailable,
-                format!(
-                    "{} holds a setup named {}, not {name}; rename the file, or run capturefab setup import {} --name {name}",
-                    path.display(),
-                    printable(&setup.name),
-                    path.display()
-                ),
-            ));
+            return Err(Misnamed {
+                file: file_name(path),
+                holds: printable(&setup.name),
+                name: name.into(),
+            }
+            .into());
         }
         Ok(setup)
     }
@@ -928,11 +993,35 @@ impl Store {
         if !path.exists() {
             return Err(self.missing(name));
         }
-        self.read_named(&path, name).with_context(|| {
+        self.read_named(&path, name)
+            .map_err(|error| self.unusable(name, &path, error))
+    }
+    /// Why a saved setup's file cannot be used, and what to do about it.
+    fn unusable(&self, name: &str, path: &Path, error: anyhow::Error) -> anyhow::Error {
+        if newer(&error) {
+            return Categorized::error(
+                ErrorKind::Unsupported,
+                format!(
+                    "Setup {name} was saved by a newer Capturefab ({:#}); update Capturefab to use it",
+                    error.root_cause()
+                ),
+            );
+        }
+        let quoted = crate::hint::shell_quote(name);
+        let hint = if let Some(misnamed) = error.downcast_ref::<Misnamed>() {
             format!(
-                "Setup {name} cannot be read; save it again with --replace or remove it with capturefab setup delete {name}"
+                "{misnamed}. Save it under this name with: capturefab setup import {} --name {quoted} --replace, or remove the copy with: capturefab setup delete {quoted}",
+                crate::hint::shell_quote(&path.display().to_string())
             )
-        })
+        } else {
+            format!(
+                "{error:#}. Save the camera again with: capturefab --camera ID setup save {quoted} --replace, or remove it with: capturefab setup delete {quoted}"
+            )
+        };
+        Categorized::error(
+            ErrorKind::Unavailable,
+            format!("Setup {name} cannot be read: {hint}"),
+        )
     }
     fn missing(&self, name: &str) -> anyhow::Error {
         let names = self.list().unwrap_or_default();
@@ -952,10 +1041,23 @@ impl Store {
         let path = self.path(&setup.name);
         if path.exists() {
             if !replace {
-                let existing = read_file(&path)
-                    .map(|existing| existing.name)
-                    .unwrap_or_else(|_| setup.name.clone());
-                return Err(NameTaken(existing).into());
+                // Name the setup the user asked for, unless the file holds
+                // it under other capitals.
+                let taken = match self.read_named(&path, &setup.name) {
+                    Ok(existing) => NameTaken {
+                        name: existing.name,
+                        problem: None,
+                    },
+                    Err(error) => NameTaken {
+                        name: setup.name.clone(),
+                        problem: Some(if newer(&error) {
+                            "was saved by a newer Capturefab"
+                        } else {
+                            "cannot be read"
+                        }),
+                    },
+                };
+                return Err(taken.into());
             }
         } else {
             ensure!(
@@ -1544,9 +1646,25 @@ mod tests {
             error.contains("version 2 was written by a newer Capturefab"),
             "{error}"
         );
-        let error = format!("{:#}", store.get("future").unwrap_err());
-        assert!(error.contains("newer Capturefab"), "{error}");
-        assert!(error.contains("setup delete future"), "{error}");
+        // It is a good setup for a newer Capturefab: never steer it to
+        // deletion, and say it is unsupported here.
+        let error = store.get("future").unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&error),
+            Some("unsupported")
+        );
+        let error = format!("{error:#}");
+        assert!(error.contains("update Capturefab to use it"), "{error}");
+        assert!(
+            !error.contains("delete") && !error.contains("--replace"),
+            "{error}"
+        );
+        let error = store.get("broken").unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&error),
+            Some("unavailable")
+        );
+        assert!(format!("{error:#}").contains("setup delete broken"));
         let list = store.list().unwrap();
         let rows = list
             .iter()
@@ -1571,11 +1689,15 @@ mod tests {
         assert!(json[2].get("status").is_none());
         assert_eq!(json[2]["transport"], serde_json::json!(Transport::GigE));
         // Neither blocks its name silently, and both delete.
-        assert!(
-            store
-                .save(&setup("broken"), false)
-                .unwrap_err()
-                .is::<NameTaken>()
+        let taken = store.save(&setup("broken"), false).unwrap_err();
+        assert!(taken.is::<NameTaken>());
+        assert_eq!(
+            taken.to_string(),
+            "A setup named broken exists but cannot be read; pass --replace to overwrite it"
+        );
+        assert_eq!(
+            store.save(&setup("future"), false).unwrap_err().to_string(),
+            "A setup named future exists but was saved by a newer Capturefab; pass --replace to overwrite it"
         );
         assert_eq!(
             store.remove("broken").unwrap(),
@@ -1618,6 +1740,26 @@ mod tests {
             crate::types::error_transport_code(&error),
             Some("unavailable")
         );
+        // Saving over the copy names the setup asked for, not the one
+        // inside the file.
+        let taken = store.save(&setup("other"), false).unwrap_err();
+        assert_eq!(
+            taken.to_string(),
+            "A setup named other exists but cannot be read; pass --replace to overwrite it"
+        );
+        // The suggested import, quoted, makes the copy a setup of its own.
+        let message = error.to_string();
+        let import = format!(
+            "capturefab setup import {} --name other --replace",
+            crate::hint::shell_quote(&store.dir().join("other.json").display().to_string())
+        );
+        assert!(message.contains(&import), "{message}");
+        store
+            .import(&store.dir().join("other.json"), Some("other"), true)
+            .unwrap();
+        assert_eq!(store.get("other").unwrap().name, "other");
+        assert!(store.list().unwrap().iter().all(Summary::readable));
+        fs::copy(&bench, store.dir().join("other.json")).unwrap();
         // Deleting other removes other.json and says so; bench stays.
         assert_eq!(store.remove("other").unwrap().name, "other");
         assert!(bench.exists());
@@ -1636,10 +1778,52 @@ mod tests {
         assert!(row.reason.as_deref().unwrap().contains("capital letters"));
         store.remove("Shelf").unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
-        // Files no setup could be named are not setups.
+        // Files no setup could be named are not setups, and do not count
+        // toward the limit.
         fs::write(store.dir().join("my notes.json"), b"{}").unwrap();
+        fs::write(store.dir().join("a b.json"), b"{}").unwrap();
         assert_eq!(store.list().unwrap().len(), 1);
+        for i in 1..MAX_SETUPS {
+            store.save(&setup(&format!("s{i}")), false).unwrap();
+        }
+        assert_eq!(store.list().unwrap().len(), MAX_SETUPS);
+        let full = format!("{:#}", store.save(&setup("one-more"), false).unwrap_err());
+        assert!(full.contains("setups are saved"), "{full}");
         let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn reasons_name_files_not_long_paths() {
+        let deep = temp("long").join("a".repeat(120)).join("b".repeat(120));
+        let store = Store::at(deep.join("setups"));
+        let bench = store.save(&setup("bench"), false).unwrap();
+        fs::copy(&bench, store.dir().join("other.json")).unwrap();
+        let mut shelf = setup("shelf");
+        shelf.name = "shelf".into();
+        fs::write(
+            store.dir().join("Shelf.json"),
+            serde_json::to_vec_pretty(&shelf).unwrap(),
+        )
+        .unwrap();
+        let list = store.list().unwrap();
+        let reason = |name: &str| {
+            list.iter()
+                .find(|row| row.name == name)
+                .unwrap()
+                .reason
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(
+            reason("other"),
+            "other.json holds a setup named bench, not other"
+        );
+        assert_eq!(
+            reason("Shelf"),
+            "Shelf.json has capital letters; Capturefab names setup files in lower case. Rename it to shelf.json"
+        );
+        let _ = fs::remove_dir_all(temp("long"));
+        let _ = fs::remove_dir_all(&deep);
     }
 
     #[test]
@@ -1653,6 +1837,45 @@ mod tests {
             assert!(parse(&serde_json::to_vec(&note).unwrap()).is_err());
         }
         validate_note("Ring light at 60% · überall").unwrap();
+    }
+
+    #[test]
+    fn a_stored_note_with_a_tab_still_reads() {
+        // Older versions stored such notes; they stay usable.
+        let store = Store::at(temp("tabbed"));
+        let path = store.save(&setup("tabbed"), false).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["note"] = serde_json::json!("a\tb\nc");
+        fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+        let list = store.list().unwrap();
+        assert!(list[0].readable(), "{list:?}");
+        assert_eq!(list[0].note.as_deref(), Some("a b c"));
+        assert_eq!(store.get("tabbed").unwrap().note.as_deref(), Some("a b c"));
+        // A new file with one is still refused.
+        assert!(read_file(&path).is_err());
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn readings_past_the_skip_limit_count_what_they_leave_out() {
+        let reading = Reading {
+            camera: setup("x").camera,
+            auto: None,
+            values: vec![value("Gain", serde_json::json!(1))],
+            skipped: (0..1500)
+                .map(|i| Skipped {
+                    feature: format!("S{i}"),
+                    at: Vec::new(),
+                    reason: "r".into(),
+                })
+                .collect(),
+        };
+        let setup = from_read("many", None, reading).unwrap();
+        assert_eq!(setup.skipped.len(), MAX_SKIPPED);
+        let last = setup.skipped.last().unwrap();
+        assert_eq!(last.feature, "(more)");
+        assert_eq!(last.reason, "477 more skipped values not listed");
     }
 
     #[test]

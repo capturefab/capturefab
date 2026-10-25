@@ -798,7 +798,7 @@ Pass `--yes` only after the person approved those exact changes.
 The CLI also sends the reviewed disruptive features as `confirmed_disruptive`; the restore is refused (exit 2), changing nothing, if the camera changed since and the restore would now make another disruptive change.
 
 RPC `read_setup`, `setup_diff` and `apply_setup` take a setup `name` or an inline `setup` document, bare or inside the `setup show NAME --json` envelope.
-`setup list --json` rows with `status` (`unreadable` or `newer_version`) and `reason` are files this Capturefab cannot read; they have no camera, date or values, and `setup delete NAME` removes them.
+`setup list --json` rows with `status` (`unreadable` or `newer_version`) and `reason` are files this Capturefab cannot read; they have no camera, date or values. A `newer_version` file is a good setup that needs a newer Capturefab: `setup show|diff|apply` of it, or `setup import` of such a file, exits 5 (`unsupported`), so update Capturefab rather than delete it. An `unreadable` one exits 3 (`unavailable`), and `setup delete NAME` removes it.
 Workflows restore a setup with the step `{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}}`.
 RPC and workflow callers skip the `--yes` confirmation, as `set_many` does, but the model, node-kind and recording checks always apply.
 A failed restore puts every value back; exit 1.
