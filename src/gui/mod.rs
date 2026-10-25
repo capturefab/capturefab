@@ -3540,7 +3540,17 @@ impl Workbench {
             Message::Format(format) => {
                 let previous = std::mem::replace(&mut self.format, format.value);
                 let mut path = PathBuf::from(&self.output);
-                if path.extension().and_then(|extension| extension.to_str()) == Some(previous) {
+                // jpg and jpeg both name the JPEG format.
+                let same = |extension: &str, format: &str| {
+                    let jpeg = |name: &str| matches!(name, "jpg" | "jpeg");
+                    extension.eq_ignore_ascii_case(format)
+                        || jpeg(&extension.to_ascii_lowercase()) && jpeg(format)
+                };
+                if path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| same(extension, previous))
+                {
                     path.set_extension(self.format);
                     self.output = path.to_string_lossy().into_owned();
                 }

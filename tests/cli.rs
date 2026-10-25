@@ -209,6 +209,21 @@ fn automatic_session_targeting_workflow_paths_and_partial_failure() {
     assert_eq!(applied["completed_steps"], 4);
     assert!(plans.join("frames/shot.png").exists());
     assert!(!server.join("frames/shot.png").exists());
+    // The CLI refuses `-n 3 -o burst.png`; workflow and RPC capture steps
+    // keep filling a folder of that name, so validate and apply agree.
+    std::fs::write(&workflow, serde_json::to_vec(&serde_json::json!({"version":1,"steps":[
+        {"camera":"sim:workflow","command":{"op":"capture","output":"frames/burst.png","count":3,"timeout_ms":2000,"format":"png"}}
+    ]})).unwrap()).unwrap();
+    json(
+        &dir,
+        &["--json", "workflow", "validate", workflow.to_str().unwrap()],
+    );
+    let burst = json(
+        &dir,
+        &["--json", "workflow", "apply", workflow.to_str().unwrap()],
+    );
+    assert_eq!(burst["completed_steps"], 1);
+    assert!(plans.join("frames/burst.png/frame-000003.png").exists());
 
     std::fs::write(&workflow, r#"{"version":1,"steps":[{"camera":"sim:workflow","command":{"op":"set","feature":"Width","value":"128"}},{"command":{"op":"status","typo":true}}]}"#).unwrap();
     let invalid = cmd(
@@ -1773,7 +1788,7 @@ fn stale_session_descriptor_is_replaced_but_live_one_is_kept() {
         dir: dir.clone(),
     };
     let (mut third, refused) = serve();
-    assert!(refused.contains("already exists"), "{refused}");
+    assert!(refused.contains("is already running"), "{refused}");
     third.wait().unwrap();
 }
 
@@ -5769,4 +5784,607 @@ fn resource_limits_are_automatic_persisted_and_reject_invalid_values_without_cam
     assert!(reset["policy"]["buffer_bytes"].is_null());
     assert!(reset["policy"].get("upload_bytes_per_second").is_none());
     let _ = std::fs::remove_dir_all(root);
+}
+
+fn failure(out: &std::process::Output) -> Value {
+    serde_json::from_slice::<Value>(&out.stdout).unwrap_or_else(|_| {
+        panic!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })["error"]
+        .clone()
+}
+
+#[test]
+fn discover_prints_aligned_plain_rows_and_a_next_step() {
+    let root = temp_root("discover-table");
+    let out = cmd(
+        &root,
+        &["--direct", "--simulate", "--timeout-ms", "300", "discover"],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stdout.starts_with("ID "), "{stdout}");
+    let row = stdout
+        .lines()
+        .find(|line| line.starts_with("sim:0 "))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    assert!(
+        row.contains("Simulator") && row.contains("Pattern camera"),
+        "{row}"
+    );
+    assert!(!stdout.contains("Next:"), "hints stay off stdout: {stdout}");
+    assert!(stderr.contains("Next: capturefab --camera "), "{stderr}");
+    let result = json(
+        &root,
+        &[
+            "--json",
+            "--direct",
+            "--simulate",
+            "--timeout-ms",
+            "300",
+            "discover",
+        ],
+    );
+    let sim = result["devices"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|device| device["id"] == "sim:0")
+        .cloned()
+        .unwrap();
+    assert_eq!(sim["transport"], "simulator");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn camera_selectors_explain_what_did_not_match() {
+    let root = temp_root("selector-hints");
+    let out = cmd(
+        &root,
+        &[
+            "--json",
+            "--direct",
+            "--timeout-ms",
+            "300",
+            "--camera",
+            "sim0",
+            "info",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let error = failure(&out);
+    assert_eq!(error["code"], "unavailable");
+    assert!(
+        error["message"].as_str().unwrap().contains("sim:0"),
+        "{error}"
+    );
+    let out = cmd(
+        &root,
+        &["--json", "--direct", "--camera", "./missing.mp4", "info"],
+    );
+    assert_eq!(out.status.code(), Some(3));
+    let error = failure(&out);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("file not found"),
+        "{error}"
+    );
+    let out = cmd(
+        &root,
+        &["--json", "--direct", "--camera", "192.168.1.300", "info"],
+    );
+    assert_eq!(out.status.code(), Some(2));
+    assert!(
+        failure(&out)["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a valid IPv4 address")
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn connect_takes_a_camera_argument_or_flag_and_reads_like_prose() {
+    let base = temp_root("connect-forms");
+    let root = base.join("sessions");
+    let cwd = base.join("cwd");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&root, &cwd, "conn"),
+        dir: base.clone(),
+    };
+    let flag = json(
+        &root,
+        &[
+            "--json",
+            "--session",
+            "conn",
+            "connect",
+            "--camera",
+            "sim:0",
+        ],
+    );
+    assert_eq!(flag["connected"]["id"], "sim:0");
+    let global = json(
+        &root,
+        &[
+            "--json",
+            "--session",
+            "conn",
+            "--camera",
+            "sim:1",
+            "connect",
+        ],
+    );
+    assert_eq!(global["connected"]["id"], "sim:1");
+    let env = json_env(
+        &root,
+        &[("CAPTUREFAB_CAMERA", "sim:2")],
+        &["--json", "--session", "conn", "connect"],
+    );
+    assert_eq!(env["connected"]["id"], "sim:2");
+    let missing = cmd(&root, &["--json", "--session", "conn", "connect"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert_eq!(failure(&missing)["code"], "usage");
+    let both = cmd(
+        &root,
+        &[
+            "--json",
+            "--session",
+            "conn",
+            "connect",
+            "sim:0",
+            "--camera",
+            "sim:1",
+        ],
+    );
+    assert_eq!(both.status.code(), Some(2));
+    let human = cmd(&root, &["--session", "conn", "connect", "sim:3"]);
+    assert!(
+        human.status.success(),
+        "{}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(!text.starts_with('{'), "{text}");
+    assert!(
+        text.contains("Connected ") && text.contains("(sim:3"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "Next: capturefab --session conn --camera sim:3 capture -o 'shot-{seq}.png'   (or start live acquisition: capturefab --session conn --camera sim:3 start)"
+        ),
+        "{text}"
+    );
+    let selected = json(
+        &root,
+        &["--json", "--session", "conn", "select", "--camera", "sim:0"],
+    );
+    assert_eq!(selected["active_camera"], "sim:0");
+    let human = cmd(&root, &["--session", "conn", "select", "sim:1"]);
+    assert_eq!(
+        String::from_utf8_lossy(&human.stdout),
+        "CLI calls without --camera now use sim:1.\n"
+    );
+    // A session name typo points at the running session.
+    let typo = cmd(&root, &["--json", "--session", "conx", "status"]);
+    assert_eq!(typo.status.code(), Some(3));
+    let error = failure(&typo);
+    assert_eq!(error["code"], "unavailable");
+    let message = error["message"].as_str().unwrap();
+    assert!(
+        message.contains("did you mean --session conn?"),
+        "{message}"
+    );
+    assert!(!message.contains("os error"), "{message}");
+}
+
+#[test]
+fn json_usage_errors_carry_structured_details() {
+    let root = temp_root("usage-details");
+    let out = cmd(&root, &["--json", "captur"]);
+    assert_eq!(out.status.code(), Some(2));
+    let error = failure(&out);
+    assert_eq!(error["code"], "usage");
+    assert_eq!(error["message"], "unrecognized subcommand 'captur'");
+    assert_eq!(error["details"]["kind"], "invalid_subcommand");
+    assert_eq!(error["details"]["suggestions"][0], "capture");
+    let out = cmd(&root, &["--json", "capture", "--bogus"]);
+    assert_eq!(out.status.code(), Some(2));
+    let error = failure(&out);
+    assert_eq!(error["details"]["invalid"], "--bogus");
+    assert!(
+        error["details"]["usage"]
+            .as_str()
+            .unwrap()
+            .starts_with("capturefab capture"),
+        "{error}"
+    );
+    assert!(
+        !error["message"].as_str().unwrap().contains('\n'),
+        "{error}"
+    );
+    let out = cmd(
+        &root,
+        &[
+            "--json",
+            "capture",
+            "-c",
+            "sim:0",
+            "-o",
+            "x.png",
+            "--on-exists",
+            "nope",
+        ],
+    );
+    let error = failure(&out);
+    assert_eq!(error["details"]["invalid"], "nope");
+    assert!(
+        !error["details"]["valid_values"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let human = cmd(&root, &["captur"]);
+    assert_eq!(human.status.code(), Some(2));
+    assert!(human.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&human.stderr).contains("tip:"));
+}
+
+#[test]
+fn subcommand_help_shows_examples_and_describes_every_option() {
+    let root = temp_root("help-examples");
+    for command in [
+        "capture", "record", "discover", "set", "serve", "workflow", "connect",
+    ] {
+        let out = cmd(&root, &[command, "--help"]);
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("Examples:"),
+            "{command}"
+        );
+    }
+    let schema = json(&root, &["--json", "schema"]);
+    let command = |name: &str| {
+        schema["cli"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|command| command["name"] == name)
+            .cloned()
+            .unwrap()
+    };
+    for (name, args) in [
+        ("capture", &["output", "count", "format"][..]),
+        ("forward", &["output", "codec", "fps", "bitrate"][..]),
+        ("connect", &["target"][..]),
+    ] {
+        let command = command(name);
+        for arg in command["arguments"].as_array().unwrap() {
+            if args.contains(&arg["name"].as_str().unwrap()) {
+                assert!(arg["description"].is_string(), "{name} {arg}");
+            }
+        }
+    }
+}
+
+#[test]
+fn network_scan_prints_a_readable_summary() {
+    let root = temp_root("network-human");
+    let out = cmd(&root, &["--direct", "--timeout-ms", "300", "network-scan"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.starts_with("Adapters\n"), "{text}");
+    assert!(text.contains("GigE cameras"), "{text}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+fn text(output: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Capture names mean what they look like, and human output summarizes.
+#[test]
+fn capture_output_paths_and_summaries() {
+    let root = temp_root("capture-guardrails");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = |name: &str| root.join(name).to_str().unwrap().to_owned();
+    let capture = |args: &[&str]| {
+        let mut all = vec!["--camera", "sim:0", "capture"];
+        all.extend(args);
+        cmd(&dir, &all)
+    };
+    let json_capture = |args: &[&str]| {
+        let mut all = vec!["--json", "--camera", "sim:0", "capture"];
+        all.extend(args);
+        let out = cmd(&dir, &all);
+        let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code(), reply)
+    };
+    // A human summary, not a path dump; JSON keeps its fields and adds two.
+    let out = capture(&["-o", &format!("{}/", path("burst")), "-n", "3"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("Saved 3 PNG frames · "), "{stdout}");
+    assert!(
+        stdout.contains('×') && stdout.contains("frame-000003.png"),
+        "{stdout}"
+    );
+    let (code, reply) = json_capture(&["-o", &path("one.png")]);
+    assert_eq!(code, Some(0), "{reply}");
+    let frame = &reply["result"]["frames"][0];
+    assert!(frame["pixel_format"].is_u64(), "{reply}");
+    assert!(frame["pixel_format_name"].is_string(), "{reply}");
+    assert_eq!(
+        frame["file_bytes"].as_u64().unwrap(),
+        std::fs::metadata(path("one.png")).unwrap().len()
+    );
+    // A taken name fails, naming the one-flag fix.
+    let out = capture(&["-o", &path("one.png")]);
+    let (_, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("output already exists"), "{stderr}");
+    assert!(
+        stderr.contains("--on-exists number") && stderr.contains("one-{seq}.png"),
+        "{stderr}"
+    );
+    let (code, reply) = json_capture(&["-o", &path("one.png")]);
+    assert_eq!(code, Some(1));
+    assert_eq!(reply["error"]["code"], "operation_failed");
+    assert!(
+        reply["error"]["details"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("{seq}"),
+        "{reply}"
+    );
+    // Several frames to one image name is a usage error with a suggestion.
+    let (code, reply) = json_capture(&["-o", &path("shot.jpg"), "-n", "3"]);
+    assert_eq!(code, Some(2), "{reply}");
+    assert_eq!(reply["error"]["code"], "usage");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("shot-{seq}.jpg"),
+        "{reply}"
+    );
+    assert!(!root.join("shot.jpg").exists());
+    let (code, reply) = json_capture(&["-o", &path("shot-{seq}.jpg"), "-n", "3"]);
+    assert_eq!(code, Some(0), "{reply}");
+    for n in 1..=3 {
+        assert!(root.join(format!("shot-{n:04}.jpg")).is_file());
+    }
+    // A trailing separator is a folder; a missing extension is added; a
+    // contradicting format is refused before anything is written.
+    let (code, reply) = json_capture(&["-o", &format!("{}/", path("newdir"))]);
+    assert_eq!(code, Some(0), "{reply}");
+    assert!(root.join("newdir/frame-000001.png").is_file());
+    let (code, reply) = json_capture(&["-o", &path("y.jpg"), "-f", "png"]);
+    assert_eq!(
+        (code, &reply["error"]["code"]),
+        (Some(2), &Value::from("usage")),
+        "{reply}"
+    );
+    assert!(!root.join("y.jpg").exists());
+    let (code, reply) = json_capture(&["-o", &path("z/{seq}"), "-n", "2"]);
+    assert_eq!(code, Some(0), "{reply}");
+    assert!(root.join("z/0001.png").is_file() && root.join("z/0002.png").is_file());
+    let (code, reply) = json_capture(&["-o", &path("noext")]);
+    assert_eq!(code, Some(0), "{reply}");
+    assert!(root.join("noext.png").is_file());
+    // A local time lapse reports each frame on stderr and ends in one line.
+    let out = capture(&[
+        "-o",
+        &format!("{}/", path("tl")),
+        "-n",
+        "2",
+        "--interval",
+        "200ms",
+    ]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stderr.contains("1/2 saved"), "{stderr}");
+    assert!(stdout.contains("Captured 2 of 2"), "{stdout}");
+    assert!(
+        !stdout.contains("first_at_ms") && !stdout.contains('{'),
+        "{stdout}"
+    );
+    // Storage and info read as prose; JSON keeps every field.
+    let out = cmd(&dir, &["storage"]);
+    let (stdout, _) = text(&out);
+    assert!(
+        stdout.starts_with("Using ") && stdout.contains("of 10 GiB"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("namespace_accounting") && !stdout.contains('{'),
+        "{stdout}"
+    );
+    assert!(json(&dir, &["--json", "storage"])["namespace_accounting"].is_string());
+    let out = cmd(&dir, &["--camera", "sim:0", "info"]);
+    let (stdout, _) = text(&out);
+    assert!(stdout.starts_with("sim:0 · "), "{stdout}");
+    assert!(!stdout.contains('{'), "{stdout}");
+    // A taken recording file fails before any encoder starts or banner shows.
+    std::fs::write(root.join("existing.mp4"), b"keep").unwrap();
+    let out = cmd(
+        &dir,
+        &[
+            "--camera",
+            "sim:0",
+            "record",
+            "-o",
+            &path("existing.mp4"),
+            "--duration",
+            "1s",
+        ],
+    );
+    let (_, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        !stderr.contains("Forwarding to") && !stderr.contains("Recording "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("existing-{seq}.mp4"), "{stderr}");
+    assert_eq!(std::fs::read(root.join("existing.mp4")).unwrap(), b"keep");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A burst cut short by storage reports what it saved and keeps exit 6;
+/// storage advice fits the command and reads in binary units.
+#[test]
+fn partial_bursts_and_storage_errors_say_what_happened() {
+    let root = temp_root("partial-burst");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let folder = root.join("f");
+    let out = cmd(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            folder.to_str().unwrap(),
+            "-n",
+            "3",
+            "--max-files",
+            "2",
+        ],
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(6), "{reply}");
+    assert_eq!(reply["error"]["code"], "storage_full");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("saved 2 of 3 frames"),
+        "{reply}"
+    );
+    assert!(folder.join("frame-000001.png").is_file() && folder.join("frame-000002.png").is_file());
+    let fresh = root.join("fresh");
+    let out = cmd(
+        &fresh,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            root.join("h.png").to_str().unwrap(),
+            "--max-space",
+            "1KiB",
+        ],
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(6), "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("--max-file-size") && message.contains("KiB"),
+        "{message}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A session's scheduled capture, job list and cancel read as prose.
+#[test]
+fn session_jobs_read_as_prose() {
+    let root = temp_root("session-jobs");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &root, "jobs"),
+        dir: root.clone(),
+    };
+    json(&dir, &["--json", "--session", "jobs", "connect", "sim:0"]);
+    let out = cmd(
+        &dir,
+        &[
+            "--session",
+            "jobs",
+            "capture",
+            "-n",
+            "3",
+            "--interval",
+            "5s",
+            "-o",
+            root.join("tl-{seq}.png").to_str().unwrap(),
+        ],
+    );
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("Scheduled job "), "{stdout}");
+    assert!(stdout.contains("--session jobs jobs"), "{stdout}");
+    let out = cmd(&dir, &["--session", "jobs", "jobs"]);
+    let (stdout, _) = text(&out);
+    assert!(
+        stdout.starts_with("ID ") && !stdout.contains("{\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n1     pending"), "{stdout}");
+    let id = json(&dir, &["--json", "--session", "jobs", "jobs"])["jobs"][0]["id"].to_string();
+    let out = cmd(&dir, &["--session", "jobs", "cancel", &id]);
+    let (stdout, stderr) = text(&out);
+    assert!(
+        stdout.contains(&format!("Cancelled capture job {id}.")),
+        "{stdout}{stderr}"
+    );
+}
+
+/// A timed recording that the session ends on time reports its final stats.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_timed_recording_reports_its_final_stats() {
+    let root = temp_root("timed-stats");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let clip = root.join("clip.mkv");
+    let result = json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "record",
+            "-o",
+            clip.to_str().unwrap(),
+            "--duration",
+            "2s",
+        ],
+    );
+    assert_eq!(result["stopped"]["by"], "duration", "{result}");
+    assert!(
+        result["stopped"]["stats"]["written"].as_u64().unwrap() > 0,
+        "{result}"
+    );
+    assert!(
+        result["stopped"]["stats"]["recording"]["bytes"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{result}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

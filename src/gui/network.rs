@@ -392,13 +392,7 @@ impl Workbench {
                 );
             }
             for interface in &report.interfaces {
-                let kind = match interface.kind {
-                    InterfaceKind::Wired => "Wired Ethernet",
-                    InterfaceKind::Wireless => "Wi-Fi",
-                    InterfaceKind::Loopback => "Loopback",
-                    InterfaceKind::Other => "Other adapter",
-                    InterfaceKind::Unknown => "Adapter type unknown",
-                };
+                let kind = crate::network::kind_label(interface.kind);
                 let speed = interface
                     .speed_mbps
                     .map_or_else(|| "speed unknown".into(), |speed| format!("{speed} Mbps"));

@@ -1,5 +1,7 @@
 pub(crate) mod assistant;
+mod human;
 mod resources;
+mod summary;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
 pub use resources::ResourcesCommand;
@@ -29,7 +31,7 @@ use std::{
     version,
     about = "Discover, configure, capture and record cameras. No command opens the GUI.",
     long_about = "Capturefab is a camera workbench for people and automation. Camera commands use the only running GUI or headless session automatically. Use --session NAME to choose one, or --direct --camera ID for a temporary camera worker. Local output paths are relative to this terminal, including when controlling the GUI.",
-    after_help = "Quick start:\n  capturefab                                  Open the visible workbench\n  capturefab discover --simulate --json        Find sources (including a test camera)\n  capturefab --camera sim:0 capture -o shot.png Capture in the running workbench\n  capturefab --direct -c sim:0 capture -o shot.png\n  capturefab --session gui set ExposureTime=5000\n  capturefab workflow validate workflow.json\n  capturefab --session gui workflow apply workflow.json\n\nExplore: <command> --help, schema --json, doctor --json, completions <shell>.\nPersistent work: start/stop, auto/manual, capture --interval, record, jobs/cancel.\nUse --json for one versioned result; progress and diagnostics go to stderr."
+    after_help = "Quick start:\n  capturefab                                        Open the visible workbench\n  capturefab discover --simulate                    Find sources (including a test camera)\n  capturefab --camera sim:0 capture -o shot.png     Capture via the running workbench, or a temporary worker if none\n  capturefab --direct -c sim:0 capture -o shot.png  Always use a temporary worker\n  capturefab --session gui set ExposureTime=5000    Change a setting in the workbench\n  capturefab workflow validate workflow.json        Check a plan without cameras\n  capturefab --session gui workflow apply workflow.json\n\nExplore: <command> --help, schema --json, doctor --json, completions <shell>.\nPersistent work: start/stop, auto/manual, capture --interval, record, jobs/cancel.\nUse --json for one versioned result; progress and diagnostics go to stderr."
 )]
 pub struct Cli {
     /// Emit one versioned JSON result on stdout; diagnostics stay on stderr
@@ -153,6 +155,7 @@ fn capture_format(format: Option<ImageFormat>, output: &str, count: u32) -> Resu
     }
     if count > 1 && !crate::naming::has_placeholder(output)
         || output == "-"
+        || crate::naming::names_directory(output)
         || std::path::Path::new(output).is_dir()
     {
         return Ok(ImageFormat::Png);
@@ -427,6 +430,9 @@ pub enum Command {
         command: ToolsCommand,
     },
     /// Validate and apply repeatable multi-camera setup, capture and recording plans
+    #[command(
+        after_help = "Examples:\n  capturefab workflow validate line1.json                Check every step without cameras\n  capturefab --session bench workflow apply line1.json   Run the steps in a session\n  capturefab --session bench workflow apply --dry-run line1.json"
+    )]
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommand,
@@ -444,7 +450,10 @@ pub enum Command {
         dataset: DatasetArg,
     },
     /// Discover GigE Vision, USB3 Vision, ONVIF, host cameras, document scanners and cameras on saved hubs
-    #[command(visible_aliases=["list","cameras"])]
+    #[command(
+        visible_aliases=["list","cameras"],
+        after_help = "Examples:\n  capturefab discover                      List cameras on this computer and network\n  capturefab discover --simulate           Include the built-in test camera sim:0\n  capturefab --json discover               One versioned JSON result for scripts\n  capturefab --timeout-ms 5000 discover    Wait longer for slow networks"
+    )]
     Discover,
     /// Host virtual GigE Vision, RTSP or ONVIF cameras using looping test data
     Simulate {
@@ -468,7 +477,11 @@ pub enum Command {
         features: Vec<String>,
     },
     /// Set one or more FEATURE=VALUE assignments (in the given order)
+    #[command(
+        after_help = "Examples:\n  capturefab -c sim:0 set ExposureTime=5000\n  capturefab -c sim:0 set Width=640 Height=480     Applied in order\n  capturefab -c sim:0 features --filter Exposure   Find feature names and bounds"
+    )]
     Set {
+        /// FEATURE=VALUE, e.g. ExposureTime=5000; see `features` for names
         #[arg(required = true)]
         assignments: Vec<String>,
     },
@@ -481,9 +494,20 @@ pub enum Command {
     /// Execute a GenICam command such as TriggerSoftware
     Execute { feature: String },
     /// Connect a camera in an existing persistent session
-    Connect { camera: String },
+    #[command(
+        after_help = "Examples:\n  capturefab discover                       List camera IDs\n  capturefab connect sim:0                  Connect the test camera\n  capturefab --camera 'avfoundation:HD Pro Webcam C920' connect\n  capturefab connect C920                   A unique model or name match also works"
+    )]
+    Connect {
+        /// Camera ID, serial, IP, media URI, hub:NAME/CAMERA or sim:0 (default: --camera / CAPTUREFAB_CAMERA)
+        #[arg(value_name = "CAMERA")]
+        target: Option<String>,
+    },
     /// Set the session's default camera for CLI calls without --camera
-    Select { camera: String },
+    Select {
+        /// Connected camera to make the default (default: --camera / CAPTUREFAB_CAMERA)
+        #[arg(value_name = "CAMERA")]
+        target: Option<String>,
+    },
     /// Observe all participants' actions, optionally waiting for a revision change
     Activity {
         /// Revision from a previous activity result; omit for immediate history
@@ -512,17 +536,24 @@ pub enum Command {
         revert: bool,
     },
     /// Record bounded video or forward frames to MediaMTX/NVR (RTSP, SRT, RTMP, UDP)
-    #[command(visible_alias = "record")]
+    #[command(
+        visible_alias = "record",
+        after_help = "Examples:\n  capturefab -c sim:0 record -o clip.mp4 --duration 30s\n  capturefab -c sim:0 record -o clip.mkv --codec h265 --fps 15 --duration 5m\n  capturefab -c sim:0 forward -o rtsp://localhost:8554/cam\n  capturefab --session bench record -o clip.mp4 --duration 1m --on-exists number"
+    )]
     Forward {
+        /// Local file (.mp4, .mov, .mkv, .ts, or .webm with av1) or a stream URL (rtsp://, srt://, rtmp://, udp://)
         #[arg(short = 'o', long)]
         output: String,
+        /// Video codec: h264, h265/hevc or av1
         #[arg(long, default_value = "h264")]
         codec: String,
         /// FFmpeg encoder name (e.g. libx264, h264_nvenc), or auto to probe available encoders
         #[arg(long, default_value = "auto")]
         encoder: String,
+        /// Output frame rate
         #[arg(long, default_value_t = 30.0)]
         fps: f64,
+        /// Target bitrate, e.g. 4M or 800k
         #[arg(long, default_value = "4M")]
         bitrate: String,
         /// Stop after this duration, e.g. 30s or 5m; the session ends the recording itself and the CLI waits for it. Omitted runs until Ctrl-C in direct mode
@@ -559,13 +590,17 @@ pub enum Command {
     /// Inspect bundled FFmpeg, codecs and supported protocols
     Ffmpeg,
     /// Capture complete frames to files; existing files are never overwritten
+    #[command(
+        after_help = "Examples:\n  capturefab -c sim:0 capture -o shot.png\n  capturefab -c sim:0 capture -n 50 --interval 2s -o 'line1/{camera}-{seq}.jpg'\n  capturefab -c sim:0 capture -n 10 -o frames/            A folder of frame-NNNNNN.png files\n  capturefab --direct -c sim:0 capture -o - > frame.png   One image to a pipe or file"
+    )]
     Capture {
-        /// File, directory, or template with {camera} {date} {time} {datetime} {seq} {frame}; '-' writes one image to stdout
+        /// File, folder (an existing one, or a name ending in /), or template with {camera} {date} {time} {datetime} {seq} {frame}; a name without an extension gets the format's; '-' writes one image to stdout
         #[arg(short = 'o', long)]
         output: String,
+        /// Number of frames (1-100000). With more than 1, give a folder (frames/ holds frame-NNNNNN files) or a template with {seq} or {frame}; one image name such as shot.jpg is refused
         #[arg(short='n',long,default_value_t=1,value_parser=clap::value_parser!(u32).range(1..=100_000))]
         count: u32,
-        /// Image format; inferred from a single file/template extension, otherwise PNG
+        /// Image format; inferred from the file or template extension, otherwise PNG. An image extension in the name must match it
         #[arg(short = 'f', long, value_enum)]
         format: Option<ImageFormat>,
         /// Set FEATURE=VALUE before acquisition; may be repeated
@@ -632,9 +667,14 @@ pub enum Command {
     /// Show the state of an existing persistent session
     Status,
     /// Run a persistent headless camera session in the foreground
+    #[command(
+        after_help = "Examples:\n  capturefab serve --name bench --camera sim:0      Keep a camera open for other commands\n  capturefab --session bench capture -o shot.png    Use it from another terminal\n  capturefab serve --name bench --listen 127.0.0.1:8787   Also serve the browser workbench"
+    )]
     Serve {
+        /// Session name other commands pass to --session
         #[arg(long, default_value = "bench")]
         name: String,
+        /// Start live acquisition as soon as the camera connects
         #[arg(long)]
         stream: bool,
         /// Serve the WASM remote workbench on this address (e.g. 100.64.0.1:8787)
@@ -824,6 +864,7 @@ impl<'a> Client<'a> {
                         request_timeout(cli, &SessionCommand::Status)?,
                         Some(&c.actor),
                     )?;
+                    note_loose_match(cli, selector, &result);
                     c.target = result["connected"]["id"].as_str().map(str::to_owned);
                 }
             } else {
@@ -837,10 +878,11 @@ impl<'a> Client<'a> {
         if cli.session.is_none()
             && let Some(selector) = &cli.camera
         {
-            c.call(SessionCommand::Connect {
+            let result = c.call(SessionCommand::Connect {
                 camera: selector.clone(),
                 timeout_ms: cli.timeout_ms,
             })?;
+            note_loose_match(cli, selector, &result);
         }
         Ok(c)
     }
@@ -886,6 +928,31 @@ impl<'a> Client<'a> {
         }
         Ok(result)
     }
+}
+
+/// Say on stderr which camera a loose name such as "C920" opened.
+fn note_loose_match(cli: &Cli, selector: &str, result: &Value) {
+    let connected = &result["connected"];
+    let Some(id) = connected["id"].as_str() else {
+        return;
+    };
+    if cli.json
+        || crate::camera::is_explicit_selector(selector)
+        || [
+            &connected["id"],
+            &connected["serial"],
+            &connected["address"],
+        ]
+        .iter()
+        .any(|value| value.as_str() == Some(selector))
+    {
+        return;
+    }
+    eprintln!(
+        "capturefab: using {} for '{}'",
+        crate::media::redact_url(id),
+        crate::media::redact_url(selector)
+    );
 }
 
 fn request_timeout(cli: &Cli, command: &SessionCommand) -> Result<Duration> {
@@ -1037,6 +1104,40 @@ fn input<T>(result: Result<T>) -> Result<T> {
             InvalidInput(format!("{error:#}")).into()
         }
     })
+}
+
+/// Refuse to dump image bytes into an interactive terminal, as curl does.
+fn binary_stdout_allowed(output: &str, stdout_is_terminal: bool) -> Result<()> {
+    ensure!(
+        output != "-" || !stdout_is_terminal,
+        "refusing to write a binary image to the terminal; redirect it (capture -o - > frame.png), pipe it, or use -o frame.png"
+    );
+    Ok(())
+}
+
+/// The camera `connect`/`select` name: their argument, else --camera or
+/// CAPTUREFAB_CAMERA. Two different cameras are a usage error.
+fn connect_target(cli: &Cli, target: &Option<String>) -> Result<String> {
+    match (target, &cli.camera) {
+        (Some(target), Some(camera)) => {
+            ensure!(
+                target == camera,
+                "two cameras given ({} and --camera {}); name one",
+                crate::media::redact_url(target),
+                crate::media::redact_url(camera)
+            );
+            Ok(target.clone())
+        }
+        (Some(camera), None) | (None, Some(camera)) => Ok(camera.clone()),
+        (None, None) => anyhow::bail!(
+            "{} needs a camera: capturefab {0} ID (find IDs with capturefab discover)",
+            if matches!(cli.command, Some(Command::Select { .. })) {
+                "select"
+            } else {
+                "connect"
+            }
+        ),
+    }
 }
 
 /// Prepare all command arguments before connecting or applying --set/--auto.
@@ -1191,12 +1292,12 @@ fn prepare_with(
         Some(Command::Execute { feature }) => Some(SessionCommand::Execute {
             feature: feature.clone(),
         }),
-        Some(Command::Connect { camera }) => Some(SessionCommand::Connect {
-            camera: camera.clone(),
+        Some(Command::Connect { target }) => Some(SessionCommand::Connect {
+            camera: connect_target(cli, target)?,
             timeout_ms: cli.timeout_ms,
         }),
-        Some(Command::Select { camera }) => Some(SessionCommand::Select {
-            camera: camera.clone(),
+        Some(Command::Select { target }) => Some(SessionCommand::Select {
+            camera: connect_target(cli, target)?,
         }),
         Some(Command::Capture {
             output,
@@ -1216,6 +1317,10 @@ fn prepare_with(
                 output != "-" || (cli.session.is_none() && !cli.json && *count == 1),
                 "binary stdout needs one frame, a direct --camera, and no --json"
             );
+            {
+                use std::io::IsTerminal;
+                binary_stdout_allowed(output, io::stdout().is_terminal())?;
+            }
             for setting in settings {
                 assignment(setting)?;
             }
@@ -1325,6 +1430,28 @@ fn prepare_with(
     Ok(command)
 }
 fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()> {
+    // Check names as typed, so the advice repeats the person's own spelling.
+    if let (
+        Some(
+            SessionCommand::Capture {
+                output,
+                count,
+                format,
+                ..
+            }
+            | SessionCommand::Schedule {
+                output,
+                count,
+                format,
+                ..
+            },
+        ),
+        Some(Command::Capture { output: typed, .. }),
+    ) = (command.as_ref(), &cli.command)
+        && output != "-"
+    {
+        crate::engine::check_capture_name(typed, *count, format)?;
+    }
     if let Some(command) = command {
         input(caller_output(command))?;
     }
@@ -1367,6 +1494,16 @@ fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()
             let resolved = crate::destination::resolve(destination.as_deref(), output)?;
             crate::engine::preflight_capture_output(&resolved.output, *count, format, *on_exists)?;
         }
+        // A taken recording file fails before any "Recording to" line.
+        if let SessionCommand::Forward {
+            output,
+            destination,
+            on_exists,
+            ..
+        } = command
+        {
+            crate::engine::preflight_recording_output(output, destination.as_deref(), *on_exists)?;
+        }
     }
     Ok(())
 }
@@ -1393,7 +1530,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
     {
         input(crate::workflow::resolve_selector(camera, &base))?;
     }
-    if let Some(Command::Connect { camera } | Command::Select { camera }) = &mut cli.command {
+    if let Some(Command::Connect { target } | Command::Select { target }) = &mut cli.command
+        && let Some(camera) = target
+    {
         input(crate::workflow::resolve_selector(camera, &base))?;
     }
     let mut prepared_tools = None;
@@ -1880,13 +2019,15 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Command::Execute { feature } => client.call(SessionCommand::Execute {
             feature: feature.clone(),
         })?,
-        Command::Connect { camera } => client.call(SessionCommand::Connect {
-            camera: camera.clone(),
-            timeout_ms: cli.timeout_ms,
-        })?,
-        Command::Select { camera } => client.call(SessionCommand::Select {
-            camera: camera.clone(),
-        })?,
+        Command::Connect { .. } => {
+            let command = prepared.clone().unwrap();
+            let result = client.call(command.clone())?;
+            if let SessionCommand::Connect { camera, .. } = &command {
+                note_loose_match(&cli, camera, &result);
+            }
+            result
+        }
+        Command::Select { .. } => client.call(prepared.clone().unwrap())?,
         Command::Forward {
             output: destination,
             duration,
@@ -1916,11 +2057,15 @@ pub fn run(mut cli: Cli) -> Result<()> {
             let mut timed = duration_ms
                 .map(|ms| TimedRecording::new(ms, &result, errors))
                 .transpose()?;
+            let shown = result["path"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::media::redact_url(destination));
             if cli.session.is_none() {
                 if !cli.json {
                     eprintln!(
-                        "Forwarding to {}. Press Ctrl-C to stop.",
-                        crate::media::redact_url(destination)
+                        "{}",
+                        summary::forward_banner(destination, &shown, duration_ms)
                     );
                 }
                 let epoch = std::time::Instant::now();
@@ -1948,7 +2093,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     match next {
                         RecordingWait::Wait => {}
                         RecordingWait::Finished => {
-                            result["stopped"] = TimedRecording::finished();
+                            result["stopped"] = timed
+                                .as_ref()
+                                .unwrap()
+                                .finished(&serde_json::to_value(&state.forwarding_progress)?);
                             break;
                         }
                         RecordingWait::Stop => {
@@ -1974,8 +2122,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 on_quit_signal(move || flag.store(true, Ordering::Relaxed))?;
                 if !cli.json {
                     eprintln!(
-                        "Recording/forwarding for {}. Ctrl-C stops this encoder.",
-                        duration.as_deref().unwrap()
+                        "{}",
+                        summary::forward_banner(destination, &shown, duration_ms)
                     );
                 }
                 let epoch = std::time::Instant::now();
@@ -1994,7 +2142,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         // Never stop-forward here: another participant may
                         // already record on this camera.
                         RecordingWait::Finished => {
-                            result["stopped"] = TimedRecording::finished();
+                            result["stopped"] = timed.finished(&state["forwarding_progress"]);
                             break;
                         }
                         RecordingWait::Stop => {
@@ -2062,11 +2210,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     .context("schedule returned no job ID")?;
                 if !cli.json {
                     eprintln!(
-                        "Capture job {id} scheduled. Keep this process running; Ctrl-C cancels."
+                        "Capture job {id} scheduled: {} frames every {}. Keep this process running; Ctrl-C cancels.",
+                        result["job"]["count"],
+                        summary::interval(result["job"]["interval_ms"].as_u64().unwrap_or(0))
                     );
                 }
                 let h = client.local.as_ref().unwrap();
                 let mut missing: Option<std::time::Instant> = None;
+                let mut shown = 0;
                 loop {
                     if h.is_shutting_down() {
                         return Ok(());
@@ -2083,10 +2234,21 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         continue;
                     };
                     missing = None;
+                    if !cli.json && job.captured > shown {
+                        // The poller can miss a frame when the interval is
+                        // shorter than its period; still count each one.
+                        for missed in shown + 1..job.captured {
+                            eprintln!("{missed}/{} saved", job.count);
+                        }
+                        shown = job.captured;
+                        eprintln!(
+                            "{}",
+                            summary::job_progress(&json!(job), crate::scheduling::now_ms())
+                        );
+                    }
                     match job.status.as_str() {
                         "complete" => {
                             let result = json!({"job":job});
-
                             return output(&cli, result);
                         }
                         "failed" => anyhow::bail!(
@@ -2168,6 +2330,83 @@ pub fn run(mut cli: Cli) -> Result<()> {
         _ => unreachable!(),
     };
     output(&cli, result)
+}
+
+/// The `--json` error for an argument-parsing failure: clap's first line
+/// as the message, and what an agent needs to fix it as `details`.
+pub fn clap_error_envelope(error: &clap::Error) -> Value {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let rendered = error.render().to_string();
+    let message = rendered
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("invalid usage");
+    let message = message.strip_prefix("error: ").unwrap_or(message);
+    let kind = match error.kind() {
+        ErrorKind::InvalidValue => "invalid_value".to_owned(),
+        ErrorKind::UnknownArgument => "unknown_argument".to_owned(),
+        ErrorKind::InvalidSubcommand => "invalid_subcommand".to_owned(),
+        ErrorKind::NoEquals => "no_equals".to_owned(),
+        ErrorKind::ValueValidation => "value_validation".to_owned(),
+        ErrorKind::TooManyValues => "too_many_values".to_owned(),
+        ErrorKind::TooFewValues => "too_few_values".to_owned(),
+        ErrorKind::WrongNumberOfValues => "wrong_number_of_values".to_owned(),
+        ErrorKind::ArgumentConflict => "argument_conflict".to_owned(),
+        ErrorKind::MissingRequiredArgument => "missing_required_argument".to_owned(),
+        ErrorKind::MissingSubcommand => "missing_subcommand".to_owned(),
+        ErrorKind::InvalidUtf8 => "invalid_utf8".to_owned(),
+        other => {
+            let mut name = String::new();
+            for (index, c) in format!("{other:?}").chars().enumerate() {
+                if c.is_ascii_uppercase() && index > 0 {
+                    name.push('_');
+                }
+                name.push(c.to_ascii_lowercase());
+            }
+            name
+        }
+    };
+    let strings = |kind: ContextKind| -> Vec<String> {
+        match error.get(kind) {
+            Some(ContextValue::String(value)) => vec![value.clone()],
+            Some(ContextValue::Strings(values)) => values.clone(),
+            Some(ContextValue::StyledStr(value)) => vec![value.to_string()],
+            Some(ContextValue::StyledStrs(values)) => {
+                values.iter().map(ToString::to_string).collect()
+            }
+            _ => Vec::new(),
+        }
+    };
+    let mut details = json!({"kind": kind});
+    // clap lists the closest match last; agents read the first.
+    let mut suggestions = strings(ContextKind::SuggestedSubcommand);
+    suggestions.extend(strings(ContextKind::SuggestedArg));
+    suggestions.extend(strings(ContextKind::SuggestedValue));
+    suggestions.reverse();
+    if !suggestions.is_empty() {
+        details["suggestions"] = json!(suggestions);
+    }
+    let invalid = [
+        ContextKind::InvalidSubcommand,
+        ContextKind::InvalidValue,
+        ContextKind::InvalidArg,
+    ]
+    .into_iter()
+    .flat_map(strings)
+    .find(|value| !value.is_empty());
+    if let Some(invalid) = invalid {
+        details["invalid"] = json!(invalid);
+    }
+    let valid = strings(ContextKind::ValidValue);
+    if !valid.is_empty() {
+        details["valid_values"] = json!(valid);
+    }
+    if let Some(usage) = strings(ContextKind::Usage).first() {
+        let usage = usage.trim();
+        details["usage"] = json!(usage.strip_prefix("Usage: ").unwrap_or(usage).trim());
+    }
+    json!({"version":1,"ok":false,"error":{"code":"usage","message":message,"details":details}})
 }
 
 pub fn write_json(value: &Value) -> Result<()> {
@@ -2259,7 +2498,9 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
                 entry["label"].as_str().unwrap_or("")
             )?;
             if let Some(detail) = entry["detail"].as_str() {
-                writeln!(out, "  {detail}")?;
+                for line in detail.lines() {
+                    writeln!(out, "  {line}")?;
+                }
             }
         }
     } else if matches!(&cli.command, Some(Command::Status)) {
@@ -2306,7 +2547,7 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             if cameras.is_empty() {
                 writeln!(
                     out,
-                    "No cameras connected. Use connect ID or --camera ID capture -o frame.png."
+                    "No cameras connected. Use capturefab connect ID, or add --camera ID to capture/record commands."
                 )?;
             }
         } else if let Some(camera) = value["connected"]["id"].as_str() {
@@ -2377,45 +2618,127 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             )?;
             writeln!(out, "{}", serde_json::to_string_pretty(&value)?)?;
         }
-    } else if let Some(files) = value["files"].as_array() {
-        writeln!(out, "Saved {} frame(s):", files.len())?;
-        for file in files {
-            writeln!(out, "  {}", file.as_str().unwrap_or(""))?;
+    } else if value["files"].is_array() {
+        write!(out, "{}", summary::capture_summary(&value))?;
+    } else if matches!(&cli.command, Some(Command::Capture { .. })) && value["job"].is_object() {
+        let job = &value["job"];
+        match &cli.session {
+            Some(session) if job["status"] != "complete" => write!(
+                out,
+                "{}",
+                summary::job_scheduled(job, cli.camera.as_deref(), session)
+            )?,
+            _ => write!(out, "{}", summary::job_finished(job))?,
+        }
+    } else if matches!(&cli.command, Some(Command::Jobs)) {
+        let jobs = value["jobs"].as_array().cloned().unwrap_or_default();
+        write!(
+            out,
+            "{}",
+            summary::jobs_table(&jobs, cli.session.as_deref(), crate::scheduling::now_ms())
+        )?;
+    } else if matches!(&cli.command, Some(Command::Cancel { .. })) {
+        writeln!(out, "Cancelled capture job {}.", value["cancelled"])?;
+    } else if matches!(
+        &cli.command,
+        Some(Command::Storage {
+            command: None | Some(StorageCommand::Status | StorageCommand::Configure { .. })
+        })
+    ) {
+        write!(out, "{}", summary::storage_summary(&value))?;
+    } else if let Some(Command::Forward { output: target, .. }) = &cli.command {
+        if value["stopped"].is_object() {
+            let (text, warnings) =
+                summary::forward_summary(target, &value, crate::scheduling::now_ms());
+            write!(out, "{text}")?;
+            out.flush()?;
+            for warning in warnings {
+                eprintln!("capturefab: {warning}");
+            }
+        } else {
+            write!(
+                out,
+                "{}",
+                summary::forward_started(
+                    target,
+                    &value,
+                    cli.session.as_deref().unwrap_or("temporary"),
+                    cli.camera.as_deref()
+                )
+            )?;
         }
     } else if let Some(devices) = value["devices"].as_array() {
-        if devices.is_empty() {
-            writeln!(
-                out,
-                "No cameras found. Try --simulate or a direct --camera IPv4 address."
-            )?;
-        } else {
-            writeln!(
-                out,
-                "{:<28} {:<10} {:<24} SERIAL",
-                "ID", "TRANSPORT", "MODEL"
-            )?;
-            for d in devices {
-                writeln!(
-                    out,
-                    "{:<28} {:<10} {:<24} {}",
-                    d["id"].as_str().unwrap_or(""),
-                    d["transport"].as_str().unwrap_or(""),
-                    d["model"]
-                        .as_str()
-                        .or_else(|| d["name"].as_str())
-                        .unwrap_or(""),
-                    d["serial"].as_str().unwrap_or("")
-                )?;
-            }
-        }
+        let kind = match &cli.command {
+            Some(Command::Native) => human::DeviceList::Native,
+            Some(Command::Scanners) => human::DeviceList::Scanners,
+            Some(Command::Onvif { .. }) => human::DeviceList::Onvif,
+            _ => human::DeviceList::Discover,
+        };
+        human::write_device_table(&mut out, devices, kind)?;
+        out.flush()?;
         if let Some(w) = value["warnings"].as_array() {
             for w in w {
                 eprintln!("capturefab: {}", w.as_str().unwrap_or(""));
             }
         }
+        for hint in human::next_steps(devices, kind) {
+            eprintln!("{hint}");
+        }
+    } else if let Some(scan) = value
+        .get("network_scan")
+        .filter(|_| matches!(&cli.command, Some(Command::NetworkScan)))
+        .and_then(|scan| serde_json::from_value::<crate::network::NetworkScan>(scan.clone()).ok())
+    {
+        crate::network::write_human(&scan, &mut out)?;
+        out.flush()?;
+        for warning in &scan.warnings {
+            eprintln!("capturefab: {warning}");
+        }
+    } else if matches!(&cli.command, Some(Command::Connect { .. }))
+        && let Some(id) = value["connected"]["id"].as_str()
+    {
+        let connected = &value["connected"];
+        let id = crate::media::redact_url(id);
+        let serial = connected["serial"]
+            .as_str()
+            .filter(|serial| !serial.is_empty() && *serial != connected["id"])
+            .map(|serial| format!(", S/N {serial}"))
+            .unwrap_or_default();
+        let session = cli
+            .session
+            .as_deref()
+            .map(|name| format!(" in session {name}"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "Connected {} ({id}{serial}){session}.",
+            connected["model"].as_str().unwrap_or("camera")
+        )?;
+        // Repeat the session the person named, so the hint reaches it even
+        // when several sessions are running.
+        let target = format!(
+            "{}--camera {}",
+            cli.session
+                .as_deref()
+                .map(|name| format!("--session {} ", crate::hint::shell_quote(name)))
+                .unwrap_or_default(),
+            crate::hint::shell_quote(&id)
+        );
+        writeln!(
+            out,
+            "Next: capturefab {target} capture -o 'shot-{{seq}}.png'   (or start live acquisition: capturefab {target} start)"
+        )?;
+    } else if matches!(&cli.command, Some(Command::Select { .. })) {
+        writeln!(
+            out,
+            "CLI calls without --camera now use {}.",
+            crate::media::redact_url(value["active_camera"].as_str().unwrap_or("no camera"))
+        )?;
+    } else if matches!(&cli.command, Some(Command::Disconnect)) {
+        writeln!(out, "Disconnected.")?;
     } else if let Some(features) = value["features"].as_array() {
-        if let Some(camera) = value.get("camera") {
-            writeln!(out, "{}", serde_json::to_string_pretty(camera)?)?;
+        if let Some(camera) = value.get("camera").filter(|camera| camera.is_object()) {
+            write!(out, "{}", summary::info_header(camera))?;
         }
         for f in features {
             writeln!(
@@ -2503,7 +2826,7 @@ fn command_schema(command: &clap::Command) -> Value {
     })
 }
 fn schema() -> Value {
-    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder; see destination list and volumes"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
+    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json; stdout must be a pipe or file, not a terminal","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder; see destination list and volumes"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     contract["tools"] = tools::schema_contract();
     contract["assistant"] = assistant::schema_contract();
@@ -2527,13 +2850,13 @@ fn schema() -> Value {
         "--direct --camera ID bypasses automatic session attachment; --direct conflicts with explicit --session and overrides CAPTUREFAB_SESSION"
     );
     contract["capture"]["format_default"] = json!(
-        "Known single file/template extension infers png/jpeg/raw/pgm/ppm; sequences to directories and stdout default to png; --format overrides inference"
+        "Known single file/template extension infers png/jpeg/raw/pgm/ppm; sequences to directories and stdout default to png; --format overrides inference, but an explicit format that differs from a png/jpg/jpeg/raw/pgm/ppm extension in the name is a usage error (exit 2; jpg and jpeg are the same)"
     );
     contract["capture"]["path_base"] = json!(
         "CLI capture/record/RPC local output paths resolve in the calling terminal; workflow paths resolve beside their file; named destination paths remain relative to the destination"
     );
     contract["capture"]["paths"] = json!(
-        "file, directory (continues frame-NNNNNN numbering after the highest existing number) or template; {seq} picks the next free number; other existing names fail unless on_exists=number. Files are never overwritten."
+        "file, directory (an existing one or a name ending in a separator; continues frame-NNNNNN numbering after the highest existing number) or template; a file name or template whose last component has no extension gets the format's (.png, .jpg, .raw, .pgm, .ppm); with -n above 1 the CLI refuses a name ending in an image extension that is not an existing directory (usage, exit 2: use a template with {seq} or {frame}, or a folder), and an explicit --format contradicting an image extension; RPC and workflow capture steps instead save such a sequence into a folder of that name and keep the given name; {seq} picks the next free number; other existing names fail unless on_exists=number. Files are never overwritten."
     );
     contract["capture"]["placeholders"] = json!({
         "camera":"model-serial, limited to A-Z a-z 0-9 . _ - (at most 64 bytes)",
@@ -2545,7 +2868,8 @@ fn schema() -> Value {
     contract["capture"]["on_exists"] = json!({
         "values":["fail","number"],"default":"fail",
         "number":"an existing name without {seq} becomes stem-0001.ext, stem-0002.ext, ...",
-        "applies_to":"capture, schedule and local recordings (record/forward)"
+        "applies_to":"capture, schedule and local recordings (record/forward)",
+        "taken":"a taken name fails before acquisition or encoding starts (exit 1, operation_failed); the CLI adds error.details.hint with the {seq} template and --on-exists number that would save it"
     });
     contract["capture"]["context"] = json!({
         "cli":"--context KEY=VALUE (repeatable)","keys":"^[a-z][a-z0-9_]{0,31}$",
@@ -2554,11 +2878,11 @@ fn schema() -> Value {
         "recorded":"echoed in the capture result, kept on scheduled jobs and stored with each file in an open dataset"
     });
     contract["capture"]["result"] = json!({
-        "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?}",
-        "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the conditional-stop result",
+        "capture":"{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,file_bytes?,wall_ms,file?}],count,context?,destination?}; bytes is the raw acquired frame size, file_bytes the saved file size (absent for stdout). A burst that fails part way keeps its saved frames and its error category; the message starts with saved N of M frames to FOLDER (names)",
+        "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\",stats?:{accepted,written,dropped,late,stalled,recording?:{path,bytes,started_ms,ended_ms,encoder}}} when the session ended it on time (stats is absent from a worker that does not report them), else the conditional-stop result",
         "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, forwarding_until_ms while a timed recording or forward runs, and recording_path (the resolved absolute file; forwarding keeps the requested output) while a local recording runs",
         "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback and assistant cleanup use this form; explicit human stop-forward stops the current instance."},
-        "stop_forward":"{forwarding:null,stats:{accepted,written,dropped,late,stalled,encoder,error,recording?}|null}; Timed CLI fallback or interruption adds the conditional-stop result as stopped; normal timed completion returns {forwarding:null,by:duration}. late counts frames lost while the encoder was still busy (dropped includes them); stalled means no new camera frame for 2 s",
+        "stop_forward":"{forwarding:null,stats:{accepted,written,dropped,late,stalled,encoder,error,recording?}|null}; stop_forward_if returns the same shape. Timed CLI fallback or interruption adds the conditional-stop result as stopped; normal timed completion returns {forwarding:null,by:duration,stats?}. late counts frames lost while the encoder was still busy (dropped includes them); stalled means no new camera frame for 2 s",
     });
     contract["status"] = json!({
         "frames":"frames the worker acquired",
@@ -2635,6 +2959,9 @@ fn schema() -> Value {
     });
     contract["selection"]["direct"] = json!(
         "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:INDEX|v4l2:/dev/videoN|dshow:video=NAME|onvif:ENDPOINT|hub:NAME/CAMERA[?stream=MODE&fps=F]|scanner:sane:DEVICE|scanner:wia:ID|scanner:ica:UUID"
+    );
+    contract["selection"]["matching"] = json!(
+        "An exact ID, serial or address wins; otherwise a bare name opens the one local camera whose model or name (the ID after its kind) equals it, or whose model contains it as whole words, ignoring case (never part of a serial or ID), and stderr names the camera chosen. Hub cameras need their exact selector; several matches fail with exit 3. connect and select take the camera as an argument or from --camera / CAPTUREFAB_CAMERA. Scripts should use IDs from discover."
     );
     contract["selection"]["existing_session"] =
         json!("--session NAME [--camera ID] targets an existing visible GUI or headless worker");
@@ -3105,9 +3432,19 @@ impl TimedRecording {
             errors,
         })
     }
-    /// The `stopped` result of a recording the session ended on time.
-    fn finished() -> Value {
-        json!({"forwarding": null, "by": "duration"})
+    /// The `stopped` result of a recording the session ended on time, with
+    /// its final counters when `progress` (the status's
+    /// `forwarding_progress`) is this recording's, not a later one's.
+    fn finished(&self, progress: &Value) -> Value {
+        let mut stopped = json!({"forwarding": null, "by": "duration"});
+        if progress["id"].as_str() == Some(self.forwarding_id.as_str()) {
+            let mut stats = progress.clone();
+            if let Some(stats) = stats.as_object_mut() {
+                stats.remove("id");
+            }
+            stopped["stats"] = stats;
+        }
+        stopped
     }
     fn stop_command(&self) -> SessionCommand {
         SessionCommand::StopForwardIf {
@@ -3237,6 +3574,28 @@ fn check_in(deadline: Option<Duration>) -> Duration {
     deadline.map_or(MOST, |left| left.clamp(Duration::from_millis(100), MOST))
 }
 
+impl Cli {
+    /// The `-o` of a capture or recording, as typed.
+    pub fn typed_output(&self) -> Option<String> {
+        match &self.command {
+            Some(Command::Capture { output, .. } | Command::Forward { output, .. })
+                if output != "-" =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        }
+    }
+}
+/// How to save under a taken output name, built from the `-o` typed; a
+/// worker's reply keeps only the text, so that is checked too.
+pub fn exists_hint(error: &anyhow::Error, output: &str) -> Option<String> {
+    let taken = error
+        .chain()
+        .any(|cause| cause.is::<crate::storage::OutputExists>())
+        || format!("{error:#}").contains("output already exists");
+    taken.then(|| summary::exists_hint(output))
+}
 pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     #[cfg(feature = "ai")]
     if let Some(failure) = error
@@ -3332,6 +3691,65 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn binary_images_never_go_to_an_interactive_terminal() {
+        let error = binary_stdout_allowed("-", true).unwrap_err();
+        assert!(error.to_string().contains("terminal"), "{error:#}");
+        binary_stdout_allowed("-", false).unwrap();
+        binary_stdout_allowed("frame.png", true).unwrap();
+    }
+    #[test]
+    fn connect_takes_its_argument_or_the_global_camera() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap();
+        let target = |cli: &Cli| match &cli.command {
+            Some(Command::Connect { target } | Command::Select { target }) => {
+                connect_target(cli, target)
+            }
+            _ => unreachable!(),
+        };
+        let cli = parse(&["capturefab", "connect", "sim:0"]);
+        assert_eq!(target(&cli).unwrap(), "sim:0");
+        let cli = parse(&["capturefab", "connect", "--camera", "sim:1"]);
+        assert_eq!(target(&cli).unwrap(), "sim:1");
+        let cli = parse(&["capturefab", "--camera", "sim:1", "select", "sim:1"]);
+        assert_eq!(target(&cli).unwrap(), "sim:1");
+        let cli = parse(&["capturefab", "connect", "sim:0", "--camera", "sim:1"]);
+        assert!(
+            target(&cli)
+                .unwrap_err()
+                .to_string()
+                .contains("two cameras")
+        );
+        let cli = parse(&["capturefab", "select"]);
+        assert!(
+            target(&cli)
+                .unwrap_err()
+                .to_string()
+                .starts_with("select needs a camera")
+        );
+    }
+    #[test]
+    fn clap_errors_become_one_line_with_details() {
+        let error = Cli::try_parse_from(["capturefab", "discovr"]).unwrap_err();
+        let envelope = clap_error_envelope(&error);
+        assert_eq!(envelope["error"]["code"], "usage");
+        assert_eq!(
+            envelope["error"]["message"],
+            "unrecognized subcommand 'discovr'"
+        );
+        assert_eq!(envelope["error"]["details"]["suggestions"][0], "discover");
+        assert_eq!(envelope["error"]["details"]["invalid"], "discovr");
+        let error = Cli::try_parse_from(["capturefab", "capture"]).unwrap_err();
+        let details = &clap_error_envelope(&error)["error"]["details"];
+        assert_eq!(details["kind"], "missing_required_argument");
+        assert!(
+            details["usage"]
+                .as_str()
+                .unwrap()
+                .starts_with("capturefab capture"),
+            "{details}"
+        );
+    }
     #[test]
     fn capture_contract_omits_retired_sensor_commands() {
         for command in ["signals", "log"] {
@@ -3627,10 +4045,22 @@ mod tests {
         assert_eq!(short().next(failed, at, s(0), false), Failed);
         let retried = status(false, None, earlier, Some(since + 50));
         assert_eq!(short().next(retried, at, s(0), false), Failed);
+        // Final counters are this recording's only, never a replacement's,
+        // and an older worker without them reports none rather than zeros.
+        let progress =
+            json!({"id":id,"accepted":30,"written":30,"dropped":0,"late":0,"stalled":false});
         assert_eq!(
-            TimedRecording::finished(),
-            json!({"forwarding":null,"by":"duration"})
+            short().finished(&progress),
+            json!({"forwarding":null,"by":"duration","stats":{"accepted":30,"written":30,"dropped":0,"late":0,"stalled":false}})
         );
+        let mut other = progress.clone();
+        other["id"] = json!("22222222222222222222222222222222");
+        for absent in [other, Value::Null] {
+            assert_eq!(
+                short().finished(&absent),
+                json!({"forwarding":null,"by":"duration"})
+            );
+        }
     }
     #[test]
     fn timed_recording_fallback_cannot_stop_a_same_millisecond_replacement() {

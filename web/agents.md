@@ -131,6 +131,8 @@ Keep credentials out of logs, command transcripts and generated configuration fi
 | 5 | `unsupported` |
 | 6 | `storage_full` |
 
+An argument-parsing usage error (exit 2) has a one-line `message` and `error.details` with `kind` (such as `invalid_subcommand`, `unknown_argument` or `invalid_value`) and, when known, `invalid`, `suggestions` (best match first), `valid_values` and `usage`.
+
 `--timeout-ms` sets each frame or transport timeout from 1 to 60000 ms.
 `--request-timeout 5m` sets the session request deadline.
 Its default depends on the capture count.
@@ -184,7 +186,7 @@ Capturefab does not reduce `--max-file-size` automatically.
 The CLI sends `duration_ms`; the camera worker stops the encoder at `until_ms`.
 Computer sleep counts toward that deadline.
 A backward clock change does not extend the recording.
-The CLI waits and returns `"stopped":{"forwarding":null,"by":"duration"}`.
+The CLI waits and returns `"stopped":{"forwarding":null,"by":"duration","stats":{...}}` with the final counters.
 Ctrl-C stops the encoder early.
 
 Without a duration, session forwarding returns immediately and continues until `stop-forward`.
@@ -261,7 +263,7 @@ With several sessions, specify `--session NAME`; otherwise the CLI returns `usag
 Use `sessions` to find the visible workspace.
 Use `--direct --camera ID` for a separate temporary worker.
 
-Binary stdout capture uses a temporary worker and cannot use `--session`.
+Binary stdout capture uses a temporary worker and cannot use `--session`; it refuses an interactive terminal (exit 2), so redirect or pipe it.
 Use `--direct` to override an environment session.
 Camera control can be exclusive.
 
@@ -281,6 +283,8 @@ Use the session name returned by `sessions`; it can differ from `gui`.
 Inspection, feature writes, capture, recording, XML and memory commands connect a missing `--camera` source to the session.
 Persistent controls such as `start` and `auto` act on connected cameras.
 Use `connect ID` first.
+`connect` and `select` take the camera as an argument or from `--camera`/`CAPTUREFAB_CAMERA`.
+A selector matches an exact ID, serial or address first. A bare name such as `C920` that matches exactly one local camera's model or name, or whole words of its model, ignoring case (never part of a serial or ID), also opens it, and stderr names the camera chosen; several matches fail with exit 3 and list them. Hub cameras need their exact selector. Scripts should use the IDs from `discover`.
 Desktop and browser camera selection stays local to each participant.
 `select ID` sets the default for CLI calls without `--camera`.
 Use explicit targets when sharing a session.
@@ -882,7 +886,7 @@ capturefab --camera sim:thermal capture --format raw -o thermal.raw --json
 
 ## Name outputs and tag captures
 
-`capture` and local `record`/`forward` outputs accept a file, a directory or a template. Placeholders: `{camera}` (`model-serial`, limited to `A-Z a-z 0-9 . _ -` and 64 bytes, never the address), `{date}` (`YYYY-MM-DD`), `{time}` (`HHMMSS`), `{datetime}` (`YYYYMMDD-HHMMSS`), `{seq}` (next free number for that folder and pattern, 4 or more digits) and `{frame}` (1-based, 6 digits). Times are local time when the frame is requested. Any other `{name}` is `usage` (exit 2). `{seq}` may appear once, only in the file name, and never directly before a digit or `{date}`, `{time}`, `{datetime}` or `{frame}`. With `-n` above 1, a template without `{frame}` or `{seq}` needs `--on-exists number`.
+`capture` and local `record`/`forward` outputs accept a file, a directory or a template. Placeholders: `{camera}` (`model-serial`, limited to `A-Z a-z 0-9 . _ -` and 64 bytes, never the address), `{date}` (`YYYY-MM-DD`), `{time}` (`HHMMSS`), `{datetime}` (`YYYYMMDD-HHMMSS`), `{seq}` (next free number for that folder and pattern, 4 or more digits) and `{frame}` (1-based, 6 digits). Times are local time when the frame is requested. Any other `{name}` is `usage` (exit 2). `{seq}` may appear once, only in the file name, and never directly before a digit or `{date}`, `{time}`, `{datetime}` or `{frame}`. With `-n` above 1, a template without `{frame}` or `{seq}` needs `--on-exists number`, and a plain image name such as `shot.jpg` (not an existing folder) is `usage` (exit 2) with the suggestion `-o 'shot-{seq}.jpg'` or `-o shot/`. A name ending in `/` is a folder. A file name or template whose last component has no extension gets the format's (`.png`, `.jpg`, `.raw`, `.pgm`, `.ppm`). A format that contradicts an image extension in the name (`-o y.jpg --format png`) is `usage`; jpg and jpeg are the same. These two name checks apply to the CLI as typed; RPC and workflow `capture` steps keep saving a sequence to `shot.jpg/frame-NNNNNN.ext` and write the requested format under the given name.
 
 ```sh
 capturefab --session gui --camera sim:0 capture -o 'line1/{date}/{camera}-{datetime}-{seq}.png' \
@@ -891,9 +895,9 @@ capturefab --session gui --camera sim:0 capture -o shot.png --on-exists number -
 capturefab --session gui --camera sim:0 record -o 'video/{camera}-{seq}.mp4' --duration 30s --json
 ```
 
-`--on-exists fail` is the CLI and RPC default and refuses an existing name; `number` writes `stem-0001.ext`, `stem-0002.ext` and so on. `{seq}` always picks a free number. A directory continues `frame-NNNNNN` after its highest existing number. Nothing is overwritten; after 64 lost races the command fails with exit 1 (`no free file name for OUTPUT after 64 attempts; choose another output`). The GUI always numbers, and saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` (`.mp4` for recordings) by default.
+`--on-exists fail` is the CLI and RPC default and refuses an existing name; `number` writes `stem-0001.ext`, `stem-0002.ext` and so on. `{seq}` always picks a free number. A directory continues `frame-NNNNNN` after its highest existing number. A taken name fails before acquisition or encoding starts (exit 1, `operation_failed`); the CLI adds `error.details.hint`, for example `add {seq} to the name (-o 'shot-{seq}.png') or pass --on-exists number`. Nothing is overwritten; after 64 lost races the command fails with exit 1 (`no free file name for OUTPUT after 64 attempts; choose another output`). The GUI always numbers, and saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` (`.mp4` for recordings) by default.
 
-`--context KEY=VALUE` (RPC `context:{...}`) tags captures, schedules and recordings. Keys match `^[a-z][a-z0-9_]{0,31}$`; at most 16 entries with 256-byte values; a duplicate key is exit 2. The GUI's Capture tags send `line`, `station`, `part`, `lot` and `note`. Read the saved names from the result, not from the template: capture returns `{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?}` with `wall_ms` in UTC milliseconds; `file` is absent for stdout. `record`/`forward` returns `{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}`, where `path` is the resolved local recording file and `until_ms` is its nominal UTC deadline. With `--duration`, `stopped` is `{"forwarding":null,"by":"duration"}` when the session stopped the recording on time. After Ctrl-C, or if the session did not stop it, `stopped` is the conditional-stop result, pinned to the original `forwarding_id`. `status` shows `forwarding_since_ms` per camera and at the top level while forwarding, `forwarding_until_ms` while a timed recording runs, and `recording_path`, the resolved absolute file, while a local recording runs (`forwarding` keeps the requested output, template and all). RPC example: `{"op":"capture","output":"line1/{date}/{camera}-{datetime}-{seq}.png","count":1,"timeout_ms":2000,"format":"png","on_exists":"number","context":{"line":"L1","part":"A-100"}}`.
+`--context KEY=VALUE` (RPC `context:{...}`) tags captures, schedules and recordings. Keys match `^[a-z][a-z0-9_]{0,31}$`; at most 16 entries with 256-byte values; a duplicate key is exit 2. The GUI's Capture tags send `line`, `station`, `part`, `lot` and `note`. Read the saved names from the result, not from the template: capture returns `{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,file_bytes?,wall_ms,file?}],count,context?,destination?}` with `wall_ms` in UTC milliseconds; `bytes` is the raw acquired frame size and `file_bytes` the saved file size; `file` and `file_bytes` are absent for stdout. A burst that fails part way keeps its saved frames and its error code; the message starts `saved N of M frames to FOLDER (names) before this failed`. `record`/`forward` returns `{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}`, where `path` is the resolved local recording file and `until_ms` is its nominal UTC deadline. With `--duration`, `stopped` is `{"forwarding":null,"by":"duration","stats":{accepted,written,dropped,late,stalled,recording?:{path,bytes,started_ms,ended_ms,encoder}}}` when the session stopped the recording on time (`stats` is absent from an older worker). After Ctrl-C, or if the session did not stop it, `stopped` is the conditional-stop result, pinned to the original `forwarding_id`. `status` shows `forwarding_since_ms` per camera and at the top level while forwarding, `forwarding_until_ms` while a timed recording runs, and `recording_path`, the resolved absolute file, while a local recording runs (`forwarding` keeps the requested output, template and all). RPC example: `{"op":"capture","output":"line1/{date}/{camera}-{datetime}-{seq}.png","count":1,"timeout_ms":2000,"format":"png","on_exists":"number","context":{"line":"L1","part":"A-100"}}`.
 
 ## Catalog captures and export datasets
 

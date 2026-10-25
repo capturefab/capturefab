@@ -115,8 +115,239 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
         crate::hubs::validate_shape(selector)?;
     } else if crate::media::is_url_source(selector) || selector.contains("://") {
         crate::media::validate_source_shape(selector)?;
+    } else if malformed_ipv4(selector) {
+        return Err(crate::dataset::Usage(format!(
+            "'{selector}' is not a valid IPv4 address; use A.B.C.D or gige:A.B.C.D"
+        ))
+        .into());
     }
     Ok(())
+}
+
+/// How a bare selector (no `sim:`, `gige:`, URL or other explicit form)
+/// matched the discovered cameras.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    /// One camera has this ID, serial or address.
+    Exact(CameraInfo),
+    /// One camera matched loosely: its model or the ID after the first ':',
+    /// ignoring case, or whole words of its model.
+    Loose {
+        info: CameraInfo,
+        matched_on: &'static str,
+    },
+    /// Several cameras matched; never guess among them.
+    Ambiguous(Vec<CameraInfo>),
+    NotFound,
+}
+
+/// Selectors whose syntax already says what they open; they are never
+/// matched loosely against discovered cameras.
+pub fn is_explicit_selector(selector: &str) -> bool {
+    selector.starts_with("sim:")
+        || selector.starts_with("gige:")
+        || selector.parse::<Ipv4Addr>().is_ok()
+        || selector.contains("://")
+        || crate::scanner::is_source(selector)
+        || crate::onvif::is_source(selector)
+        || crate::hubs::is_source(selector)
+        || crate::media::is_source(selector)
+}
+
+/// Resolve a bare selector against discovered cameras. Exact ID, serial or
+/// address wins; otherwise a unique case-insensitive model or name match,
+/// then a unique run of whole model words. Hub cameras keep their exact selectors only, so
+/// a loose name can never reach a hub's permission checks under another
+/// identity.
+pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
+    let exact: Vec<_> = known
+        .iter()
+        .filter(|d| {
+            d.id == selector || d.serial == selector || d.address.as_deref() == Some(selector)
+        })
+        .cloned()
+        .collect();
+    match exact.len() {
+        1 => return Resolution::Exact(exact.into_iter().next().unwrap()),
+        0 => {}
+        _ => return Resolution::Ambiguous(exact),
+    }
+    if is_explicit_selector(selector) || selector.trim().is_empty() {
+        return Resolution::NotFound;
+    }
+    let wanted = selector.to_lowercase();
+    let local: Vec<_> = known
+        .iter()
+        .filter(|d| !crate::hubs::is_source(&d.id))
+        .collect();
+    let suffix = |d: &CameraInfo| {
+        d.id.split_once(':')
+            .map_or(d.id.as_str(), |(_, rest)| rest)
+            .to_lowercase()
+    };
+    let pick = |matches: Vec<(&CameraInfo, &'static str)>| match matches.as_slice() {
+        [] => None,
+        [(info, matched_on)] => Some(Resolution::Loose {
+            info: (*info).clone(),
+            matched_on,
+        }),
+        _ => Some(Resolution::Ambiguous(
+            matches.iter().map(|(info, _)| (*info).clone()).collect(),
+        )),
+    };
+    let equal = local
+        .iter()
+        .filter_map(|d| {
+            if d.model.to_lowercase() == wanted {
+                Some((*d, "model"))
+            } else if suffix(d) == wanted
+                || d.id.to_lowercase() == wanted
+                || d.serial.to_lowercase() == wanted
+            {
+                Some((*d, "name"))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if let Some(resolution) = pick(equal) {
+        return resolution;
+    }
+    // Then whole words of a model (`C920` in `HD Pro Webcam C920`), never
+    // part of a word, an ID or a serial: a partial or stale serial must not
+    // open another camera. A scanner needs its model in full, because a
+    // feeder consumes paper.
+    let words = wanted.split_whitespace().collect::<Vec<_>>();
+    if wanted.chars().count() < 3 || words.is_empty() {
+        return Resolution::NotFound;
+    }
+    let partial = local
+        .iter()
+        .filter(|d| !crate::scanner::is_source(&d.id))
+        .filter(|d| {
+            let model = d.model.to_lowercase();
+            let model = model.split_whitespace().collect::<Vec<_>>();
+            model.windows(words.len()).any(|window| window == words)
+        })
+        .map(|d| (*d, "model"))
+        .collect();
+    pick(partial).unwrap_or(Resolution::NotFound)
+}
+
+/// A selector that names a local file rather than a camera.
+fn path_like(selector: &str) -> bool {
+    const MEDIA: [&str; 14] = [
+        "mp4", "mov", "mkv", "avi", "webm", "ts", "m4v", "jpg", "jpeg", "png", "tif", "tiff",
+        "bmp", "gif",
+    ];
+    selector.contains(['/', '\\'])
+        || std::path::Path::new(selector)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| MEDIA.contains(&extension.to_ascii_lowercase().as_str()))
+}
+
+/// Four dot-separated digit groups that are not a valid IPv4 address.
+fn malformed_ipv4(selector: &str) -> bool {
+    let parts: Vec<_> = selector.split('.').collect();
+    parts.len() == 4
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        && selector.parse::<Ipv4Addr>().is_err()
+}
+
+/// `sim0`, `SIM0` or `SIM:0` written for the simulator `sim:0`.
+fn simulator_typo(selector: &str) -> Option<String> {
+    if selector.starts_with("sim:") {
+        return None;
+    }
+    let lower = selector.to_ascii_lowercase();
+    let rest = lower.strip_prefix("sim")?;
+    let digits = rest.strip_prefix(':').unwrap_or(rest);
+    (!digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| format!("sim:{digits}"))
+}
+
+/// `Pattern camera`, the simulator's model, which discovery lists only
+/// with `--simulate`.
+fn simulator_model(selector: &str) -> Option<String> {
+    selector
+        .trim()
+        .eq_ignore_ascii_case("pattern camera")
+        .then(|| "sim:0".into())
+}
+
+/// Bare selectors discovery cannot help: a missing file path or a malformed
+/// IPv4 address fails at once instead of after a scan.
+pub fn needs_no_discovery(selector: &str) -> bool {
+    path_like(selector) || malformed_ipv4(selector)
+}
+
+/// Why `selector` did not open, with the closest cameras that did answer.
+fn selector_not_matched(
+    selector: &str,
+    known: &[CameraInfo],
+    matches: &[CameraInfo],
+) -> anyhow::Error {
+    use crate::types::{Categorized, ErrorKind};
+    let shown = crate::media::redact_url(selector);
+    let unavailable = |message: String| Categorized::error(ErrorKind::Unavailable, message);
+    if matches.len() > 1 {
+        let listed = matches
+            .iter()
+            .take(5)
+            .map(|d| format!("{} ({})", crate::media::redact_url(&d.id), d.model))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = if matches.len() > 5 { ", ..." } else { "" };
+        return unavailable(format!(
+            "camera '{shown}' is ambiguous: it matches {} cameras: {listed}{more}; pass a camera ID or serial",
+            matches.len()
+        ));
+    }
+    if let Some(simulator) = simulator_typo(selector).or_else(|| simulator_model(selector)) {
+        return unavailable(format!(
+            "camera '{shown}' not found; did you mean {simulator}?"
+        ));
+    }
+    if path_like(selector) {
+        return unavailable(format!("file not found: {shown}"));
+    }
+    let mut candidates: Vec<(usize, &CameraInfo)> = known
+        .iter()
+        .filter_map(|d| {
+            let suffix = d.id.split_once(':').map_or(d.id.as_str(), |(_, rest)| rest);
+            [d.id.as_str(), suffix, d.serial.as_str(), d.model.as_str()]
+                .into_iter()
+                .filter(|name| crate::hint::is_close(selector, name))
+                .map(|name| crate::hint::edit_distance(selector, name))
+                .min()
+                .map(|distance| (distance, d))
+        })
+        .collect();
+    candidates.sort_by_key(|(distance, _)| *distance);
+    if let Some((_, best)) = candidates.first() {
+        return unavailable(format!(
+            "camera '{shown}' not found; did you mean {}? Run capturefab discover to list cameras",
+            crate::hint::shell_quote(&crate::media::redact_url(&best.id))
+        ));
+    }
+    if known.is_empty() {
+        return unavailable(format!(
+            "camera '{shown}' not found; run capturefab discover to list cameras"
+        ));
+    }
+    let found = known
+        .iter()
+        .take(5)
+        .map(|d| crate::media::redact_url(&d.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = if known.len() > 5 { ", ..." } else { "" };
+    unavailable(format!(
+        "camera '{shown}' not found. Found: {found}{more}; run capturefab discover to list cameras"
+    ))
 }
 
 /// Check both selector syntax and local source availability before opening.
@@ -166,15 +397,13 @@ impl Camera {
         {
             crate::transport::gige::probe(ip, timeout)?
         } else {
-            let matches: Vec<_> = known
-                .iter()
-                .filter(|d| d.id == selector || d.serial == selector)
-                .collect();
-            ensure!(
-                matches.len() == 1,
-                "camera '{selector}' not found or ambiguous; run capturefab discover"
-            );
-            matches[0].clone()
+            match resolve_selector(selector, known) {
+                Resolution::Exact(info) | Resolution::Loose { info, .. } => info,
+                Resolution::Ambiguous(matches) => {
+                    return Err(selector_not_matched(selector, known, &matches));
+                }
+                Resolution::NotFound => return Err(selector_not_matched(selector, known, &[])),
+            }
         };
         let backend: Box<dyn Backend> = match info.transport {
             Transport::Simulator => crate::transport::simulator::open(&info.id, timeout)?,
@@ -457,6 +686,187 @@ mod tests {
         assert!(!camera.features().iter().any(|f| f.name == "DeviceScanType"));
         assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
         assert_eq!(camera.info.profile.source, DetectionSource::DeviceMetadata);
+    }
+
+    fn device(id: &str, model: &str, serial: &str) -> CameraInfo {
+        let mut info = crate::transport::simulator::info();
+        info.id = id.into();
+        info.model = model.into();
+        info.serial = serial.into();
+        info.address = Some(id.into());
+        info
+    }
+    fn known() -> Vec<CameraInfo> {
+        vec![
+            device(
+                "avfoundation:HD Pro Webcam C920",
+                "HD Pro Webcam C920",
+                "avfoundation:HD Pro Webcam C920",
+            ),
+            device(
+                "avfoundation:Capture screen 0",
+                "Capture screen 0",
+                "avfoundation:Capture screen 0",
+            ),
+            device("gige:02007f000001", "Virtual GigE camera", "SIM7F000001"),
+            device(
+                "hub:home/camera.front_door",
+                "Front door",
+                "home/camera.front_door",
+            ),
+        ]
+    }
+    fn open_error(selector: &str, known: &[CameraInfo]) -> anyhow::Error {
+        match Camera::open(selector, known, Duration::from_millis(1)) {
+            Ok(_) => panic!("{selector} opened"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn exact_selectors_win_over_loose_matches() {
+        let mut known = known();
+        known.push(device("usb:C920", "Other", "C920"));
+        let Resolution::Exact(info) = resolve_selector("C920", &known) else {
+            panic!("serial must match exactly");
+        };
+        assert_eq!(info.id, "usb:C920");
+    }
+
+    #[test]
+    fn unique_loose_names_resolve_and_several_are_ambiguous() {
+        let known = known();
+        for (selector, id, on) in [
+            (
+                "hd pro webcam c920",
+                "avfoundation:HD Pro Webcam C920",
+                "model",
+            ),
+            ("C920", "avfoundation:HD Pro Webcam C920", "model"),
+            ("virtual gige", "gige:02007f000001", "model"),
+            ("02007F000001", "gige:02007f000001", "name"),
+        ] {
+            let Resolution::Loose { info, matched_on } = resolve_selector(selector, &known) else {
+                panic!("{selector} did not match loosely");
+            };
+            assert_eq!((info.id.as_str(), matched_on), (id, on), "{selector}");
+        }
+        let mut known = known;
+        known.push(device(
+            "avfoundation:HD Pro Webcam C922",
+            "HD Pro Webcam C922",
+            "avfoundation:HD Pro Webcam C922",
+        ));
+        let Resolution::Ambiguous(matches) = resolve_selector("pro webcam", &known) else {
+            panic!("two cameras share the name");
+        };
+        assert_eq!(matches.len(), 2);
+        let error = open_error("Pro Webcam", &known);
+        let message = error.to_string();
+        assert!(message.contains("ambiguous"), "{message}");
+        assert!(message.contains("C922"), "{message}");
+        assert!(message.contains("HD Pro Webcam C920"), "{message}");
+        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+    }
+
+    #[test]
+    fn partial_serials_ids_and_words_never_match() {
+        let mut known = known();
+        known.push(device("usb:2676:ba02:23015", "Industrial camera", "23015"));
+        known.push(device(
+            "scanner:ica:E3248000-80CE-11DB-8000-3C2AF4FA0DE9",
+            "Brother MFC-L2750DW series",
+            "E3248000-80CE-11DB-8000-3C2AF4FA0DE9",
+        ));
+        for selector in [
+            "2301",
+            "ba02:2301",
+            "E3248",
+            "e3248000",
+            "cam",
+            "webca",
+            "Brother",
+        ] {
+            assert_eq!(
+                resolve_selector(selector, &known),
+                Resolution::NotFound,
+                "{selector}"
+            );
+        }
+        assert!(matches!(
+            resolve_selector("brother mfc-l2750dw series", &known),
+            Resolution::Loose { info, .. } if info.id.starts_with("scanner:")
+        ));
+    }
+
+    #[test]
+    fn hub_cameras_are_never_matched_loosely() {
+        let known = known();
+        assert_eq!(resolve_selector("front door", &known), Resolution::NotFound);
+        assert!(matches!(
+            resolve_selector("home/camera.front_door", &known),
+            Resolution::Exact(info) if info.id.starts_with("hub:")
+        ));
+    }
+
+    #[test]
+    fn unmatched_selectors_say_what_was_meant() {
+        let known = known();
+        let cases = [
+            ("sim0", "did you mean sim:0?"),
+            ("SIM:2", "did you mean sim:2?"),
+            ("./nope.mp4", "file not found: ./nope.mp4"),
+            ("nope.mp4", "file not found: nope.mp4"),
+            ("SIM7F00001", "did you mean gige:02007f000001?"),
+            ("Pattern camera", "did you mean sim:0?"),
+            ("SIM0", "did you mean sim:0?"),
+            ("zzzz", "Found: avfoundation:HD Pro Webcam C920"),
+        ];
+        for (selector, expected) in cases {
+            let error = open_error(selector, &known);
+            assert!(
+                error.to_string().contains(expected),
+                "{selector}: {error:#}"
+            );
+            assert_eq!(
+                crate::cli::error_code(&error),
+                ("unavailable", 3),
+                "{selector}"
+            );
+        }
+        let error = open_error("zzzz", &[]);
+        assert!(
+            error.to_string().contains("run capturefab discover"),
+            "{error:#}"
+        );
+        assert!(needs_no_discovery("./nope.mp4"));
+        assert!(needs_no_discovery("192.168.1.300"));
+        assert!(!needs_no_discovery("C920"));
+    }
+
+    #[test]
+    fn suggestions_never_show_credentials() {
+        let known = vec![device(
+            "rtsp://admin:secret@10.0.0.5/stream",
+            "Door",
+            "rtsp://admin:secret@10.0.0.5/stream",
+        )];
+        let message = selector_not_matched("dor", &known, &[]).to_string();
+        assert!(!message.contains("secret"), "{message}");
+        let message =
+            selector_not_matched("x", &known, &[known[0].clone(), known[0].clone()]).to_string();
+        assert!(!message.contains("secret"), "{message}");
+    }
+
+    #[test]
+    fn malformed_ipv4_is_a_usage_error() {
+        let error = validate_selector_shape("192.168.1.300").unwrap_err();
+        assert!(
+            error.to_string().contains("not a valid IPv4 address"),
+            "{error:#}"
+        );
+        assert_eq!(crate::cli::error_code(&error), ("usage", 2));
+        validate_selector_shape("192.168.1.30").unwrap();
     }
 
     #[test]

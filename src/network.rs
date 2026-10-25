@@ -940,6 +940,138 @@ fn link_bytes_per_second(value: f64, unit: Option<&str>, default_multiplier: f64
     (bytes.is_finite() && bytes > 0.0).then_some(bytes)
 }
 
+/// Plain name for an adapter type, shared by the CLI and the desktop dialog.
+pub fn kind_label(kind: InterfaceKind) -> &'static str {
+    match kind {
+        InterfaceKind::Wired => "Wired Ethernet",
+        InterfaceKind::Wireless => "Wi-Fi",
+        InterfaceKind::Loopback => "Loopback",
+        InterfaceKind::Other => "Other adapter",
+        InterfaceKind::Unknown => "Adapter type unknown",
+    }
+}
+
+fn health_label(health: NetworkHealth) -> &'static str {
+    match health {
+        NetworkHealth::Unreachable => "Unreachable",
+        NetworkHealth::Limited => "Limited",
+        NetworkHealth::Unverified => "Unverified",
+        NetworkHealth::Ready => "Ready",
+        NetworkHealth::Unstable => "Unstable",
+    }
+}
+
+/// The readable `network-scan` summary for a terminal. Report warnings are
+/// diagnostics, so callers print `scan.warnings` to stderr themselves.
+pub fn write_human(scan: &NetworkScan, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    writeln!(out, "Adapters")?;
+    let adapters: Vec<_> = scan
+        .interfaces
+        .iter()
+        .filter(|interface| interface.kind != InterfaceKind::Loopback)
+        .collect();
+    if adapters.is_empty() {
+        writeln!(out, "  No IPv4 network adapters found.")?;
+    }
+    let width = adapters
+        .iter()
+        .map(|interface| interface.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    for interface in &adapters {
+        let speed = interface
+            .speed_mbps
+            .map_or_else(|| "speed unknown".into(), |speed| format!("{speed} Mbps"));
+        let mtu = interface
+            .mtu
+            .map_or_else(|| "MTU unknown".into(), |mtu| format!("MTU {mtu}"));
+        writeln!(
+            out,
+            "  {:<width$}  {} · {} / {} · {mtu} · {speed}{}",
+            interface.name,
+            kind_label(interface.kind),
+            interface.address,
+            interface.netmask,
+            if interface.up == Some(false) {
+                " · down"
+            } else {
+                ""
+            }
+        )?;
+    }
+    writeln!(out, "GigE cameras")?;
+    if scan.cameras.is_empty() {
+        writeln!(
+            out,
+            "  No GigE Vision cameras answered. Check the power and Ethernet cable, then scan again."
+        )?;
+        // Unknown adapters may well be wired; only say so when none can be.
+        if !adapters.iter().any(|interface| {
+            matches!(
+                interface.kind,
+                InterfaceKind::Wired | InterfaceKind::Unknown
+            )
+        }) {
+            writeln!(
+                out,
+                "  No wired Ethernet adapter is up; GigE cameras need a wired adapter on the camera's subnet."
+            )?;
+        }
+    }
+    for camera in &scan.cameras {
+        let name = [camera.camera.vendor.as_str(), camera.camera.model.as_str()]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let address = camera
+            .camera
+            .address
+            .as_deref()
+            .unwrap_or(camera.camera.id.as_str());
+        let via = camera
+            .interface
+            .as_deref()
+            .map(|interface| format!(" via {interface}"))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "  {name} · {address}{via} · {} ({})",
+            health_label(camera.health),
+            if camera.active {
+                "Connected"
+            } else {
+                "Discovered"
+            }
+        )?;
+        if !camera.summary.is_empty() {
+            writeln!(out, "    {}", camera.summary)?;
+        }
+        for detail in &camera.details {
+            writeln!(out, "    {detail}")?;
+        }
+        if let Some(tuning) = &camera.tuning {
+            if let Some(size) = tuning.packet_size {
+                writeln!(out, "    Packet size {size} bytes")?;
+            }
+            if let Some(limit) = tuning.throughput_limit_bps {
+                writeln!(
+                    out,
+                    "    Throughput limit {:.1} MB/s",
+                    limit as f64 / 1_000_000.0
+                )?;
+            }
+            for change in &tuning.changes {
+                writeln!(out, "    Changed: {change}")?;
+            }
+            for warning in &tuning.warnings {
+                writeln!(out, "    Warning: {warning}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,6 +1085,20 @@ mod tests {
             speed_mbps: None,
             kind,
             up: Some(true),
+        }
+    }
+
+    fn human(scan: &NetworkScan) -> String {
+        let mut out = Vec::new();
+        write_human(scan, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+    fn scan(interfaces: Vec<NetworkInterface>, cameras: Vec<NetworkCamera>) -> NetworkScan {
+        NetworkScan {
+            interfaces,
+            cameras,
+            warnings: Vec::new(),
+            scanned_at_ms: 0,
         }
     }
 
@@ -1036,6 +1182,34 @@ mod tests {
     }
 
     #[test]
+    fn human_scan_explains_an_empty_wireless_only_result() {
+        let mut vpn = nic(InterfaceKind::Other, None);
+        vpn.name = "utun3".into();
+        let output = human(&scan(
+            vec![nic(InterfaceKind::Wireless, None), vpn],
+            Vec::new(),
+        ));
+        assert!(output.starts_with("Adapters\n"), "{output}");
+        assert!(output.contains("Wi-Fi · 192.168.5.1 / 255.255.255.0 · MTU 1500"));
+        assert!(
+            output.contains("No GigE Vision cameras answered"),
+            "{output}"
+        );
+        assert!(
+            output.contains("No wired Ethernet adapter is up"),
+            "{output}"
+        );
+        for kind in [InterfaceKind::Wired, InterfaceKind::Unknown] {
+            let output = human(&scan(vec![nic(kind, Some(1000))], Vec::new()));
+            assert!(
+                output.contains("No GigE Vision cameras answered"),
+                "{output}"
+            );
+            assert!(!output.contains("No wired Ethernet"), "{kind:?}: {output}");
+        }
+    }
+
+    #[test]
     fn gige_probe_failures_keep_their_exit_codes() {
         let wait = Duration::from_secs(2);
         let refused =
@@ -1100,6 +1274,32 @@ mod tests {
             assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
         }
     }
+
+    #[test]
+    fn human_scan_indents_camera_details_and_tuning() {
+        let interface = nic(InterfaceKind::Wired, Some(100));
+        let mut camera = checked(&interface, "192.168.5.2");
+        camera.health = NetworkHealth::Limited;
+        camera.interface = Some("camera0".into());
+        camera.tuning = Some(NetworkTuning {
+            packet_size: Some(1500),
+            throughput_limit_bps: Some(12_000_000),
+            changes: vec!["GevSCPSPacketSize 1500".into()],
+            warnings: vec!["Jumbo frames are off".into()],
+        });
+        let output = human(&scan(vec![interface], vec![camera]));
+        assert!(
+            output.contains("  Test Camera · 192.168.5.2 via camera0 · Limited (Connected)"),
+            "{output}"
+        );
+        assert!(
+            output.contains("\n    Warning: Jumbo frames are off"),
+            "{output}"
+        );
+        assert!(output.contains("\n    Packet size 1500 bytes"), "{output}");
+        assert!(!output.contains('{'), "{output}");
+    }
+
     fn nic(kind: InterfaceKind, speed: Option<u64>) -> NetworkInterface {
         NetworkInterface {
             name: "camera0".into(),
