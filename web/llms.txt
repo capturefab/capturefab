@@ -523,9 +523,9 @@ capturefab --session bench setup apply bench --json
 
 A setup is a named snapshot of one camera's writable settings, kept on this computer.
 Restoring it is one camera change that `undo` reverts; a failure restores every value.
-Preview first: `changes`, `not_applied`, `match`, `warnings`, `restarts_stream` and `blocked` describe the restore.
+Preview first: `changes`, `not_applied`, `match`, `warnings`, `restarts_stream`, `blocked` and `auto_change` describe the restore.
 Disruptive changes, such as triggering and I/O lines, need `--yes` on the CLI.
-Applying to another camera model needs `--allow-other-model` (`setup diff` previews it with a warning); `--strict` refuses any value the camera cannot take.
+Applying to another camera model needs `--allow-other-model` (`setup diff` previews it with a warning in `warnings`); `--strict` refuses any value the camera cannot take, and `--dry-run --strict` fails the same way.
 Workflows use the step `{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}}`; they skip `--yes` but keep the model and recording checks.
 Never save, import or delete a setup without the person's request.
 Back up with `setup show NAME --json > FILE` and restore with `setup import FILE`; `--file FILE` reads it too.

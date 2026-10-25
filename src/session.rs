@@ -114,12 +114,14 @@ pub enum SessionCommand {
         /// cannot write or would not accept.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         strict: bool,
-        /// The disruptive features a person confirmed from a reviewed diff.
-        /// When given, the worker refuses, before any write, a restore whose
-        /// fresh comparison changes another disruptive feature. Absent, no
-        /// confirmation is checked (RPC and workflow callers).
+        /// The disruptive changes a person confirmed from a reviewed diff,
+        /// each `{feature, at}` or a bare feature name, which confirms only
+        /// a value without banks. When given, the worker refuses, before
+        /// any write, a restore whose fresh comparison makes another
+        /// disruptive change. Absent, no confirmation is checked (RPC and
+        /// workflow callers).
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        confirmed_disruptive: Option<Vec<String>>,
+        confirmed_disruptive: Option<Vec<crate::setup::Confirmed>>,
     },
     Auto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -590,8 +592,8 @@ impl SessionCommand {
                             "confirmed_disruptive names at most {} features",
                             crate::setup::MAX_SETUP_VALUES
                         );
-                        for feature in confirmed {
-                            validate_feature(feature)?;
+                        for confirmed in confirmed {
+                            confirmed.validate()?;
                         }
                     }
                 }
@@ -5749,6 +5751,7 @@ mod tests {
             r#"{"op":"apply_setup","name":"bench","strict":true}"#,
             r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":["TriggerMode"]}"#,
             r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[]}"#,
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"TriggerMode","at":[{"selector":"TriggerSelector","value":"FrameStart"}]},{"feature":"Gain"}]}"#,
             r#"{"op":"apply_setup","name":"bench","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
         ] {
             SessionCommand::from_json_slice(valid.as_bytes())
@@ -5760,6 +5763,8 @@ mod tests {
             r#"{"op":"read_setup","name":"bench"}"#,
             r#"{"op":"setup_diff","name":"bench","extra":1}"#,
             r#"{"op":"apply_setup","name":"bench","name":"other"}"#,
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"TriggerMode","bank":"A"}]}"#,
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"TriggerMode","at":"FrameStart"}]}"#,
         ] {
             assert!(
                 SessionCommand::from_json_slice(invalid.as_bytes()).is_err(),
@@ -5771,6 +5776,8 @@ mod tests {
             r#"{"op":"apply_setup","name":"con"}"#,
             r#"{"op":"apply_setup","name":"bench","digest":"sha256:abc"}"#,
             r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":["Trigger Mode"]}"#,
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"TriggerMode","at":[{"selector":"TriggerMode","value":"On"}]}]}"#,
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"LineSource","at":[{"selector":"GevSCPSSelector","value":"A"}]}]}"#,
             r#"{"op":"setup_diff","name":"bench","setup":{"version":1,"name":"bench","saved_at":"x","camera":{"transport":"simulator"},"values":[{"feature":"Width","value":1}]}}"#,
             r#"{"op":"setup_diff","setup":{"version":1,"name":"bench","saved_at":"x","camera":{"transport":"simulator"},"values":[{"feature":"GevSCDA","value":1}]}}"#,
         ] {

@@ -116,6 +116,11 @@ VARIANTS = (
     Scene("setups", "setups,noscopes", "Saved setups to restore, one from another camera model"),
     Scene("setup-mismatch", "setup-mismatch,noscopes", "Restoring a setup from another model waits for confirmation"),
     Scene("setup-blocked", "setup-blocked,noscopes", "Restoring a geometry change is refused while recording"),
+    Scene("setup-confirm", "setup-confirm,noscopes", "Restoring a trigger change asks to confirm it as its own step"),
+    Scene("setup-auto", "setup-auto,noscopes", "Restoring a setup that only turns auto exposure on"),
+    Scene("setup-waiting", "setup-waiting,noscopes", "Restore waits while an undo replays"),
+    Scene("setup-failed", "setup-failed,noscopes", "A refused restore shown in the sheet"),
+    Scene("setups-empty", "setups-empty,noscopes", "No saved setups yet"),
 )
 
 EXTRA_STATES = (

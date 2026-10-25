@@ -103,6 +103,16 @@ pub struct Bounds {
     pub inc: Option<f64>,
 }
 
+/// Whether a feature or enumeration entry exists and can be used now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Availability {
+    Available,
+    /// Hidden now by `pIsAvailable`; another setting may make it available.
+    Unavailable,
+    /// Not in the node map, or `pIsImplemented` is false.
+    Absent,
+}
+
 #[derive(Debug, Clone)]
 struct Element {
     tag: String,
@@ -324,6 +334,148 @@ impl NodeMap {
                 ))
         }
         writable(self, io, name, 0).unwrap_or(false)
+    }
+    /// Whether a feature can be read now, following its value links: a
+    /// feature hidden by `pIsAvailable` may appear after another write,
+    /// unlike one that is not implemented or not in the node map.
+    pub(crate) fn availability(&self, io: &mut dyn RegisterIo, name: &str) -> Availability {
+        let mut name = name;
+        for depth in 0..=MAX_DEPTH {
+            let Ok(node) = self.node(name, depth) else {
+                return Availability::Absent;
+            };
+            match self.gate(io, node, depth) {
+                Availability::Available => {}
+                gated => return gated,
+            }
+            match self.resolve_value_link(io, node, depth) {
+                Ok(Some(link)) => name = link,
+                _ => break,
+            }
+        }
+        Availability::Available
+    }
+    /// Whether an enumeration entry, by symbol or entry name, can be chosen
+    /// now, is hidden by `pIsAvailable`, or does not exist.
+    pub(crate) fn entry_availability(
+        &self,
+        io: &mut dyn RegisterIo,
+        name: &str,
+        symbol: &str,
+    ) -> Availability {
+        let Ok(node) = self.node(name, 0) else {
+            return Availability::Absent;
+        };
+        let entry = self.enum_entries(node).into_iter().find_map(|entry| {
+            self.nodes.get(entry).filter(|en| {
+                symbol == entry
+                    || symbol
+                        == en.prop("Symbolic").unwrap_or_else(|| {
+                            entry.strip_prefix(&format!("{name}_")).unwrap_or(entry)
+                        })
+            })
+        });
+        match entry {
+            Some(entry) => self.gate(io, entry, 1),
+            None => Availability::Absent,
+        }
+    }
+    /// One node's `pIsImplemented` and `pIsAvailable`. A condition that
+    /// cannot be evaluated counts as available, so the read reports it.
+    fn gate(&self, io: &mut dyn RegisterIo, node: &Node, depth: usize) -> Availability {
+        for (key, closed) in [
+            ("pIsImplemented", Availability::Absent),
+            ("pIsAvailable", Availability::Unavailable),
+        ] {
+            if let Some(link) = node.prop(key)
+                && self.number(io, link, depth + 1).is_ok_and(|v| v == 0.0)
+            {
+                return closed;
+            }
+        }
+        Availability::Available
+    }
+    /// Whether `pIsLocked` holds now on the feature or a node its value
+    /// links to: it reads but cannot be written.
+    pub(crate) fn is_locked(&self, io: &mut dyn RegisterIo, name: &str) -> bool {
+        let mut name = name;
+        for depth in 0..=MAX_DEPTH {
+            let Ok(node) = self.node(name, depth) else {
+                return false;
+            };
+            if let Some(link) = node.prop("pIsLocked")
+                && self.number(io, link, depth + 1).is_ok_and(|v| v != 0.0)
+            {
+                return true;
+            }
+            match self.resolve_value_link(io, node, depth) {
+                Ok(Some(link)) => name = link,
+                _ => break,
+            }
+        }
+        false
+    }
+    /// A feature and every node its value links can reach, without
+    /// evaluating selectors.
+    fn value_chain(&self, name: &str) -> BTreeSet<String> {
+        let mut chain = vec![name.to_owned()];
+        let mut seen = BTreeSet::new();
+        while let Some(name) = chain.pop() {
+            if seen.len() > 4096 || !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(&name) {
+                for property in &node.props {
+                    if matches!(
+                        property.tag.as_str(),
+                        "pValue" | "pValueIndexed" | "pValueDefault"
+                    ) {
+                        chain.push(property.text.clone());
+                    }
+                }
+            }
+        }
+        seen
+    }
+    /// Whether writing any of `others` can release a `pIsLocked` on `name`:
+    /// a lock condition of it or its value links reads one of them or a
+    /// node their values are stored in.
+    pub(crate) fn lock_released_by(&self, name: &str, others: &[&str]) -> bool {
+        let inputs = self.lock_inputs(name);
+        others.iter().filter(|other| **other != name).any(|other| {
+            self.value_chain(other)
+                .iter()
+                .any(|node| inputs.contains(node))
+        })
+    }
+    /// Every node the `pIsLocked` conditions of a feature and its value
+    /// links read, transitively: the settings that can unlock it.
+    fn lock_inputs(&self, name: &str) -> BTreeSet<String> {
+        let mut pending = Vec::new();
+        for node in self.value_chain(name) {
+            if let Some(node) = self.nodes.get(&node) {
+                pending.extend(
+                    node.props
+                        .iter()
+                        .filter(|property| property.tag == "pIsLocked")
+                        .map(|property| property.text.clone()),
+                );
+            }
+        }
+        let mut inputs = BTreeSet::new();
+        while let Some(name) = pending.pop() {
+            if inputs.len() > 4096 || !inputs.insert(name.clone()) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(&name) {
+                for property in &node.props {
+                    if property.tag.starts_with('p') && self.nodes.contains_key(&property.text) {
+                        pending.push(property.text.clone());
+                    }
+                }
+            }
+        }
+        inputs
     }
     pub fn choices(&self, io: &mut dyn RegisterIo, name: &str) -> Result<Vec<String>> {
         let node = self.node(name, 0)?;
@@ -1990,6 +2142,49 @@ mod tests {
         assert!(m.get(&mut io, "Feature").is_ok());
         assert!(m.set(&mut io, "Feature", "3").is_err());
         assert!(m.get(&mut io, "Unavailable").is_err());
+    }
+    #[test]
+    fn availability_and_locks_are_told_apart_and_traced_to_their_inputs() {
+        let m = map(concat!(
+            "<Integer Name='Shown'><pValue>Inner</pValue></Integer>",
+            "<Integer Name='Inner'><Value>1</Value><pIsAvailable>Gate</pIsAvailable></Integer>",
+            "<Integer Name='Gate'><pValue>GateValue</pValue></Integer><Integer Name='GateValue'><Value>0</Value></Integer>",
+            "<Integer Name='Hidden'><Value>1</Value><pIsImplemented>Gate</pIsImplemented></Integer>",
+            "<Enumeration Name='Format'><EnumEntry Name='A'><Value>0</Value></EnumEntry><EnumEntry Name='B'><Value>1</Value><pIsAvailable>Gate</pIsAvailable></EnumEntry><Value>0</Value></Enumeration>",
+            "<Integer Name='Time'><Value>5</Value><pIsLocked>AutoOn</pIsLocked></Integer>",
+            "<IntSwissKnife Name='AutoOn'><pVariable Name='A'>AutoValue</pVariable><Formula>A = 1</Formula></IntSwissKnife>",
+            "<Enumeration Name='Auto'><EnumEntry Name='Off'><Value>0</Value></EnumEntry><EnumEntry Name='On'><Value>1</Value></EnumEntry><pValue>AutoValue</pValue></Enumeration>",
+            "<Integer Name='AutoValue'><Value>1</Value></Integer><Integer Name='Other'><Value>0</Value></Integer>",
+        ));
+        let mut io = Memory::default();
+        // Through a value link, pIsAvailable hides; pIsImplemented removes.
+        assert_eq!(m.availability(&mut io, "Shown"), Availability::Unavailable);
+        assert_eq!(m.availability(&mut io, "Hidden"), Availability::Absent);
+        assert_eq!(m.availability(&mut io, "Missing"), Availability::Absent);
+        assert_eq!(
+            m.entry_availability(&mut io, "Format", "A"),
+            Availability::Available
+        );
+        assert_eq!(
+            m.entry_availability(&mut io, "Format", "B"),
+            Availability::Unavailable
+        );
+        assert_eq!(
+            m.entry_availability(&mut io, "Format", "C"),
+            Availability::Absent
+        );
+        m.set(&mut io, "GateValue", "1").unwrap();
+        assert_eq!(m.availability(&mut io, "Shown"), Availability::Available);
+        assert_eq!(
+            m.entry_availability(&mut io, "Format", "B"),
+            Availability::Available
+        );
+        // A lock is released by the setting its condition reads.
+        assert!(m.is_locked(&mut io, "Time"));
+        assert!(m.lock_released_by("Time", &["Auto"]));
+        assert!(!m.lock_released_by("Time", &["Other", "Time"]));
+        m.set(&mut io, "Auto", "Off").unwrap();
+        assert!(!m.is_locked(&mut io, "Time"));
     }
     #[test]
     fn enumeration_command_and_access() {

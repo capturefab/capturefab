@@ -256,7 +256,7 @@ pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) 
         return if saved.id.is_some() && saved.id == live_saved.id {
             (Match::SameCamera, Vec::new())
         } else {
-            (Match::OtherModel, Vec::new())
+            (Match::OtherModel, vec![other_model_warning(saved, live)])
         };
     }
     if saved.transport == Transport::Media || live.transport == Transport::Media {
@@ -269,11 +269,11 @@ pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) 
                 )],
             )
         } else {
-            (Match::OtherModel, Vec::new())
+            (Match::OtherModel, vec![other_model_warning(saved, live)])
         };
     }
     if !(same(&saved.vendor, &live.vendor) && same(&saved.model, &live.model)) {
-        return (Match::OtherModel, Vec::new());
+        return (Match::OtherModel, vec![other_model_warning(saved, live)]);
     }
     match &saved.serial {
         Some(serial) if same(serial, &live.serial) => (Match::SameCamera, Vec::new()),
@@ -289,6 +289,17 @@ pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) 
             )],
         ),
     }
+}
+/// The note a preview or restore of another model carries. It names no
+/// flag: RPC callers read it too.
+fn other_model_warning(saved: &SavedCamera, live: &CameraInfo) -> String {
+    let saved = saved.id.clone().unwrap_or_else(|| saved.label());
+    let live = if live.id.starts_with("hub:") {
+        live.id.clone()
+    } else {
+        label(&live.vendor, &live.model)
+    };
+    format!("Saved from {saved}; this camera is {live}; only settings both share apply.")
 }
 fn article(model: &str) -> String {
     let model = model.trim();
@@ -312,10 +323,14 @@ pub fn other_model_message(setup: &Setup, live: &CameraInfo) -> String {
     )
 }
 
-/// Apply order: geometry and format first, then enabling switches and
-/// modes, other values alphabetically, auto flags, and selectors last, so
-/// the inspector shows the saved bank afterwards.
-pub fn order_key(feature: &str) -> (u8, u8, String) {
+/// Apply order: geometry and format first; then switches that disarm or
+/// release (TriggerMode = Off, LineMode = Input, `*Enable` = false); other
+/// modes; other values alphabetically; then switches that arm or drive
+/// (TriggerMode = On, LineMode = Output, `*Enable` = true), so a trigger
+/// or output line never runs from a stale source; auto flags; and
+/// selectors last, so the inspector shows the saved bank afterwards.
+/// `target` is the value about to be written, as text.
+pub fn order_key(feature: &str, target: Option<&str>) -> (u8, u8, String) {
     const GEOMETRY: [&str; 6] = [
         "PixelFormat",
         "Binning",
@@ -335,14 +350,21 @@ pub fn order_key(feature: &str) -> (u8, u8, String) {
         };
         return (0, rank as u8, feature.into());
     }
+    let switch = matches!(feature, "TriggerMode" | "LineMode") || feature.ends_with("Enable");
     let group = if feature.ends_with("Selector") {
-        4
+        6
     } else if feature.ends_with("Auto") {
-        3
+        5
+    } else if let (true, Some(target)) = (switch, target) {
+        if matches!(target, "Off" | "Input" | "false" | "0") {
+            1
+        } else {
+            4
+        }
     } else if feature.ends_with("Enable") || feature.ends_with("Mode") {
-        1
-    } else {
         2
+    } else {
+        3
     };
     (group, 0, feature.into())
 }
@@ -350,10 +372,66 @@ pub fn order_key(feature: &str) -> (u8, u8, String) {
 /// Sort values into apply order.
 pub fn sort_values(values: &mut [SetupValue]) {
     values.sort_by(|a, b| {
-        order_key(&a.feature)
-            .cmp(&order_key(&b.feature))
+        order_key(&a.feature, Some(&a.value.text()))
+            .cmp(&order_key(&b.feature, Some(&b.value.text())))
             .then_with(|| a.at.cmp(&b.at))
     });
+}
+
+/// A disruptive change a person confirmed from a reviewed diff: a feature
+/// name, which confirms only a value without banks, or the feature and
+/// the banks it is written at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Confirmed {
+    Name(String),
+    At(ConfirmedAt),
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmedAt {
+    pub feature: String,
+    #[serde(default)]
+    pub at: Vec<Bank>,
+}
+impl Confirmed {
+    /// The confirmation for one change of a diff (`{feature, at?}`).
+    pub fn of_change(change: &serde_json::Value) -> Option<Self> {
+        let feature = change["feature"].as_str()?.to_owned();
+        let at = if change["at"].is_null() {
+            Vec::new()
+        } else {
+            serde_json::from_value(change["at"].clone()).ok()?
+        };
+        Some(Self::At(ConfirmedAt { feature, at }))
+    }
+    pub fn feature(&self) -> &str {
+        match self {
+            Self::Name(feature) => feature,
+            Self::At(confirmed) => &confirmed.feature,
+        }
+    }
+    /// Whether this confirms writing `feature` at exactly `at`.
+    pub fn confirms(&self, feature: &str, at: &[Bank]) -> bool {
+        match self {
+            Self::Name(name) => name == feature && at.is_empty(),
+            Self::At(confirmed) => confirmed.feature == feature && confirmed.at == at,
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        crate::session::validate_feature(self.feature())?;
+        if let Self::At(confirmed) = self {
+            ensure!(
+                confirmed.at.len() <= MAX_BANKS,
+                "{} is addressed by more than {MAX_BANKS} selectors",
+                confirmed.feature
+            );
+            for bank in &confirmed.at {
+                validate_bank(&confirmed.feature, bank)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Setup names make their file names, so they avoid names some file
@@ -731,17 +809,16 @@ impl Store {
         }
         read_file(&path)
     }
-    /// Save `setup`, refusing an existing name unless `replace`. Returns
-    /// the file written.
-    pub fn save(&self, setup: &Setup, replace: bool) -> Result<PathBuf> {
-        validate(setup)?;
-        let _lock = self.lock()?;
-        let path = self.path(&setup.name);
+    /// Whether `name` can be saved: refuses a taken name unless `replace`,
+    /// and a new name when the store is full. `save` checks again under
+    /// its lock; this lets a command refuse before reading a camera.
+    pub fn check_free(&self, name: &str, replace: bool) -> Result<()> {
+        let path = self.path(name);
         if path.exists() {
             if !replace {
                 let existing = read_file(&path)
                     .map(|existing| existing.name)
-                    .unwrap_or_else(|_| setup.name.clone());
+                    .unwrap_or_else(|_| name.to_owned());
                 return Err(NameTaken(existing).into());
             }
         } else {
@@ -750,6 +827,15 @@ impl Store {
                 "{MAX_SETUPS} setups are saved; delete one first (capturefab setup delete NAME)"
             );
         }
+        Ok(())
+    }
+    /// Save `setup`, refusing an existing name unless `replace`. Returns
+    /// the file written.
+    pub fn save(&self, setup: &Setup, replace: bool) -> Result<PathBuf> {
+        validate(setup)?;
+        let _lock = self.lock()?;
+        self.check_free(&setup.name, replace)?;
+        let path = self.path(&setup.name);
         self.write(&path, setup)?;
         Ok(path)
     }
@@ -1037,7 +1123,7 @@ mod tests {
             digest: Some(digest(&big)),
             allow_other_model: true,
             strict: true,
-            confirmed_disruptive: Some(vec!["TriggerMode".into(); 8]),
+            confirmed_disruptive: Some(vec![Confirmed::Name("TriggerMode".into()); 8]),
         })
         .unwrap();
         assert!(line.len() < 1024 * 1024);
@@ -1104,13 +1190,55 @@ mod tests {
                 "BinningHorizontal",
                 "Width",
                 "OffsetX",
-                "AcquisitionFrameRateEnable",
-                "TriggerMode",
                 "BlackLevel",
                 "Gain",
+                "AcquisitionFrameRateEnable",
+                "TriggerMode",
                 "ExposureAuto",
                 "GainSelector"
             ]
+        );
+    }
+
+    #[test]
+    fn switches_disarm_first_and_arm_after_their_sources() {
+        let mut values = [
+            ("TriggerMode", "On"),
+            ("TriggerSource", "Software"),
+            ("TriggerActivation", "RisingEdge"),
+            ("LineMode", "Output"),
+            ("LineSource", "ExposureActive"),
+            ("UserOutputValue", "true"),
+            ("ExposureMode", "Timed"),
+            ("CounterEnable", "false"),
+            ("LineSelector", "Line1"),
+        ]
+        .map(|(f, v)| value(f, serde_json::json!(v)));
+        sort_values(&mut values);
+        assert_eq!(
+            values
+                .iter()
+                .map(|v| v.feature.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "CounterEnable",
+                "ExposureMode",
+                "LineSource",
+                "TriggerActivation",
+                "TriggerSource",
+                "UserOutputValue",
+                "LineMode",
+                "TriggerMode",
+                "LineSelector"
+            ]
+        );
+        // Disarming switches go before every value they gate.
+        assert!(order_key("TriggerMode", Some("Off")) < order_key("TriggerSource", Some("Line1")));
+        assert!(order_key("LineMode", Some("Input")) < order_key("LineSource", Some("Off")));
+        assert!(order_key("LineMode", Some("Output")) > order_key("LineSource", Some("Off")));
+        assert!(
+            order_key("AcquisitionFrameRateEnable", Some("true"))
+                > order_key("AcquisitionFrameRate", Some("30"))
         );
     }
 
@@ -1126,9 +1254,16 @@ mod tests {
             warnings,
             ["Saved from another acA1920-40gm (serial 23456789)."]
         );
+        // Another model carries one note naming both, and no CLI flag.
         assert_eq!(
-            matching(&saved, &info("FLIR", "BFS-U3-51S5M", "1")).0,
-            Match::OtherModel
+            matching(&saved, &info("FLIR", "BFS-U3-51S5M", "1")),
+            (
+                Match::OtherModel,
+                vec![
+                    "Saved from Basler acA1920-40gm; this camera is FLIR BFS-U3-51S5M; only settings both share apply."
+                        .to_owned()
+                ]
+            )
         );
         let rtsp = CameraInfo {
             id: "media:0123abcd".into(),
@@ -1150,7 +1285,14 @@ mod tests {
             ["Saved from an RTSP input; Capturefab cannot tell whether this is the same stream."]
         );
         assert_eq!(matching(&saved_rtsp, &same).0, Match::OtherModel);
-        assert_eq!(matching(&saved, &rtsp).0, Match::OtherModel);
+        let (other, warnings) = matching(&saved, &rtsp);
+        assert_eq!(other, Match::OtherModel);
+        assert_eq!(
+            warnings,
+            [
+                "Saved from Basler acA1920-40gm; this camera is FFmpeg RTSP input; only settings both share apply."
+            ]
+        );
         let hub = CameraInfo {
             id: "hub:home/camera.front".into(),
             ..rtsp.clone()
@@ -1162,7 +1304,14 @@ mod tests {
             id: "hub:home/camera.back".into(),
             ..rtsp
         };
-        assert_eq!(matching(&saved_hub, &other_hub).0, Match::OtherModel);
+        let (other, warnings) = matching(&saved_hub, &other_hub);
+        assert_eq!(other, Match::OtherModel);
+        assert_eq!(
+            warnings,
+            [
+                "Saved from hub:home/camera.front; this camera is hub:home/camera.back; only settings both share apply."
+            ]
+        );
     }
 
     #[test]
@@ -1223,6 +1372,12 @@ mod tests {
             taken.to_string(),
             "A setup named bench exists; pass --replace to overwrite it"
         );
+        // The same refusal, before any camera is read; replace passes.
+        let early = store.check_free("Bench", false).unwrap_err();
+        assert!(early.is::<NameTaken>());
+        assert_eq!(early.to_string(), taken.to_string());
+        store.check_free("bench", true).unwrap();
+        store.check_free("other", false).unwrap();
         store.save(&setup("BENCH"), true).unwrap();
         let list = store.list().unwrap();
         assert_eq!(list.len(), 1);
@@ -1245,6 +1400,20 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(names, ["setups.lock"]);
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn a_full_store_refuses_a_new_name_before_saving() {
+        let store = Store::at(temp("full"));
+        crate::ipc::ensure_private_dir(store.dir()).unwrap();
+        for index in 0..MAX_SETUPS {
+            fs::write(store.dir().join(format!("s{index}.json")), b"{}").unwrap();
+        }
+        let full = store.check_free("new", false).unwrap_err();
+        assert!(full.to_string().contains("setups are saved; delete one"));
+        // An existing name can still be replaced.
+        store.check_free("s1", true).unwrap();
         let _ = fs::remove_dir_all(store.dir());
     }
 

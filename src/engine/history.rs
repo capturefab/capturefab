@@ -9,7 +9,7 @@ mod setup;
 const LIMIT: usize = 200;
 static LIFETIME: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Address {
     feature: String,
     selectors: Vec<(String, String)>,
@@ -202,6 +202,25 @@ fn addressed<T>(
     result
 }
 
+/// Read the value at `address` for a checkpoint. A bank hidden by
+/// `pIsAvailable` reads as `null`: it holds no value to restore, and a
+/// restore writes nothing there, while the setting that hides it is
+/// restored as usual. Other read failures stay errors.
+fn read_at(camera: &mut Camera, address: &Address) -> Result<Value> {
+    addressed(camera, address, |camera| {
+        match camera.get(&address.feature) {
+            Ok(value) => Ok(value),
+            Err(_)
+                if camera.availability(&address.feature)
+                    == crate::genicam::Availability::Unavailable =>
+            {
+                Ok(Value::Null)
+            }
+            Err(error) => Err(error),
+        }
+    })
+}
+
 /// A feature addressed by more banks than a checkpoint reads.
 #[derive(Debug)]
 struct TooManyBanks(String);
@@ -329,8 +348,8 @@ fn capture(
         let read = (|| -> Result<Vec<(Address, Value)>> {
             let mut read = Vec::new();
             for address in addresses(camera, &name, &|_| all_banks)? {
-                let value = addressed(camera, &address, |camera| camera.get(&name))
-                    .with_context(|| format!("read {name} for undo"))?;
+                let value =
+                    read_at(camera, &address).with_context(|| format!("read {name} for undo"))?;
                 read.push((address, value));
             }
             Ok(read)
@@ -355,11 +374,10 @@ fn capture(
 fn extend(camera: &mut Camera, before: &mut Configuration, feature: &str) -> Result<()> {
     for address in addresses(camera, feature, &|_| false)? {
         if let std::collections::btree_map::Entry::Vacant(entry) = before.values.entry(address) {
-            entry.insert(
-                camera
-                    .get(feature)
-                    .with_context(|| format!("read {feature} for undo"))?,
-            );
+            // The address names the banks selected now: nothing switches.
+            let value =
+                read_at(camera, entry.key()).with_context(|| format!("read {feature} for undo"))?;
+            entry.insert(value);
         }
     }
     Ok(())
@@ -374,7 +392,7 @@ fn capture_at(
     for address in before.values.keys() {
         values.insert(
             address.clone(),
-            addressed(camera, address, |camera| camera.get(&address.feature))
+            read_at(camera, address)
                 .with_context(|| format!("read {} after change for undo", address.feature))?,
         );
     }
@@ -403,7 +421,9 @@ fn affected(before: &Configuration, after: &Configuration) -> Vec<Address> {
 
 fn set_exact(camera: &mut Camera, address: &Address, target: &Value) -> Result<()> {
     addressed(camera, address, |camera| {
-        if camera.get(&address.feature)? != *target {
+        // A value an earlier write hid (an enumeration entry gated by
+        // another setting) cannot be read, but can be overwritten.
+        if camera.get(&address.feature).ok().as_ref() != Some(target) {
             if address.feature == "VideoMode" && camera.is_streaming() {
                 camera.stop()?;
                 let result = camera.set(&address.feature, &text(target));
@@ -433,20 +453,27 @@ fn restore(
     if switch_auto {
         crate::auto::hold(camera)?;
     }
+    // A bank that was unavailable has no value to write: restoring the
+    // setting that hid it hides it again.
+    let restorable = |address: &&Address| {
+        target
+            .values
+            .get(*address)
+            .is_some_and(|value| !value.is_null())
+    };
     let mut pending = fields
         .iter()
-        .filter(|address| target.values.contains_key(*address))
+        .filter(restorable)
         .cloned()
         .collect::<Vec<_>>();
-    // Auto flags go last, selectors after the values in their banks. Retry
+    // The same order as a setup restore: a switch that arms (TriggerMode On,
+    // LineMode Output) after its source, one that disarms before it, auto
+    // flags last and selectors after the values in their banks. Retry
     // dependency-locked fields after limits and enabling controls settle.
-    pending.sort_by_key(|address| {
+    pending.sort_by_cached_key(|address| {
         (
-            matches!(
-                address.feature.as_str(),
-                "ExposureAuto" | "GainAuto" | "BalanceWhiteAuto"
-            ),
-            address.feature.ends_with("Selector"),
+            crate::setup::order_key(&address.feature, Some(&text(&target.values[address]))),
+            address.selectors.clone(),
         )
     });
     let mut errors = Vec::new();
@@ -462,7 +489,7 @@ fn restore(
         // rather than treating each successful write as permanently settled.
         pending = fields
             .iter()
-            .filter(|address| target.values.contains_key(*address))
+            .filter(restorable)
             .filter(|address| {
                 if evolving(&target.auto, &address.feature) {
                     return false;
@@ -521,6 +548,34 @@ fn publish(
     }
     let status = h.history.lock().unwrap_or_else(|e| e.into_inner()).status();
     h.state.write().unwrap_or_else(|e| e.into_inner()).history = status;
+}
+
+/// The fields a replay can write only with the stream stopped: geometry
+/// and format, and, while streaming, any field `pIsLocked` holds now unless
+/// another replayed field is what unlocks it (an auto flag, for example).
+fn stream_locked_fields(camera: &mut Camera, fields: &[Address]) -> Vec<String> {
+    let names = fields
+        .iter()
+        .map(|field| field.feature.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let streaming = camera.is_streaming();
+    let mut locked = Vec::new();
+    for field in fields {
+        if locked.contains(&field.feature) {
+            continue;
+        }
+        let by_stream = crate::genicam::stream_locked(&field.feature)
+            || streaming
+                && addressed(camera, field, |camera| Ok(camera.is_locked(&field.feature)))
+                    .unwrap_or(false)
+                && !camera.lock_released_by(&field.feature, &names);
+        if by_stream {
+            locked.push(field.feature.clone());
+        }
+    }
+    locked
 }
 
 fn replay(
@@ -599,14 +654,12 @@ fn replay(
                 auto_policy(auto) == auto_policy(&expected.auto),
                 "auto mode changed outside this history; undo/redo would overwrite it"
             );
-            if let Some(locked) = fields
-                .iter()
-                .find(|field| crate::genicam::stream_locked(&field.feature))
-            {
+            let locked = stream_locked_fields(c, fields);
+            if let Some(locked) = locked.first() {
                 ensure!(
                     !busy,
                     "cannot restore {} while recording, forwarding or scheduled captures are active",
-                    locked.feature
+                    locked
                 );
             }
             for address in fields {
@@ -624,7 +677,7 @@ fn replay(
                         address.feature.as_str(),
                         "ExposureTime" | "ExposureTimeAbs" | "Gain" | "GainAbs" | "BalanceRatio"
                     ) {
-                        let current = addressed(c, address, |camera| camera.get(&address.feature))?;
+                        let current = read_at(c, address)?;
                         let tracked = auto
                             .as_ref()
                             .and_then(|controller| controller.values().get(&address.feature));
@@ -636,7 +689,7 @@ fn replay(
                     }
                     continue;
                 }
-                let current = addressed(c, address, |camera| camera.get(&address.feature))?;
+                let current = read_at(c, address)?;
                 ensure!(
                     expected.values.get(address) == Some(&current),
                     "{} changed outside this history; undo/redo would overwrite it",
@@ -658,10 +711,7 @@ fn replay(
             let all_fields = wanted.values.keys().cloned().collect::<Vec<_>>();
             // A streaming camera locks its geometry: stop it once around the
             // writes, as restoring a setup did, and start it again after.
-            let restart = c.is_streaming()
-                && fields
-                    .iter()
-                    .any(|field| crate::genicam::stream_locked(&field.feature));
+            let restart = c.is_streaming() && !locked.is_empty();
             if restart {
                 c.stop()?;
             }
@@ -824,11 +874,18 @@ pub(super) fn process(
         _ => None,
     };
     let (all, written) = match &command {
+        // A banked row is checkpointed at its own bank before it is
+        // written, so its feature need not be readable at the bank
+        // selected now (an input line hides an output's source).
         SessionCommand::ApplySetup { .. } => (
             true,
             setup_plan
                 .iter()
-                .flat_map(|plan| plan.changes().map(|row| row.address.feature.as_str()))
+                .flat_map(|plan| {
+                    plan.changes()
+                        .filter(|row| row.address.selectors.is_empty())
+                        .map(|row| row.address.feature.as_str())
+                })
                 .collect(),
         ),
         SessionCommand::Set { feature, .. } => (auto.is_some(), vec![feature.as_str()]),
@@ -915,6 +972,7 @@ pub(super) fn process(
         (
             SessionCommand::ApplySetup {
                 setup: Some(document),
+                strict,
                 ..
             },
             Some(before),
@@ -936,6 +994,7 @@ pub(super) fn process(
                         jobs,
                         document,
                         plan,
+                        *strict,
                         |camera, address| setup::extend_at(camera, before, address),
                     )
                 })
@@ -966,14 +1025,33 @@ pub(super) fn process(
                 let fields = before.values.keys().cloned().collect::<Vec<_>>();
                 let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
                 let rollback = restore(camera_mut(camera)?, auto, before, &fields, switch_auto);
-                if restart {
-                    let _ = camera_mut(camera).and_then(Camera::start);
-                }
+                let restarted = restart.then(|| camera_mut(camera).and_then(Camera::start));
                 publish(h, camera, auto, true);
+                let restart_note = match &restarted {
+                    Some(Err(start_error)) => {
+                        format!("; the stream could not be restarted: {start_error:#}")
+                    }
+                    Some(Ok(())) => "; the stream was restarted".into(),
+                    None => String::new(),
+                };
                 if let Err(rollback_error) = rollback {
-                    return Err(
-                        error.context(format!("failed command rollback: {rollback_error:#}"))
-                    );
+                    return Err(error.context(format!(
+                        "failed command rollback: {rollback_error:#}{restart_note}"
+                    )));
+                }
+                // The context keeps the cause's category for the exit code.
+                if let SessionCommand::ApplySetup {
+                    setup: Some(document),
+                    ..
+                } = &command
+                {
+                    return Err(error.context(format!(
+                        "Restoring setup {} failed; every value was put back{restart_note}",
+                        document.name
+                    )));
+                }
+                if let Some(Err(_)) = restarted {
+                    return Err(error.context(restart_note.trim_start_matches("; ").to_owned()));
                 }
             }
             return Err(error);

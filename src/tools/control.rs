@@ -801,6 +801,7 @@ fn last_writer_is_us(ctx: &Context, plan: &PlanState, camera: &str, feature: &st
                     a.operation.as_str(),
                     "set"
                         | "set_many"
+                        | "apply_setup"
                         | "auto"
                         | "manual"
                         | "undo"
@@ -1252,6 +1253,38 @@ mod tests {
         assert!(!last_writer_is_us(&ctx, &plan, "sim:0", "Gain"));
         ctx.snapshot.activity[0].state = ActivityState::Succeeded;
         assert!(last_writer_is_us(&ctx, &plan, "sim:0", "Gain"));
+    }
+
+    #[test]
+    fn a_later_setup_restore_by_a_person_is_a_foreign_write() {
+        let mut ctx = fixture_context(fixture_snapshot());
+        let entry = |id: u64, actor: Value, operation: &str, feature: Value| {
+            serde_json::from_value(json!({
+                "id": id, "origin": "client", "actor": actor,
+                "operation":operation, "camera":"sim:0", "feature":feature, "label":"x",
+                "state":"succeeded", "submitted_at_ms":ctx.now_ms, "started_at_ms":ctx.now_ms,
+                "finished_at_ms":ctx.now_ms, "detail":null, "file_count":0, "files":[], "job":null,
+            }))
+            .unwrap()
+        };
+        let ours = entry(
+            1,
+            json!({"id":"our-run","name":"Assistant","kind":"agent"}),
+            "set",
+            json!("Gain"),
+        );
+        let restore = entry(
+            2,
+            json!({"id":"person","name":"Person","kind":"human"}),
+            "apply_setup",
+            Value::Null,
+        );
+        ctx.snapshot.activity.push(ours);
+        let mut plan = PlanState::new(&ctx);
+        plan.actor_id = Some("our-run".into());
+        assert!(last_writer_is_us(&ctx, &plan, "sim:0", "Gain"));
+        ctx.snapshot.activity.push(restore);
+        assert!(!last_writer_is_us(&ctx, &plan, "sim:0", "Gain"));
     }
 
     #[test]

@@ -505,6 +505,23 @@ impl Camera {
         self.nodes
             .is_configuration_value(self.backend.as_mut(), name)
     }
+    pub(crate) fn availability(&mut self, name: &str) -> crate::genicam::Availability {
+        self.nodes.availability(self.backend.as_mut(), name)
+    }
+    pub(crate) fn entry_availability(
+        &mut self,
+        name: &str,
+        symbol: &str,
+    ) -> crate::genicam::Availability {
+        self.nodes
+            .entry_availability(self.backend.as_mut(), name, symbol)
+    }
+    pub(crate) fn is_locked(&mut self, name: &str) -> bool {
+        self.nodes.is_locked(self.backend.as_mut(), name)
+    }
+    pub(crate) fn lock_released_by(&self, name: &str, others: &[&str]) -> bool {
+        self.nodes.lock_released_by(name, others)
+    }
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
         self.nodes.set(self.backend.as_mut(), name, value)
     }
