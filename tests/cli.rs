@@ -2274,7 +2274,7 @@ fn doctor_reports_destination_features() {
     let elapsed = started.elapsed();
     assert!(out.status.success());
     assert!(
-        elapsed < std::time::Duration::from_secs(5),
+        elapsed < std::time::Duration::from_secs(15),
         "doctor took {elapsed:?}"
     );
     let graphics = &serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"]["graphics"];

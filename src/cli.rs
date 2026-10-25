@@ -31,6 +31,7 @@ use std::{
 #[derive(Debug, Parser)]
 #[command(
     name = "capturefab",
+    bin_name = "capturefab",
     version,
     about = "Discover, configure, capture and record cameras. No command opens the GUI.",
     long_about = "Capturefab is a camera workbench for people and automation. Camera commands use the only running GUI or headless session automatically. Use --session NAME to choose one, or --direct --camera ID for a temporary camera worker. Local output paths are relative to this terminal, including when controlling the GUI.",
