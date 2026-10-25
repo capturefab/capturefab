@@ -4036,6 +4036,52 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn undo_restarts_a_stream_whose_transport_layer_lock_holds_the_feature() {
+        use crate::camera::tests::{BASLER_ACQUISITION, Device, TL_PARAMS_LOCKED, device_camera};
+        // TLParamsLocked is listed with the transport layer features, as on
+        // Basler and FLIR cameras; ReverseX is locked by it, Width is also
+        // geometry.
+        let device = Device::new(&format!(
+            r#"{TL_PARAMS_LOCKED}{BASLER_ACQUISITION}<Category Name="Fixture"><pFeature>TLParamsLocked</pFeature><pFeature>Width</pFeature><pFeature>ReverseX</pFeature></Category><Integer Name="Width"><pIsLocked>TLParamsLocked</pIsLocked><Value>640</Value><Min>16</Min><Max>1024</Max><Inc>16</Inc></Integer><Boolean Name="ReverseX"><pIsLocked>ReverseXLocked</pIsLocked><Value>0</Value><OnValue>1</OnValue><OffValue>0</OffValue></Boolean><IntSwissKnife Name="ReverseXLocked"><pVariable Name="TLP">TLParamsLocked</pVariable><Formula>TLP</Formula></IntSwissKnife>"#
+        ));
+        let mut camera = Some(device_camera(device));
+        let h = WorkerHandle::new();
+        let set = |feature: &str, value: &str| SessionCommand::Set {
+            feature: feature.into(),
+            value: value.into(),
+        };
+        let get =
+            |camera: &mut Option<Camera>, name: &str| camera.as_mut().unwrap().get(name).unwrap();
+        // A grouped write records every configuration value.
+        scanner_command(
+            &h,
+            &mut camera,
+            SessionCommand::SetMany {
+                values: vec![crate::session::FeatureValue {
+                    feature: "Width".into(),
+                    value: "320".into(),
+                }],
+            },
+        )
+        .unwrap();
+        scanner_command(&h, &mut camera, set("ReverseX", "true")).unwrap();
+        // Started outside the history, as a capture or schedule may leave it.
+        camera.as_mut().unwrap().start().unwrap();
+        assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
+        // The lock is acquisition state, never a value to set or restore.
+        //TMP
+        assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
+        scanner_command(&h, &mut camera, SessionCommand::Undo).unwrap();
+        assert_eq!(get(&mut camera, "ReverseX"), false);
+        scanner_command(&h, &mut camera, SessionCommand::Undo).unwrap();
+        assert_eq!(get(&mut camera, "Width"), 640);
+        assert!(camera.as_ref().unwrap().is_streaming());
+        assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
+        scanner_command(&h, &mut camera, SessionCommand::Stop).unwrap();
+        assert_eq!(get(&mut camera, "TLParamsLocked"), 0);
+        h.shutdown();
+    }
+    #[test]
     fn a_busy_ledger_retries_the_shot_and_other_failures_stop_the_job() {
         let h = WorkerHandle::new();
         let dir = temp_dir("retry");

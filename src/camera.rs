@@ -95,6 +95,9 @@ const STREAM_COMMANDS: [&str; 7] = [
     "TransferAbort",
 ];
 
+const TL_PARAMS_LOCKED: &str = "TLParamsLocked";
+const TL_PARAMS_LOCKED_MESSAGE: &str = "TLParamsLocked follows the stream; start and stop set it";
+
 /// Triggers that start an acquisition, a burst or a frame, in the order a
 /// software trigger fires them for one frame.
 const START_TRIGGERS: [&str; 3] = ["AcquisitionStart", "FrameBurstStart", "FrameStart"];
@@ -496,6 +499,17 @@ impl Camera {
                     | "Scan3dOutputMode"
             )
         });
+        // A host that ended without stopping, such as a killed worker, can
+        // leave a device-side TLParamsLocked set, which would keep features
+        // locked on a camera that is not streaming.
+        if nodes.has(TL_PARAMS_LOCKED)
+            && nodes
+                .get(backend.as_mut(), TL_PARAMS_LOCKED)
+                .is_ok_and(|locked| locked != 0)
+            && nodes.is_writable(backend.as_mut(), TL_PARAMS_LOCKED)
+        {
+            let _ = nodes.set(backend.as_mut(), TL_PARAMS_LOCKED, "0");
+        }
         Ok(Self {
             info,
             backend,
@@ -530,9 +544,19 @@ impl Camera {
     pub(crate) fn selectors(&self, name: &str) -> Vec<String> {
         self.nodes.selectors(name)
     }
+    /// TLParamsLocked is acquisition state that start and stop own, so it
+    /// is never a configuration value to record, restore or set.
     pub(crate) fn is_configuration_value(&mut self, name: &str) -> bool {
-        self.nodes
-            .is_configuration_value(self.backend.as_mut(), name)
+        name != TL_PARAMS_LOCKED
+            && self
+                .nodes
+                .is_configuration_value(self.backend.as_mut(), name)
+    }
+    /// Whether the camera refuses changes to `name` while it streams: the
+    /// image geometry and format, and any feature its XML locks through
+    /// TLParamsLocked, which start sets.
+    pub fn locked_while_streaming(&self, name: &str) -> bool {
+        crate::genicam::stream_locked(name) || self.nodes.locked_by(name, TL_PARAMS_LOCKED)
     }
     pub(crate) fn availability(&mut self, name: &str) -> crate::genicam::Availability {
         self.nodes.availability(self.backend.as_mut(), name)
@@ -552,10 +576,12 @@ impl Camera {
         self.nodes.lock_released_by(name, others)
     }
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
+        ensure!(name != TL_PARAMS_LOCKED, "{TL_PARAMS_LOCKED_MESSAGE}");
         self.software_triggers = None;
         self.nodes.set(self.backend.as_mut(), name, value)
     }
     pub fn validate_set(&mut self, name: &str, value: &str) -> Result<()> {
+        ensure!(name != TL_PARAMS_LOCKED, "{TL_PARAMS_LOCKED_MESSAGE}");
         self.nodes.validate_set(self.backend.as_mut(), name, value)
     }
     pub fn has(&self, name: &str) -> bool {
@@ -617,9 +643,9 @@ impl Camera {
             return Ok(());
         }
         self.acquire_continuously()?;
-        if self.has("TLParamsLocked") && self.is_writable("TLParamsLocked") {
+        if self.has(TL_PARAMS_LOCKED) && self.is_writable(TL_PARAMS_LOCKED) {
             self.nodes
-                .set(self.backend.as_mut(), "TLParamsLocked", "1")?;
+                .set(self.backend.as_mut(), TL_PARAMS_LOCKED, "1")?;
             self.tl_locked = true;
         }
         if let Err(error) = self.begin() {
@@ -689,7 +715,7 @@ impl Camera {
         if !std::mem::take(&mut self.tl_locked) {
             return Ok(());
         }
-        self.nodes.set(self.backend.as_mut(), "TLParamsLocked", "0")
+        self.nodes.set(self.backend.as_mut(), TL_PARAMS_LOCKED, "0")
     }
     pub fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.streaming, "camera is not streaming");
@@ -785,16 +811,21 @@ impl Camera {
             None
         };
         let mut selected = before.clone();
+        let last = triggers.len() - 1;
         let fired = (|| -> Result<()> {
-            for trigger in triggers {
+            for (index, trigger) in triggers.into_iter().enumerate() {
                 if let Some(trigger) = trigger
                     && selected.as_deref() != Some(trigger.as_str())
                 {
                     self.select_trigger(&trigger)?;
                     selected = Some(trigger);
                 }
-                self.nodes
-                    .execute(self.backend.as_mut(), "TriggerSoftware")?;
+                let fired = self.nodes.execute(self.backend.as_mut(), "TriggerSoftware");
+                // An acquisition or burst that an earlier request started may
+                // refuse another start; the frame trigger after it still counts.
+                if index == last {
+                    fired?;
+                }
             }
             Ok(())
         })();
@@ -901,7 +932,7 @@ pub(crate) mod tests {
             memory[(FRAME_COUNT / 4) as usize] = 1;
             Self {
                 xml: format!(
-                    r#"<RegisterDescription ModelName="Fixture" VendorName="Capturefab"><Category Name="Root"><pFeature>PayloadSize</pFeature></Category><Integer Name="PayloadSize"><pValue>PayloadReg</pValue></Integer><IntReg Name="PayloadReg"><Address>0x00</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>{nodes}</RegisterDescription>"#
+                    r#"<RegisterDescription ModelName="Fixture" VendorName="Capturefab"><Category Name="Root"><pFeature>PayloadSize</pFeature><pFeature>Fixture</pFeature></Category><Integer Name="PayloadSize"><pValue>PayloadReg</pValue></Integer><IntReg Name="PayloadReg"><Address>0x00</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>{nodes}</RegisterDescription>"#
                 ),
                 memory,
                 events: Arc::default(),
@@ -1025,12 +1056,12 @@ pub(crate) mod tests {
         }
     }
 
-    const TL_PARAMS_LOCKED: &str = r#"<Integer Name="TLParamsLocked"><ToolTip> Indicates whether a live grab is under way</ToolTip><Visibility>Invisible</Visibility><Value>0</Value><Min>0</Min><Max>1</Max></Integer>"#;
+    pub(crate) const TL_PARAMS_LOCKED: &str = r#"<Integer Name="TLParamsLocked"><ToolTip> Indicates whether a live grab is under way</ToolTip><Visibility>Invisible</Visibility><Value>0</Value><Min>0</Min><Max>1</Max></Integer>"#;
     /// Acquisition commands with no lock, as on cameras that never gate them.
     pub(crate) const OPEN_ACQUISITION: &str = r#"<Command Name="AcquisitionStart"><pValue>AcquisitionStartReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionStartReg"><Address>0x04</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="AcquisitionStop"><pValue>AcquisitionStopReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionStopReg"><Address>0x08</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
     /// Basler ace GigE (acA1300-60gm): both commands locked by N411 until
     /// the transport layer sets TLParamsLocked.
-    const BASLER_ACQUISITION: &str = r#"<Command Name="AcquisitionStart" NameSpace="Standard"><ToolTip>Starts the acquisition of images</ToolTip><pIsLocked>N411</pIsLocked><ImposedAccessMode>WO</ImposedAccessMode><pValue>N412</pValue><CommandValue>1</CommandValue></Command><Command Name="AcquisitionStop" NameSpace="Standard"><ToolTip>Stops the acquisition of images</ToolTip><pIsLocked>N411</pIsLocked><ImposedAccessMode>WO</ImposedAccessMode><pValue>N413</pValue><CommandValue>0</CommandValue></Command><IntSwissKnife Name="N411"><pVariable Name="P1">TLParamsLocked</pVariable><Formula>P1=0</Formula></IntSwissKnife><IntReg Name="N412"><Address>0x04</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><IntReg Name="N413"><Address>0x08</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
+    pub(crate) const BASLER_ACQUISITION: &str = r#"<Command Name="AcquisitionStart" NameSpace="Standard"><ToolTip>Starts the acquisition of images</ToolTip><pIsLocked>N411</pIsLocked><ImposedAccessMode>WO</ImposedAccessMode><pValue>N412</pValue><CommandValue>1</CommandValue></Command><Command Name="AcquisitionStop" NameSpace="Standard"><ToolTip>Stops the acquisition of images</ToolTip><pIsLocked>N411</pIsLocked><ImposedAccessMode>WO</ImposedAccessMode><pValue>N413</pValue><CommandValue>0</CommandValue></Command><IntSwissKnife Name="N411"><pVariable Name="P1">TLParamsLocked</pVariable><Formula>P1=0</Formula></IntSwissKnife><IntReg Name="N412"><Address>0x04</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><IntReg Name="N413"><Address>0x08</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
     /// FLIR Blackfly S (BFS-PGE-23S6C, BFS-U3-161S7M): AcquisitionStart
     /// locked by the camera's own lock bit or an unlocked transport layer.
     const FLIR_ACQUISITION: &str = r#"<Command Name="AcquisitionStart" NameSpace="Standard"><ToolTip>Starts the acquisition of images</ToolTip><Visibility>Beginner</Visibility><pIsLocked>Acquisition_Locked</pIsLocked><pValue>AcquisitionStart_Val</pValue><CommandValue>1</CommandValue></Command><IntSwissKnife Name="Acquisition_Locked"><Visibility>Invisible</Visibility><pVariable Name="TLPL">TLParamsLocked</pVariable><pVariable Name="LCK">AcquisitionStart_Lck</pVariable><Formula>LCK || ((TLPL = 0) ? 1 : 0)</Formula></IntSwissKnife><MaskedIntReg Name="AcquisitionStart_Lck"><Address>0x60</Address><Length>4</Length><AccessMode>RO</AccessMode><Bit>3</Bit><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></MaskedIntReg><IntReg Name="AcquisitionStart_Val"><Address>0x04</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="AcquisitionStop" NameSpace="Standard"><Visibility>Beginner</Visibility><pValue>AcquisitionStop_Val</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionStop_Val"><Address>0x08</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
@@ -1285,6 +1316,19 @@ pub(crate) mod tests {
         camera.start().unwrap();
         camera.request_frame().unwrap();
         camera.next_frame(Duration::from_millis(10)).unwrap();
+    }
+
+    #[test]
+    fn a_lock_left_on_the_device_is_cleared_on_open() {
+        let device = Device::new(
+            r#"<Integer Name="TLParamsLocked"><Visibility>Invisible</Visibility><pValue>TLParamsLockedReg</pValue><Min>0</Min><Max>1</Max></Integer><IntReg Name="TLParamsLockedReg"><Address>0x68</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#,
+        )
+        .with(0x68, 1);
+        let mut camera = device_camera(device);
+        assert_eq!(camera.get("TLParamsLocked").unwrap(), 0);
+        let error = camera.set("TLParamsLocked", "1").unwrap_err();
+        assert!(error.to_string().contains("start and stop"), "{error:#}");
+        assert!(!camera.is_configuration_value("TLParamsLocked"));
     }
 
     #[test]

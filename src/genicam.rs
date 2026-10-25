@@ -251,6 +251,33 @@ impl NodeMap {
         self.nodes.contains_key(name)
     }
 
+    /// Whether the `pIsLocked` link of `name` reads `target`, directly or
+    /// through the nodes its formula references.
+    pub(crate) fn locked_by(&self, name: &str, target: &str) -> bool {
+        let Some(link) = self.nodes.get(name).and_then(|node| node.prop("pIsLocked")) else {
+            return false;
+        };
+        let mut pending = vec![link.trim()];
+        let mut seen = BTreeSet::new();
+        while let Some(next) = pending.pop() {
+            if next == target {
+                return true;
+            }
+            if seen.len() >= 256 || !seen.insert(next) {
+                continue;
+            }
+            if let Some(node) = self.nodes.get(next) {
+                pending.extend(
+                    node.props
+                        .iter()
+                        .filter(|prop| prop.tag.starts_with('p'))
+                        .map(|prop| prop.text.trim()),
+                );
+            }
+        }
+        false
+    }
+
     /// The node's GenICam kind, such as `Float` or `IntReg`.
     pub(crate) fn kind(&self, name: &str) -> Option<&str> {
         self.nodes.get(name).map(|node| node.kind.as_str())
