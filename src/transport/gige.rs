@@ -1689,15 +1689,11 @@ impl Assembler {
             "GVSP camera error status 0x{:04x}",
             packet.status
         );
-        if !(1..=3).contains(&packet.kind) {
-            return Err(Categorized::error(
-                crate::types::ErrorKind::Unsupported,
-                format!(
-                    "unsupported GVSP packet content {}; multipart/GenDC/all-in packets are not supported",
-                    packet.kind
-                ),
-            ));
-        }
+        ensure!(
+            (1..=3).contains(&packet.kind),
+            "unsupported GVSP packet content {}; multipart/GenDC/all-in packets are not supported",
+            packet.kind
+        );
         let (block_size, max_packets) =
             self.limits[packet.extended as usize].context("invalid GVSP packet size")?;
         ensure!(
@@ -3526,6 +3522,10 @@ mod tests {
         let mut jpeg = leader(WIDTH, HEIGHT, MONO8);
         jpeg[2..4].copy_from_slice(&0x0006u16.to_be_bytes());
         let destination = fake.camera.lock().unwrap().destination();
+        // A late packet-size test packet is not a reason to give up.
+        fake.stream.send_to(&[0; 1472], destination).unwrap();
+        let error = gige.next_frame(Duration::from_millis(100)).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
         fake.stream
             .send_to(&gvsp(1, 0, 1, false, &jpeg), destination)
             .unwrap();
