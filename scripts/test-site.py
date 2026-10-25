@@ -529,11 +529,24 @@ def check_installers(root, errors):
         errors.append("install.sh: must never run sudo")
 
 
-def fixture_archive(directory, system, arch):
-    """A release archive whose capturefab prints a version, laid out like scripts/release.py's."""
+def fixture_archive(directory, system, arch, kind=None):
+    """A release archive whose capturefab prints a version, laid out like scripts/release.py's.
+
+    macOS takes kind "zip" (releases up to 0.4.0) or "dmg" (later releases, built with hdiutil)."""
     stem = f"capturefab-9.9.9-{system}-{arch}"
     stub = b"#!/bin/sh\necho 'capturefab 9.9.9'\n"
-    if system == "macos":
+    if system == "macos" and kind == "dmg":
+        stage = directory / f"{stem}-stage"
+        executable = stage / "Capturefab.app/Contents/MacOS/capturefab"
+        executable.parent.mkdir(parents=True)
+        executable.write_bytes(stub)
+        executable.chmod(0o755)
+        os.symlink("/Applications", stage / "Applications")
+        path = directory / f"{stem}.dmg"
+        subprocess.run(["hdiutil", "create", "-quiet", "-volname", "Capturefab 9.9.9", "-srcfolder", str(stage), "-format", "UDZO", "-ov", str(path)],
+                       check=True, capture_output=True, timeout=120)
+        shutil.rmtree(stage)
+    elif system == "macos":
         path = directory / f"{stem}.zip"
         with zipfile.ZipFile(path, "w") as archive:
             info = zipfile.ZipInfo(f"{stem}/Capturefab.app/Contents/MacOS/capturefab")
@@ -555,14 +568,29 @@ def check_installer_runs(errors):
     system = {"Darwin": "macos", "Linux": "linux"}.get(platform.system())
     if not system or not shutil.which("sh") or (system == "macos" and not shutil.which("ditto")):
         return
+    kinds = [None]
+    if system == "macos":
+        # A disk image needs hdiutil to build and mount; elsewhere only the .zip case runs.
+        kinds = ["zip"] + (["dmg"] if shutil.which("hdiutil") else [])
+    for kind in kinds:
+        check_installer_run(errors, system, kind)
+
+
+def check_installer_run(errors, system, kind):
     site = site_release()
+    label = f"install.sh ({kind})" if kind else "install.sh"
     with tempfile.TemporaryDirectory() as temp:
         temp = Path(temp)
         served = temp / "served"
         served.mkdir()
         assets = []
         for arch in ("x86_64", "aarch64"):
-            path = fixture_archive(served, system, arch)
+            try:
+                path = fixture_archive(served, system, arch, kind)
+            except (OSError, subprocess.SubprocessError) as error:
+                # hdiutil can be present but unusable, as in some sandboxes.
+                print(f"skipping the {label} fixture: {error}", file=sys.stderr)
+                return
             assets.append(dict(name=path.name, os=system, arch=arch, available=True, size=path.stat().st_size,
                                sha256=hashlib.sha256(path.read_bytes()).hexdigest(), url=f"https://example.invalid/{path.name}"))
         manifest = dict(schema_version=1, latest="9.9.9", releases=[dict(version="9.9.9", date="2026-01-01", assets=assets)])
@@ -574,29 +602,45 @@ def check_installer_runs(errors):
             def install(name, prefix=None):
                 home = temp / name
                 home.mkdir()
-                env = dict(os.environ, HOME=str(home), XDG_DATA_HOME=str(home / "share"), CAPTUREFAB_INSTALL_BASE_URL=f"http://127.0.0.1:{server.server_port}")
+                # The script's own temporary folder, which must be gone (and any image detached) afterwards.
+                (home / "tmp").mkdir()
+                env = dict(os.environ, HOME=str(home), TMPDIR=str(home / "tmp"), XDG_DATA_HOME=str(home / "share"),
+                           CAPTUREFAB_INSTALL_BASE_URL=f"http://127.0.0.1:{server.server_port}")
                 result = subprocess.run(["sh", str(script), "--prefix", prefix or str(home / "apps"), "--bin-dir", str(home / "bin")],
-                                        capture_output=True, text=True, env=env, timeout=60, cwd=home)
+                                        capture_output=True, text=True, env=env, timeout=120, cwd=home)
+                if kind == "dmg":
+                    # A disk image still mounted in the temporary folder would also stop its removal.
+                    root = str((home / "tmp").resolve())
+                    mounts = re.findall(r" on (.+?) \(", subprocess.run(["mount"], capture_output=True, text=True).stdout)
+                    for mount in [m for m in mounts if m.startswith(root + "/")]:
+                        errors.append(f"{label}: left the disk image mounted at {mount}")
+                        subprocess.run(["hdiutil", "detach", "-force", mount], capture_output=True)
+                if any((home / "tmp").iterdir()):
+                    errors.append(f"{label}: left {sorted(p.name for p in (home / 'tmp').iterdir())} in its temporary folder")
                 return home, result
             # A relative prefix must still leave a working command symlink.
             home, result = install("good", "apps")
             command = home / "bin" / "capturefab"
             if result.returncode or not command.is_symlink():
-                errors.append(f"install.sh: fixture install failed: {result.stderr.strip() or result.stdout.strip()}")
+                errors.append(f"{label}: fixture install failed: {result.stderr.strip() or result.stdout.strip()}")
             elif "capturefab 9.9.9" not in result.stdout:
-                errors.append("install.sh: did not run the installed capturefab --version")
+                errors.append(f"{label}: did not run the installed capturefab --version")
+            elif system == "macos" and command.resolve() != (home / "apps/Capturefab.app/Contents/MacOS/capturefab").resolve():
+                errors.append(f"{label}: the command must link to the app's executable, not {os.readlink(command)}")
             elif system == "linux" and 'Exec="' not in (home / "share/applications/capturefab.desktop").read_text():
-                errors.append("install.sh: the launcher entry must name the installed command")
+                errors.append(f"{label}: the launcher entry must name the installed command")
             for path in served.iterdir():
                 path.write_bytes(path.read_bytes() + b"tampered")
             home, result = install("corrupt")
             if result.returncode == 0 or "checksum mismatch" not in result.stderr:
-                errors.append("install.sh: a corrupted download must fail with a checksum mismatch")
+                errors.append(f"{label}: a corrupted download must fail with a checksum mismatch")
             if (home / "bin").exists() or (home / "apps").exists():
-                errors.append("install.sh: a corrupted download must install nothing")
+                errors.append(f"{label}: a corrupted download must install nothing")
         finally:
             server.shutdown()
             server.server_close()
+        if kind == "dmg":
+            return
         empty = temp / "empty.sh"
         empty.write_text(site.installers(dict(schema_version=1, latest=None, releases=[]), "https://capturefab.example/")[0], encoding="utf-8")
         result = subprocess.run(["sh", str(empty)], capture_output=True, text=True, env=dict(os.environ, HOME=str(temp)), timeout=30)
