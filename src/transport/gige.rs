@@ -194,22 +194,67 @@ fn discovery_info(payload: &[u8], source: Ipv4Addr) -> Result<CameraInfo> {
     })
 }
 
+/// A discovery socket bound to 0.0.0.0 but pinned to one interface, so that
+/// its limited broadcast leaves on that interface and broadcast
+/// acknowledgements from cameras on foreign subnets still reach it.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn interface_pinned_socket(index: u32) -> Option<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+    socket
+        .bind_device_by_index_v4(Some(std::num::NonZeroU32::new(index)?))
+        .ok()?;
+    socket
+        .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
+        .ok()?;
+    Some(socket.into())
+}
+#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+fn interface_pinned_socket(_index: u32) -> Option<UdpSocket> {
+    None
+}
+
 /// Discover cameras on every usable IPv4 interface, within one shared deadline.
-/// A directed broadcast is sent from a socket bound to each interface so that
-/// multi-NIC hosts do not silently discover only the default-route network.
+/// Directed and limited broadcasts are sent from sockets tied to each
+/// interface so that multi-NIC hosts do not silently discover only the
+/// default-route network, and cameras whose address does not match the
+/// interface's subnet (which ignore directed broadcasts) are still listed.
 pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
     let deadline = Instant::now() + bounded_timeout(timeout);
     let request = command_packet(DISCOVERY, 0xffff, 0x11, &[]);
     let mut sockets = Vec::new();
     let mut local_addresses = HashSet::new();
+    let mut pinned_interfaces = HashSet::new();
     // Set when a send failed in a way macOS Local Network privacy explains.
     let mut hint = None;
     for interface in if_addrs::get_if_addrs().context("enumerating IPv4 interfaces")? {
-        let if_addrs::IfAddr::V4(v4) = interface.addr else {
+        let if_addrs::IfAddr::V4(v4) = &interface.addr else {
             continue;
         };
         if v4.ip.is_unspecified() || !local_addresses.insert(v4.ip) {
             continue;
+        }
+        let mut send = |socket: &UdpSocket, to: Ipv4Addr| match socket
+            .send_to(&request, SocketAddrV4::new(to, GVCP_PORT))
+        {
+            Ok(_) => true,
+            Err(error) => {
+                hint = hint.or(crate::network::local_network_hint(&error, Some(to.into())));
+                false
+            }
+        };
+        let pinned = (!v4.ip.is_loopback() && v4.broadcast.is_some())
+            .then_some(interface.index)
+            .flatten()
+            .filter(|index| pinned_interfaces.insert(*index))
+            .and_then(interface_pinned_socket)
+            .filter(|socket| socket.set_broadcast(true).is_ok())
+            .filter(|socket| socket.set_nonblocking(true).is_ok());
+        let pinned_sent = pinned
+            .as_ref()
+            .is_some_and(|socket| send(socket, Ipv4Addr::BROADCAST));
+        if pinned_sent {
+            sockets.extend(pinned);
         }
         let Ok(socket) = UdpSocket::bind(SocketAddrV4::new(v4.ip, 0)) else {
             continue;
@@ -219,17 +264,14 @@ pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
         }
         // Probe the local interface too: camera simulators and software GigE
         // producers often bind to a unicast or loopback interface.
-        let mut send =
-            |to: Ipv4Addr| match socket.send_to(&request, SocketAddrV4::new(to, GVCP_PORT)) {
-                Ok(_) => true,
-                Err(error) => {
-                    hint = hint.or(crate::network::local_network_hint(&error, Some(to.into())));
-                    false
-                }
-            };
-        let mut sent = send(v4.ip);
+        let mut sent = send(&socket, v4.ip);
         if let Some(broadcast) = v4.broadcast {
-            sent |= send(broadcast);
+            sent |= send(&socket, broadcast);
+            // A source-bound limited broadcast leaves on this interface too,
+            // where no pinned socket is available.
+            if !pinned_sent {
+                sent |= send(&socket, Ipv4Addr::BROADCAST);
+            }
         }
         if sent {
             sockets.push(socket);
@@ -2474,6 +2516,33 @@ mod tests {
         assert!(discovery_info(&identity[..240], Ipv4Addr::LOCALHOST).is_err());
         assert!(parse_ack(&[0; 7]).is_err());
         assert!(parse_ack(&[0, 0, 0, 3, 0, 1, 0, 1]).is_err());
+    }
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[test]
+    fn interface_pinned_discovery_sockets_listen_on_every_address() {
+        let loopback = if_addrs::get_if_addrs()
+            .unwrap()
+            .into_iter()
+            .find(|interface| interface.addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .and_then(|interface| interface.index)
+            .unwrap();
+        let socket = interface_pinned_socket(loopback).unwrap();
+        let SocketAddr::V4(local) = socket.local_addr().unwrap() else {
+            unreachable!()
+        };
+        // Bound to 0.0.0.0, so broadcast acknowledgements are delivered too.
+        assert!(local.ip().is_unspecified());
+        let camera = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket
+            .send_to(b"discovery", camera.local_addr().unwrap())
+            .unwrap();
+        let mut buffer = [0; 16];
+        let (_, peer) = camera.recv_from(&mut buffer).unwrap();
+        camera.send_to(b"ack", peer).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert_eq!(socket.recv(&mut buffer).unwrap(), 3);
     }
     #[test]
     fn udp_retries_ignore_stale_id_and_wrong_ack_command() {
