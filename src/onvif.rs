@@ -382,8 +382,10 @@ struct HttpResponse {
     challenges: Vec<String>,
     body: String,
 }
-fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
-    let status = read_line(&mut reader, 4096)?;
+/// The status, headers (repeats joined) and `WWW-Authenticate` lines of an
+/// HTTP or RTSP response.
+fn parse_head(reader: &mut impl BufRead) -> Result<(u16, BTreeMap<String, String>, Vec<String>)> {
+    let status = read_line(reader, 4096)?;
     let status = std::str::from_utf8(&status)?
         .split_whitespace()
         .nth(1)
@@ -393,7 +395,7 @@ fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
     let mut challenges = Vec::new();
     let mut header_bytes = 0;
     loop {
-        let line = read_line(&mut reader, 8192)?;
+        let line = read_line(reader, 8192)?;
         header_bytes += line.len();
         ensure!(
             header_bytes <= 65536,
@@ -418,6 +420,10 @@ fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
             })
             .or_insert_with(|| value.trim().into());
     }
+    Ok((status, headers, challenges))
+}
+fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
+    let (status, headers, challenges) = parse_head(&mut reader)?;
     let mut body = Vec::new();
     if headers
         .get("transfer-encoding")
@@ -1489,6 +1495,96 @@ fn authenticated_uri(uri: &str, credentials: Option<&Credentials>) -> Result<Str
     let login = crate::logins::CameraLogin::new(&credentials.username, &credentials.password)?;
     Ok(crate::logins::with_credentials(uri, &login)?.to_string())
 }
+/// The `WWW-Authenticate` lines an RTSP server answers an anonymous DESCRIBE
+/// with; empty when it asks for no sign-in.
+fn rtsp_challenges(uri: &str, timeout: Duration) -> Result<Vec<String>> {
+    let (host, port) = host_and_port(uri).context("invalid RTSP address")?;
+    let url = HttpUrl {
+        host,
+        port,
+        authority: String::new(),
+        path: String::new(),
+    };
+    let mut stream = open_tcp(&url, timeout)?;
+    stream.write_all(
+        format!("DESCRIBE {uri} RTSP/1.0\r\nCSeq: 1\r\nAccept: application/sdp\r\n\r\n").as_bytes(),
+    )?;
+    let (status, _, challenges) = parse_head(&mut BufReader::new(stream))?;
+    Ok(if status == 401 {
+        challenges
+    } else {
+        Vec::new()
+    })
+}
+/// Why the bundled FFmpeg (9.0) cannot answer an RTSP server's challenges,
+/// if it cannot. It takes the last header that starts a Digest challenge
+/// (Digest outranks Basic) and computes only MD5 and MD5-sess, spelled in
+/// that case, with qop auth or none (libavformat/httpauth.c).
+fn ffmpeg_cannot_answer(values: &[String], address: &str) -> Option<String> {
+    let digests = values
+        .iter()
+        .filter_map(|value| {
+            challenges(std::slice::from_ref(value))
+                .ok()?
+                .into_iter()
+                .next()
+        })
+        .filter(|c| c.scheme.eq_ignore_ascii_case("digest"))
+        .collect::<Vec<_>>();
+    let algorithm = |c: &Challenge| c.params.get("algorithm").cloned().unwrap_or_default();
+    let answerable = |c: &Challenge| {
+        matches!(algorithm(c).as_str(), "" | "MD5" | "MD5-sess")
+            && c.params
+                .get("qop")
+                .is_none_or(|qop| qop.split(',').any(|q| q.trim() == "auth"))
+    };
+    let last = digests.last()?;
+    if answerable(last) {
+        return None;
+    }
+    let named = |c: &Challenge| match algorithm(c) {
+        name if name.is_empty() => "MD5".to_owned(),
+        name => name,
+    };
+    let last_name = if matches!(algorithm(last).as_str(), "" | "MD5" | "MD5-sess") {
+        format!("{} with qop auth-int", named(last))
+    } else {
+        named(last)
+    };
+    Some(if digests.iter().any(answerable) {
+        format!(
+            "{address} offers Digest sign-in with {}, but FFmpeg answers only the last challenge, {last_name}, which it cannot compute; set the camera's RTSP authentication to MD5 Digest alone",
+            digests.iter().map(named).collect::<Vec<_>>().join(", ")
+        )
+    } else {
+        format!(
+            "{address} asks for a Digest sign-in with {last_name}, which FFmpeg cannot compute (it answers MD5 only); enable MD5 Digest authentication for RTSP on the camera"
+        )
+    })
+}
+/// A camera that refused the sign-in for an rtsp:// stream although its ONVIF
+/// service took it may be asking for a Digest algorithm FFmpeg cannot answer;
+/// say so instead of reporting a wrong password.
+fn explain_rtsp_refusal(error: anyhow::Error, uri: &str, timeout: Duration) -> anyhow::Error {
+    let uri = crate::logins::strip_userinfo(uri);
+    if !crate::logins::is_auth_error(&error)
+        || !uri
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("rtsp://"))
+    {
+        return error;
+    }
+    let address = crate::media::redact_url(&uri);
+    match rtsp_challenges(&uri, timeout) {
+        Ok(values) => match ffmpeg_cannot_answer(&values, &address) {
+            Some(message) => {
+                crate::types::Categorized::error(crate::types::ErrorKind::Unsupported, message)
+            }
+            None => error,
+        },
+        Err(_) => error,
+    }
+}
 /// Try profiles in the camera's advertised order. Opening a media source reads
 /// its first frame, so success establishes that this stream can actually decode.
 fn open_stream<T>(
@@ -1554,7 +1650,13 @@ pub fn connect_with(
     let streams = resolve(&endpoint, credentials.as_ref(), None, timeout).map_err(rekey)?;
     let (profile, backend) = open_stream(&streams, |profile| {
         let uri = zeroize::Zeroizing::new(authenticated_uri(&profile.uri, credentials.as_ref())?);
-        crate::media::open_url(&uri, timeout)
+        crate::media::open_url(&uri, timeout).map_err(|error| {
+            if sent {
+                explain_rtsp_refusal(error, &profile.uri, timeout)
+            } else {
+                error
+            }
+        })
     })
     .map_err(rekey)?;
     if let Some(credentials) = &mut credentials {
@@ -2688,6 +2790,84 @@ mod tests {
             code(&endpoint_key("onvif://u:p@cam").unwrap_err()),
             Some("usage")
         );
+    }
+    #[test]
+    fn rtsp_refusals_name_digest_algorithms_ffmpeg_cannot_answer() {
+        let md5 =
+            r#"Digest realm="IP Camera(C1234)", nonce="a1b2c3", stale="FALSE", algorithm="MD5""#;
+        let sha = r#"Digest realm="IP Camera(C1234)", nonce="d4e5f6", stale="FALSE", algorithm="SHA-256""#;
+        let basic = r#"Basic realm="IP Camera(C1234)""#;
+        let check = |values: &[&str]| {
+            let values = values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+            ffmpeg_cannot_answer(&values, "rtsp://cam/live")
+        };
+        // FFmpeg keeps the last Digest challenge and computes MD5 only.
+        assert_eq!(check(&[sha, md5]), None);
+        assert_eq!(check(&[basic]), None);
+        assert_eq!(check(&[md5, basic]), None);
+        assert_eq!(
+            check(&[r#"Digest realm="r", nonce="n", qop="auth,auth-int""#]),
+            None
+        );
+        let both = check(&[md5, sha]).unwrap();
+        assert!(both.contains("MD5, SHA-256"), "{both}");
+        assert!(both.contains("last challenge, SHA-256"), "{both}");
+        let only = check(&[basic, sha]).unwrap();
+        assert!(only.contains("Digest sign-in with SHA-256"), "{only}");
+        assert!(only.contains("enable MD5 Digest"), "{only}");
+        // Case matters to FFmpeg, and auth-int alone has no answer.
+        assert!(check(&[r#"Digest realm="r", nonce="n", algorithm=md5"#]).is_some());
+        assert!(
+            check(&[r#"Digest realm="r", nonce="n", qop="auth-int""#])
+                .unwrap()
+                .contains("MD5 with qop auth-int")
+        );
+
+        let rtsp = |reply: String| {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let request = read_line(&mut reader, 4096).unwrap();
+                while read_line(&mut reader, 8192).unwrap() != b"\r\n" {}
+                stream.write_all(reply.as_bytes()).unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            (address, server)
+        };
+        let refused = || crate::logins::auth_error("rtsp://cam/live", true);
+        let timeout = Duration::from_secs(2);
+        let (address, server) = rtsp(format!(
+            "RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: {md5}\r\nWWW-Authenticate: {sha}\r\n\r\n"
+        ));
+        let uri = format!("rtsp://admin:pw@{address}/Streaming/Channels/101");
+        let error = explain_rtsp_refusal(refused(), &uri, timeout);
+        let request = server.join().unwrap();
+        assert_eq!(
+            request,
+            format!("DESCRIBE rtsp://{address}/Streaming/Channels/101 RTSP/1.0\r\n")
+        );
+        assert_eq!(code(&error), Some("unsupported"), "{error:#}");
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with(&format!(
+                "rtsp://{address}/Streaming/Channels/101 offers Digest"
+            )) && !text.contains("pw@"),
+            "{text}"
+        );
+        // A challenge FFmpeg answers means the password itself was refused.
+        let (address, server) = rtsp(format!(
+            "RTSP/1.0 401 Unauthorized\r\nCSeq: 1\r\nWWW-Authenticate: {md5}\r\n\r\n"
+        ));
+        let error = explain_rtsp_refusal(refused(), &format!("rtsp://{address}/live"), timeout);
+        server.join().unwrap();
+        assert_eq!(code(&error), Some("auth_rejected"));
+        // Other failures and rtsps:// are left alone, without a probe.
+        let error = explain_rtsp_refusal(anyhow!("decoder failed"), "rtsp://127.0.0.1:9/", timeout);
+        assert_eq!(error.to_string(), "decoder failed");
+        let error = explain_rtsp_refusal(refused(), "rtsps://127.0.0.1:9/", timeout);
+        assert_eq!(code(&error), Some("auth_rejected"));
     }
     #[test]
     fn locator_credentials_roundtrip_and_never_publish() {
