@@ -402,6 +402,11 @@ impl Workbench {
                 if job.captured > previous
                     && let Some(path) = &job.last_file
                 {
+                    // Every job that advanced counts; only the last shows.
+                    *self
+                        .session_saved
+                        .entry(camera.info.id.clone())
+                        .or_default() += u64::from(job.captured - previous);
                     saved = Some(Saved {
                         camera: Some(camera.info.id.clone()),
                         path: path.clone(),
@@ -419,7 +424,7 @@ impl Workbench {
         self.prune_saved();
         if let Some(saved) = saved {
             self.shutter.replay(1.0, 0.0, self.now);
-            self.note_saved(saved);
+            self.show_saved(saved);
         }
     }
 

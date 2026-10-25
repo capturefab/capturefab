@@ -189,13 +189,23 @@ impl Workbench {
     /// camera's tally and, for a single frame, asks for a thumbnail of the
     /// frame on show, so nothing reads the file back.
     pub(super) fn note_saved(&mut self, saved: Saved) {
+        if let Some(camera) = saved
+            .camera
+            .clone()
+            .or_else(|| self.snapshot.active_camera.clone())
+        {
+            self.add_saved(&camera, saved.count as u64);
+        }
+        self.show_saved(saved);
+    }
+
+    /// Make `saved` the last saved without adding to any tally, for files
+    /// already counted.
+    pub(super) fn show_saved(&mut self, saved: Saved) {
         let camera = saved
             .camera
             .clone()
             .or_else(|| self.snapshot.active_camera.clone());
-        if let Some(camera) = &camera {
-            self.add_saved(camera, saved.count as u64);
-        }
         self.thumb_wanted = camera
             .filter(|_| saved.count == 1 && !self.scanner_selected())
             .and_then(|camera| self.handle.latest_frame_for(&camera))
@@ -836,6 +846,40 @@ mod tests {
         bench.snapshot.cameras.clear();
         bench.sync_scheduled_captures();
         assert_eq!(bench.saved_count(Some(&id)), 0);
+    }
+
+    #[test]
+    fn scheduled_saves_on_two_cameras_in_one_report_both_count() {
+        let mut bench = bench();
+        let job = |captured| crate::scheduling::CaptureJob {
+            id: 1,
+            status: "running".into(),
+            output: "frame-{seq}.png".into(),
+            count: 10,
+            captured,
+            skipped: 0,
+            retries: 0,
+            first_at_ms: 0,
+            interval_ms: 1000,
+            next_at_ms: 0,
+            last_file: Some(format!("frame-{captured}.png")),
+            error: None,
+            destination: None,
+            context: Default::default(),
+        };
+        let mut first = super::super::liveness::streaming_camera(0, 0, 30.0);
+        let mut second = super::super::liveness::streaming_camera(1, 0, 30.0);
+        second.info.id = "sim:1".into();
+        first.jobs = vec![job(2)];
+        second.jobs = vec![job(3)];
+        let (a, b) = (first.info.id.clone(), second.info.id.clone());
+        assert_ne!(a, b);
+        bench.snapshot.cameras = vec![first, second];
+        bench.sync_scheduled_captures();
+        assert_eq!(bench.saved_count(Some(&a)), 2);
+        assert_eq!(bench.saved_count(Some(&b)), 3);
+        let last = bench.last_saved.as_ref().unwrap();
+        assert_eq!((last.camera.as_deref(), last.count), (Some(b.as_str()), 3));
     }
 
     #[test]

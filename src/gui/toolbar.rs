@@ -107,13 +107,16 @@ fn recording_clock(now: u64, since: u64, until: Option<u64>) -> String {
 
 /// A running recording's progress in a line, "01:24 · 2,520 frames written",
 /// adding what it lost, and whether that line is a warning: frames dropped
-/// or the encoder stalled. Counters of another recording are not this one's.
+/// or the encoder stalled. A forward to a stream says its frames are "sent"
+/// rather than "written". Counters of another recording are not this one's.
 pub(super) fn recording_stats(
     now: u64,
     since: Option<u64>,
     progress: Option<&crate::session::ForwardingProgress>,
     forwarding_id: Option<&str>,
+    recording: bool,
 ) -> Option<(String, bool)> {
+    let verb = if recording { "written" } else { "sent" };
     let progress = progress.filter(|progress| Some(progress.id.as_str()) == forwarding_id);
     let mut parts = Vec::new();
     if let Some(since) = since {
@@ -128,10 +131,10 @@ pub(super) fn recording_stats(
             warn = true;
         } else if dropped > 0 {
             // Short, so what was lost still fits beside it.
-            parts.push(format!("{} written", grouped(progress.written)));
+            parts.push(format!("{} {verb}", grouped(progress.written)));
         } else {
             parts.push(format!(
-                "{} {} written",
+                "{} {} {verb}",
                 grouped(progress.written),
                 if progress.written == 1 {
                     "frame"
@@ -1156,7 +1159,7 @@ mod tests {
             stalled,
         };
         let stats = |progress: &crate::session::ForwardingProgress, id| {
-            recording_stats(85_000, Some(1_000), Some(progress), Some(id))
+            recording_stats(85_000, Some(1_000), Some(progress), Some(id), true)
         };
         assert_eq!(
             stats(&progress(2_520, 0, false), "a"),
@@ -1179,7 +1182,18 @@ mod tests {
             stats(&progress(2_520, 3, false), "b"),
             Some(("01:24".into(), false))
         );
-        assert_eq!(recording_stats(0, None, None, None), None);
+        // A forward to a stream sends its frames rather than writing them.
+        assert_eq!(
+            recording_stats(
+                85_000,
+                Some(1_000),
+                Some(&progress(2_490, 0, false)),
+                Some("a"),
+                false
+            ),
+            Some(("01:24 \u{b7} 2,490 frames sent".into(), false))
+        );
+        assert_eq!(recording_stats(0, None, None, None, true), None);
     }
 
     #[test]

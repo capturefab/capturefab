@@ -643,7 +643,7 @@ fn the_next_capture_names_its_file_and_folder_apart() {
         "{:?}",
         labels(&capture)
     );
-    let caption = format!("in {dated}");
+    let caption = format!("in {dated}/");
     assert!(
         labels(&capture).contains(&caption.as_str()),
         "{:?}",

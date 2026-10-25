@@ -566,40 +566,60 @@ enum Num {
     RetentionDays,
 }
 
-/// A template's next {seq}, read for a camera on a day.
+/// A template's next {seq}, read for a camera on a day, in the folder of
+/// its named destination when it has one.
 #[derive(Clone, Debug, Default)]
 struct NextNumber {
     template: String,
+    destination: Option<String>,
     camera: String,
     date: String,
     seq: Option<u32>,
+    /// The saves seen when the read started; a save since makes it stale.
+    generation: u64,
 }
+
+/// Where a template's number is read: the template and its destination.
+type NumberKey = (String, Option<String>);
 
 /// The next {seq} of each output template, as last read, so the preview
 /// shows the number a save takes rather than `####`.
 #[derive(Default)]
 struct NextNumbers {
-    known: HashMap<String, NextNumber>,
+    known: HashMap<NumberKey, NextNumber>,
     /// Templates to read again, as a save may have taken their number.
-    stale: std::collections::HashSet<String>,
+    stale: std::collections::HashSet<NumberKey>,
     /// A read is on its way.
     busy: bool,
+    /// Saves seen so far, so a read that started before one stays stale.
+    generation: u64,
 }
 
 impl NextNumbers {
-    fn get(&self, template: &str, camera: &str, date: &str) -> Option<u32> {
+    fn key(template: &str, destination: Option<&str>) -> NumberKey {
+        (template.to_owned(), destination.map(str::to_owned))
+    }
+
+    fn get(
+        &self,
+        template: &str,
+        destination: Option<&str>,
+        camera: &str,
+        date: &str,
+    ) -> Option<u32> {
         self.known
-            .get(template)
+            .get(&Self::key(template, destination))
             .filter(|read| read.camera == camera && read.date == date)?
             .seq
     }
 
-    /// Whether `template` needs reading for this camera and day.
-    fn wanted(&self, template: &str, camera: &str, date: &str) -> bool {
-        self.stale.contains(template)
+    /// Whether `template` needs reading for this destination, camera and day.
+    fn wanted(&self, template: &str, destination: Option<&str>, camera: &str, date: &str) -> bool {
+        let key = Self::key(template, destination);
+        self.stale.contains(&key)
             || self
                 .known
-                .get(template)
+                .get(&key)
                 .is_none_or(|read| read.camera != camera || read.date != date)
     }
 
@@ -608,17 +628,22 @@ impl NextNumbers {
         if read.template.is_empty() {
             return;
         }
-        self.stale.remove(&read.template);
+        let key = Self::key(&read.template, read.destination.as_deref());
+        // A save while it was read may have taken this number: read again.
+        if read.generation == self.generation {
+            self.stale.remove(&key);
+        }
         // Bounded: only the templates read most recently are kept.
-        if self.known.len() >= 8 && !self.known.contains_key(&read.template) {
+        if self.known.len() >= 8 && !self.known.contains_key(&key) {
             self.known.clear();
         }
-        self.known.insert(read.template.clone(), read);
+        self.known.insert(key, read);
     }
 
     /// A save may have taken the numbers shown: read them all again,
     /// showing the old ones meanwhile.
     fn saved(&mut self) {
+        self.generation += 1;
         self.stale.extend(self.known.keys().cloned());
     }
 }
@@ -2416,7 +2441,10 @@ impl Workbench {
     /// next once that is known for this camera and day.
     fn preview_at(&self, template: &str, now: chrono::DateTime<chrono::Local>) -> String {
         let camera = self.name_label();
-        let seq = self.next_numbers.get(template, &camera, &day(now));
+        let destination = self.destination_of(template);
+        let seq = self
+            .next_numbers
+            .get(template, destination, &camera, &day(now));
         let preview = crate::naming::preview_numbered(template, &camera, now, seq);
         let home = prefs::capture_root();
         match home
@@ -2428,8 +2456,20 @@ impl Workbench {
         }
     }
 
+    /// The named destination `template` saves under: the capture's for the
+    /// capture output, the recording's for the recording output.
+    fn destination_of(&self, template: &str) -> Option<&str> {
+        if template == self.output {
+            self.capture_to.selected.as_deref()
+        } else if template == self.forward_output {
+            self.record_to.selected.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Read the next {seq} of a capture or recording template that is not
-    /// known for this camera and day, one at a time, on a worker thread:
+    /// known for this destination, camera and day, one at a time, on a worker thread:
     /// folders may hold many files. Screenshots show `####`, whatever the
     /// folder holds.
     fn next_number_task(&mut self) -> Task<Message> {
@@ -2439,23 +2479,34 @@ impl Workbench {
         let camera = self.name_label();
         let now = chrono::Local::now();
         let date = day(now);
-        let Some(template) = [&self.output, &self.forward_output]
-            .into_iter()
-            .find(|template| self.next_numbers.wanted(template, &camera, &date))
-            .cloned()
-        else {
+        let Some((template, destination)) = [
+            (&self.output, &self.capture_to.selected),
+            (&self.forward_output, &self.record_to.selected),
+        ]
+        .into_iter()
+        .find(|(template, destination)| {
+            self.next_numbers
+                .wanted(template, destination.as_deref(), &camera, &date)
+        })
+        .map(|(template, destination)| (template.clone(), destination.clone())) else {
             return Task::none();
         };
+        let generation = self.next_numbers.generation;
         let (done, read) = iced::futures::channel::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("capturefab-next-number".into())
             .spawn(move || {
-                let seq = crate::naming::peek_next(&template, &camera, now);
+                // A destination's output is inside its folder, not ours.
+                let seq = crate::destination::resolve(destination.as_deref(), &template)
+                    .ok()
+                    .and_then(|resolved| crate::naming::peek_next(&resolved.output, &camera, now));
                 let _ = done.send(NextNumber {
                     template,
+                    destination,
                     camera,
                     date,
                     seq,
+                    generation,
                 });
             });
         if spawned.is_err() {

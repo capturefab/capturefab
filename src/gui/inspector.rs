@@ -1480,7 +1480,7 @@ fn file_preview<'a>(
                 // Under the label, past the glyph and its gap.
                 space().width(18),
                 one_line(
-                    format!("in {subfolder}"),
+                    format!("in {subfolder}/"),
                     style::CAPTION,
                     style::SANS,
                     p.secondary
@@ -3444,9 +3444,9 @@ impl Workbench {
     }
 
     /// What the forward card says it writes: the file a recording writes,
-    /// as this window started it or else as the session reports it, so one
-    /// the CLI or assistant started also shows its real name rather than
-    /// the template; and where it goes, with its tooltip: the folder of
+    /// as the session reports it or else as this window started it, so one
+    /// the CLI or assistant started later also shows its real name rather
+    /// than this window's older file or the template; and where it goes, with its tooltip: the folder of
     /// that file (home folded to `~`), else the redacted requested output.
     fn forward_place<'a>(
         &'a self,
@@ -3455,8 +3455,10 @@ impl Workbench {
     ) -> (Option<&'a str>, String, String) {
         let file = recording
             .then(|| {
-                self.recording_file()
-                    .or(self.snapshot.recording_path.as_deref())
+                self.snapshot
+                    .recording_path
+                    .as_deref()
+                    .or(self.recording_file())
             })
             .flatten();
         match file.map(std::path::Path::new) {
@@ -3549,6 +3551,7 @@ impl Workbench {
             self.snapshot.forwarding_since_ms,
             self.snapshot.forwarding_progress.as_ref(),
             self.snapshot.forwarding_id.as_deref(),
+            recording,
         ) {
             card = card.push(
                 row![
@@ -4809,24 +4812,68 @@ mod tests {
         let template = "/captures/{camera}-{seq}.png".to_owned();
         bench.output = template.clone();
         let camera = bench.name_label();
-        assert!(bench.preview_at(&template, now).ends_with("-####.png"));
-        assert!(bench.next_numbers.wanted(&template, &camera, &day(now)));
-        bench.next_numbers.busy = true;
-        bench.next_numbers.settle(NextNumber {
+        let read = |bench: &Workbench, seq| NextNumber {
             template: template.clone(),
+            destination: None,
             camera: camera.clone(),
             date: day(now),
-            seq: Some(13),
-        });
+            seq: Some(seq),
+            generation: bench.next_numbers.generation,
+        };
+        assert!(bench.preview_at(&template, now).ends_with("-####.png"));
+        assert!(
+            bench
+                .next_numbers
+                .wanted(&template, None, &camera, &day(now))
+        );
+        bench.next_numbers.busy = true;
+        let first = read(&bench, 13);
+        bench.next_numbers.settle(first);
         assert!(!bench.next_numbers.busy);
-        assert!(!bench.next_numbers.wanted(&template, &camera, &day(now)));
+        assert!(
+            !bench
+                .next_numbers
+                .wanted(&template, None, &camera, &day(now))
+        );
         assert!(bench.preview_at(&template, now).ends_with("-0013.png"));
         // Another day's folder is read again; until then, `####`.
-        assert!(bench.next_numbers.wanted(&template, &camera, "2000-01-01"));
+        assert!(
+            bench
+                .next_numbers
+                .wanted(&template, None, &camera, "2000-01-01")
+        );
         // A save asks for the number again, showing the old one meanwhile.
         bench.next_numbers.saved();
-        assert!(bench.next_numbers.wanted(&template, &camera, &day(now)));
+        assert!(
+            bench
+                .next_numbers
+                .wanted(&template, None, &camera, &day(now))
+        );
         assert!(bench.preview_at(&template, now).ends_with("-0013.png"));
+        // A read that started before a save lands, but stays stale.
+        let early = read(&bench, 14);
+        bench.next_numbers.saved();
+        bench.next_numbers.settle(early);
+        assert!(
+            bench
+                .next_numbers
+                .wanted(&template, None, &camera, &day(now))
+        );
+        let fresh = read(&bench, 15);
+        bench.next_numbers.settle(fresh);
+        assert!(
+            !bench
+                .next_numbers
+                .wanted(&template, None, &camera, &day(now))
+        );
+        // Under a named destination it is another folder, read on its own.
+        bench.capture_to.selected = Some("lab".into());
+        assert!(
+            bench
+                .next_numbers
+                .wanted(&template, Some("lab"), &camera, &day(now))
+        );
+        assert!(bench.preview_at(&template, now).ends_with("-####.png"));
     }
 
     #[test]
@@ -4849,6 +4896,14 @@ mod tests {
             about.ends_with("Sim-SIM0-20261025-101500-0001.mp4"),
             "{about}"
         );
+        // This window's older recording does not hide the session's newer one.
+        let older = home.join("2026-10-24/Sim-SIM0-20261024-090000-0001.mp4");
+        bench.last_recording = Some((
+            bench.snapshot.active_camera.clone(),
+            older.to_string_lossy().into_owned(),
+        ));
+        let (shown, _, _) = bench.forward_place(&template, true);
+        assert_eq!(shown, bench.snapshot.recording_path.as_deref());
         // A network forward still shows its redacted address.
         let url = "rtsp://operator:secret@192.168.1.20:8554/line-1";
         let (shown, place, _) = bench.forward_place(url, false);
