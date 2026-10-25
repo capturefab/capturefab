@@ -21,9 +21,23 @@ const PRIVILEGE: u32 = 0x0a00;
 const HEARTBEAT: u32 = 0x0938;
 const STREAM_PORT: u32 = 0x0d00;
 const STREAM_SIZE: u32 = 0x0d04;
+const STREAM_DELAY: u32 = 0x0d08;
 const STREAM_ADDRESS: u32 = 0x0d18;
+const USER_NAME: u32 = 0x00e8;
+/// Inter-packet delay limit in timestamp ticks (1 GHz): 10 ms.
+const MAX_STREAM_DELAY: u32 = 10_000_000;
 const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 type AcquisitionCommands = BTreeMap<u64, (u64, u64)>;
+
+/// A GVCP acknowledgement status and its reason.
+#[derive(Debug)]
+struct Status(u16, &'static str);
+impl std::fmt::Display for Status {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.1)
+    }
+}
+impl std::error::Error for Status {}
 
 struct State {
     registers: BTreeMap<u32, u32>,
@@ -40,6 +54,130 @@ impl State {
             Ipv4Addr::from(self.reg(STREAM_ADDRESS)),
             self.reg(STREAM_PORT) as u16,
         ))
+    }
+}
+/// Device memory. Bootstrap registers hold the same values through register
+/// and memory commands, as on a camera.
+struct Device {
+    bootstrap: Arc<Vec<u8>>,
+    xml: Arc<Vec<u8>>,
+    source: Arc<Mutex<Camera>>,
+    commands: AcquisitionCommands,
+    acquisition: Arc<AtomicBool>,
+    stream: Arc<UdpSocket>,
+}
+impl Device {
+    fn read(&self, state: &State, address: u64, length: usize) -> Result<Vec<u8>> {
+        let mut bytes = read_memory(address, length, &self.bootstrap, &self.xml, &self.source)?;
+        overlay(&state.registers, address, &mut bytes);
+        Ok(bytes)
+    }
+    fn write(&self, state: &mut State, peer: SocketAddr, address: u64, data: &[u8]) -> Result<()> {
+        if address >= SOURCE_BASE {
+            ensure!(
+                state.controller == Some(peer),
+                Status(0x8006, "control privilege required")
+            );
+            return write_memory(
+                address,
+                data,
+                &self.source,
+                &self.commands,
+                &self.acquisition,
+            );
+        }
+        ensure!(
+            address.is_multiple_of(4) && data.len().is_multiple_of(4),
+            Status(0x8005, "unaligned register write")
+        );
+        for (address, word) in (address as u32..).step_by(4).zip(data.as_chunks::<4>().0) {
+            self.write_register(state, peer, address, u32::from_be_bytes(*word))?;
+        }
+        Ok(())
+    }
+    fn write_register(
+        &self,
+        state: &mut State,
+        peer: SocketAddr,
+        address: u32,
+        value: u32,
+    ) -> Result<()> {
+        ensure!(
+            address.is_multiple_of(4),
+            Status(0x8005, "unaligned register write")
+        );
+        if address == PRIVILEGE {
+            ensure!(
+                value <= 2 && (state.controller.is_none() || state.controller == Some(peer)),
+                Status(0x8006, "camera already controlled")
+            );
+            state.heartbeat = Instant::now();
+            if value == 0 {
+                return self.release(state);
+            }
+            state.controller = Some(peer);
+            state.registers.insert(PRIVILEGE, value);
+            return Ok(());
+        }
+        ensure!(
+            state.controller == Some(peer),
+            Status(0x8006, "control privilege required")
+        );
+        match address {
+            HEARTBEAT => ensure!((500..=60000).contains(&value), "heartbeat range"),
+            STREAM_PORT => ensure!(value <= u16::MAX as u32, "invalid stream port"),
+            STREAM_ADDRESS => ensure!(
+                !Ipv4Addr::from(value).is_multicast() && value != u32::MAX,
+                "invalid stream destination"
+            ),
+            STREAM_SIZE => {
+                let size = value & 0xffff;
+                ensure!((576..=9000).contains(&size), "stream packet size range");
+                state.registers.insert(address, value & 0x7fff_ffff);
+                if value & 0x8000_0000 != 0 && state.reg(STREAM_PORT) != 0 {
+                    let _ = self
+                        .stream
+                        .send_to(&vec![0; size as usize - 28], state.destination());
+                }
+                return Ok(());
+            }
+            STREAM_DELAY => ensure!(value <= MAX_STREAM_DELAY, "stream packet delay range"),
+            _ if (USER_NAME..USER_NAME + 16).contains(&address) => {}
+            _ if (address as usize) < self.bootstrap.len() => {
+                anyhow::bail!(Status(0x8004, "read-only bootstrap register"))
+            }
+            _ => {
+                return write_memory(
+                    address as u64,
+                    &value.to_be_bytes(),
+                    &self.source,
+                    &self.commands,
+                    &self.acquisition,
+                );
+            }
+        }
+        state.registers.insert(address, value);
+        Ok(())
+    }
+    fn release(&self, state: &mut State) -> Result<()> {
+        state.controller = None;
+        state.registers.insert(PRIVILEGE, 0);
+        self.acquisition.store(false, Ordering::Relaxed);
+        self.source.lock().unwrap_or_else(|e| e.into_inner()).stop()
+    }
+}
+/// Lays big-endian register values over the bootstrap bytes they cover.
+fn overlay(registers: &BTreeMap<u32, u32>, address: u64, bytes: &mut [u8]) {
+    for (&register, value) in registers {
+        for (offset, byte) in (register as u64..).zip(value.to_be_bytes()) {
+            if let Some(target) = offset
+                .checked_sub(address)
+                .and_then(|offset| usize::try_from(offset).ok())
+                .and_then(|offset| bytes.get_mut(offset))
+            {
+                *target = byte;
+            }
+        }
     }
 }
 pub(crate) struct GigEServer {
@@ -79,8 +217,9 @@ impl GigEServer {
         // A locally administered MAC, stable for each advertised IPv4 address.
         bootstrap[8..12].copy_from_slice(&0x0200u32.to_be_bytes());
         bootstrap[12..16].copy_from_slice(&u32::from(options.advertise).to_be_bytes());
-        bootstrap[0x10..0x14].copy_from_slice(&4u32.to_be_bytes());
-        bootstrap[0x14..0x18].copy_from_slice(&4u32.to_be_bytes());
+        // A persistent (static) address; link-local addressing is always on.
+        bootstrap[0x10..0x14].copy_from_slice(&5u32.to_be_bytes());
+        bootstrap[0x14..0x18].copy_from_slice(&5u32.to_be_bytes());
         bootstrap[0x24..0x28].copy_from_slice(&options.advertise.octets());
         bootstrap[0x34..0x38].copy_from_slice(&[255, 255, 255, 0]);
         put_text(&mut bootstrap, 0x48, 32, "Capturefab");
@@ -98,19 +237,24 @@ impl GigEServer {
             16,
             &format!("SIM{:08X}", u32::from(options.advertise)),
         );
-        put_text(&mut bootstrap, 0xe8, 16, &options.name);
+        put_text(&mut bootstrap, USER_NAME as usize, 16, &options.name);
         put_text(
             &mut bootstrap,
             0x200,
             512,
             &format!("Local:Capturefab.xml;{XML_BASE:x};{xml_length:x}"),
         );
+        bootstrap[0x600..0x604].copy_from_slice(&1u32.to_be_bytes());
+        bootstrap[0x64c..0x650].copy_from_slice(&options.advertise.octets());
+        bootstrap[0x65c..0x660].copy_from_slice(&[255, 255, 255, 0]);
         let bootstrap = Arc::new(bootstrap);
         let state = Arc::new(Mutex::new(State {
             registers: BTreeMap::from([
                 (PRIVILEGE, 0),
                 (HEARTBEAT, 3000),
-                (0x0934, 0x4),
+                // Concatenation, WRITEMEM, PACKETRESEND, serial number and
+                // user-defined name (arvgvcpprivate.h).
+                (0x0934, 0xc000_0007),
                 (0x093c, 0),
                 (0x0940, 1_000_000_000),
                 (0x0900, 0),
@@ -118,6 +262,7 @@ impl GigEServer {
                 (0x0d1c, stream.local_addr()?.port() as u32),
                 (STREAM_SIZE, 1500),
                 (STREAM_PORT, 0),
+                (STREAM_DELAY, 0),
                 (STREAM_ADDRESS, 0),
             ]),
             controller: None,
@@ -130,8 +275,12 @@ impl GigEServer {
             shutdown: shutdown.clone(),
         };
         if let Some((sockets, netmask)) = discovery_sockets(options.bind, port) {
-            let (replies, bootstrap, stopped) =
-                (control.try_clone()?, bootstrap.clone(), shutdown.clone());
+            let (replies, bootstrap, state, stopped) = (
+                control.try_clone()?,
+                bootstrap.clone(),
+                state.clone(),
+                shutdown.clone(),
+            );
             let bind = u32::from(options.bind);
             server.threads.push(
                 thread::Builder::new()
@@ -147,8 +296,10 @@ impl GigEServer {
                                     && (u32::from(*peer.ip()) ^ bind) & netmask == 0
                                     && let Some((0x0002, id, _)) = command(&buffer[..length])
                                 {
-                                    let _ = replies
-                                        .send_to(&ack(0, 0x0002, id, &bootstrap[..0xf8]), peer);
+                                    let mut data = bootstrap[..0xf8].to_vec();
+                                    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+                                    overlay(&state.registers, 0, &mut data);
+                                    let _ = replies.send_to(&ack(0, 0x0002, id, &data), peer);
                                 }
                             }
                         }
@@ -156,13 +307,15 @@ impl GigEServer {
                     .context("starting virtual GigE discovery")?,
             );
         }
-        let (state_control, source, stopped, active, packets) = (
-            state.clone(),
-            camera,
-            shutdown.clone(),
-            acquisition.clone(),
-            stream.clone(),
-        );
+        let device = Device {
+            bootstrap,
+            xml,
+            source: camera,
+            commands,
+            acquisition: acquisition.clone(),
+            stream: stream.clone(),
+        };
+        let (state_control, stopped) = (state.clone(), shutdown.clone());
         server.threads.push(
             thread::Builder::new()
                 .name("capturefab-virtual-gvcp".into())
@@ -175,10 +328,7 @@ impl GigEServer {
                                 && state.heartbeat.elapsed()
                                     > Duration::from_millis(state.reg(HEARTBEAT).max(500) as u64)
                             {
-                                state.controller = None;
-                                state.registers.insert(PRIVILEGE, 0);
-                                active.store(false, Ordering::Relaxed);
-                                let _ = source.lock().unwrap_or_else(|e| e.into_inner()).stop();
+                                let _ = device.release(&mut state);
                             }
                         }
                         let Ok((length, peer)) = control.recv_from(&mut buffer) else {
@@ -191,8 +341,9 @@ impl GigEServer {
                         if state.controller == Some(peer) {
                             state.heartbeat = Instant::now();
                         }
+                        let mut written = None;
                         let response: Result<Vec<u8>> = (|| match command {
-                            0x0002 => Ok(bootstrap[..0xf8].to_vec()),
+                            0x0002 => device.read(&state, 0, 0xf8),
                             0x0080 => {
                                 ensure!(
                                     !payload.is_empty() && payload.len().is_multiple_of(4),
@@ -205,21 +356,13 @@ impl GigEServer {
                                     .iter()
                                     .map(|bytes| be32(bytes, 0))
                                 {
-                                    ensure!(address.is_multiple_of(4), "unaligned register read");
-                                    if state.registers.contains_key(&address) {
-                                        data.extend(state.reg(address).to_be_bytes());
-                                    } else {
-                                        let bytes = read_memory(
-                                            address as u64,
-                                            4,
-                                            &bootstrap,
-                                            &xml,
-                                            &source,
-                                        )?;
-                                        // READ_REGISTER is also a four-byte memory
-                                        // access. GenApi applies the XML byte order.
-                                        data.extend(bytes);
-                                    }
+                                    ensure!(
+                                        address.is_multiple_of(4),
+                                        Status(0x8005, "unaligned register read")
+                                    );
+                                    // READ_REGISTER is also a four-byte memory
+                                    // access. GenApi applies the XML byte order.
+                                    data.extend(device.read(&state, address as u64, 4)?);
                                 }
                                 Ok(data)
                             }
@@ -228,81 +371,16 @@ impl GigEServer {
                                     !payload.is_empty() && payload.len().is_multiple_of(8),
                                     "invalid register write"
                                 );
-                                for pair in payload.as_chunks::<8>().0 {
-                                    let (address, value) = (be32(pair, 0), be32(pair, 4));
-                                    ensure!(address.is_multiple_of(4), "unaligned register write");
-                                    if address == PRIVILEGE {
-                                        ensure!(
-                                            value <= 2
-                                                && (state.controller.is_none()
-                                                    || state.controller == Some(peer)),
-                                            "camera already controlled"
-                                        );
-                                        state.controller = (value != 0).then_some(peer);
-                                        state.registers.insert(PRIVILEGE, value);
-                                        state.heartbeat = Instant::now();
-                                        if value == 0 {
-                                            active.store(false, Ordering::Relaxed);
-                                            source
-                                                .lock()
-                                                .unwrap_or_else(|e| e.into_inner())
-                                                .stop()?;
-                                        }
-                                    } else {
-                                        ensure!(
-                                            state.controller == Some(peer),
-                                            "control privilege required"
-                                        );
-                                        match address {
-                                            HEARTBEAT => {
-                                                ensure!(
-                                                    (500..=60000).contains(&value),
-                                                    "heartbeat range"
-                                                );
-                                                state.registers.insert(address, value);
-                                            }
-                                            STREAM_PORT => {
-                                                ensure!(
-                                                    value <= u16::MAX as u32,
-                                                    "invalid stream port"
-                                                );
-                                                state.registers.insert(address, value);
-                                            }
-                                            STREAM_ADDRESS => {
-                                                ensure!(
-                                                    !Ipv4Addr::from(value).is_multicast()
-                                                        && value != u32::MAX,
-                                                    "invalid stream destination"
-                                                );
-                                                state.registers.insert(address, value);
-                                            }
-                                            STREAM_SIZE => {
-                                                let size = value & 0xffff;
-                                                ensure!(
-                                                    (576..=9000).contains(&size),
-                                                    "stream packet size range"
-                                                );
-                                                state
-                                                    .registers
-                                                    .insert(address, value & 0x7fff_ffff);
-                                                if value & 0x8000_0000 != 0
-                                                    && state.reg(STREAM_PORT) != 0
-                                                {
-                                                    let _ = packets.send_to(
-                                                        &vec![0; size as usize - 28],
-                                                        state.destination(),
-                                                    );
-                                                }
-                                            }
-                                            _ => write_memory(
-                                                address as u64,
-                                                &value.to_be_bytes(),
-                                                &source,
-                                                &commands,
-                                                &active,
-                                            )?,
-                                        }
-                                    }
+                                for (index, pair) in payload.as_chunks::<8>().0.iter().enumerate() {
+                                    // A failed acknowledgement carries the
+                                    // number of writes already applied.
+                                    written = Some(index as u32);
+                                    device.write_register(
+                                        &mut state,
+                                        peer,
+                                        be32(pair, 0),
+                                        be32(pair, 4),
+                                    )?;
                                 }
                                 Ok((payload.len() as u32 / 8).to_be_bytes().to_vec())
                             }
@@ -312,30 +390,19 @@ impl GigEServer {
                                 let length = be16(payload, 6) as usize;
                                 ensure!((1..=512).contains(&length), "memory read limit");
                                 let mut result = address.to_be_bytes().to_vec();
-                                result.extend(read_memory(
-                                    address as u64,
-                                    length,
-                                    &bootstrap,
-                                    &xml,
-                                    &source,
-                                )?);
+                                result.extend(device.read(&state, address as u64, length)?);
                                 Ok(result)
                             }
                             0x0086 => {
                                 ensure!(
-                                    state.controller == Some(peer),
-                                    "control privilege required"
-                                );
-                                ensure!(
                                     payload.len() >= 5 && payload.len() <= 516,
                                     "invalid memory write"
                                 );
-                                write_memory(
+                                device.write(
+                                    &mut state,
+                                    peer,
                                     be32(payload, 0) as u64,
                                     &payload[4..],
-                                    &source,
-                                    &commands,
-                                    &active,
                                 )?;
                                 Ok(payload[..4].to_vec())
                             }
@@ -356,33 +423,24 @@ impl GigEServer {
                                         .skip(first)
                                         .take(4096)
                                     {
-                                        let _ = packets.send_to(packet, state.destination());
+                                        let _ = device.stream.send_to(packet, state.destination());
                                     }
                                 }
                                 Ok(Vec::new())
                             }
-                            _ => anyhow::bail!("unsupported GVCP command"),
+                            _ => anyhow::bail!(Status(0x8001, "unsupported GVCP command")),
                         })();
                         if command == 0x0040 {
                             continue;
                         }
                         let (status, data) = match response {
-                            Ok(data) => (0u16, data),
-                            Err(error) => {
-                                let message = error.to_string();
-                                let status = if message.contains("privilege")
-                                    || message.contains("controlled")
-                                {
-                                    0x8006
-                                } else if command != 0x0002
-                                    && ![0x0080, 0x0082, 0x0084, 0x0086].contains(&command)
-                                {
-                                    0x8001
-                                } else {
-                                    0x8002
-                                };
-                                (status, Vec::new())
-                            }
+                            Ok(data) => (0, data),
+                            Err(error) => (
+                                error
+                                    .downcast_ref::<Status>()
+                                    .map_or(0x8002, |status| status.0),
+                                written.map_or(Vec::new(), |index| index.to_be_bytes().to_vec()),
+                            ),
                         };
                         let _ = control.send_to(&ack(status, command, id, &data), peer);
                     }
@@ -405,7 +463,7 @@ impl GigEServer {
                         if !acquisition.load(Ordering::Relaxed) {
                             continue;
                         }
-                        let (destination, size) = {
+                        let (destination, size, delay) = {
                             let state = state.lock().unwrap_or_else(|e| e.into_inner());
                             if state.reg(STREAM_PORT) == 0 || state.reg(STREAM_ADDRESS) == 0 {
                                 continue;
@@ -413,16 +471,26 @@ impl GigEServer {
                             (
                                 state.destination(),
                                 (state.reg(STREAM_SIZE) & 0xffff) as usize,
+                                // Timestamp ticks run at 1 GHz.
+                                Duration::from_nanos(state.reg(STREAM_DELAY) as u64),
                             )
                         };
                         block = block.wrapping_add(1).max(1);
                         let packets =
                             Arc::new(frame_packets(block, &frame, size.saturating_sub(36).max(1)));
+                        let mut owed = Duration::ZERO;
                         for packet in packets.iter() {
                             if shutdown.load(Ordering::Relaxed) {
                                 break;
                             }
                             let _ = stream.send_to(packet, destination);
+                            // Sleep the inter-packet delay in batches the
+                            // scheduler can honor.
+                            owed += delay;
+                            if owed >= Duration::from_millis(1) {
+                                thread::sleep(owed);
+                                owed = Duration::ZERO;
+                            }
                         }
                         if frame.data.len() <= MAX_CACHE_BYTES / 2 {
                             let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -537,7 +605,7 @@ fn read_memory(
     }
     ensure!(
         address >= SOURCE_BASE && end <= XML_BASE,
-        "invalid memory address"
+        Status(0x8003, "invalid memory address")
     );
     source
         .lock()
@@ -553,7 +621,7 @@ fn write_memory(
 ) -> Result<()> {
     ensure!(
         address >= SOURCE_BASE && address.saturating_add(data.len() as u64) < XML_BASE,
-        "invalid memory address"
+        Status(0x8003, "invalid memory address")
     );
     let mut source = source.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((start, stop)) = commands.get(&address) {
@@ -755,6 +823,165 @@ mod tests {
         let camera = Camera::open(&id, &[info], Duration::from_secs(2)).unwrap();
         assert_eq!(camera.info.id, id);
         drop(camera);
+        drop(server);
+    }
+
+    fn loopback_camera() -> (super::super::VirtualCameraServer, SocketAddr) {
+        let ip = Ipv4Addr::LOCALHOST;
+        let mut source = Camera::open("sim:0", &[], Duration::from_millis(100)).unwrap();
+        source.set("Width", "64").unwrap();
+        source.set("Height", "64").unwrap();
+        let options = ServerOptions {
+            bind: ip,
+            advertise: ip,
+            gige_port: Some(0),
+            rtsp_port: None,
+            onvif_port: None,
+            name: "GVCP test".into(),
+            fps: 30.0,
+            bitrate: "2M".into(),
+        };
+        let server = super::super::VirtualCameraServer::start(source, options).unwrap();
+        let port = server.endpoints()["gige"]["port"].as_u64().unwrap() as u16;
+        (server, SocketAddr::from((ip, port)))
+    }
+    fn client() -> UdpSocket {
+        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        socket
+    }
+    /// Sends one GVCP command; returns the acknowledgement status and payload.
+    fn gvcp(
+        socket: &UdpSocket,
+        camera: SocketAddr,
+        command: u16,
+        id: u16,
+        payload: &[u8],
+    ) -> (u16, Vec<u8>) {
+        let mut request = vec![0x42, 0x01];
+        request.extend(command.to_be_bytes());
+        request.extend((payload.len() as u16).to_be_bytes());
+        request.extend(id.to_be_bytes());
+        request.extend(payload);
+        socket.send_to(&request, camera).unwrap();
+        let mut reply = [0u8; 1024];
+        let (length, from) = socket.recv_from(&mut reply).unwrap();
+        assert_eq!(from, camera);
+        assert_eq!(
+            (be16(&reply, 2), be16(&reply, 4) as usize, be16(&reply, 6)),
+            (command + 1, length - 8, id)
+        );
+        (be16(&reply, 0), reply[8..length].to_vec())
+    }
+
+    #[test]
+    fn bootstrap_registers_answer_register_and_memory_commands_alike() {
+        let (server, camera) = loopback_camera();
+        let (controller, other) = (client(), client());
+        // Interfaces, GVCP capability and current IP configuration in one
+        // concatenated READREG.
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0080,
+                1,
+                &[0, 0, 6, 0, 0, 0, 9, 0x34, 0, 0, 0, 0x14]
+            ),
+            (0, vec![0, 0, 0, 1, 0xc0, 0, 0, 7, 0, 0, 0, 5])
+        );
+        // The 64-bit timestamp tick frequency through READMEM: 1 GHz.
+        assert_eq!(
+            gvcp(&controller, camera, 0x0084, 2, &[0, 0, 9, 0x3c, 0, 0, 0, 8]),
+            (0, vec![0, 0, 9, 0x3c, 0, 0, 0, 0, 0x3b, 0x9a, 0xca, 0x00])
+        );
+        assert_eq!(
+            gvcp(&controller, camera, 0x0082, 3, &[0, 0, 0x0a, 0, 0, 0, 0, 2]),
+            (0, vec![0, 0, 0, 1])
+        );
+        assert_eq!(
+            gvcp(&other, camera, 0x0082, 4, &[0, 0, 0x0a, 0, 0, 0, 0, 2]),
+            (0x8006, vec![0, 0, 0, 0])
+        );
+        // SCPD written as memory reads back as a register, and SCP written as
+        // a register reads back as memory.
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0086,
+                5,
+                &[0, 0, 0x0d, 8, 0, 0, 3, 0xe8]
+            ),
+            (0, vec![0, 0, 0x0d, 8])
+        );
+        assert_eq!(
+            gvcp(&controller, camera, 0x0080, 6, &[0, 0, 0x0d, 8]),
+            (0, vec![0, 0, 3, 0xe8])
+        );
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0082,
+                7,
+                &[0, 0, 0x0d, 0, 0, 0, 0x12, 0x34]
+            )
+            .0,
+            0
+        );
+        assert_eq!(
+            gvcp(&controller, camera, 0x0084, 8, &[0, 0, 0x0d, 0, 0, 0, 0, 4]),
+            (0, vec![0, 0, 0x0d, 0, 0, 0, 0x12, 0x34])
+        );
+        let name = *b"Line 3\0\0\0\0\0\0\0\0\0\0";
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0086,
+                9,
+                &[&[0, 0, 0, 0xe8][..], &name].concat()
+            )
+            .0,
+            0
+        );
+        assert_eq!(gvcp(&other, camera, 0x0002, 10, &[]).1[0xe8..0xf8], name);
+        // A failed multi-register write reports how many writes it applied.
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0082,
+                11,
+                &[
+                    0, 0, 0x0d, 8, 0, 0, 0, 5, 0, 0, 0, 0x24, 0, 0, 0, 1, 0, 0, 0x0d, 8, 0, 0, 0, 6
+                ]
+            ),
+            (0x8004, vec![0, 0, 0, 1])
+        );
+        assert_eq!(
+            gvcp(&controller, camera, 0x0080, 12, &[0, 0, 0x0d, 8]),
+            (0, vec![0, 0, 0, 5])
+        );
+        for (command, payload, status) in [
+            (0x0082, vec![0, 0, 0x0d, 6, 0, 0, 0, 0], 0x8005),
+            (0x0080, vec![0, 0, 0, 2], 0x8005),
+            (0x0084, vec![0, 0x20, 0, 0, 0, 0, 0, 4], 0x8003),
+            (0x00f0, vec![], 0x8001),
+        ] {
+            assert_eq!(
+                gvcp(&controller, camera, command, 13, &payload).0,
+                status,
+                "{command:04x}"
+            );
+        }
+        assert_eq!(
+            gvcp(&other, camera, 0x0086, 14, &[0, 1, 1, 0, 0x80, 0, 0, 0]).0,
+            0x8006
+        );
         drop(server);
     }
 
