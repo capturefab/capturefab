@@ -124,6 +124,15 @@ const NODES: &[(&str, Node)] = &[
         },
     ),
     (
+        "AcquisitionMode",
+        Node::Enumeration {
+            link: None,
+            value: "0",
+            access: Access::ReadWrite,
+            entries: &[("Continuous", "0")],
+        },
+    ),
+    (
         "AcquisitionStart",
         Node::Command {
             link: "AcqReg",
@@ -259,8 +268,9 @@ const NODES: &[(&str, Node)] = &[
 
 /// The features reachable from Root, byte-sorted as `NodeMap::features`
 /// returns them; registers and PayloadSize are hidden.
-const FEATURES: [&str; 9] = [
+const FEATURES: [&str; 10] = [
     "AcquisitionFrameRate",
+    "AcquisitionMode",
     "AcquisitionStart",
     "AcquisitionStop",
     "DeviceScanType",
@@ -556,7 +566,8 @@ impl Simulator {
                 let v = genicam::number(&translated)?;
                 self.write_memory(address, &v.to_bits().to_le_bytes())
             }
-            // A fixed-value enumeration is read-only, refused above.
+            // A fixed-value enumeration holds one value: read-only ones are
+            // refused above, and AcquisitionMode's only choice is Continuous.
             _ => Ok(()),
         }
     }

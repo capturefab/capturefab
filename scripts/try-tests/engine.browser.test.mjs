@@ -352,7 +352,7 @@ test('the engine runs in Chrome with a fake camera', { skip, timeout: 120_000 },
     assert.ok(out.yuv.meanDifference < 3, JSON.stringify(out.yuv));
     assert.ok(out.yuv.closeShare > 0.95, JSON.stringify(out.yuv));
     assert.deepEqual(out.simInfo, { id: 'sim:0', vendor: 'Capturefab', model: 'Pattern camera', serial: 'SIM0', transport: 'simulator' });
-    assert.equal(out.simFeatureNames.length, 9);
+    assert.equal(out.simFeatureNames.length, 10);
     assert.ok(out.sim.count >= 8 && out.sim.count <= 16, `${out.sim.count} frames in 0.4 s at 30 fps`);
     assert.equal(out.sim.after, 0, 'no frames after stop');
     assert.deepEqual(out.sim.ids, out.sim.ids.map((_, i) => i + 1));
