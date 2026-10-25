@@ -51,6 +51,15 @@ def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def app_version(binary):
+    """The version the recording binary reports, or None when it cannot say."""
+    try:
+        result = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=20, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip().removeprefix("capturefab ").strip() or None
+
+
 def run(command, **kwargs):
     return subprocess.run(command, check=True, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, **kwargs)
@@ -194,8 +203,10 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     manifest = {
         "method": "Actual iced desktop renderer frames; H.264 encoding only. No reconstructed interface or desktop recording.",
-        "source_note": "Current development desktop build from workspace source. The visible save and settings results come from real session CLI commands.",
+        "source_note": "Desktop build from workspace source. The visible save and settings results come from real session CLI commands.",
         "binary_sha256": sha256(binary),
+        # Captions may name this version; scripts/test-site.py checks that they do.
+        "app_version": app_version(binary),
         "demo": "Built-in simulator cameras in isolated temporary sessions. No physical cameras or saved user data.",
         "clips": [],
     }

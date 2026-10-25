@@ -1,5 +1,5 @@
 {
-  "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface.",
+  "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface. Derived files are Lanczos-resized copies of a named crop.",
   "source_note": "Camera capture development build from the workspace source; sensor and PLC integrations removed.",
   "binary_sha256": "133eead4c2e6d88abae6b26bab556b24c436b766f5865e0a060d02799837c1bf",
   "logical_window": [
@@ -227,6 +227,19 @@
       "sha256": "400fecb5009367d754b73e3af37b04a95b22b1324dc4dc714375722ddf118bf1",
       "scene": "dark,destinations-list,noscopes",
       "description": "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."
+    }
+  ],
+  "derived": [
+    {
+      "file": "workspace-1100.png",
+      "derived_from": "workspace.png",
+      "derived_from_sha256": "6e2e8a1b5cc468719a2d00d61a13aafb465cb98532cc706592b88f517acdc2d5",
+      "operation": "resize 0.5x lanczos",
+      "size": [
+        1100,
+        700
+      ],
+      "sha256": "e01d5a29b7efe43018e03a29f5c6176a1c5744faaa0cd1a51f2a7ff22816d2d2"
     }
   ]
 }

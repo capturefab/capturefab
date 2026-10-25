@@ -15,6 +15,7 @@ FEED_EPOCH = '2026-10-04T00:00:00Z'
 OS = {'macos': 'macOS', 'windows': 'Windows', 'linux': 'Linux'}
 ARCH = {'x86_64': 'x64', 'aarch64': 'ARM64', 'armv7': 'ARMv7'}
 NOTES = {'native-smoke-passed': 'Smoke-tested on its own platform', 'cross-compiled': 'Cross-compiled; not executed', 'unsigned': 'Unsigned', 'apple-developer-id': 'Apple Developer ID', 'apple-notarized': 'Apple notarized', 'authenticode': 'Authenticode'}
+SMARTSCREEN = '<p class="note">Not code-signed yet: Windows may show a SmartScreen prompt. Verify the SHA-256, then choose More info → Run anyway.</p>'
 PAGE = '''<!doctype html>
 <html lang="en">
 <head>
@@ -41,7 +42,7 @@ PAGE = '''<!doctype html>
     <header class="site-header">
       <a class="wordmark" href="index.html" aria-label="Capturefab home"><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</a>
       <nav aria-label="Main navigation"><a href="index.html">Product</a><a href="docs.html">Documentation</a><a href="downloads.html" aria-current="page">Downloads</a><a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a></nav>
-      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
+      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
     </header>
     <main id="main">
       <section class="page-head" aria-labelledby="downloads-title">
@@ -54,9 +55,9 @@ PAGE = '''<!doctype html>
 {body}    </main>
     <footer class="site-footer">
       <div class="brand"><p><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</p><small>Capturefab uses the MIT license. The included FFmpeg uses GPLv3. Releases include its source. This site sets no cookies and loads nothing from third parties.</small></div>
-      <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
-      <div><h4>Documentation</h4><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
-      <div><h4>For agents</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
+      <div><h2 class="footer-heading">Project</h2><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
+      <div><h2 class="footer-heading">Documentation</h2><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
+      <div><h2 class="footer-heading">For agents</h2><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
     </footer>
   </div>
 </body>
@@ -142,7 +143,9 @@ def download_cards(release):
             processor = ARCH.get(asset['arch'], asset['arch'])
             detail = ' · '.join(filter(None, (size(asset['size']), NOTES.get(asset.get('platform_signature'), ''))))
             items.append(f'<li><div><strong>{html.escape(processor)}</strong><small>{html.escape(detail)}</small></div><a class="button primary" href="{href(asset["url"])}" aria-label="Download Capturefab {html.escape(release["version"])} for {label} {html.escape(processor)}">Download {html.escape(processor)} <span aria-hidden="true">↓</span></a></li>')
-        cards.append(f'<article class="platform-download-card"><h3>{label}</h3><p>Desktop app and CLI</p><ul class="static-build-list">{"".join(items)}</ul></article>')
+        # The prompt follows the manifest, so signed Windows builds lose the note.
+        note = SMARTSCREEN if system == 'windows' and any(asset.get('platform_signature') == 'unsigned' for asset in builds) else ''
+        cards.append(f'<article class="platform-download-card"><h3>{label}</h3><p>Desktop app and CLI</p><ul class="static-build-list">{"".join(items)}</ul>{note}</article>')
     return '<div class="platform-download-grid">' + ''.join(cards) + '</div>' if cards else ''
 
 def downloads(manifest, site):

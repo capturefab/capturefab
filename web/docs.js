@@ -263,7 +263,10 @@
     searchInput.focus(); searchInput.select(); searchRender();
   };
 
+  // The markup says Ctrl K; Macs use Command.
+  const macShortcut = /mac|iphone|ipad/i.test(navigator.userAgentData?.platform || navigator.platform || '');
   document.querySelectorAll('a.search-trigger').forEach((trigger) => {
+    if (macShortcut) trigger.querySelectorAll('kbd').forEach((key) => { key.textContent = '⌘K'; });
     trigger.setAttribute('aria-haspopup', 'dialog');
     trigger.addEventListener('click', (event) => {
       if (event.button || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;

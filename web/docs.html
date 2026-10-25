@@ -36,7 +36,7 @@
         <a href="downloads.html">Downloads</a>
         <a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a>
       </nav>
-      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
+      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
     </header>
     <main id="main" class="docs-layout">
       <aside class="docs-sidebar" aria-label="Documentation navigation">
@@ -122,7 +122,10 @@ capturefab --session bench activity --json</code></pre><button class="copy-butto
             <li>Select <strong>Capture &amp; save</strong>.</li>
           </ol>
           <p>Capture acquires a frame when the preview is stopped. The path below the save button shows the saved file. Each capture gets a new name, and Capturefab does not overwrite existing files.</p>
-          <div class="code-wrap"><pre><code># The same first capture from a terminal
+          <div class="code-wrap"><pre><code># Find cameras, including the built-in simulator
+capturefab discover --simulate
+
+# The same first capture from a terminal
 capturefab --camera sim:0 capture -o first.png
 
 # Examine the simulator, then capture a sequence
@@ -152,7 +155,7 @@ capturefab --session line1 dataset export -o exports/shift-b --format csv</code>
           <p>Existing owned capture files remain subject to the storage budget. Retain backups of files and configuration when changing a production installation.</p>
         </article>
 
-        <article class="doc-section" id="installation" data-doc-section data-doc-title="Install and verify a release" data-doc-category="Start here" data-doc-tags="install,download,linux,macos,windows,arm64,checksum,headless">
+        <article class="doc-section" id="installation" data-doc-section data-doc-title="Install and verify a release" data-doc-category="Start here" data-doc-tags="install,download,linux,macos,windows,arm64,checksum,headless,smartscreen,unsigned,gatekeeper,path">
           <p class="eyebrow">Start here</p><h2>Install and verify a release</h2>
           <p class="doc-summary">Every download includes the app and the command-line interface (CLI). On a computer without a display, the same executable works as a CLI.</p>
           <p>For an existing installation, read the <a href="#upgrade-040">version 0.4.0 upgrade notes</a> before replacing the executable.</p>
@@ -161,10 +164,10 @@ capturefab --session line1 dataset export -o exports/shift-b --format csv</code>
           <p>Compare the result with the checksum for the same release file. Then extract the archive. Keep the included license files with the application.</p>
           <div class="table-scroll"><table><caption>Open the extracted download</caption><thead><tr><th scope="col">System</th><th scope="col">Steps</th></tr></thead><tbody>
             <tr><td>macOS</td><td>Extract the <code>.zip</code> file. Open <code>Capturefab.app</code> from the extracted folder. For the CLI, run <code>./capturefab --help</code> from that folder. Keep this launcher beside the app.</td></tr>
-            <tr><td>Windows</td><td>Extract the <code>.zip</code> file. Open <code>capturefab.exe</code> from the extracted folder. In PowerShell, run <code>.\capturefab.exe</code> from that folder.</td></tr>
+            <tr><td>Windows</td><td>Extract the <code>.zip</code> file. Open <code>capturefab.exe</code> from the extracted folder. In PowerShell, run <code>.\capturefab.exe</code> from that folder. A build marked Unsigned on the download page can trigger a SmartScreen prompt; verify the checksum, then choose <strong>More info</strong> → <strong>Run anyway</strong>.</td></tr>
             <tr><td>Linux</td><td>Extract the <code>.tar.gz</code> file. Open a terminal in the extracted folder. Run <code>./capturefab</code>. If necessary, set executable permission with <code>chmod +x ./capturefab</code>.</td></tr>
           </tbody></table></div>
-          <p>The extracted executable also provides the CLI. Add its directory to <code>PATH</code> to use the shorter commands in these guides.</p>
+          <p>The extracted executable also provides the CLI. Add its directory to <code>PATH</code> to use the shorter commands in these guides. For the current terminal, run <code>export PATH="$PWD:$PATH"</code> in the extracted folder on macOS or Linux, or <code>$env:Path = "$PWD;$env:Path"</code> in PowerShell on Windows.</p>
           <p>Without a display, running the executable with no subcommand prints CLI help. This includes SSH sessions on Linux. Use an explicit subcommand such as <code>doctor --json</code> or <code>serve</code>.</p>
           <p>To run <code>serve</code> as a Linux service, follow the <a href="https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md">line computer guide</a>. It covers Raspberry Pi, Jetson, industrial PCs and access from a laptop browser.</p>
           <p>After moving the macOS app to Applications, use <code>/Applications/Capturefab.app/Contents/MacOS/capturefab</code> as the executable path. Run your harness under the same operating-system account as the local session.</p>
@@ -487,6 +490,15 @@ capturefab --session line1 dataset close
 # A dataset that no session holds
 capturefab dataset query --file plant.duckdb "SELECT count(*) FROM captures"
 capturefab dataset export --file plant.duckdb -o exports/csv-only --format csv</code></pre><button class="copy-button" type="button" aria-label="Copy dataset commands">Copy</button></div>
+          <p>The same workflow without a session, as three commands. The export folder holds the tables, <code>manifest.json</code> and <code>README.md</code>; the images stay in <code>parts/</code>.</p>
+          <div class="code-wrap"><pre><code># Capture 3 tagged images, 500 ms apart, into a catalog
+capturefab --camera sim:0 capture -n 3 --interval 500ms --context part=A-100 --dataset parts.duckdb -o 'parts/{camera}-{seq}.png'
+
+# Query the catalog with SQL
+capturefab dataset query --file parts.duckdb "SELECT path, wall_ms, context FROM captures"
+
+# Export Parquet and CSV tables with manifest.json and README.md
+capturefab dataset export --file parts.duckdb -o export</code></pre><button class="copy-button" type="button" aria-label="Copy the three-command dataset recipe">Copy</button></div>
           <div class="table-scroll"><table><caption>Dataset tables</caption><thead><tr><th scope="col">Table</th><th scope="col">Content</th></tr></thead><tbody>
             <tr><td><code>captures</code></td><td>One row for each saved image: time, camera, frame data, path, SHA-256, destination and tags.</td></tr>
             <tr><td><code>recordings</code></td><td>One row for each finished local recording.</td></tr>
@@ -552,6 +564,8 @@ capturefab storage configure --no-max-age</code></pre><button class="copy-button
           <p>Desktop, browser, CLI, RPC and workflow commands appear in <strong>Activity</strong>. Each entry has an actor, camera, source and state: queued, running, succeeded or failed. Output summaries and errors remain after selection changes or camera disconnection. Sequences show their file count and sample paths.</p>
           <p><code>status --json</code> includes this history in <code>result.activity</code> and its revision in <code>result.activity_revision</code>. Read-only observations and authenticated session discovery do not add entries.</p>
           <p>Use <code>--actor NAME --actor-kind agent</code> to identify an automation agent. Use <code>--actor-kind human</code> to identify a person. <code>CAPTUREFAB_ACTOR</code> and <code>CAPTUREFAB_ACTOR_KIND</code> supply defaults. Actor metadata provides display attribution. It does not authenticate a participant.</p>
+          <div class="code-wrap"><pre><code>capturefab --session bench --actor capture-agent --actor-kind agent connect sim:0 --json
+capturefab --session bench --actor capture-agent --actor-kind agent --camera sim:0 capture -o 'shot-{seq}.png' --json</code></pre><button class="copy-button" type="button" aria-label="Copy attributed agent commands">Copy</button></div>
           <p>Background work shows toolbar progress and an <strong>Activity</strong> indicator for new actions. Keyboard focus and open panels stay in place. Captures update the saved path. Streams, forwarding and scheduled jobs use shared session state. Feature values update without a change to your text drafts.</p>
           <p><strong>Activity</strong> keeps the latest 200 completed entries plus active commands and schedules for the session lifetime. Each scheduled job keeps its actor, status, saved frame count, last file and errors until completion or cancellation. Forwarding command success confirms encoder startup. Examine camera status to confirm that forwarding continues.</p>
           <p>Persons and agents can capture from the same camera. Commands for one camera run in order. Separate cameras work independently, and overlapping scheduled jobs share acquisition. Browser tabs have separate identities and editable names. The default actor kind is <code>human</code>.</p>
@@ -944,9 +958,9 @@ cargo test</code></pre><button class="copy-button" type="button" aria-label="Cop
     </main>
     <footer class="site-footer">
       <div class="brand"><p>Capturefab</p><small>A desktop app and CLI for camera capture.<br>Capturefab uses the MIT license. The included FFmpeg uses GPLv3 and ships with its source.</small></div>
-      <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">Downloads</a></li><li><a href="feed.xml">Release feed</a></li></ul></div>
-      <div><h4>Documentation</h4><ul><li><a href="#getting-started">Quickstart</a></li><li><a href="#cli-reference">CLI reference</a></li><li><a href="#troubleshooting">Troubleshooting</a></li><li><a href="#architecture">Build &amp; licensing</a></li></ul></div>
-      <div><h4>For automation</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
+      <div><h2 class="footer-heading">Project</h2><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">Downloads</a></li><li><a href="feed.xml">Release feed</a></li></ul></div>
+      <div><h2 class="footer-heading">Documentation</h2><ul><li><a href="#getting-started">Quickstart</a></li><li><a href="#cli-reference">CLI reference</a></li><li><a href="#troubleshooting">Troubleshooting</a></li><li><a href="#architecture">Build &amp; licensing</a></li></ul></div>
+      <div><h2 class="footer-heading">For automation</h2><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
     </footer>
   </div>
 </body>

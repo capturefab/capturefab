@@ -13,7 +13,27 @@
   let archGuessed = false;
   // A browser on a 32-bit ARM system, for which there is no build.
   let thirtyTwoBitArm = false;
+  // The selected build, while one is matched and published.
+  let current = null;
   const osNames = { macos: 'macOS', windows: 'Windows', linux: 'Linux' };
+  // Mirrors NOTES in scripts/site-release.py; the manifest decides, never the OS alone.
+  const signatureNotes = { 'apple-notarized': 'Notarized by Apple', 'apple-developer-id': 'Signed (Apple Developer ID)', authenticode: 'Signed (Authenticode)', unsigned: 'Not code-signed' };
+  // Steps after the download, shared by the install hint and the next-steps panel.
+  const installSteps = (osId, signature) => {
+    const steps = {
+      macos: ['Extract the ZIP file.', 'Move Capturefab.app to Applications.', 'Open Capturefab.app.'],
+      windows: ['Extract all files from the ZIP archive.', 'Open capturefab.exe from the extracted folder, or run .\\capturefab.exe --help in PowerShell for the CLI.'],
+      linux: ['Extract the .tar.gz archive.', 'From the extracted folder, run ./capturefab to open the desktop app, or ./capturefab --help for CLI options. On a computer with no display it lists the CLI commands.']
+    }[osId] || [];
+    if (osId === 'windows' && signature === 'unsigned') steps.push('This build is not code-signed yet, so Windows SmartScreen may show "Windows protected your PC". Check the SHA-256 checksum first, then choose More info → Run anyway.');
+    if (osId === 'macos' && signature === 'apple-developer-id') steps.push('If macOS blocks it, Control-click Capturefab.app and choose Open.');
+    return steps;
+  };
+  const firstRunSteps = ['Select Try a simulated camera on the welcome screen, or connect your camera.', 'Optional: run capturefab doctor in a terminal to check this computer.'];
+  // The first comment of each CLI example names the executable for the selected system.
+  const runHints = [...document.querySelectorAll('[data-run-hint]')];
+  runHints.forEach((hint) => { hint.dataset.fallback = hint.textContent; });
+  const runHintText = { macos: '# From the extracted folder: ./capturefab', windows: '# In PowerShell, from the extracted folder: .\\capturefab.exe', linux: '# From the extracted folder: ./capturefab' };
   const archNames = { x86_64: 'x64', aarch64: 'ARM64' };
   const osAliases = { darwin: 'macos', mac: 'macos', win: 'windows', win32: 'windows' };
   const archAliases = { x64: 'x86_64', amd64: 'x86_64', arm64: 'aarch64' };
@@ -37,6 +57,8 @@
   };
   // Page buttons that become a direct download once a build is matched.
   const oneclick = [...document.querySelectorAll('[data-oneclick]')];
+  // Lines under the page buttons that offer the other processor when it was guessed.
+  const alts = [...document.querySelectorAll('[data-oneclick-alt]')];
   oneclick.forEach((link) => { link.dataset.fallback = link.innerHTML; });
   const chipName = (osId, archId) => osId === 'macos' ? (archId === 'aarch64' ? 'Apple silicon' : 'Intel') : archNames[archId];
   const resetOneclick = () => oneclick.forEach((link) => {
@@ -55,8 +77,12 @@
     link.setAttribute('download', asset.name);
     link.dataset.oneclickState = 'ready';
   });
+  const hideAlts = () => alts.forEach((alt) => { alt.hidden = true; alt.replaceChildren(); });
   const clearDownload = () => {
+    current = null;
     resetOneclick();
+    hideAlts();
+    hideNextSteps(false);
     $('primary-download').hidden = true;
     $('primary-download').removeAttribute('href');
     $('verify-box').hidden = true;
@@ -64,6 +90,75 @@
     $('verify-links').replaceChildren();
     if ($('install-hint')) $('install-hint').hidden = true;
   };
+  const otherChip = (asset) => asset.os === 'macos' ? (asset.arch === 'x86_64' ? 'Intel Mac' : 'Apple silicon Mac') : (asset.arch === 'aarch64' ? 'ARM PC' : 'x64 PC');
+  const renderAlts = (selected) => {
+    const other = archGuessed && assets.find((asset) => asset.os === selected.os && asset.arch !== selected.arch && isPublished(asset));
+    if (!other) return;
+    alts.forEach((alt) => {
+      const link = document.createElement('a');
+      link.href = safeUrl(other.url);
+      link.setAttribute('download', other.name);
+      link.textContent = `${otherChip(other)}? Download ${archNames[other.arch]}`;
+      // The download goes ahead; the page then follows the chosen processor.
+      link.addEventListener('click', () => window.setTimeout(() => {
+        arch.value = other.arch;
+        archGuessed = false;
+        processorChosen = true;
+        updateHint(); renderSelection();
+        const opener = alt.parentElement?.querySelector?.('[data-oneclick]') || null;
+        if (current) showNextSteps(opener ? panelAnchor(opener) : alt, current, opener);
+      }, 0));
+      const all = document.createElement('a');
+      all.href = '#download';
+      all.textContent = 'Other platforms';
+      alt.replaceChildren(document.createTextNode(`Best guess: ${chipName(selected.os, selected.arch)}. `), link, document.createTextNode(' · '), all);
+      alt.hidden = false;
+    });
+  };
+  // A panel that follows a started download with what to do next. It never
+  // delays the browser's own download and stores nothing.
+  const panel = $('next-steps');
+  let panelOpener = null;
+  function hideNextSteps(restoreFocus) {
+    if (!panel || panel.hidden) return;
+    panel.hidden = true;
+    $('next-steps-list').replaceChildren();
+    if (restoreFocus && panelOpener?.focus) panelOpener.focus();
+    panelOpener = null;
+  }
+  function showNextSteps(anchor, asset, opener) {
+    if (!panel || !anchor) return;
+    text('next-steps-title', `Downloading Capturefab ${release.version} for ${osNames[asset.os]} (${chipName(asset.os, asset.arch)})`);
+    $('next-steps-list').replaceChildren(...[...installSteps(asset.os, asset.platform_signature), ...firstRunSteps].map((step) => {
+      const item = document.createElement('li');
+      item.textContent = step;
+      return item;
+    }));
+    const direct = $('direct-download');
+    direct.href = safeUrl(asset.url);
+    direct.setAttribute('download', asset.name);
+    anchor.after(panel);
+    panel.hidden = false;
+    panelOpener = opener;
+    panel.scrollIntoView?.({ block: 'nearest', behavior: motion.matches ? 'auto' : 'smooth' });
+  }
+  // Where the panel goes: below the clicked button's group, or below the install hint.
+  const panelAnchor = (link) => {
+    if (link === $('primary-download')) return $('install-hint') || link.closest('.download-result');
+    const group = link.closest('.download-banner') || link.closest('.actions') || link;
+    return group.nextElementSibling?.matches?.('[data-oneclick-alt]') ? group.nextElementSibling : group;
+  };
+  if (panel) {
+    for (const link of [...oneclick, $('primary-download')].filter(Boolean)) {
+      link.addEventListener('click', () => {
+        const armed = link === $('primary-download') ? !link.hidden : link.dataset.oneclickState === 'ready';
+        if (armed && current) showNextSteps(panelAnchor(link), current, link);
+      });
+    }
+    $('next-steps-close').addEventListener('click', () => hideNextSteps(true));
+    panel.addEventListener('keydown', (event) => { if (event.key === 'Escape') hideNextSteps(true); });
+    $('next-steps-verify').addEventListener('click', () => { $('verify-box').open = true; });
+  }
   const renderSelection = () => {
     clearDownload();
     if (!manifest) return;
@@ -86,7 +181,8 @@
       return;
     }
     text('download-description', `capturefab ${release.version}${release.date ? ` · ${release.date}` : ''}`);
-    text('asset-detail', [selected.name, formatSize(selected.size)].filter(Boolean).join(' · '));
+    current = selected;
+    text('asset-detail', [selected.name, formatSize(selected.size), signatureNotes[selected.platform_signature]].filter(Boolean).join(' · '));
     $('asset-detail').hidden = false;
     const download = $('primary-download');
     download.href = safeUrl(selected.url);
@@ -95,13 +191,9 @@
     download.hidden = false;
     download.textContent = `Download for ${osNames[os.value]} (${chipName(os.value, arch.value)})`;
     armOneclick(selected);
+    renderAlts(selected);
     if ($('install-hint')) {
-      const instructions = {
-        macos: 'Extract the ZIP file. Move Capturefab.app to Applications. Open Capturefab.app.',
-        windows: 'Extract all files from the ZIP archive. Open capturefab.exe from the extracted folder, or run .\\capturefab.exe --help in PowerShell for the CLI.',
-        linux: 'Extract the .tar.gz archive. From the extracted folder, run ./capturefab to open the desktop app, or ./capturefab --help for CLI options. On a computer with no display it lists the CLI commands.'
-      };
-      text('install-hint', instructions[os.value]);
+      text('install-hint', installSteps(os.value, selected.platform_signature).join(' '));
       $('install-hint').hidden = false;
     }
     text('checksum-text', `SHA-256: ${selected.sha256}`);
@@ -123,6 +215,7 @@
     };
     const armhf = 'This browser runs on 32-bit ARM, which has no Capturefab build. Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS, which uses ARM64. dpkg --print-architecture prints arm64 there and armhf on a 32-bit system; uname -m prints aarch64 on both.';
     const guess = archGuessed && arch.value ? `Best guess: ${archNames[arch.value]}${os.value === 'macos' ? ' (Apple silicon)' : ''}. Your browser did not report the processor. If wrong, choose another processor. ` : '';
+    runHints.forEach((hint) => { hint.textContent = runHintText[os.value] || hint.dataset.fallback; });
     text('platform-hint', guess + (thirtyTwoBitArm && os.value === 'linux' && !arch.value ? armhf : hints[os.value]) || 'Select the computer that runs Capturefab. If the browser cannot identify the processor architecture, select it.');
   };
   const hasDownloadPanel = Boolean(os && arch);

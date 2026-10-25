@@ -24,9 +24,19 @@ class Element {
     if (!this.listeners.has(type)) this.listeners.set(type, []);
     this.listeners.get(type).push(listener);
   }
-  emit(type) {
-    for (const listener of this.listeners.get(type) || []) listener({ target: this, preventDefault() {} });
+  emit(type, detail = {}) {
+    const event = { target: this, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, ...detail };
+    for (const listener of this.listeners.get(type) || []) listener(event);
+    return event;
   }
+  // Just enough tree for the next-steps panel: a parent, siblings and named ancestors.
+  closest(selector) { return this.ancestors?.[selector] || null; }
+  matches(selector) { return Boolean(this.selectors?.includes(selector)); }
+  querySelector(selector) { return this.children.find((child) => child.matches?.(selector)) || null; }
+  querySelectorAll(selector) { return this.children.filter((child) => child.matches?.(selector)); }
+  after(node) { this.placedAfter = node; node.placedBefore = this; }
+  focus() { this.focused = (this.focused || 0) + 1; }
+  scrollIntoView() {}
   setAttribute(name, value) { this.attributes.set(name, String(value)); }
   getAttribute(name) { return this.attributes.get(name) ?? null; }
   removeAttribute(name) {
@@ -49,8 +59,9 @@ function openPage(options = {}) {
   const events = [];
   const ids = new Map();
   if (options.downloads !== false) {
-    for (const id of ['os-select', 'arch-select', 'primary-download', 'verify-box', 'asset-detail', 'verify-links', 'install-hint', 'download-label', 'download-description', 'checksum-text', 'verify-command', 'platform-hint', 'release-version']) ids.set(id, new Element());
+    for (const id of ['os-select', 'arch-select', 'primary-download', 'verify-box', 'asset-detail', 'verify-links', 'install-hint', 'download-label', 'download-description', 'checksum-text', 'verify-command', 'platform-hint', 'release-version', 'next-steps', 'next-steps-title', 'next-steps-list', 'next-steps-close', 'next-steps-verify', 'direct-download']) ids.set(id, new Element());
     ids.get('primary-download').hidden = true;
+    ids.get('next-steps').hidden = true;
   }
   const result = new Element();
   const form = new Element('form');
@@ -82,13 +93,34 @@ function openPage(options = {}) {
     };
     return video;
   });
+  // The hero and banner buttons, each in an .actions group with a processor line after it.
+  const oneclick = [];
+  const alts = [];
+  for (let index = 0; index < (options.downloads === false ? 0 : 2); index += 1) {
+    const group = new Element();
+    const link = new Element('a');
+    link.selectors = ['[data-oneclick]'];
+    link.ancestors = { '.actions': group };
+    const alt = new Element('p');
+    alt.selectors = ['[data-oneclick-alt]'];
+    alt.hidden = true;
+    const parent = new Element();
+    parent.children = [group, alt];
+    group.children = [link];
+    group.nextElementSibling = alt;
+    alt.parentElement = parent;
+    // Nested buttons are found through the alt line's parent.
+    parent.querySelector = (selector) => selector === '[data-oneclick]' ? link : null;
+    oneclick.push(link); alts.push(alt);
+  }
+  const runHints = Array.from({ length: options.downloads === false ? 0 : 2 }, () => Object.assign(new Element('span'), { textContent: '# Run from the extracted folder' }));
   const document = new Element();
   document.documentElement = new Element('html');
   document.baseURI = 'https://capturefab.example/';
   document.hidden = Boolean(options.hidden);
   document.getElementById = (id) => ids.get(id) || null;
   document.querySelector = (selector) => ({ '.download-result': result, '.platform-form': form })[selector] || null;
-  document.querySelectorAll = (selector) => selector === '.product-video' ? videos : [];
+  document.querySelectorAll = (selector) => ({ '.product-video': videos, '[data-oneclick]': oneclick, '[data-oneclick-alt]': alts, '[data-run-hint]': runHints })[selector] || [];
   document.createElement = (tag) => new Element(tag);
   document.createTextNode = (text) => ({ textContent: text });
   const observers = [];
@@ -96,7 +128,8 @@ function openPage(options = {}) {
     constructor(callback) { this.callback = callback; observers.push(this); }
     observe() {}
   }
-  const window = { matchMedia: () => motion, setTimeout() {} };
+  // Timers run at once; the page uses them only to let a native download start first.
+  const window = { matchMedia: () => motion, setTimeout(callback) { callback(); } };
   if (options.observer !== false) window.IntersectionObserver = Observer;
   const navigator = {
     platform: options.platform || '',
@@ -112,7 +145,7 @@ function openPage(options = {}) {
   };
   vm.runInNewContext(source, { document, window, navigator, fetch, URL, IntersectionObserver: Observer }, { filename: 'web/app.js' });
   return {
-    ids, result, motion, connection, videos, document, fetchCalls,
+    ids, result, motion, connection, videos, document, fetchCalls, oneclick, alts, runHints,
     async settle() {
       for (let pass = 0; pass < 6; pass += 1) {
         await Promise.resolve();
@@ -228,6 +261,100 @@ async function downloads() {
   assert.equal(docs.fetchCalls.length, 0, 'Pages without a download panel need no release request');
 }
 
+const assetFor = (manifest, osId, archId) => manifest.releases.find((release) => release.version === manifest.latest).assets.find((asset) => asset.os === osId && asset.arch === archId);
+
+async function signing() {
+  const mac = openPage({ userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
+  await mac.settle();
+  assert.match(mac.ids.get('asset-detail').textContent, /Notarized by Apple$/);
+  assert.doesNotMatch(mac.ids.get('install-hint').textContent, /Control-click|SmartScreen/, 'A notarized Mac build needs no first-open workaround');
+  mac.change('os-select', 'windows');
+  assert.match(mac.ids.get('asset-detail').textContent, /windows-aarch64\.zip · [0-9.]+ MiB · Not code-signed$/);
+  assert.match(mac.ids.get('install-hint').textContent, /SmartScreen.*More info → Run anyway/);
+  assert.ok(mac.ids.get('install-hint').textContent.includes('.\\capturefab.exe --help'));
+  mac.change('os-select', 'linux');
+  assert.doesNotMatch(mac.ids.get('install-hint').textContent, /SmartScreen|code-signed/, 'Linux does not warn about unsigned archives');
+
+  const signed = structuredClone(published);
+  assetFor(signed, 'windows', 'x86_64').platform_signature = 'authenticode';
+  assetFor(signed, 'macos', 'x86_64').platform_signature = 'apple-developer-id';
+  const page = openPage({ manifest: signed, userAgentData: { platform: 'Windows', getHighEntropyValues: async () => ({ architecture: 'x86', bitness: '64' }) } });
+  await page.settle();
+  assert.match(page.ids.get('asset-detail').textContent, /Signed \(Authenticode\)$/);
+  assert.doesNotMatch(page.ids.get('install-hint').textContent, /SmartScreen/, 'Signed Windows builds must not mention SmartScreen');
+  page.change('os-select', 'macos');
+  assert.match(page.ids.get('install-hint').textContent, /Control-click Capturefab\.app and choose Open/);
+}
+
+async function guessedProcessor() {
+  const intel = assetFor(published, 'macos', 'x86_64');
+  const page = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X' });
+  await page.settle();
+  for (const alt of page.alts) {
+    assert.equal(alt.hidden, false, 'A guessed processor must offer the other build beside each button');
+    const link = alt.children.find((child) => child.tagName === 'A' && child.getAttribute('download'));
+    assert.equal(link.href, intel.url);
+    assert.match(link.textContent, /Intel Mac\? Download x64/);
+    assert.ok(alt.children.some((child) => child.tagName === 'A' && child.href === '#download'), 'Other platforms stays one tap away');
+  }
+  const link = page.alts[0].children.find((child) => child.getAttribute?.('download'));
+  const click = link.emit('click');
+  assert.equal(click.defaultPrevented, false, 'The alternate link must still download');
+  assert.equal(page.ids.get('arch-select').value, 'x86_64');
+  assert.doesNotMatch(page.ids.get('download-label').textContent, /^Best match: /);
+  assert.ok(page.oneclick.every((button) => button.href === intel.url), 'Page buttons follow the chosen processor');
+  assert.ok(page.alts.every((alt) => alt.hidden), 'A chosen processor is no longer a guess');
+  assert.equal(page.ids.get('next-steps').hidden, false);
+  assert.match(page.ids.get('next-steps-title').textContent, /macOS \(Intel\)$/);
+
+  const reported = openPage({ userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
+  await reported.settle();
+  assert.ok(reported.alts.every((alt) => alt.hidden), 'A processor the browser reported needs no alternative');
+
+  const single = structuredClone(published);
+  assetFor(single, 'macos', 'x86_64').available = false;
+  const only = openPage({ manifest: single, platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X' });
+  await only.settle();
+  assert.ok(only.alts.every((alt) => alt.hidden && !alt.children.length), 'No alternate link without a published alternate build');
+}
+
+async function nextSteps() {
+  const cases = [
+    ['macOS', 'arm', /Capturefab\.app/, 'macos', 'aarch64', './capturefab'],
+    ['Windows', 'x86', /\.\\capturefab\.exe/, 'windows', 'x86_64', '.\\capturefab.exe'],
+    ['Linux', 'x86', /\.\/capturefab/, 'linux', 'x86_64', './capturefab']
+  ];
+  for (const [platform, architecture, pattern, osId, archId, command] of cases) {
+    const asset = assetFor(published, osId, archId);
+    const page = openPage({ userAgentData: { platform, getHighEntropyValues: async () => ({ architecture, bitness: '64' }) } });
+    await page.settle();
+    assert.ok(page.runHints.every((hint) => hint.textContent.endsWith(command)), `CLI examples name ${command}`);
+    const [button] = page.oneclick;
+    assert.equal(button.dataset.oneclickState, 'ready');
+    const click = button.emit('click');
+    assert.equal(click.defaultPrevented, false, 'The native download must not be blocked');
+    assert.equal(button.href, asset.url);
+    const panel = page.ids.get('next-steps');
+    assert.equal(panel.hidden, false);
+    const steps = page.ids.get('next-steps-list').children.map((item) => item.textContent).join(' ');
+    assert.match(steps, pattern);
+    assert.match(steps, /Try a simulated camera/);
+    assert.equal(page.ids.get('direct-download').href, asset.url);
+    assert.equal(page.ids.get('direct-download').getAttribute('download'), asset.name);
+    assert.equal(panel.placedBefore, page.alts[0], 'The panel follows the clicked button and its processor line');
+    page.ids.get('next-steps-close').emit('click');
+    assert.equal(panel.hidden, true);
+    assert.equal(button.focused, 1, 'Dismissing returns focus to the button');
+    button.emit('click');
+    page.change('os-select', osId === 'linux' ? 'macos' : 'linux');
+    assert.equal(panel.hidden, true, 'A new selection hides steps for the previous build');
+  }
+  const early = openPage({ fetchError: true, userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
+  await early.settle();
+  early.oneclick[0].emit('click');
+  assert.equal(early.ids.get('next-steps').hidden, true, 'An unarmed button only scrolls to the download section');
+}
+
 async function visiblePlayback() {
   const page = openPage({ downloads: false });
   await page.settle();
@@ -330,7 +457,7 @@ async function missingObserverAndBlockedPlay() {
 }
 
 (async () => {
-  for (const check of [downloads, visiblePlayback, motionAndDataPreferences, missingObserverAndBlockedPlay]) {
+  for (const check of [downloads, signing, guessedProcessor, nextSteps, visiblePlayback, motionAndDataPreferences, missingObserverAndBlockedPlay]) {
     try { await check(); }
     catch (error) { console.error(`${check.name}:`, error); process.exitCode = 1; }
   }

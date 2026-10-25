@@ -7,6 +7,7 @@ import re
 import struct
 import sys
 import xml.etree.ElementTree as ET
+from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlsplit, unquote
@@ -23,6 +24,8 @@ class Page(HTMLParser):
         self.links = []
         self.scripts = []
         self.images = []
+        # (srcset, width, height, fetchpriority, src) for responsive images.
+        self.srcsets = []
         self.videos = []
         self.current_video = None
         self.errors = []
@@ -43,6 +46,8 @@ class Page(HTMLParser):
             if "alt" not in attrs or (not attrs["alt"] and attrs.get("aria-hidden") != "true"):
                 self.errors.append("image without descriptive alternative text")
             self.images.append((attrs.get("src", ""), attrs.get("width"), attrs.get("height")))
+            if attrs.get("srcset") or attrs.get("fetchpriority"):
+                self.srcsets.append((attrs.get("srcset") or "", attrs.get("width"), attrs.get("height"), attrs.get("fetchpriority"), attrs.get("src", "")))
         if tag == "script":
             self.scripts.append(attrs.get("src", ""))
         if tag == "video":
@@ -66,6 +71,9 @@ class Page(HTMLParser):
         for name in ("href", "src", "poster"):
             if attrs.get(name):
                 self.links.append(attrs[name])
+        for candidate in (attrs.get("srcset") or "").split(","):
+            if candidate.strip():
+                self.links.append(candidate.split()[0])
         if any(key.startswith("on") for key in attrs):
             self.errors.append("inline event handler")
 
@@ -270,6 +278,123 @@ def check_media(root, pages, errors):
                     errors.append(f"{name}: {src}: poster differs from recording manifest")
     for filename in recorded.keys() - embedded:
         errors.append(f"media/{filename}: recorded demonstration is not embedded in a page")
+    check_clip_copy(root, pages, recorded, errors)
+
+
+NUMBERS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8}
+
+
+def plain_text(markup):
+    return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", markup))).strip()
+
+
+def check_clip_copy(root, pages, recorded, errors):
+    """The copy beside a clip must count the cameras the recording actually shows."""
+    for name in pages:
+        markup = (root / name).read_text(encoding="utf-8")
+        for block in re.findall(r"<article\b.*?</article>", markup, re.S):
+            for filename, clip in recorded.items():
+                if f"media/{filename}" not in block:
+                    continue
+                cameras = (clip.get("source") or {}).get("cameras")
+                caption = plain_text(" ".join(re.findall(r"<figcaption\b.*?</figcaption>", block, re.S)))
+                body = plain_text(re.sub(r"<figure\b.*?</figure>", " ", block, flags=re.S))
+                stated = re.findall(r"\b(\w+) simulator cameras?\b", caption, re.I)
+                if "simulator camera" in caption.lower() and not stated:
+                    errors.append(f"media/{filename}: caption mentions simulator cameras without a count")
+                stated += re.findall(r"\b(\w+) (?:simulator )?cameras\b", body, re.I)
+                for word in stated:
+                    count = int(word) if word.isdigit() else NUMBERS.get(word.lower())
+                    if count is None:
+                        errors.append(f"media/{filename}: cannot read the camera count in '{word} ... cameras'")
+                    elif count != cameras:
+                        errors.append(f"media/{filename}: {name} says {word} simulator camera(s) but manifest source.cameras is {cameras}")
+
+
+def check_image_provenance(root, pages, errors):
+    """Responsive candidates exist at their stated widths and derived images match their manifest."""
+    manifest_path = root / "images" / "docs" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
+    for entry in manifest.get("derived", []):
+        path = manifest_path.parent / str(entry.get("file", ""))
+        source = manifest_path.parent / str(entry.get("derived_from", ""))
+        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("sha256"):
+            errors.append(f"images/docs/{entry.get('file')}: missing or modified derived image; run scripts/docs-screenshots.py --derive-only")
+        elif not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != entry.get("derived_from_sha256"):
+            errors.append(f"images/docs/{entry.get('file')}: its source {entry.get('derived_from')} changed; run scripts/docs-screenshots.py --derive-only")
+    for name, page in pages.items():
+        for srcset, width, height, priority, src in page.srcsets:
+            for candidate in filter(None, (part.strip() for part in srcset.split(","))):
+                parts = candidate.split()
+                path = root / Path(name).parent / unquote(urlsplit(parts[0]).path)
+                if len(parts) != 2 or not re.fullmatch(r"[1-9][0-9]*w", parts[1]):
+                    errors.append(f"{name}: srcset candidate needs a width descriptor: {candidate}")
+                    continue
+                if not path.is_file():
+                    continue  # Reported as a missing local resource.
+                try:
+                    size = image_size(path)
+                except (ValueError, ET.ParseError, struct.error) as error:
+                    errors.append(f"{name}: cannot validate {parts[0]}: {error}")
+                    continue
+                if size[0] != int(parts[1][:-1]):
+                    errors.append(f"{name}: {parts[0]} is {size[0]} pixels wide, not {parts[1]}")
+                if width and height and abs(size[0] * int(height) - size[1] * int(width)) > size[0]:
+                    errors.append(f"{name}: {parts[0]} does not match the {width}x{height} aspect ratio")
+            path = root / Path(name).parent / unquote(urlsplit(src).path)
+            if priority == "high" and path.is_file() and path.stat().st_size > 300_000:
+                print(f"warning: {name}: high-priority image {src} is {path.stat().st_size // 1000} KB", file=sys.stderr)
+
+
+def code_lines(markup):
+    for block in re.findall(r"<pre><code>(.*?)</code></pre>", markup, re.S):
+        yield from (line.strip() for line in plain_lines(block))
+
+
+def plain_lines(block):
+    return unescape(re.sub(r"<[^>]+>", "", block)).splitlines()
+
+
+def check_landing(root, errors):
+    """Keep the landing page's first impression and examples honest."""
+    index = (root / "index.html").read_text(encoding="utf-8")
+    docs = (root / "docs.html").read_text(encoding="utf-8")
+    title = re.search(r"<h1\b[^>]*>(.*?)</h1>", index, re.S)
+    if title and "<br" in title[1]:
+        errors.append("index.html: the hero heading must wrap on its own; remove <br>")
+    quickstart = re.search(r'<section id="quickstart".*?</section>', index, re.S)
+    for line in code_lines(quickstart[0] if quickstart else ""):
+        if re.match(r"capturefab\b.*\bdiscover\b", line) and "--simulate" not in line:
+            errors.append(f"index.html: the simulator quickstart must discover with --simulate: {line}")
+    # Landing examples are copied from documented ones, so docs coverage keeps them current.
+    documented = set(code_lines(docs))
+    for line in code_lines(index):
+        if line.startswith("capturefab ") and line not in documented:
+            errors.append(f"index.html: CLI example is not in a docs.html example: {line}")
+    faq = re.search(r'<div class="faq">\s*<details><summary>(.*?)</summary>', index, re.S)
+    if faq and re.search(r"\b(version|upgrad\w*|changed)\b|\d+\.\d+", faq[1], re.I):
+        errors.append(f"index.html: the FAQ should open with a newcomer question, not release news: {faq[1]}")
+    if index.count("development build") > 1:
+        errors.append("index.html: say 'development build' once at most; captions already link their provenance")
+    for manifest in (root / "media" / "manifest.json", root / "images" / "docs" / "manifest.json"):
+        version = json.loads(manifest.read_text(encoding="utf-8")).get("app_version") if manifest.is_file() else None
+        note = re.search(r'<p class="media-note">(.*?)</p>', index, re.S)
+        if version and (not note or version not in note[1]):
+            errors.append(f"index.html: the media note must name version {version}, recorded in {manifest.relative_to(root)}")
+
+
+def check_unused_css(root, errors):
+    """Every class selector in the site stylesheets is used by a page, a script or the release template."""
+    # Classes that appear only in the markup docs.js or app.js builds at runtime.
+    runtime = set()
+    sources = [*root.glob("*.html"), *root.glob("*.js"), Path(__file__).with_name("site-release.py")]
+    used = "\n".join(path.read_text(encoding="utf-8") for path in sources)
+    for sheet in ("style.css", "docs.css"):
+        css = re.sub(r"/\*.*?\*/", "", (root / sheet).read_text(encoding="utf-8"), flags=re.S)
+        selectors = re.sub(r"\{[^{}]*\}", "{}", css)
+        for name in sorted(set(re.findall(r"\.(-?[A-Za-z_][\w-]*)", selectors)) - runtime):
+            if not re.search(rf"(?<![\w-]){re.escape(name)}(?![\w-])", used):
+                errors.append(f"{sheet}: unused class selector .{name}")
 
 
 def check_svgs(root, errors):
@@ -411,6 +536,9 @@ def validate(root=ROOT):
     errors = []
     pages = check_pages(root, errors)
     check_media(root, pages, errors)
+    check_image_provenance(root, pages, errors)
+    check_landing(root, errors)
+    check_unused_css(root, errors)
     check_svgs(root, errors)
     for path in sorted(root.rglob("*.css")):
         css = path.read_text(encoding="utf-8")
