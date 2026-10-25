@@ -1,4 +1,4 @@
-//! ONVIF WS-Discovery and Media1 profile/RTSP URI resolution.
+//! ONVIF WS-Discovery and Media1/Media2 profile/RTSP URI resolution.
 //! SOAP uses bounded HTTP requests, WS UsernameToken PasswordDigest, and HTTP
 //! Basic/Digest authentication. HTTPS SOAP is rejected explicitly.
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -17,6 +17,7 @@ use std::{
 const MAX_SOAP: usize = 4 * 1024 * 1024;
 const DEVICE_NS: &str = "http://www.onvif.org/ver10/device/wsdl";
 const MEDIA_NS: &str = "http://www.onvif.org/ver10/media/wsdl";
+const MEDIA2_NS: &str = "http://www.onvif.org/ver20/media/wsdl";
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub username: String,
@@ -75,6 +76,10 @@ fn child_text<'a>(n: roxmltree::Node<'a, 'a>, name: &str) -> Option<&'a str> {
         .find(|n| n.is_element() && n.tag_name().name() == name)
         .and_then(|n| n.text())
         .map(str::trim)
+}
+fn child_element<'a>(n: roxmltree::Node<'a, 'a>, name: &str) -> Option<roxmltree::Node<'a, 'a>> {
+    n.children()
+        .find(|n| n.is_element() && n.tag_name().name() == name)
 }
 fn xml_document(body: &str) -> Result<roxmltree::Document<'_>> {
     ensure!(
@@ -802,7 +807,7 @@ fn digest_authorization(
 }
 fn envelope(header: &str, content: &str) -> String {
     format!(
-        "<?xml version='1.0' encoding='UTF-8'?><s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:tds='{DEVICE_NS}' xmlns:trt='{MEDIA_NS}' xmlns:tt='http://www.onvif.org/ver10/schema'><s:Header>{header}</s:Header><s:Body>{content}</s:Body></s:Envelope>"
+        "<?xml version='1.0' encoding='UTF-8'?><s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:tds='{DEVICE_NS}' xmlns:trt='{MEDIA_NS}' xmlns:tr2='{MEDIA2_NS}' xmlns:tt='http://www.onvif.org/ver10/schema'><s:Header>{header}</s:Header><s:Body>{content}</s:Body></s:Envelope>"
     )
 }
 /// A SOAP fault refusing the sign-in (ter:NotAuthorized). Devices send it
@@ -942,6 +947,65 @@ pub fn resolve(
         );
     }
     let mut soap = Soap::new(endpoint, credentials, timeout);
+    let services = media_services(&mut soap, endpoint)?;
+    let mut first_error = None;
+    for (media, address) in [(Media::V1, services.media1), (Media::V2, services.media2)] {
+        let Some(address) = address else {
+            continue;
+        };
+        match media_streams(&mut soap, media, &address, profile) {
+            Ok(streams) => return Ok(streams),
+            // Asking again with the same sign-in risks a lockout.
+            Err(error) if crate::logins::is_auth_error(&error) => return Err(error),
+            Err(error) => {
+                first_error.get_or_insert(error);
+            }
+        }
+    }
+    Err(first_error.unwrap_or_else(|| anyhow!("ONVIF device exposes no media service endpoint")))
+}
+#[derive(Default)]
+struct Services {
+    media1: Option<String>,
+    media2: Option<String>,
+}
+/// The Media1 and Media2 service addresses from GetServices (Core 8.1.2.2),
+/// or from GetCapabilities on older devices, which list Media1 only.
+fn media_services(soap: &mut Soap, endpoint: &str) -> Result<Services> {
+    let mut services = Services::default();
+    match soap.call(
+        endpoint,
+        DEVICE_NS,
+        "GetServices",
+        "<tds:GetServices><tds:IncludeCapability>false</tds:IncludeCapability></tds:GetServices>",
+    ) {
+        Ok(body) => {
+            let doc = xml_document(&body)?;
+            for service in doc
+                .descendants()
+                .filter(|n| n.is_element() && n.tag_name().name() == "Service")
+            {
+                let field = |name: &str| {
+                    child_element(service, name)
+                        .and_then(|n| n.text())
+                        .map(|text| text.trim().to_owned())
+                };
+                let slot = match field("Namespace").as_deref() {
+                    Some(MEDIA_NS) => &mut services.media1,
+                    Some(MEDIA2_NS) => &mut services.media2,
+                    _ => continue,
+                };
+                if slot.is_none() {
+                    *slot = field("XAddr").filter(|xaddr| !xaddr.is_empty());
+                }
+            }
+            if services.media1.is_some() || services.media2.is_some() {
+                return Ok(services);
+            }
+        }
+        Err(error) if crate::logins::is_auth_error(&error) => return Err(error),
+        Err(_) => {}
+    }
     let capabilities = soap.call(
         endpoint,
         DEVICE_NS,
@@ -949,13 +1013,64 @@ pub fn resolve(
         "<tds:GetCapabilities><tds:Category>Media</tds:Category></tds:GetCapabilities>",
     )?;
     let doc = xml_document(&capabilities)?;
-    let media = doc
+    services.media1 = doc
         .descendants()
         .find(|n| n.is_element() && n.tag_name().name() == "Media")
         .and_then(|n| child_text(n, "XAddr"))
-        .context("ONVIF device exposes no Media1 service endpoint")?
-        .to_string();
-    let profiles = soap.call(&media, MEDIA_NS, "GetProfiles", "<trt:GetProfiles/>")?;
+        .map(str::to_owned);
+    Ok(services)
+}
+#[derive(Clone, Copy)]
+enum Media {
+    V1,
+    V2,
+}
+impl Media {
+    fn name(self) -> &'static str {
+        match self {
+            Self::V1 => "Media1",
+            Self::V2 => "Media2",
+        }
+    }
+    fn namespace(self) -> &'static str {
+        match self {
+            Self::V1 => MEDIA_NS,
+            Self::V2 => MEDIA2_NS,
+        }
+    }
+    fn get_profiles(self) -> &'static str {
+        match self {
+            Self::V1 => "<trt:GetProfiles/>",
+            // Without a type, Media2 lists no configurations.
+            Self::V2 => "<tr2:GetProfiles><tr2:Type>VideoEncoder</tr2:Type></tr2:GetProfiles>",
+        }
+    }
+    fn get_stream_uri(self, token: &str) -> String {
+        match self {
+            Self::V1 => format!(
+                "<trt:GetStreamUri><trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>{}</trt:ProfileToken></trt:GetStreamUri>",
+                escape(token)
+            ),
+            // RtspUnicast is the one RTSP protocol Profile T devices must offer.
+            Self::V2 => format!(
+                "<tr2:GetStreamUri><tr2:Protocol>RtspUnicast</tr2:Protocol><tr2:ProfileToken>{}</tr2:ProfileToken></tr2:GetStreamUri>",
+                escape(token)
+            ),
+        }
+    }
+}
+fn media_streams(
+    soap: &mut Soap,
+    media: Media,
+    address: &str,
+    profile: Option<&str>,
+) -> Result<Vec<OnvifStream>> {
+    let profiles = soap.call(
+        address,
+        media.namespace(),
+        "GetProfiles",
+        media.get_profiles(),
+    )?;
     let doc = xml_document(&profiles)?;
     let mut result = Vec::new();
     let mut names = BTreeSet::new();
@@ -974,9 +1089,11 @@ pub fn resolve(
             continue;
         }
         let name = child_text(node, "Name").unwrap_or(token).to_string();
-        let encoder = node
-            .children()
-            .find(|n| n.is_element() && n.tag_name().name() == "VideoEncoderConfiguration");
+        // Media1 Profiles/VideoEncoderConfiguration, Media2
+        // Profiles/Configurations/VideoEncoder.
+        let encoder = child_element(node, "VideoEncoderConfiguration").or_else(|| {
+            child_element(node, "Configurations").and_then(|n| child_element(n, "VideoEncoder"))
+        });
         let encoding = encoder
             .and_then(|n| child_text(n, "Encoding"))
             .map(str::to_string);
@@ -986,15 +1103,12 @@ pub fn resolve(
         let height = encoder
             .and_then(|n| child_text(n, "Height"))
             .and_then(|v| v.parse().ok());
-        let content = format!(
-            "<trt:GetStreamUri><trt:StreamSetup><tt:Stream>RTP-Unicast</tt:Stream><tt:Transport><tt:Protocol>RTSP</tt:Protocol></tt:Transport></trt:StreamSetup><trt:ProfileToken>{}</trt:ProfileToken></trt:GetStreamUri>",
-            escape(token)
-        );
+        let content = media.get_stream_uri(token);
         // Cameras may advertise stale or non-streamable profiles alongside usable
         // ones. A failed profile must not hide the remaining streams. Explicit
         // selection still reports that profile's original error.
         let uri = (|| -> Result<String> {
-            let stream = soap.call(&media, MEDIA_NS, "GetStreamUri", &content)?;
+            let stream = soap.call(address, media.namespace(), "GetStreamUri", &content)?;
             let stream = xml_document(&stream)?;
             let uri = stream
                 .descendants()
@@ -1033,11 +1147,15 @@ pub fn resolve(
     if result.is_empty()
         && let Some(error) = stream_error
     {
-        return Err(error.context("ONVIF camera exposes no usable Media1 stream profiles"));
+        return Err(error.context(format!(
+            "ONVIF camera exposes no usable {} stream profiles",
+            media.name()
+        )));
     }
     ensure!(
         !result.is_empty(),
-        "ONVIF profile was not found or the camera exposes no Media1 profiles"
+        "ONVIF profile was not found or the camera exposes no {} profiles",
+        media.name()
     );
     Ok(result)
 }
@@ -1639,14 +1757,14 @@ mod tests {
                     http_reply("200 OK", "", &date_and_time(now_seconds().unwrap())).as_bytes(),
                 )
                 .unwrap();
-            for operation in ["GetCapabilities", "GetProfiles", "GetStreamUri"] {
+            for operation in ["GetServices", "GetProfiles", "GetStreamUri"] {
                 for authenticated in [false, true] {
                     let (mut stream, _) = listener.accept().unwrap();
                     let (path, headers, body) = mock_request(&stream);
                     assert!(headers["soapaction"].contains(operation));
                     // The token goes once; after the device asks for HTTP
                     // Digest, requests carry Digest alone.
-                    if operation == "GetCapabilities" && !authenticated {
+                    if operation == "GetServices" && !authenticated {
                         assert_username_token(&body, &server_credentials.password);
                     } else {
                         assert!(!body.contains("Security"), "{body}");
@@ -1663,7 +1781,7 @@ mod tests {
                         .unwrap();
                         assert_eq!(*supplied, expected);
                         let response=match operation {
-                            "GetCapabilities"=>format!("<Envelope><Body><GetCapabilitiesResponse><Capabilities><Media><XAddr>{media}</XAddr></Media></Capabilities></GetCapabilitiesResponse></Body></Envelope>"),
+                            "GetServices"=>format!("<Envelope><Body><GetServicesResponse><Service><Namespace>{DEVICE_NS}</Namespace><XAddr>http://{address}/onvif/device_service</XAddr><Version><Major>2</Major><Minor>40</Minor></Version></Service><Service><Namespace>{MEDIA_NS}</Namespace><XAddr>{media}</XAddr><Version><Major>2</Major><Minor>40</Minor></Version></Service></GetServicesResponse></Body></Envelope>"),
                             "GetProfiles"=>"<Envelope><Body><GetProfilesResponse><Profiles token='main'><Name>Main camera</Name><VideoEncoderConfiguration><Encoding>H264</Encoding><Resolution><Width>640</Width><Height>480</Height></Resolution></VideoEncoderConfiguration></Profiles><Profiles token='small'><Name>Substream</Name></Profiles></GetProfilesResponse></Body></Envelope>".into(),
                             _=>{assert!(body.contains("<trt:ProfileToken>main</trt:ProfileToken>"));"<Envelope><Body><GetStreamUriResponse><MediaUri><Uri>rtsp://camera.example/live</Uri></MediaUri></GetStreamUriResponse></Body></Envelope>".into()},
                         };
@@ -1889,7 +2007,9 @@ mod tests {
             let endpoint = format!("http://{}/service", listener.local_addr().unwrap());
             let media = endpoint.clone();
             let server = std::thread::spawn(move || {
-                let count = if selected.is_some() { 3 } else { 5 };
+                // A device without GetServices faults it, then answers
+                // GetCapabilities.
+                let count = if selected.is_some() { 4 } else { 6 };
                 for _ in 0..count {
                     let (mut stream, _) = listener.accept().unwrap();
                     let (_, headers, body) = mock_request(&stream);
@@ -1917,6 +2037,69 @@ mod tests {
                 assert!(error.contains("No stream available"), "{error}");
                 assert_eq!(error.contains("no usable Media1"), selected.is_none());
             }
+        }
+    }
+    const MEDIA2_PROFILES: &str = "<SOAP-ENV:Envelope xmlns:SOAP-ENV='http://www.w3.org/2003/05/soap-envelope' xmlns:tt='http://www.onvif.org/ver10/schema' xmlns:tr2='http://www.onvif.org/ver20/media/wsdl'><SOAP-ENV:Body><tr2:GetProfilesResponse><tr2:Profiles token='Profile_1' fixed='true'><tr2:Name>mainStream</tr2:Name><tr2:Configurations><tr2:VideoEncoder token='VideoEncoderToken_1' GovLength='50' Profile='Main'><tt:Name>VideoEncoder_1</tt:Name><tt:UseCount>1</tt:UseCount><tt:Encoding>H265</tt:Encoding><tt:Resolution><tt:Width>2560</tt:Width><tt:Height>1440</tt:Height></tt:Resolution><tt:RateControl ConstantBitRate='false'><tt:FrameRateLimit>25</tt:FrameRateLimit><tt:BitrateLimit>4096</tt:BitrateLimit></tt:RateControl><tt:Quality>3</tt:Quality></tr2:VideoEncoder></tr2:Configurations></tr2:Profiles></tr2:GetProfilesResponse></SOAP-ENV:Body></SOAP-ENV:Envelope>";
+    #[test]
+    fn media2_resolves_profile_t_devices() {
+        // A Media2-only device, and one whose Media1 service faults.
+        for media1 in [false, true] {
+            let (address, server) = serve(
+                if media1 { 4 } else { 3 },
+                move |operation, headers, body| {
+                    let namespace = headers["soapaction"]
+                        .trim_matches('"')
+                        .rsplit_once('/')
+                        .unwrap()
+                        .0
+                        .to_owned();
+                    let response = match operation {
+                        "GetServices" => {
+                            let local = |path: &str| format!("http://127.0.0.1/{path}");
+                            let mut services = format!(
+                                "<tds:Service><tds:Namespace>{DEVICE_NS}</tds:Namespace><tds:XAddr>{}</tds:XAddr><tds:Version><tt:Major>21</tt:Major><tt:Minor>12</tt:Minor></tds:Version></tds:Service><tds:Service><tds:Namespace>{MEDIA2_NS}</tds:Namespace><tds:XAddr>{}</tds:XAddr><tds:Version><tt:Major>21</tt:Major><tt:Minor>12</tt:Minor></tds:Version></tds:Service>",
+                                local("onvif/device_service"),
+                                local("onvif/media2_service")
+                            );
+                            if media1 {
+                                services.push_str(&format!("<tds:Service><tds:Namespace>{MEDIA_NS}</tds:Namespace><tds:XAddr>{}</tds:XAddr></tds:Service>", local("onvif/media_service")));
+                            }
+                            format!("<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:tds='{DEVICE_NS}' xmlns:tt='http://www.onvif.org/ver10/schema'><s:Body><tds:GetServicesResponse>{services}</tds:GetServicesResponse></s:Body></s:Envelope>").replace("127.0.0.1", &headers["host"])
+                        }
+                        _ if namespace == MEDIA_NS => {
+                            return http_reply(
+                                "500 Internal Server Error",
+                                "",
+                                "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope'><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value><s:Subcode><s:Value>ter:ActionNotSupported</s:Value></s:Subcode></s:Code><s:Reason><s:Text>Optional Action Not Implemented</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>",
+                            );
+                        }
+                        "GetProfiles" => {
+                            assert!(body.contains("<tr2:GetProfiles><tr2:Type>VideoEncoder</tr2:Type></tr2:GetProfiles>"), "{body}");
+                            MEDIA2_PROFILES.into()
+                        }
+                        _ => {
+                            assert!(body.contains("<tr2:Protocol>RtspUnicast</tr2:Protocol><tr2:ProfileToken>Profile_1</tr2:ProfileToken>"), "{body}");
+                            "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:tr2='http://www.onvif.org/ver20/media/wsdl'><s:Body><tr2:GetStreamUriResponse><tr2:Uri>rtsp://camera.example:554/Streaming/Channels/101</tr2:Uri></tr2:GetStreamUriResponse></s:Body></s:Envelope>".into()
+                        }
+                    };
+                    http_reply("200 OK", "", &response)
+                },
+            );
+            let endpoint = format!("http://{address}/onvif/device_service");
+            let streams = resolve(&endpoint, None, None, Duration::from_secs(2)).unwrap();
+            server.join().unwrap();
+            assert_eq!(streams.len(), 1);
+            assert_eq!(streams[0].token, "Profile_1");
+            assert_eq!(streams[0].name, "mainStream");
+            assert_eq!(streams[0].encoding.as_deref(), Some("H265"));
+            assert_eq!(
+                (streams[0].width, streams[0].height),
+                (Some(2560), Some(1440))
+            );
+            assert_eq!(
+                streams[0].uri,
+                "rtsp://camera.example:554/Streaming/Channels/101"
+            );
         }
     }
     #[test]
@@ -2009,7 +2192,7 @@ mod tests {
         server.join().unwrap();
         assert_eq!(code(&error), Some("auth_rejected"), "{error:#}");
         assert!(!format!("{error:#}").contains("onvif-secret-pw"));
-        // GetCapabilities works anonymously, GetProfiles faults.
+        // GetServices works anonymously, GetProfiles faults.
         let media = format!("http://{address}/onvif/media");
         let ok = |body: String| {
             format!(
@@ -2023,7 +2206,7 @@ mod tests {
         let media = media.replace(&address, &here.to_string());
         let responses = vec![
             ok(format!(
-                "<Envelope><Body><GetCapabilitiesResponse><Capabilities><Media><XAddr>{media}</XAddr></Media></Capabilities></GetCapabilitiesResponse></Body></Envelope>"
+                "<Envelope><Body><GetServicesResponse><Service><Namespace>{MEDIA_NS}</Namespace><XAddr>{media}</XAddr></Service></GetServicesResponse></Body></Envelope>"
             )),
             format!(
                 "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fault}",
