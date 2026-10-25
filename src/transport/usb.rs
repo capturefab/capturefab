@@ -8,7 +8,9 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use nusb::{
     DeviceInfo, Endpoint, Interface, MaybeFuture,
     descriptors::TransferType,
-    transfer::{Buffer, Bulk, Completion, In, Out, TransferError},
+    transfer::{
+        Buffer, Bulk, Completion, ControlOut, ControlType, In, Out, Recipient, TransferError,
+    },
 };
 use std::time::{Duration, Instant};
 
@@ -274,7 +276,8 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         control_in: control_interface.endpoint::<Bulk, In>(control.input)?,
         control_out: control_interface.endpoint::<Bulk, Out>(control.output.unwrap())?,
         stream_in: data_interface.endpoint::<Bulk, In>(data.input)?,
-        _interfaces: vec![control_interface, data_interface],
+        stream_interface: data_interface,
+        _control_interface: control_interface,
         timeout: timeout.max(Duration::from_millis(20)),
         id: 0,
         max_command: 65548,
@@ -309,7 +312,8 @@ struct UsbBackend {
     control_in: Endpoint<Bulk, In>,
     control_out: Endpoint<Bulk, Out>,
     stream_in: Endpoint<Bulk, In>,
-    _interfaces: Vec<Interface>,
+    stream_interface: Interface,
+    _control_interface: Interface,
     timeout: Duration,
     id: u16,
     max_command: usize,
@@ -406,6 +410,18 @@ fn layout(
 fn refused(status: &Result<(), TransferError>) -> bool {
     (cfg!(any(target_os = "linux", target_os = "android")) || cfg!(test))
         && *status == Err(TransferError::Unknown(ENOMEM))
+}
+
+/// SET_FEATURE(ENDPOINT_HALT) for an endpoint.
+fn halt(endpoint: u8) -> ControlOut<'static> {
+    ControlOut {
+        control_type: ControlType::Standard,
+        recipient: Recipient::Endpoint,
+        request: 0x03,
+        value: 0,
+        index: endpoint.into(),
+        data: &[],
+    }
 }
 
 /// Whether a completed transfer holds one whole leader or trailer: the
@@ -711,6 +727,10 @@ impl UsbBackend {
         self.write_memory(self.sirm + offset, &(value as u32).to_le_bytes())
     }
     fn start_stream(&mut self) -> Result<()> {
+        // The stream registers must not change while the stream interface
+        // is enabled, as a program streaming from the camera may have left
+        // it when it ended abruptly.
+        self.put32(SIRM_CONTROL, 0)?;
         let info = self.u32(self.sirm)?;
         let alignment = 1usize
             .checked_shl(info >> 24)
@@ -746,7 +766,14 @@ impl UsbBackend {
         self.stream = Some(stream);
         self.put32(SIRM_CONTROL, 1)
     }
+    /// Halt the stream endpoint, then clear the halt, as Aravis and the NI
+    /// driver reset it, so the camera drops any partly sent block. A host
+    /// may refuse to halt it; clearing the halt still resets it.
     fn reset_stream_endpoint(&mut self) -> Result<()> {
+        let _ = self
+            .stream_interface
+            .control_out(halt(self.stream_in.endpoint_address()), self.timeout)
+            .wait();
         self.stream_in
             .clear_halt()
             .wait()
@@ -912,6 +939,9 @@ impl Backend for UsbBackend {
         ensure!(self.stream.is_none(), "USB acquisition already started");
         let started = self.start_stream();
         if started.is_err() {
+            if self.stream.is_none() {
+                let _ = self.put32(SIRM_CONTROL, 0);
+            }
             let _ = self.stop();
         }
         started
@@ -1401,6 +1431,18 @@ mod tests {
         );
         let tail = layout(2_304_000, MPS, MPS, MPS, MAX_WINDOW).unwrap();
         assert_eq!((tail.count, tail.tail), (2, 206_848));
+    }
+    #[test]
+    fn stream_endpoint_reset_halts_it_first() {
+        // Aravis: LIBUSB_ENDPOINT_OUT | LIBUSB_REQUEST_TYPE_STANDARD |
+        // LIBUSB_RECIPIENT_ENDPOINT, SET_FEATURE, ENDPOINT_HALT, endpoint.
+        let request = halt(0x81);
+        let request_type = (request.control_type as u8) << 5 | request.recipient as u8;
+        assert_eq!(request_type, 0x02);
+        assert_eq!(
+            (request.request, request.value, request.index, request.data),
+            (0x03, 0, 0x81, &[][..])
+        );
     }
     #[test]
     fn malformed_packets_fail_without_panics() {
