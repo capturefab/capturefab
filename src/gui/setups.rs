@@ -611,6 +611,9 @@ impl Workbench {
                     self.setups.confirm = true;
                     self.setups.confirm_at = Some(std::time::Instant::now());
                     self.setups.confirm_delete = false;
+                    // The banner naming what is confirmed is at the top of
+                    // the sheet, which may have been scrolled away.
+                    return operation::snap_to(SHEET_BODY, operation::RelativeOffset::START);
                 }
                 return Task::none();
             }
@@ -1049,10 +1052,7 @@ impl Workbench {
         let state = &self.setups;
         let mut body = column![].spacing(14);
         if let Some(error) = &state.error {
-            body = body.push(field_error(
-                format!("Could not restore the setup: {error}"),
-                p,
-            ));
+            body = body.push(field_error(super::notice::restore_failure(error), p));
         }
         if state.confirm
             && let Some(diff) = state.diff()
@@ -1907,8 +1907,9 @@ mod tests {
         let mut bench = bench("setup-restore");
         // Both presses of a double-click on Restore, then a press on the
         // confirm button that appeared under the pointer at once.
-        let _ = bench.setups_input(Input::Restore);
-        let _ = bench.setups_input(Input::Restore);
+        // The first press scrolls the sheet to the banner it shows.
+        assert!(bench.setups_input(Input::Restore).units() > 0);
+        assert_eq!(bench.setups_input(Input::Restore).units(), 0);
         let _ = bench.setups_input(Input::Confirm);
         assert!(bench.setups.confirm, "a double-click restored");
         // The confirmation says what it confirms.
@@ -2039,17 +2040,26 @@ mod tests {
 
     #[test]
     fn a_failed_restore_shows_once_in_the_sheet() {
+        const ERROR: &str = "Restoring setup line-2-mono failed; every value was put back: \
+                             TriggerMode did not take the value On";
         let failed = |bench: &mut Workbench| {
             let pending = Pending {
                 camera: bench.setups.camera.clone(),
                 ..Pending::unanswered(Job::ApplySetup)
             };
-            bench.settle(&pending, &Err(anyhow::anyhow!("boom")));
+            bench.settle(&pending, &Err(anyhow::anyhow!(ERROR)));
         };
         let mut bench = bench("setup-restore");
         bench.notice = None;
         failed(&mut bench);
-        assert_eq!(bench.setups.error.as_deref(), Some("boom"));
+        assert_eq!(bench.setups.error.as_deref(), Some(ERROR));
+        // The worker's message already says the restore failed.
+        let shown = super::notice::restore_failure(ERROR);
+        assert_eq!(shown.matches("failed").count(), 1, "{shown}");
+        assert_eq!(
+            super::notice::restore_failure("boom"),
+            "Could not restore the setup: boom"
+        );
         assert!(
             bench
                 .notice
@@ -2067,10 +2077,13 @@ mod tests {
         let notice = bench.notice.as_ref().expect("a notice");
         assert_eq!(notice.level, Level::Error);
         assert!(
-            notice.text.starts_with("Could not restore the setup"),
+            notice
+                .text
+                .starts_with("Restoring setup line-2-mono failed"),
             "{}",
             notice.text
         );
+        assert_eq!(notice.text.matches("failed").count(), 1, "{}", notice.text);
     }
 
     #[test]

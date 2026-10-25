@@ -6908,8 +6908,10 @@ fn saved_setups_require_yes_for_disruptive_changes() {
     assert!(!message.contains("triggers or signals"), "{message}");
     assert!(
         message
-            .contains("capturefab --session setup-yes --camera sim:line:conveyor setup diff line,")
-            && message.ends_with("setup apply line --yes"),
+            .contains("\nReview with: capturefab --session setup-yes --camera sim:line:conveyor setup diff line\n")
+            && message.ends_with(
+                "\nThen confirm with: capturefab --session setup-yes --camera sim:line:conveyor setup apply line --yes"
+            ),
         "{message}"
     );
     assert_eq!(rate(), 500.0);
@@ -6933,7 +6935,7 @@ fn saved_setups_require_yes_for_disruptive_changes() {
     let message = refused(&["setup", "apply", "--file", path, "--strict"]);
     let quoted = format!("'{path}'");
     assert!(
-        message.contains(&format!("setup diff --file {quoted},"))
+        message.contains(&format!("setup diff --file {quoted}\n"))
             && message.ends_with(&format!("setup apply --file {quoted} --strict --yes")),
         "{message}"
     );
@@ -7284,6 +7286,22 @@ fn saved_setups_restore_preview_and_undo_in_a_session() {
     }
     let bad_file = cwd.join("bad.json");
     std::fs::write(&bad_file, serde_json::to_vec(&bad).unwrap()).unwrap();
+    // The preview says this value fails the whole restore.
+    let preview = session(&["setup", "diff", "--file", bad_file.to_str().unwrap()]);
+    let gain = preview["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["feature"] == "Gain")
+        .unwrap()
+        .clone();
+    assert!(
+        gain["warning"]
+            .as_str()
+            .unwrap()
+            .contains("restoring fails and puts every value back"),
+        "{gain}"
+    );
     let (code, error) = fail(&[
         "--json",
         "--session",

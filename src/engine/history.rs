@@ -466,15 +466,14 @@ fn restore(
         .filter(restorable)
         .cloned()
         .collect::<Vec<_>>();
-    // Auto flags go last, selectors after the values in their banks. Retry
+    // The same order as a setup restore: a switch that arms (TriggerMode On,
+    // LineMode Output) after its source, one that disarms before it, auto
+    // flags last and selectors after the values in their banks. Retry
     // dependency-locked fields after limits and enabling controls settle.
-    pending.sort_by_key(|address| {
+    pending.sort_by_cached_key(|address| {
         (
-            matches!(
-                address.feature.as_str(),
-                "ExposureAuto" | "GainAuto" | "BalanceWhiteAuto"
-            ),
-            address.feature.ends_with("Selector"),
+            crate::setup::order_key(&address.feature, Some(&text(&target.values[address]))),
+            address.selectors.clone(),
         )
     });
     let mut errors = Vec::new();

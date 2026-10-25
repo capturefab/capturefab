@@ -457,8 +457,13 @@ pub(super) fn command_notice(
                     Level::Warning,
                 ));
             }
+            let line = first_line(&full);
             Some((
-                format!("{}: {}", failure(job), first_line(&full)),
+                if matches!(job, Job::ApplySetup) {
+                    restore_failure(line)
+                } else {
+                    format!("{}: {line}", failure(job))
+                },
                 Some(full.clone()),
                 Level::Error,
             ))
@@ -599,6 +604,16 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
             "{} executed",
             words(value["executed"].as_str().unwrap_or(feature))
         )),
+    }
+}
+
+/// A failed setup restore, said once: the worker's "Restoring setup NAME
+/// failed; ..." already says what did not happen.
+pub(super) fn restore_failure(error: &str) -> String {
+    if error.starts_with("Restoring setup ") {
+        error.into()
+    } else {
+        format!("{}: {error}", failure(&Job::ApplySetup))
     }
 }
 

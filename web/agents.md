@@ -787,6 +787,7 @@ capturefab setup show bench --json
 Always preview with `setup diff` or `setup apply --dry-run` first.
 `changes[]` lists `{feature, at?, saved, current, risk, stream_locked, deferred?, warning?}`; `matched[]` lists `{feature, at?, value}` for settings that already match.
 `deferred: true` marks a value unavailable now (`current` is null) that an earlier write in the same setup should make available, such as an output line's source; it is written after the others, and listed in the result's `not_applied` if it stays unavailable (`--strict` then fails and puts every value back).
+A `warning` that a value is outside the camera's current limits is different: unless an earlier change in the setup widens them, the restore fails and puts every value back, with or without `--strict`.
 `auto_change` is `{current, saved, action, risk}`: `action` is `none`, `enter`, `balance` or `release` when restoring starts, retunes or stops Capturefab auto exposure; the result adds `auto_changed`.
 A restore verifies every saved value, including those in `matched[]`, and writes again one that an earlier write moved; `applied` counts the values it changed.
 `not_applied[]` lists values this camera lacks, cannot write or would not accept, each with `status` and `reason`.

@@ -712,7 +712,7 @@ fn row(
         if below || above {
             let limit = |limit: Option<f64>| limit.map_or("?".into(), |l| l.to_string());
             row.warning = Some(format!(
-                "outside the current limits ({}..{}); applies only if earlier changes widen them",
+                "outside the current limits ({}..{}); restoring fails and puts every value back unless earlier changes in this setup widen them",
                 limit(bounds.min),
                 limit(bounds.max)
             ));
@@ -1468,6 +1468,14 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("outside the current limits")
+        );
+        // The preview says the restore fails, unlike a value it skips.
+        assert!(
+            width["warning"]
+                .as_str()
+                .unwrap()
+                .contains("restoring fails and puts every value back"),
+            "{width}"
         );
         let entries = h.snapshot().history.entries.len();
         let error = apply(&h, &setup).unwrap_err();
@@ -2608,6 +2616,51 @@ mod tests {
         rig.apply_with(&off, false, None).unwrap();
         let (source, mode) = order(&wires);
         assert!(mode < source, "{:?}", wires.writes.lock().unwrap());
+        rig.h.shutdown();
+    }
+
+    #[test]
+    fn undo_redo_and_rollback_arm_after_their_sources() {
+        let (mut rig, wires) = Rig::rich();
+        // The last writes of the trigger source and mode.
+        let order = |wires: &Wires| {
+            let writes = wires.writes.lock().unwrap();
+            let position = |address| writes.iter().rposition(|w| *w == address).unwrap();
+            (position(TRIGGER_SOURCE), position(TRIGGER_MODE))
+        };
+        let off = rig.save("off");
+        rig.c().set("TriggerSource", "Line0").unwrap();
+        rig.c().set("TriggerMode", "On").unwrap();
+        let on = rig.save("on");
+        rig.apply_with(&off, false, None).unwrap();
+        rig.apply_with(&on, false, None).unwrap();
+        // Undo disarms: the mode turns off before the source changes.
+        wires.writes.lock().unwrap().clear();
+        rig.run(SessionCommand::Undo).unwrap();
+        let (source, mode) = order(&wires);
+        assert!(mode < source, "{:?}", wires.writes.lock().unwrap());
+        // Redo arms: the source is written before the mode turns on.
+        wires.writes.lock().unwrap().clear();
+        rig.run(SessionCommand::Redo).unwrap();
+        let (source, mode) = order(&wires);
+        assert!(source < mode, "{:?}", wires.writes.lock().unwrap());
+        // A failed restore that disarmed re-arms after the source is back.
+        let mut bad = off.clone();
+        for value in &mut bad.values {
+            if value.feature == "BlackLevel" {
+                value.value = Scalar::Number(999.into());
+            }
+        }
+        wires.writes.lock().unwrap().clear();
+        let error = rig.apply_with(&bad, false, None).unwrap_err();
+        assert!(
+            error.to_string().contains("every value was put back"),
+            "{error:#}"
+        );
+        let (source, mode) = order(&wires);
+        assert!(source < mode, "{:?}", wires.writes.lock().unwrap());
+        assert_eq!(rig.c().get("TriggerMode").unwrap(), "On");
+        assert_eq!(rig.c().get("TriggerSource").unwrap(), "Line0");
         rig.h.shutdown();
     }
 

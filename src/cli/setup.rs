@@ -383,7 +383,8 @@ fn target(cli: &Cli, camera: Option<&str>) -> String {
 }
 
 /// The refusal for disruptive changes without --yes, with the commands
-/// that review and confirm this same setup on this same camera.
+/// that review and confirm this same setup on this same camera, each on its
+/// own line so it copies and runs as printed.
 fn confirm_message(
     cli: &Cli,
     camera: Option<&str>,
@@ -402,7 +403,7 @@ fn confirm_message(
         (None, name) => crate::hint::shell_quote(name.as_deref().unwrap_or_default()),
     };
     format!(
-        "This setup changes {}, which {} and may change triggering, I/O lines or acquisition rate. Review with capturefab {target}setup diff {source}, then run capturefab {target}setup apply {source}{}{} --yes",
+        "This setup changes {}, which {} and may change triggering, I/O lines or acquisition rate.\nReview with: capturefab {target}setup diff {source}\nThen confirm with: capturefab {target}setup apply {source}{}{} --yes",
         disruptive.join(", "),
         if disruptive.len() == 1 {
             "is not a known image setting"
@@ -567,7 +568,7 @@ fn write_diff(out: &mut impl Write, diff: &Value, verb: &str) -> Result<()> {
     if changes(diff).any(|change| change["risk"] == "disruptive") {
         writeln!(
             out,
-            "  ! not a known image setting (may change triggering or I/O lines); restoring needs --yes"
+            "  ! not a known image setting (may change triggering, I/O lines or acquisition rate); restoring needs --yes"
         )?;
     }
     let not_applied = diff["not_applied"].as_array().cloned().unwrap_or_default();
@@ -658,7 +659,11 @@ fn write_applied(out: &mut impl Write, cli: &Cli, value: &Value) -> Result<()> {
         })
         .collect::<Vec<_>>();
     if !disruptive.is_empty() {
-        writeln!(out, "  Disruptive: {}", disruptive.join(", "))?;
+        writeln!(
+            out,
+            "  Confirmed (not known image settings): {}",
+            disruptive.join(", ")
+        )?;
     }
     let not_applied = value["not_applied"]
         .as_array()
@@ -826,7 +831,7 @@ pub(super) fn extend_schema(contract: &mut Value) {
         "document":{"version":1,"name":"bench","saved_at":"2026-10-25T14:03:11Z","note":"Ring light at 60%","camera":{"transport":"simulator","vendor":"Capturefab","model":"Pattern camera","serial":"SIM0","kind":"area_scan"},"auto":null,"values":[{"feature":"PixelFormat","value":"Mono8"},{"feature":"Width","value":640},{"feature":"Gain","value":2.5,"at":[{"selector":"GainSelector","value":"All"}]},{"feature":"ExposureTime","value":10000.0}],"skipped":[{"feature":"BalanceRatio","reason":"set by BalanceWhiteAuto = Continuous"}]},
         "captured":"Every writable configuration value at the selected bank, and every bank of GainSelector, BlackLevelSelector, BalanceRatioSelector, TriggerSelector, LineSelector, UserOutputSelector, CounterSelector and TimerSelector, including values unavailable at the selected bank (an output line's source while an input line is selected). Never: transport, network, stream-channel (DeviceStreamChannel*), user-set, file, chunk and event settings, commands, registers, DeviceUserID, values a firmware auto drives, values Capturefab auto exposure manages (auto records its balance instead), stream state, capture settings, credentials or addresses. Banks that cannot be read are listed in skipped; banks that are read-only or not available are listed only when another bank of the value was saved. Media sources store only transport and model.",
         "match":{"same_camera":"same vendor, model and serial (hub cameras: same hub:NAME/CAMERA id); transport is ignored","same_model":"same vendor and model, another serial; applies with a warning","other_model":"apply is refused unless allow_other_model (CLI --allow-other-model); then only settings both cameras share change, and warnings names both models. CLI setup diff previews it anyway, with that note in warnings and a hint on stderr that its --allow-other-model leaves out","unknown_source":"a webcam, stream or file of the same kind; Capturefab cannot tell whether it is the same source; applies with a warning"},
-        "diff":{"fields":["setup","digest","camera","match","warnings","changes[{feature,at?,saved,current,risk,stream_locked,deferred?,warning?}]","unchanged","matched[{feature,at?,value}]","not_applied[{feature,at?,status,saved,reason}]","risk","restarts_stream","blocked","auto_change{current,saved,action,risk}"],"deferred":"true for a value unavailable now (current null) that an earlier write in this setup should make available; it is written after the others, and moves to not_applied in the result if it stays unavailable","auto_change":"Capturefab auto exposure balance now and in the setup; action none, enter, balance or release; always reversible","stream_locked":"geometry and pixel format, or a value the camera locks (pIsLocked) while acquiring that no other change in this setup unlocks","status":["missing","read_only","invalid","skipped","refused"],"risk":"reversible when every change only affects the image (exposure, gain, white balance, ...) or selects another bank of a selector setups read bank by bank; disruptive otherwise, such as trigger and I/O line settings"},
+        "diff":{"fields":["setup","digest","camera","match","warnings","changes[{feature,at?,saved,current,risk,stream_locked,deferred?,warning?}]","unchanged","matched[{feature,at?,value}]","not_applied[{feature,at?,status,saved,reason}]","risk","restarts_stream","blocked","auto_change{current,saved,action,risk}"],"warning":"a value outside the camera's current limits: unless an earlier change in this setup widens them, the restore fails and puts every value back, strict or not","deferred":"true for a value unavailable now (current null) that an earlier write in this setup should make available; it is written after the others, and moves to not_applied in the result if it stays unavailable","auto_change":"Capturefab auto exposure balance now and in the setup; action none, enter, balance or release; always reversible","stream_locked":"geometry and pixel format, or a value the camera locks (pIsLocked) while acquiring that no other change in this setup unlocks","status":["missing","read_only","invalid","skipped","refused"],"risk":"reversible when every change only affects the image (exposure, gain, white balance, ...) or selects another bank of a selector setups read bank by bank; disruptive otherwise, such as trigger and I/O line settings"},
         "apply":{"result":"the diff fields plus applied (values changed, including matched values written again after an earlier write moved them), auto_changed, restarted_stream, auto and camera_change","order":"geometry and pixel format first; then switches that disarm (TriggerMode Off, LineMode Input, *Enable false); other modes; other values; switches that arm or drive (TriggerMode On, LineMode Output, *Enable true) after their sources; auto flags; selectors last. Up to 4 passes retry values an earlier write unlocked, made available or moved, then every saved value, changed or matched, is verified","failure":"any value that does not take within 4 passes or 90 s restores every captured value and fails with \"Restoring setup NAME failed; every value was put back\", adding whether a stopped stream was restarted; nothing is recorded in history","stream":"a running stream is stopped once and started again when the setup changes Width, Height, PixelFormat, binning, decimation, offsets, a video mode, or a value the camera locks while acquiring; refused while recording, forwarding or scheduled captures run","strict":"refuses, changing nothing, when any value is missing, read-only, invalid or refused, or when a deferred value stays unavailable; CLI --dry-run --strict fails the same way (exit 5) for values the diff already lists","digest":"apply_setup with digest refuses a setup changed since that digest was reviewed","confirmation":"The CLI refuses disruptive changes without --yes (exit 2, naming the setup diff and setup apply --yes commands for the same session, camera and --file), and sends the reviewed disruptive changes as confirmed_disruptive [{feature, at}]; the worker compares again and refuses (exit 2), changing nothing, a disruptive change at a feature and bank outside that list. A bare feature name confirms only a value without banks. RPC, browser and workflow callers that omit confirmed_disruptive have no confirmation gate (as with set_many), but the model, kind and busy checks always apply."},
         "rpc":{"read_setup":"read-only, no arguments: the values a new setup would save","setup_diff":"read-only: {name} or {setup: DOCUMENT}, optional allow_other_model","apply_setup":"{name} or {setup: DOCUMENT}, optional digest, allow_other_model, strict, confirmed_disruptive: [FEATURE | {feature, at: [{selector, value}]}]"},
         "workflow":{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}},
@@ -912,6 +917,29 @@ mod tests {
     }
 
     #[test]
+    fn disruptive_rows_name_every_effect_and_what_was_confirmed() {
+        let value = json!({"setup":"line","camera":{"id":"sim:line:0"},"applied":1,"unchanged":0,
+            "changes":[{"feature":"AcquisitionLineRate","current":700,"saved":480,"risk":"disruptive"}]});
+        let mut out = Vec::new();
+        write_diff(&mut out, &value, "Would change").unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "may change triggering, I/O lines or acquisition rate); restoring needs --yes"
+            ),
+            "{text}"
+        );
+        let mut out = Vec::new();
+        write_applied(&mut out, &cli(&["setup", "apply", "line"]), &value).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("  Confirmed (not known image settings): AcquisitionLineRate 700 → 480"),
+            "{text}"
+        );
+        assert!(!text.contains("Disruptive"), "{text}");
+    }
+
+    #[test]
     fn the_confirmation_names_the_file_camera_and_flags_it_was_given() {
         let file = cli(&[
             "--session",
@@ -939,7 +967,7 @@ mod tests {
         );
         assert!(!message.contains("triggers or signals"), "{message}");
         assert!(
-            message.contains("capturefab --session t --camera sim:line:conveyor setup diff --file 'my setup.json',"),
+            message.contains("\nReview with: capturefab --session t --camera sim:line:conveyor setup diff --file 'my setup.json'\n"),
             "{message}"
         );
         assert!(
@@ -964,7 +992,7 @@ mod tests {
             "{named}"
         );
         assert!(
-            named.contains("capturefab --camera sim:0 setup diff bench,"),
+            named.contains("\nReview with: capturefab --camera sim:0 setup diff bench\n"),
             "{named}"
         );
         assert!(named.ends_with("setup apply bench --yes"), "{named}");
