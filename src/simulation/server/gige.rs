@@ -415,7 +415,9 @@ impl GigEServer {
                                     be32(payload, 0) as u64,
                                     &payload[4..],
                                 )?;
-                                Ok(payload[..4].to_vec())
+                                // Reserved, then the data index (bytes written).
+                                let written = (payload.len() - 4) as u16;
+                                Ok([[0, 0], written.to_be_bytes()].concat())
                             }
                             0x0040 => {
                                 // Receivers request resends from their stream
@@ -1096,7 +1098,7 @@ mod tests {
                 5,
                 &[0, 0, 0x0d, 8, 0, 0, 3, 0xe8]
             ),
-            (0, vec![0, 0, 0x0d, 8])
+            (0, vec![0, 0, 0, 4])
         );
         assert_eq!(
             gvcp(&controller, camera, 0x0080, 6, &[0, 0, 0x0d, 8]),

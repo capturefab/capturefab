@@ -308,6 +308,7 @@ struct Control {
     socket: UdpSocket,
     timeout: Duration,
     next_id: u16,
+    write_memory: bool,
 }
 impl Control {
     fn connect(address: SocketAddrV4, timeout: Duration) -> Result<Self> {
@@ -319,6 +320,7 @@ impl Control {
             socket,
             timeout: bounded_timeout(timeout),
             next_id: 1,
+            write_memory: true,
         })
     }
     fn transact(&mut self, command: u16, payload: &[u8]) -> Result<Vec<u8>> {
@@ -452,30 +454,32 @@ impl Control {
             let current = address
                 .checked_add((index * MEMORY_CHUNK) as u32)
                 .context("GVCP address overflow")?;
-            if bytes.len() == 4 {
-                self.write_register(current, be32(bytes, 0))?;
-            } else {
-                let mut payload = current.to_be_bytes().to_vec();
-                payload.extend(bytes);
-                match self.transact(WRITE_MEMORY, &payload) {
-                    Ok(ack) => {
-                        ensure!(
-                            ack.len() == 4 && be32(&ack, 0) == current,
-                            "invalid memory write acknowledgement"
-                        );
-                    }
-                    Err(error)
-                        if error
-                            .downcast_ref::<GvcpStatus>()
-                            .is_some_and(|s| s.0 == 0x8001) =>
-                    {
-                        // WRITE_MEMORY is optional in older GigE Vision devices.
-                        for (word, value) in bytes.as_chunks::<4>().0.iter().enumerate() {
-                            self.write_register(current + word as u32 * 4, be32(value, 0))?;
-                        }
-                    }
-                    Err(error) => return Err(error),
+            let words = |control: &mut Self| -> Result<()> {
+                for (word, value) in bytes.as_chunks::<4>().0.iter().enumerate() {
+                    control.write_register(current + word as u32 * 4, be32(value, 0))?;
                 }
+                Ok(())
+            };
+            if bytes.len() == 4 || !self.write_memory {
+                words(self)?;
+                continue;
+            }
+            let mut payload = current.to_be_bytes().to_vec();
+            payload.extend(bytes);
+            match self.transact(WRITE_MEMORY, &payload) {
+                // The acknowledgement carries a reserved half and a data index
+                // whose unit varies between devices (simulators echo the
+                // address), so only its presence is checked.
+                Ok(ack) => ensure!(ack.len() >= 4, "invalid memory write acknowledgement"),
+                // WRITE_MEMORY is optional in older GigE Vision devices.
+                Err(error)
+                    if error
+                        .downcast_ref::<GvcpStatus>()
+                        .is_some_and(|s| s.0 == 0x8001) =>
+                {
+                    words(self)?
+                }
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -728,9 +732,9 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
             (Ok(high), Ok(low)) => ((high as u64) << 32) | low as u64,
             _ => 0,
         };
-        let resend = control
-            .read_register(GVCP_CAPABILITY)
-            .is_ok_and(|bits| bits & 0x4 != 0);
+        let capability = control.read_register(GVCP_CAPABILITY).ok();
+        let resend = capability.is_some_and(|bits| bits & 0x4 != 0);
+        control.write_memory = capability.is_none_or(|bits| bits & 0x2 != 0);
         Ok((
             heartbeat_timeout,
             Duration::from_millis((heartbeat_ms / 3).clamp(100, 1000) as u64),
@@ -2172,6 +2176,8 @@ mod tests {
         rejected_packet_sizes: Vec<u32>,
         register_reads: Vec<u32>,
         register_writes: Vec<(u32, u32)>,
+        memory_writes: Vec<(u32, usize)>,
+        no_write_memory: bool,
         resend_status: u16,
         sticky_flags: u32,
         frames: HashMap<u64, Vec<Vec<u8>>>,
@@ -2321,6 +2327,21 @@ mod tests {
                                 status => ack(command + 1, id, status, &[]),
                             },
                         ),
+                        WRITE_MEMORY if !camera.no_write_memory => {
+                            let address = be32(packet, 8);
+                            let data = &packet[12..];
+                            camera.memory_writes.push((address, data.len()));
+                            let status = data.chunks(4).enumerate().find_map(|(word, value)| {
+                                let address = address + word as u32 * 4;
+                                match camera.write(address, be32(value, 0), &mut outgoing) {
+                                    0 => None,
+                                    status => Some(status),
+                                }
+                            });
+                            // Real devices answer with reserved(16) + index(16).
+                            let index = [0, 0, 0, data.len() as u8];
+                            Some(ack(command + 1, id, status.unwrap_or(0), &index))
+                        }
                         PACKET_RESEND => {
                             camera.resend(packet, peer.port(), &mut outgoing);
                             None
@@ -2522,6 +2543,39 @@ mod tests {
             );
             worker.join().unwrap();
         }
+    }
+    #[test]
+    fn memory_writes_accept_index_acknowledgements_and_fall_back_to_registers() {
+        let name = *b"Line 3\0\0\0\0\0\0\0\0\0\0";
+        for no_write_memory in [false, true] {
+            let fake = Fake::new(|camera| camera.no_write_memory = no_write_memory);
+            let mut control = Control::connect(fake.address, Duration::from_secs(1)).unwrap();
+            // DeviceUserID on the 16-byte user-defined name, then an 8-byte register.
+            control.write_bytes(0xe8, &name).unwrap();
+            control
+                .write_bytes(0x1000, &[0, 0, 0, 1, 0, 0, 0, 2])
+                .unwrap();
+            let camera = fake.camera.lock().unwrap();
+            assert_eq!(camera.register(0xf4), u32::from_be_bytes(*b"\0\0\0\0"));
+            assert_eq!(camera.register(0xe8), u32::from_be_bytes(*b"Line"));
+            assert_eq!((camera.register(0x1000), camera.register(0x1004)), (1, 2));
+            assert_eq!(
+                camera.memory_writes,
+                if no_write_memory {
+                    vec![]
+                } else {
+                    vec![(0xe8, 16), (0x1000, 8)]
+                }
+            );
+        }
+        // Without the WRITEMEM capability bit, words go out as register writes.
+        let fake = Fake::new(|_| {});
+        let mut control = Control::connect(fake.address, Duration::from_secs(1)).unwrap();
+        control.write_memory = false;
+        control.write_bytes(0xe8, &name).unwrap();
+        let camera = fake.camera.lock().unwrap();
+        assert!(camera.memory_writes.is_empty());
+        assert_eq!(camera.register_writes.len(), 4);
     }
     #[test]
     fn local_url_hex_and_memory_ranges() {
