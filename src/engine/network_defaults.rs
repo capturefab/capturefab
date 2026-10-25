@@ -1,6 +1,20 @@
 //! Apply camera-side pacing without guessing host-wide privileged settings.
 use crate::{camera::Camera, network::NetworkTuning};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
+use serde_json::Value;
+
+/// Limiter enables, SFNC first, then older Point Grey and Daheng names.
+const FRAME_RATE_ENABLES: [&str; 3] = [
+    "AcquisitionFrameRateEnable",
+    "AcquisitionFrameRateEnabled",
+    "AcquisitionFrameRateMode",
+];
+
+fn plain(value: &Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_owned)
+}
 
 fn read(camera: &mut Camera, names: &[&str]) -> Option<f64> {
     names.iter().find_map(|name| {
@@ -100,11 +114,30 @@ pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning
             ));
             continue;
         }
+        // Allied Vision cameras pace by StreamBytesPerSecond only in this
+        // mode or Both; Vimba can leave them on SCPD.
+        if feature == "StreamBytesPerSecond"
+            && camera.has(feature)
+            && camera.has("BandwidthControlMode")
+            && !camera
+                .get("BandwidthControlMode")
+                .is_ok_and(|mode| mode == "StreamBytesPerSecond" || mode == "Both")
+            && let Err(error) = camera.set("BandwidthControlMode", "StreamBytesPerSecond")
+        {
+            failures.push(format!(
+                "Could not select StreamBytesPerSecond bandwidth control: {error:#}"
+            ));
+            continue;
+        }
         if !camera.is_writable(feature) {
             continue;
         }
         let result = (|| -> Result<f64> {
-            let actual = set_number(camera, feature, budget as f64, false)?;
+            // SFNC declares bytes per second; some vendors declare MBps.
+            let scale =
+                crate::network::bytes_per_second_scale(camera.feature_unit(feature), 1.0)
+                    .with_context(|| format!("unknown unit {:?}", camera.feature_unit(feature)))?;
+            let actual = set_number(camera, feature, budget as f64 / scale, false)? * scale;
             ensure!(actual > 0.0, "camera throughput readback must be positive");
             if feature == "DeviceLinkThroughputLimit" && camera.has("DeviceLinkThroughputLimitMode")
             {
@@ -168,30 +201,45 @@ pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning
     if !crate::auto::frame_triggered(camera)
         && let Some(payload) = read(camera, &["PayloadSize"])
     {
+        let enable = FRAME_RATE_ENABLES.into_iter().find(|f| camera.has(f));
         for feature in ["AcquisitionFrameRate", "AcquisitionFrameRateAbs"] {
-            if !camera.is_writable(feature) {
+            if !camera.has(feature) {
                 continue;
             }
+            // Without an enable the rate may not limit anything: Allied
+            // Vision applies AcquisitionFrameRateAbs only to FixedRate.
+            let Some(enable) = enable else {
+                failures.push(format!(
+                    "{feature}: camera has no readable frame-rate limiter enable"
+                ));
+                continue;
+            };
+            let on = match enable {
+                "AcquisitionFrameRateMode" => "On",
+                _ => "true",
+            };
             let fps = budget as f64 / (payload * 1.05);
+            let mut changed = Vec::new();
             let result = (|| -> Result<f64> {
+                // The SFNC rate is read-only until its enable is on, and older
+                // Point Grey cameras set it themselves while their auto runs.
+                for (control, value) in [("AcquisitionFrameRateAuto", "Off"), (enable, on)] {
+                    if !camera.has(control) {
+                        continue;
+                    }
+                    let before = camera.get(control)?;
+                    if plain(&before) != value {
+                        camera.set(control, value)?;
+                        changed.push((control, before));
+                    }
+                    ensure!(
+                        plain(&camera.get(control)?) == value,
+                        "frame-rate limit is not enabled"
+                    );
+                }
                 let current = read(camera, &[feature]).unwrap_or(fps);
                 let actual = set_number(camera, feature, current.min(fps), false)?;
                 ensure!(actual > 0.0, "frame-rate readback must be positive");
-                if camera.has("AcquisitionFrameRateEnable") {
-                    camera.set("AcquisitionFrameRateEnable", "true")?;
-                    ensure!(
-                        camera.get("AcquisitionFrameRateEnable")? == true,
-                        "frame-rate limit is not enabled"
-                    );
-                } else if camera.has("AcquisitionFrameRateMode") {
-                    camera.set("AcquisitionFrameRateMode", "On")?;
-                    ensure!(
-                        camera.get("AcquisitionFrameRateMode")? == "On",
-                        "frame-rate limit is not enabled"
-                    );
-                } else {
-                    anyhow::bail!("camera has no readable frame-rate limiter enable");
-                }
                 Ok(actual)
             })();
             match result {
@@ -204,7 +252,12 @@ pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning
                     tuning.warnings.push("Only average frame rate could be limited; packet bursts can still congest a shared link.".into());
                     return Ok(tuning);
                 }
-                Err(error) => failures.push(format!("{feature}: {error:#}")),
+                Err(error) => {
+                    for (control, before) in changed.into_iter().rev() {
+                        let _ = camera.set(control, &plain(&before));
+                    }
+                    failures.push(format!("{feature}: {error:#}"));
+                }
             }
         }
     }
@@ -381,6 +434,78 @@ mod tests {
         assert_eq!(camera.get("GevSCPD").unwrap(), 123);
         assert!(tuned.throughput_limit_bps.is_none());
         assert!(!tuned.warnings.is_empty());
+    }
+
+    #[test]
+    fn throughput_limit_is_written_in_its_declared_unit() {
+        let limit = |unit: &str| {
+            format!(
+                "<Float Name='DeviceLinkThroughputLimit'><pValue>LimitReg</pValue><Min>1</Min><Max>1000</Max><Unit>{unit}</Unit></Float><FloatReg Name='LimitReg'><Address>16</Address><Length>8</Length><AccessMode>RW</AccessMode></FloatReg>"
+            )
+        };
+        let mut mbps = camera(&limit("MBps"), &[]);
+        let tuned = apply(&mut mbps, 40_000_000).unwrap();
+        assert_eq!(mbps.get("DeviceLinkThroughputLimit").unwrap(), 40.0);
+        assert_eq!(tuned.throughput_limit_bps, Some(40_000_000));
+        let mut unknown = camera(&limit("lines"), &[]);
+        let tuned = apply(&mut unknown, 40_000_000).unwrap();
+        assert!(tuned.throughput_limit_bps.is_none());
+        assert!(tuned.warnings.iter().any(|w| w.contains("unknown unit")));
+    }
+
+    #[test]
+    fn allied_vision_bandwidth_control_selects_stream_bytes_per_second() {
+        let features = int(
+            "StreamBytesPerSecond",
+            4,
+            "<Min>1000000</Min><Max>124000000</Max>",
+            "RW",
+        ) + "<Enumeration Name='BandwidthControlMode'><EnumEntry Name='StreamBytesPerSecond'><Value>0</Value></EnumEntry><EnumEntry Name='SCPD'><Value>1</Value></EnumEntry><EnumEntry Name='Both'><Value>2</Value></EnumEntry><pValue>ModeReg</pValue></Enumeration><IntReg Name='ModeReg'><Address>8</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>";
+        let mut camera = camera(&features, &[(4, 124_000_000), (8, 1)]);
+        let tuned = apply(&mut camera, 40_000_000).unwrap();
+        assert_eq!(tuned.throughput_limit_bps, Some(40_000_000));
+        assert_eq!(
+            camera.get("BandwidthControlMode").unwrap(),
+            "StreamBytesPerSecond"
+        );
+    }
+
+    #[test]
+    fn frame_rate_fallback_enables_the_limiter_first_and_restores_it_on_failure() {
+        // A Blackfly S keeps AcquisitionFrameRate locked while its enable is off.
+        let features = int(
+            "AcquisitionFrameRate",
+            12,
+            "<Min>1</Min><Max>1000</Max><pIsLocked>RateLocked</pIsLocked>",
+            "RW",
+        ) + "<Boolean Name='AcquisitionFrameRateEnable'><pValue>EnableReg</pValue></Boolean><IntReg Name='EnableReg'><Address>16</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg><IntSwissKnife Name='RateLocked'><pVariable Name='E'>EnableReg</pVariable><Formula>E=0</Formula></IntSwissKnife>";
+        let mut limited = camera(&features, &[(12, 30)]);
+        let tuned = apply(&mut limited, 21_000_000).unwrap();
+        assert_eq!(limited.get("AcquisitionFrameRate").unwrap(), 20);
+        assert_eq!(limited.get("AcquisitionFrameRateEnable").unwrap(), true);
+        assert!(
+            tuned
+                .changes
+                .iter()
+                .any(|c| c.starts_with("Frame-rate limit"))
+        );
+
+        let mut failed = camera(&features, &[(12, 30)]);
+        apply(&mut failed, 500_000).unwrap();
+        assert_eq!(failed.get("AcquisitionFrameRate").unwrap(), 30);
+        assert_eq!(failed.get("AcquisitionFrameRateEnable").unwrap(), false);
+
+        // Without an enable, writing the rate may change nothing it limits.
+        let features = int(
+            "AcquisitionFrameRateAbs",
+            12,
+            "<Min>1</Min><Max>1000</Max>",
+            "RW",
+        );
+        let mut unlimited = camera(&features, &[(12, 30)]);
+        let tuned = apply(&mut unlimited, 21_000_000).unwrap();
+        assert_eq!(unlimited.get("AcquisitionFrameRateAbs").unwrap(), 30);
+        assert!(tuned.warnings.iter().any(|w| w.contains("no readable")));
     }
 
     #[test]

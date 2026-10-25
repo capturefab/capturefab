@@ -176,7 +176,7 @@ pub struct Caps {
     pub frame_rate_auto: Option<&'static str>,
     pub resulting_fps: Option<&'static str>,
     pub throughput: Option<&'static str>,
-    pub throughput_mode: Option<&'static str>,
+    pub throughput_mode: Option<[&'static str; 2]>,
     pub current_throughput: Option<&'static str>,
     pub gain_selector: Option<&'static str>,
     pub video_mode: bool,
@@ -793,11 +793,20 @@ impl AutoController {
                 &[["DeviceLinkThroughputLimit"], ["StreamBytesPerSecond"]],
             )
             .map(|[f]| f);
-        self.caps.throughput_mode = Some("DeviceLinkThroughputLimitMode").filter(|f| {
-            self.caps.throughput == Some("DeviceLinkThroughputLimit")
-                && camera.is_writable(f)
-                && has_choice(camera, f, "On")
-        });
+        // Allied Vision paces by StreamBytesPerSecond only in this mode or
+        // Both, and Vimba can leave a camera on SCPD.
+        self.caps.throughput_mode = match self.caps.throughput {
+            Some("DeviceLinkThroughputLimit") => Some(["DeviceLinkThroughputLimitMode", "On"]),
+            Some("StreamBytesPerSecond")
+                if !camera
+                    .get("BandwidthControlMode")
+                    .is_ok_and(|mode| mode == "Both") =>
+            {
+                Some(["BandwidthControlMode", "StreamBytesPerSecond"])
+            }
+            _ => None,
+        }
+        .filter(|[f, v]| camera.is_writable(f) && has_choice(camera, f, v));
         self.caps.current_throughput = [
             "BslDeviceLinkCurrentThroughput",
             "DeviceLinkCurrentThroughput",
@@ -1113,8 +1122,8 @@ impl AutoController {
         }
         let link = c.link.unwrap_or(125e6);
         let (feature, fps, limit, floor, cap, step) = if let Some(f) = c.throughput {
-            if let Some(mode) = c.throughput_mode {
-                self.apply(camera, mode, json!("On"), "throughput limit active");
+            if let Some([mode, on]) = c.throughput_mode {
+                self.apply(camera, mode, json!(on), "throughput limit active");
             }
             let Some(limit) = camera.get(f).ok().and_then(|v| v.as_f64()) else {
                 return;
@@ -2746,6 +2755,27 @@ mod tests {
             (fake.u32(208), fake.u32(ENABLE), fake.f64(RATE)),
             (2, 0, 1.0)
         );
+    }
+
+    #[test]
+    fn allied_vision_bandwidth_control_selects_stream_bytes_per_second() {
+        let mut fake = Fake::new(true);
+        fake.set_lost(0);
+        fake.xml = fake
+            .xml
+            .replace("DeviceLinkThroughputLimitMode", "BandwidthControlMode")
+            .replace("DeviceLinkThroughputLimit", "StreamBytesPerSecond")
+            .replace(
+                "<EnumEntry Name='On'><Value>0</Value></EnumEntry><pValue>BandwidthControlModeReg",
+                "<EnumEntry Name='StreamBytesPerSecond'><Value>0</Value></EnumEntry><EnumEntry Name='SCPD'><Value>1</Value></EnumEntry><pValue>BandwidthControlModeReg",
+            );
+        fake.set_u32(MODE, 1);
+        let mut camera = fake.camera();
+        let auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        assert_eq!(auto.caps.throughput, Some("StreamBytesPerSecond"));
+        assert_eq!(fake.u32(MODE), 0);
+        auto.release(&mut camera, true).unwrap();
+        assert_eq!(fake.u32(MODE), 1);
     }
 
     #[test]

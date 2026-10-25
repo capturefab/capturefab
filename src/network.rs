@@ -927,9 +927,16 @@ fn link_bytes_per_second(value: f64, unit: Option<&str>, default_multiplier: f64
     if !value.is_finite() || value <= 0.0 {
         return None;
     }
+    let bytes = value * bytes_per_second_scale(unit, default_multiplier)?;
+    (bytes.is_finite() && bytes > 0.0).then_some(bytes)
+}
+
+/// Bytes per second in one unit of a GenApi bandwidth `<Unit>`, or
+/// `default_multiplier` when the node declares none.
+pub(crate) fn bytes_per_second_scale(unit: Option<&str>, default_multiplier: f64) -> Option<f64> {
     // Unit case matters: B is byte, b is bit. An unfamiliar explicit unit
     // cannot safely be interpreted as the standard's default.
-    let multiplier = match unit.map(str::trim).unwrap_or("") {
+    Some(match unit.map(str::trim).unwrap_or("") {
         "" => default_multiplier,
         "Bps" | "B/s" | "byte/s" | "bytes/s" => 1.0,
         "bps" | "b/s" | "bit/s" | "bits/s" => 1.0 / 8.0,
@@ -940,9 +947,7 @@ fn link_bytes_per_second(value: f64, unit: Option<&str>, default_multiplier: f64
         "Gbps" | "Gb/s" | "Gbit/s" => 125_000_000.0,
         "GBps" | "GB/s" | "Gbyte/s" => 1_000_000_000.0,
         _ => return None,
-    };
-    let bytes = value * multiplier;
-    (bytes.is_finite() && bytes > 0.0).then_some(bytes)
+    })
 }
 
 /// Plain name for an adapter type, shared by the CLI and the desktop dialog.
