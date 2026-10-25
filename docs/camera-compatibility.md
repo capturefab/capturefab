@@ -130,7 +130,8 @@ raw and compressed inputs and selects the matching input format when the mode or
 frame rate changes; when both offer the same size, raw is chosen whenever it
 delivers the requested frame rate, and the fastest input when no rate is requested,
 such as MJPEG at HD sizes on USB 2.0 webcams.
-Unavailable cameras report permission, busy, or frame timeout diagnostics.
+Unavailable cameras report permission, busy, non-capture node, or frame timeout
+diagnostics.
 Discovered host and ONVIF devices can also be selected by their unique serial;
 Capturefab uses the discovered locator and the matching transport to open them.
 

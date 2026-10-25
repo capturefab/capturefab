@@ -2060,7 +2060,10 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
     {
         Some("camera is in use by another application".into())
     } else if log.contains("Not a video capture device.")
-        || log.contains("ioctl(VIDIOC_G_INPUT): Inappropriate ioctl for device")
+        // ENOTTY, as glibc and musl word it.
+        || ["Inappropriate ioctl for device", "Not a tty"]
+            .iter()
+            .any(|text| log.contains(&format!("ioctl(VIDIOC_G_INPUT): {text}")))
     {
         Some(format!(
             "video capture is not supported by {}, which may be a metadata, codec or ISP node; run capturefab native to list capture nodes",
@@ -7893,6 +7896,14 @@ Error opening input files: Input/output error
                     "[video4linux2,v4l2 @ 0x55d0c8a0c0] ioctl(VIDIOC_G_INPUT): Inappropriate ioctl for device\n",
                     "[in#0 @ 0x55d0c8a000] Error opening input: Inappropriate ioctl for device\n",
                     "Error opening input file /dev/video1.\n",
+                ),
+            ),
+            (
+                "/dev/video3",
+                concat!(
+                    "[video4linux2,v4l2 @ 0x7f3a1c4c40] ioctl(VIDIOC_G_INPUT): Not a tty\n",
+                    "[in#0 @ 0x7f3a1c4b80] Error opening input: Not a tty\n",
+                    "Error opening input file /dev/video3.\n",
                 ),
             ),
             (
