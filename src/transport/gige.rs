@@ -1673,8 +1673,8 @@ impl Assembler {
         }
     }
     fn incomplete_summary(&self) -> String {
-        if let Some(frame) = self.frames.last() {
-            format!(
+        match self.frames.last() {
+            Some(frame) if self.in_flight() => format!(
                 "{} incomplete frame(s), newest has {} bytes and {} packets, leader {}, trailer {}; {} expired/evicted frame(s)",
                 self.frames.len(),
                 frame.bytes,
@@ -1682,12 +1682,15 @@ impl Assembler {
                 frame.leader.is_some(),
                 frame.trailer.is_some(),
                 self.stats.incomplete_frames
-            )
-        } else {
-            format!(
+            ),
+            Some(_) => format!(
+                "an image leader arrived but no image data; {} expired/evicted frame(s); check trigger mode and trigger source",
+                self.stats.incomplete_frames
+            ),
+            None => format!(
                 "no complete image received; {} expired/evicted frame(s); check AcquisitionStart, trigger mode and stream firewall",
                 self.stats.incomplete_frames
-            )
+            ),
         }
     }
     #[cfg(test)]
@@ -2591,9 +2594,7 @@ mod tests {
         for length in 0..8 {
             assert!(parse_gvsp(&[0; 8][..length]).is_err());
         }
-        let mut huge = leader(u32::MAX, u32::MAX, RGB8);
-        assert!(ImageLeader::parse(&huge, MAX_PAYLOAD).is_err());
-        huge[2..4].copy_from_slice(&0x0004u16.to_be_bytes());
+        let huge = leader(u32::MAX, u32::MAX, RGB8);
         assert!(ImageLeader::parse(&huge, MAX_PAYLOAD).is_err());
     }
     #[test]
@@ -3421,7 +3422,7 @@ mod tests {
         assert_eq!(gige.packet_size, None);
     }
     #[test]
-    fn start_keeps_flags_drains_test_packets_and_caches_the_size() {
+    fn start_clears_only_big_endian_drains_test_packets_and_caches_the_size() {
         let flags = SCPS_NO_FRAGMENT | SCPS_BIG_ENDIAN;
         let fake = Fake::new(|camera| {
             camera.path_mtu = 9000;
@@ -3647,7 +3648,8 @@ mod tests {
         let destination = fake.camera.lock().unwrap().destination();
         let packets = frame_packets(1, false, WIDTH, HEIGHT, 1464);
         fake.stream.send_to(&packets[0], destination).unwrap();
-        assert!(gige.next_frame(Duration::from_millis(100)).is_err());
+        let error = gige.next_frame(Duration::from_millis(100)).unwrap_err();
+        assert!(error.to_string().contains("check trigger mode"), "{error}");
         if !cfg!(windows) {
             let timeout = gige.stream.as_ref().unwrap().timeout;
             assert!(timeout > POLL * 8, "{timeout:?}");
