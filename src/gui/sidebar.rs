@@ -7,6 +7,12 @@ use std::collections::HashSet;
 
 /// How many failed connect targets the picker remembers.
 const FAILURES_KEPT: usize = 8;
+
+/// The welcome footer's button that copies the udev rule a refused USB3
+/// camera needs, and what it explains.
+const USB_FIX: &str = "Copy USB access fix";
+const USB_FIX_TIP: &str = "Linux needs a udev rule to let Capturefab open this camera. Paste the copied command in a terminal (it uses sudo), unplug and replug the camera, then choose it again.";
+
 /// How long a newly found camera takes to grow onto the welcome screen.
 pub(super) const ARRIVE: Duration = Duration::from_millis(220);
 /// Between cameras found together, so they arrive one after another.
@@ -651,6 +657,18 @@ impl Workbench {
             .any(|(error, _)| crate::media::is_camera_access_denied(error))
     }
 
+    /// The fix the latest connect failure carries for a USB3 Vision camera
+    /// this user may not open (a Linux udev rule; see
+    /// `doctor::usb_access_error`), so the footer offers to copy it.
+    pub(super) fn usb_access_fix(&self) -> Option<&str> {
+        self.side
+            .connect_failures
+            .values()
+            .filter(|(error, _)| error.contains(crate::doctor::USB_ACCESS_DENIED))
+            .max_by_key(|(_, at)| *at)
+            .and_then(|(error, _)| crate::doctor::fix_line(error))
+    }
+
     /// Under the welcome screen's cards: the network check once GigE is in
     /// play, the address field and what it will try, and
     /// the window's settings.
@@ -832,6 +850,35 @@ impl Workbench {
                 .style(style::secondary)
                 .on_press(Message::OpenCameraPrivacy),
                 "Allow camera access for Capturefab in the system privacy settings, then choose the camera again",
+            ));
+        }
+        // A USB3 camera Linux refused: its udev rule, to copy and run in a
+        // terminal. It uses sudo, so it is never run from here.
+        if let Some(fix) = self.usb_access_fix() {
+            let copied = self.just_copied(fix);
+            network = network.push(tip(
+                button(
+                    row![
+                        if copied {
+                            icon(Icon::Check, 14.0, p.ink(p.live))
+                        } else {
+                            icon(Icon::Lock, 14.0, p.secondary)
+                        },
+                        text(if copied {
+                            "Copied: run it, then replug"
+                        } else {
+                            USB_FIX
+                        })
+                        .size(style::SMALL),
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+                )
+                .name(USB_FIX)
+                .padding([7, 10])
+                .style(style::secondary)
+                .on_press(Message::Copy(fix.to_owned())),
+                USB_FIX_TIP,
             ));
         }
         if self.network_check_relevant() {
@@ -1589,7 +1636,9 @@ mod tests {
             "{}: allow this app in System Settings > Privacy & Security > Camera",
             crate::media::CAMERA_ACCESS_DENIED
         );
-        bench.side.connect_failed("avfoundation:0", denied, bench.now);
+        bench
+            .side
+            .connect_failed("avfoundation:0", denied, bench.now);
         assert!(bench.camera_permission_relevant());
         let buttons = footer_buttons(&bench);
         let offered = buttons.iter().find(|(name, _)| name == label);
@@ -1604,6 +1653,40 @@ mod tests {
         // Connecting again retires the failure, and the button with it.
         bench.side.connect_failures.remove("avfoundation:0");
         assert!(!has(&footer_buttons(&bench), label));
+    }
+
+    /// A USB3 camera Linux refused brings its udev rule to copy, exactly
+    /// as `doctor` would print it; other failures bring none.
+    #[test]
+    fn a_refused_usb_camera_offers_its_fix_to_copy() {
+        let mut bench = bench();
+        bench
+            .side
+            .connect_failed("usb:2676:ba02:1", "camera busy".into(), bench.now);
+        assert!(bench.usb_access_fix().is_none());
+        assert!(!has(&footer_buttons(&bench), USB_FIX));
+        let error = crate::doctor::usb_access_error(
+            "acA1920-155um",
+            std::path::Path::new("/dev/bus/usb/002/003"),
+            "2676",
+        );
+        bench
+            .side
+            .connect_failed("usb:2676:ba02:2", format!("connect: {error:#}"), bench.now);
+        let fix = crate::doctor::usb_access_fix(&["2676"]);
+        assert_eq!(bench.usb_access_fix(), Some(fix.as_str()));
+        let buttons = footer_buttons(&bench);
+        let offered = buttons.iter().find(|(name, _)| name == USB_FIX);
+        assert!(
+            matches!(&offered.expect("the copy button").1, Some(Message::Copy(copied)) if *copied == fix),
+            "{buttons:?}"
+        );
+        // Copying confirms in place; it never runs the command.
+        let _ = bench.handle_message(Message::Copy(fix.clone()));
+        assert!(bench.just_copied(&fix));
+        assert!(has(&footer_buttons(&bench), USB_FIX), "the name stays");
+        bench.side.connect_failures.remove("usb:2676:ba02:2");
+        assert!(!has(&footer_buttons(&bench), USB_FIX));
     }
 
     #[test]

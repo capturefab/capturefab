@@ -167,17 +167,18 @@ enum Found {
 /// `Found::Mixed`: screens and webcams sort first by ID, as on a Mac.
 fn mixed_devices() -> Vec<crate::types::CameraInfo> {
     use crate::types::{CameraInfo, Transport};
-    let device = |id: &str, transport: Transport, vendor: &str, model: &str, address: Option<&str>| {
-        CameraInfo {
-            id: id.into(),
-            transport,
-            vendor: vendor.into(),
-            model: model.into(),
-            serial: id.rsplit(':').next().unwrap_or(id).into(),
-            address: address.map(str::to_owned),
-            profile: Default::default(),
-        }
-    };
+    let device =
+        |id: &str, transport: Transport, vendor: &str, model: &str, address: Option<&str>| {
+            CameraInfo {
+                id: id.into(),
+                transport,
+                vendor: vendor.into(),
+                model: model.into(),
+                serial: id.rsplit(':').next().unwrap_or(id).into(),
+                address: address.map(str::to_owned),
+                profile: Default::default(),
+            }
+        };
     let host = |id: &str, model: &str| device(id, Transport::Media, "macos", model, Some(id));
     vec![
         host("avfoundation:Capture screen 0", "Capture screen 0"),
@@ -190,8 +191,20 @@ fn mixed_devices() -> Vec<crate::types::CameraInfo> {
             "Area camera (display fixture)",
             Some("192.168.10.21"),
         ),
-        device("scanner:flatbed", Transport::Scanner, "Example Imaging", "Flatbed", None),
-        device("usb:EX0042", Transport::Usb3, "Example Vision", "USB3 camera (display fixture)", None),
+        device(
+            "scanner:flatbed",
+            Transport::Scanner,
+            "Example Imaging",
+            "Flatbed",
+            None,
+        ),
+        device(
+            "usb:EX0042",
+            Transport::Usb3,
+            "Example Vision",
+            "USB3 camera (display fixture)",
+            None,
+        ),
     ]
 }
 
@@ -313,7 +326,9 @@ impl Workbench {
     ///   `sheet-bottom` and `inspector-bottom` expose their lower content
     /// - welcome: `side-one` (with `welcome`: discovery finds one simulated
     ///   camera), `side-mixed` (finds more cameras than fit, of every kind),
-    ///   `camera-denied` (the system refused a webcam)
+    ///   `camera-denied` (the system refused a webcam), `usb-denied` (with
+    ///   `side-mixed`: Linux refused the USB3 camera, whose udev rule the
+    ///   footer offers to copy)
     /// - first frame: `no-first-frame` (the selected camera streams, but its
     ///   first frame is late), `side-gige` (it reads as GigE Vision)
     /// - failures: `write-error` (setting the selected camera's exposure
@@ -343,6 +358,20 @@ impl Workbench {
                         Err(anyhow::anyhow!(
                             "{}: allow this app in System Settings > Privacy & Security > Camera",
                             crate::media::CAMERA_ACCESS_DENIED
+                        )),
+                    );
+                }
+                "usb-denied" => {
+                    // As connecting to a USB3 camera Linux refused would.
+                    self.scene_settle(
+                        Pending {
+                            target: Some("usb:EX0042".into()),
+                            ..Pending::unanswered(Job::Connect)
+                        },
+                        Err(crate::doctor::usb_access_error(
+                            "USB3 camera (display fixture)",
+                            std::path::Path::new("/dev/bus/usb/002/003"),
+                            "2676",
                         )),
                     );
                 }

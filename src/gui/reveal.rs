@@ -90,3 +90,30 @@ pub(super) fn open_camera_privacy() -> io::Result<()> {
         Ok(())
     }
 }
+
+/// Open `url`, an `https://` address, in the default browser. Like
+/// `reveal`, the child runs without a shell and is reaped on a detached
+/// thread.
+pub(super) fn open_url(url: &str) -> io::Result<()> {
+    if !url.starts_with("https://") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only https:// addresses open in the browser",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    // Explorer hands a URL to the default browser.
+    #[cfg(windows)]
+    let mut command = Command::new("explorer.exe");
+    #[cfg(not(any(target_os = "macos", windows)))]
+    let mut command = Command::new("xdg-open");
+    let mut child = command
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}

@@ -655,6 +655,8 @@ enum Message {
     /// refused access.
     OpenCameraPrivacy,
     EnterAddress,
+    /// The quick guide's last step: the Capture panel's frame count.
+    SetFrameCount,
     CameraRow(String),
     Forget(String),
     Disconnect(String),
@@ -899,6 +901,9 @@ struct Workbench {
     copied: Option<(String, Instant)>,
     /// The last capture that saved files.
     last_saved: Option<Saved>,
+    /// A capture here saved several files, or a scheduled capture saved
+    /// one, this session: the quick guide's last step is done.
+    captured_series: bool,
     /// The file the last recording started here writes, and its camera.
     last_recording: Option<(Option<String>, String)>,
     /// Start the live view when a camera connects.
@@ -1091,6 +1096,7 @@ impl Workbench {
             notice_shown: Motion::new(0.0, motion::NOTICE_IN, motion::NOTICE_OUT, Kind::Fade),
             copied: None,
             last_saved: None,
+            captured_series: false,
             last_recording: None,
             auto_start: false,
             tags: Default::default(),
@@ -1717,10 +1723,9 @@ impl Workbench {
             self.batch_result(&pending.job, result)
         } else if pending.background {
             // A quiet round speaks only when what discovery reports changed.
-            (self.side.discovery_issues != issues_before
-                && !self.side.discovery_issues.is_empty())
-            .then(|| command_notice(&pending.job, result))
-            .flatten()
+            (self.side.discovery_issues != issues_before && !self.side.discovery_issues.is_empty())
+                .then(|| command_notice(&pending.job, result))
+                .flatten()
         } else {
             command_notice(&pending.job, result)
         };
@@ -1748,6 +1753,7 @@ impl Workbench {
         if pending.job == Job::Capture {
             self.shutter.replay(1.0, 0.0, self.now);
             if let Some(saved) = Saved::from_result(pending.camera.clone(), result, self.now) {
+                self.captured_series |= saved.count > 1;
                 self.last_saved = Some(saved);
             }
         }
@@ -3110,6 +3116,7 @@ impl Workbench {
                 self.connect(self.free_simulator());
             }
             Message::EnterAddress => return self.enter_address(),
+            Message::SetFrameCount => return self.set_frame_count(),
             Message::ShowAllCameras => self.side.welcome_all = true,
             Message::OpenCameraPrivacy => {
                 if let Err(error) = reveal::open_camera_privacy() {

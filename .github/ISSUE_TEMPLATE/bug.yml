@@ -1,0 +1,64 @@
+name: Report a problem
+description: Something in Capturefab did not work as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Everything you add here is public: remove passwords, tokens, camera addresses with credentials and private file paths before you submit.
+  - type: input
+    id: version
+    attributes:
+      label: Capturefab version
+      description: Help > Report a Problem fills this in. Otherwise run `capturefab --version`.
+      placeholder: "0.4.0"
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and architecture
+      placeholder: "macos aarch64, linux x86_64, windows x86_64"
+    validations:
+      required: true
+  - type: dropdown
+    id: source
+    attributes:
+      label: Camera or source type
+      options:
+        - GigE Vision
+        - USB3 Vision
+        - Webcam
+        - RTSP, SRT or other stream
+        - ONVIF
+        - Hub (Home Assistant, Frigate, go2rtc, UniFi Protect)
+        - Video file or folder
+        - Document scanner
+        - Simulator
+        - Other or not camera-related
+    validations:
+      required: true
+  - type: input
+    id: camera
+    attributes:
+      label: Camera model
+      description: Vendor and model, if a camera is involved.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead. Include the exact command if you used the CLI.
+    validations:
+      required: true
+  - type: textarea
+    id: activity
+    attributes:
+      label: Activity error
+      description: In the app, Activity shows connection and capture errors; Copy log copies them. Review the text before you paste it.
+      render: text
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Doctor output
+      description: The output of `capturefab doctor`. It lists local folders; review it before you paste it.
+      render: text

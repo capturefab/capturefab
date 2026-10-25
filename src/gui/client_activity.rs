@@ -355,6 +355,7 @@ impl Workbench {
                 && let Some(saved) = &mut self.last_saved
             {
                 saved.count = entry.file_count;
+                self.captured_series |= saved.count > 1;
             }
         }
         let level = if effective_state(entry) == ActivityState::Failed {
@@ -416,6 +417,8 @@ impl Workbench {
             .retain(|key, _| kept.contains(key));
         if let Some(saved) = saved {
             self.shutter.replay(1.0, 0.0, self.now);
+            // A schedule ran: the guide's series step is done.
+            self.captured_series = true;
             self.last_saved = Some(saved);
         }
     }

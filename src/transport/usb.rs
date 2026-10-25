@@ -24,6 +24,28 @@ const PENDING_ACK: u16 = 0x0805;
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const SIRM_CONTROL: u64 = 0x04;
 
+/// `doctor::usb_access_error` for `device` if this user may not read and
+/// write its usbfs node; other failures keep their own message.
+#[cfg(target_os = "linux")]
+fn denied(device: &DeviceInfo) -> Option<anyhow::Error> {
+    let node = std::path::PathBuf::from(format!(
+        "/dev/bus/usb/{:03}/{:03}",
+        device.busnum(),
+        device.device_address()
+    ));
+    crate::doctor::usb_access_denied(&node).then(|| {
+        crate::doctor::usb_access_error(
+            device.product_string().unwrap_or("USB3 Vision camera"),
+            &node,
+            &format!("{:04x}", device.vendor_id()),
+        )
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn denied(_: &DeviceInfo) -> Option<anyhow::Error> {
+    None
+}
+
 fn is_u3v_interface(class: u8, subclass: u8, protocol: u8) -> bool {
     class == 0xef && subclass == 0x05 && protocol == 0
 }
@@ -94,10 +116,15 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         .wait()?
         .find(|d| camera_info(d).id == info.id)
         .context("USB3 Vision camera disconnected or its USB address changed; discover again")?;
-    let device = device_info
-        .open()
-        .wait()
-        .context("cannot open USB camera; check OS USB permissions and driver binding")?;
+    let device = match device_info.open().wait() {
+        Ok(device) => device,
+        Err(error) => {
+            return Err(denied(&device_info).unwrap_or_else(|| {
+                anyhow::Error::from(error)
+                    .context("cannot open USB camera; check OS USB permissions and driver binding")
+            }));
+        }
+    };
     let config = device
         .active_configuration()
         .context("USB camera has no active configuration")?;
@@ -131,7 +158,14 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     }
     let control = control.context("USB3 Vision control bulk endpoints not found")?;
     let data = data.context("USB3 Vision stream bulk endpoint not found")?;
-    let control_interface = device.claim_interface(control.number).wait().context("cannot claim camera control interface; close other camera software and check USB permissions/driver")?;
+    let control_interface = match device.claim_interface(control.number).wait() {
+        Ok(interface) => interface,
+        Err(error) => {
+            return Err(denied(&device_info).unwrap_or_else(|| {
+                anyhow::Error::from(error).context("cannot claim camera control interface; close other camera software and check USB permissions/driver")
+            }));
+        }
+    };
     if control.alternate != 0 {
         control_interface
             .set_alt_setting(control.alternate)

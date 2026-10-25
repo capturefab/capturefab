@@ -279,6 +279,7 @@ pub(super) fn group_barrier(message: &Message) -> bool {
         | Message::Set(_, _)
         | Message::Execute(_)
         | Message::EnterAddress
+        | Message::SetFrameCount
         | Message::ConnectAddress
         | Message::CameraRow(_)
         | Message::Select(_)

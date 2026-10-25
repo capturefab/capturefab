@@ -72,9 +72,9 @@ fn first_frame_hint(transport: crate::types::Transport) -> Option<&'static str> 
         Transport::GigE => Some(
             "Frames may be blocked. Check that the firewall allows Capturefab, that the camera is on this computer's subnet, or try a smaller packet size.",
         ),
-        Transport::Usb3 => Some(
-            "Check the cable and USB3 port, and that the system allows access to the camera.",
-        ),
+        Transport::Usb3 => {
+            Some("Check the cable and USB3 port, and that the system allows access to the camera.")
+        }
         Transport::Media => Some(
             "Check the address and credentials, and for webcams the system's camera permission.",
         ),
@@ -1251,8 +1251,10 @@ mod tests {
         let size = Size::new(900.0, 620.0 - BAR - TOOLBAR);
         let shown = controls(app.welcome(Palette::of(false)), size);
         assert!(
-            shown.iter().any(|(label, role, _)| label == "Show all 6 cameras"
-                && *role == accessibility::Role::Button),
+            shown
+                .iter()
+                .any(|(label, role, _)| label == "Show all 6 cameras"
+                    && *role == accessibility::Role::Button),
             "{shown:?}"
         );
         let _ = app.handle_message(Message::ShowAllCameras);
@@ -1265,7 +1267,11 @@ mod tests {
         );
         assert_eq!(choices.found[4].id, "avfoundation:Capture screen 0");
         let shown = controls(app.welcome(Palette::of(false)), size);
-        assert!(!shown.iter().any(|(label, _, _)| label.starts_with("Show all")));
+        assert!(
+            !shown
+                .iter()
+                .any(|(label, _, _)| label.starts_with("Show all"))
+        );
         // Leaving the welcome screen folds the list again.
         app.snapshot.connected = Some(crate::transport::simulator::info());
         app.tick_side();
@@ -1277,7 +1283,11 @@ mod tests {
         assert_eq!(app.welcome_choices().hidden, 0);
         app.welcome.set(1.0);
         let shown = controls(app.welcome(Palette::of(false)), size);
-        assert!(!shown.iter().any(|(label, _, _)| label.starts_with("Show all")));
+        assert!(
+            !shown
+                .iter()
+                .any(|(label, _, _)| label.starts_with("Show all"))
+        );
     }
 
     /// The camera path leads: the assistant and agent entry points sit
@@ -1386,7 +1396,10 @@ mod tests {
         let mut app = bench();
         app.pending.clear();
         let id = streaming(&mut app, Transport::GigE);
-        app.liveness.get_mut(&id).unwrap().pace_triggered_for_tests();
+        app.liveness
+            .get_mut(&id)
+            .unwrap()
+            .pace_triggered_for_tests();
         app.now += Duration::from_secs(60);
         let shown = controls(app.ready(Palette::of(false)), size);
         assert!(!shown.iter().any(|(label, _, _)| label == "No picture yet"));
