@@ -70,15 +70,7 @@ impl Workbench {
         let mut date_ids = self.client_activity.date_ids.borrow_mut();
         date_ids.retain(|id, _| current.contains(id));
         let mut previous_day = None;
-        let activity = &self.snapshot.activity;
-        // Discoveries repeated back to back, as the welcome screen's quiet
-        // rediscovery makes them, read as their newest.
-        let shown = activity.iter().enumerate().filter(|(index, entry)| {
-            !activity
-                .get(index + 1)
-                .is_some_and(|next| repeats_discovery(entry, next))
-        });
-        iced::widget::keyed_column(shown.map(|(_, entry)| {
+        iced::widget::keyed_column(self.snapshot.activity.iter().map(|entry| {
             let row_id = *row_ids
                 .entry(entry.id)
                 .or_insert_with(accessibility::new_node_id);
@@ -613,18 +605,6 @@ pub(super) fn activity_time(entry: &SessionActivity) -> String {
     time_format::activity(entry).compact
 }
 
-/// Whether `next` is the same finished discovery as `entry` again: by the
-/// same participant, with the same outcome and warnings.
-fn repeats_discovery(entry: &SessionActivity, next: &SessionActivity) -> bool {
-    entry.operation == "discover"
-        && next.operation == "discover"
-        && !entry.state.active()
-        && entry.state == next.state
-        && entry.actor.id == next.actor.id
-        && entry.label == next.label
-        && entry.detail == next.detail
-}
-
 fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
     match job {
         Job::Discover => entry.operation == "discover",
@@ -726,31 +706,6 @@ mod tests {
             job: None,
         }
     }
-    #[test]
-    fn repeated_discoveries_read_as_their_newest() {
-        let discover = |id: u64, detail: Option<&str>| SessionActivity {
-            operation: "discover".into(),
-            camera: None,
-            label: "Discover cameras".into(),
-            detail: detail.map(str::to_owned),
-            file_count: 0,
-            files: Vec::new(),
-            ..entry(id, ActivityState::Succeeded)
-        };
-        let first = discover(1, None);
-        assert!(repeats_discovery(&first, &discover(2, None)));
-        assert!(
-            !repeats_discovery(&first, &discover(2, Some("USB discovery: denied"))),
-            "new warnings show"
-        );
-        let mut running = discover(2, None);
-        running.state = ActivityState::Running;
-        assert!(!repeats_discovery(&first, &running));
-        let mut capture = entry(2, ActivityState::Succeeded);
-        capture.detail = None;
-        assert!(!repeats_discovery(&first, &capture));
-    }
-
     #[test]
     fn activity_rows_read_plainly_and_name_who_only_when_it_matters() {
         let human = |id: &str, name: &str| {

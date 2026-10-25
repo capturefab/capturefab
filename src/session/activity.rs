@@ -433,6 +433,7 @@ impl CommandActivity {
                 }
             }
         }
+        coalesce_discovery(&mut entries.entries, self.id);
         trim(&mut entries.entries);
         self.activity.notify(&mut entries);
         self.finished = true;
@@ -443,6 +444,29 @@ impl Drop for CommandActivity {
         if !self.finished {
             self.finish(&Err(anyhow::anyhow!("command stopped before completion")));
         }
+    }
+}
+/// A discovery that finished just as the one before it did, by the same
+/// participant with the same outcome and warnings, replaces it, so repeated
+/// rounds such as the desktop's quiet rediscovery do not push older work
+/// out of the bounded history.
+fn coalesce_discovery(entries: &mut VecDeque<SessionActivity>, id: u64) {
+    let Some(index) = entries.iter().position(|entry| entry.id == id) else {
+        return;
+    };
+    let Some(previous) = index.checked_sub(1) else {
+        return;
+    };
+    let (entry, before) = (&entries[index], &entries[previous]);
+    if entry.operation == "discover"
+        && before.operation == "discover"
+        && !before.state.active()
+        && before.state == entry.state
+        && before.actor == entry.actor
+        && before.label == entry.label
+        && before.detail == entry.detail
+    {
+        entries.remove(previous);
     }
 }
 fn trim(entries: &mut VecDeque<SessionActivity>) {
@@ -938,6 +962,49 @@ mod tests {
                 .begin(ActivityOrigin::Client, None, &SessionCommand::Status)
                 .is_none()
         );
+    }
+    #[test]
+    fn repeated_identical_discoveries_leave_one_entry() {
+        let activity = Arc::new(Activity::default());
+        let discover = SessionCommand::Discover {
+            timeout_ms: 700,
+            simulated: false,
+        };
+        let found = json!({"devices": [], "warnings": []});
+        let run = |result: Result<Value>| {
+            let mut command = activity
+                .begin(ActivityOrigin::Gui, None, &discover)
+                .unwrap();
+            command.running();
+            command.finish(&result);
+        };
+        for _ in 0..5 {
+            run(Ok(found.clone()));
+        }
+        let entries = activity.snapshot().activity;
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].id, 5, "the newest stays");
+
+        // A different outcome, another participant or other work between
+        // two discoveries is kept.
+        run(Err(anyhow::anyhow!("USB discovery: denied")));
+        activity
+            .begin(ActivityOrigin::Client, None, &discover)
+            .unwrap()
+            .finish(&Ok(found.clone()));
+        activity
+            .begin(ActivityOrigin::Gui, None, &SessionCommand::Start)
+            .unwrap()
+            .finish(&Ok(json!({})));
+        run(Ok(found.clone()));
+        run(Ok(found));
+        let operations: Vec<_> = activity
+            .snapshot()
+            .activity
+            .iter()
+            .map(|entry| (entry.operation.clone(), entry.state))
+            .collect();
+        assert_eq!(operations.len(), 5, "{operations:?}");
     }
     #[test]
     fn abandoned_commands_fail_and_history_never_prunes_active_work() {

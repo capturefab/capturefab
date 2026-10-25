@@ -180,10 +180,7 @@ mod tests {
         let pending = bench.pending.remove(index);
         let devices: Vec<CameraInfo> = devices.iter().map(|id| device(id)).collect();
         bench.snapshot.devices = devices.clone();
-        bench.settle(
-            &pending,
-            &Ok(json!({"devices": devices, "warnings": []})),
-        );
+        bench.settle(&pending, &Ok(json!({"devices": devices, "warnings": []})));
         bench.tick_side();
     }
 
@@ -265,6 +262,42 @@ mod tests {
         assert!(bench.discovering_aloud());
         answer(&mut bench, &["sim:0", "sim:1"]);
         assert!(bench.notice.is_some(), "a search asked for reports");
+    }
+
+    #[test]
+    fn a_quiet_round_keeps_the_idle_tick() {
+        let mut bench = started(&["sim:0"]);
+        let idle = bench.tick_interval();
+        bench.now += QUICK;
+        bench.tick_rediscover();
+        assert_eq!(quiet_rounds(&bench), 1);
+        // The session lists the round's own discovery as running.
+        bench.snapshot.activity = vec![crate::session::SessionActivity {
+            id: 1,
+            origin: crate::session::ActivityOrigin::Gui,
+            actor: bench.actor.clone(),
+            operation: "discover".into(),
+            camera: None,
+            feature: None,
+            label: "Discover cameras".into(),
+            state: crate::session::ActivityState::Running,
+            submitted_at_ms: 0,
+            started_at_ms: Some(0),
+            finished_at_ms: None,
+            detail: None,
+            file_count: 0,
+            files: Vec::new(),
+            job: None,
+        }];
+        assert_eq!(
+            bench.tick_interval(),
+            idle,
+            "no fast tick for a quiet round"
+        );
+
+        // Asked for aloud, the same round ticks fast for its spinner.
+        let _ = bench.handle_message(Message::Discover);
+        assert!(bench.tick_interval() < idle);
     }
 
     #[test]

@@ -17,6 +17,9 @@ const ANCHORED: f32 = 400.0;
 const RISE: f32 = 24.0;
 /// How many cameras the welcome screen lists before "Show all".
 const SLOTS: usize = 4;
+/// Cards in a short window with cameras found, so the footer's assistant,
+/// agent, Settings and Help stay in view.
+const COMPACT_SLOTS: usize = 3;
 /// Height of the "Show all" row under the cards: its padding and one line.
 const MORE: f32 = 4.0 + style::line_height(style::SMALL) + 4.0;
 /// Room under a streaming camera's title for what to check when its first
@@ -70,7 +73,7 @@ fn first_frame_hint(transport: crate::types::Transport) -> Option<&'static str> 
     use crate::types::Transport;
     match transport {
         Transport::GigE => Some(
-            "Frames may be blocked. Check that the firewall allows Capturefab, that the camera is on this computer's subnet, or try a smaller packet size.",
+            "Frames may be blocked. Check that the firewall allows Capturefab and that the camera is on this computer's subnet, or use Check network to tune the packet size.",
         ),
         Transport::Usb3 => {
             Some("Check the cable and USB3 port, and that the system allows access to the camera.")
@@ -219,7 +222,7 @@ impl Workbench {
             button(text(label).size(style::BODY))
                 .name(label)
                 .padding([7, 12])
-                .style(style::on_glass(false, 1.0))
+                .style(style::on_stage)
                 .on_press_maybe(on)
         };
         let mut actions = row![].spacing(10).align_y(Alignment::Center);
@@ -231,7 +234,7 @@ impl Workbench {
         }
         actions = actions
             .push(action("Activity", Some(Message::CameraActivity(id))))
-            .push(action("Stop stream", Some(Message::ToggleStream)));
+            .push(action("Stop", Some(Message::ToggleStream)));
         guidance.push(actions).max_width(440).into()
     }
 
@@ -267,10 +270,16 @@ impl Workbench {
         self.welcome_content_for(p, false)
     }
 
-    /// What the welcome screen offers: the cameras connected, found and
-    /// recent ones it lists as cards, whether it says it is searching, and
-    /// how many found it has no room for.
+    /// `welcome_choices_for` a window with room for every slot.
+    #[cfg(test)]
     pub(super) fn welcome_choices(&self) -> Choices<'_> {
+        self.welcome_choices_for(SLOTS)
+    }
+
+    /// What the welcome screen offers with room for `slots` cards: the
+    /// cameras connected, found and recent ones it lists as cards, whether
+    /// it says it is searching, and how many found it has no room for.
+    fn welcome_choices_for(&self, slots: usize) -> Choices<'_> {
         let connected = self.snapshot.cameras.iter().map(|camera| &camera.info);
         let mut discovered: Vec<&CameraInfo> = self
             .listed_devices()
@@ -282,7 +291,7 @@ impl Workbench {
         let shown = if self.side.welcome_all {
             total
         } else {
-            total.min(SLOTS)
+            total.min(slots)
         };
         let found: Vec<&CameraInfo> = connected.clone().chain(discovered).take(shown).collect();
         let recent: Vec<&Recent> = self
@@ -300,7 +309,7 @@ impl Workbench {
             })
             // With nothing found, the searching or not-found slot holds the
             // first card's place, so there are never more than four slots.
-            .take(SLOTS.saturating_sub(found.len().max(1)))
+            .take(slots.saturating_sub(found.len().max(1)))
             .collect();
         // A quick search keeps what the screen said; its button spins.
         let searching = self.discovering_aloud() && self.searching_shown();
@@ -333,7 +342,7 @@ impl Workbench {
             recent,
             searching: searching_shown,
             hidden,
-        } = self.welcome_choices();
+        } = self.welcome_choices_for(if compact { COMPACT_SLOTS } else { SLOTS });
         // The next step, not the state: the cards, the simulator and the
         // address field below carry the actions.
         let subtitle = if !found.is_empty() {
@@ -533,7 +542,10 @@ impl Workbench {
             })
             .on_press_maybe((!busy).then_some(on))
         };
-        let simulator = welcome_simulator_for(&found, &recent, searching_shown);
+        // A short window offers the simulator only as the way in, not
+        // beside cameras already found, so the footer stays in view.
+        let simulator = welcome_simulator_for(&found, &recent, searching_shown)
+            .filter(|primary| *primary || !compact);
         // Search sits beside the address field. The simulator keeps its own
         // slot, so it can come and go (once a simulated camera is listed)
         // without resetting the field; it is the primary action only on an
@@ -740,8 +752,8 @@ mod tests {
     use super::*;
     use crate::types::Transport;
 
-    /// The scene lists simulated cameras as cards, so the simulator is not
-    /// offered again; the quieter links stay in view.
+    /// Whether simulated cameras or a full screen of real ones are listed,
+    /// the simulator is not offered again and the footer stays in view.
     #[test]
     fn compact_welcome_keeps_onboarding_actions_visible_and_lower_content_scrollable() {
         use crate::gui::destinations::layout_tests::{
@@ -749,10 +761,13 @@ mod tests {
         };
         use iced::advanced::{Layout, layout, widget::Tree, widget::operation};
         let mut renderer = renderer();
-        for scale in prefs::UiScale::ALL {
+        for (fixture, scale) in ["side-recent", "side-mixed"]
+            .into_iter()
+            .flat_map(|fixture| prefs::UiScale::ALL.map(|scale| (fixture, scale)))
+        {
             let mut app = bench();
             app.ui_scale = scale;
-            app.apply_scene(&["welcome", "side-recent"]);
+            app.apply_scene(&["welcome", fixture]);
             app.scene.patch(&mut app.snapshot);
             app.tick_side();
             app.now += Duration::from_secs(3);
@@ -780,12 +795,14 @@ mod tests {
                     .nodes
                     .iter()
                     .any(|(_, control)| control.label() == Some("Try a simulated camera")),
-                "simulated cameras are listed, so the simulator is not offered at {scale}"
+                "cameras are listed, so the simulator is not offered: {fixture} at {scale}"
             );
             for label in [
                 Action::Discover.hint(DISCOVERS, Os::CURRENT),
                 "Ask the assistant".into(),
                 "Connect an agent".into(),
+                "Settings".into(),
+                "Keyboard shortcuts and quick guide".into(),
             ] {
                 let action = snapshot
                     .nodes
@@ -794,7 +811,9 @@ mod tests {
                         control.role() == accessibility::Role::Button
                             && control.label() == Some(label.as_str())
                     })
-                    .unwrap_or_else(|| panic!("{label} is visible in compact welcome at {scale}"));
+                    .unwrap_or_else(|| {
+                        panic!("{label} is visible in compact welcome: {fixture} at {scale}")
+                    });
                 // Larger interface sizes scroll to them; see below.
                 if scale != prefs::UiScale::Standard {
                     continue;
@@ -806,11 +825,11 @@ mod tests {
                         && bounds.y0 >= 0.0
                         && bounds.x1 <= f64::from(size.width) + 0.5
                         && bounds.y1 <= f64::from(size.height) + 0.5,
-                    "{label} fits at {scale}: {bounds:?}, viewport {size:?}"
+                    "{label} fits: {fixture} at {scale}: {bounds:?}, viewport {size:?}"
                 );
             }
             render_artifact_scaled(
-                &format!("welcome-onboarding-{scale}"),
+                &format!("welcome-onboarding-{fixture}-{scale}"),
                 &view,
                 &tree,
                 &node,
@@ -962,7 +981,7 @@ mod tests {
                     "No picture yet",
                     "Check network",
                     "Activity",
-                    "Stop stream",
+                    "Stop",
                     first_frame_hint(Transport::GigE).unwrap(),
                 ] {
                     let bounds = shown
@@ -1277,16 +1296,25 @@ mod tests {
         app.tick_side();
         assert!(!app.side.welcome_all);
 
-        // Four or fewer need no link.
+        // Four or fewer need no link in a window with room for four; a
+        // short one lists three, so its footer stays in view.
         let mut app = bench();
         app.snapshot.devices = mixed()[..4].to_vec();
         assert_eq!(app.welcome_choices().hidden, 0);
         app.welcome.set(1.0);
-        let shown = controls(app.welcome(Palette::of(false)), size);
+        let tall = Size::new(900.0, 900.0 - BAR - TOOLBAR);
+        let shown = controls(app.welcome(Palette::of(false)), tall);
         assert!(
             !shown
                 .iter()
                 .any(|(label, _, _)| label.starts_with("Show all"))
+        );
+        let shown = controls(app.welcome(Palette::of(false)), size);
+        assert!(
+            shown
+                .iter()
+                .any(|(label, _, _)| label == "Show all 4 cameras"),
+            "{shown:?}"
         );
     }
 
@@ -1375,12 +1403,12 @@ mod tests {
             };
             let before = labels(&app);
             assert!(before.iter().any(|l| l == "Waiting for the first frame…"));
-            assert!(!before.iter().any(|l| l == "Stop stream"), "{before:?}");
+            assert!(!before.iter().any(|l| l == "Stop"), "{before:?}");
             app.now += Duration::from_secs(6);
             assert!(app.stalled(&id).is_some(), "{transport}");
             let after = labels(&app);
             assert!(after.iter().any(|l| l == "No picture yet"), "{after:?}");
-            assert!(after.iter().any(|l| l == "Stop stream"));
+            assert!(after.iter().any(|l| l == "Stop"));
             assert!(after.iter().any(|l| l == "Activity"));
             assert_eq!(
                 after.iter().any(|l| l == "Check network"),

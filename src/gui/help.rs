@@ -674,12 +674,23 @@ fn connection_notes<'a>(hub_copied: bool, p: &'static Palette) -> Element<'a, Me
         ),
         note(
             "Hubs",
-            "Save a Home Assistant, Frigate, go2rtc or UniFi Protect server once in a terminal (or add-frigate, add-go2rtc, add-unifi-protect; see capturefab hub --help). Its cameras then appear with the others.",
+            "Save a Home Assistant server once in a terminal; its cameras then appear with the others.",
             Some("hub:NAME/CAMERA")
         ),
         row![
             space().width(100),
-            container(code_block(HUB_COMMAND.into(), hub_copied, p)).width(Fill),
+            column![
+                container(code_block(HUB_COMMAND.into(), hub_copied, p)).width(Fill),
+                text(
+                    "For Frigate, go2rtc or UniFi Protect, use add-frigate, add-go2rtc or add-unifi-protect (see capturefab hub --help)."
+                )
+                .size(style::SMALL)
+                .color(p.secondary)
+                .width(Fill)
+                .wrapping(text::Wrapping::WordOrGlyph),
+            ]
+            .spacing(4)
+            .width(Fill),
         ],
         note("GigE", "Use an address on the camera's subnet.", None).push(tip(
             step_button("Check network", None, "Check network", Some(Message::ScanNetwork), p),

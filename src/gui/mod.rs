@@ -1395,8 +1395,15 @@ impl Workbench {
         style::window_theme(self.dark(), self.key_window == Some(id))
     }
 
-    fn subscription(&self) -> Subscription<Message> {
+    /// How often `subscription` ticks.
+    fn tick_interval(&self) -> Duration {
         let streaming = self.snapshot.cameras.iter().any(|camera| camera.streaming);
+        // A quiet rediscovery shows nowhere, so its own running activity
+        // entry needs no fast tick either.
+        let quiet_discovery = self
+            .pending
+            .iter()
+            .any(|pending| pending.job == Job::Discover && pending.background);
         // Pending commands (connecting, discovering) tick fast enough to
         // step spinners and pulses without per-frame redraws.
         let busy = self.pending.iter().any(|pending| !pending.background)
@@ -1404,13 +1411,16 @@ impl Workbench {
                 entry.state.active()
                     && !(self.assistant_actor_is_local(&entry.actor.id)
                         && !self.assistant.quick.open)
+                    && !(quiet_discovery
+                        && entry.operation == "discover"
+                        && entry.actor.id == self.actor.id)
             })
             || self.screenshot.is_some()
             || self.capture_to.busy()
             || self.record_to.busy()
             || self.assistant.settings.busy()
             || self.assistant_ui_busy();
-        let interval = if busy {
+        if busy {
             Duration::from_millis(60)
         } else if self.frames_paused() || self.key_window.is_none() && !streaming {
             // Nothing on screen, or nothing changing in the background:
@@ -1420,7 +1430,11 @@ impl Workbench {
             Duration::from_millis(250)
         } else {
             Duration::from_millis(300)
-        };
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let interval = self.tick_interval();
         // Redraws also measure the display until its refresh rate is known.
         let frames = if self.animating() || !self.refresh.calibrated() {
             event::listen_raw(|event, _, window| match event {
