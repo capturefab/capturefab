@@ -134,7 +134,8 @@ impl Device {
             Status(0x8006, "control privilege required")
         );
         match address {
-            HEARTBEAT => ensure!((500..=60000).contains(&value), "heartbeat range"),
+            // pylon sets an hour while debugging; GigE Vision only sets a floor.
+            HEARTBEAT => ensure!(value >= 500, "heartbeat range"),
             STREAM_PORT => ensure!(value <= u16::MAX as u32, "invalid stream port"),
             STREAM_ADDRESS => ensure!(
                 !Ipv4Addr::from(value).is_multicast() && value != u32::MAX,
@@ -1055,6 +1056,32 @@ mod tests {
         assert_eq!(
             gvcp(&other, camera, 0x0082, 4, &[0, 0, 0x0a, 0, 0, 0, 0, 2]),
             (0x8006, vec![0, 0, 0, 0])
+        );
+        // pylon's one-hour debug heartbeat is accepted; below the floor is not.
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0082,
+                4,
+                &[0, 0, 9, 0x38, 0, 0x36, 0xee, 0x80]
+            ),
+            (0, vec![0, 0, 0, 1])
+        );
+        assert_eq!(
+            gvcp(
+                &controller,
+                camera,
+                0x0082,
+                4,
+                &[0, 0, 9, 0x38, 0, 0, 0, 100]
+            )
+            .0,
+            0x8002
+        );
+        assert_eq!(
+            gvcp(&controller, camera, 0x0080, 4, &[0, 0, 9, 0x38]),
+            (0, vec![0, 0x36, 0xee, 0x80])
         );
         // SCPD written as memory reads back as a register, and SCP written as
         // a register reads back as memory.
