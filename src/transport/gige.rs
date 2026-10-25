@@ -24,6 +24,8 @@ const WRITE_MEMORY: u16 = 0x0086;
 const PENDING_ACK: u16 = 0x0089;
 const CONTROL_PRIVILEGE: u32 = 0x0a00;
 const GVCP_CAPABILITY: u32 = 0x0934;
+const GVCP_CONFIGURATION: u32 = 0x0954;
+const PENDING_TIMEOUT: u32 = 0x0958;
 const HEARTBEAT_TIMEOUT: u32 = 0x0938;
 const TIMESTAMP_HIGH: u32 = 0x093c;
 const TIMESTAMP_LOW: u32 = 0x0940;
@@ -351,6 +353,13 @@ struct Control {
     timeout: Duration,
     next_id: u16,
     write_memory: bool,
+    /// The device's maximum command response time (Pending Timeout register).
+    response: Duration,
+    /// How long PENDING_ACKs may extend a command past its deadline; `None`
+    /// keeps every command within its deadline.
+    pending_limit: Option<Duration>,
+    /// The GVCP configuration to restore after enabling PENDING_ACK.
+    restore_configuration: Option<u32>,
 }
 impl Control {
     fn connect(address: SocketAddrV4, timeout: Duration) -> Result<Self> {
@@ -363,14 +372,25 @@ impl Control {
             timeout: bounded_timeout(timeout),
             next_id: 1,
             write_memory: true,
+            response: Duration::ZERO,
+            pending_limit: None,
+            restore_configuration: None,
         })
     }
     fn transact(&mut self, command: u16, payload: &[u8]) -> Result<Vec<u8>> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let packet = command_packet(command, id, 1, payload);
-        let deadline = Instant::now() + self.timeout;
-        let retry_wait = (self.timeout / 3).max(Duration::from_millis(1));
+        // Wait for the device's advertised response time before retrying, so
+        // slow commands are not retransmitted while they execute.
+        let retry_wait = (self.timeout / 3)
+            .max(self.response + self.response.min(Duration::from_millis(100)))
+            .max(Duration::from_millis(1));
+        let start = Instant::now();
+        let mut deadline = start + self.timeout.max(retry_wait);
+        let limit = self
+            .pending_limit
+            .map_or(deadline, |limit| deadline.max(start + limit));
         let mut buffer = [0u8; 2048];
         for attempt in 0..3 {
             if Instant::now() >= deadline {
@@ -406,9 +426,12 @@ impl Control {
                             return Err(GvcpStatus(ack.status).into());
                         }
                         if ack.command == PENDING_ACK {
+                            // Reserved(16), then the time to completion in ms.
                             ensure!(ack.payload.len() == 4, "invalid pending acknowledgement");
-                            let extension = Duration::from_millis(be32(ack.payload, 0) as u64);
-                            attempt_deadline = (Instant::now() + extension).min(deadline);
+                            let completion = Duration::from_millis(be16(ack.payload, 2) as u64);
+                            attempt_deadline =
+                                (Instant::now() + completion + retry_wait).min(limit);
+                            deadline = deadline.max(attempt_deadline);
                             continue;
                         }
                         return Ok(ack.payload.to_vec());
@@ -431,7 +454,7 @@ impl Control {
         }
         Err(GvcpTimeout {
             command,
-            waited: self.timeout,
+            waited: start.elapsed(),
         }
         .into())
     }
@@ -455,6 +478,9 @@ impl Control {
         Ok(())
     }
     fn release(&mut self, heartbeat_timeout: u32) {
+        if let Some(configuration) = self.restore_configuration.take() {
+            let _ = self.write_register(GVCP_CONFIGURATION, configuration);
+        }
         let _ = self.write_register(HEARTBEAT_TIMEOUT, heartbeat_timeout);
         let _ = self.write_register(CONTROL_PRIVILEGE, 0);
     }
@@ -762,11 +788,30 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
             control.read_register(CONTROL_PRIVILEGE)? & 3 != 0,
             "camera did not grant controller privilege"
         );
+        let capability = control.read_register(GVCP_CAPABILITY).ok();
+        let resend = capability.is_some_and(|bits| bits & 0x4 != 0);
+        control.write_memory = capability.is_none_or(|bits| bits & 0x2 != 0);
+        let response = match control.read_register(PENDING_TIMEOUT) {
+            Ok(ms @ 1..=5000) => Duration::from_millis(ms as u64),
+            _ => Duration::ZERO,
+        };
+        if capability.is_some_and(|bits| bits & 0x20 != 0)
+            && let Ok(configuration) = control.read_register(GVCP_CONFIGURATION)
+            && configuration & 0x2 == 0
+            && control
+                .write_register(GVCP_CONFIGURATION, configuration | 0x2)
+                .is_ok()
+        {
+            control.restore_configuration = Some(configuration);
+        }
         let heartbeat_timeout = control.read_register(HEARTBEAT_TIMEOUT)?;
-        let heartbeat_ms = heartbeat_timeout
-            .max(3000)
-            .max(control.timeout.as_millis() as u32 * 2 + 1000);
+        let command_ms = control.timeout.max(response * 2).as_millis() as u32;
+        let heartbeat_ms = heartbeat_timeout.max(3000).max(command_ms * 2 + 1000);
         control.write_register(HEARTBEAT_TIMEOUT, heartbeat_ms)?;
+        control.response = response;
+        // The command in flight holds the heartbeat back, so pending commands
+        // must finish well within the heartbeat timeout.
+        control.pending_limit = Some(Duration::from_millis(heartbeat_ms as u64 * 2 / 3));
         let timestamp_frequency = match (
             control.read_register(TIMESTAMP_HIGH),
             control.read_register(TIMESTAMP_LOW),
@@ -774,9 +819,6 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
             (Ok(high), Ok(low)) => ((high as u64) << 32) | low as u64,
             _ => 0,
         };
-        let capability = control.read_register(GVCP_CAPABILITY).ok();
-        let resend = capability.is_some_and(|bits| bits & 0x4 != 0);
-        control.write_memory = capability.is_none_or(|bits| bits & 0x2 != 0);
         Ok((
             heartbeat_timeout,
             Duration::from_millis((heartbeat_ms / 3).clamp(100, 1000) as u64),
@@ -787,6 +829,9 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
     let (heartbeat_timeout, period, timestamp_frequency, resend) = match initialized {
         Ok(values) => values,
         Err(error) => {
+            if let Some(configuration) = control.restore_configuration.take() {
+                let _ = control.write_register(GVCP_CONFIGURATION, configuration);
+            }
             let _ = control.write_register(CONTROL_PRIVILEGE, 0);
             return Err(error);
         }
@@ -2583,6 +2628,93 @@ mod tests {
         let mut control = Control::connect(address, Duration::from_millis(300)).unwrap();
         assert_eq!(control.read_register(0x100).unwrap(), 42);
         worker.join().unwrap();
+    }
+    /// A camera that answers each command once, after `reply`, optionally
+    /// preceded by a PENDING_ACK; returns how many command packets it saw.
+    fn slow_camera(pending: Option<u16>, reply: Duration) -> (SocketAddrV4, JoinHandle<usize>) {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(address) = server.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let worker = thread::spawn(move || {
+            let mut buffer = [0u8; 100];
+            let (_, peer) = server.recv_from(&mut buffer).unwrap();
+            let id = be16(&buffer, 6);
+            if let Some(completion) = pending {
+                let payload = [[0, 0], completion.to_be_bytes()].concat();
+                server
+                    .send_to(&ack(PENDING_ACK, id, 0, &payload), peer)
+                    .unwrap();
+            }
+            let started = Instant::now();
+            let mut commands = 1;
+            server
+                .set_read_timeout(Some(Duration::from_millis(5)))
+                .unwrap();
+            while started.elapsed() < reply {
+                commands += usize::from(server.recv(&mut buffer).is_ok());
+            }
+            let value = 42u32.to_be_bytes();
+            server
+                .send_to(&ack(READ_REGISTER + 1, id, 0, &value), peer)
+                .unwrap();
+            commands
+        });
+        (address, worker)
+    }
+    #[test]
+    fn pending_acks_extend_commands_up_to_the_heartbeat_safe_limit() {
+        for limited in [false, true] {
+            let (address, camera) = slow_camera(Some(600), Duration::from_millis(400));
+            let mut control = Control::connect(address, Duration::from_millis(150)).unwrap();
+            control.pending_limit = limited.then_some(Duration::from_secs(2));
+            let result = control.read_register(0x100);
+            if limited {
+                assert_eq!(result.unwrap(), 42);
+                assert_eq!(camera.join().unwrap(), 1, "no retransmission while pending");
+            } else {
+                // Probes keep every command within its own deadline.
+                assert!(result.unwrap_err().downcast_ref::<GvcpTimeout>().is_some());
+                camera.join().unwrap();
+            }
+        }
+        // The extension never exceeds the limit.
+        let (address, camera) = slow_camera(Some(5000), Duration::from_millis(900));
+        let mut control = Control::connect(address, Duration::from_millis(150)).unwrap();
+        control.pending_limit = Some(Duration::from_millis(500));
+        let started = Instant::now();
+        assert!(control.read_register(0x100).is_err());
+        assert!(started.elapsed() < Duration::from_millis(800));
+        camera.join().unwrap();
+    }
+    #[test]
+    fn commands_wait_for_the_advertised_response_time_before_retrying() {
+        let (address, camera) = slow_camera(None, Duration::from_millis(350));
+        let mut control = Control::connect(address, Duration::from_millis(150)).unwrap();
+        control.response = Duration::from_millis(400);
+        assert_eq!(control.read_register(0x100).unwrap(), 42);
+        assert_eq!(camera.join().unwrap(), 1);
+    }
+    #[test]
+    fn connect_enables_pending_acks_and_restores_the_configuration() {
+        for (capability, configuration) in [(0x20, 0x3), (0x0, 0x1)] {
+            let fake = Fake::new(|camera| {
+                camera.registers.insert(GVCP_CAPABILITY, capability);
+                camera.registers.insert(GVCP_CONFIGURATION, 0x1);
+                camera.registers.insert(PENDING_TIMEOUT, 2000);
+            });
+            let gige = connect(fake.address, Duration::from_millis(200)).unwrap();
+            assert_eq!(fake.register(GVCP_CONFIGURATION), configuration);
+            // Commands may take twice the response time, so the heartbeat
+            // timeout covers two of them.
+            assert_eq!(fake.register(HEARTBEAT_TIMEOUT), 9000);
+            let control = gige.control.lock().unwrap();
+            assert_eq!(control.response, Duration::from_secs(2));
+            assert_eq!(control.pending_limit, Some(Duration::from_secs(6)));
+            drop(control);
+            drop(gige);
+            assert_eq!(fake.register(GVCP_CONFIGURATION), 0x1);
+        }
     }
     #[test]
     fn udp_status_and_address_validation() {
