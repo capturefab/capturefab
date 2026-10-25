@@ -5634,3 +5634,161 @@ fn resource_limits_are_automatic_persisted_and_reject_invalid_values_without_cam
     assert!(reset["policy"].get("upload_bytes_per_second").is_none());
     let _ = std::fs::remove_dir_all(root);
 }
+
+/// Save a simulator's settings, change them, preview and restore the setup
+/// in a session, undo it, and move it between files and workflows.
+#[test]
+fn saved_setups_restore_preview_and_undo_in_a_session() {
+    let root = temp_root("setups");
+    let dir = root.join("sessions");
+    let cwd = root.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &cwd, "setup-ci"),
+        dir: root.clone(),
+    };
+    let fail = |args: &[&str]| {
+        let out = cmd(&dir, args);
+        assert!(!out.status.success(), "{args:?}");
+        let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code().unwrap(), error["error"].clone())
+    };
+    // Direct mode saves without a session.
+    let saved = json(
+        &dir,
+        &[
+            "--json", "--direct", "--camera", "sim:0", "setup", "save", "bench",
+        ],
+    );
+    assert_eq!(saved["setup"]["name"], "bench");
+    assert!(saved["setup"]["values"].as_u64().unwrap() >= 4);
+    let list = json(&dir, &["--json", "setup", "list"]);
+    assert_eq!(list["setups"][0]["name"], "bench");
+    assert_eq!(list["setups"][0]["model"], "Pattern camera");
+    assert!(list["dir"].as_str().unwrap().ends_with("setups"));
+    let (code, error) = fail(&[
+        "--json", "--direct", "--camera", "sim:0", "setup", "save", "BENCH",
+    ]);
+    assert_eq!((code, error["code"].as_str()), (2, Some("usage")));
+    let (code, error) = fail(&["--json", "setup", "save", "CON"]);
+    assert_eq!((code, error["code"].as_str()), (2, Some("usage")));
+    let (code, error) = fail(&["--json", "--session", "setup-ci", "setup", "apply", "nope"]);
+    assert_eq!((code, error["code"].as_str()), (3, Some("unavailable")));
+
+    let session = |args: &[&str]| {
+        json(
+            &dir,
+            &[
+                &["--json", "--session", "setup-ci", "--camera", "sim:0"],
+                args,
+            ]
+            .concat(),
+        )
+    };
+    session(&["connect", "sim:0"]);
+    session(&["set", "ExposureTime=5000"]);
+    let diff = session(&["setup", "diff", "bench"]);
+    assert_eq!(diff["changes"].as_array().unwrap().len(), 1, "{diff}");
+    assert_eq!(diff["changes"][0]["feature"], "ExposureTime");
+    assert_eq!(diff["match"], "same_camera");
+    let dry = session(&["setup", "apply", "bench", "--dry-run"]);
+    assert_eq!(dry["dry_run"], true);
+    let exposure = |session: &dyn Fn(&[&str]) -> Value| {
+        session(&["get", "ExposureTime"])["features"][0]["value"]
+            .as_f64()
+            .unwrap()
+    };
+    assert_eq!(exposure(&session), 5000.0);
+    let applied = session(&["setup", "apply", "bench"]);
+    assert_eq!(applied["applied"], 1, "{applied}");
+    assert_eq!(applied["camera_change"]["label"], "Restore setup bench");
+    assert_eq!(exposure(&session), 10000.0);
+    session(&["undo"]);
+    assert_eq!(exposure(&session), 5000.0);
+
+    // Another model needs --allow-other-model; the same model warns.
+    let (code, error) = fail(&[
+        "--json",
+        "--session",
+        "setup-ci",
+        "--camera",
+        "sim:line:0",
+        "setup",
+        "apply",
+        "bench",
+    ]);
+    assert_eq!(code, 2);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("--allow-other-model"),
+        "{error}"
+    );
+    let other = json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "setup-ci",
+            "--camera",
+            "sim:line:0",
+            "setup",
+            "apply",
+            "bench",
+            "--allow-other-model",
+        ],
+    );
+    assert_eq!(other["match"], "other_model");
+    let same_model = json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "setup-ci",
+            "--camera",
+            "sim:1",
+            "setup",
+            "apply",
+            "bench",
+        ],
+    );
+    assert_eq!(same_model["match"], "same_model");
+    assert!(same_model["warnings"][0].as_str().unwrap().contains("SIM0"));
+
+    // A document round-trips through a file and a workflow.
+    let shown = cmd(&dir, &["--json", "setup", "show", "bench"]);
+    let document: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let file = cwd.join("bench.json");
+    std::fs::write(&file, serde_json::to_vec(&document["result"]).unwrap()).unwrap();
+    let file = file.to_str().unwrap();
+    let imported = json(&dir, &["--json", "setup", "import", file, "--name", "copy"]);
+    assert_eq!(imported["setup"]["name"], "copy");
+    let (code, _) = fail(&["--json", "setup", "import", file, "--name", "copy"]);
+    assert_eq!(code, 2);
+    session(&["set", "ExposureTime=6000"]);
+    let workflow = cwd.join("restore.json");
+    std::fs::write(
+        &workflow,
+        r#"{"version":1,"steps":[{"camera":"sim:0","command":{"op":"apply_setup","name":"copy"}}]}"#,
+    )
+    .unwrap();
+    json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "setup-ci",
+            "workflow",
+            "apply",
+            workflow.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(exposure(&session), 10000.0);
+    let removed = json(&dir, &["--json", "setup", "delete", "bench"]);
+    assert_eq!(removed["removed"], "bench");
+    let list = json(&dir, &["--json", "setup", "list"]);
+    assert_eq!(list["setups"].as_array().unwrap().len(), 1);
+    let schema = json(&dir, &["--json", "schema"]);
+    assert!(schema["setup"]["cli"].is_string());
+}

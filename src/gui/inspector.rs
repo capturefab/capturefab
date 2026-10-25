@@ -1906,8 +1906,10 @@ impl Workbench {
         } else {
             groups.into()
         };
-        let mut content =
-            column![column![self.search_field(p), count].spacing(6)].spacing(SECTION_GAP);
+        let mut content = column![
+            column![self.search_field(p), count, self.setup_links(searching, p)].spacing(6)
+        ]
+        .spacing(SECTION_GAP);
         if !searching
             && (snapshot.auto.is_some()
                 || snapshot

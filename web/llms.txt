@@ -484,6 +484,25 @@ Schedules and encoders continue in the session after Apply exits.
 Workflow commands have no wait step.
 For a timed recording, set `duration_ms` on the `forward` step, or use separate start/stop files.
 
+## Saved camera setups
+
+```sh
+capturefab --camera sim:0 setup save bench
+capturefab setup list --json
+capturefab --session bench setup diff bench --json
+capturefab --session bench setup apply bench --dry-run --json
+capturefab --session bench setup apply bench --json
+```
+
+A setup is a named snapshot of one camera's writable settings, kept on this computer.
+Restoring it is one camera change that `undo` reverts; a failure restores every value.
+Preview first: `changes`, `not_applied`, `match`, `warnings`, `restarts_stream` and `blocked` describe the restore.
+Disruptive changes, such as triggering and I/O lines, need `--yes` on the CLI.
+Another camera model needs `--allow-other-model`; `--strict` refuses any value the camera cannot take.
+Workflows use the step `{"op":"apply_setup","name":"bench"}`; they skip `--yes` but keep the model and recording checks.
+Never save, import or delete a setup without the person's request.
+Back up with `setup show NAME --json > FILE` and restore with `setup import FILE`.
+
 ## Change camera settings
 
 Read the current feature list, choices, access permissions and limits before a write.

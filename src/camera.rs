@@ -270,6 +270,9 @@ impl Camera {
     pub fn has(&self, name: &str) -> bool {
         self.nodes.has(name)
     }
+    pub(crate) fn node_kind(&self, name: &str) -> Option<&str> {
+        self.nodes.kind(name)
+    }
     pub(crate) fn feature_unit(&self, name: &str) -> Option<&str> {
         self.nodes.unit(name)
     }

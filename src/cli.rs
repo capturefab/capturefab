@@ -1,8 +1,10 @@
 pub(crate) mod assistant;
 mod resources;
+mod setup;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
 pub use resources::ResourcesCommand;
+pub use setup::SetupCommand;
 pub use tools::{ToolsCommand, ToolsConfirmationRequired};
 
 use crate::{
@@ -480,6 +482,12 @@ pub enum Command {
     History,
     /// Execute a GenICam command such as TriggerSoftware
     Execute { feature: String },
+    /// Save a tuned camera's settings by name and restore them later, with a preview of what changes
+    #[command(visible_alias = "setups")]
+    Setup {
+        #[command(subcommand)]
+        command: SetupCommand,
+    },
     /// Connect a camera in an existing persistent session
     Connect { camera: String },
     /// Set the session's default camera for CLI calls without --camera
@@ -903,20 +911,21 @@ fn addressed_camera<'a>(state: &'a Value, selector: &str) -> Option<&'a Value> {
 }
 
 fn one_shot_camera_command(command: Option<&Command>) -> bool {
-    matches!(
-        command,
-        Some(
-            Command::Info
-                | Command::Features { .. }
-                | Command::Get { .. }
-                | Command::Set { .. }
-                | Command::Execute { .. }
-                | Command::Capture { .. }
-                | Command::Forward { .. }
-                | Command::Xml { .. }
-                | Command::Memory { .. }
+    matches!(command, Some(Command::Setup { command }) if setup::needs_camera(command))
+        || matches!(
+            command,
+            Some(
+                Command::Info
+                    | Command::Features { .. }
+                    | Command::Get { .. }
+                    | Command::Set { .. }
+                    | Command::Execute { .. }
+                    | Command::Capture { .. }
+                    | Command::Forward { .. }
+                    | Command::Xml { .. }
+                    | Command::Memory { .. }
+            )
         )
-    )
 }
 fn camera_command(command: Option<&Command>) -> bool {
     one_shot_camera_command(command)
@@ -1092,6 +1101,10 @@ fn prepare_with(
         }
         Some(Command::Hub { command }) => {
             crate::hubs::command::prepare(command)?;
+            None
+        }
+        Some(Command::Setup { command }) => {
+            setup::prepare(command)?;
             None
         }
         Some(Command::Destination { command }) => {
@@ -1623,6 +1636,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Some(Command::Destination { command }) => {
             return output(&cli, destination_command(command)?);
         }
+        Some(Command::Setup { command }) if !setup::needs_camera(command) => {
+            return output(&cli, setup::run_store(command)?);
+        }
         Some(Command::Hub { command }) => {
             let result = crate::hubs::command::run(
                 command,
@@ -1758,6 +1774,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
         }
         _ => {}
     }
+    if let Some(Command::Setup { command }) = &cli.command {
+        setup::check_saved(command)?;
+    }
     let persistent = matches!(
         &cli.command,
         Some(
@@ -1791,20 +1810,21 @@ pub fn run(mut cli: Cli) -> Result<()> {
         );
         Ok(())
     })())?;
-    let camera_required = matches!(
-        &cli.command,
-        Some(
-            Command::Info
-                | Command::Features { .. }
-                | Command::Get { .. }
-                | Command::Set { .. }
-                | Command::Execute { .. }
-                | Command::Capture { .. }
-                | Command::Forward { .. }
-                | Command::Xml { .. }
-                | Command::Memory { .. }
-        )
-    );
+    let camera_required = matches!(&cli.command, Some(Command::Setup { .. }))
+        || matches!(
+            &cli.command,
+            Some(
+                Command::Info
+                    | Command::Features { .. }
+                    | Command::Get { .. }
+                    | Command::Set { .. }
+                    | Command::Execute { .. }
+                    | Command::Capture { .. }
+                    | Command::Forward { .. }
+                    | Command::Xml { .. }
+                    | Command::Memory { .. }
+            )
+        );
     input((|| {
         ensure!(
             !camera_required || cli.camera.is_some() || cli.session.is_some(),
@@ -2012,6 +2032,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Command::Stop => client.call(SessionCommand::Stop)?,
         Command::Auto { balance } => client.call(SessionCommand::Auto { balance: *balance })?,
         Command::Manual { revert } => client.call(SessionCommand::Manual { revert: *revert })?,
+        Command::Setup { command } => setup::run_camera(&cli, &client, command)?,
         Command::Undo => client.call(SessionCommand::Undo)?,
         Command::Redo => client.call(SessionCommand::Redo)?,
         Command::History => {
@@ -2186,6 +2207,9 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
     }
     if let Some(Command::Tools { command }) = &cli.command {
         return tools::print_human(command, &value);
+    }
+    if let Some(Command::Setup { command }) = &cli.command {
+        return setup::print_human(cli, command, &value);
     }
     let mut out = io::stdout().lock();
     if matches!(&cli.command, Some(Command::Doctor)) {
@@ -2735,6 +2759,7 @@ fn schema() -> Value {
         "human":"Plain doctor prints the host summary and one line per check with its fix"
     });
     contract["hubs"] = crate::hubs::schema_contract();
+    setup::extend_schema(&mut contract);
     contract
 }
 

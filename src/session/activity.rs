@@ -320,6 +320,8 @@ impl Activity {
                 | SessionCommand::Features
                 | SessionCommand::Xml
                 | SessionCommand::ReadMemory { .. }
+                | SessionCommand::ReadSetup
+                | SessionCommand::SetupDiff { .. }
                 | SessionCommand::DatasetStatus
                 | SessionCommand::DatasetQuery { .. }
                 | SessionCommand::DatasetQueryIf { .. }
@@ -504,6 +506,25 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
             },
         ),
         Execute { feature } => ("execute", format!("Execute {feature}")),
+        ReadSetup => ("read_setup", "Read settings for a setup".into()),
+        SetupDiff { name, setup, .. } => (
+            "setup_diff",
+            format!(
+                "Compare setup {}",
+                name.as_deref()
+                    .or(setup.as_ref().map(|setup| setup.name.as_str()))
+                    .unwrap_or_default()
+            ),
+        ),
+        ApplySetup { name, setup, .. } => (
+            "apply_setup",
+            format!(
+                "Restore setup {}",
+                name.as_deref()
+                    .or(setup.as_ref().map(|setup| setup.name.as_str()))
+                    .unwrap_or_default()
+            ),
+        ),
         Start => ("start", "Start acquisition".into()),
         Stop => ("stop", "Stop acquisition".into()),
         Undo => ("undo", "Undo camera change".into()),

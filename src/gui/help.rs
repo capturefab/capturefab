@@ -366,6 +366,13 @@ impl Workbench {
                 Some(Message::Resources(resources::Input::Open(false))),
                 t,
             )
+        } else if self.setups.open {
+            modal(
+                body,
+                self.setups_sheet(p, height),
+                Some(Message::Setups(setups::Input::Open(None))),
+                t,
+            )
         } else if self.analytics.open {
             modal(
                 body,

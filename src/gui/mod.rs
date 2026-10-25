@@ -42,6 +42,7 @@ mod scene;
 mod scopes;
 mod secret;
 mod settings;
+mod setups;
 mod sidebar;
 mod sparkline;
 mod stage;
@@ -419,6 +420,9 @@ impl Pending {
             Job::DatasetNote => "Adding note",
             Job::DatasetExport => "Exporting dataset",
             Job::SetMany => "Setting features",
+            Job::ReadSetup => "Reading settings",
+            Job::SetupDiff => "Comparing setup",
+            Job::ApplySetup => "Restoring setup",
             Job::Set(feature) => return format!("Setting {}", words(feature)),
             Job::Execute(feature) => return format!("Executing {}", words(feature)),
         };
@@ -466,6 +470,12 @@ enum Job {
     /// Write several features as one camera change. The desktop only
     /// replays these, for changes made over RPC.
     SetMany,
+    /// Read the camera's settings for a new saved setup.
+    ReadSetup,
+    /// Compare a saved setup with the camera.
+    SetupDiff,
+    /// Restore a saved setup as one camera change.
+    ApplySetup,
     /// Run a command feature, by name.
     Execute(String),
 }
@@ -699,6 +709,7 @@ enum Message {
     UiScale(UiScale),
     Performance(crate::efficiency::Mode),
     Resources(resources::Input),
+    Setups(setups::Input),
     ScaledViewport(Size),
     CloseRequested(window::Id),
     WindowOpened(window::Id),
@@ -922,6 +933,7 @@ struct Workbench {
     performance: crate::efficiency::Mode,
     performance_state: performance::PerformanceState,
     resources: resources::State,
+    setups: setups::State,
     screenshot: Option<ScreenshotRequest>,
     logs_open: bool,
     help_open: bool,
@@ -1136,6 +1148,7 @@ impl Workbench {
             performance: Default::default(),
             performance_state: Default::default(),
             resources: Default::default(),
+            setups: Default::default(),
             screenshot: None,
             logs_open: prefs.logs_open,
             help_open: false,
@@ -1802,6 +1815,7 @@ impl Workbench {
         self.result_stage(pending, result);
         self.result_inspector(pending, result);
         self.dataset_settled(pending, result);
+        self.setups_result(pending, result);
         let notice = if pending.batch {
             self.batch_result(&pending.job, result)
         } else {
@@ -1956,6 +1970,7 @@ impl Workbench {
         self.refresh.settle(self.now);
         self.tick_performance();
         self.tick_resources();
+        self.tick_setups();
         let destination_before = local_history::LocalState::capture(self);
         self.capture_to.tick(&mut self.output);
         self.record_to.tick(&mut self.forward_output);
@@ -3113,6 +3128,7 @@ impl Workbench {
             Message::UiScale(value) => self.ui_scale = value,
             Message::Performance(mode) => self.performance = mode,
             Message::Resources(input) => return self.resources_input(input),
+            Message::Setups(input) => return self.setups_input(input),
             Message::ScaledViewport(size) => {
                 self.width = size.width;
                 self.height = size.height;
@@ -3705,6 +3721,9 @@ impl Workbench {
             Action::Overview if self.network_open => self.network_open = false,
             Action::Overview if self.analytics.open => self.analytics.open = false,
             Action::Overview if self.resources.open => self.resources.open = false,
+            Action::Overview if self.setups.open => {
+                return self.setups_input(setups::Input::Open(None));
+            }
             Action::Overview if self.settings_open && self.settings_window.is_none() => {
                 return self.handle_message(Message::Settings(false));
             }

@@ -435,6 +435,7 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
                     a.operation.as_str(),
                     "set"
                         | "set_many"
+                        | "apply_setup"
                         | "execute"
                         | "auto"
                         | "manual"

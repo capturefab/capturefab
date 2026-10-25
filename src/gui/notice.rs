@@ -444,6 +444,8 @@ pub(super) fn command_notice(
 ) -> Option<(String, Option<String>, Level)> {
     match result {
         Ok(value) => outcome(job, value),
+        // The setup sheet shows these failures in place.
+        Err(_) if matches!(job, Job::ReadSetup | Job::SetupDiff) => None,
         Err(error) => {
             let full = format!("{error:#}");
             Some((
@@ -509,6 +511,17 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
             }
             done(text)
         }
+        // The setup sheet shows what was read or compared.
+        Job::ReadSetup | Job::SetupDiff => None,
+        Job::ApplySetup => done(format!(
+            "Restored {}: {}",
+            value["setup"].as_str().unwrap_or("the setup"),
+            plural(
+                value["applied"].as_u64().unwrap_or_default(),
+                "change",
+                "changes"
+            )
+        )),
         Job::SetMany => done(match value["values"].as_array() {
             Some(values) => format!("Set {}", plural(values.len() as u64, "feature", "features")),
             None => "Features set".into(),
@@ -548,6 +561,9 @@ fn failure(job: &Job) -> String {
         Job::DatasetNote => "Could not add the note",
         Job::DatasetExport => "Could not export the dataset",
         Job::SetMany => "Could not set the features",
+        Job::ReadSetup => "Could not read the camera's settings",
+        Job::SetupDiff => "Could not compare the setup",
+        Job::ApplySetup => "Could not restore the setup",
         Job::Set(feature) => return format!("Could not set {}", words(feature)),
         Job::Execute(feature) => return format!("Could not execute {}", words(feature)),
     };

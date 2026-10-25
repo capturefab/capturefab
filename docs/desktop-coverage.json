@@ -832,6 +832,20 @@
         "_retired_upload_limit"
       ],
       "url": "desktop.html#resources"
+    },
+    "menu.save_setup": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Command::SaveSetup"
+      ],
+      "url": "desktop.html#saved-setups"
+    },
+    "menu.restore_setup": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Command::RestoreSetup"
+      ],
+      "url": "desktop.html#saved-setups"
     }
   }
 }

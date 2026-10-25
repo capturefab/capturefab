@@ -860,6 +860,47 @@ fn report_image(
     });
 }
 
+/// Enter auto mode, or change its balance: the `auto` command, which a
+/// restored setup with an auto policy also runs.
+fn enter_auto(
+    h: &WorkerHandle,
+    camera: &mut Option<Camera>,
+    auto: &mut Option<AutoController>,
+    forwarder: &Option<(Forwarder, f64)>,
+    jobs: &[Scheduled],
+    balance: Option<f64>,
+) -> Result<Value> {
+    let c = camera_mut(camera)?;
+    ensure!(
+        !c.is_scanner(),
+        "scanner auto exposure is unsupported; configure scan settings with set"
+    );
+    let explicit = match auto.as_mut() {
+        Some(controller) => {
+            if let Some(balance) = balance {
+                controller.set_balance(c, balance)?;
+            }
+            balance.is_some()
+        }
+        None => {
+            let balance = balance.unwrap_or(crate::auto::DEFAULT_BALANCE);
+            let mut controller = AutoController::enter(c, balance)?;
+            controller.set_forward_fps(forwarder.as_ref().map(|(_, fps)| *fps))?;
+            *auto = Some(controller);
+            true
+        }
+    };
+    let controller = auto.as_mut().context("auto controller")?;
+    if explicit && forwarder.is_none() && !jobs.iter().any(|j| j.info.active()) {
+        controller.choose_video_mode(c);
+    }
+    controller.tick(c, Instant::now());
+    let status = controller.status().clone();
+    refresh(h, camera, true);
+    publish_auto(h, controller);
+    h.log("info", format!("Auto mode, balance {:.2}", status.balance));
+    Ok(json!({"auto":status}))
+}
 #[allow(clippy::too_many_arguments)]
 fn process_plain(
     h: &WorkerHandle,
@@ -914,6 +955,11 @@ fn process_plain(
         SessionCommand::Status => {
             refresh(h, camera, false);
             Ok(serde_json::to_value(h.snapshot())?)
+        }
+        SessionCommand::ReadSetup
+        | SessionCommand::SetupDiff { .. }
+        | SessionCommand::ApplySetup { .. } => {
+            anyhow::bail!("saved setups are handled by camera history")
         }
         SessionCommand::Undo | SessionCommand::Redo | SessionCommand::ReplayCameraChange { .. } => {
             anyhow::bail!("history commands must be handled by the camera journal")
@@ -1313,38 +1359,7 @@ fn process_plain(
             h.log("info", format!("Capture job {} scheduled", info.id));
             Ok(json!({"job":info}))
         }
-        SessionCommand::Auto { balance } => {
-            let c = camera_mut(camera)?;
-            ensure!(
-                !c.is_scanner(),
-                "scanner auto exposure is unsupported; configure scan settings with set"
-            );
-            let explicit = match auto.as_mut() {
-                Some(controller) => {
-                    if let Some(balance) = balance {
-                        controller.set_balance(c, balance)?;
-                    }
-                    balance.is_some()
-                }
-                None => {
-                    let balance = balance.unwrap_or(crate::auto::DEFAULT_BALANCE);
-                    let mut controller = AutoController::enter(c, balance)?;
-                    controller.set_forward_fps(forwarder.as_ref().map(|(_, fps)| *fps))?;
-                    *auto = Some(controller);
-                    true
-                }
-            };
-            let controller = auto.as_mut().context("auto controller")?;
-            if explicit && forwarder.is_none() && !jobs.iter().any(|j| j.info.active()) {
-                controller.choose_video_mode(c);
-            }
-            controller.tick(c, Instant::now());
-            let status = controller.status().clone();
-            refresh(h, camera, true);
-            publish_auto(h, controller);
-            h.log("info", format!("Auto mode, balance {:.2}", status.balance));
-            Ok(json!({"auto":status}))
-        }
+        SessionCommand::Auto { balance } => enter_auto(h, camera, auto, forwarder, jobs, balance),
         SessionCommand::Manual { revert } => {
             let c = camera_mut(camera)?;
             let released = match auto.take() {

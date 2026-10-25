@@ -28,7 +28,7 @@
 <tr><td>File</td><td>Connect to Camera…, Enter Camera Address, Quick Command…, Discover Cameras, Capture and Save, Start/Stop Recording, Schedule Capture, Set Up Recording or Forwarding…, Manage Destinations…, Close Window.</td></tr>
 <tr><td>Edit</td><td>Undo, Redo, Cut, Copy, Paste, Select All, Find Camera Feature…, Copy Session Command.</td></tr>
 <tr><td>View</td><td>Show Sidebar, Show Inspector, Show Activity, Camera Features, Capture, Record and Forward, Zoom In/Out, Zoom to Fit, Actual Pixels, Show Histogram, Show Focus Region, Image Only, Full Screen.</td></tr>
-<tr><td>Camera</td><td>Start/Stop Stream, Use Auto/Manual Exposure, Refresh Features, Start/Stop All Streams, Capture All, Record All Cameras, Stop All Recordings, Use Auto/Manual Exposure for All, Disconnect Camera.</td></tr>
+<tr><td>Camera</td><td>Start/Stop Stream, Use Auto/Manual Exposure, Refresh Features, Save Setup…, Restore Setup…, Start/Stop All Streams, Capture All, Record All Cameras, Stop All Recordings, Use Auto/Manual Exposure for All, Disconnect Camera.</td></tr>
 <tr><td>Help</td><td>Connect an Agent… and Capturefab Help.</td></tr>
 </tbody></table></div>
 <p>On macOS, the application menu contains Settings and Quit. On Windows and Linux, File contains Exit or Quit.</p>
@@ -59,6 +59,7 @@
 <p>Common controls include exposure, gain, image size, pixel format, frame rate, triggers and device commands. Availability depends on the camera.</p>
 <p>Read-only controls show their values. Locked controls cannot change in the current camera state. Stop acquisition when the camera demands it.</p>
 <p><strong>Refresh Features</strong> reloads the camera's current values and access rules. A selector change can alter the controls available under that selector.</p>
+<p id="saved-setups"><strong>Save Setup…</strong> saves the camera's settings by name. <strong>Restore Setup…</strong> compares a saved setup with the camera and restores it as one change that Undo reverts. See <a href="docs.html#setups">saved setups</a>.</p>
 <p><strong>Use Auto Exposure</strong> lets Capturefab adjust supported exposure controls. <strong>Use Manual Exposure</strong> stops those adjustments.</p>
 <p>Auto exposure includes rate constraints and optional white-balance controls where supported. See <a href="docs.html#auto-exposure">auto exposure and frame rate</a>.</p>
 <h3>GigE network report</h3>

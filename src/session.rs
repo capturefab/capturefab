@@ -78,6 +78,35 @@ pub enum SessionCommand {
         token: String,
         undo: bool,
     },
+    /// Read the camera's writable configuration values for a new saved
+    /// setup. Read-only: selectors are switched only to read and restored.
+    ReadSetup,
+    /// Compare a saved setup with the camera, by name (resolved by the
+    /// coordinator from the setup store) or inline. Read-only.
+    SetupDiff {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<crate::setup::Setup>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_other_model: bool,
+    },
+    /// Restore a saved setup as one camera change with one undo token; a
+    /// failure restores every value. `digest` pins the reviewed document.
+    ApplySetup {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        setup: Option<crate::setup::Setup>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        digest: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_other_model: bool,
+        /// Refuse, before any write, a setup with values this camera lacks,
+        /// cannot write or would not accept.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        strict: bool,
+    },
     Auto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         balance: Option<f64>,
@@ -338,6 +367,7 @@ pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
                     | "stop_forward"
                     | "dataset_close"
                     | "dataset_status"
+                    | "read_setup"
             )
         })
         && let Some(field) = fields.keys().find(|key| key.as_str() != "op")
@@ -491,6 +521,25 @@ impl SessionCommand {
                     "history token must be nonempty and contain no control characters"
                 );
             }
+            Self::SetupDiff { name, setup, .. } | Self::ApplySetup { name, setup, .. } => {
+                ensure!(
+                    name.is_some() != setup.is_some(),
+                    "name a saved setup or pass one inline, not both"
+                );
+                if let Some(name) = name {
+                    crate::setup::validate_name(name)?;
+                }
+                if let Some(setup) = setup {
+                    crate::setup::validate(setup)?;
+                }
+                if let Self::ApplySetup {
+                    digest: Some(digest),
+                    ..
+                } = self
+                {
+                    crate::setup::validate_digest(digest)?;
+                }
+            }
             Self::Auto {
                 balance: Some(balance),
             } => {
@@ -639,6 +688,9 @@ pub fn default_request_timeout(command: &SessionCommand) -> Duration {
         // settling its auto exposure, can outlast the frame wait itself.
         SessionCommand::Frame { timeout_ms, .. } => timeout_ms.saturating_add(15_000),
         SessionCommand::DatasetExport { .. } => 600_000,
+        // The worker bounds the writes to 90 s; a rollback may take as long,
+        // and restarting the stream follows.
+        SessionCommand::ApplySetup { .. } => 240_000,
         SessionCommand::DatasetExportIf { timeout_ms, .. } => timeout_ms.saturating_add(10_000),
         SessionCommand::DatasetQuery { timeout_ms, .. }
         | SessionCommand::DatasetQueryIf { timeout_ms, .. }
@@ -661,7 +713,7 @@ pub fn validate_timeout(timeout_ms: u64) -> Result<()> {
 pub fn validate_selector(camera: &str) -> Result<()> {
     crate::camera::validate_selector_shape(camera)
 }
-fn validate_feature(feature: &str) -> Result<()> {
+pub(crate) fn validate_feature(feature: &str) -> Result<()> {
     ensure!(
         !feature.is_empty()
             && !feature
@@ -2454,6 +2506,8 @@ impl SessionHandle {
         if let Some(camera) = &target {
             validate_selector(camera)?;
         }
+        // The worker never reads the state directory: load a named setup here.
+        let command = crate::setup::resolve(command)?;
         ensure!(
             !self.inner.quitting.load(Ordering::Relaxed),
             "session is shutting down"
@@ -5367,5 +5421,118 @@ mod tests {
             wait,
         );
         assert_eq!(refused.to_string(), "camera payload exceeds 256 MiB limit");
+    }
+    #[test]
+    fn setup_commands_parse_strictly_and_validate_their_shape() {
+        for valid in [
+            r#"{"op":"read_setup"}"#,
+            r#"{"op":"setup_diff","name":"bench"}"#,
+            r#"{"op":"setup_diff","name":"bench","allow_other_model":true}"#,
+            r#"{"op":"apply_setup","name":"bench","strict":true}"#,
+            r#"{"op":"apply_setup","name":"bench","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+        ] {
+            SessionCommand::from_json_slice(valid.as_bytes())
+                .unwrap_or_else(|e| panic!("{valid}: {e}"))
+                .validate()
+                .unwrap_or_else(|e| panic!("{valid}: {e}"));
+        }
+        for invalid in [
+            r#"{"op":"read_setup","name":"bench"}"#,
+            r#"{"op":"setup_diff","name":"bench","extra":1}"#,
+            r#"{"op":"apply_setup","name":"bench","name":"other"}"#,
+        ] {
+            assert!(
+                SessionCommand::from_json_slice(invalid.as_bytes()).is_err(),
+                "{invalid}"
+            );
+        }
+        for invalid in [
+            r#"{"op":"apply_setup"}"#,
+            r#"{"op":"apply_setup","name":"con"}"#,
+            r#"{"op":"apply_setup","name":"bench","digest":"sha256:abc"}"#,
+            r#"{"op":"setup_diff","name":"bench","setup":{"version":1,"name":"bench","saved_at":"x","camera":{"transport":"simulator"},"values":[{"feature":"Width","value":1}]}}"#,
+            r#"{"op":"setup_diff","setup":{"version":1,"name":"bench","saved_at":"x","camera":{"transport":"simulator"},"values":[{"feature":"GevSCDA","value":1}]}}"#,
+        ] {
+            let command = SessionCommand::from_json_slice(invalid.as_bytes()).unwrap();
+            assert!(command.validate().is_err(), "{invalid}");
+        }
+        assert_eq!(
+            default_request_timeout(
+                &SessionCommand::from_json_slice(br#"{"op":"apply_setup","name":"b"}"#).unwrap()
+            ),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            default_request_timeout(&SessionCommand::ReadSetup),
+            Duration::from_secs(60)
+        );
+    }
+    #[test]
+    fn named_setups_resolve_in_the_coordinator_and_pin_their_digest() {
+        let h = crate::engine::WorkerHandle::new();
+        h.request(SessionCommand::Connect {
+            camera: "sim:0".into(),
+            timeout_ms: 1000,
+        })
+        .unwrap();
+        let reading =
+            serde_json::from_value(h.request(SessionCommand::ReadSetup).unwrap()).unwrap();
+        h.shutdown();
+        let name = format!("resolve-{}", std::process::id());
+        let setup = crate::setup::from_read(&name, None, reading).unwrap();
+        let store = crate::setup::Store::session();
+        store.save(&setup, true).unwrap();
+        let apply = |digest: Option<String>| SessionCommand::ApplySetup {
+            name: Some(name.clone()),
+            setup: None,
+            digest,
+            allow_other_model: false,
+            strict: false,
+        };
+        let resolved = crate::setup::resolve(apply(Some(crate::setup::digest(&setup)))).unwrap();
+        assert!(
+            matches!(&resolved, SessionCommand::ApplySetup { name: None, setup: Some(s), .. } if *s == setup)
+        );
+        resolved.validate().unwrap();
+        let stale =
+            crate::setup::resolve(apply(Some(format!("sha256:{}", "0".repeat(64))))).unwrap_err();
+        assert_eq!(
+            stale.to_string(),
+            format!("Setup {name} changed after it was reviewed; preview it again")
+        );
+        assert_eq!(
+            crate::types::error_transport_code(&stale),
+            Some("operation_failed")
+        );
+        // A missing setup fails before it is queued.
+        let handle = SessionHandle::new();
+        let missing = handle
+            .submit(SessionCommand::SetupDiff {
+                name: Some("no-such-setup".into()),
+                setup: None,
+                allow_other_model: false,
+            })
+            .unwrap_err();
+        assert_eq!(
+            crate::types::error_transport_code(&missing),
+            Some("unavailable")
+        );
+        // Comparing is an observation; restoring is an action.
+        let activity = &handle.inner.activity;
+        assert!(
+            activity
+                .begin(ActivityOrigin::Client, Some("sim:0"), &resolved)
+                .is_some()
+        );
+        assert!(
+            activity
+                .begin(
+                    ActivityOrigin::Client,
+                    Some("sim:0"),
+                    &SessionCommand::ReadSetup
+                )
+                .is_none()
+        );
+        store.remove(&name).unwrap();
     }
 }
