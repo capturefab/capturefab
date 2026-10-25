@@ -27,9 +27,11 @@ const GVCP_CAPABILITY: u32 = 0x0934;
 const HEARTBEAT_TIMEOUT: u32 = 0x0938;
 const TIMESTAMP_HIGH: u32 = 0x093c;
 const TIMESTAMP_LOW: u32 = 0x0940;
+const STREAM_CAPABILITY: u32 = 0x092c;
 const STREAM_PORT: u32 = 0x0d00;
 const STREAM_PACKET_SIZE: u32 = 0x0d04;
 const STREAM_ADDRESS: u32 = 0x0d18;
+const STREAM_SOURCE_PORT: u32 = 0x0d1c;
 const SCPS_FIRE: u32 = 0x8000_0000;
 const SCPS_NO_FRAGMENT: u32 = 0x4000_0000;
 const SCPS_BIG_ENDIAN: u32 = 0x2000_0000;
@@ -48,6 +50,7 @@ const RESEND_RETRY: Duration = Duration::from_millis(20);
 const RESEND_ROUNDS: u8 = 3;
 const RESEND_RUNS: usize = 32;
 const RESEND_BUDGET: f64 = 4096.0;
+const TRAVERSAL: Duration = Duration::from_secs(10);
 
 fn be16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
@@ -827,9 +830,12 @@ impl Backend for GigE {
             .lock()
             .map_err(|_| anyhow!("GVCP mutex poisoned"))?;
         let gvcp = control.socket.peer_addr()?;
+        let mut source = None;
         let result = (|| -> Result<(u32, bool, bool)> {
             control.write_register(STREAM_ADDRESS, u32::from(self.host_ip))?;
             control.write_register(STREAM_PORT, port as u32)?;
+            source = stream_source(&mut control, self.camera_ip);
+            traverse(&socket, source);
             let original = control.read_register(STREAM_PACKET_SIZE)?;
             let mut test =
                 |size| probe_packet_size(&mut control, &socket, &mut buffer, camera, size);
@@ -886,9 +892,11 @@ impl Backend for GigE {
                 self.stream = Some(Stream {
                     socket,
                     gvcp,
+                    source,
                     buffer,
                     timeout: POLL,
                     next_poll: Instant::now(),
+                    next_traversal: Instant::now() + TRAVERSAL,
                     request_id: 0,
                     assembler,
                 });
@@ -941,6 +949,7 @@ impl Backend for GigE {
             let tuned = (|| -> Result<(u32, Option<u32>)> {
                 control.write_register(STREAM_ADDRESS, u32::from(self.host_ip))?;
                 control.write_register(STREAM_PORT, port as u32)?;
+                traverse(&socket, stream_source(&mut control, self.camera_ip));
                 let negotiated = ladder(
                     |size| {
                         probe_packet_size(
@@ -1035,6 +1044,10 @@ impl Backend for GigE {
                 self.heartbeat.check()?;
                 stream.assembler.poll(now);
                 stream.flush();
+                if now >= stream.next_traversal {
+                    traverse(&stream.socket, stream.source);
+                    stream.next_traversal = now + TRAVERSAL;
+                }
                 stream.next_poll = now + POLL;
                 continue;
             }
@@ -1139,6 +1152,22 @@ fn host_mtu(host: Ipv4Addr) -> Option<u32> {
         .into_iter()
         .find(|interface| interface.address == host)
         .and_then(|interface| interface.mtu)
+}
+/// The camera's stream source address, when it reports one (SCSP).
+fn stream_source(control: &mut Control, camera: Ipv4Addr) -> Option<SocketAddr> {
+    if control.read_register(STREAM_CAPABILITY).ok()? & 0x8000_0000 == 0 {
+        return None;
+    }
+    let port = control.read_register(STREAM_SOURCE_PORT).ok()? as u16;
+    (port != 0).then(|| SocketAddr::from((camera, port)))
+}
+/// A datagram from the receive socket to the camera's stream source port
+/// lets a stateful host firewall pass the stream as its replies; repeated
+/// while receiving, it keeps that path open through long trigger gaps.
+fn traverse(socket: &UdpSocket, source: Option<SocketAddr>) {
+    if let Some(source) = source {
+        let _ = socket.send_to(&[0; 4], source);
+    }
 }
 fn drain(socket: &UdpSocket, buffer: &mut [u8]) {
     if socket.set_nonblocking(true).is_ok() {
@@ -1310,9 +1339,11 @@ fn decode_xml(name: &str, data: Vec<u8>) -> Result<String> {
 struct Stream {
     socket: UdpSocket,
     gvcp: SocketAddr,
+    source: Option<SocketAddr>,
     buffer: Vec<u8>,
     timeout: Duration,
     next_poll: Instant,
+    next_traversal: Instant,
     request_id: u16,
     assembler: Assembler,
 }
@@ -3349,6 +3380,43 @@ mod tests {
         let probes = fake.camera.lock().unwrap().scps_writes.len();
         gige.start(8000).unwrap();
         assert_eq!(fake.camera.lock().unwrap().scps_writes[probes..], [1500]);
+    }
+    #[test]
+    fn stream_setup_opens_the_firewall_path_from_the_stream_source_port() {
+        for supported in [true, false] {
+            let fake = Fake::new(|camera| {
+                camera.path_mtu = 1500;
+                camera.test_packets = true;
+                if supported {
+                    camera.registers.insert(STREAM_CAPABILITY, 0x8000_0000);
+                }
+            });
+            let source = fake.stream.local_addr().unwrap().port() as u32;
+            fake.camera
+                .lock()
+                .unwrap()
+                .registers
+                .insert(STREAM_SOURCE_PORT, source);
+            fake.stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
+            gige.packet_size = Some(Some(1500));
+            gige.start(8000).unwrap();
+            let stream = gige.stream.as_mut().unwrap();
+            let port = stream.socket.local_addr().unwrap().port();
+            stream.next_traversal = Instant::now();
+            assert!(gige.next_frame(Duration::from_millis(20)).is_err());
+            let mut buffer = [0; 64];
+            for _ in 0..2 {
+                let received = fake.stream.recv_from(&mut buffer);
+                assert_eq!(
+                    received.ok().map(|(_, from)| from.port()),
+                    supported.then_some(port)
+                );
+            }
+            assert_eq!(gige.stats().unwrap().packet_size, Some(1500));
+        }
     }
     #[test]
     fn fake_camera_resends_lost_packets() {
