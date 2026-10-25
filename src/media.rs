@@ -1945,7 +1945,8 @@ fn v4l2_modes(
             ))
         })
         .collect::<Vec<_>>();
-    formats.sort_by_key(|format| format.0);
+    // MJPEG frames decode independently, without H.264's inter-frame delay.
+    formats.sort_by_key(|&(compressed, name, ..)| (compressed, name != "mjpeg"));
     let mut names = Vec::new();
     let mut modes: Vec<Mode> = Vec::new();
     for (_, name, description, sizes) in formats {
@@ -7784,6 +7785,42 @@ Error opening input files: Input/output error
             .set(&mut camera, "AcquisitionFrameRate", "30")
             .unwrap();
         assert_eq!(format(&camera), "mjpeg");
+    }
+    #[test]
+    fn v4l2_modes_prefer_mjpeg_over_h264() {
+        // The original C920 (046d:082d) lists YUYV, then H.264, then MJPEG,
+        // with both compressed formats at 30 down to 5 fps.
+        let (modes, formats) = v4l2_modes(
+            concat!(
+                "[video4linux2,v4l2 @ 0x55d0c8a0c0] Raw       :     yuyv422 :           YUYV 4:2:2 : 640x480 1280x720 1920x1080\n",
+                "[video4linux2,v4l2 @ 0x55d0c8a0c0] Compressed:        h264 :                H.264 : 640x480 1280x720 1920x1080\n",
+                "[video4linux2,v4l2 @ 0x55d0c8a0c0] Compressed:       mjpeg :          Motion-JPEG : 640x480 1280x720 1920x1080\n",
+            ),
+            |description, size| match (description, size) {
+                ("YUYV 4:2:2", (1280, 720)) => Some((5.0, 10.0)),
+                ("YUYV 4:2:2", (1920, 1080)) => Some((5.0, 5.0)),
+                _ => Some((5.0, 30.0)),
+            },
+        );
+        assert_eq!(formats, ["yuyv422", "mjpeg", "h264"]);
+        assert_eq!(
+            modes.iter().map(|m| m.input_format).collect::<Vec<_>>(),
+            [Some(0), Some(0), Some(0), Some(1), Some(1)]
+        );
+        let mut camera = native("v4l2:/dev/video0", modes);
+        camera.formats = formats;
+        camera.configure(NativeOptions::default()).unwrap();
+        assert_eq!(
+            camera.input_options(),
+            [
+                "-framerate",
+                "30",
+                "-video_size",
+                "1920x1080",
+                "-input_format",
+                "mjpeg"
+            ]
+        );
     }
     #[test]
     #[cfg(unix)]
