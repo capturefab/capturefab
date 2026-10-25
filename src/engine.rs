@@ -819,6 +819,97 @@ fn absolute_path(path: &std::path::Path) -> String {
         .to_string_lossy()
         .into_owned()
 }
+/// Acquisition features recorded with each saved still when the camera has
+/// them. The list is fixed, short and holds no addresses or names, so the
+/// snapshot stays small and never carries credentials.
+pub(crate) const ACQUISITION_FEATURES: &[&str] = &[
+    "ExposureTime",
+    "ExposureTimeAbs",
+    "ExposureAuto",
+    "Gain",
+    "GainRaw",
+    "GainAuto",
+    "BlackLevel",
+    "Gamma",
+    "BalanceWhiteAuto",
+    "AcquisitionFrameRate",
+    "AcquisitionFrameRateAbs",
+    "TriggerMode",
+    "TriggerSource",
+    "BinningHorizontal",
+    "BinningVertical",
+    "OffsetX",
+    "OffsetY",
+    "ReverseX",
+    "ReverseY",
+];
+
+/// What a camera was doing when a still was taken: its make and the current
+/// values of [`ACQUISITION_FEATURES`]. Read once per capture command (and per
+/// frame while auto exposure adjusts the camera) and once per scheduled shot.
+#[derive(Debug, Clone, Default)]
+pub(super) struct Acquisition {
+    vendor: String,
+    model: String,
+    pub(super) settings: serde_json::Map<String, Value>,
+}
+
+fn acquisition(c: &mut Camera) -> Acquisition {
+    let mut settings = serde_json::Map::new();
+    for &name in ACQUISITION_FEATURES {
+        if !c.has(name) {
+            continue;
+        }
+        // Unreadable features (locked, unavailable now) are left out.
+        let value = match c.get(name) {
+            Ok(Value::String(text)) => Value::String(bounded(&text, 64)),
+            Ok(value @ (Value::Number(_) | Value::Bool(_))) => value,
+            _ => continue,
+        };
+        settings.insert(name.into(), value);
+    }
+    Acquisition {
+        vendor: bounded(&c.info.vendor, 128),
+        model: bounded(&c.info.model, 128),
+        settings,
+    }
+}
+
+fn bounded(text: &str, max: usize) -> String {
+    text.chars().filter(|c| !c.is_control()).take(max).collect()
+}
+
+/// The provenance JSON written into a saved PNG or JPEG: frame fields, the
+/// camera's make, its acquisition settings and the capture context. Never a
+/// serial, address or source URL, which can identify a site or carry
+/// credentials.
+fn still_meta(
+    frame: &Frame,
+    wall_ms: u64,
+    acquisition: &Acquisition,
+    context: &crate::context::Context,
+) -> Value {
+    let mut meta = json!({
+        "capturefab": env!("CARGO_PKG_VERSION"),
+        "frame_id": frame.id,
+        "timestamp_ns": frame.timestamp_ns,
+        "wall_ms": wall_ms,
+        "width": frame.width,
+        "height": frame.height,
+        "pixel_format": crate::frame::pixel_format_name(frame.pixel_format),
+    });
+    if !acquisition.vendor.is_empty() || !acquisition.model.is_empty() {
+        meta["camera"] = json!({"vendor": acquisition.vendor, "model": acquisition.model});
+    }
+    if !acquisition.settings.is_empty() {
+        meta["settings"] = Value::Object(acquisition.settings.clone());
+    }
+    if !context.is_empty() {
+        meta["context"] = json!(context);
+    }
+    meta
+}
+
 /// Report a locally saved image to the coordinator's dataset.
 #[allow(clippy::too_many_arguments)]
 fn report_image(
@@ -1432,6 +1523,7 @@ fn process_plain(
                 }
                 let label = crate::naming::camera_label(&c.info);
                 let plan = crate::naming::Plan::new(&resolved.output, count, &format);
+                let mut settings = acquisition(c);
                 for index in 0..count {
                     // Pick the name before requesting the frame: a feeder
                     // consumes paper irreversibly, so a taken name in fail
@@ -1459,11 +1551,21 @@ fn process_plain(
                         status = auto.as_ref().map(|a| a.status().clone());
                     }
                     let wall_ms = crate::scheduling::now_ms();
+                    // Auto exposure changes the camera between frames.
+                    if index > 0 && auto.is_some() {
+                        settings = acquisition(c);
+                    }
                     let mut metadata = serde_json::to_value(&frame)?;
                     metadata["bytes"] = json!(frame.data.len());
                     metadata["wall_ms"] = json!(wall_ms);
+                    metadata["pixel_format_name"] =
+                        json!(crate::frame::pixel_format_name(frame.pixel_format));
+                    if !settings.settings.is_empty() {
+                        metadata["settings"] = Value::Object(settings.settings.clone());
+                    }
                     if let Some(first) = first {
-                        let bytes = crate::frame::encode(&frame, &format)?;
+                        let meta = still_meta(&frame, wall_ms, &settings, &context);
+                        let bytes = crate::frame::encode_with_meta(&frame, &format, Some(&meta))?;
                         let (path, stored) = crate::naming::save_named(
                             &h.names,
                             &plan,
@@ -1924,6 +2026,7 @@ fn shoot(
     (!saves.is_empty()).then(|| saver::Shot {
         frame: frame.clone(),
         wall_ms: now,
+        acquisition: Acquisition::default(),
         saves,
     })
 }
@@ -2177,7 +2280,11 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
                     let settled = auto.as_ref().is_none_or(AutoController::converged);
                     // A scanned page is never skipped: it waits for room.
                     let room = c.is_scanner() || saver.has_room();
-                    let shot = shoot(&h, &frame, &mut jobs, settled, room);
+                    let shot =
+                        shoot(&h, &frame, &mut jobs, settled, room).map(|shot| saver::Shot {
+                            acquisition: acquisition(c),
+                            ..shot
+                        });
                     // Publish first: the forwarder then takes the sensor
                     // buffer itself instead of a copy of it, and the saver
                     // works on its own copy.
@@ -3721,6 +3828,44 @@ mod tests {
         assert_eq!(snapshot.logs.len(), logs + 1);
         assert!(snapshot.last_error.unwrap().contains("no camera connected"));
         h.shutdown();
+    }
+    #[test]
+    fn saved_stills_record_settings_and_tags_but_no_serial_or_address() {
+        let mut c = Camera::open("sim:0", &[], Duration::from_secs(5)).unwrap();
+        c.set("ExposureTime", "2500").unwrap();
+        let acquired = acquisition(&mut c);
+        assert_eq!(acquired.settings["ExposureTime"], json!(2500.0));
+        assert!(acquired.settings.contains_key("Gain"));
+        let frame = Frame {
+            id: 7,
+            width: 2,
+            height: 1,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 9,
+            data: vec![0, 0],
+        };
+        let context = crate::context::Context::from([("part".into(), "B-7".into())]);
+        let meta = still_meta(&frame, 11, &acquired, &context);
+        assert_eq!(
+            (&meta["frame_id"], &meta["wall_ms"], &meta["pixel_format"]),
+            (&json!(7), &json!(11), &json!("Mono8"))
+        );
+        assert_eq!(meta["context"]["part"], "B-7");
+        assert_eq!(meta["camera"]["model"], json!(c.info.model));
+        assert_eq!(
+            meta["camera"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["model", "vendor"]
+        );
+        for key in ["serial", "address", "source", "id"] {
+            assert!(meta.get(key).is_none(), "{key}");
+        }
+        // Tagless stills leave the context out.
+        let plain = still_meta(&frame, 11, &Acquisition::default(), &Default::default());
+        assert!(plain.get("context").is_none() && plain.get("camera").is_none());
     }
     #[test]
     fn exposure_measurements_follow_exposure_time_on_the_simulator() {

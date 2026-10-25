@@ -2986,7 +2986,42 @@ fn capture_outputs_number_templates_and_carry_context() {
         assert_eq!(v["result"]["frames"][0]["file"], v["result"]["files"][0]);
         assert!(v["result"]["frames"][0]["wall_ms"].as_u64().unwrap() > 0);
         assert_eq!(v["result"]["context"]["line"], "L1");
+        let frame = &v["result"]["frames"][0];
+        assert_eq!(frame["pixel_format_name"], "Mono8");
+        assert!(frame["settings"]["ExposureTime"].is_number(), "{frame}");
+        // The tags and settings travel inside the file, without a dataset.
+        let reader = png::Decoder::new(std::fs::File::open(path).unwrap())
+            .read_info()
+            .unwrap();
+        assert_eq!(reader.info().color_type, png::ColorType::Grayscale);
+        let embedded = reader
+            .info()
+            .utf8_text
+            .iter()
+            .find(|chunk| chunk.keyword == "capturefab")
+            .unwrap()
+            .get_text()
+            .unwrap();
+        let embedded: Value = serde_json::from_str(&embedded).unwrap();
+        assert_eq!(embedded["context"]["line"], "L1");
+        assert_eq!(embedded["frame_id"], frame["id"]);
+        assert_eq!(embedded["settings"], frame["settings"]);
     }
+    let jpeg = out.join("tagged.jpeg");
+    let output = capture(&[
+        "-o",
+        jpeg.to_str().unwrap(),
+        "--format",
+        "jpeg",
+        "--context",
+        "part=B-7",
+    ]);
+    files(&output);
+    let bytes = std::fs::read(&jpeg).unwrap();
+    let at = bytes.windows(2).position(|w| w == [0xFF, 0xFE]).unwrap();
+    let length = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+    let embedded: Value = serde_json::from_slice(&bytes[at + 4..at + 2 + length]).unwrap();
+    assert_eq!(embedded["context"]["part"], "B-7");
     // A directory continues its numbering.
     let frames = out.join("frames");
     for _ in 0..2 {

@@ -246,6 +246,9 @@ capturefab --camera sim:0 capture -o 'qa/{camera}-{seq}.png' --context line=L1 -
 `--on-exists number` writes `stem-0001.ext`, `stem-0002.ext` and so on.
 A directory output continues its `frame-NNNNNN` numbers.
 `--context KEY=VALUE` tags captures and recordings; keys match `^[a-z][a-z0-9_]{0,31}$`.
+Saved PNG and JPEG files embed compact JSON with frame fields, camera vendor and model, `settings` and `context`: PNG iTXt `capturefab`, JPEG COM.
+The embedded JSON never holds a serial, address or URL; tags, including `note`, travel with the file.
+`frames[].settings` gives allowlisted acquisition features (ExposureTime, Gain, AcquisitionFrameRate and similar) when the camera has them; `frames[].pixel_format_name` names the pixel format.
 Read saved names from `result.files` and `result.frames[].file`.
 `frames[].wall_ms` is UTC milliseconds.
 A recording result gives the resolved file in `path` and the start time in `since_ms`.

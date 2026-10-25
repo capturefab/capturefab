@@ -80,10 +80,23 @@ pub(super) fn context(tags: &CaptureTags) -> crate::context::Context {
         .collect()
 }
 
+/// Where the tags go: into each saved still, and into the dataset `file`
+/// when captures are being cataloged.
+pub(super) fn caption(file: Option<&str>) -> String {
+    match file {
+        Some(file) => format!("Written into each saved PNG and JPEG, and cataloged in {file}."),
+        None => "Written into each saved PNG and JPEG. Turn on Catalog captures \
+                 automatically in Dataset to search them later."
+            .into(),
+    }
+}
+
 /// The inspector's section: a summary of the tags, and their fields when open.
+/// `dataset_open` hides the link to a Dataset section already shown.
 pub(super) fn view<'a>(
     bench: &'a Workbench,
     open: bool,
+    dataset_open: bool,
     p: &'static Palette,
 ) -> Option<Element<'a, Message>> {
     let tags = &bench.tags;
@@ -110,11 +123,26 @@ pub(super) fn view<'a>(
     if !open {
         return Some(section.into());
     }
-    section = section.push(
-        text("Saved with every capture and recording, and in the dataset.")
-            .size(style::SMALL)
-            .color(p.secondary),
-    );
+    section = section.push(match dataset::catalog(bench) {
+        Some(file) => Element::from(
+            text(caption(Some(&file)))
+                .size(style::SMALL)
+                .color(p.secondary),
+        ),
+        None => {
+            let mut note =
+                column![text(caption(None)).size(style::SMALL).color(p.ink(p.warn))].spacing(2);
+            if !dataset_open {
+                note = note.push(
+                    button(text("Show Dataset").size(style::SMALL).font(style::MEDIUM))
+                        .padding([3, 0])
+                        .style(style::link)
+                        .on_press(Message::InspectorDisclosure(inspector::Section::Dataset)),
+                );
+            }
+            note.into()
+        }
+    });
     let invalid = crate::context::validate(&context).err();
     for field in TagField::ALL {
         section = section.push(
@@ -150,6 +178,15 @@ pub(super) fn view<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caption_says_where_tags_go() {
+        assert_eq!(
+            caption(Some("capturefab.duckdb")),
+            "Written into each saved PNG and JPEG, and cataloged in capturefab.duckdb."
+        );
+        assert!(caption(None).contains("Turn on Catalog captures automatically"));
+    }
 
     #[test]
     fn context_drops_empty_tags_and_trims() {

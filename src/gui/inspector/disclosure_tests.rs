@@ -934,3 +934,24 @@ fn quick_recording_ignores_an_unfinished_stream_url() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn capture_tags_say_whether_the_dataset_catalogs_them() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let _ = app.update(Message::InspectorDisclosure(Section::CaptureTags));
+    let mut tree = Tree::empty();
+    let off = snapshot(&app, Pane::Capture, &mut tree, &renderer);
+    let caption = super::super::tags::caption(None);
+    assert!(
+        labels(&off).contains(&caption.as_str()),
+        "{:?}",
+        labels(&off)
+    );
+    named(&off, "Show Dataset");
+    let _ = app.update(Message::Dataset(super::super::dataset::Msg::Auto(true)));
+    let on = snapshot(&app, Pane::Capture, &mut tree, &renderer);
+    let caption = super::super::tags::caption(Some("capturefab.duckdb"));
+    assert!(labels(&on).contains(&caption.as_str()), "{:?}", labels(&on));
+    assert!(!labels(&on).contains(&"Show Dataset"));
+}

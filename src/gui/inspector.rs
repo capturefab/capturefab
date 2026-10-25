@@ -2805,7 +2805,12 @@ impl Workbench {
         }
         column![
             section_slot(Some(save.into())),
-            section_slot(super::tags::view(self, self.inspect.tags_open, p)),
+            section_slot(super::tags::view(
+                self,
+                self.inspect.tags_open,
+                self.inspect.dataset_open,
+                p,
+            )),
             section_slot(
                 (self.schedule_enabled || !self.snapshot.jobs.is_empty()).then(|| self.jobs(p))
             ),

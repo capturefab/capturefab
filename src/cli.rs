@@ -2535,10 +2535,21 @@ fn schema() -> Value {
         "cli":"--context KEY=VALUE (repeatable)","keys":"^[a-z][a-z0-9_]{0,31}$",
         "max_entries":crate::context::MAX_ENTRIES,"max_value_bytes":crate::context::MAX_VALUE,
         "duplicate_key":"usage error (exit 2)",
-        "recorded":"echoed in the capture result, kept on scheduled jobs and stored with each file in an open dataset"
+        "recorded":"echoed in the capture result, kept on scheduled jobs and stored with each file in an open dataset",
+        "embedded":"written into each saved PNG (iTXt 'capturefab' JSON, and Description as key=value; ...) and JPEG (COM JSON), including note"
+    });
+    contract["capture"]["metadata"] = json!({
+        "png":"iTXt chunk with keyword 'capturefab' holding compact JSON; tags also in iTXt 'Description'",
+        "jpeg":"COM segment holding the same JSON",
+        "none":["raw","pgm","ppm"],
+        "fields":"{capturefab:version,frame_id,timestamp_ns,wall_ms,width,height,pixel_format:name,camera?:{vendor,model},settings?,context?}",
+        "settings":crate::engine::ACQUISITION_FEATURES,
+        "excludes":"serial numbers, addresses and source URLs",
+        "max_bytes":crate::frame::MAX_META,
+        "channels":"monochrome PNG and PGM are one 8-bit gray channel; color and Bayer PNG are 8-bit RGB"
     });
     contract["capture"]["result"] = json!({
-        "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?}",
+        "capture":"{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,wall_ms,settings?,file?}],count,context?,destination?}; settings maps the camera's allowlisted acquisition features to their values",
         "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the conditional-stop result",
         "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, and forwarding_until_ms while a timed recording or forward runs",
         "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback and assistant cleanup use this form; explicit human stop-forward stops the current instance."},

@@ -69,6 +69,16 @@ impl Auto {
     }
 }
 
+/// The dataset file captures are cataloged in, or will be on the first
+/// save; `None` when nothing catalogs them.
+pub(super) fn catalog(bench: &Workbench) -> Option<String> {
+    match (bench.snapshot.dataset.as_ref(), Auto::of(&bench.handle)) {
+        (Some(status), _) => Some(file_name(&status.path)),
+        (None, Auto::Armed) => Some(file_name(&auto_path().to_string_lossy())),
+        _ => None,
+    }
+}
+
 fn summary(status: Option<&DatasetStatus>, auto: &Auto) -> String {
     match status {
         None => match auto {

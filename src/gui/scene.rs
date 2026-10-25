@@ -243,7 +243,8 @@ impl Workbench {
     ///   `recording` (the selected camera records to a file, for 1:23),
     ///   `timed` (with `recording`: the session stops it after 1 h)
     /// - `tags`: the capture tags filled in and open; `dataset`: the Dataset
-    ///   section open; `side-hub`: cameras from saved hubs in the camera
+    ///   section open; `catalog`: Catalog captures automatically ticked;
+    ///   `side-hub`: cameras from saved hubs in the camera
     ///   list (with `welcome`, on the welcome cards)
     /// - review fixtures: `network`, `network-empty`, `network-error`,
     ///   `destinations-remove`, `folder-error`, `settings-credentials`,
@@ -372,6 +373,9 @@ impl Workbench {
                 "dataset" => {
                     let _ = self
                         .handle_message(Message::InspectorDisclosure(inspector::Section::Dataset));
+                }
+                "catalog" => {
+                    let _ = self.handle_message(Message::Dataset(dataset::Msg::Auto(true)));
                 }
                 "connect-failed" => {
                     let target = "192.168.10.50";

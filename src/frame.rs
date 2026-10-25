@@ -1,6 +1,6 @@
 //! Bounded PFNC image conversion and portable output without image codecs from the OS.
 use crate::types::{Frame, MONO8, RGB8};
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use std::io::Write;
 
 pub fn pixel_format_name(format: u32) -> &'static str {
@@ -56,11 +56,7 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
                 frame.data.len() >= pixels * 2,
                 "truncated unpacked monochrome frame"
             );
-            let shift = match frame.pixel_format {
-                0x0110_0003 => 2,
-                0x0110_0005 => 4,
-                _ => 8,
-            };
+            let shift = unpacked_shift(frame.pixel_format).unwrap_or(8);
             let data = &frame.data[..pixels * 2];
             gray(&mut out, |i| {
                 (u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) >> shift).min(255) as u8
@@ -69,6 +65,40 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
         _ => return Ok(convert(frame, |p| p)?.into_flattened()),
     }
     Ok(out)
+}
+/// How far an unpacked 16-bit monochrome sample shifts right to its top 8
+/// bits: Mono10 keeps bits 9-2, Mono12 bits 11-4, and the full-range 16-bit
+/// formats their high byte. None for every other format.
+fn unpacked_shift(format: u32) -> Option<u32> {
+    match format {
+        0x0110_0003 => Some(2),
+        0x0110_0005 => Some(4),
+        0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => Some(8),
+        _ => None,
+    }
+}
+/// One 8-bit sample per pixel for the monochrome family, with the same bit
+/// choice as [`rgb`]; None for color and Bayer formats, which stay RGB.
+pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
+    let pixels = checked_pixels(frame)?;
+    if matches!(frame.pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6) {
+        ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
+        return Ok(Some(frame.data[..pixels].to_vec()));
+    }
+    let Some(shift) = unpacked_shift(frame.pixel_format) else {
+        return Ok(None);
+    };
+    ensure!(
+        frame.data.len() >= pixels * 2,
+        "truncated unpacked monochrome frame"
+    );
+    let samples = frame.data[..pixels * 2].as_chunks::<2>().0;
+    Ok(Some(
+        samples
+            .iter()
+            .map(|p| (u16::from_le_bytes(*p) >> shift).min(255) as u8)
+            .collect(),
+    ))
 }
 /// Opaque RGBA bytes, converted in one pass without an intermediate RGB image.
 pub fn rgba(frame: &Frame) -> Result<Vec<u8>> {
@@ -851,50 +881,86 @@ pub fn luminance_histogram(rgba: &[u8]) -> [u32; 64] {
     bins
 }
 
+/// The most bytes of provenance JSON a saved still carries. Context (16
+/// entries of at most 256 bytes) and the fixed allowlist of settings keep it
+/// well under this.
+pub const MAX_META: usize = 16 * 1024;
+
 pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
+    encode_with_meta(frame, format, None)
+}
+
+/// Encode a still, writing `meta` (compact provenance JSON) into PNG as an
+/// iTXt chunk named `capturefab` and into JPEG as a COM segment. Raw, PPM and
+/// PGM have no place for it and stay plain. Monochrome PNG and PGM are one
+/// 8-bit gray channel; color and Bayer are 8-bit RGB.
+pub fn encode_with_meta(
+    frame: &Frame,
+    format: &str,
+    meta: Option<&serde_json::Value>,
+) -> Result<Vec<u8>> {
+    let json = meta.map(serde_json::to_string).transpose()?;
+    if let Some(json) = &json {
+        ensure!(
+            json.len() <= MAX_META,
+            "capture metadata exceeds {MAX_META} bytes"
+        );
+    }
     if format == "raw" {
         return Ok(frame.data.clone());
     }
     if format == "jpeg" {
-        return crate::jpeg::encode(frame);
+        let bytes = crate::jpeg::encode(frame)?;
+        return match &json {
+            Some(json) => crate::jpeg::insert_com(&bytes, json.as_bytes()),
+            None => Ok(bytes),
+        };
     }
-    let rgb = rgb(frame)?;
     let mut bytes = Vec::new();
     match format {
         "png" => {
+            let (color, samples) = match gray8(frame)? {
+                Some(gray) => (png::ColorType::Grayscale, gray),
+                None => (png::ColorType::Rgb, rgb(frame)?),
+            };
             let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
-            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_color(color);
             encoder.set_depth(png::BitDepth::Eight);
             // A fixed Paeth filter reduces camera-texture output size without
             // running all five filters for every scanline.
             encoder.set_filter(png::FilterType::Paeth);
-            encoder.write_header()?.write_image_data(&rgb)?;
+            if let Some(json) = json {
+                // Tags also go in the standard Description, which general
+                // image tools display.
+                if let Some(description) = meta.and_then(description) {
+                    encoder.add_itxt_chunk("Description".into(), description)?;
+                }
+                encoder.add_itxt_chunk("capturefab".into(), json)?;
+            }
+            encoder.write_header()?.write_image_data(&samples)?;
         }
         "ppm" => {
             write!(bytes, "P6\n{} {}\n255\n", frame.width, frame.height)?;
-            bytes.extend_from_slice(&rgb);
+            bytes.extend_from_slice(&rgb(frame)?);
         }
         "pgm" => {
-            ensure!(
-                matches!(
-                    frame.pixel_format,
-                    MONO8
-                        | 0x0108_00b1
-                        | 0x0108_00c6
-                        | 0x0110_0003
-                        | 0x0110_0005
-                        | 0x0110_0007
-                        | 0x0110_00b8
-                        | 0x0110_00c7
-                ),
-                "PGM requires a monochrome image; use PNG or PPM"
-            );
+            let gray = gray8(frame)?.context("PGM requires a monochrome image; use PNG or PPM")?;
             write!(bytes, "P5\n{} {}\n255\n", frame.width, frame.height)?;
-            bytes.extend(rgb.as_chunks::<3>().0.iter().map(|p| p[0]));
+            bytes.extend_from_slice(&gray);
         }
         _ => bail!("unknown image format {format}; use png, jpeg, raw, pgm or ppm"),
     }
     Ok(bytes)
+}
+
+/// The context tags of provenance JSON as `key=value; ...`, if it has any.
+fn description(meta: &serde_json::Value) -> Option<String> {
+    let context = meta.get("context")?.as_object()?;
+    let tags = context
+        .iter()
+        .filter_map(|(key, value)| Some(format!("{key}={}", value.as_str()?)))
+        .collect::<Vec<_>>();
+    (!tags.is_empty()).then(|| tags.join("; "))
 }
 
 #[cfg(test)]
@@ -1658,12 +1724,119 @@ mod tests {
                 <= 65_536
         );
     }
-    #[test]
-    fn png_roundtrip() {
-        let data = encode(&f(MONO8, vec![0, 255]), "png").unwrap();
-        let mut reader = png::Decoder::new(data.as_slice()).read_info().unwrap();
+    fn decode_png(data: &[u8]) -> (png::ColorType, png::BitDepth, Vec<u8>, png::Info<'static>) {
+        let mut reader = png::Decoder::new(data).read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size()];
-        reader.next_frame(&mut buf).unwrap();
-        assert_eq!(buf, vec![0, 0, 0, 255, 255, 255]);
+        let out = reader.next_frame(&mut buf).unwrap();
+        buf.truncate(out.buffer_size());
+        let info = reader.info().clone();
+        (out.color_type, out.bit_depth, buf, info)
+    }
+    #[test]
+    fn png_is_gray_for_mono_and_rgb_otherwise() {
+        let sized = |fmt, data: Vec<u8>| Frame {
+            width: 4,
+            height: 2,
+            ..f(fmt, data)
+        };
+        let mono = sized(MONO8, (0..8).map(|i| i * 30).collect());
+        let (color, depth, samples, _) = decode_png(&encode(&mono, "png").unwrap());
+        assert_eq!(
+            (color, depth),
+            (png::ColorType::Grayscale, png::BitDepth::Eight)
+        );
+        assert_eq!(samples, mono.data);
+        // Mono12 keeps its top 8 bits, the same as JPEG and the preview.
+        let mono12 = sized(
+            0x0110_0005,
+            [0x0ABCu16; 8]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        );
+        let (color, depth, samples, _) = decode_png(&encode(&mono12, "png").unwrap());
+        assert_eq!(
+            (color, depth),
+            (png::ColorType::Grayscale, png::BitDepth::Eight)
+        );
+        assert_eq!(samples, vec![0xAB; 8]);
+        for color_frame in [sized(RGB8, vec![7; 24]), sized(0x0108_0009, vec![7; 8])] {
+            let (color, depth, samples, _) = decode_png(&encode(&color_frame, "png").unwrap());
+            assert_eq!((color, depth), (png::ColorType::Rgb, png::BitDepth::Eight));
+            assert_eq!(samples, rgb(&color_frame).unwrap());
+        }
+    }
+    #[test]
+    fn pgm_matches_the_red_channel_of_rgb() {
+        for fmt in [
+            MONO8,
+            0x0108_00b1,
+            0x0108_00c6,
+            0x0110_0003,
+            0x0110_0005,
+            0x0110_0007,
+            0x0110_00b8,
+            0x0110_00c7,
+        ] {
+            let bytes = if fmt >> 16 == 0x0110 { 4 } else { 2 };
+            let frame = f(fmt, (0..bytes).map(|i| i as u8 * 77 + 3).collect());
+            let mut expected = b"P5\n2 1\n255\n".to_vec();
+            expected.extend(rgb(&frame).unwrap().as_chunks::<3>().0.iter().map(|p| p[0]));
+            assert_eq!(encode(&frame, "pgm").unwrap(), expected, "{fmt:#x}");
+        }
+        assert!(encode(&f(RGB8, vec![0; 6]), "pgm").is_err());
+    }
+    #[test]
+    fn metadata_goes_into_png_and_jpeg() {
+        let meta = serde_json::json!({"frame_id":1,"context":{"part":"B-7","line":"L1"}});
+        let frame = f(MONO8, vec![0, 255]);
+        let (_, _, _, info) = decode_png(&encode_with_meta(&frame, "png", Some(&meta)).unwrap());
+        let text = |key: &str| {
+            info.utf8_text
+                .iter()
+                .find(|chunk| chunk.keyword == key)
+                .map(|chunk| chunk.get_text().unwrap())
+        };
+        let embedded: serde_json::Value =
+            serde_json::from_str(&text("capturefab").unwrap()).unwrap();
+        assert_eq!(embedded, meta);
+        assert_eq!(text("Description").unwrap(), "line=L1; part=B-7");
+        // Without tags only the provenance chunk is written.
+        let plain = serde_json::json!({"frame_id":1});
+        let (_, _, _, info) = decode_png(&encode_with_meta(&frame, "png", Some(&plain)).unwrap());
+        assert_eq!(info.utf8_text.len(), 1);
+        assert!(
+            decode_png(&encode(&frame, "png").unwrap())
+                .3
+                .utf8_text
+                .is_empty()
+        );
+        // Formats without a metadata field stay byte-identical.
+        for format in ["raw", "pgm", "ppm"] {
+            assert_eq!(
+                encode_with_meta(&frame, format, Some(&meta)).unwrap(),
+                encode(&frame, format).unwrap()
+            );
+        }
+        let huge = serde_json::json!({"context":{"note":"x".repeat(MAX_META)}});
+        assert!(encode_with_meta(&frame, "png", Some(&huge)).is_err());
+    }
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn jpeg_carries_metadata_as_a_comment() {
+        let meta = serde_json::json!({"context":{"part":"B-7"}});
+        let frame = Frame {
+            width: 16,
+            height: 16,
+            ..f(MONO8, vec![90; 256])
+        };
+        let bytes = encode_with_meta(&frame, "jpeg", Some(&meta)).unwrap();
+        assert!(crate::jpeg::well_formed(&bytes, 16, 16));
+        let image = turbojpeg::decompress(&bytes, turbojpeg::PixelFormat::GRAY).unwrap();
+        assert_eq!((image.width, image.height), (16, 16));
+        let json = meta.to_string();
+        let at = bytes.windows(2).position(|w| w == [0xFF, 0xFE]).unwrap();
+        let length = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+        assert_eq!(&bytes[at + 4..at + 2 + length], json.as_bytes());
     }
 }
