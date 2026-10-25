@@ -392,22 +392,20 @@ struct UsbBackend {
 /// Longest stream transfer, as in Aravis: payload transfers are this long at
 /// most.
 const MAX_TRANSFER: usize = 1024 * 1024;
-/// Stream transfer bytes kept submitted, as Aravis caps them.
-const MAX_WINDOW: usize = 8 * 1024 * 1024;
 /// Fewest stream transfers kept submitted.
 const MIN_TRANSFERS: usize = 4;
 /// Linux's errno when usbfs memory cannot cover another transfer.
 const ENOMEM: u32 = 12;
 const USBFS_EXHAUSTED: &str = "USB stream transfers cannot be submitted because usbfs memory is exhausted; raise /sys/module/usbcore/parameters/usbfs_memory_mb";
 
-/// Bytes of stream transfers to keep submitted. Linux charges every usbfs
-/// transfer, mapped or copied, against one limit that all USB devices on
-/// the computer share, so each USB3 Vision camera takes an equal share of
-/// half of it.
+/// Bytes of stream transfers to keep submitted, unbounded without a usbfs
+/// limit. Linux charges every usbfs transfer, mapped or copied, against one
+/// limit that all USB devices on the computer share, so each USB3 Vision
+/// camera takes an equal share of half of it.
 fn window(usbfs_memory_mb: Option<u64>, cameras: usize) -> usize {
     match usbfs_memory_mb {
-        Some(mb) if mb > 0 => MAX_WINDOW.min(((mb.min(4095) as usize) << 20) / 2 / cameras.max(1)),
-        _ => MAX_WINDOW,
+        Some(mb) if mb > 0 => ((mb.min(4095) as usize) << 20) / 2 / cameras.max(1),
+        _ => usize::MAX,
     }
 }
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1790,9 +1788,9 @@ mod tests {
         assert_eq!(window(Some(16), 1), 8 * MIB);
         assert_eq!(window(Some(16), 2), 4 * MIB);
         assert_eq!(window(Some(4), 1), 2 * MIB);
-        assert_eq!(window(Some(0), 1), 8 * MIB);
-        assert_eq!(window(Some(1000), 3), 8 * MIB);
-        assert_eq!(window(None, 4), 8 * MIB);
+        assert_eq!(window(Some(256), 1), 128 * MIB);
+        assert_eq!(window(Some(0), 1), usize::MAX);
+        assert_eq!(window(None, 4), usize::MAX);
         let submitted = |layout: Layout| layout.request * layout.transfers;
         // 4000x3000 Mono8 and 5472x3648 Mono8 at Linux's default limit.
         for expected in [12_000_000, 19_961_856] {
@@ -1809,8 +1807,17 @@ mod tests {
             (vga.block, vga.count, vga.tail, vga.transfers),
             (307_200, 1, 0, 6)
         );
-        let tail = layout(2_304_000, MPS, MPS, MPS, MAX_WINDOW).unwrap();
+        let tail = layout(2_304_000, MPS, MPS, MPS, window(Some(16), 1)).unwrap();
         assert_eq!((tail.count, tail.tail), (2, 206_848));
+        // Without a usbfs limit, or with a raised one, large frames keep two
+        // frames of transfers submitted too.
+        for limit in [None, Some(0), Some(256)] {
+            let unlimited = layout(12_000_000, MPS, MPS, MPS, window(limit, 1)).unwrap();
+            assert_eq!(
+                (unlimited.block, unlimited.count, unlimited.transfers),
+                (MIB, 11, 28)
+            );
+        }
     }
     #[test]
     fn stream_endpoint_reset_halts_it_first() {
