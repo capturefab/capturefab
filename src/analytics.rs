@@ -1063,6 +1063,114 @@ fn plot_error<E: std::fmt::Debug>(error: E) -> anyhow::Error {
     anyhow!("render analytics SVG: {error:?}")
 }
 
+/// What a time chart's header says about its series: the latest value large,
+/// then a one-line summary, so the first question needs no axis reading.
+struct Readout {
+    latest: String,
+    summary: String,
+    /// The summary for a panel too narrow for the full sentence.
+    brief: String,
+}
+
+fn readout(caption: &str, values: &[f64], lost: u64) -> Readout {
+    let unit = match caption {
+        "Frame rate" => " fps",
+        "Throughput" => " MiB/s",
+        _ => "%",
+    };
+    let Some(&last) = values.last() else {
+        return Readout {
+            latest: String::new(),
+            summary: "Waiting for measurements".to_owned(),
+            brief: "Waiting".to_owned(),
+        };
+    };
+    let average = values.iter().sum::<f64>() / values.len() as f64;
+    let peak = values.iter().copied().fold(0.0_f64, f64::max);
+    let (summary, brief) = if unit == "%" {
+        if lost == 0 {
+            (
+                "None missed in this window".to_owned(),
+                "None missed".to_owned(),
+            )
+        } else {
+            (
+                format!("{} missed · peak {}%", compact(lost), readout_number(peak)),
+                format!("{} missed", compact(lost)),
+            )
+        }
+    } else {
+        (
+            format!(
+                "Average {} · peak {}",
+                readout_number(average),
+                readout_number(peak)
+            ),
+            format!("Peak {}", readout_number(peak)),
+        )
+    };
+    Readout {
+        latest: format!("{}{unit}", readout_number(last)),
+        summary,
+        brief,
+    }
+}
+
+/// A generous estimate of a line's width in pixels: SVG text is laid out by
+/// the viewer, so the header plans with wide average glyphs.
+fn text_width(text: &str, requested_size: f64) -> f64 {
+    // plotters-svg emits requested sizes divided by 1.24 (see `label_size`).
+    text.chars().count() as f64 * requested_size / 1.24 * 0.6
+}
+
+/// Where a time chart's header puts its lines in a panel `width` wide.
+#[derive(Debug, PartialEq)]
+struct HeaderLayout<'a> {
+    /// The latest value sits under the title rather than opposite it.
+    stacked: bool,
+    summary: &'a str,
+    /// Height reserved above the plot.
+    height: u32,
+}
+
+fn header_layout<'a>(
+    caption: &str,
+    header: &'a Readout,
+    width: u32,
+    options: SvgOptions,
+) -> HeaderLayout<'a> {
+    let available = width.saturating_sub(28) as f64;
+    let stacked = text_width(caption, options.caption_size())
+        + 16.0
+        + text_width(&header.latest, options.caption_size())
+        > available;
+    let summary = if text_width(&header.summary, options.label_size()) > available {
+        &header.brief
+    } else {
+        &header.summary
+    };
+    HeaderLayout {
+        stacked,
+        summary,
+        height: if stacked { 83 } else { 60 },
+    }
+}
+
+/// A header figure: one decimal below a hundred, then compact thousands.
+fn readout_number(value: f64) -> String {
+    if !value.is_finite() || value < 0.0 {
+        "0".to_owned()
+    } else if value >= 1e3 {
+        interface_axis_label(&value)
+    } else if value >= 100.0 {
+        format!("{value:.0}")
+    } else if value > 0.0 && value < 0.05 {
+        format!("{value:.2}")
+    } else {
+        format!("{value:.1}")
+    }
+}
+
 fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
     area: &DrawingArea<SVGBackend<'_>, Shift>,
     report: &AnalyticsSnapshot,
@@ -1072,6 +1180,7 @@ fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
     value: F,
     options: SvgOptions,
 ) -> Result<()> {
+    use plotters::style::text_anchor::{HPos, Pos, VPos};
     let first = report
         .points
         .first()
@@ -1082,34 +1191,67 @@ fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
         .map_or(first + 1000, |p| p.timestamp_ms)
         .max(first + 1000);
     let span = (last - first) as f64 / 1000.0;
-    let maximum = report
+    let values: Vec<f64> = report.points.iter().map(&value).collect();
+    let maximum = values.iter().copied().fold(0.0_f64, f64::max).max(1.0) * 1.18;
+    // The header replaces plotters' centered caption: title at the left
+    // edge, in line with the camera panel's, and the latest value opposite.
+    let inset = 14;
+    let (width, _) = area.dim_in_pixel();
+    let caption_font = (options.font_family(), options.caption_size()).into_font();
+    let label_font = (options.font_family(), options.label_size()).into_font();
+    let lost = report
         .points
         .iter()
-        .map(&value)
-        .fold(0.0_f64, f64::max)
-        .max(1.0)
-        * 1.18;
-    let mut chart = ChartBuilder::on(area)
+        .fold(0_u64, |sum, p| sum.saturating_add(p.lost));
+    let header = readout(caption, &values, lost);
+    let layout = header_layout(caption, &header, width, options);
+    area.draw(&Text::new(
+        caption.to_owned(),
+        (inset, 17),
+        caption_font
+            .clone()
+            .color(&rgb(options.colors.text))
+            .pos(Pos::new(HPos::Left, VPos::Top)),
+    ))
+    .map_err(plot_error)?;
+    area.draw(&Text::new(
+        header.latest.clone(),
+        if layout.stacked {
+            (inset, 40)
+        } else {
+            (width as i32 - inset, 17)
+        },
+        caption_font.color(&rgb(options.colors.text)).pos(Pos::new(
+            if layout.stacked {
+                HPos::Left
+            } else {
+                HPos::Right
+            },
+            VPos::Top,
+        )),
+    ))
+    .map_err(plot_error)?;
+    area.draw(&Text::new(
+        layout.summary.to_owned(),
+        (inset, layout.height as i32 - 20),
+        label_font
+            .clone()
+            .color(&rgb(options.colors.secondary))
+            .pos(Pos::new(HPos::Left, VPos::Top)),
+    ))
+    .map_err(plot_error)?;
+    let plot = area.margin(layout.height, 0, 0, 0);
+    let mut chart = ChartBuilder::on(&plot)
         .margin(if options.interface { 12 } else { 18 })
-        .caption(
-            caption,
-            (options.font_family(), options.caption_size())
-                .into_font()
-                .color(&rgb(options.colors.text)),
-        )
         .x_label_area_size(if options.interface { 42 } else { 46 })
-        .y_label_area_size(if options.interface { 60 } else { 64 })
+        .y_label_area_size(if options.interface { 40 } else { 64 })
         .build_cartesian_2d(0.0..span, 0.0..maximum)
         .map_err(plot_error)?;
     let mut mesh = chart.configure_mesh();
+    // Only the labelled ticks get hairlines; the minor grid between them
+    // read as a hatched fill behind the data.
     mesh.disable_x_mesh()
-        .light_line_style(
-            rgb(options.colors.axis).mix(if options.colors.increased_contrast {
-                0.3
-            } else {
-                0.12
-            }),
-        )
+        .max_light_lines(0)
         .bold_line_style(
             rgb(options.colors.axis).mix(if options.colors.increased_contrast {
                 0.5
@@ -1117,12 +1259,14 @@ fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
                 0.2
             }),
         )
-        .axis_style(rgb(options.colors.axis).mix(if options.interface { 1.0 } else { 0.4 }))
-        .label_style(
-            (options.font_family(), options.label_size())
-                .into_font()
-                .color(&rgb(options.colors.secondary)),
+        .axis_style(
+            rgb(options.colors.axis).mix(if options.colors.increased_contrast {
+                1.0
+            } else {
+                0.5
+            }),
         )
+        .label_style(label_font.clone().color(&rgb(options.colors.secondary)))
         .x_labels(if options.interface && area.dim_in_pixel().0 < 272 {
             2
         } else if options.interface && area.dim_in_pixel().0 < 430 {
@@ -1137,28 +1281,27 @@ fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
         } else {
             "Time in retained window"
         })
-        .y_desc(unit)
-        .axis_desc_style(
-            (options.font_family(), options.label_size())
-                .into_font()
-                .color(&rgb(options.colors.secondary)),
-        );
+        .axis_desc_style(label_font.color(&rgb(options.colors.secondary)));
     if options.interface {
+        // The unit rides the header value; the axis keeps only numbers.
         mesh.y_label_formatter(&interface_axis_label);
+    } else {
+        mesh.y_desc(unit);
     }
     mesh.draw().map_err(plot_error)?;
     let points: Vec<_> = report
         .points
         .iter()
-        .map(|p| {
+        .zip(&values)
+        .map(|(p, value)| {
             (
                 (p.timestamp_ms.saturating_sub(first)) as f64 / 1000.0,
-                value(p),
+                *value,
             )
         })
         .collect();
     chart
-        .draw_series(AreaSeries::new(points.clone(), 0.0, color.mix(0.12)))
+        .draw_series(AreaSeries::new(points.clone(), 0.0, color.mix(0.1)))
         .map_err(plot_error)?;
     chart
         .draw_series(LineSeries::new(
@@ -1171,8 +1314,13 @@ fn draw_time_chart<F: Fn(&AnalyticsPoint) -> f64>(
         ))
         .map_err(plot_error)?;
     if let Some(last) = points.last() {
+        // The newest value: an 8px dot in a 2px surface ring, so it stays
+        // legible where it sits on the line or the axis.
         chart
-            .draw_series(std::iter::once(Circle::new(*last, 3, color.filled())))
+            .draw_series([
+                Circle::new(*last, 6, rgb(options.colors.background).filled()),
+                Circle::new(*last, 4, color.filled()),
+            ])
             .map_err(plot_error)?;
     }
     Ok(())
@@ -1189,11 +1337,11 @@ fn draw_interface_cameras(
     let available = width.saturating_sub(inset * 2);
     area.draw(&Text::new(
         "Camera data volume",
-        (width as i32 / 2, 17),
+        (inset as i32, 17),
         (options.font_family(), options.caption_size())
             .into_font()
             .color(&rgb(options.colors.text))
-            .pos(Pos::new(HPos::Center, VPos::Top)),
+            .pos(Pos::new(HPos::Left, VPos::Top)),
     ))
     .map_err(plot_error)?;
     let maximum = cameras
@@ -1283,7 +1431,10 @@ fn interface_camera_name(name: &str, budget: u32) -> String {
 }
 
 fn interface_axis_label(value: &f64) -> String {
-    if *value >= 1e12 {
+    if *value == 0.0 {
+        // The baseline reads as a plain zero beside whole-number ticks.
+        "0".to_owned()
+    } else if *value >= 1e12 {
         format!("{value:.0e}")
     } else if *value >= 1e9 {
         format!("{:.0}G", value / 1e9)
@@ -1315,7 +1466,7 @@ fn draw_camera_chart(
     let (width, height) = area.dim_in_pixel();
     area.draw(&Text::new(
         "Camera data volume",
-        ((width as i32 - 170) / 2, 32),
+        (14, 17),
         ("sans-serif", 19).into_font().color(&TEXT),
     ))
     .map_err(plot_error)?;

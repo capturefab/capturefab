@@ -177,6 +177,10 @@ fn camera_panel<'a>(
         .max()
         .unwrap_or(1)
         .max(1);
+    // In floating point, so byte counts near u64::MAX cannot saturate it.
+    let total: f64 = cameras.iter().map(|camera| camera.bytes as f64).sum();
+    // One camera is all of the data: a full bar would only restate that.
+    let compared = cameras.len() > 1;
     let mut body = column![accessibility::label(
         text("Camera data volume")
             .font(style::SANS)
@@ -202,11 +206,20 @@ fn camera_panel<'a>(
         } else {
             &camera.name
         };
-        let value = format!(
-            "{} · {} bytes",
-            human_bytes(camera.bytes),
-            grouped(camera.bytes)
-        );
+        let value = if compared && total > 0.0 {
+            format!(
+                "{} · {} of shown · {} bytes",
+                human_bytes(camera.bytes),
+                share(camera.bytes, total),
+                grouped(camera.bytes)
+            )
+        } else {
+            format!(
+                "{} · {} bytes",
+                human_bytes(camera.bytes),
+                grouped(camera.bytes)
+            )
+        };
         let mut content = column![
             text(name)
                 .font(style::SANS)
@@ -227,24 +240,29 @@ fn camera_panel<'a>(
                     .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
             );
         }
-        let content = content.extend([
+        let mut content = content.push(
             text(value)
                 .font(style::SANS)
                 .size(12)
                 .color(p.secondary)
                 .width(Length::Fill)
                 .shaping(iced::widget::text::Shaping::Advanced)
-                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                .into(),
-            progress_bar(0.0..=1.0, (camera.bytes as f64 / maximum as f64) as f32)
-                .girth(6)
-                .style(move |_| iced::widget::progress_bar::Style {
-                    background: p.field.into(),
-                    bar: data_color.into(),
-                    border: iced::Border::default(),
-                })
-                .into(),
-        ]);
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
+        );
+        if compared {
+            content = content.push(
+                progress_bar(0.0..=1.0, (camera.bytes as f64 / maximum as f64) as f32)
+                    .girth(6)
+                    .style(move |_| iced::widget::progress_bar::Style {
+                        background: p.field.into(),
+                        bar: data_color.into(),
+                        border: iced::Border {
+                            radius: 3.0.into(),
+                            ..Default::default()
+                        },
+                    }),
+            );
+        }
         body = body.push(accessibility::group_with_id(
             content.into(),
             if name == &camera.id {
@@ -263,6 +281,19 @@ fn camera_panel<'a>(
             ..Default::default()
         })
         .into()
+}
+
+/// A camera's whole-percent share, never rounding a nonzero share to 0%
+/// or a partial one to 100%.
+fn share(bytes: u64, total: f64) -> String {
+    let percent = bytes as f64 / total * 100.0;
+    if bytes > 0 && percent < 1.0 {
+        "<1%".to_owned()
+    } else if (bytes as f64) < total && percent > 99.0 {
+        ">99%".to_owned()
+    } else {
+        format!("{percent:.0}%")
+    }
 }
 
 #[cfg(test)]

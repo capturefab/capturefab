@@ -156,3 +156,50 @@ fn interface_options_bound_invalid_widths_and_empty_reports_stay_inside_the_canv
         assert!(node.attribute("y").unwrap().parse::<u32>().unwrap() < 1040);
     }
 }
+
+#[test]
+fn chart_headers_lead_with_the_latest_value_and_say_when_nothing_was_missed() {
+    let fps = readout("Frame rate", &[20.0, 30.0, 29.94], 0);
+    assert_eq!(fps.latest, "29.9 fps");
+    assert_eq!(fps.summary, "Average 26.6 · peak 30.0");
+    let clean = readout("Missed frame rate", &[0.0, 0.0], 0);
+    assert_eq!(clean.latest, "0.0%");
+    assert_eq!(clean.summary, "None missed in this window");
+    let lossy = readout("Missed frame rate", &[0.0, 0.01, 0.0], 3);
+    assert_eq!(lossy.summary, "3 missed · peak 0.01%");
+    let huge = readout("Throughput", &[1e19], 0);
+    assert_eq!(huge.latest, "1e19 MiB/s");
+    assert_eq!(
+        readout("Throughput", &[], 0).summary,
+        "Waiting for measurements"
+    );
+    assert_eq!(readout_number(f64::NAN), "0");
+}
+
+#[test]
+fn narrow_chart_headers_stack_the_value_and_shorten_the_summary() {
+    let clean = readout("Missed frame rate", &[0.0], 0);
+    let narrow = SvgOptions::interface(180, SvgColors::default());
+    let layout = header_layout("Missed frame rate", &clean, 180, narrow);
+    assert!(layout.stacked);
+    assert_eq!(layout.summary, "None missed");
+    assert_eq!(layout.height, 83);
+    // The fixed title renders about 127px wide; the lines the layout
+    // chooses must fit even by its generous estimate.
+    assert!(text_width(&clean.latest, narrow.caption_size()) <= 152.0);
+    assert!(text_width(layout.summary, narrow.label_size()) <= 152.0);
+    let wide = SvgOptions::interface(396, SvgColors::default());
+    let layout = header_layout("Missed frame rate", &clean, 396, wide);
+    assert!(!layout.stacked);
+    assert_eq!(layout.summary, "None missed in this window");
+    assert_eq!(layout.height, 60);
+}
+
+#[test]
+fn missed_frame_totals_saturate_rather_than_overflow() {
+    let mut report = fixture();
+    for point in &mut report.points {
+        point.lost = u64::MAX;
+    }
+    render_svg_with_options(&report, SvgOptions::interface(396, SvgColors::default())).unwrap();
+}

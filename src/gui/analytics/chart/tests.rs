@@ -305,8 +305,12 @@ fn actual_composite_keeps_native_full_names_and_pixels_inside_ancestor_clip() {
                     camera.name.clone(),
                     camera.id.clone(),
                     format!(
-                        "{} · {} bytes",
+                        "{} · {} of shown · {} bytes",
                         human_bytes(camera.bytes),
+                        super::share(
+                            camera.bytes,
+                            report.cameras.iter().map(|c| c.bytes as f64).sum()
+                        ),
                         grouped(camera.bytes)
                     ),
                 ] {
@@ -754,8 +758,11 @@ fn actual_window_pending_resize_keeps_current_width_native_values_history_and_pi
 #[test]
 fn stale_opposite_theme_graphic_cannot_lower_the_native_bar_contrast() {
     let mut report = active_report();
-    report.cameras.truncate(1);
+    // Two equal cameras: a lone camera has no bar, and equal volumes give
+    // the last row a full one.
+    report.cameras.truncate(2);
     report.cameras[0].name = "Camera 镜头 👩‍🚀".to_owned();
+    report.cameras[1].bytes = report.cameras[0].bytes;
     let mut renderer = crate::gui::destinations::layout_tests::renderer();
     for (_, palette) in PALETTES {
         let stale_palette = if palette.dark {
@@ -798,4 +805,43 @@ fn stale_opposite_theme_graphic_cannot_lower_the_native_bar_contrast() {
             );
         }
     }
+}
+
+#[test]
+fn a_lone_camera_has_no_bar_that_only_restates_the_whole() {
+    let mut report = active_report();
+    report.cameras.truncate(1);
+    let state = ViewState::default();
+    let current = profile(396.0, &style::DARK);
+    let graphic = render(&report, current).unwrap();
+    let mut view = view(&report, &graphic, current, current, &style::DARK, &state);
+    let mut tree = Tree::new(view.as_widget());
+    let renderer = crate::gui::destinations::layout_tests::renderer();
+    view.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(Size::ZERO, Size::new(396.0, 2000.0)),
+    );
+    let mut native = Vec::new();
+    text_states(&tree, &mut native);
+    let camera = &report.cameras[0];
+    assert!(native.iter().any(|text| text.content()
+        == format!(
+            "{} · {} bytes",
+            human_bytes(camera.bytes),
+            grouped(camera.bytes)
+        )));
+    assert!(
+        !native
+            .iter()
+            .any(|text| text.content().contains("of shown"))
+    );
+}
+
+#[test]
+fn camera_share_never_rounds_a_partial_share_to_none_or_all() {
+    assert_eq!(super::share(1, 1_000.0), "<1%");
+    assert_eq!(super::share(999, 1_000.0), ">99%");
+    assert_eq!(super::share(500, 1_000.0), "50%");
+    assert_eq!(super::share(1_000, 1_000.0), "100%");
 }
