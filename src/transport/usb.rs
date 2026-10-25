@@ -7,12 +7,15 @@ use crate::{
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use nusb::{
     DeviceInfo, Endpoint, Interface, MaybeFuture,
-    descriptors::TransferType,
+    descriptors::{TransferType, language_id::US_ENGLISH},
     transfer::{
         Buffer, Bulk, Completion, ControlOut, ControlType, In, Out, Recipient, TransferError,
     },
 };
-use std::time::{Duration, Instant};
+use std::{
+    num::NonZeroU8,
+    time::{Duration, Instant},
+};
 
 const MAGIC: u32 = 0x4356_3355;
 const LEADER_MAGIC: u32 = 0x4c56_3355;
@@ -26,24 +29,88 @@ const SIRM_CONTROL: u64 = 0x04;
 fn is_u3v_interface(class: u8, subclass: u8, protocol: u8) -> bool {
     class == 0xef && subclass == 0x05 && protocol == 0
 }
+/// Names nusb could not take from the operating system's cache: Windows
+/// keeps no manufacturer string, and some cameras have no USB serial number.
+#[derive(Default)]
+struct DeviceNames {
+    vendor: Option<String>,
+    model: Option<String>,
+    serial: Option<String>,
+    guid: Option<String>,
+}
+/// The iDeviceGUID, iVendorName, iModelName and iSerialNumber string indexes
+/// of a USB3 Vision device info descriptor (type 0x24, subtype 1).
+fn name_indexes(descriptor: &[u8]) -> Option<[u8; 4]> {
+    match descriptor {
+        [_, 0x24, 0x01, ..] if descriptor.len() >= 18 => Some([
+            descriptor[11],
+            descriptor[12],
+            descriptor[13],
+            descriptor[17],
+        ]),
+        _ => None,
+    }
+}
+/// Read the strings the control interface's device info descriptor names,
+/// falling back to the device descriptor's, as Aravis does.
+fn device_names(d: &DeviceInfo) -> DeviceNames {
+    let Ok(device) = d.open().wait() else {
+        return DeviceNames::default();
+    };
+    let [guid, vendor, model, serial] = device
+        .configurations()
+        .find_map(|c| {
+            c.interface_alt_settings()
+                .filter(|i| is_u3v_interface(i.class(), i.subclass(), i.protocol()))
+                .find_map(|i| i.descriptors().find_map(|d| name_indexes(&d)))
+        })
+        .unwrap_or_default();
+    let descriptor = device.device_descriptor();
+    let read = |index: Option<NonZeroU8>| {
+        let text = device
+            .get_string_descriptor(index?, US_ENGLISH, Duration::from_millis(100))
+            .wait()
+            .ok()?;
+        Some(text.trim().to_string()).filter(|text| !text.is_empty())
+    };
+    DeviceNames {
+        vendor: read(NonZeroU8::new(vendor))
+            .or_else(|| read(descriptor.manufacturer_string_index())),
+        model: read(NonZeroU8::new(model)).or_else(|| read(descriptor.product_string_index())),
+        serial: read(NonZeroU8::new(serial))
+            .or_else(|| read(descriptor.serial_number_string_index())),
+        guid: read(NonZeroU8::new(guid)),
+    }
+}
 fn camera_info(d: &DeviceInfo) -> CameraInfo {
     let location = format!("{}:{}", d.bus_id(), d.device_address());
-    let serial = d.serial_number().unwrap_or("").to_string();
+    let cached = |text: Option<&str>| text.filter(|text| !text.is_empty()).map(String::from);
+    let mut names = DeviceNames {
+        vendor: cached(d.manufacturer_string()),
+        model: cached(d.product_string()),
+        serial: cached(d.serial_number()),
+        guid: None,
+    };
+    if names.vendor.is_none() || names.model.is_none() || names.serial.is_none() {
+        let read = device_names(d);
+        names.vendor = names.vendor.or(read.vendor);
+        names.model = names.model.or(read.model);
+        names.serial = names.serial.or(read.serial);
+        names.guid = read.guid;
+    }
+    // A camera without a serial number is told apart by its GUID, and by
+    // its USB address only when it has neither.
+    let unique = names
+        .serial
+        .as_ref()
+        .or(names.guid.as_ref())
+        .unwrap_or(&location);
     CameraInfo {
-        id: format!(
-            "usb:{:04x}:{:04x}:{}",
-            d.vendor_id(),
-            d.product_id(),
-            if serial.is_empty() {
-                &location
-            } else {
-                &serial
-            }
-        ),
+        id: format!("usb:{:04x}:{:04x}:{unique}", d.vendor_id(), d.product_id()),
         transport: Transport::Usb3,
-        vendor: d.manufacturer_string().unwrap_or("Unknown").into(),
-        model: d.product_string().unwrap_or("USB3 Vision camera").into(),
-        serial,
+        vendor: names.vendor.unwrap_or_else(|| "Unknown".into()),
+        model: names.model.unwrap_or_else(|| "USB3 Vision camera".into()),
+        serial: names.serial.unwrap_or_default(),
         address: Some(location),
         profile: Default::default(),
     }
@@ -178,8 +245,13 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         info.transport == Transport::Usb3,
         "camera is not a USB3 Vision device"
     );
+    // Reading names may open a device, so only cameras of this model are.
     let device_info = nusb::list_devices()
         .wait()?
+        .filter(|d| {
+            let model = format!("usb:{:04x}:{:04x}:", d.vendor_id(), d.product_id());
+            info.id.starts_with(&model)
+        })
         .find(|d| camera_info(d).id == info.id)
         .context("USB3 Vision camera disconnected or its USB address changed; discover again")?;
     let name = display_name(
@@ -1278,6 +1350,18 @@ mod tests {
         assert!(is_u3v_interface(0xef, 5, 0));
         assert!(!is_u3v_interface(0xef, 2, 1));
         assert!(!is_u3v_interface(0xef, 5, 2));
+    }
+    #[test]
+    fn device_info_descriptor_names_its_strings() {
+        // bLength, type, subtype, GenCP 1.0, U3V 1.0, then iDeviceGUID,
+        // iVendorName, iModelName, iFamilyName, iDeviceVersion,
+        // iManufacturerInfo, iSerialNumber, iUserDefinedName, bmSpeedSupport.
+        let descriptor = [
+            0x14, 0x24, 0x01, 0, 0, 1, 0, 0, 0, 1, 0, 4, 1, 2, 0, 5, 0, 3, 6, 0x0c,
+        ];
+        assert_eq!(name_indexes(&descriptor), Some([4, 1, 2, 3]));
+        assert_eq!(name_indexes(&descriptor[..17]), None);
+        assert_eq!(name_indexes(&[7, 5, 0x81, 2, 0, 4, 0]), None);
     }
     #[test]
     fn uvcp_little_endian_wire_packet() {
