@@ -202,14 +202,12 @@ pub(super) fn job_scheduled(job: &Value, camera: Option<&str>, session: &str) ->
     )
 }
 
-/// The stderr line a local schedule prints as each frame is saved.
+/// The stderr line a local schedule prints as each frame is saved: `2/3
+/// saved · next in 1s`. Names wait for the final line, because frames the
+/// poller missed have none to show.
 pub(super) fn job_progress(job: &Value, now_ms: u64) -> String {
     let captured = job["captured"].as_u64().unwrap_or(0);
-    let mut line = format!(
-        "{captured}/{} saved {}",
-        job["count"].as_u64().unwrap_or(0),
-        job["last_file"].as_str().map(file_name).unwrap_or_default()
-    );
+    let mut line = format!("{captured}/{} saved", job["count"].as_u64().unwrap_or(0));
     if job["status"] != "complete" && captured < job["count"].as_u64().unwrap_or(u64::MAX) {
         let next = job["next_at_ms"]
             .as_u64()
@@ -405,14 +403,14 @@ pub(super) fn is_file(output: &str) -> bool {
 }
 
 /// What the CLI says as a recording or stream starts.
-pub(super) fn forward_banner(output: &str, shown: &str, duration: Option<&str>) -> String {
+pub(super) fn forward_banner(output: &str, shown: &str, duration_ms: Option<u64>) -> String {
     let verb = if is_file(output) {
         "Recording"
     } else {
         "Streaming"
     };
-    match duration {
-        Some(duration) => format!("{verb} {duration} to {shown} (Ctrl-C stops early)…"),
+    match duration_ms {
+        Some(ms) => format!("{verb} {} to {shown} (Ctrl-C stops early)…", interval(ms)),
         None => format!("{verb} to {shown}. Press Ctrl-C to stop."),
     }
 }
@@ -582,10 +580,7 @@ mod tests {
     #[test]
     fn jobs_read_as_progress_and_a_table() {
         let job = json!({"id":1,"status":"running","output":"tl-{seq}.png","count":3,"captured":2,"skipped":0,"retries":0,"interval_ms":1000,"next_at_ms":11_000,"last_file":"/tmp/tl/tl-0002.png","error":null});
-        assert_eq!(
-            job_progress(&job, 10_000),
-            "2/3 saved tl-0002.png · next in 1s"
-        );
+        assert_eq!(job_progress(&job, 10_000), "2/3 saved · next in 1s");
         let scheduled = job_scheduled(&job, Some("sim:0"), "bench");
         assert!(
             scheduled.starts_with("Scheduled job 1 on sim:0: 3 frames every 1s → tl-{seq}.png\n"),
@@ -649,8 +644,12 @@ mod tests {
         lossy["stopped"]["stats"]["dropped"] = json!(3);
         assert_eq!(forward_summary("clip.mp4", &lossy, 5000).1.len(), 1);
         assert_eq!(
-            forward_banner("clip.mp4", "clip.mp4", Some("2s")),
+            forward_banner("clip.mp4", "clip.mp4", Some(2000)),
             "Recording 2s to clip.mp4 (Ctrl-C stops early)…"
+        );
+        assert_eq!(
+            forward_banner("clip.mp4", "clip.mp4", Some(90_000)),
+            "Recording 1m30s to clip.mp4 (Ctrl-C stops early)…"
         );
         assert!(forward_banner("rtsp://h/x", "rtsp://h/x", None).starts_with("Streaming to"));
     }

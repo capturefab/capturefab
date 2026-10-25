@@ -203,6 +203,21 @@ fn automatic_session_targeting_workflow_paths_and_partial_failure() {
     assert_eq!(applied["completed_steps"], 4);
     assert!(plans.join("frames/shot.png").exists());
     assert!(!server.join("frames/shot.png").exists());
+    // The CLI refuses `-n 3 -o burst.png`; workflow and RPC capture steps
+    // keep filling a folder of that name, so validate and apply agree.
+    std::fs::write(&workflow, serde_json::to_vec(&serde_json::json!({"version":1,"steps":[
+        {"camera":"sim:workflow","command":{"op":"capture","output":"frames/burst.png","count":3,"timeout_ms":2000,"format":"png"}}
+    ]})).unwrap()).unwrap();
+    json(
+        &dir,
+        &["--json", "workflow", "validate", workflow.to_str().unwrap()],
+    );
+    let burst = json(
+        &dir,
+        &["--json", "workflow", "apply", workflow.to_str().unwrap()],
+    );
+    assert_eq!(burst["completed_steps"], 1);
+    assert!(plans.join("frames/burst.png/frame-000003.png").exists());
 
     std::fs::write(&workflow, r#"{"version":1,"steps":[{"camera":"sim:workflow","command":{"op":"set","feature":"Width","value":"128"}},{"command":{"op":"status","typo":true}}]}"#).unwrap();
     let invalid = cmd(
@@ -5811,7 +5826,9 @@ fn connect_takes_a_camera_argument_or_flag_and_reads_like_prose() {
         "{text}"
     );
     assert!(
-        text.contains("Next: capturefab --camera sim:3 capture"),
+        text.contains(
+            "Next: capturefab --session conn --camera sim:3 capture -o 'shot-{seq}.png'   (or start live acquisition: capturefab --session conn --camera sim:3 start)"
+        ),
         "{text}"
     );
     let selected = json(

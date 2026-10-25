@@ -1662,7 +1662,6 @@ pub fn preflight_capture_output(
 ) -> Result<()> {
     validate_capture_output(output)?;
     ensure!((1..=100_000).contains(&count), "count must be 1..100000");
-    check_capture_name(output, count, format)?;
     let plan = crate::naming::Plan::new(output, count, format);
     if !plan.is_static() {
         // Names are picked per frame; only the folders before the first
@@ -1713,6 +1712,8 @@ pub fn preflight_recording_output(
 }
 /// A name that cannot mean what it says is a usage error: several frames
 /// sent to one image name, or an image extension naming another format.
+/// The CLI checks the name as typed; session clients such as workflows and
+/// the desktop app keep the folder and format rules they always had.
 pub fn check_capture_name(output: &str, count: u32, format: &str) -> Result<()> {
     if output == "-" {
         return Ok(());
@@ -3264,31 +3265,34 @@ mod tests {
         }
     }
     #[test]
-    fn names_that_cannot_mean_what_they_say_are_usage_errors() {
+    fn session_clients_keep_folder_and_format_rules_for_image_names() {
         use crate::naming::OnExists;
         let h = WorkerHandle::new();
         connect(&h, "1000");
         let dir = temp_dir("guardrails");
-        let usage = |error: anyhow::Error| {
-            assert_eq!(
-                crate::types::error_transport_code(&error),
-                Some("usage"),
-                "{error:#}"
-            );
-            format!("{error:#}")
-        };
-        // A sequence to one image name, and an extension naming another format.
-        let message = usage(
-            h.request(capture_to(&dir.join("shot.raw"), 3, OnExists::Fail))
-                .unwrap_err(),
+        // The CLI refuses these names as typed (check_capture_name); the
+        // worker keeps serving workflows, the desktop app and other clients
+        // as before: a sequence fills a folder, and the format wins.
+        let v = h
+            .request(capture_to(&dir.join("shot.raw"), 3, OnExists::Fail))
+            .unwrap();
+        assert_eq!(
+            v["files"][2].as_str().unwrap(),
+            dir.join("shot.raw")
+                .join("frame-000003.raw")
+                .to_str()
+                .unwrap()
         );
-        assert!(message.contains("shot-{seq}.raw"), "{message}");
         let mut mismatched = capture_to(&dir.join("y.jpg"), 1, OnExists::Fail);
         if let SessionCommand::Capture { format, .. } = &mut mismatched {
             *format = "png".into();
         }
-        assert!(usage(h.request(mismatched).unwrap_err()).contains("rename it to y.png"));
-        assert!(!dir.join("shot.raw").exists() && !dir.join("y.jpg").exists());
+        let v = h.request(mismatched).unwrap();
+        assert_eq!(
+            v["files"][0].as_str().unwrap(),
+            dir.join("y.jpg").to_str().unwrap()
+        );
+        assert!(check_capture_name(dir.join("y.jpg").to_str().unwrap(), 1, "png").is_err());
         // A trailing separator names a folder; a bare name gets an extension.
         let folder = format!(
             "{}{}",

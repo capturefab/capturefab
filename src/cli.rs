@@ -2056,7 +2056,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 if !cli.json {
                     eprintln!(
                         "{}",
-                        summary::forward_banner(destination, &shown, duration.as_deref())
+                        summary::forward_banner(destination, &shown, duration_ms)
                     );
                 }
                 let epoch = std::time::Instant::now();
@@ -2114,7 +2114,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 if !cli.json {
                     eprintln!(
                         "{}",
-                        summary::forward_banner(destination, &shown, duration.as_deref())
+                        summary::forward_banner(destination, &shown, duration_ms)
                     );
                 }
                 let epoch = std::time::Instant::now();
@@ -2703,10 +2703,19 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             "Connected {} ({id}{serial}){session}.",
             connected["model"].as_str().unwrap_or("camera")
         )?;
-        let camera = crate::hint::shell_quote(&id);
+        // Repeat the session the person named, so the hint reaches it even
+        // when several sessions are running.
+        let target = format!(
+            "{}--camera {}",
+            cli.session
+                .as_deref()
+                .map(|name| format!("--session {} ", crate::hint::shell_quote(name)))
+                .unwrap_or_default(),
+            crate::hint::shell_quote(&id)
+        );
         writeln!(
             out,
-            "Next: capturefab --camera {camera} capture -o shot.png  ·  capturefab --camera {camera} start"
+            "Next: capturefab {target} capture -o 'shot-{{seq}}.png'   (or start live acquisition: capturefab {target} start)"
         )?;
     } else if matches!(&cli.command, Some(Command::Select { .. })) {
         writeln!(
@@ -2831,7 +2840,7 @@ fn schema() -> Value {
         "CLI capture/record/RPC local output paths resolve in the calling terminal; workflow paths resolve beside their file; named destination paths remain relative to the destination"
     );
     contract["capture"]["paths"] = json!(
-        "file, directory (an existing one or a name ending in a separator; continues frame-NNNNNN numbering after the highest existing number) or template; a file name or template whose last component has no extension gets the format's (.png, .jpg, .raw, .pgm, .ppm); with count>1 a name ending in an image extension that is not an existing directory is a usage error (exit 2): use a template with {seq} or {frame}, or a folder; {seq} picks the next free number; other existing names fail unless on_exists=number. Files are never overwritten."
+        "file, directory (an existing one or a name ending in a separator; continues frame-NNNNNN numbering after the highest existing number) or template; a file name or template whose last component has no extension gets the format's (.png, .jpg, .raw, .pgm, .ppm); with -n above 1 the CLI refuses a name ending in an image extension that is not an existing directory (usage, exit 2: use a template with {seq} or {frame}, or a folder), and an explicit --format contradicting an image extension; RPC and workflow capture steps instead save such a sequence into a folder of that name and keep the given name; {seq} picks the next free number; other existing names fail unless on_exists=number. Files are never overwritten."
     );
     contract["capture"]["placeholders"] = json!({
         "camera":"model-serial, limited to A-Z a-z 0-9 . _ - (at most 64 bytes)",
@@ -2934,6 +2943,9 @@ fn schema() -> Value {
     });
     contract["selection"]["direct"] = json!(
         "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:INDEX|v4l2:/dev/videoN|dshow:video=NAME|onvif:ENDPOINT|hub:NAME/CAMERA[?stream=MODE&fps=F]|scanner:sane:DEVICE|scanner:wia:ID|scanner:ica:UUID"
+    );
+    contract["selection"]["matching"] = json!(
+        "An exact ID, serial or address wins; otherwise a bare name opens the one local camera whose model or name (the ID after its kind) equals it, or whose model contains it as whole words, ignoring case (never part of a serial or ID), and stderr names the camera chosen. Hub cameras need their exact selector; several matches fail with exit 3. connect and select take the camera as an argument or from --camera / CAPTUREFAB_CAMERA. Scripts should use IDs from discover."
     );
     contract["selection"]["existing_session"] =
         json!("--session NAME [--camera ID] targets an existing visible GUI or headless worker");

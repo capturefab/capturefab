@@ -128,7 +128,7 @@ capturefab --session bench status --json
 `select ID` sets the default for CLI calls without `--camera`.
 Persistent `start` and `auto` controls act on a connected camera; use `connect ID` first.
 `connect` and `select` take the camera as an argument or from `--camera`/`CAPTUREFAB_CAMERA`.
-A selector matches an exact ID, serial or address first. A bare name such as `C920` that matches exactly one local camera's model or name, ignoring case, also opens it, and stderr names the camera chosen; several matches fail with exit 3 and list them. Hub cameras need their exact selector. Scripts should use the IDs from `discover`.
+A selector matches an exact ID, serial or address first. A bare name such as `C920` that matches exactly one local camera's model or name, or whole words of its model, ignoring case (never part of a serial or ID), also opens it, and stderr names the camera chosen; several matches fail with exit 3 and list them. Hub cameras need their exact selector. Scripts should use the IDs from `discover`.
 Binary stdout captures use a temporary worker and cannot use `--session`; they refuse an interactive terminal (exit 2), so redirect or pipe them.
 Camera control can be exclusive, so use the existing session for an open camera.
 
@@ -251,6 +251,7 @@ A directory output continues its `frame-NNNNNN` numbers; a name ending in `/` is
 A name without an extension gets the format's (`noext` becomes `noext.png`).
 `-n 3 -o shot.jpg` is a usage error (exit 2); use `-o 'shot-{seq}.jpg'` or `-o shot/`.
 An explicit `--format` that contradicts an image extension in the name is a usage error.
+Those two name checks are CLI-only; RPC and workflow capture steps keep saving a sequence into a folder of that name.
 A taken name fails before acquisition; `error.details.hint` names the `{seq}` template or `--on-exists number` that would save it.
 Capture frames carry `pixel_format_name` (`Mono8`) and `file_bytes` (saved size) beside the raw `pixel_format` and `bytes`.
 A burst that fails part way keeps its saved frames; the message starts `saved N of M frames to FOLDER` and the exit code is unchanged.

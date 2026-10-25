@@ -105,11 +105,13 @@ fn camera_row(device: &Value) -> Vec<String> {
         .map(crate::media::redact_url)
         .unwrap_or_default();
     let serial = text(device, "serial");
-    let serial = if serial == text(device, "id") || Some(serial) == device["address"].as_str() {
-        String::new()
-    } else {
-        serial.into()
-    };
+    // A serial the ID already spells out (scanner:ica:UUID) adds nothing.
+    let serial =
+        if text(device, "id").ends_with(serial) || Some(serial) == device["address"].as_str() {
+            String::new()
+        } else {
+            serial.into()
+        };
     let model = device["model"]
         .as_str()
         .or_else(|| device["name"].as_str())
@@ -231,7 +233,7 @@ pub(super) fn next_steps(devices: &[Value], kind: DeviceList) -> Vec<String> {
         DeviceList::Scanners => {
             if let Some(device) = devices.first() {
                 hints.push(format!(
-                    "Next: capturefab --camera {} capture -o scan.png",
+                    "Next: capturefab --camera {} capture -o 'scan-{{seq}}.png'",
                     crate::hint::shell_quote(text(device, "id"))
                 ));
             }
@@ -322,6 +324,11 @@ mod tests {
         assert!(output.contains("Screen"), "{output}");
         assert!(output.contains("Scanner"), "{output}");
         assert!(table(&[scanner], DeviceList::Scanners).contains("Perfection V39"));
+        let uuid = "E3248000-80CE-11DB-8000-3C2AF4FA0DE9";
+        let ica = json!({"id":format!("scanner:ica:{uuid}"),"transport":"scanner",
+            "model":"Brother MFC-L2750DW series","serial":uuid});
+        let output = table(&[ica], DeviceList::Discover);
+        assert_eq!(output.matches(uuid).count(), 1, "{output}");
     }
 
     #[test]

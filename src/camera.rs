@@ -127,7 +127,7 @@ pub enum Resolution {
     /// One camera has this ID, serial or address.
     Exact(CameraInfo),
     /// One camera matched loosely: its model or the ID after the first ':',
-    /// ignoring case, or as a substring of either.
+    /// ignoring case, or whole words of its model.
     Loose {
         info: CameraInfo,
         matched_on: &'static str,
@@ -152,7 +152,7 @@ pub fn is_explicit_selector(selector: &str) -> bool {
 
 /// Resolve a bare selector against discovered cameras. Exact ID, serial or
 /// address wins; otherwise a unique case-insensitive model or name match,
-/// then a unique substring. Hub cameras keep their exact selectors only, so
+/// then a unique run of whole model words. Hub cameras keep their exact selectors only, so
 /// a loose name can never reach a hub's permission checks under another
 /// identity.
 pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
@@ -209,20 +209,23 @@ pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
     if let Some(resolution) = pick(equal) {
         return resolution;
     }
-    if wanted.chars().count() < 3 {
+    // Then whole words of a model (`C920` in `HD Pro Webcam C920`), never
+    // part of a word, an ID or a serial: a partial or stale serial must not
+    // open another camera. A scanner needs its model in full, because a
+    // feeder consumes paper.
+    let words = wanted.split_whitespace().collect::<Vec<_>>();
+    if wanted.chars().count() < 3 || words.is_empty() {
         return Resolution::NotFound;
     }
     let partial = local
         .iter()
-        .filter_map(|d| {
-            if d.model.to_lowercase().contains(&wanted) {
-                Some((*d, "model"))
-            } else if suffix(d).contains(&wanted) {
-                Some((*d, "name"))
-            } else {
-                None
-            }
+        .filter(|d| !crate::scanner::is_source(&d.id))
+        .filter(|d| {
+            let model = d.model.to_lowercase();
+            let model = model.split_whitespace().collect::<Vec<_>>();
+            model.windows(words.len()).any(|window| window == words)
         })
+        .map(|d| (*d, "model"))
         .collect();
     pick(partial).unwrap_or(Resolution::NotFound)
 }
@@ -262,6 +265,15 @@ fn simulator_typo(selector: &str) -> Option<String> {
         .then(|| format!("sim:{digits}"))
 }
 
+/// `Pattern camera`, the simulator's model, which discovery lists only
+/// with `--simulate`.
+fn simulator_model(selector: &str) -> Option<String> {
+    selector
+        .trim()
+        .eq_ignore_ascii_case("pattern camera")
+        .then(|| "sim:0".into())
+}
+
 /// Bare selectors discovery cannot help: a missing file path or a malformed
 /// IPv4 address fails at once instead of after a scan.
 pub fn needs_no_discovery(selector: &str) -> bool {
@@ -290,7 +302,7 @@ fn selector_not_matched(
             matches.len()
         ));
     }
-    if let Some(simulator) = simulator_typo(selector) {
+    if let Some(simulator) = simulator_typo(selector).or_else(|| simulator_model(selector)) {
         return unavailable(format!(
             "camera '{shown}' not found; did you mean {simulator}?"
         ));
@@ -754,6 +766,36 @@ mod tests {
     }
 
     #[test]
+    fn partial_serials_ids_and_words_never_match() {
+        let mut known = known();
+        known.push(device("usb:2676:ba02:23015", "Industrial camera", "23015"));
+        known.push(device(
+            "scanner:ica:E3248000-80CE-11DB-8000-3C2AF4FA0DE9",
+            "Brother MFC-L2750DW series",
+            "E3248000-80CE-11DB-8000-3C2AF4FA0DE9",
+        ));
+        for selector in [
+            "2301",
+            "ba02:2301",
+            "E3248",
+            "e3248000",
+            "cam",
+            "webca",
+            "Brother",
+        ] {
+            assert_eq!(
+                resolve_selector(selector, &known),
+                Resolution::NotFound,
+                "{selector}"
+            );
+        }
+        assert!(matches!(
+            resolve_selector("brother mfc-l2750dw series", &known),
+            Resolution::Loose { info, .. } if info.id.starts_with("scanner:")
+        ));
+    }
+
+    #[test]
     fn hub_cameras_are_never_matched_loosely() {
         let known = known();
         assert_eq!(resolve_selector("front door", &known), Resolution::NotFound);
@@ -772,6 +814,8 @@ mod tests {
             ("./nope.mp4", "file not found: ./nope.mp4"),
             ("nope.mp4", "file not found: nope.mp4"),
             ("SIM7F00001", "did you mean gige:02007f000001?"),
+            ("Pattern camera", "did you mean sim:0?"),
+            ("SIM0", "did you mean sim:0?"),
             ("zzzz", "Found: avfoundation:HD Pro Webcam C920"),
         ];
         for (selector, expected) in cases {
