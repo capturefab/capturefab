@@ -92,6 +92,9 @@ pub struct Camera {
     network_budget_bytes_per_second: Option<u64>,
     /// Whether start set TLParamsLocked, which stop clears again.
     tl_locked: bool,
+    /// Whether start executed TransferStart, which stop follows with
+    /// TransferStop.
+    transferring: bool,
 }
 /// Reject malformed known source forms without checking availability or build capabilities.
 /// Bare camera IDs and serials are resolved against discovery results on open.
@@ -481,6 +484,7 @@ impl Camera {
             profile_metadata,
             network_budget_bytes_per_second: None,
             tl_locked: false,
+            transferring: false,
         })
     }
     pub fn features(&mut self) -> Vec<FeatureInfo> {
@@ -638,7 +642,24 @@ impl Camera {
             let _ = self.backend.stop();
             return Err(e);
         }
+        if self.user_controlled_transfer() {
+            if let Err(e) = self.nodes.execute(self.backend.as_mut(), "TransferStart") {
+                let _ = self.nodes.execute(self.backend.as_mut(), "AcquisitionStop");
+                let _ = self.backend.stop();
+                return Err(e);
+            }
+            self.transferring = true;
+        }
         Ok(())
+    }
+    /// A camera in TransferControlMode UserControlled sends acquired frames
+    /// only between TransferStart and TransferStop (SFNC Transfer Control).
+    fn user_controlled_transfer(&mut self) -> bool {
+        self.has("TransferControlMode")
+            && self.has("TransferStart")
+            && self
+                .get("TransferControlMode")
+                .is_ok_and(|mode| mode == "UserControlled")
     }
     fn unlock(&mut self) -> Result<()> {
         if !std::mem::take(&mut self.tl_locked) {
@@ -664,10 +685,16 @@ impl Camera {
         // Some cameras lock AcquisitionStop too until TLParamsLocked is set,
         // so the lock is released last.
         let acquisition = self.nodes.execute(self.backend.as_mut(), "AcquisitionStop");
+        let transfer = if std::mem::take(&mut self.transferring) {
+            self.nodes.execute(self.backend.as_mut(), "TransferStop")
+        } else {
+            Ok(())
+        };
         let transport = self.backend.stop();
         self.streaming = false;
         let unlocked = self.unlock();
         acquisition?;
+        transfer?;
         transport?;
         unlocked
     }
@@ -876,6 +903,10 @@ pub(crate) mod tests {
     /// layer as on FLIR Blackfly S, with Basler ace entry values.
     const ACQUISITION_MODE_NODES: &str = r#"<Enumeration Name="AcquisitionMode" NameSpace="Standard"><pIsLocked>TLParamsLocked</pIsLocked><EnumEntry Name="SingleFrame" NameSpace="Standard"><Value>0</Value></EnumEntry><EnumEntry Name="MultiFrame" NameSpace="Standard"><Value>1</Value></EnumEntry><EnumEntry Name="Continuous" NameSpace="Standard"><Value>2</Value></EnumEntry><pValue>AcquisitionModeReg</pValue></Enumeration><IntReg Name="AcquisitionModeReg"><Address>0x0c</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Integer Name="AcquisitionFrameCount" NameSpace="Standard"><pIsLocked>TLParamsLocked</pIsLocked><pValue>FrameCountReg</pValue><Min>1</Min><Max>255</Max><Inc>1</Inc></Integer><IntReg Name="FrameCountReg"><Address>0x10</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
 
+    /// FLIR Blackfly S transfer control: TransferStart is locked until the
+    /// transport layer locks its parameters.
+    const TRANSFER_NODES: &str = r#"<Enumeration Name="TransferControlMode" NameSpace="Standard"><ImposedAccessMode>RW</ImposedAccessMode><EnumEntry Name="Basic" NameSpace="Standard"><Value>0</Value></EnumEntry><EnumEntry Name="Automatic" NameSpace="Standard"><Value>1</Value></EnumEntry><EnumEntry Name="UserControlled" NameSpace="Standard"><Value>2</Value></EnumEntry><pValue>TransferControlMode_Val</pValue></Enumeration><IntReg Name="TransferControlMode_Val"><Address>0x50</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="TransferStart" NameSpace="Standard"><pIsLocked>TransferStart_Locked</pIsLocked><ImposedAccessMode>WO</ImposedAccessMode><pValue>XmitStart_Val</pValue><CommandValue>1</CommandValue></Command><IntSwissKnife Name="TransferStart_Locked"><pVariable Name="TLP">TLParamsLocked</pVariable><pVariable Name="LCK">XmitStart_Lck</pVariable><Formula>(TLP = 0) || LCK</Formula></IntSwissKnife><MaskedIntReg Name="XmitStart_Lck"><Address>0x60</Address><Length>4</Length><AccessMode>RO</AccessMode><Bit>4</Bit><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></MaskedIntReg><IntReg Name="XmitStart_Val"><Address>0x54</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="TransferStop" NameSpace="Standard"><ImposedAccessMode>WO</ImposedAccessMode><pValue>XmitStop_Val</pValue><CommandValue>1</CommandValue></Command><IntReg Name="XmitStop_Val"><Address>0x58</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
+
     pub(crate) fn device_camera(device: Device) -> Camera {
         Camera::from_backend(crate::transport::simulator::info(), Box::new(device)).unwrap()
     }
@@ -968,6 +999,64 @@ pub(crate) mod tests {
         assert_eq!(camera.get("AcquisitionMode").unwrap(), "SingleFrame");
         camera.next_frame(Duration::from_millis(10)).unwrap();
         assert!(camera.next_frame(Duration::from_millis(10)).is_err());
+    }
+
+    #[test]
+    fn user_controlled_transfer_starts_and_stops_with_acquisition() {
+        let device = Device::new(&format!(
+            "{TL_PARAMS_LOCKED}{FLIR_ACQUISITION}{TRANSFER_NODES}"
+        ))
+        .with(TRANSFER_MODE, 2);
+        let log = events(&device);
+        let mut camera = device_camera(device);
+        camera.start().unwrap();
+        camera.next_frame(Duration::from_millis(10)).unwrap();
+        camera.stop().unwrap();
+        assert_eq!(
+            taken(&log),
+            [
+                "receive",
+                "AcquisitionStart",
+                "TransferStart",
+                "AcquisitionStop",
+                "TransferStop",
+                "release"
+            ]
+        );
+        // A refused TransferStart stops acquisition and the receiver again.
+        let device = Device::new(&format!(
+            "{TL_PARAMS_LOCKED}{FLIR_ACQUISITION}{TRANSFER_NODES}"
+        ))
+        .with(TRANSFER_MODE, 2)
+        .with(LOCKS, 16);
+        let log = events(&device);
+        let mut camera = device_camera(device);
+        let error = camera.start().unwrap_err();
+        assert!(
+            error.to_string().contains("TransferStart is locked"),
+            "{error:#}"
+        );
+        assert_eq!(camera.get("TLParamsLocked").unwrap(), 0);
+        assert_eq!(
+            taken(&log),
+            ["receive", "AcquisitionStart", "AcquisitionStop", "release"]
+        );
+        // Basic and Automatic transfers follow acquisition by themselves.
+        for mode in [0, 1] {
+            let device = Device::new(&format!(
+                "{TL_PARAMS_LOCKED}{FLIR_ACQUISITION}{TRANSFER_NODES}"
+            ))
+            .with(TRANSFER_MODE, mode);
+            let log = events(&device);
+            let mut camera = device_camera(device);
+            camera.start().unwrap();
+            camera.next_frame(Duration::from_millis(10)).unwrap();
+            camera.stop().unwrap();
+            assert_eq!(
+                taken(&log),
+                ["receive", "AcquisitionStart", "AcquisitionStop", "release"]
+            );
+        }
     }
 
     #[test]
