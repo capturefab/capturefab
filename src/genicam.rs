@@ -143,10 +143,15 @@ impl Node {
         ) && self.prop("Value").is_some()
     }
     fn value(&self, text: &str) -> Result<Value> {
-        self.stored
-            .borrow()
-            .clone()
-            .map_or_else(|| literal(text), Ok)
+        if let Some(stored) = self.stored.borrow().clone() {
+            return Ok(stored);
+        }
+        // A Boolean's Value is an xs:boolean.
+        match text.trim() {
+            "true" if self.kind == "Boolean" => Ok(json!(true)),
+            "false" if self.kind == "Boolean" => Ok(json!(false)),
+            text => literal(text),
+        }
     }
 }
 
@@ -165,12 +170,30 @@ impl NodeMap {
             "expected GenICam RegisterDescription root"
         );
         let mut nodes = BTreeMap::new();
+        // A register's address may include IntSwissKnife elements nested in
+        // it. Each becomes a node, and the register's element names it.
+        let embedded = |p: roxmltree::Node<'_, '_>| {
+            (p.tag_name().name() == "IntSwissKnife"
+                && p.parent_element().is_some_and(|parent| {
+                    matches!(
+                        parent.tag_name().name(),
+                        "Register"
+                            | "IntReg"
+                            | "MaskedIntReg"
+                            | "FloatReg"
+                            | "StringReg"
+                            | "StructReg"
+                            | "StructEntry"
+                    )
+                }))
+            .then(|| format!("__embedded::{}", p.id().get()))
+        };
         let props = |n: roxmltree::Node<'_, '_>| {
             n.children()
                 .filter(|p| p.is_element())
                 .map(|p| Element {
                     tag: p.tag_name().name().into(),
-                    text: p.text().unwrap_or("").trim().into(),
+                    text: embedded(p).unwrap_or_else(|| p.text().unwrap_or("").trim().into()),
                     attrs: p
                         .attributes()
                         .map(|a| (a.name().into(), a.value().into()))
@@ -244,6 +267,22 @@ impl NodeMap {
                 );
             }
         }
+        for knife in doc.root_element().descendants() {
+            let Some(stored_name) = embedded(knife) else {
+                continue;
+            };
+            let node = Node {
+                kind: "IntSwissKnife".into(),
+                props: props(knife),
+                stored: RefCell::default(),
+            };
+            if let Some(name) = knife.attribute("Name")
+                && !nodes.contains_key(name)
+            {
+                nodes.insert(name.into(), node.clone());
+            }
+            nodes.insert(stored_name, node);
+        }
         ensure!(!nodes.is_empty(), "GenICam XML has no named nodes");
         Ok(Self { nodes })
     }
@@ -270,7 +309,7 @@ impl NodeMap {
                 pending.extend(
                     node.props
                         .iter()
-                        .filter(|prop| prop.tag.starts_with('p'))
+                        .filter(|prop| node_link(&prop.tag))
                         .map(|prop| prop.text.trim()),
                 );
             }
@@ -300,7 +339,7 @@ impl NodeMap {
                 continue;
             };
             for property in &node.props {
-                if property.tag.starts_with('p') && self.nodes.contains_key(&property.text) {
+                if node_link(&property.tag) && self.nodes.contains_key(&property.text) {
                     pending.push(property.text.clone());
                     if property.tag == "pIndex" || property.text.ends_with("Selector") {
                         selectors.insert(property.text.clone());
@@ -497,7 +536,7 @@ impl NodeMap {
             }
             if let Some(node) = self.nodes.get(&name) {
                 for property in &node.props {
-                    if property.tag.starts_with('p') && self.nodes.contains_key(&property.text) {
+                    if node_link(&property.tag) && self.nodes.contains_key(&property.text) {
                         pending.push(property.text.clone());
                     }
                 }
@@ -654,7 +693,8 @@ impl NodeMap {
         self.nodes
             .iter()
             .filter(|(name, n)| {
-                (exposed.as_ref().is_none_or(|names| names.contains(*name)))
+                !name.starts_with("__")
+                    && (exposed.as_ref().is_none_or(|names| names.contains(*name)))
                     && matches!(
                         n.kind.as_str(),
                         "Integer"
@@ -722,6 +762,7 @@ impl NodeMap {
             .filter(|(name, node)| {
                 IDENTITY.contains(&name.as_str())
                     || (exposed.as_ref().is_none_or(|names| names.contains(*name))
+                        && !name.starts_with("__")
                         && node.prop("Visibility") != Some("Invisible")
                         && matches!(
                             node.kind.as_str(),
@@ -886,7 +927,11 @@ impl NodeMap {
             }
             "Integer" | "Float" | "String" | "EnumEntry" => {
                 if let Some(link) = self.resolve_value_link(io, n, depth)? {
-                    self.get_inner(io, link, depth + 1)
+                    if n.kind == "String" {
+                        self.get_inner(io, link, depth + 1)
+                    } else {
+                        self.numeric_value(io, link, depth + 1)
+                    }
                 } else if let Some(value) = n.prop("Value") {
                     if n.kind == "String" {
                         Ok(n.stored.borrow().clone().unwrap_or_else(|| json!(value)))
@@ -899,6 +944,9 @@ impl NodeMap {
             }
             "Boolean" => {
                 let value = self.raw_value(io, n, depth)?;
+                if let Some(enabled) = value.as_bool() {
+                    return Ok(json!(enabled));
+                }
                 let on = self
                     .property_value(io, n, "OnValue", depth)?
                     .unwrap_or_else(|| json!(1));
@@ -1078,23 +1126,40 @@ impl NodeMap {
                 "chunk and event ports are not supported for live register access"
             );
         }
-        let mut address = 0u64;
+        let length = if let Some(p) = n.prop("pLength") {
+            exact_integer(&self.numeric_value(io, p, depth + 1)?)?
+        } else {
+            exact_integer(&literal(
+                n.prop("Length").context("register has no length")?,
+            )?)?
+        };
+        ensure!(
+            length > 0 && length <= 1024 * 1024,
+            "register length is outside 1..1048576"
+        );
+        // Address, pAddress and embedded IntSwissKnife entries are summed;
+        // pIndex adds its index times Offset, pOffset or the length.
+        let mut address = 0i128;
         let mut supplied = false;
         for p in &n.props {
             let offset = match p.tag.as_str() {
                 "Address" => {
                     supplied = true;
-                    unsigned(&literal(&p.text)?)?
+                    exact_integer(&literal(&p.text)?)?
                 }
-                "pAddress" => {
+                "pAddress" | "IntSwissKnife" => {
                     supplied = true;
-                    unsigned(&self.get_inner(io, &p.text, depth + 1)?)?
+                    exact_integer(&self.numeric_value(io, &p.text, depth + 1)?)?
                 }
                 "pIndex" => {
-                    let index = unsigned(&self.get_inner(io, &p.text, depth + 1)?)?;
-                    let stride = unsigned(&literal(
-                        p.attrs.get("Offset").map(String::as_str).unwrap_or("1"),
-                    )?)?;
+                    let index = exact_integer(&self.numeric_value(io, &p.text, depth + 1)?)?;
+                    let stride = if let Some(offset) = p.attrs.get("Offset") {
+                        exact_integer(&literal(offset)?)?
+                    } else if let Some(offset) = p.attrs.get("pOffset") {
+                        exact_integer(&self.numeric_value(io, offset, depth + 1)?)?
+                    } else {
+                        length
+                    };
                     index
                         .checked_mul(stride)
                         .context("register index overflow")?
@@ -1106,19 +1171,9 @@ impl NodeMap {
                 .context("register address overflow")?;
         }
         ensure!(supplied, "register has no address");
-        let length = if let Some(p) = n.prop("pLength") {
-            unsigned(&self.get_inner(io, p, depth + 1)?)?
-        } else {
-            unsigned(&literal(
-                n.prop("Length").context("register has no length")?,
-            )?)?
-        };
-        ensure!(
-            length > 0 && length <= 1024 * 1024,
-            "register length is outside 1..1048576"
-        );
+        let address = u64::try_from(address).context("register address is out of range")?;
         address
-            .checked_add(length)
+            .checked_add(length as u64)
             .context("register range overflow")?;
         Ok((address, length as usize))
     }
@@ -1228,14 +1283,28 @@ impl NodeMap {
                 if on { enabled } else { disabled }
             }
             "Enumeration" => {
-                let symbol = value.as_str().context("expected enumeration symbol")?;
-                let entry = self.find_entry(name, n, symbol).ok_or_else(|| {
-                    anyhow!(
-                        "unknown {name} choice {symbol:?}; choose one of: {}",
-                        self.entry_names(io, name, n).join(", ")
-                    )
-                })?;
-                let en = self.node(entry, depth + 1)?;
+                let (en, symbol) = if let Some(symbol) = value.as_str() {
+                    let entry = self.find_entry(name, n, symbol).ok_or_else(|| {
+                        anyhow!(
+                            "unknown {name} choice {symbol:?}; choose one of: {}",
+                            self.entry_names(io, name, n).join(", ")
+                        )
+                    })?;
+                    (self.node(entry, depth + 1)?, symbol.to_string())
+                } else {
+                    // An integer link writes an entry's value.
+                    let mut found = None;
+                    for entry in self.enum_entries(n) {
+                        let en = self.node(entry, depth + 1)?;
+                        if numeric_equal(&self.entry_value(io, en, depth + 1)?, value)? {
+                            found = Some(en);
+                            break;
+                        }
+                    }
+                    let en =
+                        found.ok_or_else(|| anyhow!("{name} has no entry with value {value}"))?;
+                    (en, value.to_string())
+                };
                 self.available(io, en, depth + 1).with_context(|| {
                     format!("{name} choice {symbol:?} is currently unavailable")
                 })?;
@@ -1257,7 +1326,7 @@ impl NodeMap {
         ) {
             let mut constraint = |key| -> Result<Option<Value>> {
                 if let Some(link) = n.prop(&format!("p{key}")) {
-                    self.get_inner(io, link, depth + 1).map(Some)
+                    self.numeric_value(io, link, depth + 1).map(Some)
                 } else {
                     n.prop(key)
                         .map(|text| {
@@ -1423,7 +1492,7 @@ impl NodeMap {
         let n = self.node(name, 0)?;
         ensure!(n.kind == "Command", "{name} is not a command");
         let v = if let Some(link) = n.prop("pCommandValue") {
-            self.get_inner(io, link, 1)?
+            self.numeric_value(io, link, 1)?
         } else {
             literal(
                 n.prop("CommandValue")
@@ -1541,6 +1610,11 @@ impl NodeMap {
             &expressions,
         )
     }
+}
+/// Whether an element names another node: a `p` link, or a register's
+/// embedded address IntSwissKnife.
+fn node_link(tag: &str) -> bool {
+    tag.starts_with('p') || tag == "IntSwissKnife"
 }
 fn fields_has(fields: &[Element], tag: &str) -> bool {
     fields.iter().any(|p| p.tag == tag)
@@ -2397,6 +2471,73 @@ mod tests {
         assert_eq!(m.get(&mut io, "Width").unwrap(), 32);
         assert!(m.set(&mut io, "Width", "33").is_err());
         assert!(m.set(&mut io, "Width", "66").is_err());
+    }
+    #[test]
+    fn index_stride_defaults_to_the_register_length_and_reads_p_offset() {
+        let m = map(concat!(
+            "<IntReg Name='Indexed'><Address>100</Address><Address>20</Address>",
+            "<pIndex Offset='1000'>Index1</pIndex><pIndex Offset='10000'>Index2</pIndex>",
+            "<pIndex>Index3</pIndex><Length>4</Length></IntReg>",
+            "<Integer Name='Index1'><Value>5</Value></Integer>",
+            "<Integer Name='Index2'><Value>3</Value></Integer>",
+            "<Integer Name='Index3'><Value>2</Value></Integer>",
+            "<IntReg Name='Gain'><Address>0x1000</Address><pIndex pOffset='Stride'>GainSelector</pIndex><Length>4</Length></IntReg>",
+            "<Integer Name='Stride'><Value>0x10</Value></Integer>",
+            "<Enumeration Name='GainSelector'><EnumEntry Name='All'><Value>0</Value></EnumEntry><EnumEntry Name='Red'><Value>3</Value></EnumEntry><Value>3</Value></Enumeration>",
+        ));
+        let mut io = Memory::default();
+        let indexed = m.node("Indexed", 0).unwrap();
+        assert_eq!(m.register(&mut io, indexed, 0).unwrap(), (35128, 4));
+        m.set(&mut io, "Gain", "7").unwrap();
+        assert_eq!(io.read_memory(0x1030, 4).unwrap(), 7u32.to_le_bytes());
+    }
+    #[test]
+    fn embedded_swiss_knives_add_to_register_addresses() {
+        // Shaped like Allied Vision Alvium per-line and inquiry registers.
+        let m = map(concat!(
+            "<Enumeration Name='LineSelector'><EnumEntry Name='Line0'><Value>0</Value></EnumEntry><EnumEntry Name='Line1'><Value>1</Value></EnumEntry><Value>0</Value></Enumeration>",
+            "<IntSwissKnife Name='LineSelectorIndex'><pVariable Name='LINESELECTOR'>LineSelector</pVariable><Formula>LINESELECTOR &amp; 0xFF</Formula></IntSwissKnife>",
+            "<Enumeration Name='LineMode'><EnumEntry Name='Input'><Value>0</Value></EnumEntry><EnumEntry Name='Output'><Value>1</Value></EnumEntry><pValue>RegLineMode</pValue></Enumeration>",
+            "<IntReg Name='RegLineMode'><Address>0x10380020</Address><IntSwissKnife Name='RegLineMode_Offset'><pVariable Name='LINESELECTORINDEX'>LineSelectorIndex</pVariable><Formula>LINESELECTORINDEX * 0x04</Formula></IntSwissKnife><Length>0x04</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>",
+            "<StructReg Comment='StructDeviceVendorNameInq'><Address>0x00800000</Address><IntSwissKnife Name='StructDeviceVendorNameImpl_Offset'><Formula>1 * 0x04</Formula></IntSwissKnife><Length>0x04</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess><StructEntry Name='RegDeviceVendorNameImpl'><Bit>0</Bit></StructEntry><StructEntry Name='RegDeviceVendorNameAvail'><Bit>1</Bit></StructEntry></StructReg>",
+            "<IntReg Name='DeviceTemperatureRegister'><IntSwissKnife><Formula>0x2000 + 0x10</Formula></IntSwissKnife><Length>4</Length><AccessMode>RO</AccessMode></IntReg>",
+        ));
+        let mut io = Memory::default();
+        m.set(&mut io, "LineSelector", "Line1").unwrap();
+        m.set(&mut io, "LineMode", "Output").unwrap();
+        assert_eq!(io.read_memory(0x10380024, 4).unwrap(), [1, 0, 0, 0]);
+        assert_eq!(io.read_memory(0x10380020, 4).unwrap(), [0; 4]);
+        assert_eq!(m.selectors("LineMode"), ["LineSelector"]);
+        assert_eq!(m.get(&mut io, "RegLineMode_Offset").unwrap(), 4);
+        io.write_memory(0x00800004, &[2, 0, 0, 0]).unwrap();
+        assert_eq!(m.get(&mut io, "RegDeviceVendorNameImpl").unwrap(), 0);
+        assert_eq!(m.get(&mut io, "RegDeviceVendorNameAvail").unwrap(), 1);
+        io.write_memory(0x2010, &[9, 0, 0, 0]).unwrap();
+        assert_eq!(m.get(&mut io, "DeviceTemperatureRegister").unwrap(), 9);
+        assert!(
+            m.features(&mut io)
+                .iter()
+                .all(|feature| !feature.name.starts_with("__"))
+        );
+    }
+    #[test]
+    fn integer_links_read_enumeration_values_and_boolean_values_accept_words() {
+        let m = map(concat!(
+            "<Enumeration Name='Bank'><EnumEntry Name='Low'><Value>0x100</Value></EnumEntry><EnumEntry Name='High'><Value>0x200</Value></EnumEntry><Value>0x200</Value></Enumeration>",
+            "<IntReg Name='Banked'><pAddress>Bank</pAddress><Length>4</Length></IntReg>",
+            "<Integer Name='BankValue'><pValue>Bank</pValue></Integer>",
+            "<Boolean Name='Floating'><Value>true</Value></Boolean>",
+        ));
+        let mut io = Memory::default();
+        io.write_memory(0x200, &[5, 0, 0, 0]).unwrap();
+        assert_eq!(m.get(&mut io, "Banked").unwrap(), 5);
+        assert_eq!(m.get(&mut io, "BankValue").unwrap(), 0x200);
+        m.set(&mut io, "BankValue", "256").unwrap();
+        assert_eq!(m.get(&mut io, "Bank").unwrap(), "Low");
+        assert!(m.set(&mut io, "BankValue", "3").is_err());
+        assert_eq!(m.get(&mut io, "Floating").unwrap(), true);
+        m.set(&mut io, "Floating", "false").unwrap();
+        assert_eq!(m.get(&mut io, "Floating").unwrap(), false);
     }
     #[test]
     fn indexed_value_routes_read_write_and_default_without_changing_register_indexing() {
