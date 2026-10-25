@@ -1966,7 +1966,13 @@ fn merge(mut modes: Vec<Mode>, mode: Mode) -> Vec<Mode> {
                 .intervals
                 .zip(mode.intervals)
                 .map(|((a, c), (b, d))| (a.max(b), c.max(d)));
-            m.min_size = m.min_size.or(mode.min_size);
+            if m.min_size.is_some() || mode.min_size.is_some() {
+                let (a, b) = (
+                    m.min_size.unwrap_or(m.size()),
+                    mode.min_size.unwrap_or(mode.size()),
+                );
+                m.min_size = Some((a.0.min(b.0), a.1.min(b.1)));
+            }
         }
         None => modes.push(mode),
     }
@@ -2869,8 +2875,12 @@ impl MediaBackend {
             _ => self.fps.to_string(),
         };
         let mut options = vec!["-framerate".to_string(), rate];
-        if let Some((width, height)) =
-            (self.mode.is_some() || self.requested_size).then_some((self.width, self.height))
+        let size = (self.width, self.height);
+        if let Some((width, height)) = self
+            .mode
+            .map(|index| self.modes[index])
+            .map(|mode| if mode.fits(size) { size } else { mode.size() })
+            .or(self.requested_size.then_some(size))
         {
             options.extend(["-video_size".into(), format!("{width}x{height}")]);
         }
@@ -8014,8 +8024,10 @@ Error opening input files: Input/output error
     fn dshow_size_ranges_take_the_sizes_inside_them() {
         let modes = dshow_modes(concat!(
             "[dshow @ 000002a3c8b4e0c0]   vcodec=mjpeg  min s=1920x1080 fps=5 max s=1920x1080 fps=30\n",
-            "[dshow @ 000002a3c8b4e0c0]   pixel_format=bgr24  min s=320x240 fps=1 max s=1920x1080 fps=60\n",
+            "[dshow @ 000002a3c8b4e0c0]   pixel_format=bgr24  min s=640x480 fps=1 max s=1920x1080 fps=60\n",
+            "[dshow @ 000002a3c8b4e0c0]   pixel_format=rgb32  min s=320x240 fps=1 max s=1920x1080 fps=60\n",
         ));
+        assert_eq!(modes.len(), 2);
         assert_eq!(modes[0].min_size, None);
         assert_eq!(modes[1].min_size, Some((320, 240)));
         let mut camera = native("dshow:video=Capture Filter", modes);
