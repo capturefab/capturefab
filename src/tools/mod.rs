@@ -21,6 +21,7 @@ pub mod read;
 pub mod redact;
 pub mod risk;
 pub mod schema;
+pub mod setups;
 pub mod values;
 pub use check::{check, check_plan, check_plan_with};
 pub use exec::{
@@ -143,6 +144,8 @@ static CATALOG: &[ToolSpec] = &[
     read::GET_STORAGE,
     read::LIST_JOBS,
     read::GET_CAMERA_FEATURES,
+    setups::LIST_CAMERA_SETUPS,
+    setups::PREVIEW_CAMERA_SETUP,
     read::INSPECT_FRAME,
     read::WAIT_FOR,
     data::GET_DATASET,
@@ -159,6 +162,7 @@ static CATALOG: &[ToolSpec] = &[
     control::SET_AUTO_EXPOSURE,
     control::RUN_CAMERA_COMMAND,
     control::UNDO_CAMERA_CHANGE,
+    setups::APPLY_CAMERA_SETUP,
     capture::CAPTURE_PHOTOS,
     capture::START_RECORDING,
     capture::STOP_RECORDING,

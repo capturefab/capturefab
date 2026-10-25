@@ -155,6 +155,10 @@ Observe reads state. Reversible actions change camera state. Bounded actions acq
 
 The assistant always asks before a Disruptive or HumanOnly action. This includes streaming to a URL, creating a folder destination, starting physical scanner acquisition, stopping another participant's work, restarting busy acquisition, and overwriting a value a person changed during the task. Unsafe transport, firmware, persistent-network, user-set and raw-register operations are refused by the camera tool registry.
 
+### Saved camera setups
+
+The assistant can restore a setup the user saved, never save, replace or delete one. `list_camera_setups` lists the saved setups and how each matches a connected camera; `preview_camera_setup` reads what a restore would change without changing anything. `apply_camera_setup` restores one setup as a single camera change with one undo token, pinned to the reviewed setup's digest, so a setup edited after the step was checked is refused. A restore that changes only image-quality values is Reversible and counts each value that may change against the task's settings budget. One that may change any other value, such as a trigger, line or counter setting, is HumanOnly and is approved once per restore; the camera refuses a disruptive change the reviewed step did not list. A restore that needs a live-view restart is refused while a recording or scheduled captures run.
+
 An approval is for the displayed action. The runtime rechecks its camera, destination, output, risk and other facts before execution. Approval for a task covers the same tool, camera and risk, with the same egress target; HumanOnly approval is always once. A human change or replacement camera worker invalidates earlier grants. Denied or unanswered actions return an error to the model. Three denials or timeouts end the task as `needs_user`.
 
 Run defaults to supervised mode. Approval handling defaults to `ask` when stdin and stderr are TTYs, otherwise `deny`. `--approvals ask` displays prompts on stderr and must have a TTY. `--approvals deny` denies proposals that need approval. A denial does not authorize a different URL, destination or unsafe operation.

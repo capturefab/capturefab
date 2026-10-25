@@ -674,6 +674,7 @@ pub(super) fn extend_schema(contract: &mut Value) {
         "apply":{"result":"the diff fields plus applied, restarted_stream, auto and camera_change","order":"geometry and pixel format first, then Enable/Mode switches, other values, auto flags and selectors last; up to 4 passes retry values an earlier write unlocked, then every value is verified","failure":"any value that does not take within 4 passes or 90 s restores every captured value; nothing is recorded in history","stream":"a running stream is stopped once and started again when the setup changes Width, Height, PixelFormat, binning, decimation, offsets or a video mode; refused while recording, forwarding or scheduled captures run","strict":"refuses, changing nothing, when any value is missing, read-only, invalid or refused","digest":"apply_setup with digest refuses a setup changed since that digest was reviewed","confirmation":"The CLI refuses disruptive changes without --yes, and sends the reviewed disruptive features as confirmed_disruptive; the worker compares again and refuses (exit 2), changing nothing, a disruptive change outside that list. RPC, browser and workflow callers that omit confirmed_disruptive have no confirmation gate (as with set_many), but the model, kind and busy checks always apply."},
         "rpc":{"read_setup":"read-only: the values a new setup would save","setup_diff":"read-only: {name} or {setup: DOCUMENT}, optional allow_other_model","apply_setup":"{name} or {setup: DOCUMENT}, optional digest, allow_other_model, strict, confirmed_disruptive: [FEATURE]"},
         "workflow":{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}},
+        "tools":{"list_camera_setups":"observe: saved setups, with their match against an optional connected camera","preview_camera_setup":"observe: the diff summary, at most 40 changes and 20 not_applied rows, with truncated","apply_camera_setup":"sends apply_setup with name, digest and confirmed_disruptive; reversible when every value that may change is an image-quality setting, else human_only (--confirmed-by-user)","writes":"no tool saves, imports or deletes a setup"},
         "exit_codes":{"missing setup":3,"other model (CLI apply)":2,"other model (CLI diff)":0,"other model (RPC)":5,"disruptive without --yes":2,"disruptive change not in confirmed_disruptive":2,"name taken, invalid name or document":2,"blocked by recording, forwarding or schedules":3,"strict refusal":5,"setup changed since review":1,"restore failed (rolled back)":1}
     });
     if let Some(commands) = contract["rpc"]["commands"].as_array_mut() {
@@ -714,5 +715,11 @@ mod tests {
             .validate()
             .unwrap();
         assert!(contract["writes"].as_str().unwrap().contains("apply_setup"));
+        for tool in contract["setup"]["tools"].as_object().unwrap().keys() {
+            assert!(
+                tool == "writes" || crate::tools::spec(tool).is_some(),
+                "{tool}"
+            );
+        }
     }
 }

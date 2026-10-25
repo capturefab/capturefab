@@ -440,6 +440,7 @@ pub(crate) fn fixture_context(snapshot: SessionSnapshot) -> Context {
         capture_root: home().join("Capturefab"),
         compiled: Compiled::current(),
         defaults: RecordingDefaults::default(),
+        setups: Vec::new(),
     }
 }
 
@@ -493,6 +494,8 @@ fn catalog_lists_the_observe_tools_with_their_sessions() {
             "get_storage",
             "list_jobs",
             "get_camera_features",
+            "list_camera_setups",
+            "preview_camera_setup",
             "inspect_frame",
             "wait_for",
             "get_dataset",
@@ -513,7 +516,8 @@ fn catalog_lists_the_observe_tools_with_their_sessions() {
             "get_overview",
             "list_cameras",
             "list_destinations",
-            "get_storage"
+            "get_storage",
+            "list_camera_setups"
         ]
     );
     assert_eq!(spec("inspect_frame").unwrap().title, "Inspect frame");
@@ -1683,6 +1687,10 @@ impl Sources for FakeSources {
 
     fn free_space(&self, path: &Path) -> Option<u64> {
         (!path.starts_with("/Volumes/Gone")).then_some(42)
+    }
+
+    fn setups(&self) -> Result<Vec<crate::setup::Setup>> {
+        Ok(Vec::new())
     }
 
     fn volume_problem(&self, path: &Path) -> Option<String> {

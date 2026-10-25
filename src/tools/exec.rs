@@ -37,6 +37,17 @@ pub enum Op {
         camera: CameraRef,
         command: SessionCommand,
     },
+    /// Restore a saved setup by name and digest. The check records how many
+    /// values may change and which features, for the task's settings budget
+    /// and the before and after values a run reports.
+    ApplySetup {
+        camera: CameraRef,
+        command: SessionCommand,
+        changes: usize,
+        features: Vec<String>,
+        /// The setup turns on Capturefab's auto exposure.
+        auto: bool,
+    },
     /// Stop the checked recording, or one a preceding step in this executor
     /// started. An absent identity never means stop whatever is current.
     StopForward {
@@ -75,6 +86,15 @@ impl Serialize for Op {
             Self::Connect { selector, .. } => json!({"op":"connect","selector":selector}),
             Self::Command { camera, command } => {
                 json!({"camera":camera.selector(),"command":command})
+            }
+            Self::ApplySetup {
+                camera,
+                command,
+                changes,
+                features,
+                auto,
+            } => {
+                json!({"op":"apply_setup","camera":camera.selector(),"command":command,"changes":changes,"features":features,"auto":auto})
             }
             Self::StopForward {
                 camera,
@@ -400,7 +420,7 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
     if run.is_some_and(|run| !run.scope.contains(&camera))
         && matches!(
             tool.as_str(),
-            "set_auto_exposure" | "connect_camera" | "disconnect_camera"
+            "set_auto_exposure" | "connect_camera" | "disconnect_camera" | "apply_camera_setup"
         )
     {
         raise(checked, "Changes a camera outside this task's scope.");
@@ -511,12 +531,24 @@ pub fn classify(ctx: &Context, run: Option<&RunFacts>, checked: &mut Checked) {
             .map(str::to_owned)
             .to_vec()
     } else {
-        Vec::new()
+        checked
+            .ops
+            .iter()
+            .flat_map(|op| match op {
+                Op::ApplySetup { features, .. } => features.clone(),
+                _ => Vec::new(),
+            })
+            .collect()
     };
+    let setup_auto = checked
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::ApplySetup { auto: true, .. }));
     // Auto controls and one-shot commands can change values indirectly.
     // A person's writes remain protected for the whole task, including after
     // the recent-activity window and when an auto policy releases a control.
     let indirect_auto = tool == "set_auto_exposure"
+        || setup_auto
         || tool == "run_camera_command"
             && checked.call.args["command"].as_str().is_some_and(|name| {
                 name.ends_with("AutoOnce") || name.starts_with("Auto") && name.ends_with("Once")
@@ -630,6 +662,17 @@ impl<'a> Executor<'a> {
     }
 
     fn command(&mut self, camera: &CameraRef, command: SessionCommand) -> Result<Value> {
+        self.command_with(camera, command, BTreeSet::new())
+    }
+
+    /// Send `command`, reporting the before and after values of `changes`
+    /// and of every feature a SetMany writes.
+    fn command_with(
+        &mut self,
+        camera: &CameraRef,
+        command: SessionCommand,
+        mut changes: BTreeSet<String>,
+    ) -> Result<Value> {
         command.validate()?;
         let camera = self.camera(camera)?;
         let forward = matches!(command, SessionCommand::Forward { .. });
@@ -640,13 +683,10 @@ impl<'a> Executor<'a> {
                 | SessionCommand::Stop
                 | SessionCommand::Disconnect
         );
-        let changes = match &command {
-            SessionCommand::SetMany { values } => values
-                .iter()
-                .map(|v| v.feature.clone())
-                .collect::<BTreeSet<_>>(),
-            _ => BTreeSet::new(),
-        };
+        if let SessionCommand::SetMany { values } = &command {
+            changes.extend(values.iter().map(|v| v.feature.clone()));
+        }
+        let setup = matches!(command, SessionCommand::ApplySetup { .. });
         let duration_ms = match &command {
             SessionCommand::Forward { duration_ms, .. } => *duration_ms,
             _ => None,
@@ -668,7 +708,31 @@ impl<'a> Executor<'a> {
         let mut result = self.host.execute(Some(&camera), command)?;
         if !previous.is_empty() && result.is_object() {
             result["before"] = json!(previous);
-            result["after"] = result["values"].clone();
+            result["after"] = if result["values"].is_array() {
+                result["values"].clone()
+            } else {
+                // A restore reports a diff, not values: read them back.
+                json!(
+                    self.host
+                        .snapshot()
+                        .ok()
+                        .and_then(|snapshot| {
+                            let state = snapshot.cameras.into_iter().find(|c| c.info.id == camera)?;
+                            Some(
+                                state
+                                    .features
+                                    .iter()
+                                    .filter(|feature| changes.contains(feature.name.as_str()))
+                                    .map(|feature| json!({"name":feature.name,"value":feature.value}))
+                                    .collect::<Vec<_>>(),
+                            )
+                        })
+                        .unwrap_or_default()
+                )
+            };
+        }
+        if setup {
+            result = super::setups::summary(result);
         }
         if let Some(token) = result["camera_change"]["token"]
             .as_str()
@@ -846,6 +910,14 @@ impl<'a> Executor<'a> {
                     result
                 }
                 Op::Command { camera, command } => self.command(camera, command.clone())?,
+                Op::ApplySetup {
+                    camera,
+                    command,
+                    features,
+                    ..
+                } => {
+                    self.command_with(camera, command.clone(), features.iter().cloned().collect())?
+                }
                 Op::StopForward {
                     camera,
                     forwarding_id,
@@ -1793,6 +1865,102 @@ mod tests {
             sent.iter()
                 .all(|(camera, _)| camera.as_deref() == Some("sim:0"))
         );
+    }
+
+    fn apply_setup_op(auto: bool) -> Op {
+        Op::ApplySetup {
+            camera: CameraRef::Connected("sim:0".into()),
+            command: SessionCommand::ApplySetup {
+                name: Some("bench".into()),
+                setup: None,
+                digest: Some(format!("sha256:{}", "a".repeat(64))),
+                allow_other_model: false,
+                strict: false,
+                confirmed_disruptive: Some(Vec::new()),
+            },
+            changes: 2,
+            features: vec!["ExposureTime".into(), "Gain".into()],
+            auto,
+        }
+    }
+
+    #[test]
+    fn a_restore_reports_checked_values_and_a_bounded_result() {
+        let mut after = fixture_snapshot();
+        let features = std::sync::Arc::make_mut(&mut after.cameras[0].features);
+        features[0].value = Some(json!(5000.0));
+        features[1].value = Some(json!(6.0));
+        let matched: Vec<Value> = (0..500)
+            .map(|i| json!({"feature":format!("Feature{i}"),"value":i}))
+            .collect();
+        let host = FakeHost::new(fixture_snapshot()).then(after).reply(
+            "apply_setup",
+            Ok(json!({
+                "setup":"bench","match":"same_camera","warnings":[],
+                "changes":[{"feature":"ExposureTime","saved":5000.0,"current":10000.0,"risk":"reversible"},
+                           {"feature":"Gain","saved":6.0,"current":0.0,"risk":"reversible"}],
+                "unchanged":500,"matched":matched,"not_applied":[],"applied":2,
+                "camera_change":{"token":"worker:1:change:3","label":"Restore setup bench"},
+            })),
+        );
+        let mut executor = Executor::new(&host, &EmptySecrets);
+        let mut checked = step("apply_camera_setup", json!({"camera":"sim:0"}));
+        checked.ops.push(apply_setup_op(false));
+        let outcome = executor
+            .run_step(&checked, &AtomicBool::new(false))
+            .unwrap();
+        let result = &outcome.results[0];
+        assert_eq!(
+            result["before"],
+            json!([{"name":"ExposureTime","value":10000.0},{"name":"Gain","value":0.0}])
+        );
+        assert_eq!(
+            result["after"],
+            json!([{"name":"ExposureTime","value":5000.0},{"name":"Gain","value":6.0}])
+        );
+        assert_eq!(result["applied"], 2);
+        assert!(result.get("matched").is_none(), "{result}");
+        assert!(serde_json::to_vec(result).unwrap().len() <= super::super::MAX_OUTPUT_BYTES);
+        assert_eq!(
+            executor.tokens,
+            [("sim:0".to_owned(), "worker:1:change:3".to_owned())]
+        );
+        assert_eq!(host.ops(), ["apply_setup"]);
+        assert_eq!(host.sent()[0].1["name"], "bench");
+        assert!(host.sent()[0].1.get("setup").is_none());
+    }
+
+    #[test]
+    fn restores_protect_values_a_person_changed_during_the_task() {
+        let ctx = fixture_context(fixture_snapshot());
+        let mut run = RunFacts {
+            actor_id: "agent".into(),
+            scope: ["sim:0".to_owned()].into(),
+            ..RunFacts::default()
+        };
+        run.human_values
+            .insert(("sim:0".into(), "Gain".into()), "3".into());
+        let mut checked = step("apply_camera_setup", json!({"camera":"sim:0"}));
+        checked.risk = Risk::Reversible;
+        checked.ops.push(apply_setup_op(false));
+        classify(&ctx, Some(&run), &mut checked);
+        assert_eq!(checked.risk, Risk::Disruptive);
+        assert!(
+            checked
+                .reasons
+                .iter()
+                .any(|r| r.contains("Overwrites Gain")),
+            "{:?}",
+            checked.reasons
+        );
+        // Outside the task's cameras, a restore needs approval too.
+        run.human_values.clear();
+        run.scope.clear();
+        let mut outside = step("apply_camera_setup", json!({"camera":"sim:0"}));
+        outside.risk = Risk::Reversible;
+        outside.ops.push(apply_setup_op(false));
+        classify(&ctx, Some(&run), &mut outside);
+        assert_eq!(outside.risk, Risk::Disruptive);
     }
 
     struct CancelAfterStop<'a> {

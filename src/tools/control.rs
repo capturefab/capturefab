@@ -472,7 +472,7 @@ fn resolve(
         }
     }
 }
-fn connected<'a>(
+pub(super) fn connected<'a>(
     ctx: &'a Context,
     plan: &PlanState,
     checked: &mut Checked,

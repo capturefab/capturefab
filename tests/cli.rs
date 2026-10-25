@@ -3462,6 +3462,132 @@ fn tools_photo_args(camera: &str, name: &str) -> Value {
     serde_json::json!({"camera":camera,"count":1,"format":"png","file_name":name,"destination":"captures","tags":null})
 }
 
+/// Agents list, preview and restore saved setups through the tool registry;
+/// a restore that changes more than image quality needs the user's approval.
+#[test]
+fn tools_list_preview_and_restore_saved_setups() {
+    let (_fixture, dir, cwd, _) = tools_fixture("tools-setups");
+    let session = |args: &[&str]| {
+        tools_ok(
+            &dir,
+            &cwd,
+            &[
+                &[
+                    "--json",
+                    "--session",
+                    "tools-ci",
+                    "--actor",
+                    "tools-integration",
+                    "--actor-kind",
+                    "agent",
+                ],
+                args,
+            ]
+            .concat(),
+        )
+    };
+    let value = |camera: &str, feature: &str| {
+        session(&["--camera", camera, "get", feature])["features"][0]["value"]
+            .as_f64()
+            .unwrap()
+    };
+    for camera in ["sim:0", "sim:line:0"] {
+        session(&["connect", camera]);
+    }
+    session(&["--camera", "sim:0", "setup", "save", "bench"]);
+    session(&["--camera", "sim:line:0", "setup", "save", "line"]);
+    session(&["--camera", "sim:0", "set", "ExposureTime=5000"]);
+
+    let listed = tools_call(
+        &dir,
+        &cwd,
+        "list_camera_setups",
+        serde_json::json!({"camera":"sim:0"}),
+        &[],
+    );
+    assert_eq!(listed["count"], 2, "{listed}");
+    assert_eq!(listed["setups"][0]["name"], "bench");
+    assert_eq!(listed["setups"][0]["match"], "same_camera");
+    assert_eq!(listed["setups"][1]["match"], "other_model");
+    let args = serde_json::json!({"camera":"sim:0","name":"bench","allow_other_model":false});
+    let preview = tools_call(&dir, &cwd, "preview_camera_setup", args.clone(), &[]);
+    assert_eq!(preview["change_count"], 1, "{preview}");
+    assert_eq!(preview["changes"][0]["feature"], "ExposureTime");
+    assert_eq!(value("sim:0", "ExposureTime"), 5000.0);
+
+    // Image-quality values only: reversible, so no confirmation.
+    let restored = tools_call(&dir, &cwd, "apply_camera_setup", args.clone(), &[]);
+    let result = &restored["results"][0];
+    assert_eq!(result["applied"], 1, "{restored}");
+    assert_eq!(result["before"][0]["name"], "ExposureTime");
+    assert_eq!(result["after"][0]["value"], 10000.0);
+    assert_eq!(value("sim:0", "ExposureTime"), 10000.0);
+    let token = result["camera_change"]["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tools_call(
+        &dir,
+        &cwd,
+        "undo_camera_change",
+        serde_json::json!({"camera":"sim:0","token":token}),
+        &["--confirmed-by-user"],
+    );
+    assert_eq!(value("sim:0", "ExposureTime"), 5000.0);
+
+    // A line rate controls more than the image: the user approves it.
+    session(&["--camera", "sim:line:0", "set", "AcquisitionLineRate=240"]);
+    let line = serde_json::json!({"camera":"sim:line:0","name":"line","allow_other_model":false});
+    let refused = tools_output(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "tools",
+            "call",
+            "apply_camera_setup",
+            "--args",
+            &line.to_string(),
+        ],
+        None,
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(
+        tools_response(&refused)["error"]["details"]["risk"],
+        "human_only"
+    );
+    assert_eq!(value("sim:line:0", "AcquisitionLineRate"), 240.0);
+    tools_call(
+        &dir,
+        &cwd,
+        "apply_camera_setup",
+        line,
+        &["--confirmed-by-user"],
+    );
+    assert_eq!(value("sim:line:0", "AcquisitionLineRate"), 480.0);
+
+    // A name nobody saved is unavailable (exit 3).
+    let missing = tools_output(
+        &dir,
+        &cwd,
+        &[
+            "--json",
+            "--session",
+            "tools-ci",
+            "tools",
+            "call",
+            "apply_camera_setup",
+            "--args",
+            r#"{"camera":"sim:0","name":"nope","allow_other_model":false}"#,
+        ],
+        None,
+    );
+    assert_eq!(missing.status.code(), Some(3));
+    assert_eq!(tools_response(&missing)["error"]["code"], "unavailable");
+}
+
 #[test]
 fn tools_list_and_overview_work_without_a_session() {
     let root = temp_root("tools-offline");
@@ -3469,7 +3595,7 @@ fn tools_list_and_overview_work_without_a_session() {
     let dir = root.join("sessions");
     let listed = tools_ok(&dir, &root, &["--json", "tools", "list"]);
     let catalog = listed.as_array().unwrap();
-    assert_eq!(catalog.len(), 29);
+    assert_eq!(catalog.len(), 32);
     for name in [
         "get_overview",
         "inspect_frame",
@@ -5611,7 +5737,7 @@ fn tools_schema_and_doctor_describe_shared_registry() {
     let schema = tools_ok(&dir, &root, &["--json", "schema"]);
     let tools = &schema["tools"];
     let catalog = tools["catalog"].as_array().unwrap();
-    assert_eq!(catalog.len(), 29);
+    assert_eq!(catalog.len(), 32);
     assert_eq!(
         tools["catalog"],
         tools_ok(&dir, &root, &["--json", "tools", "list"])
@@ -5623,6 +5749,8 @@ fn tools_schema_and_doctor_describe_shared_registry() {
         ("get_storage", "observe", false),
         ("list_jobs", "observe", true),
         ("get_camera_features", "observe", true),
+        ("list_camera_setups", "observe", false),
+        ("preview_camera_setup", "observe", true),
         ("inspect_frame", "observe", true),
         ("wait_for", "observe", true),
         ("connect_camera", "reversible", true),
@@ -5633,6 +5761,7 @@ fn tools_schema_and_doctor_describe_shared_registry() {
         ("set_auto_exposure", "reversible", true),
         ("run_camera_command", "reversible", true),
         ("undo_camera_change", "reversible", true),
+        ("apply_camera_setup", "reversible", true),
         ("capture_photos", "bounded", true),
         ("start_recording", "bounded", true),
         ("stop_recording", "bounded", true),

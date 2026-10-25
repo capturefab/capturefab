@@ -444,6 +444,9 @@ pub fn run_read(
         "get_camera_features" => parse_args(spec, &call.args)
             .and_then(|args| camera_features(host, ctx, args, opts.origin))
             .map(ToolOutput::from),
+        "list_camera_setups" | "preview_camera_setup" => {
+            super::setups::read(host, ctx, call, opts.origin).map(ToolOutput::from)
+        }
         "inspect_frame" => {
             parse_args(spec, &call.args).and_then(|args| inspect_frame(host, ctx, args, opts))
         }
@@ -529,6 +532,9 @@ fn preflight_for(
             connected_camera(ctx, "camera", &args.camera, origin)
                 .map(|_| ())
                 .map_err(|issue| vec![issue])
+        }
+        "list_camera_setups" | "preview_camera_setup" => {
+            super::setups::preflight(ctx, call, origin)
         }
         "inspect_frame" => {
             let args: InspectArgs = parse_args(spec, &call.args)?;
@@ -1424,7 +1430,7 @@ fn owned_job<'a>(
 
 /// The connected camera `text` names, or the issue to ask for it to be
 /// connected first.
-fn connected_camera<'a>(
+pub(super) fn connected_camera<'a>(
     ctx: &'a Context,
     field: &str,
     text: &str,

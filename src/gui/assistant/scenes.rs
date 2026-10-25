@@ -214,6 +214,7 @@ pub(in crate::gui) fn context(mut snapshot: SessionSnapshot) -> Context {
         }),
         compiled: Compiled::current(),
         defaults: RecordingDefaults::default(),
+        setups: Vec::new(),
     }
 }
 

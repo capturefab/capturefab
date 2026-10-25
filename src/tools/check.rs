@@ -51,6 +51,9 @@ pub fn check(
             ToolKind::Capture => {
                 super::capture::check(ctx, &mut overlay, &mut checked, secrets_present)
             }
+            ToolKind::Configure if call.tool == super::setups::APPLY_CAMERA_SETUP.name => {
+                super::setups::check(ctx, &mut overlay, &mut checked)
+            }
             ToolKind::Configure => super::destinations::check(ctx, &mut overlay, &mut checked),
         }
     }
@@ -63,6 +66,7 @@ pub fn check(
     for op in &checked.ops {
         match op {
             Op::Command { command, .. }
+            | Op::ApplySetup { command, .. }
             | Op::Stream { command, .. }
             | Op::Session { command, .. } => {
                 if let Err(error) = command.validate() {

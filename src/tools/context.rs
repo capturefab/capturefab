@@ -237,6 +237,25 @@ pub struct Context {
     pub capture_root: PathBuf,
     pub compiled: Compiled,
     pub defaults: RecordingDefaults,
+    /// Saved camera setups (`setup::Store`), in name order. Unreadable
+    /// files are left out, as `setup list` leaves them out.
+    pub setups: Vec<SavedSetup>,
+}
+
+/// A saved setup as checks read it, with the digest that pins its content.
+#[derive(Clone, Debug)]
+pub struct SavedSetup {
+    pub setup: Arc<crate::setup::Setup>,
+    pub digest: String,
+}
+
+impl SavedSetup {
+    pub fn new(setup: crate::setup::Setup) -> Self {
+        Self {
+            digest: crate::setup::digest(&setup),
+            setup: Arc::new(setup),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -423,6 +442,8 @@ pub(crate) trait Sources {
     /// Why `path` cannot be written now: an external volume that is not
     /// mounted.
     fn volume_problem(&self, path: &Path) -> Option<String>;
+    /// Every readable saved setup.
+    fn setups(&self) -> Result<Vec<crate::setup::Setup>>;
 }
 
 /// This computer.
@@ -456,6 +477,15 @@ impl Sources for System {
         crate::volumes::ensure_present(path)
             .err()
             .map(|error| format!("{error:#}"))
+    }
+
+    fn setups(&self) -> Result<Vec<crate::setup::Setup>> {
+        let store = crate::setup::Store::session();
+        Ok(store
+            .list()?
+            .iter()
+            .filter_map(|summary| store.get(&summary.name).ok())
+            .collect())
     }
 }
 
@@ -493,6 +523,14 @@ pub(crate) fn gather_with(
         files: count("files"),
         free_disk: sources.free_space(&capture_root),
     };
+    // A setup store that cannot be read leaves only the setup tools without
+    // setups; every other tool still works.
+    let setups = sources
+        .setups()
+        .unwrap_or_default()
+        .into_iter()
+        .map(SavedSetup::new)
+        .collect();
     let media = match sources.encoders() {
         Ok(names) => MediaInfo::from_names(&names),
         Err(error) => MediaInfo::unavailable(format!("{error:#}")),
@@ -510,6 +548,7 @@ pub(crate) fn gather_with(
         capture_root,
         compiled,
         defaults,
+        setups,
     })
 }
 
