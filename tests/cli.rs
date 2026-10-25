@@ -5486,6 +5486,20 @@ mod assistant_cli_tests {
             .spawn()
             .unwrap(),
         ));
+        // Drain both pipes while the child runs: its stopped-run JSON can exceed
+        // the pipe buffer (16 KiB on macOS), and an unread pipe would block the
+        // final write so the process could never exit.
+        let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+            let mut pipe = pipe.unwrap();
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes).unwrap();
+                bytes
+            })
+        };
+        let child = running.0.as_mut().unwrap();
+        let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+        let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
         let ready_deadline = std::time::Instant::now() + Duration::from_secs(10);
         while server.requests.lock().unwrap().is_empty() {
             assert!(
@@ -5513,7 +5527,11 @@ mod assistant_cli_tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
-        let out = running.0.take().unwrap().wait_with_output().unwrap();
+        let out = std::process::Output {
+            status: running.0.take().unwrap().wait().unwrap(),
+            stdout: stdout.join().unwrap(),
+            stderr: stderr.join().unwrap(),
+        };
         assert_eq!(
             out.status.code(),
             Some(1),
