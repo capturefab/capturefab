@@ -141,7 +141,7 @@ impl Node {
     fn host_value(&self) -> bool {
         matches!(
             self.kind.as_str(),
-            "Integer" | "Float" | "String" | "Boolean" | "Enumeration"
+            "Integer" | "Float" | "String" | "Boolean" | "Enumeration" | "Command"
         ) && self
             .props
             .iter()
@@ -1569,21 +1569,62 @@ impl NodeMap {
         self.access(io, name, true, 0)?;
         let n = self.node(name, 0)?;
         ensure!(n.kind == "Command", "{name} is not a command");
-        let v = if let Some(link) = n.prop("pCommandValue") {
-            self.numeric_value(io, link, 1)?
+        let v = self.command_value(io, n)?;
+        if let Some(target) = n.prop("pValue") {
+            return self.set_inner(io, target, &v, 1, true);
+        }
+        // A floating command writes its host Value.
+        let index = self
+            .host_entry(io, n, 0)?
+            .context("command has no pValue or Value")?;
+        n.stored.borrow_mut().insert(index, v);
+        Ok(())
+    }
+    /// Poll a command's IsDone after `execute`: its target reads back
+    /// something other than the command value. A write-only or floating
+    /// command, or a target that cannot be read, counts as done. Returns
+    /// false if the command is still running at `timeout`.
+    pub fn wait_done(
+        &self,
+        io: &mut dyn RegisterIo,
+        name: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool> {
+        let n = self.node(name, 0)?;
+        ensure!(n.kind == "Command", "{name} is not a command");
+        let Some(target) = n.prop("pValue") else {
+            return Ok(true);
+        };
+        if ["AccessMode", "ImposedAccessMode"]
+            .into_iter()
+            .any(|key| n.prop(key) == Some("WO"))
+        {
+            return Ok(true);
+        }
+        let value = self.command_value(io, n)?;
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let running = self
+                .numeric_value(io, target, 1)
+                .is_ok_and(|current| numeric_equal(&current, &value).unwrap_or(false));
+            if !running {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fn command_value(&self, io: &mut dyn RegisterIo, n: &Node) -> Result<Value> {
+        if let Some(link) = n.prop("pCommandValue") {
+            self.numeric_value(io, link, 1)
         } else {
             literal(
                 n.prop("CommandValue")
                     .context("command has no CommandValue")?,
-            )?
-        };
-        self.set_inner(
-            io,
-            n.prop("pValue").context("command has no pValue")?,
-            &v,
-            1,
-            true,
-        )
+            )
+        }
     }
     /// A pVariable's value. The `.Min`, `.Max` and `.Inc` name extensions read
     /// the linked node's bounds, `.Entry.<Name>` the value of one of its
@@ -2838,6 +2879,49 @@ mod tests {
         m.execute(&mut io, "Start").unwrap();
         assert_eq!(m.get(&mut io, "Mode").unwrap(), "A");
         assert!(m.set(&mut io, "ReadOnly", "2").is_err());
+    }
+    #[test]
+    fn commands_report_done_when_the_target_clears_and_may_float() {
+        struct SelfClearing {
+            memory: Memory,
+            reads: usize,
+        }
+        impl RegisterIo for SelfClearing {
+            fn read_memory(&mut self, a: u64, n: usize) -> Result<Vec<u8>> {
+                self.reads += 1;
+                if self.reads == 3 {
+                    self.memory.write_memory(a, &vec![0; n])?;
+                }
+                self.memory.read_memory(a, n)
+            }
+            fn write_memory(&mut self, a: u64, b: &[u8]) -> Result<()> {
+                self.memory.write_memory(a, b)
+            }
+        }
+        let m = map(concat!(
+            "<Command Name='UserSetLoad'><pValue>UserSetLoadReg</pValue><CommandValue>1</CommandValue></Command>",
+            "<IntReg Name='UserSetLoadReg'><Address>0x20</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
+            "<Command Name='TriggerSoftware'><ImposedAccessMode>WO</ImposedAccessMode><pValue>TriggerReg</pValue><CommandValue>1</CommandValue></Command>",
+            "<IntReg Name='TriggerReg'><Address>0x24</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
+            "<Command Name='AcquisitionStart'><Value>0</Value><CommandValue>0</CommandValue></Command>",
+        ));
+        let timeout = std::time::Duration::from_secs(5);
+        let mut io = SelfClearing {
+            memory: Memory::default(),
+            reads: 0,
+        };
+        m.execute(&mut io, "UserSetLoad").unwrap();
+        assert!(m.wait_done(&mut io, "UserSetLoad", timeout).unwrap());
+        assert_eq!(io.reads, 3);
+        let mut io = Memory::default();
+        m.execute(&mut io, "UserSetLoad").unwrap();
+        let short = std::time::Duration::from_millis(20);
+        assert!(!m.wait_done(&mut io, "UserSetLoad", short).unwrap());
+        m.execute(&mut io, "TriggerSoftware").unwrap();
+        assert!(m.wait_done(&mut io, "TriggerSoftware", short).unwrap());
+        m.execute(&mut io, "AcquisitionStart").unwrap();
+        assert!(m.wait_done(&mut io, "AcquisitionStart", short).unwrap());
+        assert!(m.is_writable(&mut io, "AcquisitionStart"));
     }
     #[test]
     fn converter_float_and_cycles() {

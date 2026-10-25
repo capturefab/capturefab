@@ -656,7 +656,12 @@ impl Camera {
             "use start/stop to manage transport and acquisition together"
         );
         self.software_triggers = None;
-        self.nodes.execute(self.backend.as_mut(), name)
+        self.nodes.execute(self.backend.as_mut(), name)?;
+        // Let a command such as UserSetLoad finish before its effects are
+        // read back; one whose target never clears just returns later.
+        self.nodes
+            .wait_done(self.backend.as_mut(), name, Duration::from_secs(2))?;
+        Ok(())
     }
     /// Start acquisition as a GenTL producer would: lock the transport
     /// layer parameters (SFNC TLParamsLocked), which many cameras require
