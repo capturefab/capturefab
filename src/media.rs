@@ -1902,8 +1902,8 @@ struct Mode {
     /// holds the interval it derives from `-framerate`.
     intervals: Option<(u32, u32)>,
     /// The smallest size of a DirectShow capability that takes any size up
-    /// to this mode's.
-    min_size: Option<(u32, u32)>,
+    /// to this mode's, and the lowest rate it takes them at.
+    min_size: Option<((u32, u32), f64)>,
 }
 impl Mode {
     fn size(&self) -> (u32, u32) {
@@ -1911,7 +1911,7 @@ impl Mode {
     }
     fn fits(&self, (width, height): (u32, u32)) -> bool {
         self.size() == (width, height)
-            || self.min_size.is_some_and(|(low_width, low_height)| {
+            || self.min_size.is_some_and(|((low_width, low_height), _)| {
                 (low_width..=self.width).contains(&width)
                     && (low_height..=self.height).contains(&height)
             })
@@ -1919,6 +1919,11 @@ impl Mode {
     fn honors(&self, fps: f64) -> bool {
         self.fps
             .is_none_or(|(low, high)| fps > low - 0.01 && fps < high + 0.01)
+    }
+    /// Whether this mode runs at `fps` at `size`, which it fits.
+    fn honors_at(&self, size: (u32, u32), fps: f64) -> bool {
+        self.honors(fps)
+            && (size == self.size() || self.min_size.is_none_or(|(_, low)| fps > low - 0.01))
     }
     fn label(&self) -> String {
         match self.fps {
@@ -1966,13 +1971,12 @@ fn merge(mut modes: Vec<Mode>, mode: Mode) -> Vec<Mode> {
                 .intervals
                 .zip(mode.intervals)
                 .map(|((a, c), (b, d))| (a.max(b), c.max(d)));
-            if m.min_size.is_some() || mode.min_size.is_some() {
-                let (a, b) = (
-                    m.min_size.unwrap_or(m.size()),
-                    mode.min_size.unwrap_or(mode.size()),
-                );
-                m.min_size = Some((a.0.min(b.0), a.1.min(b.1)));
-            }
+            m.min_size = match (m.min_size, mode.min_size) {
+                (Some((a, low)), Some((b, other))) => {
+                    Some(((a.0.min(b.0), a.1.min(b.1)), low.min(other)))
+                }
+                (a, b) => a.or(b),
+            };
         }
         None => modes.push(mode),
     }
@@ -2054,11 +2058,13 @@ fn dshow_modes(log: &str) -> Vec<Mode> {
                 fps: Some((low.min(high), high)),
                 input_format: None,
                 intervals: intervals.filter(|(fast, slow)| fast <= slow),
-                min_size: dimensions(smallest).filter(|&(low_width, low_height)| {
-                    (low_width, low_height) != (width, height)
-                        && low_width <= width
-                        && low_height <= height
-                }),
+                min_size: dimensions(smallest)
+                    .filter(|&(low_width, low_height)| {
+                        (low_width, low_height) != (width, height)
+                            && low_width <= width
+                            && low_height <= height
+                    })
+                    .map(|smallest| (smallest, low.min(high))),
             })
         })
         .fold(Vec::new(), merge)
@@ -2787,7 +2793,9 @@ impl MediaBackend {
         }
         let index = best(&self.modes, |m| {
             options.size.is_none_or(|size| m.fits(size))
-                && options.fps.is_none_or(|fps| m.honors(fps))
+                && options
+                    .fps
+                    .is_none_or(|fps| m.honors_at(options.size.unwrap_or(m.size()), fps))
         })
         .ok_or_else(|| {
             let (width, height) = options.size.unwrap_or_else(|| {
@@ -3218,7 +3226,8 @@ impl RegisterIo for MediaBackend {
                         .iter()
                         .enumerate()
                         .filter(|(_, m)| {
-                            let (low_width, low_height) = m.min_size.unwrap_or(m.size());
+                            let (low_width, low_height) =
+                                m.min_size.map_or(m.size(), |(smallest, _)| smallest);
                             if address == 0 {
                                 (low_width..=m.width).contains(&w)
                             } else {
@@ -3227,7 +3236,17 @@ impl RegisterIo for MediaBackend {
                         })
                         .max_by_key(|&(index, m)| {
                             let current = self.mode == Some(index);
-                            (m.fits((w, h)), m.honors(self.fps), current, m.rank())
+                            let fits = m.fits((w, h));
+                            (
+                                fits,
+                                if fits {
+                                    m.honors_at((w, h), self.fps)
+                                } else {
+                                    m.honors(self.fps)
+                                },
+                                current,
+                                m.rank(),
+                            )
                         })
                         .map(|(index, _)| index)
                         .ok_or_else(|| self.unsupported(w, h, self.fps))?;
@@ -3237,8 +3256,12 @@ impl RegisterIo for MediaBackend {
                         self.raw_first(index, self.fps)
                     };
                     self.select(index, Some(self.fps));
-                    if self.modes[index].fits((w, h)) {
+                    let mode = self.modes[index];
+                    if mode.fits((w, h)) && (w, h) != mode.size() {
                         (self.width, self.height) = (w, h);
+                        if let Some((_, low)) = mode.min_size {
+                            self.fps = self.fps.max(low);
+                        }
                     }
                 }
             }
@@ -3254,9 +3277,11 @@ impl RegisterIo for MediaBackend {
                     let size = (self.width, self.height);
                     let index = self
                         .mode
-                        .filter(|&i| self.modes[i].fits(size) && self.modes[i].honors(value))
+                        .filter(|&i| {
+                            self.modes[i].fits(size) && self.modes[i].honors_at(size, value)
+                        })
                         .or_else(|| {
-                            best(&self.modes, |m| m.fits(size) && m.honors(value))
+                            best(&self.modes, |m| m.fits(size) && m.honors_at(size, value))
                                 .map(|i| self.raw_first(i, value))
                         })
                         .ok_or_else(|| self.unsupported(size.0, size.1, value))?;
@@ -8029,7 +8054,7 @@ Error opening input files: Input/output error
         ));
         assert_eq!(modes.len(), 2);
         assert_eq!(modes[0].min_size, None);
-        assert_eq!(modes[1].min_size, Some((320, 240)));
+        assert_eq!(modes[1].min_size, Some(((320, 240), 1.0)));
         let mut camera = native("dshow:video=Capture Filter", modes);
         camera
             .configure(NativeOptions {
@@ -8060,6 +8085,24 @@ Error opening input files: Input/output error
                 })
                 .is_err()
         );
+        // A fixed size at 5-60 fps merged with a range only from 30 fps.
+        let merged = dshow_modes(concat!(
+            "[dshow @ 000002a3c8b4e0c0]   pixel_format=yuyv422  min s=1920x1080 fps=5 max s=1920x1080 fps=60\n",
+            "[dshow @ 000002a3c8b4e0c0]   pixel_format=bgr24  min s=640x480 fps=30 max s=1920x1080 fps=60\n",
+        ));
+        assert_eq!(merged.len(), 1);
+        let mut camera = native("dshow:video=Capture Filter", merged);
+        let open = |camera: &mut MediaBackend, size, fps| {
+            camera
+                .configure(NativeOptions {
+                    size: Some(size),
+                    fps: Some(fps),
+                })
+                .is_ok()
+        };
+        assert!(open(&mut camera, (1920, 1080), 5.0));
+        assert!(open(&mut camera, (640, 480), 30.0));
+        assert!(!open(&mut camera, (640, 480), 5.0));
     }
     #[test]
     fn v4l2_modes_take_a_compressed_format_where_raw_cannot_reach_the_rate() {
