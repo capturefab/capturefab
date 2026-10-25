@@ -879,6 +879,15 @@ mod tests {
     }
 
     #[test]
+    fn switching_from_jpeg_renames_a_jpg_output() {
+        let mut app = bench();
+        update(&mut app, Message::Format(FORMATS[1]));
+        app.output = "capture.jpg".into();
+        update(&mut app, Message::Format(FORMATS[0]));
+        assert_eq!(app.output, "capture.png");
+    }
+
+    #[test]
     fn user_gestures_and_scanner_context_separate_typing_groups() {
         let mut app = bench();
         update(&mut app, Message::Num(Num::Timeout, "4000".into()));

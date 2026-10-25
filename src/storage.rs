@@ -405,7 +405,7 @@ impl Manager {
         removed
     }
     fn writer(&self, path: &Path, policy: &StoragePolicy, reserve: u64) -> Result<StorageWriter> {
-        self.writer_anchored(path, policy, reserve, None)
+        self.writer_for(path, policy, reserve, None, SaveKind::Recording)
     }
     fn writer_anchored(
         &self,
@@ -414,20 +414,34 @@ impl Manager {
         reserve: u64,
         directory: Option<Arc<OutputDirectory>>,
     ) -> Result<StorageWriter> {
+        self.writer_for(path, policy, reserve, directory, SaveKind::File)
+    }
+    fn writer_for(
+        &self,
+        path: &Path,
+        policy: &StoragePolicy,
+        reserve: u64,
+        directory: Option<Arc<OutputDirectory>>,
+        kind: SaveKind,
+    ) -> Result<StorageWriter> {
         policy.validate()?;
         ensure!(reserve > 0, "capture storage reservation must be positive");
         ensure!(
             reserve <= policy.max_bytes,
-            "Storage full: reservation {reserve} bytes exceeds the {} byte budget; lower --max-file-size or explicitly configure a larger storage budget",
-            policy.max_bytes
+            "Storage full: {} exceeds the {} budget; {}",
+            kind.reservation(reserve),
+            human_bytes(policy.max_bytes),
+            kind.budget_hint()
         );
         let mut locked = self.lock()?;
         namespace::ensure_write_allowed(&locked, path)?;
         let policy = policy.constrained_by(&locked.configured_policy()?);
         ensure!(
             reserve <= policy.max_bytes,
-            "Storage full: reservation {reserve} bytes exceeds the configured {} byte global budget; lower the recording reservation or explicitly configure a larger storage policy",
-            policy.max_bytes
+            "Storage full: {} exceeds the configured {} global budget; {}",
+            kind.reservation(reserve),
+            human_bytes(policy.max_bytes),
+            kind.configured_hint()
         );
         let (base, path) = if let Some(directory) = &directory {
             directory.verify()?;
@@ -466,7 +480,7 @@ impl Manager {
                 return Err(OutputExists(path).into());
             }
         }
-        locked.make_room(&policy, reserve, &base, device(&base))?;
+        locked.make_room(&policy, reserve, &base, device(&base), kind)?;
         let id = nonce()?;
         let lease_name = format!("storage-{id}.lease");
         let lease_path = locked.directory.join(&lease_name);
@@ -1312,6 +1326,7 @@ impl Locked {
         reserve: u64,
         base: &Path,
         device: Option<u64>,
+        kind: SaveKind,
     ) -> Result<()> {
         // Expired files beyond one batch, and space on the disk beyond one
         // round of removals, wait for later saves: freeing disk space can
@@ -1348,22 +1363,26 @@ impl Locked {
             }
             if policy.on_full == "stop" && (full || expired) {
                 bail!(
-                    "Storage full: {allocated} allocated bytes and {} retained files (limits: {} bytes, {} files{}); enable explicit --delete-oldest retention, remove old captures yourself, or use storage configure --max-space/--max-files to increase the budget",
+                    "Storage full: {} allocated and {} retained files (limits: {}, {} files{}); enable explicit --delete-oldest retention, remove old captures yourself, or raise --max-space/--max-files (storage configure keeps them)",
+                    human_bytes(allocated),
                     self.ledger.entries.len(),
-                    policy.max_bytes,
+                    human_bytes(policy.max_bytes),
                     policy.max_files,
                     if expired { "; maximum age reached" } else { "" }
                 );
             }
             let low = |stalled: bool| {
                 anyhow!(
-                    "Storage full: {} needs at least 512 MiB free on its disk after this {reserve}-byte save, and {free} bytes are free{}; free some space, lower --max-file-size, or choose another output folder",
+                    "Storage full: {} needs at least 512 MiB free on its disk after this {} save, and {} is free{}; {}",
                     base.display(),
+                    human_bytes(reserve),
+                    human_bytes(free),
                     if stalled {
                         "; removing old captures there did not free space, perhaps because a snapshot still holds it, so none are removed until a save fits"
                     } else {
                         ""
-                    }
+                    },
+                    kind.disk_hint()
                 )
             };
             if short > 0 {
@@ -1553,9 +1572,9 @@ impl Write for StorageWriter {
             self.failed = true;
             self.cut = true;
             return Err(io::Error::other(format!(
-                "Storage full: {} reached its maximum file size of {} bytes; raise the maximum file size (--max-file-size) or record shorter segments",
+                "Storage full: {} reached its maximum file size of {}; raise the maximum file size (--max-file-size) or record shorter segments",
                 self.path.display(),
-                self.reserve
+                human_bytes(self.reserve)
             )));
         }
         let result = self
@@ -1816,15 +1835,79 @@ impl std::fmt::Display for OutputExists {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "capture output already exists: {}; choose a new file name",
+            "output already exists: {}; Capturefab never overwrites files, so choose a new name",
             self.0.display()
         )
     }
 }
 impl std::error::Error for OutputExists {}
+/// A byte count for people in binary units, as storage limits are written:
+/// "512 B", "284 KiB", "2.5 MiB", "10 GiB".
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut size = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    let text = if size < 10.0 {
+        format!("{size:.1}")
+    } else {
+        format!("{size:.0}")
+    };
+    format!(
+        "{} {}",
+        text.strip_suffix(".0").unwrap_or(&text),
+        UNITS[unit]
+    )
+}
+/// What a refused save was, for advice the person can act on: a whole file
+/// (a capture or export) fits the budget, a recording its --max-file-size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SaveKind {
+    File,
+    Recording,
+}
+impl SaveKind {
+    fn reservation(self, reserve: u64) -> String {
+        match self {
+            Self::File => format!("this {} file", human_bytes(reserve)),
+            Self::Recording => format!("the {} recording reservation", human_bytes(reserve)),
+        }
+    }
+    fn budget_hint(self) -> &'static str {
+        match self {
+            Self::File => "raise --max-space or the saved budget (storage configure --max-space)",
+            Self::Recording => {
+                "lower --max-file-size or explicitly configure a larger storage budget"
+            }
+        }
+    }
+    fn configured_hint(self) -> &'static str {
+        match self {
+            Self::File => "raise it with storage configure --max-space",
+            Self::Recording => {
+                "lower --max-file-size or explicitly configure a larger storage policy"
+            }
+        }
+    }
+    fn disk_hint(self) -> &'static str {
+        match self {
+            Self::File => "free some space or choose another output folder",
+            Self::Recording => {
+                "free some space, lower --max-file-size, or choose another output folder"
+            }
+        }
+    }
+}
 /// Save already encoded bytes as a new file.
 pub fn save_bytes(bytes: &[u8], path: &Path, policy: &StoragePolicy) -> Result<Stored> {
-    let mut writer = create_writer(path, policy, bytes.len() as u64)?;
+    let mut writer =
+        Manager::global().writer_for(path, policy, bytes.len() as u64, None, SaveKind::File)?;
     writer.write_all(bytes)?;
     let stored = Stored {
         bytes: writer.bytes_written(),
@@ -3147,6 +3230,7 @@ mod tests {
                 1,
                 &base,
                 device(&base),
+                SaveKind::File,
             )
             .unwrap();
         assert_eq!(locked.ledger.entries.len(), 99);
@@ -3160,7 +3244,9 @@ mod tests {
         let mut policy = policy(1 << 30, 100_000, "delete-oldest");
         policy.max_age_seconds = Some(10);
         locked.commits = 0;
-        locked.make_room(&policy, 1, &base, device(&base)).unwrap();
+        locked
+            .make_room(&policy, 1, &base, device(&base), SaveKind::File)
+            .unwrap();
         assert_eq!(locked.ledger.entries.len(), 99 - EXPIRED_BATCH);
         assert_eq!(locked.commits, 1);
     }
@@ -3311,13 +3397,17 @@ mod tests {
         AVAILABLE.set(Some(small_disk));
         let mut locked = manager.lock().unwrap();
         // As on Windows, where the oldest file could be on another drive.
-        let error = locked.make_room(&oldest, 60, &base, None).unwrap_err();
+        let error = locked
+            .make_room(&oldest, 60, &base, None, SaveKind::File)
+            .unwrap_err();
         assert!(
             format!("{error:#}").contains("needs at least 512 MiB free"),
             "{error:#}"
         );
         assert!(temp.path("kept").exists());
-        locked.make_room(&oldest, 60, &base, device(&base)).unwrap();
+        locked
+            .make_room(&oldest, 60, &base, device(&base), SaveKind::File)
+            .unwrap();
         assert!(!temp.path("kept").exists());
         AVAILABLE.set(None);
     }

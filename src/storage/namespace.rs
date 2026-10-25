@@ -452,7 +452,13 @@ impl Manager {
         };
         crate::dataset::task::TaskDataset::validate_namespace_path(&parent)?;
         ensure_write_allowed(&locked, &parent)?;
-        locked.make_room(&policy, cap, &parent, device(&parent))?;
+        locked.make_room(
+            &policy,
+            cap,
+            &parent,
+            device(&parent),
+            super::SaveKind::File,
+        )?;
         let id = nonce()?;
         let parent_identity = identity(&fs::metadata(&parent)?);
         let path = parent.join(format!("task-{id}"));

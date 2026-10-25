@@ -323,6 +323,15 @@ pub(super) fn command_notice(
         Ok(value) => outcome(job, value),
         Err(error) => {
             let full = format!("{error:#}");
+            if matches!(job, Job::Capture)
+                && let Some((saved, requested, folder, reason)) = partial_burst(&full)
+            {
+                return Some((
+                    format!("Saved {saved} of {requested} · {reason}"),
+                    Some(folder),
+                    Level::Warning,
+                ));
+            }
             Some((
                 format!("{}: {}", failure(job), first_line(&full)),
                 Some(full.clone()),
@@ -330,6 +339,30 @@ pub(super) fn command_notice(
             ))
         }
     }
+}
+
+/// A burst that failed part way, as the worker words it (see
+/// `engine::saved_before`): frames saved, frames asked for, their folder and
+/// a short reason.
+fn partial_burst(message: &str) -> Option<(u64, u64, String, &'static str)> {
+    let rest = &message[message.find("saved ")? + "saved ".len()..];
+    let (saved, rest) = rest.split_once(" of ")?;
+    let (requested, rest) = rest.split_once(" frames to ")?;
+    let (folder, rest) = rest.split_once(" (")?;
+    let (_, cause) = rest.split_once(") before this failed")?;
+    let reason = if cause.to_ascii_lowercase().contains("storage full") {
+        "storage full"
+    } else if cause.contains("timeout") {
+        "frame timeout"
+    } else {
+        "the rest failed"
+    };
+    Some((
+        saved.parse().ok()?,
+        requested.parse().ok()?,
+        folder.into(),
+        reason,
+    ))
 }
 
 fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> {
@@ -657,6 +690,28 @@ mod tests {
             let result = Ok(json!({ "streaming": streaming }));
             assert!(command_notice(&job, &result).is_none(), "{job:?}");
         }
+    }
+
+    #[test]
+    fn partial_bursts_say_what_was_saved() {
+        let error = anyhow::anyhow!("Storage full: 1 MiB allocated")
+            .context("save shots/frame-000003.png")
+            .context(crate::engine::saved_before(
+                &[
+                    "shots/frame-000001.png".into(),
+                    "shots/frame-000002.png".into(),
+                ],
+                3,
+            ));
+        let (text, detail, level) = command_notice(&Job::Capture, &Err(error)).unwrap();
+        assert_eq!(text, "Saved 2 of 3 · storage full");
+        assert_eq!(detail.as_deref(), Some("shots"));
+        assert_eq!(level, Level::Warning);
+        let other = anyhow::anyhow!("frame timeout");
+        assert_eq!(
+            command_notice(&Job::Capture, &Err(other)).unwrap().2,
+            Level::Error
+        );
     }
 
     #[test]

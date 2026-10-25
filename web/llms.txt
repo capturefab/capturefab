@@ -206,7 +206,7 @@ RPC and workflow `forward` commands use `duration_ms` for the same limit.
 Set the maximum file size for the full duration; a recording that reaches its limit stops with storage_full and keeps the video written until then, recorded in the ledger.
 Without a duration, a session command returns immediately and records until `stop-forward`.
 A direct recording command stays active until Ctrl-C.
-`stop-forward` returns final `stats`: `accepted`, `written`, `dropped`, `late`, `stalled`, `encoder`, `error`; `record --duration` adds them as `stopped`.
+`stop-forward` returns final `stats`: `accepted`, `written`, `dropped`, `late`, `stalled`, `encoder`, `error`, `recording?`; `record --duration` adds `stopped.stats` with `accepted`, `written`, `dropped`, `late`, `stalled` and `recording?` (`path`, `bytes`, `started_ms`, `ended_ms`, `encoder`).
 `late` counts frames lost while the encoder was busy; `stalled` means no new camera frame for 2 s.
 Recordings keep wall-clock time, so a file lasts as long as its recording and a camera stall leaves a gap.
 H.265 or AV1 without a working hardware encoder fails before recording with exit 5 and names the working codecs.
@@ -247,7 +247,13 @@ capturefab --camera sim:0 capture -o 'qa/{camera}-{seq}.png' --context line=L1 -
 
 `--on-exists fail` is the CLI and RPC default.
 `--on-exists number` writes `stem-0001.ext`, `stem-0002.ext` and so on.
-A directory output continues its `frame-NNNNNN` numbers.
+A directory output continues its `frame-NNNNNN` numbers; a name ending in `/` is a folder.
+A name without an extension gets the format's (`noext` becomes `noext.png`).
+`-n 3 -o shot.jpg` is a usage error (exit 2); use `-o 'shot-{seq}.jpg'` or `-o shot/`.
+An explicit `--format` that contradicts an image extension in the name is a usage error.
+A taken name fails before acquisition; `error.details.hint` names the `{seq}` template or `--on-exists number` that would save it.
+Capture frames carry `pixel_format_name` (`Mono8`) and `file_bytes` (saved size) beside the raw `pixel_format` and `bytes`.
+A burst that fails part way keeps its saved frames; the message starts `saved N of M frames to FOLDER` and the exit code is unchanged.
 `--context KEY=VALUE` tags captures and recordings; keys match `^[a-z][a-z0-9_]{0,31}$`.
 Read saved names from `result.files` and `result.frames[].file`.
 `frames[].wall_ms` is UTC milliseconds.
@@ -256,7 +262,7 @@ Forward replies and active status include an opaque 32-character lowercase hexad
 RPC `{"op":"stop_forward_if","forwarding_id":"ID"}` stops only that instance and refuses a replacement.
 Timed CLI fallback and assistant recording cleanup use that identity. Explicit human stop-forward stops the current recording.
 A timed recording result also gives the nominal UTC deadline in `until_ms`; `status` shows it in `forwarding_until_ms`.
-When the session stops a timed recording on time, `record --duration` returns `"stopped":{"forwarding":null,"by":"duration"}`.
+When the session stops a timed recording on time, `record --duration` returns `"stopped":{"forwarding":null,"by":"duration","stats":{...}}`.
 The desktop saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` by default.
 
 ## Catalog and export datasets

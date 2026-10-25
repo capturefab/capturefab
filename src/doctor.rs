@@ -128,7 +128,7 @@ struct Facts {
     graphics: Option<Value>,
     /// Where sessions are found, with their short-lived files.
     runtime: Place,
-    /// Settings, saved destinations, the upload queue and the storage ledger.
+    /// Settings, saved destinations and the storage ledger.
     state: Place,
     /// CAPTUREFAB_SESSION_DIR chose both.
     session_dir_set: bool,
@@ -408,7 +408,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
             "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
         ),
         format!(
-            "{fix} Settings, destinations, the upload queue and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
+            "{fix} Settings, destinations and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
         ),
     )
 }
@@ -488,7 +488,7 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
         return Check::ok(
             "session_storage",
             format!(
-                "Settings, saved destinations, the upload queue and the storage ledger are in {}.",
+                "Settings, saved destinations and the storage ledger are in {}.",
                 state.described()
             ),
         );
@@ -496,7 +496,7 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
     let mut check = Check::ok(
         "session_storage",
         format!(
-            "Settings, saved destinations, the upload queue and the storage ledger are in memory in {} and are cleared at reboot.",
+            "Settings, saved destinations and the storage ledger are in memory in {} and are cleared at reboot.",
             state.described()
         ),
     );
@@ -1050,7 +1050,7 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.message,
-            "Settings, saved destinations, the upload queue and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
+            "Settings, saved destinations and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
         );
         assert_eq!(check.fix, None);
         // Memory is only ever chosen, so it informs rather than warns, with

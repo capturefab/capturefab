@@ -1,6 +1,7 @@
 pub(crate) mod assistant;
 mod human;
 mod resources;
+mod summary;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
 pub use resources::ResourcesCommand;
@@ -154,6 +155,7 @@ fn capture_format(format: Option<ImageFormat>, output: &str, count: u32) -> Resu
     }
     if count > 1 && !crate::naming::has_placeholder(output)
         || output == "-"
+        || crate::naming::names_directory(output)
         || std::path::Path::new(output).is_dir()
     {
         return Ok(ImageFormat::Png);
@@ -592,13 +594,13 @@ pub enum Command {
         after_help = "Examples:\n  capturefab -c sim:0 capture -o shot.png\n  capturefab -c sim:0 capture -n 50 --interval 2s -o 'line1/{camera}-{seq}.jpg'\n  capturefab -c sim:0 capture -n 10 -o frames/            A folder of frame-NNNNNN.png files\n  capturefab --direct -c sim:0 capture -o - > frame.png   One image to a pipe or file"
     )]
     Capture {
-        /// File, directory, or template with {camera} {date} {time} {datetime} {seq} {frame}; '-' writes one image to stdout
+        /// File, folder (an existing one, or a name ending in /), or template with {camera} {date} {time} {datetime} {seq} {frame}; a name without an extension gets the format's; '-' writes one image to stdout
         #[arg(short = 'o', long)]
         output: String,
-        /// Number of frames (1-100000). With more than 1, a plain file name becomes a folder of frame-NNNNNN files; use {seq} or {frame} in a template to name them yourself
+        /// Number of frames (1-100000). With more than 1, give a folder (frames/ holds frame-NNNNNN files) or a template with {seq} or {frame}; one image name such as shot.jpg is refused
         #[arg(short='n',long,default_value_t=1,value_parser=clap::value_parser!(u32).range(1..=100_000))]
         count: u32,
-        /// Image format; inferred from a single file/template extension, otherwise PNG
+        /// Image format; inferred from the file or template extension, otherwise PNG. An image extension in the name must match it
         #[arg(short = 'f', long, value_enum)]
         format: Option<ImageFormat>,
         /// Set FEATURE=VALUE before acquisition; may be repeated
@@ -1422,6 +1424,28 @@ fn prepare_with(
     Ok(command)
 }
 fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()> {
+    // Check names as typed, so the advice repeats the person's own spelling.
+    if let (
+        Some(
+            SessionCommand::Capture {
+                output,
+                count,
+                format,
+                ..
+            }
+            | SessionCommand::Schedule {
+                output,
+                count,
+                format,
+                ..
+            },
+        ),
+        Some(Command::Capture { output: typed, .. }),
+    ) = (command.as_ref(), &cli.command)
+        && output != "-"
+    {
+        crate::engine::check_capture_name(typed, *count, format)?;
+    }
     if let Some(command) = command {
         input(caller_output(command))?;
     }
@@ -1463,6 +1487,16 @@ fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()
         {
             let resolved = crate::destination::resolve(destination.as_deref(), output)?;
             crate::engine::preflight_capture_output(&resolved.output, *count, format, *on_exists)?;
+        }
+        // A taken recording file fails before any "Recording to" line.
+        if let SessionCommand::Forward {
+            output,
+            destination,
+            on_exists,
+            ..
+        } = command
+        {
+            crate::engine::preflight_recording_output(output, destination.as_deref(), *on_exists)?;
         }
     }
     Ok(())
@@ -2014,11 +2048,15 @@ pub fn run(mut cli: Cli) -> Result<()> {
             let mut timed = duration_ms
                 .map(|ms| TimedRecording::new(ms, &result, errors))
                 .transpose()?;
+            let shown = result["path"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| crate::media::redact_url(destination));
             if cli.session.is_none() {
                 if !cli.json {
                     eprintln!(
-                        "Forwarding to {}. Press Ctrl-C to stop.",
-                        crate::media::redact_url(destination)
+                        "{}",
+                        summary::forward_banner(destination, &shown, duration.as_deref())
                     );
                 }
                 let epoch = std::time::Instant::now();
@@ -2046,7 +2084,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     match next {
                         RecordingWait::Wait => {}
                         RecordingWait::Finished => {
-                            result["stopped"] = TimedRecording::finished();
+                            result["stopped"] = timed
+                                .as_ref()
+                                .unwrap()
+                                .finished(&serde_json::to_value(&state.forwarding_progress)?);
                             break;
                         }
                         RecordingWait::Stop => {
@@ -2072,8 +2113,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 on_quit_signal(move || flag.store(true, Ordering::Relaxed))?;
                 if !cli.json {
                     eprintln!(
-                        "Recording/forwarding for {}. Ctrl-C stops this encoder.",
-                        duration.as_deref().unwrap()
+                        "{}",
+                        summary::forward_banner(destination, &shown, duration.as_deref())
                     );
                 }
                 let epoch = std::time::Instant::now();
@@ -2092,7 +2133,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         // Never stop-forward here: another participant may
                         // already record on this camera.
                         RecordingWait::Finished => {
-                            result["stopped"] = TimedRecording::finished();
+                            result["stopped"] = timed.finished(&state["forwarding_progress"]);
                             break;
                         }
                         RecordingWait::Stop => {
@@ -2160,11 +2201,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     .context("schedule returned no job ID")?;
                 if !cli.json {
                     eprintln!(
-                        "Capture job {id} scheduled. Keep this process running; Ctrl-C cancels."
+                        "Capture job {id} scheduled: {} frames every {}. Keep this process running; Ctrl-C cancels.",
+                        result["job"]["count"],
+                        summary::interval(result["job"]["interval_ms"].as_u64().unwrap_or(0))
                     );
                 }
                 let h = client.local.as_ref().unwrap();
                 let mut missing: Option<std::time::Instant> = None;
+                let mut shown = 0;
                 loop {
                     if h.is_shutting_down() {
                         return Ok(());
@@ -2181,10 +2225,16 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         continue;
                     };
                     missing = None;
+                    if !cli.json && job.captured > shown {
+                        shown = job.captured;
+                        eprintln!(
+                            "{}",
+                            summary::job_progress(&json!(job), crate::scheduling::now_ms())
+                        );
+                    }
                     match job.status.as_str() {
                         "complete" => {
                             let result = json!({"job":job});
-
                             return output(&cli, result);
                         }
                         "failed" => anyhow::bail!(
@@ -2432,7 +2482,9 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
                 entry["label"].as_str().unwrap_or("")
             )?;
             if let Some(detail) = entry["detail"].as_str() {
-                writeln!(out, "  {detail}")?;
+                for line in detail.lines() {
+                    writeln!(out, "  {line}")?;
+                }
             }
         }
     } else if matches!(&cli.command, Some(Command::Status)) {
@@ -2550,10 +2602,54 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             )?;
             writeln!(out, "{}", serde_json::to_string_pretty(&value)?)?;
         }
-    } else if let Some(files) = value["files"].as_array() {
-        writeln!(out, "Saved {} frame(s):", files.len())?;
-        for file in files {
-            writeln!(out, "  {}", file.as_str().unwrap_or(""))?;
+    } else if value["files"].is_array() {
+        write!(out, "{}", summary::capture_summary(&value))?;
+    } else if matches!(&cli.command, Some(Command::Capture { .. })) && value["job"].is_object() {
+        let job = &value["job"];
+        match &cli.session {
+            Some(session) if job["status"] != "complete" => write!(
+                out,
+                "{}",
+                summary::job_scheduled(job, cli.camera.as_deref(), session)
+            )?,
+            _ => write!(out, "{}", summary::job_finished(job))?,
+        }
+    } else if matches!(&cli.command, Some(Command::Jobs)) {
+        let jobs = value["jobs"].as_array().cloned().unwrap_or_default();
+        write!(
+            out,
+            "{}",
+            summary::jobs_table(&jobs, cli.session.as_deref(), crate::scheduling::now_ms())
+        )?;
+    } else if matches!(&cli.command, Some(Command::Cancel { .. })) {
+        writeln!(out, "Cancelled capture job {}.", value["cancelled"])?;
+    } else if matches!(
+        &cli.command,
+        Some(Command::Storage {
+            command: None | Some(StorageCommand::Status | StorageCommand::Configure { .. })
+        })
+    ) {
+        write!(out, "{}", summary::storage_summary(&value))?;
+    } else if let Some(Command::Forward { output: target, .. }) = &cli.command {
+        if value["stopped"].is_object() {
+            let (text, warnings) =
+                summary::forward_summary(target, &value, crate::scheduling::now_ms());
+            write!(out, "{text}")?;
+            out.flush()?;
+            for warning in warnings {
+                eprintln!("capturefab: {warning}");
+            }
+        } else {
+            write!(
+                out,
+                "{}",
+                summary::forward_started(
+                    target,
+                    &value,
+                    cli.session.as_deref().unwrap_or("temporary"),
+                    cli.camera.as_deref()
+                )
+            )?;
         }
     } else if let Some(devices) = value["devices"].as_array() {
         let kind = match &cli.command {
@@ -2616,8 +2712,8 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
     } else if matches!(&cli.command, Some(Command::Disconnect)) {
         writeln!(out, "Disconnected.")?;
     } else if let Some(features) = value["features"].as_array() {
-        if let Some(camera) = value.get("camera") {
-            writeln!(out, "{}", serde_json::to_string_pretty(camera)?)?;
+        if let Some(camera) = value.get("camera").filter(|camera| camera.is_object()) {
+            write!(out, "{}", summary::info_header(camera))?;
         }
         for f in features {
             writeln!(
@@ -2724,13 +2820,13 @@ fn schema() -> Value {
         "--direct --camera ID bypasses automatic session attachment; --direct conflicts with explicit --session and overrides CAPTUREFAB_SESSION"
     );
     contract["capture"]["format_default"] = json!(
-        "Known single file/template extension infers png/jpeg/raw/pgm/ppm; sequences to directories and stdout default to png; --format overrides inference"
+        "Known single file/template extension infers png/jpeg/raw/pgm/ppm; sequences to directories and stdout default to png; --format overrides inference, but an explicit format that differs from a png/jpg/jpeg/raw/pgm/ppm extension in the name is a usage error (exit 2; jpg and jpeg are the same)"
     );
     contract["capture"]["path_base"] = json!(
         "CLI capture/record/RPC local output paths resolve in the calling terminal; workflow paths resolve beside their file; named destination paths remain relative to the destination"
     );
     contract["capture"]["paths"] = json!(
-        "file, directory (continues frame-NNNNNN numbering after the highest existing number) or template; {seq} picks the next free number; other existing names fail unless on_exists=number. Files are never overwritten."
+        "file, directory (an existing one or a name ending in a separator; continues frame-NNNNNN numbering after the highest existing number) or template; a file name or template whose last component has no extension gets the format's (.png, .jpg, .raw, .pgm, .ppm); with count>1 a name ending in an image extension that is not an existing directory is a usage error (exit 2): use a template with {seq} or {frame}, or a folder; {seq} picks the next free number; other existing names fail unless on_exists=number. Files are never overwritten."
     );
     contract["capture"]["placeholders"] = json!({
         "camera":"model-serial, limited to A-Z a-z 0-9 . _ - (at most 64 bytes)",
@@ -2742,7 +2838,8 @@ fn schema() -> Value {
     contract["capture"]["on_exists"] = json!({
         "values":["fail","number"],"default":"fail",
         "number":"an existing name without {seq} becomes stem-0001.ext, stem-0002.ext, ...",
-        "applies_to":"capture, schedule and local recordings (record/forward)"
+        "applies_to":"capture, schedule and local recordings (record/forward)",
+        "taken":"a taken name fails before acquisition or encoding starts (exit 1, operation_failed); the CLI adds error.details.hint with the {seq} template and --on-exists number that would save it"
     });
     contract["capture"]["context"] = json!({
         "cli":"--context KEY=VALUE (repeatable)","keys":"^[a-z][a-z0-9_]{0,31}$",
@@ -2751,11 +2848,11 @@ fn schema() -> Value {
         "recorded":"echoed in the capture result, kept on scheduled jobs and stored with each file in an open dataset"
     });
     contract["capture"]["result"] = json!({
-        "capture":"{files:[path],frames:[{id,width,height,pixel_format,timestamp_ns,bytes,wall_ms,file?}],count,context?,destination?}",
-        "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\"} when the session ended it on time, else the conditional-stop result",
+        "capture":"{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,file_bytes?,wall_ms,file?}],count,context?,destination?}; bytes is the raw acquired frame size, file_bytes the saved file size (absent for stdout). A burst that fails part way keeps its saved frames and its error category; the message starts with saved N of M frames to FOLDER (names)",
+        "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\",stats?:{accepted,written,dropped,late,stalled,recording?:{path,bytes,started_ms,ended_ms,encoder}}} when the session ended it on time (stats is absent from a worker that does not report them), else the conditional-stop result",
         "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, and forwarding_until_ms while a timed recording or forward runs",
         "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback and assistant cleanup use this form; explicit human stop-forward stops the current instance."},
-        "stop_forward":"{forwarding:null,stats:{accepted,written,dropped,late,stalled,encoder,error,recording?}|null}; Timed CLI fallback or interruption adds the conditional-stop result as stopped; normal timed completion returns {forwarding:null,by:duration}. late counts frames lost while the encoder was still busy (dropped includes them); stalled means no new camera frame for 2 s",
+        "stop_forward":"{forwarding:null,stats:{accepted,written,dropped,late,stalled,encoder,error,recording?}|null}; stop_forward_if returns the same shape. Timed CLI fallback or interruption adds the conditional-stop result as stopped; normal timed completion returns {forwarding:null,by:duration,stats?}. late counts frames lost while the encoder was still busy (dropped includes them); stalled means no new camera frame for 2 s",
     });
     contract["status"] = json!({
         "frames":"frames the worker acquired",
@@ -3300,9 +3397,19 @@ impl TimedRecording {
             errors,
         })
     }
-    /// The `stopped` result of a recording the session ended on time.
-    fn finished() -> Value {
-        json!({"forwarding": null, "by": "duration"})
+    /// The `stopped` result of a recording the session ended on time, with
+    /// its final counters when `progress` (the status's
+    /// `forwarding_progress`) is this recording's, not a later one's.
+    fn finished(&self, progress: &Value) -> Value {
+        let mut stopped = json!({"forwarding": null, "by": "duration"});
+        if progress["id"].as_str() == Some(self.forwarding_id.as_str()) {
+            let mut stats = progress.clone();
+            if let Some(stats) = stats.as_object_mut() {
+                stats.remove("id");
+            }
+            stopped["stats"] = stats;
+        }
+        stopped
     }
     fn stop_command(&self) -> SessionCommand {
         SessionCommand::StopForwardIf {
@@ -3432,6 +3539,28 @@ fn check_in(deadline: Option<Duration>) -> Duration {
     deadline.map_or(MOST, |left| left.clamp(Duration::from_millis(100), MOST))
 }
 
+impl Cli {
+    /// The `-o` of a capture or recording, as typed.
+    pub fn typed_output(&self) -> Option<String> {
+        match &self.command {
+            Some(Command::Capture { output, .. } | Command::Forward { output, .. })
+                if output != "-" =>
+            {
+                Some(output.clone())
+            }
+            _ => None,
+        }
+    }
+}
+/// How to save under a taken output name, built from the `-o` typed; a
+/// worker's reply keeps only the text, so that is checked too.
+pub fn exists_hint(error: &anyhow::Error, output: &str) -> Option<String> {
+    let taken = error
+        .chain()
+        .any(|cause| cause.is::<crate::storage::OutputExists>())
+        || format!("{error:#}").contains("output already exists");
+    taken.then(|| summary::exists_hint(output))
+}
 pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     #[cfg(feature = "ai")]
     if let Some(failure) = error
@@ -3881,10 +4010,22 @@ mod tests {
         assert_eq!(short().next(failed, at, s(0), false), Failed);
         let retried = status(false, None, earlier, Some(since + 50));
         assert_eq!(short().next(retried, at, s(0), false), Failed);
+        // Final counters are this recording's only, never a replacement's,
+        // and an older worker without them reports none rather than zeros.
+        let progress =
+            json!({"id":id,"accepted":30,"written":30,"dropped":0,"late":0,"stalled":false});
         assert_eq!(
-            TimedRecording::finished(),
-            json!({"forwarding":null,"by":"duration"})
+            short().finished(&progress),
+            json!({"forwarding":null,"by":"duration","stats":{"accepted":30,"written":30,"dropped":0,"late":0,"stalled":false}})
         );
+        let mut other = progress.clone();
+        other["id"] = json!("22222222222222222222222222222222");
+        for absent in [other, Value::Null] {
+            assert_eq!(
+                short().finished(&absent),
+                json!({"forwarding":null,"by":"duration"})
+            );
+        }
     }
     #[test]
     fn timed_recording_fallback_cannot_stop_a_same_millisecond_replacement() {

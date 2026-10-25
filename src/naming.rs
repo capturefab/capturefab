@@ -108,6 +108,85 @@ pub fn has_placeholder(output: &str) -> bool {
         .any(|p| output.contains(&format!("{{{p}}}")))
 }
 
+/// Whether `output` ends in a path separator, naming a folder to fill.
+pub fn names_directory(output: &str) -> bool {
+    output != "-" && output.ends_with(std::path::is_separator)
+}
+
+/// The extension a file of `format` is given when its name has none.
+pub fn format_extension(format: &str) -> &str {
+    if format == "jpeg" { "jpg" } else { format }
+}
+
+/// `output` with `.ext` appended when its last component has no '.' at all.
+fn with_extension(output: &str, format: &str) -> String {
+    let last = output
+        .rsplit(std::path::is_separator)
+        .next()
+        .unwrap_or(output);
+    if last.contains('.') || last.is_empty() {
+        output.into()
+    } else {
+        format!("{output}.{}", format_extension(format))
+    }
+}
+
+/// The image extension (as written) and the format it names, when the last
+/// component of `output` ends in a literal .png, .jpg, .jpeg, .raw, .pgm or
+/// .ppm. Text after a placeholder's closing brace counts; a placeholder
+/// inside the extension does not.
+pub fn image_extension(output: &str) -> Option<(&str, &'static str)> {
+    let last = output.rsplit(std::path::is_separator).next()?;
+    let (_, extension) = last.rsplit_once('.')?;
+    if extension.contains(['{', '}']) {
+        return None;
+    }
+    let format = match extension.to_ascii_lowercase().as_str() {
+        "png" => "png",
+        "jpg" | "jpeg" => "jpeg",
+        "raw" => "raw",
+        "pgm" => "pgm",
+        "ppm" => "ppm",
+        _ => return None,
+    };
+    Some((extension, format))
+}
+
+/// Why `output` cannot hold `count` frames: a sequence written to one image
+/// name (not an existing folder), with a template and a folder that would.
+pub fn sequence_needs_template(output: &str, count: u32) -> Option<String> {
+    if count <= 1 || output == "-" || has_placeholder(output) || Path::new(output).is_dir() {
+        return None;
+    }
+    let (extension, _) = image_extension(output)?;
+    let stem = &output[..output.len() - extension.len() - 1];
+    Some(format!(
+        "-n {count} saves several files, but {output} names one file; use a template such as -o '{stem}-{{seq}}.{extension}' or a folder such as -o {stem}/"
+    ))
+}
+
+/// Why `format` cannot be written to `output`: its image extension names
+/// another format. jpg and jpeg are the same.
+pub fn format_mismatch(output: &str, format: &str) -> Option<String> {
+    let (extension, named) = image_extension(output)?;
+    if named == format {
+        return None;
+    }
+    let last = output
+        .rsplit(std::path::is_separator)
+        .next()
+        .unwrap_or(output);
+    let renamed = format!(
+        "{}.{}",
+        &last[..last.len() - extension.len() - 1],
+        format_extension(format)
+    );
+    Some(format!(
+        "{last} names a {} file but the format is {format}; rename it to {renamed} or drop --format",
+        named.to_ascii_uppercase()
+    ))
+}
+
 /// A template written once per frame needs a name that changes per frame.
 pub fn validate_for_count(output: &str, count: u32, on_exists: OnExists) -> Result<()> {
     ensure!(
@@ -224,19 +303,22 @@ pub enum Plan {
     Template(String),
 }
 impl Plan {
-    /// The same file and directory rules capture has always used.
+    /// A name ending in a separator, a sequence without a placeholder and
+    /// an existing folder number `frame-NNNNNN.ext` files in that folder. A
+    /// file name or template whose last component has no extension gets the
+    /// format's, so the name says what the file holds.
     pub fn new(output: &str, count: u32, format: &str) -> Plan {
         if output == "-" {
             Plan::Stdout
         } else if has_placeholder(output) {
-            Plan::Template(output.into())
-        } else if count > 1 || Path::new(output).is_dir() {
+            Plan::Template(with_extension(output, format))
+        } else if names_directory(output) || count > 1 || Path::new(output).is_dir() {
             Plan::Directory {
                 dir: output.into(),
                 ext: format.into(),
             }
         } else {
-            Plan::File(output.into())
+            Plan::File(with_extension(output, format).into())
         }
     }
     /// Whether every frame's name is known in advance.
@@ -792,5 +874,55 @@ mod tests {
         assert!(validate_request("out-{nope}.png", 1, OnExists::Fail, &context).is_err());
         context.insert("Line".into(), "x".into());
         assert!(validate_request("out.png", 1, OnExists::Fail, &context).is_err());
+    }
+    #[test]
+    fn output_names_say_what_they_hold() {
+        assert!(matches!(
+            Plan::new("out/", 1, "png"),
+            Plan::Directory { .. }
+        ));
+        assert_eq!(Plan::new("noext", 1, "png"), Plan::File("noext.png".into()));
+        assert_eq!(
+            Plan::new("noext", 1, "jpeg"),
+            Plan::File("noext.jpg".into())
+        );
+        assert_eq!(Plan::new("y.jpg", 1, "png"), Plan::File("y.jpg".into()));
+        assert_eq!(
+            Plan::new("z/{seq}", 2, "png"),
+            Plan::Template("z/{seq}.png".into())
+        );
+        assert_eq!(Plan::new("-", 1, "png"), Plan::Stdout);
+        assert_eq!(image_extension("a/b.JPG"), Some(("JPG", "jpeg")));
+        assert_eq!(image_extension("x-{seq}.png"), Some(("png", "png")));
+        assert_eq!(image_extension("x.{date}"), None);
+        assert_eq!(image_extension("clip.mp4"), None);
+        assert!(format_mismatch("y.jpeg", "jpeg").is_none());
+        assert!(format_mismatch("y.jpg", "jpeg").is_none());
+        assert_eq!(
+            format_mismatch("out/y.jpg", "png").unwrap(),
+            "y.jpg names a JPEG file but the format is png; rename it to y.png or drop --format"
+        );
+    }
+
+    #[test]
+    fn sequences_need_a_template_or_folder() {
+        let hint = sequence_needs_template("shot.jpg", 3).unwrap();
+        assert!(
+            hint.contains("-o 'shot-{seq}.jpg'") && hint.contains("-o shot/"),
+            "{hint}"
+        );
+        assert!(
+            sequence_needs_template("SHOT.PNG", 2)
+                .unwrap()
+                .contains("SHOT-{seq}.PNG")
+        );
+        for allowed in ["shots", "shot-{seq}.jpg", "-", "clip.mp4"] {
+            assert!(sequence_needs_template(allowed, 3).is_none(), "{allowed}");
+        }
+        assert!(sequence_needs_template("shot.jpg", 1).is_none());
+        let dir = temp("seqdir").join("d.png");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(sequence_needs_template(dir.to_str().unwrap(), 3).is_none());
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 }

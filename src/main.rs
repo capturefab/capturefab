@@ -62,6 +62,7 @@ fn main() {
             std::process::exit(2)
         }
     };
+    let typed_output = cli.typed_output();
     if let Err(error) = cli::run(cli) {
         if error.chain().any(|e| {
             e.downcast_ref::<std::io::Error>()
@@ -98,6 +99,9 @@ fn main() {
         #[cfg(feature = "ai")]
         let message = provider_failure.map(ToString::to_string).unwrap_or(message);
         let message = capturefab::hubs::scrub::scrub(&message).into_owned();
+        let hint = typed_output
+            .as_deref()
+            .and_then(|output| cli::exists_hint(&error, output));
         if json_mode {
             let mut envelope =
                 json!({"version":1,"ok":false,"error":{"code":code,"message":message}});
@@ -129,6 +133,12 @@ fn main() {
                 }
                 envelope["error"]["details"] = details;
             }
+            if let Some(hint) = hint {
+                if !envelope["error"]["details"].is_object() {
+                    envelope["error"]["details"] = json!({});
+                }
+                envelope["error"]["details"]["hint"] = json!(hint);
+            }
             let _ = cli::write_json(&envelope);
         } else if let Some(failure) = assistant_failure {
             let _ = failure.print_human();
@@ -146,6 +156,9 @@ fn main() {
             }
         } else {
             eprintln!("capturefab: {message}");
+            if let Some(hint) = hint {
+                eprintln!("capturefab: to keep both, {hint}");
+            }
         }
         std::process::exit(exit)
     }

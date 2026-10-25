@@ -893,6 +893,18 @@ pub struct ForwardingProgress {
     pub dropped: u64,
     pub late: u64,
     pub stalled: bool,
+    /// The finished local file, once a recording that wrote one stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording: Option<FinishedRecording>,
+}
+/// Where a stopped recording's file is and how much it holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FinishedRecording {
+    pub path: String,
+    pub bytes: u64,
+    pub started_ms: u64,
+    pub ended_ms: u64,
+    pub encoder: String,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CameraSnapshot {
@@ -3695,6 +3707,7 @@ mod tests {
                     dropped,
                     late: 2,
                     stalled: false,
+                    recording: None,
                 }),
                 ..Default::default()
             };

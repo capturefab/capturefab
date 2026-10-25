@@ -1418,6 +1418,7 @@ mod tests {
             dropped: 0,
             late: 0,
             stalled: false,
+            recording: None,
         });
         let mut delivery = Delivery::default();
         delivery.observe(&[camera.clone()], start);

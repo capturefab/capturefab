@@ -5940,3 +5940,298 @@ fn network_scan_prints_a_readable_summary() {
     assert!(text.contains("GigE cameras"), "{text}");
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn text(output: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    )
+}
+
+/// Capture names mean what they look like, and human output summarizes.
+#[test]
+fn capture_output_paths_and_summaries() {
+    let root = temp_root("capture-guardrails");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let path = |name: &str| root.join(name).to_str().unwrap().to_owned();
+    let capture = |args: &[&str]| {
+        let mut all = vec!["--camera", "sim:0", "capture"];
+        all.extend(args);
+        cmd(&dir, &all)
+    };
+    let json_capture = |args: &[&str]| {
+        let mut all = vec!["--json", "--camera", "sim:0", "capture"];
+        all.extend(args);
+        let out = cmd(&dir, &all);
+        let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code(), reply)
+    };
+    // A human summary, not a path dump; JSON keeps its fields and adds two.
+    let out = capture(&["-o", &format!("{}/", path("burst")), "-n", "3"]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("Saved 3 PNG frames · "), "{stdout}");
+    assert!(
+        stdout.contains('×') && stdout.contains("frame-000003.png"),
+        "{stdout}"
+    );
+    let (code, reply) = json_capture(&["-o", &path("one.png")]);
+    assert_eq!(code, Some(0), "{reply}");
+    let frame = &reply["result"]["frames"][0];
+    assert!(frame["pixel_format"].is_u64(), "{reply}");
+    assert!(frame["pixel_format_name"].is_string(), "{reply}");
+    assert_eq!(
+        frame["file_bytes"].as_u64().unwrap(),
+        std::fs::metadata(path("one.png")).unwrap().len()
+    );
+    // A taken name fails, naming the one-flag fix.
+    let out = capture(&["-o", &path("one.png")]);
+    let (_, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("output already exists"), "{stderr}");
+    assert!(
+        stderr.contains("--on-exists number") && stderr.contains("one-{seq}.png"),
+        "{stderr}"
+    );
+    let (code, reply) = json_capture(&["-o", &path("one.png")]);
+    assert_eq!(code, Some(1));
+    assert_eq!(reply["error"]["code"], "operation_failed");
+    assert!(
+        reply["error"]["details"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("{seq}"),
+        "{reply}"
+    );
+    // Several frames to one image name is a usage error with a suggestion.
+    let (code, reply) = json_capture(&["-o", &path("shot.jpg"), "-n", "3"]);
+    assert_eq!(code, Some(2), "{reply}");
+    assert_eq!(reply["error"]["code"], "usage");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("shot-{seq}.jpg"),
+        "{reply}"
+    );
+    assert!(!root.join("shot.jpg").exists());
+    let (code, reply) = json_capture(&["-o", &path("shot-{seq}.jpg"), "-n", "3"]);
+    assert_eq!(code, Some(0), "{reply}");
+    for n in 1..=3 {
+        assert!(root.join(format!("shot-{n:04}.jpg")).is_file());
+    }
+    // A trailing separator is a folder; a missing extension is added; a
+    // contradicting format is refused before anything is written.
+    let (code, reply) = json_capture(&["-o", &format!("{}/", path("newdir"))]);
+    assert_eq!(code, Some(0), "{reply}");
+    assert!(root.join("newdir/frame-000001.png").is_file());
+    let (code, reply) = json_capture(&["-o", &path("y.jpg"), "-f", "png"]);
+    assert_eq!(
+        (code, &reply["error"]["code"]),
+        (Some(2), &Value::from("usage")),
+        "{reply}"
+    );
+    assert!(!root.join("y.jpg").exists());
+    let (code, reply) = json_capture(&["-o", &path("z/{seq}"), "-n", "2"]);
+    assert_eq!(code, Some(0), "{reply}");
+    assert!(root.join("z/0001.png").is_file() && root.join("z/0002.png").is_file());
+    let (code, reply) = json_capture(&["-o", &path("noext")]);
+    assert_eq!(code, Some(0), "{reply}");
+    assert!(root.join("noext.png").is_file());
+    // A local time lapse reports each frame on stderr and ends in one line.
+    let out = capture(&[
+        "-o",
+        &format!("{}/", path("tl")),
+        "-n",
+        "2",
+        "--interval",
+        "200ms",
+    ]);
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stderr.contains("1/2 saved"), "{stderr}");
+    assert!(stdout.contains("Captured 2 of 2"), "{stdout}");
+    assert!(
+        !stdout.contains("first_at_ms") && !stdout.contains('{'),
+        "{stdout}"
+    );
+    // Storage and info read as prose; JSON keeps every field.
+    let out = cmd(&dir, &["storage"]);
+    let (stdout, _) = text(&out);
+    assert!(
+        stdout.starts_with("Using ") && stdout.contains("of 10 GiB"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("namespace_accounting") && !stdout.contains('{'),
+        "{stdout}"
+    );
+    assert!(json(&dir, &["--json", "storage"])["namespace_accounting"].is_string());
+    let out = cmd(&dir, &["--camera", "sim:0", "info"]);
+    let (stdout, _) = text(&out);
+    assert!(stdout.starts_with("sim:0 · "), "{stdout}");
+    assert!(!stdout.contains('{'), "{stdout}");
+    // A taken recording file fails before any encoder starts or banner shows.
+    std::fs::write(root.join("existing.mp4"), b"keep").unwrap();
+    let out = cmd(
+        &dir,
+        &[
+            "--camera",
+            "sim:0",
+            "record",
+            "-o",
+            &path("existing.mp4"),
+            "--duration",
+            "1s",
+        ],
+    );
+    let (_, stderr) = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        !stderr.contains("Forwarding to") && !stderr.contains("Recording "),
+        "{stderr}"
+    );
+    assert!(stderr.contains("existing-{seq}.mp4"), "{stderr}");
+    assert_eq!(std::fs::read(root.join("existing.mp4")).unwrap(), b"keep");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A burst cut short by storage reports what it saved and keeps exit 6;
+/// storage advice fits the command and reads in binary units.
+#[test]
+fn partial_bursts_and_storage_errors_say_what_happened() {
+    let root = temp_root("partial-burst");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let folder = root.join("f");
+    let out = cmd(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            folder.to_str().unwrap(),
+            "-n",
+            "3",
+            "--max-files",
+            "2",
+        ],
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(6), "{reply}");
+    assert_eq!(reply["error"]["code"], "storage_full");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("saved 2 of 3 frames"),
+        "{reply}"
+    );
+    assert!(folder.join("frame-000001.png").is_file() && folder.join("frame-000002.png").is_file());
+    let fresh = root.join("fresh");
+    let out = cmd(
+        &fresh,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            root.join("h.png").to_str().unwrap(),
+            "--max-space",
+            "1KiB",
+        ],
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(6), "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(
+        !message.contains("--max-file-size") && message.contains("KiB"),
+        "{message}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A session's scheduled capture, job list and cancel read as prose.
+#[test]
+fn session_jobs_read_as_prose() {
+    let root = temp_root("session-jobs");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &root, "jobs"),
+        dir: root.clone(),
+    };
+    json(&dir, &["--json", "--session", "jobs", "connect", "sim:0"]);
+    let out = cmd(
+        &dir,
+        &[
+            "--session",
+            "jobs",
+            "capture",
+            "-n",
+            "3",
+            "--interval",
+            "5s",
+            "-o",
+            root.join("tl-{seq}.png").to_str().unwrap(),
+        ],
+    );
+    let (stdout, stderr) = text(&out);
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.starts_with("Scheduled job "), "{stdout}");
+    assert!(stdout.contains("--session jobs jobs"), "{stdout}");
+    let out = cmd(&dir, &["--session", "jobs", "jobs"]);
+    let (stdout, _) = text(&out);
+    assert!(
+        stdout.starts_with("ID ") && !stdout.contains("{\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\n1     pending"), "{stdout}");
+    let id = json(&dir, &["--json", "--session", "jobs", "jobs"])["jobs"][0]["id"].to_string();
+    let out = cmd(&dir, &["--session", "jobs", "cancel", &id]);
+    let (stdout, stderr) = text(&out);
+    assert!(
+        stdout.contains(&format!("Cancelled capture job {id}.")),
+        "{stdout}{stderr}"
+    );
+}
+
+/// A timed recording that the session ends on time reports its final stats.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_timed_recording_reports_its_final_stats() {
+    let root = temp_root("timed-stats");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let clip = root.join("clip.mkv");
+    let result = json(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "sim:0",
+            "record",
+            "-o",
+            clip.to_str().unwrap(),
+            "--duration",
+            "2s",
+        ],
+    );
+    assert_eq!(result["stopped"]["by"], "duration", "{result}");
+    assert!(
+        result["stopped"]["stats"]["written"].as_u64().unwrap() > 0,
+        "{result}"
+    );
+    assert!(
+        result["stopped"]["stats"]["recording"]["bytes"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{result}"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
