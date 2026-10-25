@@ -128,7 +128,7 @@ jobs:
         with:
           cache-on-failure: true
       # Every default feature except the window, so the GUI-free code paths keep compiling.
-      - run: cargo build --locked --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,hubs
+      - run: cargo build --locked --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,hubs,updates
       - run: cargo check --locked --no-default-features
       - run: cargo check --locked --no-default-features --features hubs
 

@@ -59,6 +59,7 @@ pub mod storage;
 pub mod tools;
 pub mod transport;
 pub mod types;
+pub mod updates;
 #[cfg(feature = "vaapi")]
 pub mod vajpeg;
 #[cfg(feature = "ai")]

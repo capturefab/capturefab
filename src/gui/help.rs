@@ -366,6 +366,13 @@ impl Workbench {
                 Some(Message::Resources(resources::Input::Open(false))),
                 t,
             )
+        } else if self.updates.open {
+            modal(
+                body,
+                self.updates_sheet(p, height),
+                Some(Message::Updates(updates::Input::Close)),
+                t,
+            )
         } else if self.analytics.open {
             modal(
                 body,
@@ -453,6 +460,7 @@ impl Workbench {
         let [editing, cameras, acquisition, view, panels, window] = Action::SECTIONS;
         let more = self.sheets.more;
         let mut body = column![
+            self.updates_help_row(p),
             button(text("Connect an external agent…").size(style::BODY))
                 .name("Open agent setup")
                 .style(style::secondary)

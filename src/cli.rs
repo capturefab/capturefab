@@ -673,6 +673,12 @@ pub enum Command {
     },
     /// Check this computer (efficiency mode, GPU, session and state folders, GigE and USB limits, storage budget) and print a fix under each warning; --json adds interfaces and compiled capabilities
     Doctor,
+    /// Print this build's version and what the last update check found; --check asks capturefab.com now
+    Version {
+        /// Read the public release list now (one GET of capturefab.com/releases.json)
+        #[arg(long)]
+        check: bool,
+    },
     /// Emit the versioned CLI and session automation contract as JSON
     Schema,
     /// Generate native shell completions (bash, zsh, fish, PowerShell, Elvish)
@@ -1016,7 +1022,7 @@ fn resolve_session(cli: &mut Cli) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct InvalidInput(String);
+pub(crate) struct InvalidInput(pub(crate) String);
 impl std::fmt::Display for InvalidInput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -1569,6 +1575,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
         },
         Some(Command::Doctor) => return output(&cli, doctor()),
+        Some(Command::Version { check }) => {
+            return output(&cli, crate::updates::version_command(*check)?);
+        }
         Some(Command::Resources { command }) => {
             return output(&cli, resources::run(command.as_ref())?);
         }
@@ -2190,6 +2199,8 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
     let mut out = io::stdout().lock();
     if matches!(&cli.command, Some(Command::Doctor)) {
         crate::doctor::print_checklist(&mut out, &value)?;
+    } else if matches!(&cli.command, Some(Command::Version { .. })) {
+        write!(out, "{}", crate::updates::human(&value))?;
     } else if let Some(Command::Serve { name, .. }) = &cli.command {
         writeln!(
             out,
@@ -2439,6 +2450,11 @@ fn build_report() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
     let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"gui":cfg!(feature="gui"),"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"wgpu":cfg!(feature="gui"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"parquet":cfg!(feature="parquet"),"embedded_web":crate::remote::embedded(),"hubs":cfg!(feature="hubs"),"keychain":cfg!(feature="keychain")},"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS graphics/USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}});
     value["features"]["ai"] = json!(cfg!(feature = "ai"));
+    value["features"]["updates"] = json!(cfg!(feature = "updates"));
+    value["update_check"] = crate::updates::report(
+        &crate::updates::Settings::load(&ipc::state_dir()),
+        &crate::updates::policy(),
+    );
     value["assistant"] = assistant::doctor();
     value
 }
@@ -2730,11 +2746,13 @@ fn schema() -> Value {
         "directories":"runtime_directory holds session descriptors and their locks, scanner and GPU JPEG staging; state_directory holds GUI settings, saved hubs and destinations, the storage ledger; cache_directory holds the extracted FFmpeg and, on Linux, dataset staging. On Linux runtime is $XDG_RUNTIME_DIR/capturefab, else /run/user/<uid>/capturefab when the user lingers (loginctl enable-linger) and that directory is theirs with mode 0700, else ~/.cache/capturefab/sessions, and state is $XDG_STATE_HOME/capturefab or ~/.local/state/capturefab; elsewhere both are one directory. CAPTUREFAB_SESSION_DIR sets both and CAPTUREFAB_CACHE_DIR the cache",
         "limits":"{rmem_max,usbfs_memory_mb}; null outside Linux",
         "graphics":"{available,adapter,backend,device_type,driver,max_texture_dimension_2d,software} from a helper process with a 3 s deadline in desktop builds, or {available:false,reason}",
-        "checks":"[{id,level:ok|warn,message,fix}]; ids include efficiency, graphics, runtime_dir, session_storage, receive_buffer, usb_access and storage_budget; checks that do not apply are omitted",
+        "checks":"[{id,level:ok|warn,message,fix}]; ids include efficiency, graphics, runtime_dir, session_storage, receive_buffer, usb_access, storage_budget and updates (an available version, or an unrecognized CAPTUREFAB_UPDATE_CHECK); checks that do not apply are omitted",
+        "update_check":"{compiled,automatic,policy,skipped,last_checked,latest,update_available,last_error}, as version --json; doctor never fetches",
         "ring_backing":"memfd|posix-shm|file: where camera frame rings live; file only on Windows or where anonymous shared memory is unavailable",
         "human":"Plain doctor prints the host summary and one line per check with its fix"
     });
     contract["hubs"] = crate::hubs::schema_contract();
+    contract["updates"] = crate::updates::schema_contract();
     contract
 }
 

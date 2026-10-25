@@ -19,8 +19,8 @@ FFmpeg stays a separate executable. Never enable nonfree FFmpeg components: the 
 ## Commands
 
 ```sh
-cargo build                                                   # desktop (default features: gui, usb, scanner, jpeg, nvjpeg, vaapi, videotoolbox, parquet, hubs)
-cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,hubs  # no GUI (CI checks it); scripts/release.py builds the default features, with no separate headless release
+cargo build                                                   # desktop (default features: gui, usb, scanner, jpeg, nvjpeg, vaapi, videotoolbox, parquet, hubs, updates)
+cargo build --release --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,hubs,updates  # no GUI (CI checks it); scripts/release.py builds the default features, with no separate headless release
 cargo test
 cargo test --test cli                                         # end-to-end binary tests (tests/cli.rs)
 cargo test --lib storage::                                    # unit tests in one module

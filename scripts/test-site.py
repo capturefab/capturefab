@@ -426,6 +426,13 @@ def check_manifest(root, errors):
     if manifest["latest"] is not None and manifest["latest"] not in versions:
         errors.append("releases.json: latest is not a listed release")
     for release in manifest["releases"]:
+        notable = release.get("highlights", [])
+        if not isinstance(notable, list) or len(notable) > 6 or any(
+            not isinstance(line, str) or not line.strip() or len(line) > 200
+            or any(ord(c) < 32 or 0x7F <= ord(c) < 0xA0 or 0x202A <= ord(c) <= 0x202E or 0x2066 <= ord(c) <= 0x2069 for c in line)
+            for line in notable
+        ):
+            errors.append(f"releases.json {release.get('version')}: highlights must be at most 6 plain lines of at most 200 characters")
         targets = set()
         for asset in release["assets"]:
             identity = (asset["os"], asset["arch"])

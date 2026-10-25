@@ -83,10 +83,8 @@ pub(in crate::gui) fn sync(workbench: &Workbench) {
         }),
         ..Item::command("Quit Capturefab", Command::Quit, true)
     };
-    let specs: Vec<_> = std::iter::once(&settings)
-        .chain(std::iter::once(&quit))
-        .chain(model.iter().flat_map(|menu| menu.items.iter().flatten()))
-        .collect();
+    let updates = workbench.updates_menu_item();
+    let specs = app_menu_specs(&updates, &settings, &quit, &model);
     MENU.with_borrow_mut(|slot| {
         let app = NSApplication::sharedApplication(mtm);
         let native = slot.get_or_insert_with(|| {
@@ -103,8 +101,9 @@ pub(in crate::gui) fn sync(workbench: &Workbench) {
                 "",
                 NSEventModifierFlags::empty(),
             ));
-            separator(mtm, &app_menu);
             let mut items = Vec::new();
+            add_command(mtm, &app_menu, &updates, &target, &mut items);
+            separator(mtm, &app_menu);
             add_command(mtm, &app_menu, &settings, &target, &mut items);
             separator(mtm, &app_menu);
             let services = submenu(mtm, &app_menu, "Services");
@@ -200,6 +199,21 @@ pub(in crate::gui) fn sync(workbench: &Workbench) {
             app.setMainMenu(Some(&native.root));
         }
     });
+}
+
+/// The commands in `add_command` order: Check for Updates, Settings and
+/// Quit in the app menu, then the model's menus. Each native item's tag is
+/// its index here.
+pub(super) fn app_menu_specs<'a>(
+    updates: &'a Item,
+    settings: &'a Item,
+    quit: &'a Item,
+    model: &'a [super::Menu],
+) -> Vec<&'a Item> {
+    [updates, settings, quit]
+        .into_iter()
+        .chain(model.iter().flat_map(|menu| menu.items.iter().flatten()))
+        .collect()
 }
 
 fn submenu(mtm: MainThreadMarker, parent: &NSMenu, title: &str) -> Retained<NSMenu> {

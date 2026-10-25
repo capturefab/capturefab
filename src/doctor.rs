@@ -229,7 +229,13 @@ impl HostReport {
             .graphics
             .clone()
             .unwrap_or_else(|| json!({"available":false,"reason":"not compiled in"}));
-        report["checks"] = json!(checks(&facts));
+        let mut checks = checks(&facts);
+        checks.extend(
+            crate::updates::doctor_notes()
+                .into_iter()
+                .map(|(message, fix)| Check::warn("updates", message, fix)),
+        );
+        report["checks"] = json!(checks);
     }
 }
 

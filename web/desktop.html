@@ -29,9 +29,9 @@
 <tr><td>Edit</td><td>Undo, Redo, Cut, Copy, Paste, Select All, Find Camera Feature…, Copy Session Command.</td></tr>
 <tr><td>View</td><td>Show Sidebar, Show Inspector, Show Activity, Camera Features, Capture, Record and Forward, Zoom In/Out, Zoom to Fit, Actual Pixels, Show Histogram, Show Focus Region, Image Only, Full Screen.</td></tr>
 <tr><td>Camera</td><td>Start/Stop Stream, Use Auto/Manual Exposure, Refresh Features, Start/Stop All Streams, Capture All, Record All Cameras, Stop All Recordings, Use Auto/Manual Exposure for All, Disconnect Camera.</td></tr>
-<tr><td>Help</td><td>Connect an Agent… and Capturefab Help.</td></tr>
+<tr><td>Help</td><td>Connect an Agent…, Capturefab Help and, on Windows and Linux, Check for Updates….</td></tr>
 </tbody></table></div>
-<p>On macOS, the application menu contains Settings and Quit. On Windows and Linux, File contains Exit or Quit.</p>
+<p>On macOS, the application menu contains Check for Updates…, Settings and Quit. On Windows and Linux, File contains Exit or Quit. When a check finds a new version, the item reads <strong>Update Available: VERSION…</strong>; see <a href="#settings-updates">update checks</a>.</p>
 <p><strong>Capture All</strong> saves from every connected camera. The other “All” commands operate on eligible connected cameras. Document scanners do not stream or record video.</p>
 <p>Use <strong>Copy Session Command</strong> to give a terminal the current session name. Use <strong>Connect an Agent…</strong> for an agent briefing.</p>
 <p>For detailed procedures, see <a href="docs.html#capture">capture</a>, <a href="docs.html#scheduling">schedules</a>, <a href="docs.html#recording">recording</a> and <a href="docs.html#forwarding">forwarding</a>.</p>
@@ -46,12 +46,20 @@
 <tr><td>Resource usage &amp; limits</td><td>Open CPU, memory and disk measurements. See <a href="#resources">resource limits</a>.</td></tr>
 <tr><td>Include simulated cameras</td><td>Include built-in simulators in discovery so you can practise without hardware.</td></tr>
 <tr><td>Start the live view when a camera connects</td><td>Start preview automatically for supported cameras. A document scanner always waits for an explicit scan.</td></tr>
+<tr><td>Updates</td><td>Check for new versions automatically, at most once a day; Check Now checks immediately. See <a href="#settings-updates">update checks</a>.</td></tr>
 <tr><td>Prompt measurement keys</td><td>Save or remove provider keys used by prompt measurements. Select Save key to store a new key.</td></tr>
 </tbody></table></div>
 <p>On macOS, Settings opens in a separate window. The app opens only one Settings window at a time.</p>
 <p>A saved API key uses the operating system's credential store. Ordinary preferences do not contain API keys.</p>
 <p>Apple Intelligence displays local model availability and a <strong>Test local AI</strong> button. It has no model picker, server field or image-sharing control.</p>
 <p>The local model can use text, numeric observations and permitted data results. It cannot view camera images. See <a href="docs.html#apple-intelligence">requirements and troubleshooting</a>.</p>
+</article>
+<article class="doc-section" id="settings-updates" data-doc-section data-doc-title="Check for new versions" data-doc-category="Desktop and browser" data-doc-tags="updates,check for updates,new version,release,skip,policy,privacy"><h2>Check for new versions</h2>
+<p class="doc-summary">The desktop app reads the public release list at most once a day. It never downloads or installs anything itself.</p>
+<p>The check is one request for <code>https://capturefab.com/releases.json</code>. It sends no account, device, usage or version information and sets no cookies; the server sees your IP address, as for any website visit. The first check runs shortly after launch.</p>
+<p>Choose <strong>Check for Updates…</strong> to check now. The Software Update sheet shows the new version's highlights, <strong>Download for</strong> this computer, <strong>Release Notes</strong> and the file's SHA-256 to compare with <code>SHA256SUMS</code>. <strong>Skip This Version</strong> stops the notice and menu title for that version. Install a download the same way you installed this version; recordings and schedules keep running until you quit.</p>
+<p>In <strong>Settings › Updates</strong>, turn off <strong>Check for new versions automatically</strong>, or use <strong>Check Now</strong>. The line below shows when the last check ran and what it found.</p>
+<p>Managed installs can turn off every check with <code>CAPTUREFAB_UPDATE_CHECK=off</code> or a policy file; see <a href="docs.html#updates">update checks</a>.</p>
 </article>
 <article class="doc-section" id="camera-controls" data-doc-section data-doc-title="Connect, configure and examine cameras" data-doc-category="Desktop and browser" data-doc-tags="camera,network,gige,scan,feature,trigger,pixel format,refresh,white balance"><h2>Connect, configure and examine cameras</h2>
 <p class="doc-summary">The camera supplies its available controls, allowed values and access rules. Capturefab displays those controls in the inspector.</p>

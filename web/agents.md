@@ -1225,7 +1225,26 @@ if ((Get-FileHash .\DOWNLOADED_FILE -Algorithm SHA256).Hash -eq 'EXPECTED_SHA256
 On macOS, link the app's executable into a `PATH` folder after moving the app to Applications:
 `mkdir -p ~/.local/bin && ln -sf /Applications/Capturefab.app/Contents/MacOS/capturefab ~/.local/bin/capturefab`.
 
+A release can carry `highlights`: at most six plain-text lines of at most 200 characters.
+On macOS the asset is a disk image (`.dmg`); each operating system and architecture has one asset.
+
 Capturefab source is MIT-licensed. The bundled FFmpeg executable is GPLv3; its source, build configuration, and licensing notices are part of the release provenance. See the repository's source and FFmpeg build guide when producing a new platform binary.
+
+## Check for a newer Capturefab
+
+`capturefab version --json` reports `version`, `os`, `arch` and `update_check` without a network request.
+`update_check` holds `compiled`, `automatic`, `policy`, `skipped`, `last_checked`, `latest`, `update_available` and `last_error`.
+`update_available` is null until a check has found a release; it is recomputed against the running version.
+`doctor --json` includes the same `update_check` object and `features.updates`.
+
+`capturefab version --check --json` reads `https://capturefab.com/releases.json` once.
+It adds `latest`, `update_available`, `skipped`, `checked_at` and `release` (`version`, `date`, `url`, `checksums_url`, `highlights`, `download`).
+`download` is `{name,url,sha256,size,platform}` for this computer, or null.
+It never changes the desktop app's automatic setting or skipped version.
+Exit codes: 5 when `CAPTUREFAB_UPDATE_CHECK=off`, a policy file or the build turns checks off; 3 offline or HTTP error; 4 timeout; 1 unreadable or redirected list; 2 invalid `CAPTUREFAB_UPDATE_URL`.
+
+Do not run `version --check` unprompted; the person decides when to contact capturefab.com.
+Never download or install a release for the person without their approval, and verify its SHA-256 first.
 
 ## Resource protection
 
