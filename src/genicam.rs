@@ -513,7 +513,11 @@ impl NodeMap {
             return Bounds {
                 min: own("Min"),
                 max: own("Max"),
-                inc: own("Inc"),
+                inc: if n.kind == "IntConverter" {
+                    Some(1.0)
+                } else {
+                    own("Inc")
+                },
             };
         }
         let inner = self
@@ -538,13 +542,25 @@ impl NodeMap {
                     .ok()
             }
         };
+        let inc = (n.kind == "IntConverter").then_some(1.0);
+        // A Varying formula is not monotonic, so its endpoints say nothing
+        // about its range. Increasing, Decreasing and Automatic map them.
+        if n.prop("Slope") == Some("Varying") {
+            return Bounds {
+                inc,
+                ..Bounds::default()
+            };
+        }
         match (from(inner.min), from(inner.max)) {
             (Some(a), Some(b)) => Bounds {
                 min: Some(a.min(b)),
                 max: Some(a.max(b)),
-                inc: None,
+                inc,
             },
-            _ => Bounds::default(),
+            _ => Bounds {
+                inc,
+                ..Bounds::default()
+            },
         }
     }
     fn node(&self, name: &str, depth: usize) -> Result<&Node> {
@@ -3069,6 +3085,32 @@ mod tests {
         indexed.set(&mut io, "M", "11").unwrap();
         assert_eq!(indexed.get(&mut io, "M").unwrap(), 11);
         assert_eq!(indexed.get(&mut io, "A").unwrap(), 0);
+    }
+    #[test]
+    fn converter_bounds_follow_the_slope_and_integer_increment() {
+        let m = map(concat!(
+            "<Integer Name='Temperature'><pValue>T</pValue></Integer>",
+            "<IntConverter Name='T'><FormulaTo>FROM &lt; 0 ? FROM + 65536 : FROM</FormulaTo><FormulaFrom>TO &gt; 32767 ? TO - 65536 : TO</FormulaFrom><pValue>Raw</pValue><Slope>Varying</Slope></IntConverter>",
+            "<Integer Name='Raw'><pValue>R</pValue><Min>0</Min><Max>65535</Max></Integer>",
+            "<IntReg Name='R'><Address>0</Address><Length>2</Length><AccessMode>RW</AccessMode></IntReg>",
+            "<Integer Name='Offset'><pValue>O</pValue></Integer>",
+            "<IntConverter Name='O'><FormulaTo>FROM * 4</FormulaTo><FormulaFrom>TO / 4.0</FormulaFrom><pValue>Raw</pValue><Slope>Increasing</Slope></IntConverter>",
+            "<Float Name='Scaled'><pValue>S</pValue></Float>",
+            "<Converter Name='S'><FormulaTo>FROM * 2</FormulaTo><FormulaFrom>TO / 2</FormulaFrom><pValue>Raw</pValue><Slope>Varying</Slope></Converter>",
+        ));
+        let mut io = Memory::default();
+        let full = Bounds {
+            inc: Some(1.0),
+            ..Bounds::default()
+        };
+        assert_eq!(m.bounds(&mut io, "Temperature").unwrap(), full);
+        m.set(&mut io, "Temperature", "-40").unwrap();
+        assert_eq!(m.get(&mut io, "Temperature").unwrap(), -40);
+        assert_eq!(
+            m.bounds(&mut io, "Offset").unwrap(),
+            bounds(0.0, 16383.0, Some(1.0))
+        );
+        assert_eq!(m.bounds(&mut io, "Scaled").unwrap(), Bounds::default());
     }
     #[test]
     fn dynamic_minimum_follows_the_lower_limit() {
