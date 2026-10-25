@@ -3047,7 +3047,7 @@ fn schema() -> Value {
         "hubs":"Connecting a hub:NAME/CAMERA camera (or a discovered hub camera) is refused unless serve was started with --allow-hubs, because it would use this computer's hub secrets"
     });
     contract["selection"]["direct"] = json!(
-        "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:INDEX|v4l2:/dev/videoN|dshow:video=NAME|onvif:ENDPOINT|hub:NAME/CAMERA[?stream=MODE&fps=F]|scanner:sane:DEVICE|scanner:wia:ID|scanner:ica:UUID"
+        "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:NAME_OR_INDEX[?size=WxH&fps=F]|v4l2:/dev/videoN[?size=WxH&fps=F]|dshow:video=NAME[?size=WxH&fps=F]|onvif:http://HOST[:PORT]/PATH|onvif://[USER:PASS@]HOST[:PORT][/PATH]|hub:NAME/CAMERA[?stream=MODE&fps=F]|scanner:sane:DEVICE|scanner:wia:ID|scanner:ica:UUID"
     );
     contract["selection"]["matching"] = json!(
         "An exact ID, serial or address wins; otherwise a bare name opens the one local camera whose model or name (the ID after its kind) equals it, or whose model contains it as whole words, ignoring case (never part of a serial or ID), and stderr names the camera chosen. Hub cameras need their exact selector; several matches fail with exit 3. connect and select take the camera as an argument or from --camera / CAPTUREFAB_CAMERA. Scripts should use IDs from discover."
@@ -4194,6 +4194,18 @@ mod tests {
             json!({"forwarding_id":"invalid","until_ms":31000}),
         ] {
             assert!(TimedRecording::new(30_000, &incomplete, ErrorMark::default()).is_err());
+        }
+    }
+    #[test]
+    fn schema_direct_selection_lists_native_options_and_onvif_sign_ins() {
+        let direct = schema()["selection"]["direct"].as_str().unwrap().to_owned();
+        for form in [
+            "avfoundation:NAME_OR_INDEX[?size=WxH&fps=F]",
+            "v4l2:/dev/videoN[?size=WxH&fps=F]",
+            "dshow:video=NAME[?size=WxH&fps=F]",
+            "onvif://[USER:PASS@]HOST[:PORT][/PATH]",
+        ] {
+            assert!(direct.contains(form), "{form}");
         }
     }
     #[test]
