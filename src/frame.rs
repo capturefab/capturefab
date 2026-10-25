@@ -1,16 +1,23 @@
 //! Bounded PFNC image conversion and portable output without image codecs from the OS.
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Context as _, Result, bail, ensure};
-use std::io::Write;
+use std::{borrow::Cow, io::Write};
 
 pub fn pixel_format_name(format: u32) -> &'static str {
     match format {
         MONO8 => "Mono8",
         RGB8 => "RGB8",
         0x0218_0015 => "BGR8",
+        0x0220_0016 => "RGBa8",
+        0x0220_0017 => "BGRa8",
         0x0110_0003 => "Mono10",
         0x0110_0005 => "Mono12",
+        0x0110_0025 => "Mono14",
         0x0110_0007 => "Mono16",
+        0x010a_0046 => "Mono10p",
+        0x010c_0047 => "Mono12p",
+        0x010c_0004 => "Mono10Packed",
+        0x010c_0006 => "Mono12Packed",
         0x0108_00b1 => "Coord3D_C8",
         0x0110_00b8 => "Coord3D_C16",
         0x0120_00bf => "Coord3D_C32f",
@@ -20,8 +27,251 @@ pub fn pixel_format_name(format: u32) -> &'static str {
         0x0108_0009 => "BayerRG8",
         0x0108_000a => "BayerGB8",
         0x0108_000b => "BayerBG8",
+        0x0110_000c => "BayerGR10",
+        0x0110_000d => "BayerRG10",
+        0x0110_000e => "BayerGB10",
+        0x0110_000f => "BayerBG10",
+        0x0110_0010 => "BayerGR12",
+        0x0110_0011 => "BayerRG12",
+        0x0110_0012 => "BayerGB12",
+        0x0110_0013 => "BayerBG12",
+        0x0110_002e => "BayerGR16",
+        0x0110_002f => "BayerRG16",
+        0x0110_0030 => "BayerGB16",
+        0x0110_0031 => "BayerBG16",
+        0x010a_0056 => "BayerGR10p",
+        0x010a_0058 => "BayerRG10p",
+        0x010a_0054 => "BayerGB10p",
+        0x010a_0052 => "BayerBG10p",
+        0x010c_0057 => "BayerGR12p",
+        0x010c_0059 => "BayerRG12p",
+        0x010c_0055 => "BayerGB12p",
+        0x010c_0053 => "BayerBG12p",
+        0x010c_0026 => "BayerGR10Packed",
+        0x010c_0027 => "BayerRG10Packed",
+        0x010c_0028 => "BayerGB10Packed",
+        0x010c_0029 => "BayerBG10Packed",
+        0x010c_002a => "BayerGR12Packed",
+        0x010c_002b => "BayerRG12Packed",
+        0x010c_002c => "BayerGB12Packed",
+        0x010c_002d => "BayerBG12Packed",
+        0x0210_001f => "YUV422_8_UYVY",
+        0x0210_0032 => "YUV422_8",
+        0x0210_003b => "YCbCr422_8",
+        0x0210_0043 => "YCbCr422_8_CbYCrY",
         _ => "Unknown",
     }
+}
+/// Bytes in one row of a `width`-pixel image: rows of packed formats are
+/// padded to a whole byte.
+pub fn row_bytes(width: u32, pixel_format: u32) -> usize {
+    (width as usize * ((pixel_format >> 16) & 0xff) as usize).div_ceil(8)
+}
+/// How a packed format stores its samples.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Packing {
+    /// PFNC lsb packing (the `p` formats): samples follow each other from
+    /// the least significant bit of the first byte.
+    Lsb,
+    /// GigE Vision `Packed`: two samples in three bytes, the high bits of
+    /// each in the outer bytes and both low parts in the middle one, the
+    /// first sample's in its low nibble.
+    GigE,
+}
+/// The unpacked 16-bit format of a packed format's family, its sample bits
+/// and its packing.
+pub(crate) fn packing(pixel_format: u32) -> Option<(u32, u32, Packing)> {
+    use Packing::{GigE, Lsb};
+    Some(match pixel_format {
+        0x010a_0046 => (0x0110_0003, 10, Lsb),
+        0x010c_0047 => (0x0110_0005, 12, Lsb),
+        0x010c_0004 => (0x0110_0003, 10, GigE),
+        0x010c_0006 => (0x0110_0005, 12, GigE),
+        0x010a_0056 => (0x0110_000c, 10, Lsb),
+        0x010a_0058 => (0x0110_000d, 10, Lsb),
+        0x010a_0054 => (0x0110_000e, 10, Lsb),
+        0x010a_0052 => (0x0110_000f, 10, Lsb),
+        0x010c_0057 => (0x0110_0010, 12, Lsb),
+        0x010c_0059 => (0x0110_0011, 12, Lsb),
+        0x010c_0055 => (0x0110_0012, 12, Lsb),
+        0x010c_0053 => (0x0110_0013, 12, Lsb),
+        v @ 0x010c_0026..=0x010c_0029 => (v - 0x010c_0026 + 0x0110_000c, 10, GigE),
+        v @ 0x010c_002a..=0x010c_002d => (v - 0x010c_002a + 0x0110_0010, 12, GigE),
+        _ => return None,
+    })
+}
+/// YUV 4:2:2 formats: the byte offsets of the first pixel's luma, the shared
+/// Cb (U), the second pixel's luma and the shared Cr (V) in each two pixels.
+fn yuv422(pixel_format: u32) -> Option<[usize; 4]> {
+    match pixel_format {
+        0x0210_001f | 0x0210_0043 => Some([1, 0, 3, 2]),
+        0x0210_0032 | 0x0210_003b => Some([0, 1, 2, 3]),
+        _ => None,
+    }
+}
+/// The format `unpacked` turns `pixel_format` into.
+pub fn unpacked_format(pixel_format: u32) -> u32 {
+    match pixel_format {
+        0x0220_0016 | 0x0220_0017 => RGB8,
+        v if yuv422(v).is_some() => RGB8,
+        v => packing(v).map_or(v, |(unpacked, ..)| unpacked),
+    }
+}
+/// `frame` with whole samples at their native depth: packed 10- and 12-bit
+/// samples as the unpacked 16-bit format of their family, YUV 4:2:2 and
+/// RGBa8/BGRa8 as RGB8, and any other format as it is.
+pub fn unpacked(frame: &Frame) -> Result<Cow<'_, Frame>> {
+    let pixel_format = unpacked_format(frame.pixel_format);
+    if pixel_format == frame.pixel_format {
+        return Ok(Cow::Borrowed(frame));
+    }
+    let pixels = checked_pixels(frame)?;
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let row = row_bytes(frame.width, frame.pixel_format);
+    ensure!(
+        frame.data.len() >= row * height,
+        "truncated {} frame",
+        pixel_format_name(frame.pixel_format)
+    );
+    let rows = frame.data[..row * height].chunks_exact(row);
+    let data = if let Some((_, bits, packing)) = packing(frame.pixel_format) {
+        let mut data = vec![0; pixels * 2];
+        for (line, out) in rows.zip(data.chunks_exact_mut(width * 2)) {
+            unpack_row(line, bits, packing, out.as_chunks_mut::<2>().0);
+        }
+        data
+    } else if let Some([y0, cb, y1, cr]) = yuv422(frame.pixel_format) {
+        let mut data = Vec::with_capacity(pixels * 3);
+        for line in rows {
+            // An odd last pixel has no Cr; it is taken as neutral.
+            for (x, bytes) in (0..width).step_by(2).zip(line.chunks(4)) {
+                let mut pair = [128; 4];
+                pair[..bytes.len()].copy_from_slice(bytes);
+                data.extend(ycbcr(pair[y0], pair[cb], pair[cr]));
+                if x + 1 < width {
+                    data.extend(ycbcr(pair[y1], pair[cb], pair[cr]));
+                }
+            }
+        }
+        data
+    } else {
+        let order = if frame.pixel_format == 0x0220_0016 {
+            [0, 1, 2]
+        } else {
+            [2, 1, 0]
+        };
+        let source = frame.data[..pixels * 4].as_chunks::<4>().0;
+        source.iter().flat_map(|p| order.map(|c| p[c])).collect()
+    };
+    Ok(Cow::Owned(Frame {
+        pixel_format,
+        data,
+        ..*frame
+    }))
+}
+/// One row of packed samples as little-endian 16-bit samples, one per
+/// element of `out`; a short last group is completed with zeros.
+fn unpack_row(row: &[u8], bits: u32, packing: Packing, out: &mut [[u8; 2]]) {
+    fn groups<const BYTES: usize, const SAMPLES: usize>(
+        row: &[u8],
+        out: &mut [[u8; 2]],
+        unpack: impl Fn([u16; BYTES]) -> [u16; SAMPLES],
+    ) {
+        for (samples, bytes) in out.chunks_mut(SAMPLES).zip(row.chunks(BYTES)) {
+            let mut group = [0; BYTES];
+            for (value, &byte) in group.iter_mut().zip(bytes) {
+                *value = u16::from(byte);
+            }
+            for (sample, value) in samples.iter_mut().zip(unpack(group)) {
+                *sample = value.to_le_bytes();
+            }
+        }
+    }
+    match (packing, bits) {
+        (Packing::Lsb, 10) => groups(row, out, |[b0, b1, b2, b3, b4]| {
+            [
+                b0 | (b1 & 0x03) << 8,
+                b1 >> 2 | (b2 & 0x0f) << 6,
+                b2 >> 4 | (b3 & 0x3f) << 4,
+                b3 >> 6 | b4 << 2,
+            ]
+        }),
+        (Packing::Lsb, _) => groups(row, out, |[b0, b1, b2]| {
+            [b0 | (b1 & 0x0f) << 8, b1 >> 4 | b2 << 4]
+        }),
+        (Packing::GigE, 10) => groups(row, out, |[b0, b1, b2]| {
+            [b0 << 2 | b1 & 0x03, b2 << 2 | b1 >> 4 & 0x03]
+        }),
+        (Packing::GigE, _) => groups(row, out, |[b0, b1, b2]| {
+            [b0 << 4 | b1 & 0x0f, b2 << 4 | b1 >> 4]
+        }),
+    }
+}
+/// Full-range BT.601 Y'CbCr as R'G'B', as PFNC defines its YCbCr formats
+/// and, with U as Cb and V as Cr, its YUV ones; 16-bit fixed point as JFIF
+/// decoders compute it.
+pub(crate) fn ycbcr(y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let (y, cb, cr) = (i32::from(y), i32::from(cb) - 128, i32::from(cr) - 128);
+    [
+        y + ((91_881 * cr + 32_768) >> 16),
+        y + ((-22_554 * cb - 46_802 * cr + 32_768) >> 16),
+        y + ((116_130 * cb + 32_768) >> 16),
+    ]
+    .map(|v| v.clamp(0, 255) as u8)
+}
+/// The Bayer8 format with the color filter of an unpacked 10-, 12- or 16-bit
+/// mosaic, and the shift that brings its samples to 8 bits.
+fn wide_bayer(pixel_format: u32) -> Option<(u32, u32)> {
+    let (first, shift) = match pixel_format {
+        0x0110_000c..=0x0110_000f => (0x0110_000c, 2),
+        0x0110_0010..=0x0110_0013 => (0x0110_0010, 4),
+        0x0110_002e..=0x0110_0031 => (0x0110_002e, 8),
+        _ => return None,
+    };
+    Some((0x0108_0008 + pixel_format - first, shift))
+}
+/// The Bayer8 format with the color filter of any Bayer format.
+fn bayer8(pixel_format: u32) -> Option<u32> {
+    match unpacked_format(pixel_format) {
+        v @ 0x0108_0008..=0x0108_000b => Some(v),
+        v => wide_bayer(v).map(|(bayer8, _)| bayer8),
+    }
+}
+/// The format `eight_bit` turns `pixel_format` into.
+fn eight_bit_format(pixel_format: u32) -> u32 {
+    let unpacked = unpacked_format(pixel_format);
+    wide_bayer(unpacked).map_or(unpacked, |(bayer8, _)| bayer8)
+}
+/// `frame` in a format the converters read directly: `unpacked`, then a
+/// 10- to 16-bit Bayer mosaic reduced to Bayer8.
+fn eight_bit(frame: &Frame) -> Result<Cow<'_, Frame>> {
+    let frame = unpacked(frame)?;
+    let Some((pixel_format, shift)) = wide_bayer(frame.pixel_format) else {
+        return Ok(frame);
+    };
+    let pixels = checked_pixels(&frame)?;
+    ensure!(
+        frame.data.len() >= pixels * 2,
+        "truncated {} frame",
+        pixel_format_name(frame.pixel_format)
+    );
+    let source = frame.data[..pixels * 2].as_chunks::<2>().0;
+    let data = source
+        .iter()
+        .map(|&p| (u16::from_le_bytes(p) >> shift).min(255) as u8)
+        .collect();
+    Ok(Cow::Owned(Frame {
+        pixel_format,
+        data,
+        ..*frame
+    }))
+}
+/// One-channel formats: the 8-bit monochrome family, the unpacked 16-bit one
+/// of [`unpacked_shift`], and the packed formats that unpack into it.
+pub(crate) fn monochrome(pixel_format: u32) -> bool {
+    let pixel_format = unpacked_format(pixel_format);
+    matches!(pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6)
+        || unpacked_shift(pixel_format).is_some()
 }
 fn gray(out: &mut [u8], value: impl Fn(usize) -> u8) {
     for i in 0..out.len() / 3 {
@@ -30,6 +280,7 @@ fn gray(out: &mut [u8], value: impl Fn(usize) -> u8) {
     }
 }
 pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
+    let frame = &*eight_bit(frame)?;
     let pixels = checked_pixels(frame)?;
     // Flat byte stores vectorize as interleaved 3-byte stores, which `[u8; 3]`
     // elements from the generic converter do not; only Bayer is shared.
@@ -51,7 +302,7 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
                 *dst = [p[2], p[1], p[0]];
             }
         }
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
+        0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
             ensure!(
                 frame.data.len() >= pixels * 2,
                 "truncated unpacked monochrome frame"
@@ -67,20 +318,26 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
     Ok(out)
 }
 /// How far an unpacked 16-bit monochrome sample shifts right to its top 8
-/// bits: Mono10 keeps bits 9-2, Mono12 bits 11-4, and the full-range 16-bit
-/// formats their high byte. None for every other format.
+/// bits: Mono10 keeps bits 9-2, Mono12 bits 11-4, Mono14 bits 13-6, and the
+/// full-range 16-bit formats their high byte. None for every other format.
 fn unpacked_shift(format: u32) -> Option<u32> {
     match format {
         0x0110_0003 => Some(2),
         0x0110_0005 => Some(4),
+        0x0110_0025 => Some(6),
         0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => Some(8),
         _ => None,
     }
 }
-/// One 8-bit sample per pixel for the monochrome family, with the same bit
-/// choice as [`rgb`]; None for color and Bayer formats, which stay RGB.
+/// One 8-bit sample per pixel for the monochrome family, packed formats
+/// unpacked first, with the same bit choice as [`rgb`]; None for color,
+/// Bayer, YUV and RGBa formats, which stay RGB.
 pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
     let pixels = checked_pixels(frame)?;
+    if !monochrome(frame.pixel_format) {
+        return Ok(None);
+    }
+    let frame = &*unpacked(frame)?;
     if matches!(frame.pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6) {
         ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
         return Ok(Some(frame.data[..pixels].to_vec()));
@@ -182,6 +439,7 @@ fn convert_to<'a, P: Copy + Default + Send + 'a>(
     out: impl Sink<'a, P>,
     pixel: impl Fn([u8; 3]) -> P + Sync,
 ) -> Result<()> {
+    let frame = &*eight_bit(frame)?;
     let pixels = checked_pixels(frame)?;
     // Streaming formats map source to output in order.
     match frame.pixel_format {
@@ -199,16 +457,12 @@ fn convert_to<'a, P: Copy + Default + Send + 'a>(
             let source = frame.data[..pixels * 3].as_chunks::<3>().0;
             out.stream(source.iter().map(|p| pixel([p[2], p[1], p[0]])));
         }
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
+        0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
             ensure!(
                 frame.data.len() >= pixels * 2,
                 "truncated unpacked monochrome frame"
             );
-            let shift = match frame.pixel_format {
-                0x0110_0003 => 2,
-                0x0110_0005 => 4,
-                _ => 8,
-            };
+            let shift = unpacked_shift(frame.pixel_format).unwrap_or(8);
             let source = frame.data[..pixels * 2].as_chunks::<2>().0;
             out.stream(source.iter().map(|&p| {
                 let v = (u16::from_le_bytes(p) >> shift).min(255) as u8;
@@ -297,8 +551,9 @@ pub(crate) fn worker_threads(pixels: usize) -> usize {
 fn spare_cores(cores: usize) -> usize {
     cores.saturating_sub(1).clamp(1, 8)
 }
-fn is_bayer(pixel_format: u32) -> bool {
-    matches!(pixel_format, 0x0108_0008..=0x0108_000b)
+/// Any Bayer mosaic, whatever its depth or packing.
+pub(crate) fn is_bayer(pixel_format: u32) -> bool {
+    bayer8(pixel_format).is_some()
 }
 /// A Bayer frame read as whole 2x2 quads, one color each: red, the mean of
 /// both greens, blue. As good as a demosaic for statistics over many samples
@@ -316,7 +571,8 @@ impl<'a> Quads<'a> {
     /// must have passed `validated_bytes_per_pixel`.
     fn of(frame: &'a Frame) -> Option<Self> {
         let (width, height) = (frame.width as usize, frame.height as usize);
-        (is_bayer(frame.pixel_format) && width >= 2 && height >= 2).then(|| Self {
+        let bayer8 = matches!(frame.pixel_format, 0x0108_0008..=0x0108_000b);
+        (bayer8 && width >= 2 && height >= 2).then(|| Self {
             data: &frame.data,
             width,
             order: quad_order(bayer_pattern(frame.pixel_format)),
@@ -344,7 +600,7 @@ fn quad_order(pattern: [usize; 4]) -> [usize; 4] {
 /// Color filter layout as the channel (0 R, 1 G, 2 B) at (x & 1, y & 1),
 /// indexed `[(y & 1) * 2 + (x & 1)]`.
 pub fn bayer_pattern(pixel_format: u32) -> [usize; 4] {
-    match pixel_format {
+    match bayer8(pixel_format).unwrap_or(pixel_format) {
         0x0108_0008 => [1, 0, 2, 1],
         0x0108_0009 => [0, 1, 1, 2],
         0x0108_000a => [1, 2, 0, 1],
@@ -379,10 +635,11 @@ pub(crate) fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
     let (bytes, name) = match frame.pixel_format {
         MONO8 | 0x0108_00b1 | 0x0108_00c6 => (1, "8-bit scalar"),
         RGB8 | 0x0218_0015 => (3, "RGB"),
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
+        0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
             (2, "unpacked monochrome")
         }
         0x0108_0008..=0x0108_000b => (1, "Bayer8"),
+        v if wide_bayer(v).is_some() => (2, "unpacked Bayer"),
         v => {
             bail!("unsupported PFNC format 0x{v:08x}; capture with --format raw to preserve bytes")
         }
@@ -393,7 +650,7 @@ pub(crate) fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
 /// Whether `rgb`/`convert` can decode this pixel format.
 pub fn convertible(pixel_format: u32) -> bool {
     matches!(
-        pixel_format,
+        eight_bit_format(pixel_format),
         MONO8
             | 0x0108_00b1
             | 0x0108_00c6
@@ -401,6 +658,7 @@ pub fn convertible(pixel_format: u32) -> bool {
             | 0x0218_0015
             | 0x0110_0003
             | 0x0110_0005
+            | 0x0110_0025
             | 0x0110_0007
             | 0x0110_00b8
             | 0x0110_00c7
@@ -417,12 +675,8 @@ fn pixel_at(frame: &Frame, x: usize, y: usize) -> [u8; 3] {
         MONO8 | 0x0108_00b1 | 0x0108_00c6 => [data[i]; 3],
         RGB8 => [data[3 * i], data[3 * i + 1], data[3 * i + 2]],
         0x0218_0015 => [data[3 * i + 2], data[3 * i + 1], data[3 * i]],
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
-            let shift = match frame.pixel_format {
-                0x0110_0003 => 2,
-                0x0110_0005 => 4,
-                _ => 8,
-            };
+        0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
+            let shift = unpacked_shift(frame.pixel_format).unwrap_or(8);
             [(u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) >> shift).min(255) as u8; 3]
         }
         _ => bayer_bounded(frame, bayer_pattern(frame.pixel_format), x, y),
@@ -455,19 +709,10 @@ pub struct Exposure {
 }
 
 pub fn exposure(frame: &Frame) -> Result<Exposure> {
+    let frame = &*eight_bit(frame)?;
     validated_bytes_per_pixel(frame)?;
     let (w, pixels) = (frame.width as usize, checked_pixels(frame)?);
-    let mono = matches!(
-        frame.pixel_format,
-        MONO8
-            | 0x0108_00b1
-            | 0x0108_00c6
-            | 0x0110_0003
-            | 0x0110_0005
-            | 0x0110_0007
-            | 0x0110_00b8
-            | 0x0110_00c7
-    );
+    let mono = monochrome(frame.pixel_format);
     let (mut luma_bins, mut channels) = ([0; 64], [[0; 64]; 3]);
     let (mut sum, mut samples, mut shadows, mut highlights) = (0u64, 0u32, 0u32, 0u32);
     let mut add = |rgb: [u8; 3]| {
@@ -524,6 +769,7 @@ pub struct Sharpness {
 /// full-resolution neighbours, so fine detail still counts in large regions.
 /// A Bayer mosaic is measured over its 2x2 quads, the finest whole colors it has.
 pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
+    let frame = &*eight_bit(frame)?;
     validated_bytes_per_pixel(frame)?;
     checked_pixels(frame)?;
     if let Some(quads) = Quads::of(frame).filter(|q| q.columns >= 3 && q.rows >= 3) {
@@ -690,9 +936,10 @@ pub(crate) fn shrink_to(frame: &Frame, (max_width, max_height): (u32, u32)) -> O
 /// for other formats, a factor below 2, or a frame without a whole block.
 pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
     const MAX_ROWS: usize = 4;
+    let frame = &*eight_bit(frame).ok()?;
     let (bytes, channels) = match frame.pixel_format {
         MONO8 | 0x0108_00b1 | 0x0108_00c6 => (1, 1),
-        0x0110_0003 | 0x0110_0005 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => (2, 1),
+        0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => (2, 1),
         RGB8 | 0x0218_0015 => (3, 3),
         0x0108_0008..=0x0108_000b => (1, 3),
         _ => return None,
@@ -713,11 +960,7 @@ pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
     }
     let line = frame.width as usize * bytes;
     let pattern = bayer_pattern(frame.pixel_format);
-    let shift = match frame.pixel_format {
-        0x0110_0003 => 2,
-        0x0110_0005 => 4,
-        _ => 8,
-    };
+    let shift = unpacked_shift(frame.pixel_format).unwrap_or(8);
     // Bytes of whole units in one source line, and the samples they hold:
     // bytes, or pixels of a 16-bit format.
     let used = columns * unit * bytes;
@@ -1525,6 +1768,7 @@ mod tests {
             (0x0218_0015, 3),
             (0x0110_0003, 2),
             (0x0110_0005, 2),
+            (0x0110_0025, 2),
             (0x0110_0007, 2),
             (0x0108_0008, 1),
             (0x0108_0009, 1),
@@ -1574,6 +1818,7 @@ mod tests {
                 (RGB8, 3),
                 (0x0218_0015, 3),
                 (0x0110_0005, 2),
+                (0x0110_0025, 2),
                 (0x0110_0007, 2),
                 (0x0108_0008, 1),
                 (0x0108_0009, 1),
@@ -1760,10 +2005,39 @@ mod tests {
             (png::ColorType::Grayscale, png::BitDepth::Eight)
         );
         assert_eq!(samples, vec![0xAB; 8]);
-        for color_frame in [sized(RGB8, vec![7; 24]), sized(0x0108_0009, vec![7; 8])] {
+        // Packed Mono12p and Mono12Packed rows of 0xABC unpack to the same
+        // gray; Mono14 keeps bits 13-6.
+        for (mono, expected) in [
+            (sized(0x010c_0047, [0xBC, 0xCA, 0xAB].repeat(4)), 0xAB),
+            (sized(0x010c_0006, [0xAB, 0xCC, 0xAB].repeat(4)), 0xAB),
+            (sized(0x0110_0025, le16(&[0x2ABC; 8])), 0xAA),
+        ] {
+            let name = pixel_format_name(mono.pixel_format);
+            let (color, depth, samples, _) = decode_png(&encode(&mono, "png").unwrap());
+            assert_eq!(
+                (color, depth),
+                (png::ColorType::Grayscale, png::BitDepth::Eight),
+                "{name}"
+            );
+            assert_eq!(samples, vec![expected; 8], "{name}");
+        }
+        // Bayer at any depth or packing, YUV 4:2:2 and RGBa stay RGB.
+        for color_frame in [
+            sized(RGB8, vec![7; 24]),
+            sized(0x0108_0009, vec![7; 8]),
+            sized(0x0110_002f, vec![7; 16]),
+            sized(0x010c_0059, vec![7; 12]),
+            sized(0x0210_0032, vec![7; 16]),
+            sized(0x0220_0016, vec![7; 32]),
+        ] {
+            let name = pixel_format_name(color_frame.pixel_format);
             let (color, depth, samples, _) = decode_png(&encode(&color_frame, "png").unwrap());
-            assert_eq!((color, depth), (png::ColorType::Rgb, png::BitDepth::Eight));
-            assert_eq!(samples, rgb(&color_frame).unwrap());
+            assert_eq!(
+                (color, depth),
+                (png::ColorType::Rgb, png::BitDepth::Eight),
+                "{name}"
+            );
+            assert_eq!(samples, rgb(&color_frame).unwrap(), "{name}");
         }
     }
     #[test]
@@ -1774,17 +2048,33 @@ mod tests {
             0x0108_00c6,
             0x0110_0003,
             0x0110_0005,
+            0x0110_0025,
             0x0110_0007,
             0x0110_00b8,
             0x0110_00c7,
+            0x010a_0046,
+            0x010c_0047,
+            0x010c_0004,
+            0x010c_0006,
         ] {
-            let bytes = if fmt >> 16 == 0x0110 { 4 } else { 2 };
+            let bytes = row_bytes(2, fmt);
             let frame = f(fmt, (0..bytes).map(|i| i as u8 * 77 + 3).collect());
             let mut expected = b"P5\n2 1\n255\n".to_vec();
             expected.extend(rgb(&frame).unwrap().as_chunks::<3>().0.iter().map(|p| p[0]));
             assert_eq!(encode(&frame, "pgm").unwrap(), expected, "{fmt:#x}");
+            assert!(monochrome(fmt), "{fmt:#x}");
         }
-        assert!(encode(&f(RGB8, vec![0; 6]), "pgm").is_err());
+        for (fmt, bytes) in [
+            (RGB8, 6),
+            (0x0108_0009, 2),
+            (0x0110_002f, 4),
+            (0x010c_0059, 3),
+            (0x0210_0032, 4),
+            (0x0220_0016, 8),
+        ] {
+            assert!(encode(&f(fmt, vec![0; bytes]), "pgm").is_err(), "{fmt:#x}");
+            assert!(!monochrome(fmt), "{fmt:#x}");
+        }
     }
     #[test]
     fn metadata_goes_into_png_and_jpeg() {
@@ -1838,5 +2128,208 @@ mod tests {
         let at = bytes.windows(2).position(|w| w == [0xFF, 0xFE]).unwrap();
         let length = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
         assert_eq!(&bytes[at + 4..at + 2 + length], json.as_bytes());
+    }
+    fn sized(pixel_format: u32, width: u32, height: u32, data: Vec<u8>) -> Frame {
+        Frame {
+            width,
+            height,
+            ..f(pixel_format, data)
+        }
+    }
+    fn le16(samples: &[u16]) -> Vec<u8> {
+        samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+    #[test]
+    fn packed_samples_unpack_as_pfnc_and_gige_vision_lay_them_out() {
+        // Odd widths: each row ends with a half-filled group and the next
+        // row starts on a fresh byte.
+        let twelve = [0xabc, 0x123, 0xfed, 0x001, 0x800, 0x7ff];
+        // Mono12p: the first sample from bit 0 of byte 0, its high nibble in
+        // the low nibble of byte 1.
+        let mono12p = vec![
+            0xbc, 0x3a, 0x12, 0xed, 0x0f, //
+            0x01, 0x00, 0x80, 0xff, 0x07,
+        ];
+        // Mono12Packed: high bits in the outer bytes, low nibbles in the middle.
+        let mono12_packed = vec![
+            0xab, 0x3c, 0x12, 0xfe, 0x0d, //
+            0x00, 0x01, 0x80, 0x7f, 0x0f,
+        ];
+        for (format, data) in [(0x010c_0047, mono12p), (0x010c_0006, mono12_packed)] {
+            let frame = sized(format, 3, 2, data);
+            let unpacked = unpacked(&frame).unwrap();
+            assert_eq!(unpacked.pixel_format, 0x0110_0005, "{format:x}");
+            assert_eq!(unpacked.data, le16(&twelve), "{format:x}");
+            let gray: Vec<u8> = twelve.iter().flat_map(|v| [(v >> 4) as u8; 3]).collect();
+            assert_eq!(rgb(&frame).unwrap(), gray, "{format:x}");
+        }
+        // Mono10p: four samples in five bytes; a fifth starts a new group.
+        let mono10p = vec![0x55, 0xa9, 0x0a, 0xcf, 0xc3, 0xe1, 0x03];
+        let frame = unpacked(&sized(0x010a_0046, 5, 1, mono10p))
+            .unwrap()
+            .into_owned();
+        assert_eq!(frame.pixel_format, 0x0110_0003);
+        assert_eq!(frame.data, le16(&[0x155, 0x2aa, 0x0f0, 0x30f, 0x3e1]));
+        // Mono10Packed: two samples in three bytes, their two low bits at
+        // bits 0-1 and 4-5 of the middle byte.
+        let frame = sized(0x010c_0004, 3, 1, vec![0x55, 0x21, 0xaa, 0xf8, 0x01]);
+        assert_eq!(unpacked(&frame).unwrap().data, le16(&[0x155, 0x2aa, 0x3e1]));
+        assert_eq!(
+            rgb(&frame).unwrap(),
+            [0x55, 0x55, 0x55, 0xaa, 0xaa, 0xaa, 0xf8, 0xf8, 0xf8]
+        );
+        assert_eq!([3, 5].map(|w| row_bytes(w, 0x010a_0046)), [4, 7]);
+        assert_eq!([3, 4].map(|w| row_bytes(w, 0x010c_0004)), [5, 6]);
+        let short = sized(0x010c_0047, 3, 2, vec![0; 9]);
+        let error = rgb(&short).unwrap_err().to_string();
+        assert!(error.contains("truncated Mono12p frame"), "{error}");
+        assert!(shrink(&short, 2).is_none() && exposure(&short).is_err());
+    }
+    #[test]
+    fn every_bayer_depth_and_packing_keeps_its_color_filter() {
+        // Codes from GenICam's pixel format values, with the unpacked format
+        // and the 8-bit mosaic of the same filter.
+        let formats = [
+            (0x0110_000c, "BayerGR10", 0x0110_000c, 0x0108_0008),
+            (0x0110_000d, "BayerRG10", 0x0110_000d, 0x0108_0009),
+            (0x0110_000e, "BayerGB10", 0x0110_000e, 0x0108_000a),
+            (0x0110_000f, "BayerBG10", 0x0110_000f, 0x0108_000b),
+            (0x0110_0010, "BayerGR12", 0x0110_0010, 0x0108_0008),
+            (0x0110_0011, "BayerRG12", 0x0110_0011, 0x0108_0009),
+            (0x0110_0012, "BayerGB12", 0x0110_0012, 0x0108_000a),
+            (0x0110_0013, "BayerBG12", 0x0110_0013, 0x0108_000b),
+            (0x0110_002e, "BayerGR16", 0x0110_002e, 0x0108_0008),
+            (0x0110_002f, "BayerRG16", 0x0110_002f, 0x0108_0009),
+            (0x0110_0030, "BayerGB16", 0x0110_0030, 0x0108_000a),
+            (0x0110_0031, "BayerBG16", 0x0110_0031, 0x0108_000b),
+            (0x010a_0056, "BayerGR10p", 0x0110_000c, 0x0108_0008),
+            (0x010a_0058, "BayerRG10p", 0x0110_000d, 0x0108_0009),
+            (0x010a_0054, "BayerGB10p", 0x0110_000e, 0x0108_000a),
+            (0x010a_0052, "BayerBG10p", 0x0110_000f, 0x0108_000b),
+            (0x010c_0057, "BayerGR12p", 0x0110_0010, 0x0108_0008),
+            (0x010c_0059, "BayerRG12p", 0x0110_0011, 0x0108_0009),
+            (0x010c_0055, "BayerGB12p", 0x0110_0012, 0x0108_000a),
+            (0x010c_0053, "BayerBG12p", 0x0110_0013, 0x0108_000b),
+            (0x010c_0026, "BayerGR10Packed", 0x0110_000c, 0x0108_0008),
+            (0x010c_0027, "BayerRG10Packed", 0x0110_000d, 0x0108_0009),
+            (0x010c_0028, "BayerGB10Packed", 0x0110_000e, 0x0108_000a),
+            (0x010c_0029, "BayerBG10Packed", 0x0110_000f, 0x0108_000b),
+            (0x010c_002a, "BayerGR12Packed", 0x0110_0010, 0x0108_0008),
+            (0x010c_002b, "BayerRG12Packed", 0x0110_0011, 0x0108_0009),
+            (0x010c_002c, "BayerGB12Packed", 0x0110_0012, 0x0108_000a),
+            (0x010c_002d, "BayerBG12Packed", 0x0110_0013, 0x0108_000b),
+        ];
+        for (format, name, unpacked, bayer8) in formats {
+            assert_eq!(pixel_format_name(format), name);
+            assert_eq!(unpacked_format(format), unpacked, "{name}");
+            assert_eq!(bayer_pattern(format), bayer_pattern(bayer8), "{name}");
+            assert!(convertible(format) && is_bayer(format), "{name}");
+        }
+        // A 12-bit BayerRG mosaic, unpacked and packed both ways, converts
+        // as the 8-bit mosaic of its high bits.
+        let (width, height) = (6u32, 4u32);
+        let samples: Vec<u16> = random(3, 24 * 2)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&p| u16::from_le_bytes(p) & 0xfff)
+            .collect();
+        let pairs = samples.as_chunks::<2>().0;
+        let pfnc = pairs
+            .iter()
+            .flat_map(|&[a, b]| [a as u8, (a >> 8) as u8 | (b << 4) as u8, (b >> 4) as u8]);
+        let gige = pairs.iter().flat_map(|&[a, b]| {
+            [
+                (a >> 4) as u8,
+                (a & 0xf) as u8 | (b << 4) as u8,
+                (b >> 4) as u8,
+            ]
+        });
+        let reference = sized(
+            0x0108_0009,
+            width,
+            height,
+            samples.iter().map(|v| (v >> 4) as u8).collect(),
+        );
+        let shrunk = |frame: &Frame| {
+            shrink(frame, 2).map(|small| (small.width, small.pixel_format, small.data))
+        };
+        for frame in [
+            sized(0x0110_0011, width, height, le16(&samples)),
+            sized(0x010c_0059, width, height, pfnc.collect()),
+            sized(0x010c_002b, width, height, gige.collect()),
+        ] {
+            let name = pixel_format_name(frame.pixel_format);
+            assert_eq!(rgb(&frame).unwrap(), rgb(&reference).unwrap(), "{name}");
+            assert_eq!(exposure(&frame).unwrap(), exposure(&reference).unwrap());
+            assert_eq!(
+                sharpness(&frame, [0, 0, 6, 4]).unwrap(),
+                sharpness(&reference, [0, 0, 6, 4]).unwrap()
+            );
+            assert_eq!(shrunk(&frame), shrunk(&reference), "{name}");
+            assert_eq!(covering(&frame, (2, 2)), covering(&reference, (2, 2)));
+            assert_eq!(
+                preview_rgba(&frame, 3, 2).unwrap(),
+                preview_rgba(&reference, 3, 2).unwrap()
+            );
+        }
+        // 10- and 16-bit mosaics shift by their own depth.
+        for (format, shift) in [(0x0110_000f, 2), (0x0110_0031, 8)] {
+            let data = le16(&[1 << shift, 2 << shift, 3 << shift, u16::MAX]);
+            assert_eq!(
+                rgb(&sized(format, 2, 2, data)).unwrap(),
+                rgb(&sized(0x0108_000b, 2, 2, vec![1, 2, 3, 255])).unwrap()
+            );
+        }
+    }
+    #[test]
+    fn yuv_422_decodes_as_full_range_bt601_in_either_byte_order() {
+        // A gray pair and a red pair (JFIF Y'CbCr of R'G'B' 255, 0, 0), then
+        // an odd last pixel without Cr.
+        let yuyv = vec![200, 128, 50, 128, 76, 85, 76, 255, 128, 255];
+        let uyvy = vec![128, 200, 128, 50, 85, 76, 255, 76, 255, 128];
+        assert_eq!(ycbcr(128, 255, 128), [128, 84, 255]);
+        let expected = [
+            [200, 200, 200],
+            [50, 50, 50],
+            [254, 0, 0],
+            [254, 0, 0],
+            [128, 84, 255],
+        ]
+        .concat();
+        for (format, data) in [
+            (0x0210_0032, yuyv.clone()),
+            (0x0210_003b, yuyv),
+            (0x0210_001f, uyvy.clone()),
+            (0x0210_0043, uyvy),
+        ] {
+            let name = pixel_format_name(format);
+            let frame = sized(format, 5, 1, data);
+            assert_eq!(rgb(&frame).unwrap(), expected, "{name}");
+            assert_eq!(unpacked(&frame).unwrap().pixel_format, RGB8);
+            assert!(exposure(&frame).unwrap().channels.is_some());
+            let mut rows = frame.clone();
+            (rows.width, rows.height) = (2, 2);
+            rows.data.truncate(8);
+            assert_eq!(rgb(&rows).unwrap(), expected[..12], "{name}");
+            rows.data.pop();
+            assert!(rgb(&rows).is_err());
+        }
+    }
+    #[test]
+    fn mono14_and_alpha_padded_rgb_convert() {
+        let mono14 = f(0x0110_0025, le16(&[0x3fff, 0x0040]));
+        assert_eq!(rgb(&mono14).unwrap(), [255, 255, 255, 1, 1, 1]);
+        assert!(exposure(&mono14).unwrap().channels.is_none());
+        assert_eq!(encode(&mono14, "pgm").unwrap()[11..], [255, 1]);
+        let mono12p = f(0x010c_0047, vec![0xff, 0x0f, 0x00]);
+        assert_eq!(encode(&mono12p, "pgm").unwrap()[11..], [255, 0]);
+        let rgba = f(0x0220_0016, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let bgra = f(0x0220_0017, vec![3, 2, 1, 4, 7, 6, 5, 8]);
+        for frame in [rgba, bgra] {
+            assert_eq!(rgb(&frame).unwrap(), [1, 2, 3, 5, 6, 7]);
+            assert!(encode(&frame, "pgm").is_err());
+        }
+        assert!(rgb(&f(0x0220_0016, vec![0; 7])).is_err());
     }
 }

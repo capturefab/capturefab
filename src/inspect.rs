@@ -2,12 +2,7 @@
 //! keeps the colour filter phase, exposure, auto-meter and focus
 //! measurements, and a bounded JPEG or PNG preview. The session's `frame`
 //! command answers with these for agents, scripts and remote clients.
-use crate::{
-    camera_profile::CameraKind,
-    frame,
-    jpeg::Raster,
-    types::{Frame, MONO8},
-};
+use crate::{camera_profile::CameraKind, frame, jpeg::Raster, types::Frame};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, ops::RangeInclusive};
@@ -110,25 +105,6 @@ pub fn region_pixels(region: [f64; 4], width: u32, height: u32) -> [u32; 4] {
     ]
 }
 
-fn bayer(pixel_format: u32) -> bool {
-    matches!(pixel_format, 0x0108_0008..=0x0108_000b)
-}
-
-/// One-channel formats, previewed as gray.
-fn gray(pixel_format: u32) -> bool {
-    matches!(
-        pixel_format,
-        MONO8
-            | 0x0108_00b1
-            | 0x0108_00c6
-            | 0x0110_0003
-            | 0x0110_0005
-            | 0x0110_0007
-            | 0x0110_00b8
-            | 0x0110_00c7
-    )
-}
-
 /// A PFNC name such as `BayerRG8`, or the code in hex when it has none here.
 pub fn pixel_format_label(pixel_format: u32) -> String {
     match frame::pixel_format_name(pixel_format) {
@@ -149,7 +125,7 @@ pub fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
     let y = px[1].min(fh - 1);
     let width = px[2].clamp(1, fw - x);
     let height = px[3].clamp(1, fh - y);
-    if !bayer(frame.pixel_format) || fw < 2 || fh < 2 {
+    if !frame::is_bayer(frame.pixel_format) || fw < 2 || fh < 2 {
         return [x, y, width, height];
     }
     let (even_width, even_height) = (fw & !1, fh & !1);
@@ -161,8 +137,9 @@ pub fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
 }
 
 /// The `crop_rect` of `px` as a frame of its own, with the original's
-/// identity, pixel format and timestamp.
+/// identity and timestamp and its pixel format as `frame::unpacked` leaves it.
 pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
+    let frame = &*frame::unpacked(frame)?;
     let bytes = frame::validated_bytes_per_pixel(frame)?;
     let [x, y, width, height] = crop_rect(frame, px);
     let stride = frame.width as usize * bytes;
@@ -475,7 +452,7 @@ fn render_within(
         return Ok(None);
     }
     let jpeg = jpeg_preview(format, jpeg_available)?;
-    let (channels, pixels) = if gray(frame.pixel_format) {
+    let (channels, pixels) = if frame::monochrome(frame.pixel_format) {
         (1, frame::convert(frame, |[value, _, _]| value)?)
     } else {
         (3, frame::rgb(frame)?)
@@ -665,7 +642,7 @@ pub fn inspect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::RGB8;
+    use crate::types::{MONO8, RGB8};
 
     const MONO12: u32 = 0x0110_0005;
     const BAYER_RG8: u32 = 0x0108_0009;
@@ -809,6 +786,43 @@ mod tests {
         let mono = frame(MONO8, 8, 6, source.data.clone());
         let cropped = crop(&mono, [3, 1, 2, 2]).unwrap();
         assert_eq!(cropped.data, [11, 12, 19, 20]);
+    }
+
+    #[test]
+    fn packed_frames_crop_unpacked_and_measure_at_native_depth() {
+        // BayerRG12p: each pair of 12-bit samples lsb packed into three bytes.
+        let (width, height) = (8u32, 6u32);
+        let sample = |i: u32| (i * 50) as u16;
+        let packed = (0..width * height / 2)
+            .flat_map(|pair| {
+                let (a, b) = (sample(2 * pair), sample(2 * pair + 1));
+                [a as u8, (a >> 8) as u8 | (b << 4) as u8, (b >> 4) as u8]
+            })
+            .collect();
+        let source = frame(0x010c_0059, width, height, packed);
+        assert_eq!(crop_rect(&source, [3, 1, 2, 2]), [2, 0, 4, 4]);
+        let cropped = crop(&source, [3, 1, 2, 2]).unwrap();
+        assert_eq!(
+            (cropped.width, cropped.height, cropped.pixel_format),
+            (4, 4, 0x0110_0011)
+        );
+        let expected: Vec<u8> = (0..4)
+            .flat_map(|y| (2..6).flat_map(move |x| sample(y * width + x).to_le_bytes()))
+            .collect();
+        assert_eq!(cropped.data, expected);
+        assert_eq!(
+            frame::bayer_pattern(cropped.pixel_format),
+            frame::bayer_pattern(BAYER_RG8)
+        );
+        // Mono12p rows of 4095 and 0 measure half bright, metered at 12 bits.
+        let mono12p = frame(0x010c_0047, 4, 4, [0xff, 0x0f, 0x00].repeat(8));
+        for region in [[0, 0, 4, 4], [1, 1, 2, 2]] {
+            let measured = measure(&mono12p, CameraKind::AreaScan, region);
+            assert!(measured.exposure.unwrap().channels.is_none());
+            assert!((measured.auto_meter.unwrap().mean - 0.5).abs() < 1e-9);
+        }
+        let image = render(&mono12p, 64, PreviewFormat::Png).unwrap().unwrap();
+        assert_eq!((image.width, image.height), (4, 4));
     }
 
     #[test]

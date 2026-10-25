@@ -338,19 +338,7 @@ pub(super) fn epoch_ms() -> u64 {
 }
 
 pub(super) fn pixel_name(pixel_format: u32) -> String {
-    match pixel_format {
-        MONO8 => "Mono8".into(),
-        RGB8 => "RGB8".into(),
-        0x0218_0015 => "BGR8".into(),
-        0x0110_0003 => "Mono10".into(),
-        0x0110_0005 => "Mono12".into(),
-        0x0110_0007 => "Mono16".into(),
-        0x0108_0008 => "BayerGR8".into(),
-        0x0108_0009 => "BayerRG8".into(),
-        0x0108_000a => "BayerGB8".into(),
-        0x0108_000b => "BayerBG8".into(),
-        _ => format!("0x{pixel_format:08x}"),
-    }
+    crate::inspect::pixel_format_label(pixel_format)
 }
 
 pub(super) fn shell_quote(value: &str) -> String {

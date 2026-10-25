@@ -69,7 +69,7 @@ use crate::{
     genicam::FeatureInfo,
     session::{ActivityOrigin, SessionActor, SessionCommand, SessionHandle, SessionSnapshot},
     storage::StoragePolicy,
-    types::{CameraInfo, MONO8, RGB8, TransportStats},
+    types::{CameraInfo, TransportStats},
 };
 use anyhow::Result;
 use button::button;

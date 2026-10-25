@@ -138,15 +138,14 @@ fn recent_lines(source: &Frame) -> Result<Option<Frame>> {
         pixels.is_some_and(|n| n > 0 && n <= 64 * 1024 * 1024),
         "image dimensions exceed conversion limit"
     );
-    let bytes = ((source.pixel_format >> 16) & 0xff) as usize / 8;
-    let stride = source.width as usize * bytes;
+    let stride = frame::row_bytes(source.width, source.pixel_format);
     ensure!(
-        source.data.len() >= pixels.unwrap() * bytes,
+        source.data.len() >= stride * source.height as usize,
         "truncated line frame"
     );
     let mut start = source.height as usize - HISTORY_ROWS;
     // The first retained Bayer row must keep its original CFA parity.
-    if matches!(source.pixel_format, 0x0108_0008..=0x0108_000b) {
+    if frame::is_bayer(source.pixel_format) {
         start = start.next_multiple_of(2);
     }
     Ok(Some(Frame {
@@ -250,7 +249,9 @@ impl LineHistory {
 fn scalar_bytes(format: u32) -> Option<usize> {
     match format {
         crate::types::MONO8 | 0x0108_00b1 | 0x0108_00c6 => Some(1),
-        0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => Some(2),
+        0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
+            Some(2)
+        }
         0x0120_00bf => Some(4),
         _ => None,
     }
@@ -594,6 +595,64 @@ mod tests {
             .unwrap();
         assert_eq!((image.width, image.height), (640, HISTORY_ROWS as u32));
         assert_eq!(&image.rgba[..4], &[128, 128, 128, 255]);
+        // Mono12p rows take 1.5 bytes a pixel: the newest rows, 0x800 in
+        // every sample (bytes 0x00, 0x08, 0x80), stay after older zero rows.
+        let mut data = vec![0; 960 * 10_000];
+        let newest = 960 * (10_000 - HISTORY_ROWS);
+        data[newest..].copy_from_slice(&[0x00, 0x08, 0x80].repeat(320 * HISTORY_ROWS));
+        let source = Frame {
+            pixel_format: 0x010c_0047,
+            data,
+            ..source
+        };
+        let recent = recent_lines(&source).unwrap().unwrap();
+        assert_eq!((recent.height, recent.data.len()), (512, 960 * 512));
+        let image = CameraView::default()
+            .transform(CameraKind::LineScan, &source, &[], ALL)
+            .unwrap()
+            .unwrap();
+        assert!(image.rgba.chunks(4).all(|p| p == [128, 128, 128, 255]));
+        // A BayerRG12 block keeps rows from an even one, so red stays red.
+        let bayer = Frame {
+            width: 2,
+            height: 515,
+            pixel_format: 0x0110_0011,
+            data: [[4095u16, 0], [0, 0]]
+                .concat()
+                .repeat(258)
+                .into_iter()
+                .take(2 * 515)
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+            ..Frame::default()
+        };
+        let recent = recent_lines(&bayer).unwrap().unwrap();
+        assert_eq!(recent.height, 511);
+        assert_eq!(&recent.data[..4], &[0xff, 0x0f, 0, 0]);
+    }
+
+    #[test]
+    fn thermal_heatmaps_read_mono14_and_other_unpacked_depths() {
+        // FLIR Ax5 radiometric streams are Mono14.
+        for pixel_format in [0x0110_0025, 0x0110_0003, 0x0110_0005] {
+            let source = Frame {
+                width: 3,
+                height: 1,
+                pixel_format,
+                data: [100u16, 200, 300]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                ..Frame::default()
+            };
+            let mut view = CameraView::default();
+            let image = view
+                .transform(CameraKind::Thermal, &source, &[], ALL)
+                .unwrap()
+                .unwrap();
+            assert_ne!(image.rgba[..4], image.rgba[8..12]);
+            assert!(view.legend.unwrap().contains("raw 100.0–300.0"));
+        }
     }
 
     #[test]

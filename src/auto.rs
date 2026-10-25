@@ -80,14 +80,19 @@ pub struct Meter {
 }
 
 pub fn meter(frame: &Frame) -> Option<Meter> {
+    let frame = &*crate::frame::unpacked(frame).ok()?;
     let (w, h) = (frame.width as usize, frame.height as usize);
     let (bytes, bits, quad) = match frame.pixel_format {
         crate::types::MONO8 => (1, 8, false),
         crate::types::RGB8 | 0x0218_0015 => (3, 8, false),
         0x0110_0003 => (2, 10, false),
         0x0110_0005 => (2, 12, false),
+        0x0110_0025 => (2, 14, false),
         0x0110_0007 => (2, 16, false),
         0x0108_0008..=0x0108_000b => (1, 8, true),
+        0x0110_000c..=0x0110_000f => (2, 10, true),
+        0x0110_0010..=0x0110_0013 => (2, 12, true),
+        0x0110_002e..=0x0110_0031 => (2, 16, true),
         _ => return None,
     };
     let (gw, gh) = if quad { (w / 2, h / 2) } else { (w, h) };
@@ -1960,12 +1965,28 @@ mod tests {
             .collect();
         let deep = meter(&frame(0x0110_0005, 4, 2, mono12)).unwrap();
         assert!(near(deep.mean, 0.5) && near(deep.p99, 1.0));
+        // Mono12p and Mono12Packed rows of 4095, 0, 4095, 0 (the same bytes
+        // in both); BayerRG12 with only red at full scale; Mono14 at full scale.
+        for format in [0x010c_0047, 0x010c_0006] {
+            let deep = meter(&frame(format, 4, 2, [0xff, 0x0f, 0x00].repeat(4))).unwrap();
+            assert!(near(deep.mean, 0.5) && near(deep.p99, 1.0), "{format:x}");
+        }
+        let red12 = (0..512 * 512)
+            .flat_map(|i: usize| {
+                let red = (i / 512).is_multiple_of(2) && i.is_multiple_of(2);
+                (if red { 4095u16 } else { 0 }).to_le_bytes()
+            })
+            .collect();
+        let bayer12 = meter(&frame(0x0110_0011, 512, 512, red12)).unwrap();
+        assert!(near(bayer12.mean, 0.25) && near(bayer12.p99, 1.0));
+        let mono14 = meter(&frame(0x0110_0025, 2, 1, vec![0xff, 0x3f, 0xff, 0x3f])).unwrap();
+        assert!(near(mono14.mean, 1.0));
         assert_eq!(
             meter(&frame(MONO8, 2, 2, vec![0; 4])).unwrap().mean,
             1.0 / 1024.0
         );
         assert!(meter(&frame(MONO8, 4, 4, vec![0; 15])).is_none());
-        assert!(meter(&frame(0x010c_0047, 4, 4, vec![0; 24])).is_none());
+        assert!(meter(&frame(0x010c_0047, 4, 4, vec![0; 23])).is_none());
     }
 
     #[test]

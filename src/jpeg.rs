@@ -15,8 +15,8 @@ pub const QUALITY: i32 = 90;
 
 pub(crate) fn monochrome(pixel_format: u32) -> bool {
     matches!(
-        pixel_format,
-        MONO8 | 0x0110_0003 | 0x0110_0005 | 0x0110_0007
+        crate::frame::unpacked_format(pixel_format),
+        MONO8 | 0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007
     )
 }
 
@@ -347,6 +347,17 @@ mod tests {
         );
         let bayer = Raster::new(&frame(0x0108_0009, 6, 4, 1)).unwrap();
         assert_eq!((bayer.channels, bayer.data.len()), (3, 72));
+        // Mono14 and packed Mono12p stay gray; packed BayerRG12p is color.
+        for (format, bytes) in [(0x0110_0025, 2.0), (0x010c_0047, 1.5), (0x010c_0059, 1.5)] {
+            let size = (6.0 * 4.0 * bytes) as usize;
+            let packed = Frame {
+                data: (0..size).map(|i| (i * 37) as u8).collect(),
+                ..frame(format, 6, 4, 0)
+            };
+            let raster = Raster::new(&packed).unwrap();
+            let channels = if format == 0x010c_0059 { 3 } else { 1 };
+            assert_eq!(raster.data.len(), 24 * channels, "{format:x}");
+        }
         assert!(Raster::new(&frame(0, 2, 2, 1)).is_err());
     }
     #[test]
