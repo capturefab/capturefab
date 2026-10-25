@@ -1914,7 +1914,12 @@ fn dshow_modes(log: &str) -> Vec<Mode> {
         })
         .fold(Vec::new(), merge)
 }
-fn v4l2_modes(log: &str) -> (Vec<Mode>, Vec<String>) {
+/// Modes from FFmpeg's V4L2 format listing, with the frame rate bounds
+/// `rates` reports for a format's listed description and a size.
+fn v4l2_modes(
+    log: &str,
+    rates: impl Fn(&str, (u32, u32)) -> Option<(f64, f64)>,
+) -> (Vec<Mode>, Vec<String>) {
     let mut formats = log
         .lines()
         .filter_map(|line| {
@@ -1925,38 +1930,65 @@ fn v4l2_modes(log: &str) -> (Vec<Mode>, Vec<String>) {
                 _ => return None,
             };
             let mut fields = fields.splitn(3, " : ");
-            let name = fields.next()?.trim();
-            let modes = fields
-                .nth(1)?
-                .split_whitespace()
-                .filter_map(dimensions)
-                .map(|(width, height)| Mode {
-                    width,
-                    height,
-                    fps: None,
-                    input_format: None,
-                })
-                .fold(Vec::new(), merge);
-            (name != "Unsupported" && !modes.is_empty()).then_some((compressed, name, modes))
+            let (name, description) = (fields.next()?.trim(), fields.next()?.trim());
+            let mut sizes = Vec::new();
+            for size in fields.next()?.split_whitespace().filter_map(dimensions) {
+                if !sizes.contains(&size) {
+                    sizes.push(size);
+                }
+            }
+            (name != "Unsupported" && !sizes.is_empty()).then_some((
+                compressed,
+                name,
+                description,
+                sizes,
+            ))
         })
         .collect::<Vec<_>>();
     formats.sort_by_key(|format| format.0);
     let mut names = Vec::new();
-    let mut modes = Vec::new();
-    let mut sizes = HashSet::new();
-    for (_, name, choices) in formats {
-        let index = names.len();
+    let mut modes: Vec<Mode> = Vec::new();
+    for (_, name, description, sizes) in formats {
+        let input_format = Some(names.len());
         names.push(name.to_string());
-        for mut mode in choices {
+        for (width, height) in sizes {
+            let fps = rates(description, (width, height))
+                .map(|(low, high)| (rounded(low), rounded(high)))
+                .filter(|&(_, high)| high > 0.0);
             // Prefer a raw format when the same size is available in both,
-            // while retaining sizes available only in a compressed format.
-            if sizes.insert(mode.size()) {
-                mode.input_format = Some(index);
-                modes.push(mode);
+            // and keep a compressed one where it reaches a higher frame rate:
+            // USB 2.0 webcams offer HD sizes in YUYV at 5-10 fps but in MJPEG
+            // at 30.
+            let faster = modes
+                .iter()
+                .filter(|mode| mode.size() == (width, height))
+                .all(|mode| {
+                    mode.fps
+                        .zip(fps)
+                        .is_some_and(|((_, kept), (_, high))| high > kept)
+                });
+            if faster {
+                modes.push(Mode {
+                    width,
+                    height,
+                    fps,
+                    input_format,
+                });
             }
         }
     }
     (modes, names)
+}
+/// The frame rate bounds the driver reports for a format, by its description
+/// in FFmpeg's listing, and a size; FFmpeg lists only the sizes.
+#[cfg(target_os = "linux")]
+fn v4l2_rates(path: &str) -> impl Fn(&str, (u32, u32)) -> Option<(f64, f64)> {
+    let formats = v4l2::Formats::open(std::path::Path::new(path)).ok();
+    move |description, (width, height)| formats.as_ref()?.frame_rates(description, width, height)
+}
+#[cfg(not(target_os = "linux"))]
+fn v4l2_rates(_: &str) -> impl Fn(&str, (u32, u32)) -> Option<(f64, f64)> {
+    |_, _| None
 }
 
 fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
@@ -1972,7 +2004,7 @@ fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
         .iter()
         .chain(options)
         .map(|arg| arg.to_string())
-        .chain(["-i".into(), input])
+        .chain(["-i".into(), input.clone()])
         .collect::<Vec<_>>();
     let Ok((_, log)) = executable().and_then(|exe| bounded_output(&exe, &args, PROBE_TIMEOUT))
     else {
@@ -1980,7 +2012,7 @@ fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
     };
     match format {
         "avfoundation" => (avfoundation_modes(&log), Vec::new()),
-        "v4l2" => v4l2_modes(&log),
+        "v4l2" => v4l2_modes(&log, v4l2_rates(&input)),
         _ => (dshow_modes(&log), Vec::new()),
     }
 }
@@ -7530,12 +7562,16 @@ Error opening input files: Input/output error
             camera.input_options(),
             ["-framerate", "15", "-video_size", "1920x1080"]
         );
-        let (modes, format) = v4l2_modes(concat!(
-            "[video4linux2,v4l2 @ 0x5581d1c2a0] Compressed:       mjpeg :          Motion-JPEG : 1920x1080 1280x720 640x480\n",
-            "[video4linux2,v4l2 @ 0x5581d1c2a0] Raw       : Unsupported :         10-bit Bayer : 4056x3040\n",
-            "[video4linux2,v4l2 @ 0x5581d1c2a0] Raw       :     yuyv422 :           YUYV 4:2:2 : 640x480 1280x720 640x480\n",
-            "[video4linux2,v4l2 @ 0x5581d1c2a0] Raw       :        gray :            8-bit Greyscale : {8-1920, 8}x{8-1080, 8}\n",
-        ));
+        // A driver that enumerates no frame intervals leaves rates unbounded.
+        let (modes, format) = v4l2_modes(
+            concat!(
+                "[video4linux2,v4l2 @ 0x5581d1c2a0] Compressed:       mjpeg :          Motion-JPEG : 1920x1080 1280x720 640x480\n",
+                "[video4linux2,v4l2 @ 0x5581d1c2a0] Raw       : Unsupported :         10-bit Bayer : 4056x3040\n",
+                "[video4linux2,v4l2 @ 0x5581d1c2a0] Raw       :     yuyv422 :           YUYV 4:2:2 : 640x480 1280x720 640x480\n",
+                "[video4linux2,v4l2 @ 0x5581d1c2a0] Raw       :        gray :            8-bit Greyscale : {8-1920, 8}x{8-1080, 8}\n",
+            ),
+            |_, _| None,
+        );
         assert_eq!(labels(&modes), ["640x480", "1280x720", "1920x1080"]);
         let mut camera = native("v4l2:/dev/video0", modes);
         camera.formats = format;
@@ -7590,6 +7626,86 @@ Error opening input files: Input/output error
                 "yuyv422"
             ]
         );
+    }
+    #[test]
+    fn v4l2_modes_take_a_compressed_format_where_raw_cannot_reach_the_rate() {
+        // The UVC camera of FFmpeg trac #9878, whose v4l2-ctl listing gives
+        // YUYV 1280x720 at 10 fps and every other format and size at 30.
+        let (modes, formats) = v4l2_modes(
+            concat!(
+                "[video4linux2,v4l2 @ 0x5694e62800] Compressed:       mjpeg :          Motion-JPEG : 1280x720 320x240 640x360 640x480\n",
+                "[video4linux2,v4l2 @ 0x5694e62800] Raw       :     yuyv422 :           YUYV 4:2:2 : 1280x720 320x240 640x360 640x480\n",
+            ),
+            |description, size| match (description, size) {
+                ("YUYV 4:2:2", (1280, 720)) => Some((10.0, 10.0)),
+                ("YUYV 4:2:2" | "Motion-JPEG", _) => Some((30.0, 30.0)),
+                _ => None,
+            },
+        );
+        assert_eq!(formats, ["yuyv422", "mjpeg"]);
+        assert_eq!(
+            labels(&modes),
+            [
+                "1280x720@10",
+                "320x240@30",
+                "640x360@30",
+                "640x480@30",
+                "1280x720@30"
+            ]
+        );
+        let mut camera = native("v4l2:/dev/video0", modes);
+        camera.formats = formats;
+        camera.configure(NativeOptions::default()).unwrap();
+        assert_eq!(
+            camera.input_options(),
+            [
+                "-framerate",
+                "30",
+                "-video_size",
+                "1280x720",
+                "-input_format",
+                "mjpeg"
+            ]
+        );
+        camera
+            .configure(NativeOptions {
+                size: Some((1280, 720)),
+                fps: Some(10.0),
+            })
+            .unwrap();
+        assert_eq!(
+            camera.input_options(),
+            [
+                "-framerate",
+                "10",
+                "-video_size",
+                "1280x720",
+                "-input_format",
+                "yuyv422"
+            ]
+        );
+        let rejected = NativeOptions {
+            size: Some((1280, 720)),
+            fps: Some(60.0),
+        };
+        assert_eq!(
+            camera.configure(rejected).unwrap_err().to_string(),
+            "1280x720@60 is not supported by /dev/video0; supported: 1280x720@30, 1280x720@10, 640x480@30, 640x360@30, 320x240@30"
+        );
+        let nodes = NodeMap::parse(&camera.xml().unwrap()).unwrap();
+        nodes
+            .set(&mut camera, "AcquisitionFrameRate", "30")
+            .unwrap();
+        assert_eq!(nodes.get(&mut camera, "VideoMode").unwrap(), "1280x720@30");
+        assert_eq!(camera.input_options()[5], "mjpeg");
+        assert!(
+            nodes
+                .set(&mut camera, "AcquisitionFrameRate", "15")
+                .is_err()
+        );
+        nodes.set(&mut camera, "VideoMode", "1280x720@10").unwrap();
+        assert_eq!(camera.fps, 10.0);
+        assert_eq!(camera.input_options()[5], "yuyv422");
     }
     #[test]
     #[cfg(unix)]

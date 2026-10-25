@@ -123,10 +123,13 @@ Native locators accept optional `size` and `fps`, for example
 `avfoundation:Camera Name?size=1920x1080&fps=30`. Run `features` to inspect the
 device's supported `VideoMode` choices, then use `--set VideoMode=WIDTHxHEIGHT@FPS`
 for capture or `set VideoMode=...` in a stopped persistent session. AVFoundation
-choices reflect frame rates the bundled FFmpeg input honors; V4L2 lists dimensions
-without frame-rate bounds, so its driver still determines accepted rates. V4L2
-keeps sizes advertised across raw and compressed inputs and selects the matching
-input format when the mode changes; when both offer the same size, raw is preferred.
+choices reflect frame rates the bundled FFmpeg input honors, and V4L2 choices the
+frame intervals its driver reports for each format and size; a driver that reports
+none leaves the accepted rates to the driver. V4L2 keeps sizes advertised across
+raw and compressed inputs and selects the matching input format when the mode or
+frame rate changes; when both offer the same size, raw is preferred unless the
+compressed input reaches a higher frame rate, as MJPEG does at HD sizes on USB 2.0
+webcams.
 Unavailable cameras report permission, busy, or frame timeout diagnostics.
 Discovered host and ONVIF devices can also be selected by their unique serial;
 Capturefab uses the discovered locator and the matching transport to open them.

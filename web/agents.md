@@ -1039,7 +1039,7 @@ Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`.
 Examine `features` for advertised `VideoMode` choices.
 Set a supported `VideoMode`, `Width`, `Height` or `AcquisitionFrameRate` before acquisition.
 Stop a live session before changing those controls.
-V4L2 format listings do not establish frame-rate bounds.
+V4L2 frame-rate bounds come from the frame intervals the driver reports; a size where a compressed input such as MJPEG reaches a higher rate than raw has a mode for each.
 GigE status includes packet size, receive buffer, resend and loss counters.
 
 Release builds use bundled FFmpeg for media input and forwarding.

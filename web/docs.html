@@ -279,7 +279,7 @@ capturefab --session gui start</code></pre><button class="copy-button" type="but
             <tr><td>Video file</td><td><code>/path/to/clip.mp4</code></td><td>A readable file with a format FFmpeg can decode.</td></tr>
           </tbody></table></div>
           <h3>Choose a native camera mode</h3>
-          <p>Native locators accept <code>?size=1280x720&amp;fps=30</code>. Examine <strong>Features</strong> for available <code>VideoMode</code> choices. Before acquisition, select a supported mode. You can also set supported <code>Width</code>, <code>Height</code> and <code>AcquisitionFrameRate</code> values. Available modes depend on the driver. V4L2 format listings do not establish frame-rate limits.</p>
+          <p>Native locators accept <code>?size=1280x720&amp;fps=30</code>. Examine <strong>Features</strong> for available <code>VideoMode</code> choices. Before acquisition, select a supported mode. You can also set supported <code>Width</code>, <code>Height</code> and <code>AcquisitionFrameRate</code> values. Available modes depend on the driver. V4L2 frame-rate limits come from the frame intervals the driver reports.</p>
           <div class="code-wrap"><pre><code>capturefab --camera 'avfoundation:0?size=1280x720&amp;fps=30' capture -o webcam.png
 capturefab --camera 'rtsp://camera/live' capture -o network.png
 capturefab --camera '/path/to/clip.mp4' capture -o video-frame.png

@@ -1,5 +1,5 @@
 //! V4L2 queries that FFmpeg's v4l2 input does not make: whether a device
-//! node captures video.
+//! node captures video, and the frame intervals of each format and size.
 
 const VIDEO_CAPTURE: u32 = 0x1;
 const VIDEO_CAPTURE_MPLANE: u32 = 0x1000;
@@ -22,8 +22,23 @@ pub(super) fn captures(capabilities: u32, device_caps: u32) -> bool {
     caps & (VIDEO_CAPTURE | VIDEO_CAPTURE_MPLANE) != 0 && caps & (VIDEO_M2M | VIDEO_M2M_MPLANE) == 0
 }
 
+/// The lowest and highest frame rates of frame intervals given as
+/// (numerator, denominator) seconds: every discrete interval, or the ends
+/// of a stepwise or continuous range.
+pub(super) fn frame_rates(intervals: &[(u32, u32)]) -> Option<(f64, f64)> {
+    intervals
+        .iter()
+        .filter(|&&(numerator, denominator)| numerator > 0 && denominator > 0)
+        .map(|&(numerator, denominator)| f64::from(denominator) / f64::from(numerator))
+        .fold(None, |range, fps| {
+            Some(range.map_or((fps, fps), |(low, high): (f64, f64)| {
+                (low.min(fps), high.max(fps))
+            }))
+        })
+}
+
 #[cfg(target_os = "linux")]
-pub(super) use device::captures_video;
+pub(super) use device::{Formats, captures_video};
 
 #[cfg(target_os = "linux")]
 mod device {
@@ -46,8 +61,42 @@ mod device {
         device_caps: u32,
         reserved: [u32; 3],
     }
+    /// `struct v4l2_fmtdesc`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct FormatDescription {
+        index: u32,
+        kind: u32,
+        flags: u32,
+        description: [u8; 32],
+        pixel_format: u32,
+        mbus_code: u32,
+        reserved: [u32; 3],
+    }
+    /// `struct v4l2_frmivalenum`, whose union holds a discrete interval or
+    /// the minimum, maximum and step of a range.
+    #[repr(C)]
+    #[derive(Default)]
+    struct FrameInterval {
+        index: u32,
+        pixel_format: u32,
+        width: u32,
+        height: u32,
+        kind: u32,
+        interval: [u32; 6],
+        reserved: [u32; 2],
+    }
     const _: () = assert!(size_of::<Capability>() == 104);
+    const _: () = assert!(size_of::<FormatDescription>() == 64);
+    const _: () = assert!(size_of::<FrameInterval>() == 52);
     const QUERYCAP: libc::Ioctl = libc::_IOR::<Capability>(b'V' as u32, 0);
+    const ENUM_FMT: libc::Ioctl = libc::_IOWR::<FormatDescription>(b'V' as u32, 2);
+    const ENUM_FRAMEINTERVALS: libc::Ioctl = libc::_IOWR::<FrameInterval>(b'V' as u32, 75);
+    const BUF_TYPE_VIDEO_CAPTURE: u32 = 1;
+    const BUF_TYPE_VIDEO_CAPTURE_MPLANE: u32 = 9;
+    const FRMIVAL_TYPE_DISCRETE: u32 = 1;
+    /// More entries than any driver lists, in case one never ends a list.
+    const MAX_ENTRIES: u32 = 256;
 
     fn open(path: &Path) -> io::Result<File> {
         OpenOptions::new()
@@ -68,16 +117,88 @@ mod device {
             }
         }
     }
+    fn capability(device: &File) -> io::Result<Capability> {
+        let mut capability = Capability::default();
+        ioctl(device, QUERYCAP, &mut capability)?;
+        Ok(capability)
+    }
     /// Whether the node at `path` captures video. A node that cannot be
     /// opened or queried, for example without permission, is kept, so that
     /// opening it reports why.
     pub fn captures_video(path: &Path) -> bool {
-        let mut capability = Capability::default();
         open(path)
-            .and_then(|device| ioctl(&device, QUERYCAP, &mut capability))
-            .map_or(true, |()| {
+            .and_then(|device| capability(&device))
+            .map_or(true, |capability| {
                 super::captures(capability.capabilities, capability.device_caps)
             })
+    }
+
+    /// A capture node's formats, for the frame intervals FFmpeg's format
+    /// listing leaves out.
+    pub struct Formats {
+        device: File,
+        /// Each format's description, as FFmpeg lists it, and fourcc.
+        formats: Vec<(String, u32)>,
+    }
+    impl Formats {
+        pub fn open(path: &Path) -> io::Result<Self> {
+            let device = open(path)?;
+            // FFmpeg picks the buffer type from the device-wide capabilities.
+            let kind = if capability(&device)?.capabilities & super::VIDEO_CAPTURE != 0 {
+                BUF_TYPE_VIDEO_CAPTURE
+            } else {
+                BUF_TYPE_VIDEO_CAPTURE_MPLANE
+            };
+            let mut formats = Vec::new();
+            for index in 0..MAX_ENTRIES {
+                let mut format = FormatDescription {
+                    index,
+                    kind,
+                    ..Default::default()
+                };
+                if ioctl(&device, ENUM_FMT, &mut format).is_err() {
+                    break;
+                }
+                let length = format.description.iter().position(|&b| b == 0);
+                let description = &format.description[..length.unwrap_or(32)];
+                formats.push((
+                    String::from_utf8_lossy(description).trim().to_owned(),
+                    format.pixel_format,
+                ));
+            }
+            Ok(Self { device, formats })
+        }
+        /// The frame rate bounds of the format FFmpeg lists as
+        /// `description`, at a size, or `None` when the driver does not
+        /// enumerate frame intervals.
+        pub fn frame_rates(
+            &self,
+            description: &str,
+            width: u32,
+            height: u32,
+        ) -> Option<(f64, f64)> {
+            let &(_, pixel_format) = self.formats.iter().find(|(name, _)| name == description)?;
+            let mut intervals = Vec::new();
+            for index in 0..MAX_ENTRIES {
+                let mut interval = FrameInterval {
+                    index,
+                    pixel_format,
+                    width,
+                    height,
+                    ..Default::default()
+                };
+                if ioctl(&self.device, ENUM_FRAMEINTERVALS, &mut interval).is_err() {
+                    break;
+                }
+                let [numerator, denominator, longest, longest_denominator, ..] = interval.interval;
+                intervals.push((numerator, denominator));
+                if interval.kind != FRMIVAL_TYPE_DISCRETE {
+                    intervals.push((longest, longest_denominator));
+                    break;
+                }
+            }
+            super::frame_rates(&intervals)
+        }
     }
 }
 
@@ -100,5 +221,21 @@ mod tests {
         assert!(captures(0x0500_0001, 0));
         // v4l2loopback without exclusive_caps reports capture and output.
         assert!(captures(0x8520_0003, 0x0520_0003));
+    }
+    #[test]
+    fn frame_intervals_become_frame_rate_bounds() {
+        // uvcvideo's discrete intervals for a C920's 1280x720 MJPEG frames:
+        // 30, 24, 20, 15, 10, 7.5 and 5 fps.
+        assert_eq!(
+            frame_rates(&[(1, 30), (1, 24), (1, 20), (1, 15), (1, 10), (2, 15), (1, 5)]),
+            Some((5.0, 30.0))
+        );
+        // A stepwise range from 1/120 s to 1 s, and NTSC rates.
+        assert_eq!(frame_rates(&[(1, 120), (1, 1)]), Some((1.0, 120.0)));
+        let (low, high) = frame_rates(&[(1001, 30000), (1001, 60000)]).unwrap();
+        assert!((low - 29.97).abs() < 0.001 && (high - 59.94).abs() < 0.001);
+        // A driver that fills no interval reports no bounds.
+        assert_eq!(frame_rates(&[(0, 0)]), None);
+        assert_eq!(frame_rates(&[]), None);
     }
 }

@@ -450,7 +450,7 @@ capturefab --session bench stop-forward
 
 Host-driver discovery includes standard USB and built-in webcams, virtual camera drivers and compatible HDMI capture devices. CSI cameras work when the host exposes an accessible supported video driver; libcamera-only sensor pipelines and proprietary tether/USB protocols are not implemented. The GX85 can use its clean HDMI output through a capture card; see the compatibility guide for camera settings and the manufacturer source.
 
-Native cameras accept `?size=1280x720&fps=30` locator options. Before acquisition, use `features` to inspect advertised `VideoMode` choices and set a supported mode, `Width`, `Height`, or `AcquisitionFrameRate`. The selected dimensions and frame rate depend on the host driver; V4L2 format listings do not provide frame-rate bounds. Stop acquisition before changing a mode.
+Native cameras accept `?size=1280x720&fps=30` locator options. Before acquisition, use `features` to inspect advertised `VideoMode` choices and set a supported mode, `Width`, `Height`, or `AcquisitionFrameRate`. The selected dimensions and frame rate depend on the host driver; V4L2 frame-rate bounds come from the frame intervals the driver reports, and a compressed input such as MJPEG is chosen where it reaches a higher rate than raw at the same size. Stop acquisition before changing a mode.
 
 ONVIF discovery and profile resolution support WS-Security, HTTP Basic and Digest authentication. HTTPS SOAP endpoints are currently unsupported. ONVIF media ultimately uses the selected RTSP URI.
 
