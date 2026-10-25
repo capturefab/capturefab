@@ -113,11 +113,11 @@ fn parse_discovery(xml: &str, source: SocketAddr) -> Result<Vec<OnvifDevice>> {
             .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
             .map(str::to_string)
             .collect::<Vec<_>>();
-        if addresses.is_empty() {
+        let Some(endpoint) = device_endpoint(&addresses, source.ip()) else {
             continue;
-        }
+        };
         result.push(OnvifDevice {
-            endpoint: addresses[0].clone(),
+            endpoint,
             addresses,
             scopes: child_text(matched, "Scopes")
                 .unwrap_or("")
@@ -130,49 +130,153 @@ fn parse_discovery(xml: &str, source: SocketAddr) -> Result<Vec<OnvifDevice>> {
     }
     Ok(result)
 }
+/// The device service address to connect to among those a ProbeMatch lists
+/// (one per scheme and address, in no set order, Core 7.3.2.3): HTTP before
+/// the unsupported HTTPS, then the address the reply came from, IPv4, host
+/// names and IPv6, with an IPv6 link-local address, unusable without its
+/// zone, last. An unspecified host, which some cameras report, becomes the
+/// reply's source address.
+fn device_endpoint(addresses: &[String], source: IpAddr) -> Option<String> {
+    let rank = |url: &String| {
+        let host = host_and_port(url).map(|(host, _)| host).unwrap_or_default();
+        let place = match host.parse::<IpAddr>() {
+            Ok(ip) if ip == source || ip.is_unspecified() => 0,
+            Ok(IpAddr::V4(_)) => 1,
+            Err(_) => 2,
+            Ok(IpAddr::V6(ip)) if ip.is_unicast_link_local() => 4,
+            Ok(IpAddr::V6(_)) => 3,
+        };
+        (url.starts_with("https://"), place)
+    };
+    let url = addresses.iter().min_by_key(|url| rank(url))?;
+    let Some((host, port)) = host_and_port(url) else {
+        return Some(url.clone());
+    };
+    if !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified()) {
+        return Some(url.clone());
+    }
+    let (scheme, rest) = url.split_once("://")?;
+    let path = &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..];
+    Some(match source {
+        IpAddr::V4(ip) => format!("{scheme}://{ip}:{port}{path}"),
+        IpAddr::V6(ip) => format!("{scheme}://[{ip}]:{port}{path}"),
+    })
+}
+/// Add a discovered device unless it is already listed: the same endpoint,
+/// or the same EndpointReference (stable across interfaces, Core 7.3.1)
+/// with an address in common, since cloned firmware can repeat one UUID.
+fn merge_device(devices: &mut Vec<OnvifDevice>, device: OnvifDevice) {
+    let known = devices.iter_mut().find(|known| {
+        known.endpoint == device.endpoint
+            || (!device.uuid.is_empty()
+                && known.uuid == device.uuid
+                && known.addresses.iter().any(|a| device.addresses.contains(a)))
+    });
+    match known {
+        Some(known) => {
+            for address in device.addresses {
+                if !known.addresses.contains(&address) {
+                    known.addresses.push(address);
+                }
+            }
+        }
+        None => devices.push(device),
+    }
+}
+/// A WS-Discovery Probe for one type. ONVIF devices must list tds:Device
+/// (Core 7.3.2.1); Profile S devices list dn:NetworkVideoTransmitter, and
+/// some list only one of them. A Probe matches only devices that list all
+/// its types, so each type gets its own Probe.
+fn probe_message(message_id: &str, types: &str) -> String {
+    format!(
+        "<?xml version='1.0'?><s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:a='http://schemas.xmlsoap.org/ws/2004/08/addressing' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery' xmlns:dn='http://www.onvif.org/ver10/network/wsdl' xmlns:tds='{DEVICE_NS}'><s:Header><a:MessageID>urn:uuid:{message_id}</a:MessageID><a:To s:mustUnderstand='1'>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To><a:Action s:mustUnderstand='1'>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action></s:Header><s:Body><d:Probe><d:Types>{types}</d:Types></d:Probe></s:Body></s:Envelope>"
+    )
+}
+/// When to send the Probes again after the first copy, for a first delay
+/// drawn from 50..=250 ms: SOAP-over-UDP Appendix I for multicast, four
+/// transmissions with the delay doubling up to 500 ms. WS-Discovery 2.4
+/// requires it to make up for lost datagrams; devices answer one copy.
+fn repeat_offsets(first_delay_ms: u64) -> [Duration; 3] {
+    let mut delay = first_delay_ms.clamp(50, 250);
+    let mut at = 0;
+    [(); 3].map(|_| {
+        at += delay;
+        delay = (delay * 2).min(500);
+        Duration::from_millis(at)
+    })
+}
 pub fn discover(timeout: Duration) -> Result<Vec<OnvifDevice>> {
     validate_timeout(timeout)?;
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .context("cannot open ONVIF discovery socket")?;
     socket.set_multicast_ttl_v4(1)?;
-    socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-    let xml = format!(
-        "<?xml version='1.0'?><s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:a='http://schemas.xmlsoap.org/ws/2004/08/addressing' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery' xmlns:dn='http://www.onvif.org/ver10/network/wsdl'><s:Header><a:MessageID>urn:uuid:{}</a:MessageID><a:To s:mustUnderstand='1'>urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To><a:Action s:mustUnderstand='1'>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action></s:Header><s:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></s:Body></s:Envelope>",
-        uuid()?
-    );
+    let probes = [
+        probe_message(&uuid()?, "dn:NetworkVideoTransmitter"),
+        probe_message(&uuid()?, "tds:Device"),
+    ];
     let destination = (Ipv4Addr::new(239, 255, 255, 250), 3702);
-    let mut sent = false;
-    if let Ok(interfaces) = if_addrs::get_if_addrs() {
-        for interface in interfaces {
-            if interface.is_loopback() {
-                continue;
-            }
-            if let if_addrs::IfAddr::V4(v4) = interface.addr {
-                let sock = socket2::SockRef::from(&socket);
-                if sock.set_multicast_if_v4(&v4.ip).is_ok()
-                    && socket.send_to(xml.as_bytes(), destination).is_ok()
-                {
-                    sent = true;
+    let interfaces = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|interface| !interface.is_loopback())
+        .filter_map(|interface| match interface.addr {
+            if_addrs::IfAddr::V4(v4) => Some(v4.ip),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let send = || {
+        let mut sent = false;
+        for ip in &interfaces {
+            let sock = socket2::SockRef::from(&socket);
+            if sock.set_multicast_if_v4(ip).is_ok() {
+                for xml in &probes {
+                    sent |= socket.send_to(xml.as_bytes(), destination).is_ok();
                 }
             }
         }
+        sent
+    };
+    let start = Instant::now();
+    let deadline = start + timeout;
+    if !send() {
+        for xml in &probes {
+            socket
+                .send_to(xml.as_bytes(), destination)
+                .context("cannot send ONVIF WS-Discovery probe")?;
+        }
     }
-    if !sent {
-        socket
-            .send_to(xml.as_bytes(), destination)
-            .context("cannot send ONVIF WS-Discovery probe")?;
-    }
-    let deadline = Instant::now() + timeout;
+    let mut first_delay = [0u8; 2];
+    getrandom::fill(&mut first_delay)
+        .map_err(|e| anyhow!("cannot choose an ONVIF probe delay: {e}"))?;
+    let mut repeats = repeat_offsets(50 + u64::from(u16::from_le_bytes(first_delay)) % 201)
+        .map(|offset| start + offset)
+        .into_iter()
+        // Devices wait up to 500 ms before answering, so a later copy is late.
+        .filter(|at| *at + Duration::from_millis(500) <= deadline)
+        .peekable();
     let mut buffer = [0u8; 65536];
-    let mut devices = BTreeMap::new();
-    while Instant::now() < deadline {
+    let mut devices = Vec::new();
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        if repeats.next_if(|at| *at <= now).is_some() {
+            send();
+        }
+        let wait = repeats
+            .peek()
+            .map_or(deadline, |at| (*at).min(deadline))
+            .saturating_duration_since(now)
+            .clamp(Duration::from_millis(1), Duration::from_millis(100));
+        socket.set_read_timeout(Some(wait))?;
         match socket.recv_from(&mut buffer) {
             Ok((n, source)) => {
                 if let Ok(xml) = std::str::from_utf8(&buffer[..n])
                     && let Ok(found) = parse_discovery(xml, source)
                 {
                     for device in found {
-                        devices.entry(device.endpoint.clone()).or_insert(device);
+                        merge_device(&mut devices, device);
                     }
                 }
             }
@@ -184,7 +288,8 @@ pub fn discover(timeout: Duration) -> Result<Vec<OnvifDevice>> {
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(devices.into_values().collect())
+    devices.sort_by(|a, b| a.endpoint.cmp(&b.endpoint));
+    Ok(devices)
 }
 #[derive(Debug)]
 struct HttpUrl {
@@ -1503,6 +1608,115 @@ mod tests {
         let devices = parse_discovery(xml, "192.168.1.3:3702".parse().unwrap()).unwrap();
         assert_eq!(devices[0].uuid, "urn:uuid:test");
         assert_eq!(devices[0].addresses.len(), 2);
+    }
+    fn probe_match(types: &str, address: &str, xaddrs: &str) -> String {
+        format!(
+            "<?xml version='1.0' encoding='UTF-8'?><env:Envelope xmlns:env='http://www.w3.org/2003/05/soap-envelope' xmlns:wsadis='http://schemas.xmlsoap.org/ws/2004/08/addressing' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery' xmlns:dn='http://www.onvif.org/ver10/network/wsdl' xmlns:tds='http://www.onvif.org/ver10/device/wsdl'><env:Header><wsadis:MessageID>urn:uuid:6b2f6f86-0b2c-4c19-9c5c-2f1e3f0a9d01</wsadis:MessageID><wsadis:RelatesTo>urn:uuid:0f0e9d1c-6a6b-4c5d-8e7f-9a0b1c2d3e4f</wsadis:RelatesTo><wsadis:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</wsadis:To><wsadis:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</wsadis:Action></env:Header><env:Body><d:ProbeMatches><d:ProbeMatch><wsadis:EndpointReference><wsadis:Address>{address}</wsadis:Address></wsadis:EndpointReference><d:Types>{types}</d:Types><d:Scopes>onvif://www.onvif.org/type/video_encoder onvif://www.onvif.org/Profile/Streaming onvif://www.onvif.org/name/IPC</d:Scopes><d:XAddrs>{xaddrs}</d:XAddrs><d:MetadataVersion>10</d:MetadataVersion></d:ProbeMatch></d:ProbeMatches></env:Body></env:Envelope>"
+        )
+    }
+    #[test]
+    fn discovery_probes_each_onvif_type_and_repeats() {
+        let ids = ["a1", "b2"];
+        for (id, types, prefix, namespace) in [
+            (
+                ids[0],
+                "dn:NetworkVideoTransmitter",
+                "dn",
+                "http://www.onvif.org/ver10/network/wsdl",
+            ),
+            (ids[1], "tds:Device", "tds", DEVICE_NS),
+        ] {
+            let xml = probe_message(id, types);
+            let doc = roxmltree::Document::parse(&xml).unwrap();
+            let node = doc
+                .descendants()
+                .find(|n| n.tag_name().name() == "Types")
+                .unwrap();
+            assert_eq!(node.text(), Some(types));
+            assert_eq!(node.lookup_namespace_uri(Some(prefix)), Some(namespace));
+            assert!(xml.contains(&format!("<a:MessageID>urn:uuid:{id}</a:MessageID>")));
+        }
+        let ms = |offsets: [Duration; 3]| offsets.map(|d| d.as_millis());
+        assert_eq!(ms(repeat_offsets(50)), [50, 150, 350]);
+        assert_eq!(ms(repeat_offsets(100)), [100, 300, 700]);
+        assert_eq!(ms(repeat_offsets(250)), [250, 750, 1250]);
+        // A device answering the tds:Device Probe lists only that type.
+        let devices = parse_discovery(
+            &probe_match(
+                "tds:Device",
+                "urn:uuid:4419c000-7b6a-11b2-8000-c0a8010a0b0c",
+                "http://192.168.1.64/onvif/device_service",
+            ),
+            "192.168.1.64:3702".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            devices[0].endpoint,
+            "http://192.168.1.64/onvif/device_service"
+        );
+    }
+    #[test]
+    fn discovery_picks_a_usable_address_and_merges_one_device() {
+        let source: SocketAddr = "192.168.0.90:3702".parse().unwrap();
+        for (xaddrs, expected) in [
+            (
+                "https://192.168.0.90/onvif/device_service http://192.168.0.90/onvif/device_service",
+                "http://192.168.0.90/onvif/device_service",
+            ),
+            (
+                "http://[fe80::c2a8:10ff:fe0a:b0c]/onvif/device_service http://10.1.1.90/onvif/device_service http://192.168.0.90/onvif/device_service",
+                "http://192.168.0.90/onvif/device_service",
+            ),
+            (
+                "http://[fe80::c2a8:10ff:fe0a:b0c]/onvif/device_service http://[2001:db8::90]/onvif/device_service",
+                "http://[2001:db8::90]/onvif/device_service",
+            ),
+            (
+                "http://0.0.0.0:8080/onvif/device_service",
+                "http://192.168.0.90:8080/onvif/device_service",
+            ),
+        ] {
+            let devices = parse_discovery(
+                &probe_match("dn:NetworkVideoTransmitter", "urn:uuid:x", xaddrs),
+                source,
+            )
+            .unwrap();
+            assert_eq!(devices[0].endpoint, expected, "{xaddrs}");
+            assert_eq!(devices[0].addresses.join(" "), xaddrs);
+        }
+        // One camera on two subnets answers on both with all its addresses;
+        // two cameras with cloned firmware share a UUID but no address.
+        let both = "http://192.168.0.90/onvif/device_service http://10.1.1.90/onvif/device_service";
+        let mut devices = Vec::new();
+        for (source, uuid, xaddrs) in [
+            ("192.168.0.90:3702", "urn:uuid:cam", both),
+            ("10.1.1.90:3702", "urn:uuid:cam", both),
+            (
+                "192.168.0.91:3702",
+                "urn:uuid:cam",
+                "http://192.168.0.91/onvif/device_service",
+            ),
+        ] {
+            for device in parse_discovery(
+                &probe_match("tds:Device", uuid, xaddrs),
+                source.parse().unwrap(),
+            )
+            .unwrap()
+            {
+                merge_device(&mut devices, device);
+            }
+        }
+        let endpoints = devices
+            .iter()
+            .map(|d| d.endpoint.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            endpoints,
+            [
+                "http://192.168.0.90/onvif/device_service",
+                "http://192.168.0.91/onvif/device_service"
+            ]
+        );
     }
     #[test]
     fn locators_and_profiles_fail_before_network_or_credential_side_effects() {
