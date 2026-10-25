@@ -1048,6 +1048,8 @@ impl AutoController {
             && camera.has("GainRaw")
             && let (Some(auto), Some(_)) = (c.gain_auto, c.profile)
         {
+            self.own("GainRaw");
+            self.remember(camera, "GainRaw");
             self.apply(camera, auto, json!("Continuous"), "camera auto gain");
         }
         if let Some(g) = c.gain {
@@ -2937,8 +2939,9 @@ mod tests {
         );
         assert_eq!([PROFILE, GAIN_AUTO].map(|a| fake.u32(a)), [0, 2]);
         assert_eq!(fake.f64(GAIN_UPPER), 24.0);
+        fake.set_f64(GAIN, 20.0);
         auto.release(&mut camera, true).unwrap();
-        assert_eq!(fake.u32(GAIN_AUTO), 0);
+        assert_eq!((fake.u32(GAIN_AUTO), fake.f64(GAIN)), (0, 13.3));
     }
 
     #[test]
