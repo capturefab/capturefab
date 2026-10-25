@@ -55,6 +55,7 @@ pub mod scanner;
 pub mod scheduling;
 pub mod secret_input;
 pub mod session;
+pub mod setup;
 pub mod shared_memory;
 pub mod simulation;
 pub mod storage;

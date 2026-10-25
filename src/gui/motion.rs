@@ -464,6 +464,7 @@ impl Workbench {
             || self.analytics.open
             || self.resources.open
             || self.updates.open
+            || self.setups.open
             || (self.settings_open && self.settings_window.is_none())
             || self.capture_to.manager_open
             || self.record_to.manager_open

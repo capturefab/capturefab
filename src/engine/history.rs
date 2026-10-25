@@ -4,6 +4,8 @@ use super::*;
 use crate::session::{CameraHistoryEntry, CameraHistoryStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod setup;
+
 const LIMIT: usize = 200;
 static LIFETIME: AtomicU64 = AtomicU64::new(1);
 
@@ -200,7 +202,23 @@ fn addressed<T>(
     result
 }
 
-fn addresses(camera: &mut Camera, feature: &str, all_banks: bool) -> Result<Vec<Address>> {
+/// A feature addressed by more banks than a checkpoint reads.
+#[derive(Debug)]
+struct TooManyBanks(String);
+impl std::fmt::Display for TooManyBanks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "too many selected banks for {} undo", self.0)
+    }
+}
+impl std::error::Error for TooManyBanks {}
+
+/// Every bank of `feature` to read: the selected one of each selector, and
+/// every choice of the selectors `banks` names.
+fn addresses(
+    camera: &mut Camera,
+    feature: &str,
+    banks: &dyn Fn(&str) -> bool,
+) -> Result<Vec<Address>> {
     let selectors = camera.selectors(feature);
     let mut addresses = vec![Address {
         feature: feature.into(),
@@ -211,17 +229,16 @@ fn addresses(camera: &mut Camera, feature: &str, all_banks: bool) -> Result<Vec<
             .get(&selector)
             .with_context(|| format!("read {selector} for undo"))?;
         let mut choices = vec![text(&current)];
-        if all_banks {
+        if banks(&selector) {
             for choice in camera.choices(&selector).unwrap_or_default() {
                 if !choices.contains(&choice) {
                     choices.push(choice);
                 }
             }
         }
-        ensure!(
-            addresses.len().saturating_mul(choices.len()) <= 256,
-            "too many selected banks for {feature} undo"
-        );
+        if addresses.len().saturating_mul(choices.len()) > 256 {
+            return Err(TooManyBanks(feature.into()).into());
+        }
         addresses = addresses
             .into_iter()
             .flat_map(|address| {
@@ -311,7 +328,7 @@ fn capture(
         let all_banks = all && matches!(name.as_str(), "Gain" | "GainAbs" | "BalanceRatio");
         let read = (|| -> Result<Vec<(Address, Value)>> {
             let mut read = Vec::new();
-            for address in addresses(camera, &name, all_banks)? {
+            for address in addresses(camera, &name, &|_| all_banks)? {
                 let value = addressed(camera, &address, |camera| camera.get(&name))
                     .with_context(|| format!("read {name} for undo"))?;
                 read.push((address, value));
@@ -336,7 +353,7 @@ fn capture(
 /// now, to the checkpoint taken before a SetMany: an earlier value of the
 /// same SetMany may have switched a selector to a bank it did not read.
 fn extend(camera: &mut Camera, before: &mut Configuration, feature: &str) -> Result<()> {
-    for address in addresses(camera, feature, false)? {
+    for address in addresses(camera, feature, &|_| false)? {
         if let std::collections::btree_map::Entry::Vacant(entry) = before.values.entry(address) {
             entry.insert(
                 camera
@@ -582,10 +599,16 @@ fn replay(
                 auto_policy(auto) == auto_policy(&expected.auto),
                 "auto mode changed outside this history; undo/redo would overwrite it"
             );
-            ensure!(
-                !busy || !fields.iter().any(|field| field.feature == "VideoMode"),
-                "cannot restore video mode while capture jobs or forwarding are active"
-            );
+            if let Some(locked) = fields
+                .iter()
+                .find(|field| crate::genicam::stream_locked(&field.feature))
+            {
+                ensure!(
+                    !busy,
+                    "cannot restore {} while recording, forwarding or scheduled captures are active",
+                    locked.feature
+                );
+            }
             for address in fields {
                 // Software/firmware auto values evolve between commands. The
                 // Exposure/gain/white balance evolve in firmware. For other
@@ -633,8 +656,21 @@ fn replay(
             // current unrelated settings and the recorded affected values.
             // This also repairs new coupled side effects caused by replay.
             let all_fields = wanted.values.keys().cloned().collect::<Vec<_>>();
-            if let Err(error) = restore(c, auto, &wanted, &all_fields, switch_auto) {
+            // A streaming camera locks its geometry: stop it once around the
+            // writes, as restoring a setup did, and start it again after.
+            let restart = c.is_streaming()
+                && fields
+                    .iter()
+                    .any(|field| crate::genicam::stream_locked(&field.feature));
+            if restart {
+                c.stop()?;
+            }
+            let restored = restore(c, auto, &wanted, &all_fields, switch_auto);
+            if let Err(error) = restored {
                 let rollback_result = restore(c, auto, &rollback, &all_fields, switch_auto);
+                if restart {
+                    let _ = c.start();
+                }
                 publish(h, camera, auto, true);
                 return match rollback_result {
                     Ok(()) => {
@@ -644,6 +680,9 @@ fn replay(
                         "undo/redo failed and rollback failed: {rollback_error:#}"
                     ))),
                 };
+            }
+            if restart {
+                c.start()?;
             }
         }
     }
@@ -693,6 +732,21 @@ pub(super) fn process(
         SessionCommand::ReplayCameraChange { token, undo } => {
             return replay(h, camera, auto, Some(token), *undo, busy);
         }
+        // Reading and comparing switch selectors only to read, and restore them.
+        SessionCommand::ReadSetup => return setup::read(h, camera_mut(camera)?, auto),
+        SessionCommand::SetupDiff {
+            setup: Some(document),
+            allow_other_model,
+            ..
+        } => {
+            let holders = setup::stream_holders(forwarder, jobs);
+            let c = camera_mut(camera)?;
+            let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
+            return Ok(setup::report(&plan, &c.info));
+        }
+        SessionCommand::SetupDiff { .. } | SessionCommand::ApplySetup { setup: None, .. } => {
+            anyhow::bail!("setup names are resolved by the session coordinator")
+        }
         _ => {}
     }
     let eligible =
@@ -702,6 +756,7 @@ pub(super) fn process(
                 | SessionCommand::SetMany { .. }
                 | SessionCommand::Auto { .. }
                 | SessionCommand::Manual { .. }
+                | SessionCommand::ApplySetup { .. }
         ) || !busy && !scanner && matches!(command, SessionCommand::Start | SessionCommand::Stop);
     if !eligible {
         let boundary = matches!(
@@ -750,7 +805,32 @@ pub(super) fn process(
     // Only a plain Set names the one value it changes. Otherwise every
     // configuration value is captured, so a failed SetMany restores all of
     // them, and the written features are added even when unlisted.
+    // A setup is compared again here, by the camera's owner, right before
+    // it is restored; only the values it changes are required readable.
+    let setup_plan = match &command {
+        SessionCommand::ApplySetup {
+            setup: Some(document),
+            allow_other_model,
+            strict,
+            confirmed_disruptive,
+            ..
+        } => {
+            let holders = setup::stream_holders(forwarder, jobs);
+            let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
+            plan.check(*strict)?;
+            plan.confirm(confirmed_disruptive.as_deref())?;
+            Some(plan)
+        }
+        _ => None,
+    };
     let (all, written) = match &command {
+        SessionCommand::ApplySetup { .. } => (
+            true,
+            setup_plan
+                .iter()
+                .flat_map(|plan| plan.changes().map(|row| row.address.feature.as_str()))
+                .collect(),
+        ),
         SessionCommand::Set { feature, .. } => (auto.is_some(), vec![feature.as_str()]),
         SessionCommand::SetMany { values } => (
             true,
@@ -759,16 +839,22 @@ pub(super) fn process(
         _ => (true, Vec::new()),
     };
     let set_many = matches!(command, SessionCommand::SetMany { .. });
+    let apply_setup = matches!(command, SessionCommand::ApplySetup { .. });
     let mut before = if stream {
         None
     } else {
         match capture(h, c, auto, all, &written) {
             Ok(before) => Some(before),
             // Its values must be restorable together, so it writes none.
-            Err(error) if set_many => {
-                return Err(error.context(
-                    "set_many changed nothing: the values it would replace could not be read",
-                ));
+            Err(error) if set_many || apply_setup => {
+                return Err(error.context(format!(
+                    "{} changed nothing: the values it would replace could not be read",
+                    if apply_setup {
+                        "apply_setup"
+                    } else {
+                        "set_many"
+                    }
+                )));
             }
             Err(error) => {
                 // A write-only control is still useful. Its previous state
@@ -810,14 +896,57 @@ pub(super) fn process(
         SessionCommand::Manual { .. } => "Switch to manual mode".into(),
         SessionCommand::Start => "Start stream".into(),
         SessionCommand::Stop => "Stop stream".into(),
+        SessionCommand::ApplySetup {
+            setup: Some(document),
+            ..
+        } => format!("Restore setup {}", document.name),
         _ => unreachable!(),
     };
+    let mut restart = false;
     let result = match (&command, before.as_mut()) {
         // Each write first records the bank it is about to change.
         (SessionCommand::SetMany { values }, Some(before)) => {
             super::set_many(h, camera, auto, values, |camera, feature| {
                 extend(camera, before, feature)
             })
+        }
+        // A streaming camera locks its geometry: stop it once, write, and
+        // start it again after success or the rollback below.
+        (
+            SessionCommand::ApplySetup {
+                setup: Some(document),
+                ..
+            },
+            Some(before),
+        ) => {
+            let plan = setup_plan.as_ref().expect("planned above");
+            restart = plan.restarts_stream;
+            let stopped = if restart {
+                camera_mut(camera).and_then(Camera::stop)
+            } else {
+                Ok(())
+            };
+            stopped
+                .and_then(|()| {
+                    setup::apply(
+                        h,
+                        camera,
+                        forwarder,
+                        auto,
+                        jobs,
+                        document,
+                        plan,
+                        |camera, address| setup::extend_at(camera, before, address),
+                    )
+                })
+                .and_then(|mut result| {
+                    if restart {
+                        camera_mut(camera)?.start()?;
+                        refresh(h, camera, false);
+                        result["restarted_stream"] = json!(true);
+                    }
+                    Ok(result)
+                })
         }
         _ => process_plain(
             h,
@@ -837,6 +966,9 @@ pub(super) fn process(
                 let fields = before.values.keys().cloned().collect::<Vec<_>>();
                 let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
                 let rollback = restore(camera_mut(camera)?, auto, before, &fields, switch_auto);
+                if restart {
+                    let _ = camera_mut(camera).and_then(Camera::start);
+                }
                 publish(h, camera, auto, true);
                 if let Err(rollback_error) = rollback {
                     return Err(
@@ -886,6 +1018,7 @@ pub(super) fn process(
             SessionCommand::Manual { .. } => ("manual", None),
             SessionCommand::Start => ("start", None),
             SessionCommand::Stop => ("stop", None),
+            SessionCommand::ApplySetup { .. } => ("apply_setup", None),
             _ => unreachable!(),
         };
         result["camera_change"] = h.history.lock().unwrap_or_else(|e| e.into_inner()).record(

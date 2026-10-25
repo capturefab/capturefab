@@ -1972,7 +1972,7 @@ fn home() -> Option<PathBuf> {
 }
 
 /// `path` with the home folder shown as `~`.
-fn home_short(path: &Path) -> String {
+pub(super) fn home_short(path: &Path) -> String {
     tilde(path, home().as_deref())
 }
 

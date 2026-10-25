@@ -647,6 +647,7 @@ impl Workbench {
             || self.scene_performance(word, late)
             || self.scene_resources(word, late)
             || self.scene_updates(word, late)
+            || self.scene_setups(word, late)
             || self.scene_sheets(word, late)
             || self.scene_sign_in(word, late)
     }

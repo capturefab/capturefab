@@ -563,6 +563,7 @@ impl Workbench {
                         pending.job,
                         Job::Set(_)
                             | Job::SetMany
+                            | Job::ApplySetup
                             | Job::AutoOn
                             | Job::AutoOff
                             | Job::Balance
@@ -691,6 +692,7 @@ impl Workbench {
                     pending.job,
                     Job::Set(_)
                         | Job::SetMany
+                        | Job::ApplySetup
                         | Job::NetworkScan
                         | Job::AutoOn
                         | Job::AutoOff

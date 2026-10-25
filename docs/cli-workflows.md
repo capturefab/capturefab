@@ -201,6 +201,25 @@ recording, removes the partial file and reports a storage error, so size
 36 MiB per minute plus 16 MiB of margin. Encoder support depends on the FFmpeg
 build and host; `ffmpeg --json` and `doctor --json` describe availability.
 
+## Restore a saved setup
+
+A step can restore a setup saved with `capturefab setup save NAME`. The session
+loads it by name when the step runs and applies it, without a preview, as one
+camera change:
+
+```json
+{"camera": "sim:0", "command": {"op": "apply_setup", "name": "bench"}}
+{"camera": "sim:0", "command": {"op": "apply_setup", "name": "bench", "strict": true}}
+```
+
+`strict` stops the workflow, changing nothing, when any saved value cannot be
+applied; `allow_other_model` applies the settings two different camera models
+share. Workflow steps skip the CLI's `--yes` confirmation for trigger and I/O
+changes, so review the setup with `capturefab setup diff NAME` first. The
+`setup` field takes a setup document instead of `name`, so a workflow can
+carry its own setup: the `result` object that `capturefab setup show NAME
+--json` prints, without the `{"version":1,"ok":true,...}` envelope around it.
+
 ## Catalog captures
 
 Workflow steps can open a camera dataset and add notes without an outer `camera` target:

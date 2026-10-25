@@ -68,6 +68,8 @@ BASELINE = (
     Scene("analytics", "analytics,noscopes", "Session acquisition analytics with live simulator statistics"),
     Scene("measurements", "analytics-measurements,noscopes", "Default prompt measurements form before collection starts"),
     Scene("close-error", "close-error,noscopes", "Save-settings failure alert with Retry and Cancel"),
+    Scene("setup-save", "setup-save,noscopes", "Save Setup with the settings a setup leaves out"),
+    Scene("setup-restore", "setup-restore,noscopes", "Restore Setup preview with a disruptive change and a stream restart"),
 )
 
 # The compact matrix covers each long sheet and inspector at the largest
@@ -95,6 +97,7 @@ COMPACT = (
     Scene("analytics", "analytics,noscopes,sheet-bottom", "Lower acquisition analytics and native camera statistics"),
     Scene("measurements", "analytics-invalid,noscopes", "Compact prompt measurement rows and invalid sample interval"),
     Scene("measurements-bottom", "analytics-measurements-populated,noscopes,sheet-bottom", "Populated measurement chart and wrapped result notes"),
+    Scene("setup-restore", "setup-restore,noscopes", "Compact Restore Setup preview with pinned actions"),
     Scene("quick-command-exported", "quick-command-exported,noscopes", "Compact exported-plan preview command with reviewed capture folder", 1),
 )
 
@@ -110,6 +113,9 @@ VARIANTS = (
     Scene("quick-command-data-consent", "quick-command-data-consent,noscopes", "Quick Command with independent image and data consent enabled", 2),
     Scene("quick-command-thinking", "quick-command-thinking,noscopes", "Pending assistant turn with Stop and read-only plan cards", 2),
     Scene("quick-command-error", "quick-command-error,noscopes", "Assistant provider failure and retry action", 2),
+    Scene("setups", "setups,noscopes", "Saved setups to restore, one from another camera model"),
+    Scene("setup-mismatch", "setup-mismatch,noscopes", "Restoring a setup from another model waits for confirmation"),
+    Scene("setup-blocked", "setup-blocked,noscopes", "Restoring a geometry change is refused while recording"),
 )
 
 EXTRA_STATES = (

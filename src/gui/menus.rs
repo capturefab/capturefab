@@ -20,6 +20,8 @@ pub(super) enum Command {
     Schedule,
     Quit,
     AgentSetup,
+    SaveSetup,
+    RestoreSetup,
     CheckUpdates,
     /// Open a page about Capturefab in the browser.
     Link(Link),
@@ -162,7 +164,8 @@ impl Workbench {
                     && self.sign_in.is_none()
                     && !self.assistant.quick.open
                     && !self.analytics.open
-                    && !self.resources.open,
+                    && !self.resources.open
+                    && !self.setups.open,
             ))
         };
         let edit = |title, command, key| {
@@ -358,6 +361,17 @@ impl Workbench {
                     )),
                     None,
                     Some(Item::command(
+                        "Save Setup…",
+                        Command::SaveSetup,
+                        camera && !busy,
+                    )),
+                    Some(Item::command(
+                        "Restore Setup…",
+                        Command::RestoreSetup,
+                        camera,
+                    )),
+                    None,
+                    Some(Item::command(
                         "Start All Streams",
                         Command::AllStreams(true),
                         multiple
@@ -538,6 +552,10 @@ impl Workbench {
                 self.handle_message(Message::AllRecord(recordings == 0))
             }
             Command::RefreshFeatures => self.handle_message(Message::RefreshFeatures),
+            Command::SaveSetup => self.setups_input(setups::Input::Open(Some(setups::Page::Save))),
+            Command::RestoreSetup => {
+                self.setups_input(setups::Input::Open(Some(setups::Page::List)))
+            }
             Command::Destinations => {
                 self.handle_message(Message::CapturePicker(destinations::Message::OpenManager))
             }

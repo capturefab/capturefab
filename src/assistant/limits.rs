@@ -222,6 +222,16 @@ impl ToolImpact {
                         .setting_changes
                         .saturating_add(values.len().try_into().unwrap_or(u32::MAX))
                 }
+                // No checked tool records a setup's change count yet, so a
+                // raw restore counts as the most a setup can change.
+                SessionCommand::ApplySetup { .. } => {
+                    impact.setting_changes = impact.setting_changes.saturating_add(
+                        crate::setup::MAX_SETUP_VALUES
+                            .try_into()
+                            .unwrap_or(u32::MAX),
+                    );
+                    impact.blocking_ms = impact.blocking_ms.saturating_add(240_000);
+                }
                 SessionCommand::Set { .. }
                 | SessionCommand::Auto { .. }
                 | SessionCommand::Manual { .. } => {

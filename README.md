@@ -187,6 +187,22 @@ Workflow steps use the session RPC commands, can target different cameras, and r
 
 Relative capture and recording paths resolve beside the workflow file; stdin workflows use the calling directory. Local `file:relative.mkv` and `sim:replay:relative-folder` sources use that same base, including workflow camera targets. Bare existing filenames are recognized as file sources. Ordinary CLI/RPC sources and outputs use the calling terminal's directory. Network/device locators and names inside `--destination` keep their meaning. Workflows require file outputs for captures. Workflow steps can also open a dataset (`dataset_open`), add notes and export; [plant-line.json](examples/workflows/plant-line.json) is an example. See the [workflow guide and runnable examples](docs/cli-workflows.md) for timelapse, feeder scans and bounded or timed recording.
 
+## Saved setups
+
+Save a tuned camera's settings by name, then preview and restore them later as one change that **Undo** reverts. In the desktop app use **Camera › Save Setup…** and **Camera › Restore Setup…**, or the links above the Features list.
+
+```sh
+capturefab --camera sim:0 setup save bench --note "Ring light at 60%"
+capturefab setup list
+capturefab --session bench setup diff bench          # what would change; changes nothing
+capturefab --session bench setup apply bench --dry-run --json
+capturefab --session bench setup apply bench         # one camera change; undo reverts it
+capturefab setup show bench --json > bench.json      # back up or share
+capturefab setup import bench.json --name bench-copy
+```
+
+A setup holds every writable configuration value at the selected bank and every bank of the gain, black level, white balance, trigger, line, user output, counter and timer selectors. It never holds network, transport, user-set, file or event settings, commands, values a firmware auto drives, stream state, capture settings, credentials or addresses, and it never touches the camera's own user sets. Restoring writes geometry and pixel format first, retries values an earlier write unlocks, verifies every value and restores everything if one does not take. Changing Width, Height or PixelFormat stops and restarts a running stream once; that is refused while recording, forwarding or scheduled captures run. `setup diff` previews a setup from another model with a warning, and `setup apply` refuses it unless `--allow-other-model` is given; changes to triggering or I/O lines need `--yes`, and `--strict` refuses a setup with any value this camera cannot take. Setups live in `setups/` in the state directory (`setup list` prints it). Workflows restore one with the step `{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}}`; workflow and RPC callers skip the `--yes` confirmation but not the model and recording checks. `setup import` and `--file` read the output of `setup show NAME --json` as is.
+
 ## Remote browser control
 
 Release executables from 0.2.2 on have the WebAssembly browser client built in. Run a headless server with `capturefab serve --name remote --listen 100.101.102.103:8787` and open the server URL from another laptop on the same tailnet to discover cameras, edit settings, preview frames and set up captures or schedules. Anyone who can reach the listener can control captures; tailnet policy and the host firewall provide the access boundary. Capture files and jobs stay on the server; the local CLI can control the same session. Each tab costs the server one JPEG encode per new frame, shared with every other tab, and nothing while the frame is unchanged or the tab is hidden. Source builds build the client with `./web-client/build.sh` and either the `embedded-web` feature or `--web-dir web-client/dist`; an older release needs that `--web-dir` too. See [remote setup and Tailscale HTTPS](docs/remote-control.md), and the [line computer guide](docs/line-computer.md) to run it as a service on a Raspberry Pi, Jetson or industrial PC: the Linux archive, camera permissions, a systemd unit, the storage budget and efficiency mode.

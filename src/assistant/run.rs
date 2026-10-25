@@ -600,6 +600,7 @@ fn human_operation(operation: &str) -> bool {
         operation,
         "set"
             | "set_many"
+            | "apply_setup"
             | "execute"
             | "auto"
             | "manual"

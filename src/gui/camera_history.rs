@@ -48,6 +48,7 @@ impl Change {
         let job = match entry.kind.as_str() {
             "set" => Job::Set(entry.feature.clone()?),
             "set_many" => Job::SetMany,
+            "apply_setup" => Job::ApplySetup,
             "auto" => Job::AutoOn,
             "manual" => Job::AutoOff,
             "balance" => Job::Balance,

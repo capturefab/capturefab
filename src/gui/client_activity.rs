@@ -663,6 +663,9 @@ fn matches_job(entry: &SessionActivity, job: &Job) -> bool {
         Job::DatasetExport => entry.operation == "dataset_export",
         Job::Set(feature) => entry.operation == "set" && entry.feature.as_ref() == Some(feature),
         Job::SetMany => entry.operation == "set_many",
+        Job::ReadSetup => entry.operation == "read_setup",
+        Job::SetupDiff => entry.operation == "setup_diff",
+        Job::ApplySetup => entry.operation == "apply_setup",
         Job::Execute(feature) => {
             entry.operation == "execute" && entry.feature.as_ref() == Some(feature)
         }

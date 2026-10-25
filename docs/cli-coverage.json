@@ -111,7 +111,16 @@
     "version": "reference.html#command-version",
     "schema": "reference.html#command-schema",
     "completions": "reference.html#command-completions",
-    "help": "reference.html#command-help"
+    "help": "reference.html#command-help",
+    "setup": "reference.html#command-setup",
+    "setups": "reference.html#command-setup",
+    "setup save": "reference.html#command-setup-save",
+    "setup list": "reference.html#command-setup-list",
+    "setup show": "reference.html#command-setup-show",
+    "setup diff": "reference.html#command-setup-diff",
+    "setup apply": "reference.html#command-setup-apply",
+    "setup delete": "reference.html#command-setup-delete",
+    "setup import": "reference.html#command-setup-import"
   },
   "tools": {
     "get_overview": "reference.html#tool-get-overview",
@@ -187,6 +196,9 @@
     "dataset_note_if": "reference.html#rpc-dataset-note-if",
     "dataset_query_if": "reference.html#rpc-dataset-query-if",
     "dataset_model_query_if": "reference.html#rpc-dataset-model-query-if",
-    "dataset_export_if": "reference.html#rpc-dataset-export-if"
+    "dataset_export_if": "reference.html#rpc-dataset-export-if",
+    "read_setup": "reference.html#rpc-read-setup",
+    "setup_diff": "reference.html#rpc-setup-diff",
+    "apply_setup": "reference.html#rpc-apply-setup"
   }
 }

@@ -6778,3 +6778,245 @@ fn login_add_saves_in_the_real_credential_store() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Save a simulator's settings, change them, preview and restore the setup
+/// in a session, undo it, and move it between files and workflows.
+#[test]
+fn saved_setups_restore_preview_and_undo_in_a_session() {
+    let root = temp_root("setups");
+    let dir = root.join("sessions");
+    let cwd = root.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &cwd, "setup-ci"),
+        dir: root.clone(),
+    };
+    let fail = |args: &[&str]| {
+        let out = cmd(&dir, args);
+        assert!(!out.status.success(), "{args:?}");
+        let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+        (out.status.code().unwrap(), error["error"].clone())
+    };
+    // Direct mode saves without a session.
+    let saved = json(
+        &dir,
+        &[
+            "--json", "--direct", "--camera", "sim:0", "setup", "save", "bench",
+        ],
+    );
+    assert_eq!(saved["setup"]["name"], "bench");
+    assert!(saved["setup"]["values"].as_u64().unwrap() >= 4);
+    let list = json(&dir, &["--json", "setup", "list"]);
+    assert_eq!(list["setups"][0]["name"], "bench");
+    assert_eq!(list["setups"][0]["model"], "Pattern camera");
+    assert!(list["dir"].as_str().unwrap().ends_with("setups"));
+    let (code, error) = fail(&[
+        "--json", "--direct", "--camera", "sim:0", "setup", "save", "BENCH",
+    ]);
+    assert_eq!((code, error["code"].as_str()), (2, Some("usage")));
+    let (code, error) = fail(&["--json", "setup", "save", "CON"]);
+    assert_eq!((code, error["code"].as_str()), (2, Some("usage")));
+    // A non-ASCII name is a usage error, never a crash.
+    for name in ["1€", "é", "€€"] {
+        let (code, error) = fail(&["--json", "setup", "show", name]);
+        assert_eq!((code, error["code"].as_str()), (2, Some("usage")), "{name}");
+    }
+    // The restore hint names the camera the save used, so it runs as is.
+    let human = cmd(
+        &dir,
+        &["--direct", "--camera", "sim:0", "setup", "save", "hint"],
+    );
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("Restore with: capturefab --camera sim:0 setup apply hint"),
+        "{text}"
+    );
+    let shown = String::from_utf8_lossy(&cmd(&dir, &["setup", "show", "hint"]).stdout).into_owned();
+    assert!(!shown.contains(".0\n"), "{shown}");
+    json(&dir, &["--json", "setup", "delete", "hint"]);
+    let (code, error) = fail(&["--json", "--session", "setup-ci", "setup", "apply", "nope"]);
+    assert_eq!((code, error["code"].as_str()), (3, Some("unavailable")));
+
+    let session = |args: &[&str]| {
+        json(
+            &dir,
+            &[
+                &["--json", "--session", "setup-ci", "--camera", "sim:0"],
+                args,
+            ]
+            .concat(),
+        )
+    };
+    session(&["connect", "sim:0"]);
+    session(&["set", "ExposureTime=5000"]);
+    let diff = session(&["setup", "diff", "bench"]);
+    assert_eq!(diff["changes"].as_array().unwrap().len(), 1, "{diff}");
+    assert_eq!(diff["changes"][0]["feature"], "ExposureTime");
+    assert_eq!(diff["match"], "same_camera");
+    let dry = session(&["setup", "apply", "bench", "--dry-run"]);
+    assert_eq!(dry["dry_run"], true);
+    let exposure = |session: &dyn Fn(&[&str]) -> Value| {
+        session(&["get", "ExposureTime"])["features"][0]["value"]
+            .as_f64()
+            .unwrap()
+    };
+    assert_eq!(exposure(&session), 5000.0);
+    let applied = session(&["setup", "apply", "bench"]);
+    assert_eq!(applied["applied"], 1, "{applied}");
+    assert_eq!(applied["camera_change"]["label"], "Restore setup bench");
+    assert_eq!(exposure(&session), 10000.0);
+    // Nothing differs: the human output says so plainly.
+    let human = |args: &[&str]| {
+        let out = cmd(
+            &dir,
+            &[&["--session", "setup-ci", "--camera", "sim:0"], args].concat(),
+        );
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let text = human(&["setup", "diff", "bench"]);
+    assert!(
+        text.starts_with("Nothing to change: all ")
+            && text.contains("settings in bench already match sim:0."),
+        "{text}"
+    );
+    let text = human(&["setup", "apply", "bench"]);
+    assert!(
+        text.starts_with("sim:0 already matches bench; nothing was changed."),
+        "{text}"
+    );
+    session(&["undo"]);
+    assert_eq!(exposure(&session), 5000.0);
+    let text = human(&["setup", "diff", "bench"]);
+    assert!(text.contains("ExposureTime: 5000 → 10000"), "{text}");
+    let matched = session(&["setup", "diff", "bench"]);
+    assert_eq!(
+        matched["matched"].as_array().unwrap().len() as u64,
+        matched["unchanged"].as_u64().unwrap()
+    );
+
+    // Another model is previewed with a warning; applying it needs
+    // --allow-other-model; the same model warns.
+    let out = cmd(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "setup-ci",
+            "--camera",
+            "sim:line:0",
+            "setup",
+            "diff",
+            "bench",
+        ],
+    );
+    assert!(out.status.success());
+    let preview: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(preview["result"]["match"], "other_model");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--allow-other-model"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (code, error) = fail(&[
+        "--json",
+        "--session",
+        "setup-ci",
+        "--camera",
+        "sim:line:0",
+        "setup",
+        "apply",
+        "bench",
+    ]);
+    assert_eq!(code, 2);
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("--allow-other-model"),
+        "{error}"
+    );
+    let other = json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "setup-ci",
+            "--camera",
+            "sim:line:0",
+            "setup",
+            "apply",
+            "bench",
+            "--allow-other-model",
+        ],
+    );
+    assert_eq!(other["match"], "other_model");
+    let same_model = json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "setup-ci",
+            "--camera",
+            "sim:1",
+            "setup",
+            "apply",
+            "bench",
+        ],
+    );
+    assert_eq!(same_model["match"], "same_model");
+    assert!(same_model["warnings"][0].as_str().unwrap().contains("SIM0"));
+
+    // `setup show NAME --json > FILE` round-trips as is: import and
+    // apply --file read the envelope it prints.
+    let shown = cmd(&dir, &["--json", "setup", "show", "bench"]);
+    assert!(shown.status.success());
+    let backup = cwd.join("backup.json");
+    std::fs::write(&backup, &shown.stdout).unwrap();
+    let backup = backup.to_str().unwrap();
+    let restored = json(
+        &dir,
+        &["--json", "setup", "import", backup, "--name", "backup"],
+    );
+    assert_eq!(restored["setup"]["name"], "backup");
+    session(&["set", "ExposureTime=7000"]);
+    let applied = session(&["setup", "apply", "--file", backup]);
+    assert_eq!(applied["applied"], 1, "{applied}");
+    assert_eq!(exposure(&session), 10000.0);
+    json(&dir, &["--json", "setup", "delete", "backup"]);
+    // The bare document works too.
+    let document: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let file = cwd.join("bench.json");
+    std::fs::write(&file, serde_json::to_vec(&document["result"]).unwrap()).unwrap();
+    let file = file.to_str().unwrap();
+    let imported = json(&dir, &["--json", "setup", "import", file, "--name", "copy"]);
+    assert_eq!(imported["setup"]["name"], "copy");
+    let (code, _) = fail(&["--json", "setup", "import", file, "--name", "copy"]);
+    assert_eq!(code, 2);
+    session(&["set", "ExposureTime=6000"]);
+    let workflow = cwd.join("restore.json");
+    std::fs::write(
+        &workflow,
+        r#"{"version":1,"steps":[{"camera":"sim:0","command":{"op":"apply_setup","name":"copy"}}]}"#,
+    )
+    .unwrap();
+    json(
+        &dir,
+        &[
+            "--json",
+            "--session",
+            "setup-ci",
+            "workflow",
+            "apply",
+            workflow.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(exposure(&session), 10000.0);
+    let removed = json(&dir, &["--json", "setup", "delete", "bench"]);
+    assert_eq!(removed["removed"], "bench");
+    let list = json(&dir, &["--json", "setup", "list"]);
+    assert_eq!(list["setups"].as_array().unwrap().len(), 1);
+    let schema = json(&dir, &["--json", "schema"]);
+    assert!(schema["setup"]["cli"].is_string());
+}

@@ -240,6 +240,10 @@ impl NodeMap {
         self.nodes.contains_key(name)
     }
 
+    /// The node's GenICam kind, such as `Float` or `IntReg`.
+    pub(crate) fn kind(&self, name: &str) -> Option<&str> {
+        self.nodes.get(name).map(|node| node.kind.as_str())
+    }
     pub(crate) fn unit(&self, name: &str) -> Option<&str> {
         self.nodes.get(name)?.prop("Unit")
     }
