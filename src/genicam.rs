@@ -1186,33 +1186,17 @@ impl NodeMap {
             }
             "Enumeration" => {
                 let symbol = value.as_str().context("expected enumeration symbol")?;
-                let entry = self
-                    .enum_entries(n)
-                    .into_iter()
-                    .find(|entry| {
-                        self.nodes.get(*entry).is_some_and(|en| {
-                            symbol == *entry
-                                || symbol
-                                    == en.prop("Symbolic").unwrap_or_else(|| {
-                                        entry.strip_prefix(&format!("{name}_")).unwrap_or(entry)
-                                    })
-                        })
-                    })
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "unknown {name} choice {symbol:?}; choose one of: {}",
-                            self.entry_names(io, name, n).join(", ")
-                        )
-                    })?;
+                let entry = self.find_entry(name, n, symbol).ok_or_else(|| {
+                    anyhow!(
+                        "unknown {name} choice {symbol:?}; choose one of: {}",
+                        self.entry_names(io, name, n).join(", ")
+                    )
+                })?;
                 let en = self.node(entry, depth + 1)?;
                 self.available(io, en, depth + 1).with_context(|| {
                     format!("{name} choice {symbol:?} is currently unavailable")
                 })?;
-                if let Some(link) = en.prop("pValue") {
-                    self.get_inner(io, link, depth + 1)?
-                } else {
-                    literal(en.prop("Value").context("enumeration entry has no value")?)?
-                }
+                self.entry_value(io, en, depth + 1)?
             }
             "IntConverter" => {
                 let from = i64::try_from(exact_integer(value)?)
@@ -1411,6 +1395,68 @@ impl NodeMap {
             true,
         )
     }
+    /// A pVariable's value. The `.Min`, `.Max` and `.Inc` name extensions read
+    /// the linked node's bounds, `.Entry.<Name>` the value of one of its
+    /// enumeration entries, and `.Value` or no extension its value.
+    fn variable(
+        &self,
+        io: &mut dyn RegisterIo,
+        var: &str,
+        link: &str,
+        depth: usize,
+    ) -> Result<Value> {
+        let Some((_, extension)) = var.split_once('.') else {
+            return self.numeric_value(io, link, depth);
+        };
+        let node = self.node(link, depth)?;
+        match extension {
+            "Value" => self.numeric_value(io, link, depth),
+            "Min" | "Max" | "Inc" => {
+                if let Some(value) = self.property_value(io, node, extension, depth)? {
+                    return Ok(value);
+                }
+                let bounds = self.range(io, node, depth);
+                match extension {
+                    "Min" => bounds.min,
+                    "Max" => bounds.max,
+                    _ => bounds.inc,
+                }
+                .map(|v| json!(v))
+                .with_context(|| format!("{link} has no {extension}"))
+            }
+            _ => {
+                let symbol = extension
+                    .strip_prefix("Entry.")
+                    .with_context(|| format!("unsupported formula variable {var}"))?;
+                ensure!(
+                    node.kind == "Enumeration",
+                    "formula variable {var} needs an enumeration"
+                );
+                let entry = self
+                    .find_entry(link, node, symbol)
+                    .with_context(|| format!("{link} has no entry {symbol}"))?;
+                self.entry_value(io, self.node(entry, depth + 1)?, depth + 1)
+            }
+        }
+    }
+    fn find_entry<'a>(&'a self, name: &str, n: &'a Node, symbol: &str) -> Option<&'a str> {
+        self.enum_entries(n).into_iter().find(|entry| {
+            self.nodes.get(*entry).is_some_and(|en| {
+                symbol == *entry
+                    || symbol
+                        == en.prop("Symbolic").unwrap_or_else(|| {
+                            entry.strip_prefix(&format!("{name}_")).unwrap_or(entry)
+                        })
+            })
+        })
+    }
+    fn entry_value(&self, io: &mut dyn RegisterIo, en: &Node, depth: usize) -> Result<Value> {
+        if let Some(link) = en.prop("pValue") {
+            self.get_inner(io, link, depth)
+        } else {
+            literal(en.prop("Value").context("enumeration entry has no value")?)
+        }
+    }
     /// Evaluate one of the node's formulas: as `f64` for SwissKnife and
     /// Converter nodes, as `i64` for IntSwissKnife and IntConverter nodes.
     fn formula<T: Operand>(
@@ -1431,7 +1477,7 @@ impl NodeMap {
                     .context("formula variable missing Name")?;
                 match p.tag.as_str() {
                     "pVariable" => {
-                        let value = self.numeric_value(io, &p.text, depth + 1)?;
+                        let value = self.variable(io, name, &p.text, depth + 1)?;
                         vars.insert(name.clone(), T::variable(&value)?);
                     }
                     "Constant" => {
@@ -2041,7 +2087,11 @@ fn evaluate_with<T: Operand>(
         }
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             i += 1;
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric()
+                    || bytes[i] == b'_'
+                    || bytes[i] == b'.' && bytes.get(i + 1).is_some_and(u8::is_ascii_alphabetic))
+            {
                 i += 1;
             }
             tokens.push(Token::Name(expression[start..i].into()));
@@ -2462,6 +2512,28 @@ mod tests {
         assert_eq!(m.get(&mut io, "Half").unwrap(), 6);
         let error = format!("{:#}", m.get(&mut io, "Nested").unwrap_err());
         assert!(error.contains("unknown formula variable A"), "{error}");
+    }
+    #[test]
+    fn formula_variable_extensions_read_bounds_and_entries() {
+        let m = map(concat!(
+            "<SwissKnife Name='MidRange'><pVariable Name='Gain.Max'>Gain</pVariable><pVariable Name='Gain.Min'>Gain</pVariable><Formula> (Gain.Max - Gain.Min) / 2 </Formula></SwissKnife>",
+            "<Float Name='Gain'><pValue>GainRaw</pValue><Min>1.5</Min><pMax>GainMax</pMax></Float>",
+            "<FloatReg Name='GainRaw'><Address>0</Address><Length>8</Length><AccessMode>RW</AccessMode></FloatReg>",
+            "<Integer Name='GainMax'><Value>24</Value></Integer>",
+            "<IntSwissKnife Name='Aligned'><pVariable Name='W.Value'>Width</pVariable><pVariable Name='W.Inc'>Width</pVariable><pVariable Name='MODE'>Mode</pVariable><pVariable Name='Mode.Entry.Fast'>Mode</pVariable>",
+            "<Formula>MODE = Mode.Entry.Fast ? W.Value / W.Inc * W.Inc : W.Value</Formula></IntSwissKnife>",
+            "<Integer Name='Width'><Value>1001</Value><Inc>16</Inc></Integer>",
+            "<Enumeration Name='Mode'><EnumEntry Name='Slow'><Value>3</Value></EnumEntry><EnumEntry Name='Fast'><pValue>FastCode</pValue></EnumEntry><Value>7</Value></Enumeration>",
+            "<Integer Name='FastCode'><Value>7</Value></Integer>",
+            "<IntSwissKnife Name='Bad'><pVariable Name='Mode.Entry.Missing'>Mode</pVariable><Formula>Mode.Entry.Missing</Formula></IntSwissKnife>",
+        ));
+        let mut io = Memory::default();
+        assert_eq!(m.get(&mut io, "MidRange").unwrap(), 11.25);
+        assert_eq!(m.get(&mut io, "Aligned").unwrap(), 992);
+        m.set(&mut io, "Mode", "Slow").unwrap();
+        assert_eq!(m.get(&mut io, "Aligned").unwrap(), 1001);
+        let error = format!("{:#}", m.get(&mut io, "Bad").unwrap_err());
+        assert!(error.contains("Mode has no entry Missing"), "{error}");
     }
     #[test]
     fn formula_fail_closed() {
