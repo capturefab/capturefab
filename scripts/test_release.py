@@ -378,6 +378,18 @@ class ReleaseTests(unittest.TestCase):
                                             cwd=temp, capture_output=True, text=True)
                     self.assertEqual(result.returncode, 23)
                     self.assertEqual(result.stdout.splitlines(), [str(temp.resolve()), '--help', 'argument with spaces', '*'])
+                    # Moved to ~/Applications: the launcher falls back to it.
+                    home = temp / 'home'
+                    (home / 'Applications').mkdir(parents=True)
+                    (extracted / stem / 'Capturefab.app').rename(home / 'Applications' / 'Capturefab.app')
+                    moved = subprocess.run([str(cli), 'moved'], cwd=temp, capture_output=True, text=True, env=dict(os.environ, HOME=str(home)))
+                    self.assertEqual((moved.returncode, moved.stdout.splitlines()[1:]), (23, ['moved']))
+                    # With no app anywhere it says so instead of running something else.
+                    shutil.rmtree(home / 'Applications')
+                    missing = subprocess.run([str(cli)], cwd=temp, capture_output=True, text=True, env=dict(os.environ, HOME=str(home)))
+                    if not Path('/Applications/Capturefab.app').exists():
+                        self.assertEqual(missing.returncode, 127)
+                        self.assertIn('Capturefab.app not found', missing.stderr)
                 self.assertIn(f'{stem}/media-licenses/NOTICE.txt', archive.namelist())
             source = plistlib.loads((release.ROOT / 'assets' / 'Info.plist').read_bytes())
             self.assertEqual(info['CFBundleIdentifier'], source['CFBundleIdentifier'])

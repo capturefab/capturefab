@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Generate web/downloads.html and the web/feed.xml Atom feed from web/releases.json."""
+"""Generate web/downloads.html, the web/feed.xml Atom feed and the web/install.sh and
+web/install.ps1 installers from web/releases.json."""
 import argparse
 import html
 import json
 import re
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from release import SEMVER, precedence
 
@@ -15,6 +16,15 @@ FEED_EPOCH = '2026-10-04T00:00:00Z'
 OS = {'macos': 'macOS', 'windows': 'Windows', 'linux': 'Linux'}
 ARCH = {'x86_64': 'x64', 'aarch64': 'ARM64', 'armv7': 'ARMv7'}
 NOTES = {'native-smoke-passed': 'Smoke-tested on its own platform', 'cross-compiled': 'Cross-compiled; not executed', 'unsigned': 'Unsigned', 'apple-developer-id': 'Apple Developer ID', 'apple-notarized': 'Apple notarized', 'authenticode': 'Authenticode'}
+# Mirrors the minimum operating system table in docs.html#installation; test-site.py compares them.
+MIN_OS = {('macos', 'aarch64'): 'macOS 11+', ('macos', 'x86_64'): 'macOS 10.15+', ('windows', 'x86_64'): 'Windows 10+',
+          ('windows', 'aarch64'): 'Windows 11 on ARM', ('linux', 'x86_64'): 'glibc 2.28+ (Debian 10, RHEL 8)',
+          ('linux', 'aarch64'): 'glibc 2.28+ (Debian 10, RHEL 8, Jetson Linux R34)'}
+FIRST_LAUNCH = 'docs.html#first-launch'
+SCRIPTS = Path(__file__).resolve().parent
+SAFE_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
+SAFE_URL = re.compile(r"https://[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+")
+SMARTSCREEN = '<p class="note">Not code-signed yet: Windows may show a SmartScreen prompt. Verify the SHA-256, then choose More info → Run anyway.</p>'
 PAGE = '''<!doctype html>
 <html lang="en">
 <head>
@@ -41,26 +51,35 @@ PAGE = '''<!doctype html>
     <header class="site-header">
       <a class="wordmark" href="index.html" aria-label="Capturefab home"><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</a>
       <nav aria-label="Main navigation"><a href="index.html">Product</a><a href="docs.html">Documentation</a><a href="downloads.html" aria-current="page">Downloads</a><a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a></nav>
-      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
+      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
     </header>
     <main id="main">
       <section class="page-head" aria-labelledby="downloads-title">
         <h1 id="downloads-title">All downloads</h1>
         <p class="lead">Every app download includes the desktop app and the CLI. Latest release: {status}.</p>
-        <p>Choose your operating system and processor. ARM64 is for Apple silicon and 64-bit ARM systems. x64 is for Intel or AMD systems.</p>
-        <p>Compare the file's SHA-256 with the value below. Extract the archive before you open the app.</p>
+        <p>Choose your operating system and processor. Apple silicon Macs and 64-bit ARM systems use ARM64. Intel and AMD computers use x64.</p>
+        <p>Check the file's SHA-256 with the command under each download, then extract the archive before you open the app. The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
         <p>Read the <a href="docs.html#installation">installation instructions</a> for system requirements, command-line setup and use without a display.</p>
       </section>
-{body}    </main>
+{install}{body}    </main>
     <footer class="site-footer">
       <div class="brand"><p><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</p><small>Capturefab uses the MIT license. The included FFmpeg uses GPLv3. Releases include its source. This site sets no cookies and loads nothing from third parties.</small></div>
-      <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
-      <div><h4>Documentation</h4><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
-      <div><h4>For agents</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
+      <div><h2 class="footer-heading">Project</h2><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
+      <div><h2 class="footer-heading">Documentation</h2><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
+      <div><h2 class="footer-heading">For agents</h2><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
     </footer>
   </div>
 </body>
 </html>
+'''
+INSTALL = '''      <section class="section install-cli" id="install-cli" aria-labelledby="install-cli-title">
+        <div class="section-heading"><h2 id="install-cli-title">Install from a terminal</h2><p>One command downloads the build for this computer, checks its SHA-256 and installs it for your account, without sudo or administrator rights.</p></div>
+        <div class="install-commands">
+          <div><h3>macOS and Linux</h3><div class="code-wrap"><pre><code>curl -fsSL {site}install.sh | sh</code></pre><button class="copy-button" type="button" aria-label="Copy the macOS and Linux install command">Copy</button></div><p>Installs <code>Capturefab.app</code> in <code>~/Applications</code> on macOS, or the release folder in <code>~/.local/share/capturefab</code> on Linux, and links <code>capturefab</code> in <code>~/.local/bin</code>.</p></div>
+          <div><h3>Windows PowerShell</h3><div class="code-wrap"><pre><code>irm {site}install.ps1 | iex</code></pre><button class="copy-button" type="button" aria-label="Copy the Windows install command">Copy</button></div><p>Installs in <code>%LOCALAPPDATA%\\Programs\\Capturefab</code>, adds it to your user <code>PATH</code> and adds a Start menu shortcut.</p></div>
+        </div>
+        <p class="install-read-first">To read a script before it runs: <code>curl -fsSLO {site}install.sh; less install.sh; sh install.sh</code>. Add <code>--dry-run</code> to print the file, URL and checksum it would use. Read <a href="install.sh">install.sh</a> or <a href="install.ps1">install.ps1</a>.</p>
+      </section>
 '''
 EMPTY = '''      <section class="section" aria-labelledby="none-title">
         <div class="section-heading"><h2 id="none-title">No published binaries yet.</h2><p>No release is available. The <a href="releases.json">release manifest</a> is empty. The <a href="feed.xml">Atom release feed</a> has no entries. Use the source build below.</p></div>
@@ -108,7 +127,7 @@ def size(value):
     return f'{value / 1048576:.1f} MiB'
 
 def row(asset):
-    cells = [OS.get(asset['os'], asset['os']), ARCH.get(asset['arch'], asset['arch'])]
+    cells = [OS.get(asset['os'], asset['os']), processor_label(asset['os'], asset['arch'])]
     head = ''.join(f'<td>{html.escape(c)}</td>' for c in cells)
     if not asset.get('available'):
         return f'<tr>{head}<td class="unavailable">Not published</td><td>—</td><td>{html.escape(asset.get("reason", ""))}</td></tr>'
@@ -130,6 +149,22 @@ def section(release, latest):
       </section>
 '''
 
+def processor_label(system, arch):
+    """Mac buyers know their chip by name, not by instruction set."""
+    if system == 'macos':
+        return {'aarch64': 'Apple silicon (M1 and later)', 'x86_64': 'Intel Mac'}.get(arch, ARCH.get(arch, arch))
+    return ARCH.get(arch, arch)
+
+def check_command(asset):
+    """A copyable command that checks a download in the Downloads folder and prints a verdict."""
+    name, digest = asset['name'], asset['sha256'].lower()
+    if not SAFE_NAME.fullmatch(name) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+        return None  # The table still lists the checksum.
+    if asset['os'] == 'windows':
+        return f"cd $HOME\\Downloads; if ((Get-FileHash .\\{name} -Algorithm SHA256).Hash -eq '{digest}') {{ 'OK: checksum matches' }} else {{ 'MISMATCH: do not open this file' }}"
+    tool = 'shasum -a 256' if asset['os'] == 'macos' else 'sha256sum'
+    return f'cd ~/Downloads && echo "{digest}  {name}" | {tool} -c'
+
 def download_cards(release):
     """Keep direct downloads readable on narrow screens without JavaScript."""
     cards = []
@@ -137,23 +172,36 @@ def download_cards(release):
         builds = [asset for asset in release['assets'] if asset['os'] == system and asset.get('available')]
         if not builds:
             continue
+        # Most current Macs are Apple silicon; most Windows and Linux PCs are x64.
+        builds.sort(key=lambda asset: asset['arch'] != ('aarch64' if system == 'macos' else 'x86_64'))
         items = []
         for asset in builds:
-            processor = ARCH.get(asset['arch'], asset['arch'])
-            detail = ' · '.join(filter(None, (size(asset['size']), NOTES.get(asset.get('platform_signature'), ''))))
-            items.append(f'<li><div><strong>{html.escape(processor)}</strong><small>{html.escape(detail)}</small></div><a class="button primary" href="{href(asset["url"])}" aria-label="Download Capturefab {html.escape(release["version"])} for {label} {html.escape(processor)}">Download {html.escape(processor)} <span aria-hidden="true">↓</span></a></li>')
-        cards.append(f'<article class="platform-download-card"><h3>{label}</h3><p>Desktop app and CLI</p><ul class="static-build-list">{"".join(items)}</ul></article>')
+            processor = processor_label(system, asset['arch'])
+            signature = NOTES.get(asset.get('platform_signature'), '')
+            facts = ' · '.join(html.escape(fact) for fact in filter(None, (MIN_OS.get((system, asset['arch'])), size(asset['size']))))
+            if asset.get('platform_signature') == 'unsigned':
+                signature = f'{html.escape(signature)} · <a href="{FIRST_LAUNCH}">first-launch steps</a>'
+            else:
+                signature = html.escape(signature)
+            detail = ' · '.join(filter(None, (facts, signature)))
+            command = check_command(asset)
+            check = command and f'<details class="build-check"><summary>Check the download</summary><div class="code-wrap"><pre><code>{html.escape(command)}</code></pre><button class="copy-button" type="button" aria-label="Copy the checksum command for {html.escape(asset["name"])}">Copy</button></div></details>'
+            items.append(f'<li data-os="{system}" data-arch="{html.escape(asset["arch"])}"><div><strong>{html.escape(processor)}</strong><small>{detail}</small></div><a class="button primary" href="{href(asset["url"])}" aria-label="Download Capturefab {html.escape(release["version"])} for {label} {html.escape(processor)}">Download for {html.escape(processor.split(" (")[0])} <span aria-hidden="true">↓</span></a>{check or ''}</li>')
+        # The prompt follows the manifest, so signed Windows builds lose the note.
+        note = SMARTSCREEN if system == 'windows' and any(asset.get('platform_signature') == 'unsigned' for asset in builds) else ''
+        cards.append(f'<article class="platform-download-card" data-os="{system}"><h3>{label}</h3><p>Desktop app and CLI</p><ul class="static-build-list">{"".join(items)}</ul>{note}</article>')
     return '<div class="platform-download-grid">' + ''.join(cards) + '</div>' if cards else ''
 
 def downloads(manifest, site):
     releases = [r for r in ordered(manifest) if r['version'] == manifest.get('latest')] or ordered(manifest)[:1]
     body = ''.join(section(r, True) for r in releases) or EMPTY
     status = f'v{html.escape(manifest["latest"])}' if manifest.get('latest') else 'none published yet'
-    return PAGE.format(site=html.escape(site), status=status, body=body)
+    install = INSTALL.format(site=html.escape(site)) if releases else ''
+    return PAGE.format(site=html.escape(site), status=status, body=body, install=install)
 
 def entry(release, site):
     page = f'{site}downloads.html#v{release["version"]}'
-    published = [f'{OS.get(a["os"], a["os"])} {ARCH.get(a["arch"], a["arch"])}' for a in release['assets'] if a.get('available')]
+    published = [f'{OS.get(a["os"], a["os"])} {processor_label(a["os"], a["arch"])}' for a in release['assets'] if a.get('available')]
     summary = f'Published downloads: {", ".join(published)}.' if published else 'No published downloads.'
     return f'''  <entry>
     <id>{href(release.get('url') or page)}</id>
@@ -170,10 +218,43 @@ def feed(manifest, site):
     updated = max((f'{r["date"]}T00:00:00Z' for r in releases), default=FEED_EPOCH)
     return FEED.format(site=html.escape(site), updated=html.escape(updated), entries=''.join(entry(r, site) for r in releases))
 
+def installer_assets(manifest, site, system):
+    """The latest release's published builds for one system, with values safe to quote in a script."""
+    releases = [r for r in ordered(manifest) if r['version'] == manifest.get('latest')] or ordered(manifest)[:1]
+    if not releases:
+        return '', []
+    release = releases[0]
+    if not SEMVER.fullmatch(release['version']):
+        raise ValueError(f'invalid release version: {release["version"]}')
+    builds = []
+    for asset in release['assets']:
+        if asset['os'] != system or not asset.get('available'):
+            continue
+        url = urljoin(site, asset['url'])
+        digest = asset['sha256'].lower()
+        if not SAFE_NAME.fullmatch(asset['name']) or not SAFE_URL.fullmatch(url) or "'" in url or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise ValueError(f'release asset cannot go in an install script: {asset["name"]}')
+        if asset['arch'] not in ARCH:
+            raise ValueError(f'unknown processor in release manifest: {asset["arch"]}')
+        builds.append((asset['arch'], asset['name'], url, digest))
+    return release['version'], builds
+
+def installers(manifest, site):
+    """install.sh covers macOS and Linux; install.ps1 covers Windows."""
+    version, unix = installer_assets(manifest, site, 'macos')
+    _, linux = installer_assets(manifest, site, 'linux')
+    sh = ''.join(f"    {system}/{arch}) name='{name}' url='{url}' expected='{digest}' ;;\n" for system, builds in (('macos', unix), ('linux', linux)) for arch, name, url, digest in builds)
+    _, windows = installer_assets(manifest, site, 'windows')
+    ps1 = ''.join(f"  '{arch}' = @{{ Name = '{name}'; Url = '{url}'; Sha256 = '{digest}' }}\n" for arch, name, url, digest in windows)
+    label = version or '(no published release)'
+    fill = lambda template, assets: (SCRIPTS / template).read_text(encoding='utf-8').replace('@VERSION_LABEL@', label).replace('@VERSION@', version).replace('@SITE@', site).replace('@ASSETS@', assets)
+    return fill('install-template.sh', sh), fill('install-template.ps1', ps1)
+
 def pages(web):
     site = re.search(r'<link rel="canonical" href="([^"]+)"', (web / 'index.html').read_text(encoding='utf-8'))[1].rstrip('/') + '/'
     manifest = json.loads((web / 'releases.json').read_text(encoding='utf-8'))
-    return {web / 'downloads.html': downloads(manifest, site), web / 'feed.xml': feed(manifest, site)}
+    sh, ps1 = installers(manifest, site)
+    return {web / 'downloads.html': downloads(manifest, site), web / 'feed.xml': feed(manifest, site), web / 'install.sh': sh, web / 'install.ps1': ps1}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

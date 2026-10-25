@@ -17,7 +17,7 @@ Your harness supplies model access; Capturefab provider credentials are unnecess
 The [built-in assistant](#use-the-ai-assistant) uses separate provider settings.
 Your harness controls whether its model receives camera images and tool results.
 
-1. Make the installed executable available to the harness through `PATH` or its full path.
+1. Make the installed executable available to the harness through `PATH` or its full path. If it is not installed, `curl -fsSL https://capturefab.com/install.sh | sh` (macOS, Linux) or `irm https://capturefab.com/install.ps1 | iex` (Windows) installs it for the current user; see [Install the correct release](#install-the-correct-release).
 2. Examine the build and read the compact tool catalog.
 3. Read only the schemas for the tools your task uses.
 
@@ -1171,6 +1171,23 @@ A different `CAPTUREFAB_SESSION_DIR` creates a separate budget.
 
 ## Install the correct release
 
+The install scripts choose, download, check and install the latest release for the current user:
+
+```sh
+curl -fsSL https://capturefab.com/install.sh | sh -s -- --dry-run   # print the selected file, URL and SHA-256 only
+curl -fsSL https://capturefab.com/install.sh | sh                   # macOS and Linux
+irm https://capturefab.com/install.ps1 | iex                        # Windows PowerShell
+```
+
+`install.sh` checks the SHA-256 written into the script before it extracts anything and exits nonzero on a mismatch.
+On macOS it installs `Capturefab.app` in `~/Applications`; on Linux it installs the release folder in `~/.local/share/capturefab/VERSION`.
+It links `capturefab` in `~/.local/bin` and prints a `PATH` hint when that folder is missing from `PATH`.
+`--prefix DIR` and `--bin-dir DIR` choose other folders.
+`install.ps1` installs in `%LOCALAPPDATA%\Programs\Capturefab` and adds it to the user `PATH`.
+Neither script uses sudo or administrator rights.
+Without a published release, both exit nonzero with a "no published release" message.
+Ask before installing software when the user has not requested it.
+
 Read [`releases.json`](releases.json), schema version 1, for available downloads.
 Each asset lists its operating system, architecture, filename, URL and SHA-256.
 Assets can also include signatures and an application bundle.
@@ -1193,16 +1210,20 @@ It can report `aarch64` for a 32-bit Raspberry Pi operating system.
 Elsewhere on Linux and macOS, `uname -m` reports `x86_64` for x64 and `aarch64` or `arm64` for ARM64.
 On Windows, use system information.
 Apple silicon uses ARM64.
-Verify the release checksum before running the binary.
+After a manual download, verify the release checksum before running the binary.
+Each command prints `OK` only for a match.
 
 ```sh
 # Linux
-sha256sum DOWNLOADED_FILE
+echo "EXPECTED_SHA256  DOWNLOADED_FILE" | sha256sum -c
 # macOS
-shasum -a 256 DOWNLOADED_FILE
+echo "EXPECTED_SHA256  DOWNLOADED_FILE" | shasum -a 256 -c
 # Windows PowerShell
-Get-FileHash DOWNLOADED_FILE -Algorithm SHA256
+if ((Get-FileHash .\DOWNLOADED_FILE -Algorithm SHA256).Hash -eq 'EXPECTED_SHA256') { 'OK: checksum matches' } else { 'MISMATCH: do not open this file' }
 ```
+
+On macOS, link the app's executable into a `PATH` folder after moving the app to Applications:
+`mkdir -p ~/.local/bin && ln -sf /Applications/Capturefab.app/Contents/MacOS/capturefab ~/.local/bin/capturefab`.
 
 Capturefab source is MIT-licensed. The bundled FFmpeg executable is GPLv3; its source, build configuration, and licensing notices are part of the release provenance. See the repository's source and FFmpeg build guide when producing a new platform binary.
 

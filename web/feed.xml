@@ -13,6 +13,6 @@
     <updated>2026-10-23T00:00:00Z</updated>
     <link rel="alternate" type="text/html" href="https://github.com/capturefab/capturefab/releases/tag/v0.4.0"/>
     <link rel="related" type="text/html" href="https://capturefab.com/downloads.html#v0.4.0"/>
-    <summary>Published downloads: Linux x64, Linux ARM64, macOS x64, macOS ARM64, Windows x64, Windows ARM64.</summary>
+    <summary>Published downloads: Linux x64, Linux ARM64, macOS Intel Mac, macOS Apple silicon (M1 and later), Windows x64, Windows ARM64.</summary>
   </entry>
 </feed>

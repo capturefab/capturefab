@@ -44,9 +44,49 @@ CROPS = {
     "history": ("destinations", (288, 218, 456, 255), "Undo and Redo controls in the destination manager; macOS keyboard shortcuts are shown."),
 }
 
+# Smaller copies of crops for pages that show them small, e.g. the landing hero.
+# Lossless: a Lanczos resize saved as optimized PNG, recorded beside its crop.
+DERIVED = {
+    "workspace-1100": ("workspace", (1100, 700)),
+}
+METHOD = ("Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface. "
+          "Derived files are Lanczos-resized copies of a named crop.")
+
 
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def app_version(binary):
+    """The version the capture binary reports, so captions can name it."""
+    try:
+        result = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=20, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip().removeprefix("capturefab ").strip() or None
+
+
+def derive(output, manifest):
+    """Write each derived image from its crop and record it in the manifest."""
+    manifest["derived"] = []
+    for name, (source, size) in DERIVED.items():
+        crop = output / f"{source}.png"
+        if not crop.exists():
+            continue
+        with Image.open(crop) as image:
+            scale = size[0] / image.width
+            if abs(size[1] / image.height - scale) > 0.001:
+                raise ValueError(f"{name}: {size} does not keep the aspect ratio of {crop.name}")
+            resized = image.resize(size, Image.Resampling.LANCZOS)
+            # Dropping an alpha channel that is fully opaque loses nothing.
+            if resized.mode == "RGBA" and resized.getchannel("A").getextrema() == (255, 255):
+                resized = resized.convert("RGB")
+            path = output / f"{name}.png"
+            resized.save(path, optimize=True)
+        manifest["derived"].append({"file": path.name, "derived_from": crop.name, "derived_from_sha256": sha256(crop),
+                                    "operation": f"resize {scale:g}x lanczos", "size": list(size),
+                                    "sha256": sha256(path)})
+        print(f"{path.name}: {size[0]} x {size[1]} from {crop.name}", flush=True)
 
 
 def main():
@@ -55,8 +95,16 @@ def main():
     parser.add_argument("--output", type=Path, default=ROOT / "web/images/docs")
     parser.add_argument("--only", choices=list(SCENES), help="Capture one scene while tuning crops")
     parser.add_argument("--crop-only", action="store_true", help="Reuse the saved renderer originals")
-    parser.add_argument("--source-note", default="Current development desktop build from the workspace source.")
+    parser.add_argument("--derive-only", action="store_true", help="Regenerate only the derived images from the saved crops")
+    parser.add_argument("--source-note", default="Desktop build from the workspace source.")
     args = parser.parse_args()
+    if args.derive_only:
+        output = args.output.resolve()
+        manifest = json.loads((output / "manifest.json").read_text())
+        manifest["method"] = METHOD
+        derive(output, manifest)
+        (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        return
     binary = args.binary.resolve()
     binary_digest = sha256(binary)
     output = args.output.resolve()
@@ -82,9 +130,10 @@ def main():
                     rendered.save(originals / f"{name}.png", optimize=True)
                 print(f"Captured {name}", flush=True)
     manifest = {
-        "method": "Actual iced desktop renderer screenshots; crop only, no generated or reconstructed interface.",
+        "method": METHOD,
         "source_note": args.source_note,
         "binary_sha256": binary_digest,
+        "app_version": app_version(binary),
         "logical_window": [1100, 700],
         "demo": "Built-in simulator cameras. Destination names, paths and scheduled jobs are built-in demonstration scenes. Capture, scheduling and Video scenes use the validated default storage policy as a read-only display fixture without accessing a storage ledger.",
         "images": [],
@@ -107,6 +156,7 @@ def main():
                                        "sha256": sha256(cropped_path),
                                        "scene": SCENES[source][1], "description": description})
             print(f"{name}.png: {crop.width} x {crop.height}", flush=True)
+    derive(output, manifest)
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 

@@ -6,16 +6,16 @@
   <meta name="color-scheme" content="light dark">
   <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
   <meta name="theme-color" content="#1e1e20" media="(prefers-color-scheme: dark)">
-  <meta name="description" content="Capture camera images and video on macOS, Windows and Linux. Use desktop controls, scripts or AI agents with supported cameras and network streams.">
-  <meta property="og:title" content="Capturefab — capture camera images and video">
-  <meta property="og:description" content="A free desktop app and CLI for supported cameras and network streams. Preview images, adjust settings, save files and export capture data.">
+  <meta name="description" content="Free, open-source camera workbench for manufacturing, process and vision engineers. Native GigE Vision and USB3 Vision with no vendor SDK, plus webcams, RTSP/ONVIF streams and hub cameras, on macOS, Windows and Linux.">
+  <meta property="og:title" content="Capturefab — camera capture for engineers">
+  <meta property="og:description" content="A free desktop app and CLI with native GigE Vision and USB3 Vision and no vendor SDK to install. Preview, adjust, capture and export cataloged images to Parquet or CSV.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://capturefab.com/">
   <meta property="og:image" content="https://capturefab.com/images/docs/workspace.png">
   <meta property="og:image:width" content="2200">
   <meta property="og:image:height" content="1400">
   <meta name="twitter:card" content="summary_large_image">
-  <title>Capturefab — capture camera images and video</title>
+  <title>Capturefab — camera capture for engineers</title>
   <link rel="stylesheet" href="style.css">
   <link rel="icon" href="favicon.ico" sizes="16x16 32x32 48x48">
   <link rel="icon" href="favicon-32.png" type="image/png" sizes="32x32">
@@ -33,29 +33,30 @@
     <header class="site-header">
       <a class="wordmark" href="index.html" aria-label="Capturefab home"><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</a>
       <nav aria-label="Main navigation"><a href="index.html" aria-current="page">Product</a><a href="docs.html">Documentation</a><a href="downloads.html">Downloads</a><a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a></nav>
-      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
+      <a class="search-trigger" href="docs.html#search" aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
     </header>
     <main id="main">
       <div class="hero product-hero">
         <section class="hero-copy" aria-labelledby="hero-title">
-          <p class="eyebrow"><span class="brand-dot" aria-hidden="true"></span> Free, open-source camera app</p>
-          <h1 id="hero-title">Capture camera images<br>and video.</h1>
-          <p class="lead">Connect supported cameras and network streams. Preview images, adjust settings and save files with desktop controls, scripts or AI agents.</p>
+          <p class="eyebrow"><span class="brand-dot" aria-hidden="true"></span> Free, open-source (MIT) camera workbench</p>
+          <h1 id="hero-title">Industrial and network camera capture.</h1>
+          <p class="lead">For manufacturing, process and vision engineers. GigE Vision and USB3 Vision are built in, plus webcams, RTSP/ONVIF streams and hub cameras. Captures are cataloged and export to Parquet or CSV, from the desktop app, scripts or AI agents.</p>
           <div class="actions"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↓</span></a><a class="button" href="#in-action">See it in action <span aria-hidden="true">→</span></a></div>
-          <p class="hero-note">Free and open source (MIT). macOS, Windows and Linux.<br>App and CLI in one download.</p>
-          <ul class="hero-facts"><li>Published downloads include FFmpeg. Supported connections use no vendor SDK.</li><li>The CLI returns JSON for scripts and coding agents.</li><li>Simulator cameras let you start without hardware.</li></ul>
+          <p class="oneclick-alt" data-oneclick-alt hidden></p>
+          <p class="hero-note">Free and open source (MIT). <a href="downloads.html">macOS, Windows and Linux</a>.<br>App and CLI in one download.</p>
+          <ul class="hero-facts"><li>No vendor SDK, Aravis, libusb or FFmpeg to install.</li><li>The CLI returns JSON for scripts and coding agents.</li><li>Simulator cameras let you start without hardware.</li></ul>
         </section>
-        <figure class="hero-shot"><a class="screenshot-link" href="images/docs/workspace.png" aria-label="Enlarge the Capturefab desktop screenshot"><img src="images/docs/workspace.png" alt="Capturefab desktop with a simulator camera preview, focus and exposure scopes and the camera's Features inspector" width="2200" height="1400" fetchpriority="high" decoding="async"></a><figcaption>Actual desktop interface from a development build with simulator cameras. Select the image to enlarge it.</figcaption></figure>
+        <figure class="hero-shot"><a class="screenshot-link" href="images/docs/workspace.png" aria-label="Enlarge the Capturefab desktop screenshot"><img src="images/docs/workspace-1100.png" srcset="images/docs/workspace-1100.png 1100w, images/docs/workspace.png 2200w" sizes="(max-width: 800px) calc(100vw - 40px), 45vw" alt="Capturefab desktop with a simulator camera preview, focus and exposure scopes and the camera's Features inspector" width="1100" height="700" fetchpriority="high" decoding="async"></a><figcaption>The real desktop app running built-in simulator cameras. Select the image to enlarge it.</figcaption></figure>
       </div>
       <section class="works-with" aria-label="Supported source types">
-        <div class="source-strip"><span>GigE Vision</span><span>USB3 Vision</span><span>Webcams</span><span>ONVIF / RTSP / SRT</span><span>Home Assistant / Frigate / UniFi Protect</span><span>Video files</span><span>Document scanners</span></div>
+        <ul class="source-strip"><li><a href="docs.html#discovery">GigE Vision</a></li><li><a href="docs.html#discovery">USB3 Vision</a></li><li><a href="docs.html#discovery">Webcams</a></li><li><a href="docs.html#discovery">ONVIF / RTSP / SRT</a></li><li><a href="docs.html#hubs">Home Assistant / Frigate / UniFi Protect</a></li><li><a href="docs.html#discovery">Video files</a></li><li><a href="docs.html#scanners">Document scanners</a></li></ul>
         <p class="compatibility-note">Camera support depends on the device, connection and operating system. <a href="docs.html#discovery">Read the connection guide →</a></p>
       </section>
       <section id="in-action" class="section" aria-labelledby="action-title">
         <div class="section-heading"><p class="eyebrow">See the controls and the result</p><h2 id="action-title">See Capturefab in action.</h2><p>These short clips show the desktop app with simulator cameras. Each clip plays in a loop without sound. Use the controls to pause it.</p></div>
         <div class="demo-grid">
-          <article class="demo-card"><div class="demo-heading"><span class="eyebrow">01 / Live images</span><h3>Compare camera previews</h3><p>Four cameras share the workspace. A CLI command changes exposure on one camera while the other previews continue.</p></div><figure><video class="product-video" controls muted loop playsinline preload="none" poster="media/live-preview.png" width="1100" height="700" aria-label="Live camera preview demonstration" aria-describedby="preview-caption"><source src="media/live-preview.mp4" type="video/mp4"><p><a href="media/live-preview.mp4">Download the live preview clip</a>.</p></video><figcaption id="preview-caption">8-second loop at the recorded speed. Four simulator cameras in a development build. <a href="docs.html#preview">Read about live previews →</a></figcaption></figure></article>
-          <article class="demo-card"><div class="demo-heading"><span class="eyebrow">02 / Capture</span><h3>Save an image</h3><p>A CLI command saves three frames, then one PNG image. The desktop app shows the saved result.</p></div><figure><video class="product-video" controls muted loop playsinline preload="none" poster="media/capture-workflow.png" width="1100" height="700" aria-label="Image capture demonstration" aria-describedby="capture-caption"><source src="media/capture-workflow.mp4" type="video/mp4"><p><a href="media/capture-workflow.mp4">Download the image capture clip</a>.</p></video><figcaption id="capture-caption">8-second loop at the recorded speed. One simulator camera in a development build. <a href="docs.html#capture">Read about image capture →</a></figcaption></figure></article>
+          <article class="demo-card"><div class="demo-heading"><span class="eyebrow">01 / Live settings</span><h3>Change a setting, watch the image respond</h3><p>A CLI command raises the simulator camera's exposure, then restores it. The live preview and the Exposure control update while the stream keeps running.</p></div><figure><video class="product-video" controls muted loop playsinline preload="none" poster="media/live-preview.png" width="1100" height="700" aria-label="Live camera preview demonstration" aria-describedby="preview-caption"><source src="media/live-preview.mp4" type="video/mp4"><p><a href="media/live-preview.mp4">Download the live preview clip</a>.</p></video><figcaption id="preview-caption">8-second loop at the recorded speed. One simulator camera. <a href="docs.html#preview">Read about live previews →</a></figcaption></figure></article>
+          <article class="demo-card"><div class="demo-heading"><span class="eyebrow">02 / Capture</span><h3>Save an image</h3><p>A CLI command saves three frames, then one PNG image. The desktop app shows the saved result.</p></div><figure><video class="product-video" controls muted loop playsinline preload="none" poster="media/capture-workflow.png" width="1100" height="700" aria-label="Image capture demonstration" aria-describedby="capture-caption"><source src="media/capture-workflow.mp4" type="video/mp4"><p><a href="media/capture-workflow.mp4">Download the image capture clip</a>.</p></video><figcaption id="capture-caption">8-second loop at the recorded speed. One simulator camera. <a href="docs.html#capture">Read about image capture →</a></figcaption></figure></article>
         </div>
         <div class="actions inline-cta"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↓</span></a><a href="#quickstart">Try the simulator first <span aria-hidden="true">→</span></a></div>
       </section>
@@ -66,7 +67,7 @@
           <article class="detail-card"><figure><a class="screenshot-link" href="images/docs/capture.png" aria-label="Enlarge the capture settings screenshot"><img src="images/docs/capture.png" alt="Capture inspector with manual capture controls first, followed by options, scheduling, storage and shell access" width="568" height="1400" loading="lazy" decoding="async"></a></figure><div><h3>Set the output</h3><p>Save one image or a sequence. Select the format, frame count and storage limits before capture.</p><a href="docs.html#capture">Capture settings →</a></div></article>
           <article class="detail-card"><figure><a class="screenshot-link" href="images/docs/scopes.png" aria-label="Enlarge the focus and exposure screenshot"><img src="images/docs/scopes.png" alt="Simulator image with a focus region, focus metric chart and exposure histogram" width="1316" height="804" loading="lazy" decoding="async"></a></figure><div><h3>Examine focus and exposure</h3><p>Use the focus metric and histogram to examine changes in the live image.</p><a href="docs.html#scopes">Preview and image scopes →</a></div></article>
         </div>
-        <p class="media-note">Screenshots show the actual development interface with simulator data. Features can differ from the published release.</p>
+        <p class="media-note">Real app captures with simulator data, recorded from Capturefab pre-release source. Details can differ slightly in your release.</p>
       </section>
       <section id="start" class="start-section" aria-labelledby="start-title">
         <div class="start-intro"><h2 id="start-title">Choose how to control the cameras.</h2><p>People, scripts and agents can share a camera session. The preview and Activity log let you review actions and take control.</p></div>
@@ -78,7 +79,9 @@
       </section>
       <section id="automation" class="section" aria-labelledby="automation-title">
         <div class="section-heading"><p class="eyebrow">Desktop and CLI in one session</p><h2 id="automation-title">See what your agent does.</h2><p>Pin a named session and camera. Give the agent a recognizable name. Activity shows its actions, saved files and errors.</p></div>
-        <div class="automation-grid"><div><div class="code-wrap"><pre><code># Open a named desktop session
+        <div class="automation-grid"><div><div class="code-wrap"><pre><code><span data-run-hint># Not installed? Use the one-line installer under Download, or ./capturefab (.\capturefab.exe on Windows) from the extracted folder.</span>
+
+# Open a named desktop session
 capturefab gui --name bench
 
 # Use another terminal for these commands
@@ -89,6 +92,16 @@ capturefab --session bench status --json</code></pre><button class="copy-button"
       </section>
       <section id="beyond" class="section" aria-labelledby="beyond-title">
         <div class="section-heading"><p class="eyebrow">Capture, store and analyze</p><h2 id="beyond-title">Keep files and capture data together.</h2><p>Save capture times and tags with each cataloged image. Use saved destinations to save files on your disk, removable drives or mounted network folders.</p></div>
+        <div class="automation-grid dataset-recipe"><div><h3 id="recipe-title">Build an image dataset in three commands</h3><p>Capture tagged images into a DuckDB catalog, query it with SQL and export the tables for pandas, Polars or a notebook.</p><div class="code-wrap"><pre><code><span data-run-hint># Not installed? Use the one-line installer under Download, or ./capturefab (.\capturefab.exe on Windows) from the extracted folder.</span>
+
+# Capture 3 tagged images, 500 ms apart, into a catalog
+capturefab --camera sim:0 capture -n 3 --interval 500ms --context part=A-100 --dataset parts.duckdb -o 'parts/{camera}-{seq}.png'
+
+# Query the catalog with SQL
+capturefab dataset query --file parts.duckdb "SELECT path, wall_ms, context FROM captures"
+
+# Export Parquet and CSV tables with manifest.json and README.md
+capturefab dataset export --file parts.duckdb -o export</code></pre><button class="copy-button" type="button" aria-label="Copy the dataset commands">Copy</button></div><div class="text-links"><a href="docs.html#datasets">Catalog and export datasets →</a><a href="docs.html#naming">Name files and tag captures →</a></div></div><figure class="file-tree-figure" aria-labelledby="tree-caption"><ul class="file-tree"><li class="dir">parts/<ul><li>Pattern-camera-SIM0-0001.png</li><li>Pattern-camera-SIM0-0002.png</li><li>Pattern-camera-SIM0-0003.png</li></ul></li><li>parts.duckdb <span>catalog</span></li><li class="dir">export/<ul><li>captures.parquet, captures.csv</li><li>events.parquet, events.csv</li><li>recordings.parquet, recordings.csv</li><li>manifest.json</li><li>README.md</li></ul></li></ul><figcaption id="tree-caption">The files these commands create. The export holds the catalog tables, with each image's path, time and tags. The images stay in <code>parts/</code>.</figcaption></figure></div>
         <div class="start-routes capability-routes">
           <article><h3>Datasets and exports</h3><p>Catalog images, recordings, timestamps and tags in DuckDB. Export Parquet or CSV tables with a manifest for analysis tools.</p><a href="docs.html#datasets">Catalog captures</a><a href="docs.html#plant-data">Export camera data</a></article>
           <article><h3>Schedules and video</h3><p>Schedule image captures, record video files or forward a live stream to an existing server.</p><a href="docs.html#scheduling">Schedule captures</a><a href="docs.html#recording">Record video</a><a href="docs.html#forwarding">Forward a stream</a></article>
@@ -98,14 +111,16 @@ capturefab --session bench status --json</code></pre><button class="copy-button"
       </section>
       <section id="quickstart" class="section" aria-labelledby="quickstart-title">
         <div class="section-heading"><p class="eyebrow">Try it without a camera</p><h2 id="quickstart-title">Capture your first simulator image.</h2><p>The built-in simulator supplies test images. Use it to learn the app or test a script.</p></div>
-        <div class="first-frame"><ol class="simple-steps"><li><span>1</span><div><h3>Open Capturefab</h3><p>Extract the desktop download. Open the app. Select <strong>Try a simulated camera</strong> on the welcome screen.</p></div></li><li><span>2</span><div><h3>Connect a Pattern camera</h3><p>Select a simulator camera. Start its stream. Select the preview to open its settings.</p></div></li><li><span>3</span><div><h3>Capture an image</h3><p>Open <strong>Capture</strong>. Set an output name and image format. Capture a frame.</p></div></li></ol><div class="terminal-card"><div class="terminal-heading"><span><span class="brand-dot" aria-hidden="true"></span> Capture from the terminal</span><span>CLI</span></div><div class="code-wrap"><pre><code># Find available cameras
-capturefab discover
+        <div class="first-frame"><ol class="simple-steps"><li><span>1</span><div><h3>Open Capturefab</h3><p>Extract the desktop download. Open the app. Select <strong>Try a simulated camera</strong> on the welcome screen.</p></div></li><li><span>2</span><div><h3>Connect a Pattern camera</h3><p>Select a simulator camera. Start its stream. Select the preview to open its settings.</p></div></li><li><span>3</span><div><h3>Capture an image</h3><p>Open <strong>Capture</strong>. Set an output name and image format. Capture a frame.</p></div></li></ol><div class="terminal-card"><div class="terminal-heading"><span><span class="brand-dot" aria-hidden="true"></span> Capture from the terminal</span><span>CLI</span></div><div class="code-wrap"><pre><code><span data-run-hint># Not installed? Use the one-line installer under Download, or ./capturefab (.\capturefab.exe on Windows) from the extracted folder.</span>
 
-# Save a simulator image
-capturefab --camera sim:0 capture -o first.png
+# Find cameras, including the built-in simulator
+capturefab discover --simulate
+
+# Save a simulator image; run it again for first-0002.png
+capturefab --camera sim:0 capture -o 'first-{seq}.png'
 
 # Read camera features
-capturefab --camera sim:0 features</code></pre><button class="copy-button" type="button" aria-label="Copy the simulator quickstart">Copy</button></div><p><a href="docs.html#getting-started">Read the quickstart →</a></p></div></div>
+capturefab --camera sim:0 features</code></pre><button class="copy-button" type="button" aria-label="Copy the simulator quickstart">Copy</button></div><p class="text-links"><a href="docs.html#getting-started">Read the quickstart →</a><a href="docs.html#installation">Install and add to PATH →</a></p></div></div>
       </section>
       <section id="download" class="section download-section" aria-labelledby="download-title">
         <div class="section-heading"><p class="eyebrow">Get Capturefab</p><h2 id="download-title">Download Capturefab.</h2><p>Free. No account. One download includes the app and the CLI.</p></div>
@@ -122,8 +137,14 @@ capturefab --camera sim:0 features</code></pre><button class="copy-button" type=
             </div>
             <p class="install-hint" id="install-hint" hidden></p>
             <details id="verify-box" class="verify-box" hidden>
-              <summary>Verify the download</summary><p>Compare this command's result with the SHA-256 checksum.</p><pre><code id="verify-command"></code></pre>
+              <summary>Verify the download</summary><p>Run this in a terminal. It prints <code>OK</code> on macOS and Linux, or <code>OK: checksum matches</code> on Windows. If your browser saved the file in another folder or renamed it, change the folder or name. If Safari unzipped the download, compare the archive from a new download with that setting off.</p><div class="code-wrap"><pre><code id="verify-command"></code></pre><button class="copy-button" type="button" aria-label="Copy the checksum command">Copy</button></div>
               <p class="checksum" id="checksum-text"></p><div class="verify-links" id="verify-links"></div>
+            </details>
+            <details class="install-cli-box">
+              <summary>Install from a terminal</summary><p>One command picks the build for this computer, checks its SHA-256 and installs it for your account, without sudo or administrator rights.</p>
+              <div class="code-wrap"><pre><code>curl -fsSL https://capturefab.com/install.sh | sh</code></pre><button class="copy-button" type="button" aria-label="Copy the macOS and Linux install command">Copy</button></div>
+              <div class="code-wrap"><pre><code>irm https://capturefab.com/install.ps1 | iex</code></pre><button class="copy-button" type="button" aria-label="Copy the Windows PowerShell install command">Copy</button></div>
+              <p>The first line is for macOS and Linux, the second for Windows PowerShell. To read the script first: <code>curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh</code>. Read <a href="install.sh">install.sh</a> or <a href="install.ps1">install.ps1</a>.</p>
             </details>
             <div class="download-help"><a href="downloads.html">All downloads and checksums →</a><a href="docs.html#installation">Installation instructions →</a></div>
             <noscript><p class="notice">Open <a href="downloads.html">all downloads</a> to select a file. JavaScript is not necessary.</p></noscript>
@@ -133,17 +154,19 @@ capturefab --camera sim:0 features</code></pre><button class="copy-button" type=
       <section id="faq" class="section" aria-labelledby="faq-title">
         <div class="section-heading"><h2 id="faq-title">Before you download</h2></div>
         <div class="faq">
-          <details><summary>What changed in version 0.4.0?</summary><p>Built-in S3, FTP and SFTP uploads and industrial signal sources were removed. Local folders, mounted network drives and stream forwarding remain available. Legacy transfers do not resume. Read the <a href="docs.html#upgrade-040">upgrade notes</a> before replacing an existing installation.</p></details>
           <details><summary>Which cameras can I connect?</summary><p>Capturefab supports GigE Vision, USB3 Vision, host cameras, network streams and other sources. Support depends on the device and operating system. This is an initial implementation with less feature coverage than some vendor SDKs. Read the <a href="docs.html#discovery">connection guide</a> and <a href="https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md">camera compatibility notes</a> for device requirements.</p></details>
-          <details><summary>Do I need a vendor SDK or FFmpeg?</summary><p>No. Published downloads include FFmpeg for host cameras, streams and video encoding. You must supply the operating system's graphics, USB and camera drivers. USB3 Vision cameras on Windows must have WinUSB. Read the <a href="docs.html#installation">installation instructions</a>.</p></details>
+          <details><summary>Do I need a vendor SDK or FFmpeg?</summary><p>No. Published downloads include FFmpeg for host cameras, streams and video encoding. You must supply the operating system's graphics, USB and camera drivers. USB3 Vision cameras on Windows must use WinUSB; the <a href="docs.html#first-launch">first-launch steps</a> say how to set it and undo it. Read the <a href="docs.html#installation">installation instructions</a>.</p></details>
+          <details><summary>Windows says the app is unrecognized. Is that expected?</summary><p>If a Windows download is listed as Unsigned, Microsoft Defender SmartScreen may warn the first time you open <code>capturefab.exe</code>. Check the SHA-256 checksum or the GitHub attestation first, then choose <strong>More info</strong> → <strong>Run anyway</strong>. The <a href="downloads.html">download list</a> shows each file's signature.</p></details>
+          <details><summary>How do I check that my computer is ready?</summary><p>Run <code>capturefab doctor</code> from the extracted folder. It lists checks for the GPU, settings storage and capture efficiency. <code>capturefab doctor --json</code> adds compiled features and network interfaces. Read the <a href="docs.html#troubleshooting">troubleshooting guide</a> for what each check means.</p></details>
           <details><summary>Can I use Capturefab for commercial work?</summary><p>Yes. Capturefab uses the MIT license. The separate FFmpeg executable uses GPLv3. Each release includes the corresponding source and license notices. Read the <a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">licensing details</a> before redistribution.</p></details>
           <details><summary>Does Capturefab send my images to a cloud service?</summary><p>Capture saves images to files. Stream forwarding sends video to the receiver you configure. The assistant sends prompts and session details to the selected provider. Apple Intelligence runs locally and accepts text only. Other providers share images and dataset rows only with separate permission.</p><p>Prompt-driven video analytics sends sampled images when you start collection. External agents control their own data sharing. Read about <a href="docs.html#assistant">the assistant</a>, <a href="docs.html#destinations">destinations</a> and <a href="https://github.com/capturefab/capturefab/blob/main/docs/video-analytics.md">video analytics</a>.</p></details>
           <details><summary>Can a script control an open desktop session?</summary><p>Yes. Camera commands automatically use the only desktop or headless session that is open. Use <code>capturefab sessions</code> to list sessions. Use <code>--session NAME</code> to select one when several sessions are open. Read about <a href="docs.html#sessions">sessions and automation</a>.</p></details>
-          <details><summary>What happens at the storage limit?</summary><p>Capturefab stops capture or recording. It returns exit code 6 and a message that identifies the limit. Capturefab disables automatic deletion by default. <code>--delete-oldest</code> permits deletion of unchanged Capturefab files.</p></details>
-          <details><summary>How do I verify a download?</summary><p>The download selector shows a SHA-256 command and the correct checksum. Run the command for the downloaded file. Compare its result with the correct checksum. The <a href="downloads.html">full download list</a> also includes checksums. You can verify GitHub build provenance with <code>gh attestation verify FILE --repo capturefab/capturefab</code>.</p></details>
+          <details><summary>Where are captures saved, and what happens at the storage limit?</summary><p>The desktop app saves to a <code>Capturefab</code> folder in your home folder by default. CLI output names are relative to the terminal's current folder. Add a <a href="docs.html#destinations">saved destination</a> to use another folder or drive. Capturefab never overwrites an existing file.</p><p>At the storage limit, Capturefab stops capture or recording. It returns exit code 6 and a message that identifies the limit. Capturefab disables automatic deletion by default. <code>--delete-oldest</code> permits deletion of unchanged Capturefab files.</p></details>
+          <details><summary>How do I verify a download?</summary><p>The download selector shows a command with the file name and its SHA-256 filled in. Run it in your Downloads folder: it prints OK when the file matches. The <a href="downloads.html">full download list</a> has the same command under each build, and the install script checks the checksum before it installs anything. You can verify GitHub build provenance with <code>gh attestation verify FILE --repo capturefab/capturefab</code>.</p></details>
+          <details><summary>Upgrading from 0.3 or earlier?</summary><p>Version 0.4.0 removed built-in S3, FTP and SFTP uploads and signal sources. Read the <a href="docs.html#upgrade-040">upgrade notes</a> before replacing an existing installation.</p></details>
         </div>
       </section>
-      <section class="download-banner section" aria-labelledby="ready-title"><div><p class="eyebrow">Start with the simulator</p><h2 id="ready-title">Capture your first frame.</h2><p>Download the app. Try a simulator camera. Then connect your own source.</p></div><div class="actions"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↑</span></a><a href="docs.html#getting-started">Read the quickstart →</a></div></section>
+      <section class="download-banner section" aria-labelledby="ready-title"><div><p class="eyebrow">Start with the simulator</p><h2 id="ready-title">Capture your first frame.</h2><p>Download the app. Try a simulator camera. Then connect your own source.</p></div><div class="actions"><a class="button primary" href="#download" data-oneclick>Download Capturefab <span aria-hidden="true">↑</span></a><a href="docs.html#getting-started">Read the quickstart →</a><p class="oneclick-alt" data-oneclick-alt hidden></p></div></section>
       <details class="source-build-details"><summary>Build Capturefab from source</summary><div class="source-build"><div><h3>Build requirements</h3><p>Use a stable Rust toolchain, a C compiler and CMake. For x86 builds, NASM is also necessary for libjpeg-turbo. FFmpeg is necessary for webcams, streams and recording. Read the <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> for configuration.</p></div><div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
 cd capturefab
 # Desktop app and CLI
@@ -151,12 +174,17 @@ cargo build --release
 # Headless CLI
 cargo build --release --no-default-features --features usb,jpeg
 target/release/capturefab --camera sim:0 capture -o first.png</code></pre><button class="copy-button" type="button" aria-label="Copy the build commands">Copy</button></div></div></details>
+      <div id="next-steps" class="next-steps" role="status" hidden>
+        <div class="next-steps-head"><p id="next-steps-title" class="next-steps-title">Your download is starting</p><button type="button" class="next-steps-close" id="next-steps-close" aria-label="Dismiss the next steps">×</button></div>
+        <ol id="next-steps-list" class="next-steps-list"></ol>
+        <p class="next-steps-links"><a href="#quickstart">Then try the simulator →</a><a href="#verify-box" id="next-steps-verify">Verify the download</a><span>Download didn't start? <a id="direct-download">Use the direct link</a> · <a href="downloads.html">All downloads</a></span></p>
+      </div>
     </main>
     <footer class="site-footer">
       <div class="brand"><p><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</p><small>Capturefab uses the MIT license. The included FFmpeg uses GPLv3. Releases include its source. This site sets no cookies and loads nothing from third parties.</small></div>
-      <div><h4>Project</h4><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
-      <div><h4>Documentation</h4><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#plant-data">Plant data for analysis</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
-      <div><h4>For agents</h4><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
+      <div><h2 class="footer-heading">Project</h2><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
+      <div><h2 class="footer-heading">Documentation</h2><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#plant-data">Plant data for analysis</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
+      <div><h2 class="footer-heading">For agents</h2><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
     </footer>
   </div>
 </body>

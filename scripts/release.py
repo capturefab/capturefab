@@ -475,17 +475,21 @@ def package(args, binary):
             (app / 'MacOS').mkdir(parents=True)
             (app / 'Resources').mkdir()
             # Store the signed Mach-O once. A tiny launcher keeps ./capturefab
-            # available for CLI use while Finder opens the same app executable.
+            # available for CLI use while Finder opens the same app executable,
+            # and still works after the app is moved to Applications.
             executable.rename(app / 'MacOS' / 'capturefab')
             executable.write_text(
                 '#!/bin/sh\n'
-                'directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\n'
-                'exec "$directory/Capturefab.app/Contents/MacOS/capturefab" "$@"\n',
+                'd=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 1\n'
+                'for a in "$d" "$HOME/Applications" /Applications; do\n'
+                '  b="$a/Capturefab.app/Contents/MacOS/capturefab"; [ -x "$b" ] && exec "$b" "$@"\n'
+                'done\n'
+                'echo "capturefab: Capturefab.app not found beside this launcher or in Applications" >&2; exit 127\n',
                 encoding='utf-8',
             )
             executable.chmod(0o755)
             with (stage / 'README.txt').open('a', encoding='utf-8') as readme:
-                readme.write('macOS CLI: ./capturefab --help launches the executable inside Capturefab.app.\nKeep the launcher beside the app, or run /Applications/Capturefab.app/Contents/MacOS/capturefab directly after installing.\n')
+                readme.write('macOS: move Capturefab.app to Applications. ./capturefab --help runs the app beside it or in Applications.\nTo use capturefab anywhere: mkdir -p ~/.local/bin && ln -sf /Applications/Capturefab.app/Contents/MacOS/capturefab ~/.local/bin/capturefab\n')
             shutil.copy2(ROOT / 'assets/icons/capturefab.icns', app / 'Resources/capturefab.icns')
             info = plistlib.loads((ROOT / 'assets' / 'Info.plist').read_bytes())
             short = '.'.join(SEMVER.fullmatch(args.version).groups()[:3])

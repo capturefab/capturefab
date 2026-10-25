@@ -35,5 +35,9 @@ if (fs.existsSync(indexPath)) {
     assert.ok(searchDocuments(actual, query).length, `Published documentation must answer ${JSON.stringify(query)}`);
   }
   assert.equal(searchDocuments(actual, 'scanners')[0].document.id, 'scanners');
+  // First-launch prompts are found by the words a dialog shows.
+  for (const query of ['smartscreen', 'firewall', 'winusb', 'local network', 'install script']) {
+    assert.equal(searchDocuments(actual, query)[0].document.id, 'installation', `${query} must find the installation guide first`);
+  }
 }
 console.log('Documentation search ranking, command aliases, multiword matching and snippets passed.');

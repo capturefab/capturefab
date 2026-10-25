@@ -14,16 +14,28 @@ dpkg --print-architecture
 
 `arm64` takes the `linux-aarch64` archive and `amd64` the `linux-x86_64` one. `armhf` is a 32-bit system, for which there is no build: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS, so reinstall with that. Do not go by `uname -m`, which prints `aarch64` on 32-bit Raspberry Pi OS too. Releases need glibc 2.28 or newer: Debian 10, Ubuntu 18.10, Jetson Linux R34 and later.
 
-Take the Linux archive for your board. It is the same executable as the desktop app. With no `DISPLAY` or `WAYLAND_DISPLAY` it never opens a window, so you can run `capturefab serve` over SSH or as a service without a screen. From 0.2.2 on it includes the browser client for `serve --listen`; an older archive needs a [separately built client](remote-control.md#get-the-server-and-browser-client) passed with `--web-dir`. Download it and `SHA256SUMS` from [GitHub Releases](https://github.com/capturefab/capturefab/releases), then check and install it:
+Take the Linux archive for your board. It is the same executable as the desktop app. With no `DISPLAY` or `WAYLAND_DISPLAY` it never opens a window, so you can run `capturefab serve` over SSH or as a service without a screen. From 0.2.2 on it includes the browser client for `serve --listen`; an older archive needs a [separately built client](remote-control.md#get-the-server-and-browser-client) passed with `--web-dir`.
+
+The install script does the choosing and checking for you. It reads `dpkg --print-architecture`, refuses `armhf`, downloads the matching archive from GitHub Releases, checks its SHA-256 before extracting, installs it in `~/.local/share/capturefab/VERSION` and links `~/.local/bin/capturefab`. It does not use `sudo`:
+
+```sh
+curl -fsSL https://capturefab.com/install.sh | sh -s -- --dry-run   # show the file and checksum it would use
+curl -fsSL https://capturefab.com/install.sh | sh
+capturefab doctor
+```
+
+The default `~/.profile` on Debian-based systems adds `~/.local/bin` to `PATH` at your next login once the folder exists; the script prints the line to add when it is missing. To read the script first: `curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh`.
+
+To install by hand instead, download the archive and `SHA256SUMS` from [GitHub Releases](https://github.com/capturefab/capturefab/releases), then check and install it (replace `VERSION` with the release number):
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS
 tar -xzf capturefab-VERSION-linux-aarch64.tar.gz
-sudo install -m 755 capturefab-VERSION-linux-aarch64/capturefab /usr/local/bin/capturefab
+install -Dm755 capturefab-VERSION-linux-aarch64/capturefab ~/.local/bin/capturefab
 capturefab doctor
 ```
 
-Keep the extracted folder's license files with the executable if you copy it to other machines. `capturefab doctor` checks the computer and prints a copyable fix under each warning; the next sections explain the ones a line computer usually needs. Run it again after each step.
+The service below runs `/usr/local/bin/capturefab`. Give it a system path with `sudo ln -sf ~/.local/bin/capturefab /usr/local/bin/capturefab` after either install. The link follows the script's `~/.local/bin` link, so rerunning the script upgrades the service too after `sudo systemctl restart capturefab-line1`. Keep the extracted folder's license files with the executable if you copy it to other machines. `capturefab doctor` checks the computer and prints a copyable fix under each warning; the next sections explain the ones a line computer usually needs. Run it again after each step.
 
 ## 2. Give the service account the cameras
 
