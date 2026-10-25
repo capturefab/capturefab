@@ -282,6 +282,13 @@
       ],
       "url": "desktop.html#menus"
     },
+    "menus.check_updates": {
+      "source": "src/gui/menus.rs",
+      "terms": [
+        "Check for Updates\u2026"
+      ],
+      "url": "desktop.html#menus"
+    },
     "menus.all_streams": {
       "source": "src/gui/menus.rs",
       "terms": [
@@ -339,6 +346,14 @@
         "Start the live view when a camera connects"
       ],
       "url": "desktop.html#settings"
+    },
+    "settings.updates": {
+      "source": "src/gui/updates.rs",
+      "terms": [
+        "Check for new versions automatically",
+        "Skip This Version"
+      ],
+      "url": "desktop.html#settings-updates"
     },
     "settings.credential_save": {
       "source": "src/gui/settings.rs",

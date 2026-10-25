@@ -103,6 +103,7 @@
     "workflow validate": "reference.html#command-workflow-validate",
     "workflow apply": "reference.html#command-workflow-apply",
     "doctor": "reference.html#command-doctor",
+    "version": "reference.html#command-version",
     "schema": "reference.html#command-schema",
     "completions": "reference.html#command-completions",
     "help": "reference.html#command-help"

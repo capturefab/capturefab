@@ -52,6 +52,7 @@ mod text_input;
 mod time_format;
 mod titlebar;
 mod toolbar;
+mod updates;
 mod video_analytics;
 mod welcome;
 mod widgets;
@@ -699,6 +700,7 @@ enum Message {
     UiScale(UiScale),
     Performance(crate::efficiency::Mode),
     Resources(resources::Input),
+    Updates(updates::Input),
     ScaledViewport(Size),
     CloseRequested(window::Id),
     WindowOpened(window::Id),
@@ -922,6 +924,7 @@ struct Workbench {
     performance: crate::efficiency::Mode,
     performance_state: performance::PerformanceState,
     resources: resources::State,
+    updates: updates::State,
     screenshot: Option<ScreenshotRequest>,
     logs_open: bool,
     help_open: bool,
@@ -1136,6 +1139,7 @@ impl Workbench {
             performance: Default::default(),
             performance_state: Default::default(),
             resources: Default::default(),
+            updates: updates::State::load(),
             screenshot: None,
             logs_open: prefs.logs_open,
             help_open: false,
@@ -1959,6 +1963,7 @@ impl Workbench {
         self.refresh.settle(self.now);
         self.tick_performance();
         self.tick_resources();
+        self.tick_updates();
         let destination_before = local_history::LocalState::capture(self);
         self.capture_to.tick(&mut self.output);
         self.record_to.tick(&mut self.forward_output);
@@ -3116,6 +3121,7 @@ impl Workbench {
             Message::UiScale(value) => self.ui_scale = value,
             Message::Performance(mode) => self.performance = mode,
             Message::Resources(input) => return self.resources_input(input),
+            Message::Updates(input) => return self.updates_input(input),
             Message::ScaledViewport(size) => {
                 self.width = size.width;
                 self.height = size.height;
@@ -3708,6 +3714,7 @@ impl Workbench {
             Action::Overview if self.network_open => self.network_open = false,
             Action::Overview if self.analytics.open => self.analytics.open = false,
             Action::Overview if self.resources.open => self.resources.open = false,
+            Action::Overview if self.updates.open => self.updates.open = false,
             Action::Overview if self.settings_open && self.settings_window.is_none() => {
                 return self.handle_message(Message::Settings(false));
             }

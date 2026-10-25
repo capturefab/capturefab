@@ -761,6 +761,25 @@ class ReleaseTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'modified'):
                 release.assemble(args)
 
+    def test_assemble_publishes_optional_highlights(self):
+        with tempfile.TemporaryDirectory() as temp:
+            notes = Path(temp) / 'highlights.txt'
+            notes.write_text('Faster previews\n\nClearer camera errors\n')
+            self.assemble_fixture(Path(temp), highlights=notes)
+            output = Path(temp) / 'release'
+            entry = json.loads((output / 'releases.json').read_text())['releases'][0]
+            self.assertEqual(entry['highlights'], ['Faster previews', 'Clearer camera errors'])
+            self.assertIn('Highlights:\n- Faster previews\n- Clearer camera errors\n', (output / 'release-notes.md').read_text())
+        with tempfile.TemporaryDirectory() as temp:
+            self.assemble_fixture(Path(temp))
+            self.assertNotIn('highlights', json.loads((Path(temp) / 'release' / 'releases.json').read_text())['releases'][0])
+        for bad in ['x' * 201, '\n'.join(['line'] * 7), 'bidi \u202e text']:
+            with self.subTest(bad=bad[:10]), tempfile.TemporaryDirectory() as temp:
+                notes = Path(temp) / 'highlights.txt'
+                notes.write_text(bad)
+                with self.assertRaisesRegex(ValueError, 'at most 6 highlights'):
+                    self.assemble_fixture(Path(temp), highlights=notes)
+
     @unittest.skipUnless(shutil.which('gpg'), 'gpg is required')
     def test_assemble_signs_checksums_with_the_named_key(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as temp:

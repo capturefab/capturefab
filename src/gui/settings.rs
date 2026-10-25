@@ -132,6 +132,8 @@ impl Workbench {
             rule::horizontal(1).style(style::line),
             discovery,
             rule::horizontal(1).style(style::line),
+            self.updates_settings_section(p),
+            rule::horizontal(1).style(style::line),
             self.api_keys_section(p),
         ]
         .spacing(20)

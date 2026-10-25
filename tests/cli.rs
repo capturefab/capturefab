@@ -23,15 +23,21 @@ fn test_cache() -> PathBuf {
     std::env::temp_dir().join("capturefab-test-cache")
 }
 
-fn cmd(dir: &PathBuf, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_capturefab"))
+/// The binary with isolated state, and an update URL that goes nowhere: a
+/// closed loopback port, never capturefab.com.
+fn binary(dir: &PathBuf) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
+    command
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
         .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .args(args)
-        .output()
-        .unwrap()
+        .env("CAPTUREFAB_UPDATE_URL", "http://127.0.0.1:9/releases.json");
+    command
+}
+
+fn cmd(dir: &PathBuf, args: &[&str]) -> std::process::Output {
+    binary(dir).args(args).output().unwrap()
 }
 
 fn serve_at(dir: &PathBuf, cwd: &PathBuf, name: &str) -> Child {
@@ -2179,12 +2185,7 @@ fn temp_root(name: &str) -> PathBuf {
 /// Run the binary with extra environment variables; never touches the
 /// real environment or the user’s saved state.
 fn cmd_env(dir: &PathBuf, env: &[(&str, &str)], args: &[&str]) -> std::process::Output {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
-    command
-        .env_remove("CAPTUREFAB_SESSION")
-        .env_remove("CAPTUREFAB_CAMERA")
-        .env("CAPTUREFAB_SESSION_DIR", dir)
-        .env("CAPTUREFAB_CACHE_DIR", test_cache());
+    let mut command = binary(dir);
     for (name, value) in env {
         command.env(name, value);
     }

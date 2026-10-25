@@ -753,8 +753,18 @@ def build(args):
     if failures:
         raise RuntimeError(f'{len(failures)} build(s) failed; successful artifacts and failure report retained')
 
+def highlights(path):
+    """Up to six one-line release highlights, plain text: shown by the in-app update check."""
+    if not path:
+        return []
+    lines = [line.strip() for line in Path(path).read_text(encoding='utf-8').splitlines() if line.strip()]
+    if len(lines) > 6 or any(len(line) > 200 or any(ord(c) < 32 or 0x7f <= ord(c) < 0xa0 or 0x202a <= ord(c) <= 0x202e or 0x2066 <= ord(c) <= 0x2069 for c in line) for line in lines):
+        raise ValueError(f'{path}: at most 6 highlights of at most 200 plain characters each')
+    return lines
+
 def assemble(args):
     ver = version(args.version)
+    notable = highlights(getattr(args, 'highlights', None))
     root, output = Path(args.input), Path(args.output)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f'{output} must be empty so that only verified files are released')
@@ -792,6 +802,8 @@ def assemble(args):
     release = dict(version=ver, date=dt.datetime.now(dt.timezone.utc).date().isoformat(), url=f'https://github.com/{args.repository}/releases/tag/v{ver}', checksums_url=link(args.download_base, 'SHA256SUMS'), source_url=link(args.download_base, source.name), sbom_url=link(args.download_base, bill.name), assets=assets)
     if signature:
         release['checksums_signature_url'] = link(args.download_base, signature)
+    if notable:
+        release['highlights'] = notable
     (output / 'releases.json').write_text(json.dumps(dict(schema_version=1, latest=ver, releases=[release]), indent=2) + '\n')
     files = sorted(p for p in output.iterdir() if p.is_file() and not p.name.startswith('SHA256SUMS') and p.name != 'release-notes.md')
     (output / 'SHA256SUMS').write_text(''.join(f'{digest(p)}  {p.name}\n' for p in files))
@@ -803,6 +815,7 @@ def assemble(args):
     if any(key[0] == 'macos' for key in successes):
         notes += ['- macOS: open the .dmg and drag Capturefab to Applications. Where the platform signature says apple-notarized, both the disk image and the app inside are notarized and stapled.',
                   '', 'Upgrade note:', '- The macOS download no longer includes the ./capturefab launcher; use /Applications/Capturefab.app/Contents/MacOS/capturefab or add that folder to PATH.']
+    notes = notes[:2] + ['Highlights:'] + [f'- {line}' for line in notable] + [''] + notes[2:] if notable else notes
     notes += ['', 'Unavailable targets:'] + unavailable if unavailable else []
     notes += ['', 'Verification:', '- Check downloads against SHA256SUMS, for example `sha256sum --check --ignore-missing SHA256SUMS`.']
     notes += [f'- SHA256SUMS.asc is an OpenPGP signature by key {args.gpg_key}: `gpg --verify SHA256SUMS.asc SHA256SUMS`.'] if signature else []
@@ -837,6 +850,7 @@ def main():
     collect.add_argument('--download-base', default='')
     collect.add_argument('--gpg-key', help='sign SHA256SUMS with this OpenPGP key; passphrase from RELEASE_GPG_PASSPHRASE')
     collect.add_argument('--provenance', action='store_true', help='document GitHub build provenance created for SHA256SUMS')
+    collect.add_argument('--highlights', help='one highlight per line (at most 6, 200 characters each), e.g. docs/releases/VERSION.txt')
     args = parser.parse_args()
     try:
         if args.command == 'version':

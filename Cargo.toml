@@ -8,8 +8,8 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "parquet", "hubs"]
-gui = ["ai", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading"]
+default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "parquet", "hubs", "updates"]
+gui = ["ai", "updates", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading"]
 usb = ["dep:nusb"]
 # Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
 # Drivers run in disposable helper processes, never in the UI.
@@ -29,6 +29,9 @@ parquet = ["duckdb/parquet", "duckdb/json", "dep:parquet"]
 # Prompt measurements use HTTPS with the OS certificate store and native
 # Keychain / Credential Manager / Secret Service credentials.
 ai = ["dep:ureq", "keychain", "dep:ring"]
+# New-version checks: a GET of the public releases.json over HTTPS with the
+# OS certificate store; the desktop app checks daily unless turned off.
+updates = ["dep:ureq"]
 # Camera hubs (Home Assistant, Frigate, go2rtc, UniFi Protect): a hand-rolled
 # HTTP/1.1 client with rustls (ring; the OS trust store or a pinned certificate)
 # in the camera worker, JPEG/PNG decoded there with libjpeg-turbo and png, and

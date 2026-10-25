@@ -24,6 +24,7 @@ Use the built-in simulators to try commands without camera hardware.
 - [Assistant guide](https://github.com/capturefab/capturefab/blob/main/docs/assistant.md): Providers, credentials, data sent, plans, approvals and bounded camera tasks.
 - [Workflow examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows): Multi-camera timelapse, scanner feeder and local recording.
 - [Release manifest](releases.json): Published files, architectures, SHA-256 checksums and available signatures.
+- [Update checks](docs.html#updates): The desktop app reads releases.json at most daily (Settings › Updates, `CAPTUREFAB_UPDATE_CHECK=off`); `capturefab version` is offline and `version --check` reads it once.
 - [Release feed](feed.xml): Atom release announcements.
 - [Source and build guide](https://github.com/capturefab/capturefab): Rust source, build instructions and MIT license.
 - [FFmpeg build notes](https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md): Media dependencies, corresponding source and build provenance.

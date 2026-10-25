@@ -484,6 +484,7 @@ impl Workbench {
             || self.scene_assistant_task(word, late)
             || self.scene_performance(word, late)
             || self.scene_resources(word, late)
+            || self.scene_updates(word, late)
             || self.scene_sheets(word, late)
     }
 

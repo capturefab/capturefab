@@ -20,6 +20,7 @@ pub(super) enum Command {
     Schedule,
     Quit,
     AgentSetup,
+    CheckUpdates,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,6 +71,22 @@ pub(super) struct Menu {
 }
 
 impl Workbench {
+    /// "Check for Updates…", or the version it found. On macOS it follows
+    /// About in the app menu; elsewhere it ends the Help menu. A focused
+    /// Settings window disables it: the sheet opens in the main window.
+    pub(super) fn updates_menu_item(&self) -> Item {
+        Item::command(
+            self.updates.announce().map_or_else(
+                || "Check for Updates…".into(),
+                |version| format!("Update Available: {version}…"),
+            ),
+            Command::CheckUpdates,
+            self.close_error.is_none()
+                && self.settings_window != Some(self.focused_window)
+                && (!self.sheet_open() || self.updates.open),
+        )
+    }
+
     pub(super) fn command_menus(&self) -> Vec<Menu> {
         let ready = !self.sheet_open()
             && self.settings_window != Some(self.focused_window)
@@ -361,6 +378,9 @@ impl Workbench {
             },
         ];
         if !cfg!(target_os = "macos") {
+            let help = menus.len() - 1;
+            menus[help].items.push(None);
+            menus[help].items.push(Some(self.updates_menu_item()));
             menus[0].items.push(None);
             menus[0].items.push(Some(Item {
                 shortcut: Action::Quit.display_binding(Os::CURRENT),
@@ -397,6 +417,8 @@ impl Workbench {
             Command::Quit => self.handle_message(Message::Quit),
             Command::Action(action) => self.dispatch_action(action),
             Command::AgentSetup => self.handle_message(Message::AgentSetup(true)),
+            // Before the guard: the handler itself refuses to stack sheets.
+            Command::CheckUpdates => self.handle_message(Message::Updates(updates::Input::Open)),
             Command::Edit(command) => {
                 let serial = self
                     .menu_edit
@@ -603,6 +625,72 @@ mod tests {
         let idle = commands(&app);
         app.snapshot.cameras[1].forwarding = Some("/tmp/sim-1.mp4".into());
         assert_eq!(commands(&app), idle);
+        // Finding a new version retitles Check for Updates in place.
+        app.updates.settings.last_outcome = Some(crate::updates::Outcome {
+            latest: Some("999.0.0".into()),
+            ..Default::default()
+        });
+        assert_eq!(commands(&app), idle);
+        assert_eq!(app.updates_menu_item().command, Command::CheckUpdates);
+    }
+
+    #[test]
+    fn check_for_updates_opens_its_sheet_only_when_nothing_else_is_up() {
+        let mut app = bench();
+        let updates = app.updates_menu_item();
+        assert_eq!(
+            (updates.title.as_str(), updates.command, updates.enabled),
+            ("Check for Updates…", Command::CheckUpdates, true)
+        );
+        if !cfg!(target_os = "macos") {
+            let help = app.command_menus().pop().unwrap();
+            assert_eq!(help.title, "Help");
+            assert_eq!(help.items.last().cloned().flatten(), Some(updates));
+        }
+        app.help_open = true;
+        assert!(!app.updates_menu_item().enabled);
+        let _ = app.menu_command(Command::CheckUpdates);
+        assert!(!app.updates.open);
+        app.help_open = false;
+        let settings = window::Id::unique();
+        app.settings_window = Some(settings);
+        app.focused_window = settings;
+        assert!(!app.updates_menu_item().enabled);
+        let _ = app.menu_command(Command::CheckUpdates);
+        assert!(!app.updates.open);
+        app.focused_window = app.main_window;
+        let _ = app.menu_command(Command::CheckUpdates);
+        assert!(app.updates.open);
+        assert!(
+            app.updates_menu_item().enabled,
+            "it refocuses its own sheet"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_menu_tags_follow_add_command_order() {
+        let app = bench();
+        let updates = app.updates_menu_item();
+        let settings = Item::action("Settings…", Action::Settings, true);
+        let quit = Item::command("Quit Capturefab", Command::Quit, true);
+        let model = app.command_menus();
+        let specs = native::app_menu_specs(&updates, &settings, &quit, &model);
+        let commands: Vec<_> = specs.iter().map(|item| item.command).collect();
+        assert_eq!(
+            commands[..3],
+            [
+                Command::CheckUpdates,
+                Command::Action(Action::Settings),
+                Command::Quit
+            ]
+        );
+        let flat: Vec<_> = model
+            .iter()
+            .flat_map(|menu| menu.items.iter().flatten())
+            .map(|item| item.command)
+            .collect();
+        assert_eq!(commands[3..], flat[..]);
     }
 
     #[test]

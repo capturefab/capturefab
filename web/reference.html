@@ -644,10 +644,15 @@ capturefab --session bench status --json</code></pre></div>
 <tr><td><code>--dry-run</code></td><td>Validate and print the plan without making changes.</td><td>—</td></tr>
 </tbody></table></div>
 </article>
-<article class="doc-section" id="cli-diagnostics" data-doc-section data-doc-title="Diagnostics and command help" data-doc-category="Command reference" data-doc-tags="doctor,schema,completions,help"><h2>Diagnostics and command help</h2><p class="doc-summary">Read capabilities, the automation schema and shell help.</p>
+<article class="doc-section" id="cli-diagnostics" data-doc-section data-doc-title="Diagnostics and command help" data-doc-category="Command reference" data-doc-tags="doctor,version,schema,completions,help"><h2>Diagnostics and command help</h2><p class="doc-summary">Read capabilities, the automation schema and shell help.</p>
 <p>Task guide: <a href="docs.html#troubleshooting">Diagnostics and command help</a>.</p>
 <h3 id="command-doctor"><code>capturefab doctor</code></h3>
 <p>Report this computer’s camera, storage and acceleration capabilities. Each warning includes a suggested action.</p>
+<h3 id="command-version"><code>capturefab version</code></h3>
+<p>Print this build's version and what the last update check found, without a network request. <code>capturefab version --check</code> reads <code>https://capturefab.com/releases.json</code> once and reports the newest release, its download for this computer and its SHA-256. It never changes the desktop app's automatic setting or skipped version.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--check</code></td><td>Read the public release list now. Exits 5 when <code>CAPTUREFAB_UPDATE_CHECK=off</code> or a policy file turns checks off, 3 when offline, 4 on a timeout and 2 for an invalid <code>CAPTUREFAB_UPDATE_URL</code>.</td><td>Off</td></tr>
+</tbody></table></div>
 <h3 id="command-schema"><code>capturefab schema</code></h3>
 <p>Emit the versioned CLI and session automation contract as JSON.</p>
 <h3 id="command-completions"><code>capturefab completions</code></h3>
