@@ -1768,21 +1768,25 @@ enum Token {
     R,
     Q,
     Colon,
+    Comma,
     End,
 }
 /// Formula arithmetic. GenApi evaluates SwissKnife and Converter formulas in
 /// `f64`, and IntSwissKnife and IntConverter formulas in 64-bit integers.
 trait Operand: Copy + Default {
+    const INTEGER: bool;
     fn literal(value: &Value) -> Result<Self>;
     fn variable(value: &Value) -> Result<Self>;
     fn truth(self) -> bool;
     fn finite(self) -> bool;
     fn boolean(value: bool) -> Self;
+    fn constant(name: &str) -> Option<Self>;
     fn unary(op: &str, value: Self) -> Result<Self>;
     fn binary(op: &str, lhs: Self, rhs: Self) -> Result<Self>;
-    fn call(name: &str, arg: Self) -> Result<Self>;
+    fn call(name: &str, args: &[Self]) -> Result<Self>;
 }
 impl Operand for f64 {
+    const INTEGER: bool = false;
     fn literal(value: &Value) -> Result<f64> {
         number(value)
     }
@@ -1797,6 +1801,13 @@ impl Operand for f64 {
     }
     fn boolean(value: bool) -> f64 {
         value as u8 as f64
+    }
+    fn constant(name: &str) -> Option<f64> {
+        match name {
+            "PI" => Some(std::f64::consts::PI),
+            "E" => Some(std::f64::consts::E),
+            _ => None,
+        }
     }
     fn unary(op: &str, value: f64) -> Result<f64> {
         Ok(match op {
@@ -1826,23 +1837,34 @@ impl Operand for f64 {
         ensure!(value.is_finite(), "non-finite formula result");
         Ok(value)
     }
-    fn call(name: &str, arg: f64) -> Result<f64> {
+    fn call(name: &str, args: &[f64]) -> Result<f64> {
+        let x = args[0];
         Ok(match name {
-            "ABS" => arg.abs(),
-            "EXP" => arg.exp(),
-            "LN" => arg.ln(),
-            "LOG" => arg.log10(),
-            "SQRT" => arg.sqrt(),
-            "SIN" => arg.sin(),
-            "COS" => arg.cos(),
-            "TAN" => arg.tan(),
-            "ASIN" => arg.asin(),
-            "ACOS" => arg.acos(),
-            "ATAN" => arg.atan(),
-            "FLOOR" => arg.floor(),
-            "CEIL" => arg.ceil(),
-            "ROUND" => arg.round(),
-            "TRUNC" => arg.trunc(),
+            "SGN" => f64::boolean(x > 0.0) - f64::boolean(x < 0.0),
+            "NEG" => -x,
+            "ABS" => x.abs(),
+            "EXP" => x.exp(),
+            "LN" => x.ln(),
+            "LG" => x.log10(),
+            "SQRT" => x.sqrt(),
+            "SIN" => x.sin(),
+            "COS" => x.cos(),
+            "TAN" => x.tan(),
+            "ASIN" => x.asin(),
+            "ACOS" => x.acos(),
+            "ATAN" => x.atan(),
+            "FLOOR" => x.floor(),
+            "CEIL" => x.ceil(),
+            "TRUNC" => x.trunc(),
+            "ROUND" => match args.get(1) {
+                Some(&precision) => {
+                    let digits =
+                        i32::try_from(bits(precision)?).context("invalid ROUND precision")?;
+                    let scale = 10f64.powi(digits);
+                    (x * scale).round() / scale
+                }
+                None => x.round(),
+            },
             _ => bail!("unsupported formula function {name}"),
         })
     }
@@ -1850,6 +1872,7 @@ impl Operand for f64 {
 /// Integer formulas wrap on overflow like the C `int64_t` arithmetic of
 /// GenApi implementations, and divide with truncation toward zero.
 impl Operand for i64 {
+    const INTEGER: bool = true;
     fn literal(value: &Value) -> Result<i64> {
         if value.is_f64() {
             ensure!(
@@ -1883,6 +1906,9 @@ impl Operand for i64 {
     }
     fn boolean(value: bool) -> i64 {
         value.into()
+    }
+    fn constant(_: &str) -> Option<i64> {
+        None
     }
     fn unary(op: &str, value: i64) -> Result<i64> {
         Ok(match op {
@@ -1919,16 +1945,32 @@ impl Operand for i64 {
             _ => i64::boolean(comparison(op, lhs, rhs)),
         })
     }
-    fn call(name: &str, arg: i64) -> Result<i64> {
-        match name {
-            "ABS" => Ok(arg.wrapping_abs()),
-            "EXP" | "LN" | "LOG" | "SQRT" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN"
-            | "FLOOR" | "CEIL" | "ROUND" | "TRUNC" => {
-                bail!("formula function {name} is not available in integer formulas")
-            }
+    fn call(name: &str, args: &[i64]) -> Result<i64> {
+        let x = args[0];
+        Ok(match name {
+            "SGN" => x.signum(),
+            "NEG" => x.wrapping_neg(),
+            "ABS" => x.wrapping_abs(),
             _ => bail!("unsupported formula function {name}"),
-        }
+        })
     }
+}
+/// The standard formula functions and how many arguments each takes. Only SGN
+/// and NEG are standard in integer formulas; ABS is also accepted there
+/// because vendor XMLs use it in IntSwissKnife nodes.
+fn function(name: &str, integer: bool) -> Result<std::ops::RangeInclusive<usize>> {
+    let arity = match name {
+        "SGN" | "NEG" | "ABS" => return Ok(1..=1),
+        "ROUND" => 1..=2,
+        "EXP" | "LN" | "LG" | "SQRT" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN"
+        | "FLOOR" | "CEIL" | "TRUNC" => 1..=1,
+        _ => bail!("unsupported formula function {name}"),
+    };
+    ensure!(
+        !integer,
+        "formula function {name} is not available in integer formulas"
+    );
+    Ok(arity)
 }
 fn comparison<T: PartialOrd>(op: &str, lhs: T, rhs: T) -> bool {
     match op {
@@ -2003,6 +2045,7 @@ fn evaluate<T: Operand>(expression: &str, vars: &BTreeMap<String, T>) -> Result<
             b')' => Token::R,
             b'?' => Token::Q,
             b':' => Token::Colon,
+            b',' => Token::Comma,
             b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'~' | b'!' | b'<' | b'>'
             | b'=' => Token::Op((bytes[i] as char).to_string()),
             _ => bail!("unsupported formula syntax at byte {i}"),
@@ -2059,17 +2102,28 @@ impl<T: Operand> Expr<'_, T> {
             Token::Name(n) => {
                 if self.tokens[self.pos] == Token::L {
                     self.pos += 1;
-                    let arg = self.expr(0)?;
+                    let name = n.to_ascii_uppercase();
+                    let arity = function(&name, T::INTEGER)?;
+                    let mut args = vec![self.expr(0)?];
+                    while self.tokens[self.pos] == Token::Comma {
+                        self.pos += 1;
+                        args.push(self.expr(0)?);
+                    }
                     ensure!(
                         self.tokens[self.pos] == Token::R,
                         "unclosed formula function"
                     );
                     self.pos += 1;
-                    self.compute(|| T::call(&n, arg))?
+                    ensure!(
+                        arity.contains(&args.len()),
+                        "wrong number of arguments for formula function {name}"
+                    );
+                    self.compute(|| T::call(&name, &args))?
                 } else {
-                    *self
-                        .vars
+                    self.vars
                         .get(&n)
+                        .copied()
+                        .or_else(|| T::constant(&n))
                         .ok_or_else(|| anyhow!("unknown formula variable {n}"))?
                 }
             }
@@ -2364,6 +2418,70 @@ mod tests {
         assert_eq!(evaluate("X=7 ? EXP(LN(1)) : 0", &vars).unwrap(), 1.0);
         assert!(evaluate("X / 0", &vars).is_err());
         assert!(evaluate("X + ", &vars).is_err());
+    }
+    #[test]
+    fn standard_formula_functions_and_constants() {
+        let none = BTreeMap::new();
+        for (expression, expected) in [
+            ("ROUND(10.11, 1)", 10.1),
+            ("ROUND(10.99, 1)", 11.0),
+            ("ROUND(-20.11, 1)", -20.1),
+            ("ROUND(-20.99, 1)", -21.0),
+            ("ROUND(1234, -2)", 1200.0),
+            ("ROUND(10.5)", 11.0),
+            ("LN(E)", 1.0),
+            ("LG(10)", 1.0),
+            ("COS(PI)", -1.0),
+            ("SIN(-PI/2)", -1.0),
+            ("SGN(-2.0)", -1.0),
+            ("SGN(0)", 0.0),
+            ("SGN(2)", 1.0),
+            ("NEG(-2.5)", 2.5),
+            ("exp(0) + Abs(-1)", 2.0),
+        ] {
+            assert_eq!(
+                evaluate::<f64>(expression, &none).unwrap(),
+                expected,
+                "{expression}"
+            );
+        }
+        let shadowed = BTreeMap::from([("E".into(), 2.0)]);
+        assert_eq!(
+            evaluate::<f64>("E * PI", &shadowed).unwrap(),
+            2.0 * std::f64::consts::PI
+        );
+        for invalid in [
+            "LOG(10)",
+            "ROUND(1, 2, 3)",
+            "SGN(1, 2)",
+            "SGN()",
+            "1, 2",
+            "(1, 2)",
+        ] {
+            assert!(evaluate::<f64>(invalid, &none).is_err(), "{invalid}");
+        }
+        let integers = BTreeMap::from([("X".into(), -7i64)]);
+        assert_eq!(evaluate::<i64>("SGN(X) * NEG(X)", &integers).unwrap(), -7);
+        assert!(evaluate::<i64>("PI", &integers).is_err());
+        assert!(evaluate::<i64>("X > 0 ? LG(X) : 0", &integers).is_err());
+
+        let m = map(concat!(
+            "<Float Name='ShutterTemperature'><pValue>ShutterTemperatureValConv</pValue><Unit>K</Unit></Float>",
+            "<Converter Name='ShutterTemperatureValConv'><FormulaTo>(FROM - 273) * 100</FormulaTo><FormulaFrom>ROUND(((TO &gt; 32767 ? (TO - 65536) : TO) / 100),0) + 273</FormulaFrom><pValue>ShutterTempInternalReg</pValue><Slope>Varying</Slope></Converter>",
+            "<IntReg Name='ShutterTempInternalReg'><Address>0xE868</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Signed</Sign><Endianess>BigEndian</Endianess></IntReg>",
+            "<Float Name='AutoExposureTimeAbsLowerLimit'><pValue>N871</pValue></Float>",
+            "<Converter Name='N871'><pVariable Name='P1'>N1803</pVariable><FormulaTo>ROUND(FROM/P1,0)*P1</FormulaTo><FormulaFrom>TO</FormulaFrom><pValue>N1804</pValue><Slope>Increasing</Slope></Converter>",
+            "<Integer Name='N1803'><Value>35</Value></Integer>",
+            "<IntReg Name='N1804'><Address>0x100</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>BigEndian</Endianess></IntReg>",
+        ));
+        let mut io = Memory::default();
+        io.write_memory(0xe868, &2_549u32.to_be_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "ShutterTemperature").unwrap(), 298.0);
+        io.write_memory(0xe868, &65_036u32.to_be_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "ShutterTemperature").unwrap(), 268.0);
+        m.set(&mut io, "AutoExposureTimeAbsLowerLimit", "1000")
+            .unwrap();
+        assert_eq!(io.read_memory(0x100, 4).unwrap(), 1015u32.to_be_bytes());
     }
     #[test]
     fn untaken_formula_branches_cannot_fail() {
