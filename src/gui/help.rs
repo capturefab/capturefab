@@ -638,7 +638,7 @@ fn webcam_scheme() -> &'static str {
     } else if cfg!(target_os = "windows") {
         "dshow://"
     } else {
-        "v4l2://"
+        "v4l2:/dev/videoN"
     }
 }
 
