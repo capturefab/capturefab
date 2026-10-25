@@ -1,50 +1,69 @@
 {
-  "method": "Actual iced desktop renderer frames; H.264 encoding only. No reconstructed interface or desktop recording.",
-  "source_note": "Current development desktop build from workspace source. The visible save and settings results come from real session CLI commands.",
-  "binary_sha256": "4d2e915ecd97c8ad4d592786995f54998ee20b9a192a2cd1b58f081e352166fd",
+  "method": "Actual iced desktop renderer frames captured in real time at up to 30 fps; frames are only repeated, never interpolated; H.264 encoding only. Acquisition is real time, so frames differ between recordings.",
+  "source_note": "Desktop build from workspace source. The visible save and settings results come from real session CLI commands.",
+  "binary_sha256": "d7d912017b780c450e2a81ec241b0eda7509411ea9e08c373fe8bf824bb071c9",
+  "app_version": "0.4.0",
   "demo": "Built-in simulator cameras in isolated temporary sessions. No physical cameras or saved user data.",
   "clips": [
     {
       "file": "live-preview.mp4",
       "poster": "live-preview.png",
-      "sha256": "2d03ea85bd3cf2d83cde7aee4c5c317e35be90b0c5892d7d6dc5c18d0ea143d6",
-      "poster_sha256": "c8358bbf47b00d315c6739c693c64f451fb69da3d42348959ef9efa7c330c5bb",
-      "size_bytes": 200366,
+      "sha256": "1d5da7b36ed7f40dde6368c4e659173882d7372078ffa3e69ec29e3a8ae9eafc",
+      "poster_sha256": "c845bdc85658b4e10d7187968860c3c2774766dac4a06fa76500c97a687b0f79",
+      "size_bytes": 495471,
       "width": 1100,
       "height": 700,
       "duration_seconds": 8.0,
-      "fps": 24,
+      "fps": 30,
+      "frame_count": 240,
+      "preview_motion_fps": 24.875,
+      "coded_change_samples": 200,
       "codec": "h264",
       "pixel_format": "yuv420p",
       "audio": false,
       "preview_frame_differences": [
         {
-          "mean_pixel_difference": 91.321,
-          "changed_fraction": 0.7812
+          "mean_pixel_difference": 91.38,
+          "changed_fraction": 0.7794
         },
         {
-          "mean_pixel_difference": 91.481,
-          "changed_fraction": 0.7794
+          "mean_pixel_difference": 91.667,
+          "changed_fraction": 0.7804
         }
       ],
+      "encoder": {
+        "codec": "libx264",
+        "crf": 21,
+        "preset": "slow",
+        "bframes": 0,
+        "gop": 60,
+        "threads": 4,
+        "ffmpeg_version": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+        "ffmpeg_pinned": true
+      },
       "source": {
         "method": "Built-in renderer screenshot sequence with real simulator acquisition and session CLI commands",
         "scene": "dark,features,noscopes",
         "cameras": 1,
-        "frames": 64,
-        "duration_seconds": 22.077,
-        "maximum_fps": 12,
-        "observed_fps": 2.854,
+        "frames": 271,
+        "capture_fps_target": 30,
+        "observed_fps": 25.68,
+        "max_frame_gap_ms": 66.6,
+        "p95_frame_gap_ms": 51.8,
+        "distinct_preview_frames": 206,
+        "held_by_pending": 0,
+        "efficiency": "smooth",
         "playback_excerpt": {
           "start_seconds": 0,
           "end_seconds": 8,
           "speed": 1
         },
-        "first_frame_sha256": "b4a4bb75953e537c402b4bd7461d444daa89a44575bdf67f1396b0cee28d3d18",
-        "last_frame_sha256": "a2f6fc95104e13fb32dae044941370e3bc9a041acb6a6a209bfd690a4a366b10",
+        "first_frame_sha256": "3279305085675167e6dded50200bae10bfef42c3c071d52f69b08b82efadf03e",
+        "last_frame_sha256": "6ce87b348426e3b3b03f25f76bb77ff405da63fe37218c82b72eef562ce3bae0",
         "actions": [
           {
-            "after_seconds": 1.789,
+            "after_seconds": 1.5,
+            "renderer_seconds_at_send": 1.516,
             "arguments": [
               "--camera",
               "sim:0",
@@ -53,7 +72,8 @@
             ]
           },
           {
-            "after_seconds": 5.291,
+            "after_seconds": 5.0,
+            "renderer_seconds_at_send": 5.016,
             "arguments": [
               "--camera",
               "sim:0",
@@ -68,44 +88,62 @@
     {
       "file": "capture-workflow.mp4",
       "poster": "capture-workflow.png",
-      "sha256": "d3f18b4ab2127b8151a20e4e99c6c58fbe519a2044820bdc486a4e52c0b7bb19",
-      "poster_sha256": "a958e0279972b8ebdcaeb6ba4719be7e8a69b4b8fe19b4f10c53b1b118e6e956",
-      "size_bytes": 249084,
+      "sha256": "59c8a01c717c3e14cc8ffb8f43876d72a1db984bc81ffa8de6c7445377033bc0",
+      "poster_sha256": "3584dfdcf365359e6f2b2c01223d6b49496cb7e217c5c195f19c430187b63df6",
+      "size_bytes": 625101,
       "width": 1100,
       "height": 700,
       "duration_seconds": 8.0,
-      "fps": 24,
+      "fps": 30,
+      "frame_count": 240,
+      "preview_motion_fps": 26.75,
+      "coded_change_samples": 215,
       "codec": "h264",
       "pixel_format": "yuv420p",
       "audio": false,
       "preview_frame_differences": [
         {
-          "mean_pixel_difference": 26.676,
-          "changed_fraction": 0.7703
+          "mean_pixel_difference": 26.88,
+          "changed_fraction": 0.7732
         },
         {
-          "mean_pixel_difference": 27.149,
-          "changed_fraction": 0.77
+          "mean_pixel_difference": 27.758,
+          "changed_fraction": 0.7756
         }
       ],
+      "encoder": {
+        "codec": "libx264",
+        "crf": 21,
+        "preset": "slow",
+        "bframes": 0,
+        "gop": 60,
+        "threads": 4,
+        "ffmpeg_version": "ffmpeg version 9.0.2 Copyright (c) 2000-2026 the FFmpeg developers",
+        "ffmpeg_pinned": true
+      },
       "source": {
         "method": "Built-in renderer screenshot sequence with real simulator acquisition and session CLI commands",
         "scene": "dark,capture,noscopes",
         "cameras": 1,
-        "frames": 64,
-        "duration_seconds": 22.562,
-        "maximum_fps": 12,
-        "observed_fps": 2.792,
+        "frames": 271,
+        "capture_fps_target": 30,
+        "observed_fps": 27.682,
+        "max_frame_gap_ms": 66.7,
+        "p95_frame_gap_ms": 50.0,
+        "distinct_preview_frames": 220,
+        "held_by_pending": 0,
+        "efficiency": "smooth",
         "playback_excerpt": {
           "start_seconds": 0,
           "end_seconds": 8,
           "speed": 1
         },
-        "first_frame_sha256": "8501cffda0d4860b51ada8ced0e7a905126cb1a4a90538b7d0a19c8675351918",
-        "last_frame_sha256": "96b890dd34731ab25c7959130ce7c31a076909ade1c2de8d333a970359c70400",
+        "first_frame_sha256": "906e3b0d360267477ec419c5bc811ff42c8ad20d96d3f24db7007cde239ff43f",
+        "last_frame_sha256": "885d316bca7544cc01b7e6d73e287fc99f4f820149c4cab5d69fd65d27ac5f28",
         "actions": [
           {
-            "after_seconds": 2.571,
+            "after_seconds": 2.0,
+            "renderer_seconds_at_send": 2.017,
             "arguments": [
               "--camera",
               "sim:0",
@@ -118,7 +156,8 @@
             "verified_saved_frames": 3
           },
           {
-            "after_seconds": 5.418,
+            "after_seconds": 5.0,
+            "renderer_seconds_at_send": 5.017,
             "arguments": [
               "--camera",
               "sim:0",

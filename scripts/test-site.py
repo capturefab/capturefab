@@ -165,33 +165,130 @@ def check_pages(root, errors):
     return pages
 
 
-def mp4_boxes(path):
-    """Read top-level ISO BMFF boxes without a platform media dependency."""
-    data = path.read_bytes()
-    boxes = []
-    offset = 0
-    while offset < len(data):
-        if len(data) - offset < 8:
+def boxes(data, start=0, end=None):
+    """ISO BMFF boxes in data[start:end] as (kind, body start, box end)."""
+    end = len(data) if end is None else end
+    found = []
+    offset = start
+    while offset < end:
+        if end - offset < 8:
             raise ValueError("incomplete MP4 box header")
         size, kind = struct.unpack_from(">I4s", data, offset)
         header = 8
         if size == 1:
-            if len(data) - offset < 16:
+            if end - offset < 16:
                 raise ValueError("incomplete extended MP4 box header")
             size = struct.unpack_from(">Q", data, offset + 8)[0]
             header = 16
         elif size == 0:
-            size = len(data) - offset
-        if size < header or offset + size > len(data):
+            size = end - offset
+        if size < header or offset + size > end:
             raise ValueError("invalid MP4 box size")
-        boxes.append(kind)
+        found.append((kind, offset + header, offset + size))
         offset += size
-    return boxes
+    return found
+
+
+def mp4_boxes(path):
+    """Read top-level ISO BMFF boxes without a platform media dependency."""
+    return [kind for kind, _, _ in boxes(path.read_bytes())]
+
+
+def mp4_child(data, start, end, *path):
+    for kind, body, box_end in boxes(data, start, end):
+        if kind == path[0]:
+            return (body, box_end) if len(path) == 1 else mp4_child(data, body, box_end, *path[1:])
+    raise ValueError(f"missing MP4 {b'/'.join(path).decode()} box")
+
+
+def mp4_video_timing(path):
+    """The first video track's size, codec, timescale, duration, stts entries
+    and sample sizes, read from moov without a media dependency."""
+    data = Path(path).read_bytes()
+    moov = mp4_child(data, 0, len(data), b"moov")
+    for kind, start, end in boxes(data, *moov):
+        if kind != b"trak":
+            continue
+        hdlr, _ = mp4_child(data, start, end, b"mdia", b"hdlr")
+        if data[hdlr + 8:hdlr + 12] != b"vide":
+            continue
+        tkhd, _ = mp4_child(data, start, end, b"tkhd")
+        # Width and height are the last two 16.16 fields of tkhd.
+        width, height = struct.unpack_from(">II", data, tkhd + (88 if data[tkhd] == 1 else 76))
+        mdhd, _ = mp4_child(data, start, end, b"mdia", b"mdhd")
+        if data[mdhd] == 1:
+            timescale, duration = struct.unpack_from(">IQ", data, mdhd + 20)
+        else:
+            timescale, duration = struct.unpack_from(">II", data, mdhd + 12)
+        stbl = mp4_child(data, start, end, b"mdia", b"minf", b"stbl")
+        stsd, _ = mp4_child(data, *stbl, b"stsd")
+        codec = data[stsd + 12:stsd + 16].decode("latin-1")
+        stts, _ = mp4_child(data, *stbl, b"stts")
+        count = struct.unpack_from(">I", data, stts + 4)[0]
+        entries = [struct.unpack_from(">II", data, stts + 8 + 8 * index) for index in range(count)]
+        stsz, _ = mp4_child(data, *stbl, b"stsz")
+        fixed, samples = struct.unpack_from(">II", data, stsz + 4)
+        sizes = ([fixed] * samples if fixed else
+                 [struct.unpack_from(">I", data, stsz + 12 + 4 * index)[0] for index in range(samples)])
+        return {"width": width >> 16, "height": height >> 16, "codec": codec, "timescale": timescale,
+                "duration": duration, "stts": entries, "samples": samples, "sizes": sizes}
+    raise ValueError("no video track")
+
+
+MIN_CLIP_FPS = 24
+CODED_CHANGE_BYTES = 400
+CODED_CHANGE_FRACTION = 0.8
+CLIP_BYTE_BUDGET = 1_500_000
+TOTAL_BYTE_BUDGET = 3_500_000
+
+
+def check_clip_timing(prefix, path, clip, errors):
+    """A clip must play at its manifest rate, constantly, and show new images.
+
+    Samples under CODED_CHANGE_BYTES are x264 skip frames that repeat the last
+    image. This assumes these scenes always move the camera preview and the
+    pinned encoder settings: no B-frames, which code new images in a few
+    hundred bytes, and a fixed GOP that keeps I-frames from skewing the
+    count: a clip whose frames mostly repeat was not captured at its rate."""
+    timing = mp4_video_timing(path)
+    fps = clip.get("fps")
+    duration = clip.get("duration_seconds")
+    seconds = timing["duration"] / timing["timescale"] if timing["timescale"] else 0
+    if len(timing["stts"]) != 1:
+        errors.append(f"{prefix}: expected constant-frame-rate video")
+    played = timing["samples"] / seconds if seconds else 0
+    if type(fps) in (int, float) and abs(played - fps) > 0.05:
+        errors.append(f"{prefix}: video plays at {played:.1f} fps; manifest says {fps}")
+    if type(fps) not in (int, float) or fps < MIN_CLIP_FPS:
+        errors.append(f"{prefix}: demonstration must play at {MIN_CLIP_FPS} fps or more")
+    if timing["samples"] != clip.get("frame_count"):
+        errors.append(f"{prefix}: video has {timing['samples']} frames; manifest says {clip.get('frame_count')}")
+    if type(duration) in (int, float) and abs(seconds - duration) > 0.05:
+        errors.append(f"{prefix}: video lasts {seconds:.2f} s; manifest says {duration}")
+    if (timing["width"], timing["height"]) != (clip.get("width"), clip.get("height")):
+        errors.append(f"{prefix}: video is {timing['width']}x{timing['height']}; manifest says {clip.get('width')}x{clip.get('height')}")
+    if seconds and type(fps) in (int, float):
+        changes = sum(1 for size in timing["sizes"] if size >= CODED_CHANGE_BYTES) / seconds
+        if changes < CODED_CHANGE_FRACTION * fps:
+            errors.append(f"{prefix}: only {changes:.1f} fps of the {fps} fps clip show new images (repeated frames)")
+    source = clip.get("source") if isinstance(clip.get("source"), dict) else {}
+    for value, label in ((source.get("observed_fps"), "renderer capture rate"),
+                         (clip.get("preview_motion_fps"), "camera preview change rate")):
+        if type(value) not in (int, float) or value < MIN_CLIP_FPS:
+            errors.append(f"{prefix}: {label} must be {MIN_CLIP_FPS} fps or more")
+    size = path.stat().st_size
+    if size != clip.get("size_bytes"):
+        errors.append(f"{prefix}: file is {size:,} bytes; manifest says {clip.get('size_bytes')}")
+    if size > CLIP_BYTE_BUDGET:
+        errors.append(f"{prefix}: {size:,} bytes exceeds the {CLIP_BYTE_BUDGET:,}-byte clip budget")
 
 
 def check_media(root, pages, errors):
     """Anchor recorded-media metadata to checked-in files and accessible embeds."""
     directory = root / "media"
+    total = sum(path.stat().st_size for path in directory.glob("*.mp4"))
+    if total > TOTAL_BYTE_BUDGET:
+        errors.append(f"media: clips total {total:,} bytes, over the {TOTAL_BYTE_BUDGET:,}-byte budget")
     manifest_path = directory / "manifest.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -261,11 +358,13 @@ def check_media(root, pages, errors):
         path = directory / filename
         if path.is_file():
             try:
-                boxes = mp4_boxes(path)
-                if not boxes or boxes[0] != b"ftyp" or b"moov" not in boxes or b"mdat" not in boxes:
+                top = mp4_boxes(path)
+                if not top or top[0] != b"ftyp" or b"moov" not in top or b"mdat" not in top:
                     errors.append(f"{prefix}: invalid MP4 container")
-                elif boxes.index(b"moov") > boxes.index(b"mdat"):
+                elif top.index(b"moov") > top.index(b"mdat"):
                     errors.append(f"{prefix}: MP4 metadata must precede media for progressive playback")
+                else:
+                    check_clip_timing(prefix, path, clip, errors)
             except (ValueError, struct.error) as error:
                 errors.append(f"{prefix}: cannot validate MP4 container: {error}")
 

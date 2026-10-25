@@ -228,17 +228,19 @@ pub fn run_capture(
             let existing = handle.snapshot().cameras.len() as u32;
             let count = scene::screenshot_camera_count(&scene, existing, demo_cameras);
             app.apply_scene(&scene);
-            app.screenshot = Some(ScreenshotRequest {
-                path: path.clone(),
-                cameras: count,
-                started: Instant::now(),
-                streams_started: None,
-                staged: false,
-                requested: false,
-                save: None,
-                outcome: app_outcome.clone(),
-                sequence: screenshot_sequence.expect("validated screenshot sequence"),
-            });
+            match ScreenshotRequest::new(
+                path.clone(),
+                count,
+                app_outcome.clone(),
+                screenshot_sequence.expect("validated screenshot sequence"),
+            ) {
+                Ok(request) => app.screenshot = Some(request),
+                Err(error) => {
+                    *app_outcome.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(format!("{error:#}"));
+                    return (host::Host::new(app), iced::exit());
+                }
+            }
             for index in 0..if existing == 0 { count } else { 0 } {
                 app.send(
                     Job::Connect,
@@ -1507,8 +1509,21 @@ impl Workbench {
         style::window_theme(self.dark(), self.key_window == Some(id))
     }
 
-    /// How often `subscription` ticks.
+    /// How often the workbench ticks. A video sequence is moved on by its
+    /// own events instead: the staged frame's draw, its readback, and a
+    /// wake when the next frame is due. Every message redraws the window,
+    /// and draws beyond the display's rate delay the next screenshot; only
+    /// a frame the full writer queue holds back is retried quickly.
     fn tick_interval(&self) -> Duration {
+        if let Some(request) = &self.screenshot
+            && let Some(video) = &request.video
+        {
+            return if video.backlog.is_some() {
+                Duration::from_millis(5)
+            } else {
+                Duration::from_millis(60)
+            };
+        }
         let streaming = self.snapshot.cameras.iter().any(|camera| camera.streaming);
         // A quiet rediscovery shows nowhere, so its own running activity
         // entry needs no fast tick either.
@@ -1548,7 +1563,7 @@ impl Workbench {
     fn subscription(&self) -> Subscription<Message> {
         let interval = self.tick_interval();
         // Redraws also measure the display until its refresh rate is known.
-        let frames = if self.animating() || !self.refresh.calibrated() {
+        let frames = if self.animating() || !self.refresh.calibrated() || self.video_awaits_draw() {
             event::listen_raw(|event, _, window| match event {
                 iced::Event::Window(window::Event::RedrawRequested(at)) => Some((window, at)),
                 _ => None,
@@ -1967,11 +1982,7 @@ impl Workbench {
             let task = self.screenshot_tick();
             // The shot is saved: take the frames held back meanwhile now,
             // which frees the frame watcher, rather than a tick later.
-            if self
-                .screenshot
-                .as_ref()
-                .is_some_and(|request| !request.staged)
-            {
+            if !self.shot_staged() {
                 self.tick_frames();
             }
             return task;
@@ -2038,7 +2049,13 @@ impl Workbench {
             } else {
                 Task::none()
             },
-            if self.screenshot.is_none() {
+            // Video sequences run in isolated session dirs, so the summary
+            // settles deterministically instead of reading "Checking…".
+            if self
+                .screenshot
+                .as_ref()
+                .is_none_or(|request| request.sequence.is_video())
+            {
                 // A destination's own picker shows its free space.
                 let folder = self
                     .capture_to
@@ -3226,7 +3243,12 @@ impl Workbench {
                 }
             }
             Message::Tick => return self.tick(),
-            Message::Frame(at) => self.refresh.redraw(at),
+            Message::Frame(at) => {
+                self.refresh.redraw(at);
+                if self.video_awaits_draw() {
+                    return self.screenshot_tick();
+                }
+            }
             Message::Displaced => {
                 self.refresh.moved(self.now);
                 let id = self.main_window;
@@ -3236,7 +3258,12 @@ impl Workbench {
                 ]);
             }
             Message::ScreenRefresh(period) => self.refresh.report(period),
-            Message::FrameArrived | Message::Redrawn if !self.shot_staged() => self.update_frames(),
+            Message::FrameArrived | Message::Redrawn if !self.shot_staged() => {
+                self.update_frames();
+                if self.video_awaits_camera() {
+                    return self.screenshot_tick();
+                }
+            }
             Message::FrameArrived | Message::Redrawn => {}
             Message::Hidden(Some(hidden)) => {
                 if std::mem::replace(&mut self.hidden, hidden) && !hidden {
@@ -3727,6 +3754,13 @@ impl Workbench {
             Message::Tag(field, value) => field.set(&mut self.tags, value),
             Message::Dataset(message) => return self.dataset_update(message),
             Message::Screenshot(shot) => {
+                if self
+                    .screenshot
+                    .as_ref()
+                    .is_some_and(|request| request.video.is_some())
+                {
+                    return self.video_frame_read(shot);
+                }
                 if let Some(request) = &mut self.screenshot {
                     let path = request.sequence.path(&request.path);
                     let (sender, receiver) = mpsc::channel();

@@ -368,23 +368,34 @@ impl Workbench {
             .as_ref()
             .map(|camera| format!(" · {camera}"))
             .unwrap_or_default();
-        let text = format!(
+        let full = format!(
             "{}{} · {}: {}",
             actor_display(entry),
             target,
             activity_state(entry),
             entry.label
         );
-        // The toolbar may clip a long attribution. Its tooltip retains the
-        // actor and progress alongside the outcome; announcements include the
-        // same summary once, through Notice::announcement's shared handling.
+        // The narrow toolbar clips from the end, so the visible line leads
+        // with what was done; the mark already shows success. Its tooltip
+        // retains the full attribution and progress; announcements include
+        // it once, through Notice::announcement's shared handling.
+        let text = if effective_state(entry) == ActivityState::Succeeded && entry.job.is_none() {
+            format!("{} · {}{target}", entry.label, actor_display(entry))
+        } else {
+            format!(
+                "{}: {} · {}{target}",
+                activity_state(entry),
+                entry.label,
+                actor_display(entry)
+            )
+        };
         let mut detail = vec![format!(
             "Participant: {} · {}",
             actor_kind(entry.actor.kind),
             entry.actor.id
         )];
         detail.extend(entry.detail.iter().cloned());
-        let detail = Some(format!("{text}\n{}", detail.join("\n")));
+        let detail = Some(format!("{full}\n{}", detail.join("\n")));
         self.set_notice(text, detail, level);
     }
 

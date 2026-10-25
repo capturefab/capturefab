@@ -753,17 +753,15 @@ mod tests {
         let mut bench = Workbench::new(handle.clone(), "test".into(), true, None);
         bench.snapshot.active_camera = Some("cam".into());
         let (saved, save) = std::sync::mpsc::channel();
-        bench.screenshot = Some(ScreenshotRequest {
-            path: "shot.png".into(),
-            cameras: 1,
-            started: Instant::now(),
-            streams_started: None,
-            staged: true,
-            requested: true,
-            save: Some(save),
-            outcome: Default::default(),
-            sequence: scene::ScreenshotSequence::parse(Some("2"), Some("8")).unwrap(),
-        });
+        let mut request = ScreenshotRequest::new(
+            "shot.png".into(),
+            1,
+            Default::default(),
+            scene::ScreenshotSequence::parse(Some("1"), Some("8")).unwrap(),
+        )
+        .unwrap();
+        (request.staged, request.requested, request.save) = (true, true, Some(save));
+        bench.screenshot = Some(request);
         let frame = crate::types::Frame {
             id: 1,
             width: 4,
@@ -780,10 +778,46 @@ mod tests {
         assert_eq!(bench.frame_id, None, "held back");
         saved.send(Ok(())).unwrap();
         let _ = bench.update(Message::Tick);
-        assert!(!bench.shot_staged(), "released for the next shot");
+        assert!(bench.screenshot.is_none(), "the single shot is done");
         assert_eq!(bench.frame_id, Some(1), "taken on that tick");
         assert!(!bench.cadence.announced.load(Ordering::Acquire));
         handle.shutdown();
+    }
+
+    #[test]
+    fn frames_held_back_for_a_video_frame_are_taken_on_readback() {
+        let dir = scene::test_dir("video-readback");
+        let (handle, mut writer) = SessionHandle::fed(4096);
+        let mut bench = Workbench::new(handle.clone(), "test".into(), true, None);
+        bench.snapshot.active_camera = Some("cam".into());
+        let mut request = ScreenshotRequest::new(
+            dir.join("shot.png"),
+            1,
+            Default::default(),
+            scene::ScreenshotSequence::parse(Some("2"), Some("8")).unwrap(),
+        )
+        .unwrap();
+        (request.staged, request.requested) = (true, true);
+        bench.screenshot = Some(request);
+        let frame = crate::types::Frame {
+            id: 1,
+            width: 4,
+            height: 4,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: vec![0; 16],
+        };
+        writer.write(&frame, true).unwrap();
+        bench.cadence.announced.store(true, Ordering::Release);
+        let _ = bench.update(Message::FrameArrived);
+        assert_eq!(bench.frame_id, None, "held back");
+        let shot = window::Screenshot::new(vec![0; 64], iced::Size::new(4, 4), 1.0);
+        let _ = bench.update(Message::Screenshot(shot));
+        assert!(!bench.shot_staged(), "released for the next frame");
+        assert_eq!(bench.frame_id, Some(1), "taken on readback, without a tick");
+        assert!(!bench.cadence.announced.load(Ordering::Acquire));
+        handle.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
