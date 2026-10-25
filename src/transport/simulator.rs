@@ -582,10 +582,9 @@ mod tests {
             // AcquisitionStart.
             assert_eq!(camera.get("AcquisitionMode").unwrap(), "Continuous");
             assert!(camera.is_writable("TLParamsLocked"), "{selector}");
-            camera.set("TLParamsLocked", "1").unwrap();
-            assert_eq!(camera.get("TLParamsLocked").unwrap(), 1);
-            assert!(camera.set("TLParamsLocked", "2").is_err(), "{selector}");
+            assert!(camera.set("TLParamsLocked", "1").is_err(), "{selector}");
             camera.start().unwrap();
+            assert_eq!(camera.get("TLParamsLocked").unwrap(), 1, "{selector}");
             let frame = camera.next_frame(Duration::from_secs(1)).unwrap();
             assert_eq!(
                 frame.data.len(),
@@ -593,7 +592,7 @@ mod tests {
                 "{selector}"
             );
             camera.stop().unwrap();
-            camera.set("TLParamsLocked", "0").unwrap();
+            assert_eq!(camera.get("TLParamsLocked").unwrap(), 0, "{selector}");
         }
     }
 

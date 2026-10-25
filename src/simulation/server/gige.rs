@@ -870,18 +870,18 @@ mod tests {
         assert_eq!(camera.get("GevSCPD").unwrap(), 1000);
         assert_eq!(camera.get("AcquisitionMode").unwrap(), "Continuous");
         camera.set("AcquisitionMode", "Continuous").unwrap();
-        // GenTL producers lock transport parameters around acquisition.
+        // Acquisition locks transport parameters around AcquisitionStart.
         assert!(camera.is_writable("TLParamsLocked"));
-        camera.set("TLParamsLocked", "1").unwrap();
-        assert!(camera.set("TLParamsLocked", "2").is_err());
+        assert!(camera.set("TLParamsLocked", "1").is_err());
         camera.start().unwrap();
+        assert_eq!(camera.get("TLParamsLocked").unwrap(), 1);
         let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(
             (frame.width, frame.height, frame.data.len()),
             (64, 64, 4096)
         );
         camera.stop().unwrap();
-        camera.set("TLParamsLocked", "0").unwrap();
+        assert_eq!(camera.get("TLParamsLocked").unwrap(), 0);
         // Four-byte feature access exercises GVCP register transactions; Gain
         // above exercises the eight-byte READ/WRITE_MEMORY path.
         camera.set("Width", "96").unwrap();
