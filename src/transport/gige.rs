@@ -201,19 +201,22 @@ fn discovery_info(payload: &[u8], source: Ipv4Addr) -> Result<CameraInfo> {
 /// its limited broadcast leaves on that interface and broadcast
 /// acknowledgements from cameras on foreign subnets still reach it.
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
-fn interface_pinned_socket(index: u32) -> Option<UdpSocket> {
+fn interface_pinned_socket(index: u32, _name: &str) -> Option<UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).ok()?;
-    socket
-        .bind_device_by_index_v4(Some(std::num::NonZeroU32::new(index)?))
-        .ok()?;
+    let pinned = socket.bind_device_by_index_v4(Some(std::num::NonZeroU32::new(index)?));
+    // Kernels before 5.0 lack SO_BINDTOIFINDEX; SO_BINDTODEVICE needs no
+    // privilege from 5.7.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let pinned = pinned.or_else(|_| socket.bind_device(Some(_name.as_bytes())));
+    pinned.ok()?;
     socket
         .bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0).into())
         .ok()?;
     Some(socket.into())
 }
 #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
-fn interface_pinned_socket(_index: u32) -> Option<UdpSocket> {
+fn interface_pinned_socket(_index: u32, _name: &str) -> Option<UdpSocket> {
     None
 }
 
@@ -250,7 +253,7 @@ pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
             .then_some(interface.index)
             .flatten()
             .filter(|index| pinned_interfaces.insert(*index))
-            .and_then(interface_pinned_socket)
+            .and_then(|index| interface_pinned_socket(index, &interface.name))
             .filter(|socket| socket.set_broadcast(true).is_ok())
             .filter(|socket| socket.set_nonblocking(true).is_ok());
         let pinned_sent = pinned
@@ -2658,9 +2661,14 @@ mod tests {
             .unwrap()
             .into_iter()
             .find(|interface| interface.addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST))
-            .and_then(|interface| interface.index)
             .unwrap();
-        let socket = interface_pinned_socket(loopback).unwrap();
+        let socket = interface_pinned_socket(loopback.index.unwrap(), &loopback.name);
+        // Older or restricted Linux kernels refuse interface binding, and
+        // discovery then falls back to source-bound sockets.
+        if socket.is_none() && cfg!(not(target_os = "macos")) {
+            return;
+        }
+        let socket = socket.unwrap();
         let SocketAddr::V4(local) = socket.local_addr().unwrap() else {
             unreachable!()
         };
