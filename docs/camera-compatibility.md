@@ -11,7 +11,7 @@ network streams as well as industrial cameras. Run `capturefab doctor --json` an
 | GenICam USB3 Vision | Discovered `usb:` ID or unique serial | Register-backed camera XML features; USB3 Vision transport requires the `usb` build feature |
 | Document scanner | SANE `scanner:sane:DEVICE` on Linux, WIA `scanner:wia:ID` on Windows, ImageCaptureCore `scanner:ica:UUID` on macOS | On-demand page capture with resolution, mode and source settings; installed scanner driver and `scanner` build feature required; physical scanner compatibility has not been validated |
 | Built-in laptop camera or USB webcam/UVC capture device | AVFoundation on macOS, V4L2 on Linux, DirectShow on Windows | Capture; configure native size/frame rate and advertised `VideoMode` choices before acquisition; host device exposure/focus controls are not currently exposed |
-| Driver-backed Linux CSI camera | A usable `v4l2:/dev/videoN` endpoint | Same host capture path; platform driver and pipeline setup are required |
+| Driver-backed Linux CSI camera | A usable `v4l2:/dev/videoN` endpoint | Same host capture path when the node delivers a format FFmpeg's V4L2 input supports; Raspberry Pi camera modules and Jetson Bayer sensors usually need a libcamera or Argus stream instead |
 | ONVIF camera | `onvif:http://HOST/onvif/device_service` or authenticated locator | Discovery and Media1 profile/RTSP URI resolution; ONVIF PTZ and imaging configuration are not implemented |
 | Camera on a Home Assistant, Frigate, go2rtc or UniFi Protect server | `hub:NAME/CAMERA` after `capturefab hub add-…` saves the server | Read-only frames from the hub's MJPEG stream, snapshots or RTSP restream; camera settings stay in the hub; `hubs` build feature required; not validated against physical cameras or particular hub versions |
 | RTSP, SRT, HTTP, RTMP, UDP, or supported video file | Direct URL or file path | Decode and capture; source configuration belongs to its camera/server |
@@ -137,19 +137,28 @@ Capturefab uses the discovered locator and the matching transport to open them.
 ## Raspberry Pi and Jetson CSI cameras
 
 A CSI connector alone does not define a userspace camera interface. Capturefab
-can open a Linux camera pipeline that exposes a capture-capable V4L2 video node.
-Some Raspberry Pi/libcamera and Jetson/Argus camera pipelines require their own
-platform software, sensor driver, media-controller configuration, or an exported
-stream before they expose usable video. Capturefab does not currently implement
-libcamera's pipeline API, the NVIDIA Argus API, or CSI sensor/PHY drivers.
+captures from a V4L2 video node through FFmpeg's V4L2 input, so the node must
+deliver a format that input supports (YUV, RGB, 8- or 16-bit greyscale,
+MJPEG/H.264, or 8-bit Bayer without ISP processing such as auto exposure or white
+balance), and its driver must take the format from the video node rather than a
+media-controller pipeline. Raspberry Pi camera modules and Jetson Bayer sensors
+usually do not qualify: on Jetson, V4L2 delivers their raw 10- or 12-bit Bayer
+data, and Raspberry Pi OS runs the CSI receiver as a media-controller pipeline
+for libcamera (the only mode on Raspberry Pi 5). Capturefab does not currently
+implement libcamera's pipeline API, the NVIDIA Argus API, or CSI sensor/PHY
+drivers.
 
-Check native discovery, then capture from a node it reports. If the platform only
-exports a network stream, use its RTSP or other supported URL. Choose the Linux
-release matching the **installed operating system architecture**: run
-`dpkg --print-architecture`, and `arm64` takes the ARM64 (`aarch64`) release.
-There is no 32-bit ARM release; an `armhf` system, such as 32-bit Raspberry Pi
-OS, needs the 64-bit OS instead, which Raspberry Pi 3 and later run. `uname -m`
-cannot tell them apart there: it prints `aarch64` on 32-bit Raspberry Pi OS too.
+Publish those cameras as a stream with the platform software, for example
+`rpicam-vid` or MediaMTX's Raspberry Pi camera source, or `nvarguscamerasrc` on
+Jetson, and open its RTSP or SRT URL. For a YUV sensor or HDMI-to-CSI bridge
+that qualifies, check native discovery, then capture from a node it reports.
+
+Choose the Linux release matching the **installed operating system
+architecture**: run `dpkg --print-architecture`, and `arm64` takes the ARM64
+(`aarch64`) release. There is no 32-bit ARM release; an `armhf` system, such as
+32-bit Raspberry Pi OS, needs the 64-bit OS instead, which Raspberry Pi 3 and
+later run. `uname -m` cannot tell them apart there: it prints `aarch64` on 32-bit
+Raspberry Pi OS too.
 
 ## Panasonic LUMIX GX85 through HDMI
 
