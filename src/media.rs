@@ -1898,6 +1898,19 @@ fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
         _ => (dshow_modes(&log), Vec::new()),
     }
 }
+/// How a host camera's connect error begins when the system refused access;
+/// `cli::error_code` and the desktop's settings shortcut both read it.
+pub const CAMERA_ACCESS_DENIED: &str = "camera access denied";
+
+/// Whether `error` says the system refused access to a host camera, however
+/// session or IPC layers prefixed it.
+pub fn is_camera_access_denied(error: &str) -> bool {
+    error
+        .lines()
+        .next()
+        .is_some_and(|line| line.to_ascii_lowercase().contains(CAMERA_ACCESS_DENIED))
+}
+
 fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> Option<String> {
     let lower = log.to_ascii_lowercase();
     let platform = scheme(source);
@@ -1920,7 +1933,7 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
             }
             _ => "allow this app in System Settings > Privacy & Security > Camera",
         };
-        Some(format!("camera access denied: {guidance}"))
+        Some(format!("{CAMERA_ACCESS_DENIED}: {guidance}"))
     } else if log.contains("Cannot Use ")
         || ["device or resource busy", "already in use"]
             .iter()
@@ -6844,6 +6857,19 @@ Error opening input files: Input/output error
             failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot use FaceTime HD Camera").unwrap(),
             "camera access denied: allow this app in System Settings > Privacy & Security > Camera"
         );
+        for (source, log) in [
+            ("avfoundation:FaceTime HD Camera", "Cannot use FaceTime HD Camera"),
+            ("dshow:video=Integrated Webcam", "Error opening input: access denied"),
+            ("v4l2:/dev/video0", "Permission denied"),
+        ] {
+            let denied = native_failure(log, false, source, timeout).unwrap();
+            assert!(is_camera_access_denied(&denied), "{denied}");
+            assert!(is_camera_access_denied(&format!(
+                "connect avfoundation:0: {denied}\nmore detail"
+            )));
+        }
+        assert!(!is_camera_access_denied("camera is in use by another application"));
+        assert!(!is_camera_access_denied("timed out\ncamera access denied"));
         assert_eq!(
             failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot Use FaceTime HD Camera").unwrap(),
             "camera is in use by another application"

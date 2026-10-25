@@ -35,6 +35,7 @@ mod pick_list;
 mod prefs;
 pub(crate) use prefs::saved_performance;
 mod preview;
+mod rediscover;
 mod refresh;
 mod resources;
 mod reveal;
@@ -368,6 +369,9 @@ struct Pending {
     /// shared timeline rather than recording another edit.
     history_replay: Option<bool>,
     history_token: Option<String>,
+    /// A quiet rediscovery the welcome screen started by itself: no
+    /// placeholder, spinner, fast tick or notice; see `rediscover`.
+    background: bool,
 }
 
 impl Pending {
@@ -384,6 +388,7 @@ impl Pending {
             batch: false,
             history_replay: None,
             history_token: None,
+            background: false,
         }
     }
 
@@ -644,6 +649,11 @@ enum Message {
     VideoAnalytics(video_analytics::Input),
     IncludeSimulator(bool),
     TrySimulator,
+    /// List every camera found on the welcome screen, past its first few.
+    ShowAllCameras,
+    /// Open the system's camera privacy settings, after a webcam was
+    /// refused access.
+    OpenCameraPrivacy,
     EnterAddress,
     CameraRow(String),
     Forget(String),
@@ -1383,7 +1393,7 @@ impl Workbench {
         let streaming = self.snapshot.cameras.iter().any(|camera| camera.streaming);
         // Pending commands (connecting, discovering) tick fast enough to
         // step spinners and pulses without per-frame redraws.
-        let busy = !self.pending.is_empty()
+        let busy = self.pending.iter().any(|pending| !pending.background)
             || self.snapshot.activity.iter().any(|entry| {
                 entry.state.active()
                     && !(self.assistant_actor_is_local(&entry.actor.id)
@@ -1690,6 +1700,11 @@ impl Workbench {
         if self.camera_history_result(pending, result) {
             return;
         }
+        let issues_before = if pending.background {
+            self.side.discovery_issues.clone()
+        } else {
+            Vec::new()
+        };
         match result {
             Ok(value) => self.finished(pending, value),
             Err(error) => self.failed(pending, error),
@@ -1700,6 +1715,12 @@ impl Workbench {
         self.dataset_settled(pending, result);
         let notice = if pending.batch {
             self.batch_result(&pending.job, result)
+        } else if pending.background {
+            // A quiet round speaks only when what discovery reports changed.
+            (self.side.discovery_issues != issues_before
+                && !self.side.discovery_issues.is_empty())
+            .then(|| command_notice(&pending.job, result))
+            .flatten()
         } else {
             command_notice(&pending.job, result)
         };
@@ -1863,6 +1884,7 @@ impl Workbench {
         let pages = self.pickers_to_top();
         self.tick_chrome();
         self.tick_side();
+        self.tick_rediscover();
         self.tick_stage();
         self.tick_inspector();
         self.tick_analytics();
@@ -1941,6 +1963,10 @@ impl Workbench {
     /// when the main view now shows more or less of it: after a zoom, a
     /// resize or a change of scale.
     fn update_frame(&mut self, arrival: bool) {
+        // A screenshot scene whose first frame never comes.
+        if self.scene.no_picture {
+            return;
+        }
         let Some(frame) = self.selected_frame() else {
             return;
         };
@@ -2093,13 +2119,33 @@ impl Workbench {
     }
 
     fn discover(&mut self) {
-        self.send(
-            Job::Discover,
-            SessionCommand::Discover {
-                timeout_ms: 700,
-                simulated: self.include_simulator,
-            },
-        );
+        // Asked for while a quiet round runs: that round answers aloud.
+        if let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|pending| pending.job == Job::Discover && pending.background)
+        {
+            pending.background = false;
+            pending.at = self.now;
+            return;
+        }
+        self.send(Job::Discover, self.discover_command());
+    }
+
+    fn discover_command(&self) -> SessionCommand {
+        SessionCommand::Discover {
+            timeout_ms: 700,
+            simulated: self.include_simulator,
+        }
+    }
+
+    /// Whether a discovery anyone asked for is on its way: not a quiet
+    /// rediscovery, which shows nowhere.
+    fn discovering_aloud(&self) -> bool {
+        self.pending
+            .iter()
+            .any(|pending| pending.job == Job::Discover && !pending.background)
+            || self.client_pending(&Job::Discover, None)
     }
 
     fn connect(&mut self, camera: String) {
@@ -3064,6 +3110,16 @@ impl Workbench {
                 self.connect(self.free_simulator());
             }
             Message::EnterAddress => return self.enter_address(),
+            Message::ShowAllCameras => self.side.welcome_all = true,
+            Message::OpenCameraPrivacy => {
+                if let Err(error) = reveal::open_camera_privacy() {
+                    self.set_notice(
+                        format!("Could not open the camera privacy settings: {error}"),
+                        None,
+                        Level::Error,
+                    );
+                }
+            }
             Message::Forget(target) => self.recent.retain(|recent| recent.target != target),
             Message::CameraRow(id) => {
                 if self.snapshot.cameras.iter().any(|c| c.info.id == id) {

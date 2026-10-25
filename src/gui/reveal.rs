@@ -46,3 +46,47 @@ pub(super) fn reveal(path: &Path) -> io::Result<()> {
     std::thread::spawn(move || child.wait());
     Ok(())
 }
+
+/// What the button that opens the system's camera privacy settings says;
+/// `None` where there is no such page to open (Linux grants access through
+/// device groups, which the connect error explains).
+pub(super) fn camera_privacy_label() -> Option<&'static str> {
+    if cfg!(any(target_os = "macos", windows)) {
+        Some("Open Camera Settings")
+    } else {
+        None
+    }
+}
+
+/// Open the system's camera privacy settings: Privacy & Security > Camera
+/// on macOS, Privacy & security > Camera on Windows. Like `reveal`, the
+/// child runs without a shell and is reaped on a detached thread.
+pub(super) fn open_camera_privacy() -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Camera");
+        command
+    };
+    #[cfg(windows)]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        command.arg("ms-settings:privacy-webcam");
+        command
+    };
+    #[cfg(not(any(target_os = "macos", windows)))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this system has no camera privacy settings page",
+    ));
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        let mut child = command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        std::thread::spawn(move || child.wait());
+        Ok(())
+    }
+}

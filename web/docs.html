@@ -214,7 +214,7 @@ capturefab sessions
 capturefab --session gui connect sim:0
 capturefab --session gui start</code></pre><button class="copy-button" type="button" aria-label="Copy discovery and connection commands">Copy</button></div>
           <p>Select a camera by its discovered ID, unique serial number or GigE IPv4 address. A GigE camera must have a reachable address on its subnet.</p>
-          <p>USB3 Vision uses userspace access. Linux must have USB permissions. macOS must have an available IOKit interface. Windows must have WinUSB. Native webcams can also need operating system camera permission.</p>
+          <p>USB3 Vision uses userspace access. Linux must have USB permissions. macOS must have an available IOKit interface. Windows must have WinUSB. Native webcams can also need operating system camera permission. On macOS and Windows, when the system refuses a webcam, the welcome screen shows <strong>Open Camera Settings</strong>. Allow access there, then select the camera again.</p>
           <p>Camera commands automatically use the only active GUI or headless session. With several sessions, use <code>--session NAME</code>. Use <code>--direct --camera ID</code> for a temporary connection. Camera control can be exclusive. If the app has the camera open, use its session.</p>
           <p><code>--camera ID</code> targets a camera and keeps the visible selection. <code>select ID</code> sets the session default for CLI calls without <code>--camera</code>. Desktop windows and browser tabs each keep their own selection. <code>disconnect</code> releases the addressed camera.</p>
         </article>

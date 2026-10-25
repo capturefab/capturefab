@@ -12,9 +12,75 @@ const CALLOUT: f32 = 4.0 + style::line_height(style::SMALL) + 4.0;
 /// Height of the welcome screen's content with one card and its footer,
 /// which sits centered; more grows downward from there, so nothing above
 /// the cards ever moves as discovery changes them.
-const ANCHORED: f32 = 440.0;
+const ANCHORED: f32 = 400.0;
 /// How far the welcome screen rises as it fades in.
 const RISE: f32 = 24.0;
+/// How many cameras the welcome screen lists before "Show all".
+const SLOTS: usize = 4;
+/// Height of the "Show all" row under the cards: its padding and one line.
+const MORE: f32 = 4.0 + style::line_height(style::SMALL) + 4.0;
+/// Room under a streaming camera's title for what to check when its first
+/// frame is late, kept from the start so the title never moves: a hint of
+/// up to three lines and a row of buttons.
+const GUIDANCE: f32 = 10.0 + 3.0 * style::line_height(style::SMALL) + 12.0 + 32.0;
+
+/// What the welcome screen offers; see `welcome_choices`.
+pub(super) struct Choices<'a> {
+    /// Cameras to list as cards: connected ones, then found ones by rank.
+    pub(super) found: Vec<&'a CameraInfo>,
+    /// Recent cameras not found again, under their own heading.
+    pub(super) recent: Vec<&'a Recent>,
+    /// Whether the slot says discovery is searching.
+    pub(super) searching: bool,
+    /// Cameras found but not listed, for want of room.
+    pub(super) hidden: usize,
+}
+
+/// Where a found camera ranks on the welcome screen: machine-vision
+/// cameras first, then network streams, webcams, hub cameras, the
+/// simulator, screens and scanners. `camera::discover` keeps its own order,
+/// which the CLI reports.
+fn welcome_rank(device: &CameraInfo) -> u8 {
+    use crate::types::Transport;
+    match device.transport {
+        Transport::GigE | Transport::Usb3 => 0,
+        Transport::Media if crate::hubs::is_source(&device.id) => 3,
+        Transport::Media => match host_device(device) {
+            None => 1,
+            Some(HostKind::Webcam) => 2,
+            Some(HostKind::Screen) => 5,
+        },
+        Transport::Simulator => 4,
+        Transport::Scanner => 6,
+    }
+}
+
+/// A found camera's glyph: what kind of input it is.
+fn card_icon(device: &CameraInfo) -> Icon {
+    match host_device(device) {
+        Some(HostKind::Webcam) => Icon::Webcam,
+        Some(HostKind::Screen) => Icon::Monitor,
+        None => Icon::transport(device.transport),
+    }
+}
+
+/// What a streaming camera's user might check when its first frame is late,
+/// by transport; suggestions only, as a slow camera may simply be slow.
+fn first_frame_hint(transport: crate::types::Transport) -> Option<&'static str> {
+    use crate::types::Transport;
+    match transport {
+        Transport::GigE => Some(
+            "Frames may be blocked. Check that the firewall allows Capturefab, that the camera is on this computer's subnet, or try a smaller packet size.",
+        ),
+        Transport::Usb3 => Some(
+            "Check the cable and USB3 port, and that the system allows access to the camera.",
+        ),
+        Transport::Media => Some(
+            "Check the address and credentials, and for webcams the system's camera permission.",
+        ),
+        Transport::Simulator | Transport::Scanner => None,
+    }
+}
 
 impl Workbench {
     /// A connected camera before its first frame. On the first connect the
@@ -22,6 +88,12 @@ impl Workbench {
     pub(super) fn ready(&self, p: &'static Palette) -> Element<'_, Message> {
         let streaming = self.snapshot.streaming;
         let scanner = self.scanner_selected();
+        // A stream whose first frame is past due, by the same measure as
+        // the stall badge: never for triggered cameras or a busy worker.
+        let id = self.snapshot.active_camera.as_deref();
+        let late = streaming
+            && !scanner
+            && id.is_some_and(|id| self.stalled(id).is_some() && self.reconnecting(id).is_none());
         let mut ready = column![
             icon(
                 if scanner { Icon::Scan } else { Icon::Camera },
@@ -33,6 +105,8 @@ impl Workbench {
                 "Scanning document…"
             } else if scanner {
                 "Ready to scan a document"
+            } else if late {
+                "No picture yet"
             } else if streaming {
                 "Waiting for the first frame…"
             } else {
@@ -83,6 +157,14 @@ impl Workbench {
                 ),
             );
         }
+        if streaming && !scanner {
+            ready = ready.push(
+                container(self.first_frame_guidance(late))
+                    .height(GUIDANCE)
+                    .center_x(Fill)
+                    .align_top(GUIDANCE),
+            );
+        }
         let t = self.side.stage_in.get(self.now);
         let surface = style::mix(p.base, p.stage, t);
         // Floating panels cover the stage's center in compact windows.
@@ -110,6 +192,47 @@ impl Workbench {
                 ..container::Style::default()
             })
             .into()
+    }
+
+    /// Under a streaming camera's title, once its first frame is `late`:
+    /// what to check for its transport, and what to do about it.
+    fn first_frame_guidance(&self, late: bool) -> Element<'_, Message> {
+        let Some(id) = self.snapshot.active_camera.clone().filter(|_| late) else {
+            return space().height(0).into();
+        };
+        let transport = self
+            .snapshot
+            .connected
+            .as_ref()
+            .map(|camera| camera.transport);
+        let mut guidance = column![].spacing(12).align_x(Alignment::Center);
+        if let Some(hint) = transport.and_then(first_frame_hint) {
+            guidance = guidance.push(
+                text(hint)
+                    .size(style::SMALL)
+                    .color(style::ON_STAGE_SECONDARY)
+                    .align_x(Alignment::Center)
+                    .width(Fill),
+            );
+        }
+        let action = |label: &'static str, on: Option<Message>| {
+            button(text(label).size(style::BODY))
+                .name(label)
+                .padding([7, 12])
+                .style(style::on_glass(false, 1.0))
+                .on_press_maybe(on)
+        };
+        let mut actions = row![].spacing(10).align_y(Alignment::Center);
+        if transport == Some(crate::types::Transport::GigE) {
+            actions = actions.push(action(
+                "Check network",
+                (!self.pending(Job::NetworkScan)).then_some(Message::ScanNetwork),
+            ));
+        }
+        actions = actions
+            .push(action("Activity", Some(Message::CameraActivity(id))))
+            .push(action("Stop stream", Some(Message::ToggleStream)));
+        guidance.push(actions).max_width(440).into()
     }
 
     pub(super) fn welcome(&self, p: &'static Palette) -> Element<'_, Message> {
@@ -145,26 +268,30 @@ impl Workbench {
     }
 
     /// What the welcome screen offers: the cameras connected, found and
-    /// recent ones it lists as cards, and whether it says it is searching.
-    fn welcome_choices(&self) -> (Vec<&CameraInfo>, Vec<&Recent>, bool) {
+    /// recent ones it lists as cards, whether it says it is searching, and
+    /// how many found it has no room for.
+    pub(super) fn welcome_choices(&self) -> Choices<'_> {
         let connected = self.snapshot.cameras.iter().map(|camera| &camera.info);
-        let found: Vec<&CameraInfo> = connected
-            .clone()
-            .chain(
-                self.snapshot
-                    .devices
-                    .iter()
-                    .filter(|device| !connected.clone().any(|camera| camera.id == device.id)),
-            )
-            .take(4)
+        let mut discovered: Vec<&CameraInfo> = self
+            .listed_devices()
+            .filter(|device| !connected.clone().any(|camera| camera.id == device.id))
             .collect();
+        // Stable, so cameras of one rank keep discovery's order.
+        discovered.sort_by_key(|device| welcome_rank(device));
+        let total = connected.len() + discovered.len();
+        let shown = if self.side.welcome_all {
+            total
+        } else {
+            total.min(SLOTS)
+        };
+        let found: Vec<&CameraInfo> = connected.clone().chain(discovered).take(shown).collect();
         let recent: Vec<&Recent> = self
             .recent
             .iter()
             .filter(|recent| {
                 !connected
                     .clone()
-                    .chain(self.snapshot.devices.iter())
+                    .chain(self.listed_devices())
                     .any(|device| {
                         device.id == recent.target
                             || device.serial == recent.target
@@ -173,19 +300,24 @@ impl Workbench {
             })
             // With nothing found, the searching or not-found slot holds the
             // first card's place, so there are never more than four slots.
-            .take(4 - found.len().max(1))
+            .take(SLOTS.saturating_sub(found.len().max(1)))
             .collect();
         // A quick search keeps what the screen said; its button spins.
-        let searching_shown = self.pending(Job::Discover) && self.searching_shown();
-        (found, recent, searching_shown)
+        let searching = self.discovering_aloud() && self.searching_shown();
+        Choices {
+            hidden: total - found.len(),
+            found,
+            recent,
+            searching,
+        }
     }
 
     /// How the welcome screen offers a simulated camera; see
     /// `simulator_offer`.
     #[cfg(test)]
     fn welcome_simulator(&self) -> Option<bool> {
-        let (found, recent, searching_shown) = self.welcome_choices();
-        welcome_simulator_for(&found, &recent, searching_shown)
+        let choices = self.welcome_choices();
+        welcome_simulator_for(&choices.found, &choices.recent, choices.searching)
     }
 
     fn welcome_content_for(
@@ -194,53 +326,39 @@ impl Workbench {
         compact: bool,
     ) -> (Element<'_, Message>, f32) {
         let now = self.now;
-        let discovering = self.pending(Job::Discover);
+        let discovering = self.discovering_aloud();
         let spin = self.spin();
-        let (found, recent, searching_shown) = self.welcome_choices();
+        let Choices {
+            found,
+            recent,
+            searching: searching_shown,
+            hidden,
+        } = self.welcome_choices();
+        // The next step, not the state: the cards, the simulator and the
+        // address field below carry the actions.
         let subtitle = if !found.is_empty() {
-            "Choose a camera.".to_owned()
+            "Choose a camera to see a live image.".to_owned()
         } else if searching_shown {
             DISCOVERING.into()
         } else {
-            "No cameras found. Try the simulator, or enter an address or stream URL.".into()
+            "No cameras found yet.".into()
         };
         let mut extra = 0.0;
+        // A short window keeps its room for the cameras and the footer.
+        let mark: Element<'_, Message> = if compact {
+            space().height(0).into()
+        } else {
+            column![icon(Icon::Mark, 44.0, p.accent), space().height(10)]
+                .align_x(Alignment::Center)
+                .into()
+        };
         let mut content = column![
-            icon(Icon::Mark, if compact { 32.0 } else { 44.0 }, p.accent),
-            space().height(if compact { 6 } else { 10 }),
+            mark,
             text("Your capture workbench")
                 .size(style::DISPLAY)
                 .font(style::BOLD)
                 .color(p.text),
-            row![
-                button(
-                    row![
-                        icon(Icon::Sparkle, 15.0, Color::WHITE),
-                        text("Ask the assistant").size(style::BODY)
-                    ]
-                    .spacing(7)
-                    .align_y(Alignment::Center)
-                )
-                .name("Ask the assistant")
-                .description("Plan or run a capture task using your own provider or local model")
-                .style(style::primary)
-                .padding([7, 12])
-                .on_press(Message::Assistant(assistant::Input::Quick(
-                    assistant::quick::Input::Open(true)
-                ))),
-                button(text("Connect an agent").size(style::BODY))
-                    .name("Connect an agent")
-                    .description(
-                        "Let an external harness control this same workbench through the CLI"
-                    )
-                    .style(style::secondary)
-                    .padding([7, 12])
-                    .on_press(Message::AgentSetup(true)),
-            ]
-            .spacing(8)
-            .wrap()
-            .vertical_spacing(8),
-            space().height(if compact { 4 } else { 12 }),
+            space().height(if compact { 2 } else { 6 }),
             text(subtitle)
                 .size(style::BODY)
                 .color(p.secondary)
@@ -310,7 +428,7 @@ impl Workbench {
         for (index, device) in found.iter().enumerate() {
             let connected = self.snapshot.cameras.iter().any(|c| c.info.id == device.id);
             let card = self.welcome_card(
-                Icon::transport(device.transport),
+                card_icon(device),
                 &device.model,
                 if connected {
                     format!("Connected · {}", place(device))
@@ -328,6 +446,20 @@ impl Workbench {
             } else {
                 grow(card, CARD, arrival)
             });
+        }
+        if hidden > 0 {
+            let total = found.len() + hidden;
+            cards = cards.push(
+                container(
+                    button(text(format!("Show all {total} cameras")).size(style::SMALL))
+                        .name(format!("Show all {total} cameras"))
+                        .style(style::link)
+                        .padding([4, 6])
+                        .on_press(Message::ShowAllCameras),
+                )
+                .center_x(Fill),
+            );
+            extra += MORE + 8.0;
         }
         if !recent.is_empty() {
             cards = cards.push(
@@ -598,6 +730,7 @@ fn not_found<'a>(p: &'static Palette) -> Element<'a, Message> {
     )
     .width(Fill)
     .height(CARD)
+    .center_x(Fill)
     .center_y(CARD)
     .into()
 }
@@ -801,6 +934,55 @@ mod tests {
         }
     }
 
+    /// What to check when the first frame is late fits beside either
+    /// floating panel, at every interface size, in a compact window.
+    #[test]
+    fn late_first_frame_guidance_fits_beside_either_floating_panel_at_every_scale() {
+        for scale in prefs::UiScale::ALL {
+            for sidebar in [true, false] {
+                let mut app = bench();
+                app.pending.clear();
+                let id = streaming(&mut app, Transport::GigE);
+                app.now += Duration::from_secs(6);
+                assert!(app.stalled(&id).is_some());
+                app.ui_scale = scale;
+                app.width = 900.0 / scale.factor();
+                app.sidebar_peek = sidebar;
+                app.inspector_peek = !sidebar;
+                app.sidebar_slide.set(if sidebar { 1.0 } else { 0.0 });
+                app.inspector_slide.set(if sidebar { 0.0 } else { 1.0 });
+                let size = Size::new(app.width, 620.0 / scale.factor() - BAR - TOOLBAR);
+                let shown = controls(app.ready(Palette::of(false)), size);
+                let (left, right) = if sidebar {
+                    (INSPECTOR, size.width)
+                } else {
+                    (0.0, size.width - INSPECTOR)
+                };
+                for label in [
+                    "No picture yet",
+                    "Check network",
+                    "Activity",
+                    "Stop stream",
+                    first_frame_hint(Transport::GigE).unwrap(),
+                ] {
+                    let bounds = shown
+                        .iter()
+                        .find(|(name, _, _)| name == label)
+                        .map(|(_, _, bounds)| *bounds)
+                        .unwrap_or_else(|| panic!("{label} is visible at {scale}"));
+                    assert!(
+                        bounds.x0 >= f64::from(left) - 0.5
+                            && bounds.x1 <= f64::from(right) + 0.5
+                            && bounds.y0 >= 0.0
+                            && bounds.y1 <= f64::from(size.height) + 0.5,
+                        "{label} fits beside {} at {scale}: {bounds:?}",
+                        if sidebar { "Capture" } else { "Features" }
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_new_window_shows_the_picker_with_its_address_field() {
         use crate::gui::destinations::layout_tests::{prepare_artifact_frame, renderer};
@@ -812,7 +994,7 @@ mod tests {
         app.project_local_camera();
         assert!(app.local_camera.is_none() && app.snapshot.connected.is_none());
         // The camera it showed is still connected, and offered as a card.
-        let (found, _, _) = app.welcome_choices();
+        let found = app.welcome_choices().found;
         assert_eq!(found[0].id, camera.info.id);
         app.welcome.set(1.0);
         let size = Size::new(900.0, 620.0 - BAR - TOOLBAR);
@@ -963,17 +1145,251 @@ mod tests {
         // stopped advertising it. Its existing card must still replace
         // every recent alias, so those aliases cannot reconnect it.
         app.snapshot.cameras = vec![camera.clone()];
-        let (found, recent, _) = app.welcome_choices();
+        let Choices { found, recent, .. } = app.welcome_choices();
         assert_eq!(found.len(), 1);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].target, "192.168.1.21");
 
         app.snapshot.cameras.clear();
         app.snapshot.devices = vec![camera.info];
-        let (found, recent, _) = app.welcome_choices();
+        let Choices { found, recent, .. } = app.welcome_choices();
         assert_eq!(found.len(), 1);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].target, "192.168.1.21");
+    }
+
+    /// The labelled controls `view` lays out in `size`, with their bounds.
+    fn controls(
+        mut view: Element<'_, Message>,
+        size: Size,
+    ) -> Vec<(String, accessibility::Role, accesskit::Rect)> {
+        use crate::gui::destinations::layout_tests::{prepare_artifact_frame, renderer};
+        use iced::advanced::{Layout, layout, widget::Tree};
+        let renderer = renderer();
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        prepare_artifact_frame(&mut view, &mut tree, &node, &renderer, size);
+        let (snapshot, _, _) = accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        );
+        snapshot
+            .nodes
+            .iter()
+            .filter_map(|(_, control)| {
+                Some((
+                    control.label()?.to_owned(),
+                    control.role(),
+                    control.bounds()?,
+                ))
+            })
+            .collect()
+    }
+
+    fn mixed() -> Vec<CameraInfo> {
+        let device = |id: &str, transport: Transport, model: &str| CameraInfo {
+            id: id.into(),
+            transport,
+            vendor: "macos".into(),
+            model: model.into(),
+            serial: id.into(),
+            address: Some(id.into()),
+            profile: Default::default(),
+        };
+        // In discovery's ID order, which puts this computer's inputs first.
+        vec![
+            device(
+                "avfoundation:Capture screen 0",
+                Transport::Media,
+                "Capture screen 0",
+            ),
+            device("avfoundation:FaceTime", Transport::Media, "FaceTime"),
+            device("avfoundation:C920", Transport::Media, "C920"),
+            device("gige:10.0.0.5", Transport::GigE, "Area camera"),
+            device("scanner:flatbed", Transport::Scanner, "Flatbed"),
+            device("usb:XYZ", Transport::Usb3, "USB3 camera"),
+        ]
+    }
+
+    /// Machine-vision cameras lead, screens and scanners come last, and the
+    /// welcome screen says how many more it found than it lists.
+    #[test]
+    fn the_welcome_ranks_cameras_by_kind_and_offers_the_rest() {
+        let mut app = bench();
+        app.pending.clear();
+        app.snapshot.devices = mixed();
+        let choices = app.welcome_choices();
+        let ids: Vec<&str> = choices.found.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "gige:10.0.0.5",
+                "usb:XYZ",
+                "avfoundation:FaceTime",
+                "avfoundation:C920"
+            ]
+        );
+        assert_eq!(choices.hidden, 2, "the screen and the scanner");
+        assert!(choices.recent.is_empty());
+        // A connected camera still comes first.
+        let mut connected = liveness::streaming_camera(0, 0, 0.0);
+        connected.info = app.snapshot.devices[0].clone();
+        app.snapshot.cameras = vec![connected];
+        let choices = app.welcome_choices();
+        assert_eq!(choices.found[0].id, "avfoundation:Capture screen 0");
+        assert_eq!(choices.found[1].id, "gige:10.0.0.5");
+        assert_eq!(choices.hidden, 2);
+        app.snapshot.cameras.clear();
+
+        app.welcome.set(1.0);
+        let size = Size::new(900.0, 620.0 - BAR - TOOLBAR);
+        let shown = controls(app.welcome(Palette::of(false)), size);
+        assert!(
+            shown.iter().any(|(label, role, _)| label == "Show all 6 cameras"
+                && *role == accessibility::Role::Button),
+            "{shown:?}"
+        );
+        let _ = app.handle_message(Message::ShowAllCameras);
+        let choices = app.welcome_choices();
+        assert_eq!(choices.found.len(), 6);
+        assert_eq!(choices.hidden, 0);
+        assert_eq!(
+            choices.found.last().map(|d| d.id.as_str()),
+            Some("scanner:flatbed")
+        );
+        assert_eq!(choices.found[4].id, "avfoundation:Capture screen 0");
+        let shown = controls(app.welcome(Palette::of(false)), size);
+        assert!(!shown.iter().any(|(label, _, _)| label.starts_with("Show all")));
+        // Leaving the welcome screen folds the list again.
+        app.snapshot.connected = Some(crate::transport::simulator::info());
+        app.tick_side();
+        assert!(!app.side.welcome_all);
+
+        // Four or fewer need no link.
+        let mut app = bench();
+        app.snapshot.devices = mixed()[..4].to_vec();
+        assert_eq!(app.welcome_choices().hidden, 0);
+        app.welcome.set(1.0);
+        let shown = controls(app.welcome(Palette::of(false)), size);
+        assert!(!shown.iter().any(|(label, _, _)| label.starts_with("Show all")));
+    }
+
+    /// The camera path leads: the assistant and agent entry points sit
+    /// below the address field, quietly, and still in view.
+    #[test]
+    fn the_camera_path_leads_and_the_assistant_follows() {
+        let mut app = bench();
+        app.pending.clear();
+        app.welcome.set(1.0);
+        let size = Size::new(900.0, 620.0 - BAR - TOOLBAR);
+        let shown = controls(app.welcome(Palette::of(false)), size);
+        let top = |name: &str| {
+            shown
+                .iter()
+                .find(|(label, _, _)| label == name)
+                .map(|(_, _, bounds)| bounds.y0)
+                .unwrap_or_else(|| panic!("{name} in {shown:?}"))
+        };
+        let field = top("Camera address");
+        assert!(top("Try a simulated camera") < field);
+        assert!(top("Ask the assistant") > field);
+        assert!(top("Connect an agent") > field);
+        // The simulator is the one primary action, and only here.
+        assert_eq!(app.welcome_simulator(), Some(true));
+    }
+
+    /// The not-found slot sits centered under the headline, like the cards.
+    #[test]
+    fn the_not_found_slot_is_centered() {
+        let mut app = bench();
+        app.pending.clear();
+        app.welcome.set(1.0);
+        let size = Size::new(900.0, 620.0 - BAR - TOOLBAR);
+        let shown = controls(app.welcome(Palette::of(false)), size);
+        let bounds = |name: &str| {
+            shown
+                .iter()
+                .find(|(label, _, _)| label == name)
+                .map(|(_, _, bounds)| *bounds)
+                .unwrap_or_else(|| panic!("{name} in {shown:?}"))
+        };
+        let tips = bounds("Connection tips");
+        let field = bounds("Camera address");
+        let search = bounds(&Action::Discover.hint(DISCOVERS, Os::CURRENT));
+        let center = (field.x0 + search.x1) / 2.0;
+        // "Not seeing your camera?" sits left of the link, so the row's
+        // center is left of the link's; but far from the left edge.
+        assert!(
+            tips.x0 > center - 20.0 && tips.x0 < center + 120.0,
+            "tips {tips:?} around {center}"
+        );
+    }
+
+    fn streaming(app: &mut Workbench, transport: Transport) -> String {
+        let mut camera = liveness::streaming_camera(0, 0, 0.0);
+        camera.info.transport = transport;
+        let id = camera.info.id.clone();
+        app.snapshot.streaming = true;
+        app.snapshot.active_camera = Some(id.clone());
+        app.snapshot.connected = Some(camera.info.clone());
+        app.snapshot.cameras = vec![camera];
+        app.observe_liveness();
+        id
+    }
+
+    /// While a stream's first frame is late, the stage says what to check
+    /// for its transport, and offers what to do; never before its limit.
+    #[test]
+    fn a_late_first_frame_says_what_to_check() {
+        let size = Size::new(900.0, 620.0 - BAR - TOOLBAR);
+        for (transport, network) in [
+            (Transport::GigE, true),
+            (Transport::Usb3, false),
+            (Transport::Media, false),
+            (Transport::Simulator, false),
+        ] {
+            let mut app = bench();
+            app.pending.clear();
+            let id = streaming(&mut app, transport);
+            let labels = |app: &Workbench| -> Vec<String> {
+                controls(app.ready(Palette::of(false)), size)
+                    .into_iter()
+                    .map(|(label, _, _)| label)
+                    .collect()
+            };
+            let before = labels(&app);
+            assert!(before.iter().any(|l| l == "Waiting for the first frame…"));
+            assert!(!before.iter().any(|l| l == "Stop stream"), "{before:?}");
+            app.now += Duration::from_secs(6);
+            assert!(app.stalled(&id).is_some(), "{transport}");
+            let after = labels(&app);
+            assert!(after.iter().any(|l| l == "No picture yet"), "{after:?}");
+            assert!(after.iter().any(|l| l == "Stop stream"));
+            assert!(after.iter().any(|l| l == "Activity"));
+            assert_eq!(
+                after.iter().any(|l| l == "Check network"),
+                network,
+                "{transport}"
+            );
+            assert_eq!(
+                after.iter().any(|l| l.starts_with("Frames may be blocked")),
+                network
+            );
+        }
+        // A triggered camera waits as long as it must.
+        let mut app = bench();
+        app.pending.clear();
+        let id = streaming(&mut app, Transport::GigE);
+        app.liveness.get_mut(&id).unwrap().pace_triggered_for_tests();
+        app.now += Duration::from_secs(60);
+        let shown = controls(app.ready(Palette::of(false)), size);
+        assert!(!shown.iter().any(|(label, _, _)| label == "No picture yet"));
     }
 
     #[test]

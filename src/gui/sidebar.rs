@@ -82,6 +82,11 @@ pub(super) struct SideState {
     /// The stage dimming from the welcome screen's surface to its own as the
     /// first camera connects.
     pub(super) stage_in: Motion,
+    /// The welcome screen lists every camera found, not just its first
+    /// few; until it is left.
+    pub(super) welcome_all: bool,
+    /// Quiet rediscovery while the welcome screen waits.
+    pub(super) rediscover: rediscover::Rediscover,
 }
 
 struct AddressConnect {
@@ -107,6 +112,8 @@ impl Default for SideState {
             address_connect: None,
             had_camera: false,
             stage_in: Motion::new(1.0, motion::IMAGE, motion::IMAGE_OUT, Kind::Fade),
+            welcome_all: false,
+            rediscover: Default::default(),
         }
     }
 }
@@ -343,23 +350,23 @@ impl Workbench {
         }
         let now = self.now;
         let typed = self.address.trim();
-        // Newly found cameras arrive one after another, in list order.
+        // Newly found cameras arrive one after another, in list order. One
+        // a quiet round held is still listed, so it never arrives again.
+        let listed: Vec<String> = self
+            .listed_devices()
+            .map(|device| device.id.clone())
+            .collect();
         let side = &mut self.side;
         let mut fresh = 0;
-        for device in &self.snapshot.devices {
-            if !side.found.contains(&device.id) {
+        for id in &listed {
+            if !side.found.contains(id) {
                 let delay = STAGGER * fresh.min(STAGGERED) as u32;
-                side.arrived.hit(device.id.clone(), now + delay);
+                side.arrived.hit(id.clone(), now + delay);
                 fresh += 1;
             }
         }
-        if fresh > 0 || side.found.len() != self.snapshot.devices.len() {
-            side.found = self
-                .snapshot
-                .devices
-                .iter()
-                .map(|device| device.id.clone())
-                .collect();
+        if fresh > 0 || side.found.len() != listed.len() {
+            side.found = listed.into_iter().collect();
             // A serial typed before discovery found it reads as known now.
             if !typed.is_empty() {
                 side.hint.1 = read_address(typed, &self.snapshot.devices, side.is_file(typed));
@@ -382,6 +389,10 @@ impl Workbench {
             side.arrived.hit(ISSUES.to_owned(), now);
         }
         side.had_issues = issues;
+        // Leaving the welcome screen folds its list of cameras again.
+        if self.snapshot.connected.is_some() {
+            side.welcome_all = false;
+        }
         // The stage dims in as the first camera connects.
         let connected = self.observed_camera.is_some();
         if connected && !side.had_camera {
@@ -400,6 +411,7 @@ impl Workbench {
     ) {
         if pending.job == Job::Discover {
             self.side.searched = true;
+            self.result_rediscover(pending, result);
         }
         if let (Err(_), Some(target)) = (result, &pending.target)
             && self.address.trim() == target
@@ -476,6 +488,13 @@ fn host(address: &str) -> String {
 /// Where a camera is, identifier first: its address or serial (see
 /// `identity`), then its transport. Two cameras of one model differ here.
 pub(super) fn place(camera: &CameraInfo) -> String {
+    // A webcam or screen of this computer reads plainly, not as its
+    // backend's selector ("avfoundation:… · Media").
+    if host_device(camera).is_some()
+        && let Some(place) = host_place(&camera.id, &camera.model)
+    {
+        return place;
+    }
     // A hub camera's product says more than its transport ("Media").
     if crate::hubs::is_source(&camera.id) {
         return format!("{} · {}", identity(camera), camera.vendor);
@@ -486,6 +505,11 @@ pub(super) fn place(camera: &CameraInfo) -> String {
 /// A recent camera's detail, identifier first like `place`. Recents keep it
 /// as "transport · address or serial".
 pub(super) fn recent_place(recent: &Recent) -> String {
+    if recent.transport == crate::types::Transport::Media
+        && let Some(place) = host_place(&recent.target, &recent.label)
+    {
+        return place;
+    }
     match recent.detail.split_once(" · ") {
         Some((transport, place)) if place.contains("://") || crate::hubs::is_source(place) => {
             format!("{} · {transport}", short_address(place))
@@ -582,12 +606,13 @@ pub(super) fn reads_as_gige(target: &str, devices: &[CameraInfo]) -> bool {
 impl Workbench {
     /// Whether the welcome screen should say discovery is searching: from
     /// the start until the first one finishes, then once one has run for
-    /// `SEARCH_SHOWN`. Before that its slot keeps what it said.
+    /// `SEARCH_SHOWN`. Before that its slot keeps what it said. Quiet
+    /// rediscovery never says so.
     pub(super) fn searching_shown(&self) -> bool {
         let running = self
             .pending
             .iter()
-            .filter(|pending| pending.job == Job::Discover)
+            .filter(|pending| pending.job == Job::Discover && !pending.background)
             .map(|pending| self.now.saturating_duration_since(pending.at))
             .max();
         !self.side.searched || running.is_some_and(|running| running >= SEARCH_SHOWN)
@@ -615,6 +640,15 @@ impl Workbench {
                 .address
                 .as_deref()
                 .is_some_and(|address| self.connecting(address))
+    }
+
+    /// Whether a webcam's last connect failed because the system refused
+    /// access, so the footer offers the system's camera settings.
+    pub(super) fn camera_permission_relevant(&self) -> bool {
+        self.side
+            .connect_failures
+            .values()
+            .any(|(error, _)| crate::media::is_camera_access_denied(error))
     }
 
     /// Under the welcome screen's cards: the network check once GigE is in
@@ -733,6 +767,44 @@ impl Workbench {
                     .on_press(Message::Help(true)),
                 Action::Help.hint("Keyboard shortcuts and quick guide", Os::CURRENT),
             ),
+            // Other ways to work, after the camera's: quiet beside the
+            // window's own controls.
+            tip_above(
+                button(
+                    row![
+                        icon(Icon::Sparkle, 13.0, p.secondary),
+                        text("Ask the assistant")
+                            .size(style::SMALL)
+                            .color(p.secondary),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center),
+                )
+                .name("Ask the assistant")
+                .description("Plan or run a capture task using your own provider or local model")
+                .padding([5, 6])
+                .style(style::plain)
+                .on_press(Message::Assistant(assistant::Input::Quick(
+                    assistant::quick::Input::Open(true)
+                ))),
+                Action::QuickCommand.hint(
+                    "Plan or run a capture task using your own provider or local model",
+                    Os::CURRENT
+                ),
+            ),
+            tip_above(
+                button(
+                    text("Connect an agent")
+                        .size(style::SMALL)
+                        .color(p.secondary)
+                )
+                .name("Connect an agent")
+                .description("Let an external harness control this same workbench through the CLI")
+                .padding([5, 6])
+                .style(style::plain)
+                .on_press(Message::AgentSetup(true)),
+                "Let an external harness control this same workbench through the CLI",
+            ),
             space::horizontal(),
             session,
         ]
@@ -741,7 +813,27 @@ impl Workbench {
         // Its report only once there is one, so it is never shown disabled.
         // The slot stays one container either way, so the widgets after it
         // keep their state as it comes and goes.
-        let mut network = row![].align_y(Alignment::Center);
+        let mut network = row![].spacing(8).align_y(Alignment::Center);
+        // A webcam the system refused: one click to where access is given.
+        if self.camera_permission_relevant()
+            && let Some(label) = reveal::camera_privacy_label()
+        {
+            network = network.push(tip(
+                button(
+                    row![
+                        icon(Icon::Lock, 14.0, p.secondary),
+                        text(label).size(style::SMALL),
+                    ]
+                    .spacing(7)
+                    .align_y(Alignment::Center),
+                )
+                .name(label)
+                .padding([7, 10])
+                .style(style::secondary)
+                .on_press(Message::OpenCameraPrivacy),
+                "Allow camera access for Capturefab in the system privacy settings, then choose the camera again",
+            ));
+        }
         if self.network_check_relevant() {
             network = network
                 .push(self.network_scan_button(p))
@@ -1097,6 +1189,62 @@ mod tests {
         assert_eq!(recent_place(&recent("GigE")), "GigE");
     }
 
+    /// Webcams and screens say what they are, not their backend's selector,
+    /// unless the selector is what tells two of them apart.
+    #[test]
+    fn host_inputs_read_as_webcams_and_screens() {
+        let host = |id: &str, model: &str| CameraInfo {
+            id: id.into(),
+            transport: Transport::Media,
+            vendor: "macos".into(),
+            model: model.into(),
+            serial: id.into(),
+            address: Some(id.into()),
+            profile: Default::default(),
+        };
+        let cases = [
+            (
+                "avfoundation:HD Pro Webcam C920",
+                "HD Pro Webcam C920",
+                "Webcam · this computer",
+            ),
+            (
+                "avfoundation:Capture screen 0",
+                "Capture screen 0",
+                "Screen · this computer",
+            ),
+            ("avfoundation:4", "Cam", "#4 · Webcam"),
+            ("v4l2:/dev/video0", "UVC Camera", "/dev/video0 · Webcam"),
+            (
+                "dshow:video=Integrated Webcam",
+                "Integrated Webcam",
+                "Webcam · this computer",
+            ),
+        ];
+        for (id, model, expected) in cases {
+            assert_eq!(place(&host(id, model)), expected, "{id}");
+            let recent = Recent {
+                target: id.into(),
+                label: model.into(),
+                detail: format!("Media · {id}"),
+                transport: Transport::Media,
+            };
+            assert_eq!(recent_place(&recent), expected, "recent {id}");
+        }
+        // Streams and machine-vision cameras are unchanged.
+        let stream = host("rtsp://cam.local/line", "RTSP input");
+        assert_eq!(place(&stream), "cam.local/line · Media");
+        let mut gige = host("gige:10.0.0.5", "acA1920");
+        gige.transport = Transport::GigE;
+        gige.address = Some("10.0.0.5".into());
+        assert_eq!(place(&gige), "10.0.0.5 · GigE");
+        assert_eq!(
+            host_device(&host("avfoundation:Capture screen 1", "Capture screen 1")),
+            Some(HostKind::Screen)
+        );
+        assert_eq!(host_device(&gige), None);
+    }
+
     #[test]
     fn found_cameras_arrive_once_one_after_another() {
         let mut bench = bench();
@@ -1421,6 +1569,41 @@ mod tests {
         let mut bench = self::bench();
         bench.network_open = true;
         assert!(bench.network_check_relevant());
+    }
+
+    /// A webcam the system refused brings one click to its privacy
+    /// settings, where the system has such a page; nothing else does.
+    #[test]
+    fn a_refused_webcam_offers_the_camera_settings() {
+        let label = "Open Camera Settings";
+        let mut bench = bench();
+        assert!(!bench.camera_permission_relevant());
+        assert!(!has(&footer_buttons(&bench), label));
+        bench.side.connect_failed(
+            "192.168.1.50",
+            "no GigE Vision camera answered at 192.168.1.50 within 5 s".into(),
+            bench.now,
+        );
+        assert!(!bench.camera_permission_relevant(), "a GigE timeout");
+        let denied = format!(
+            "{}: allow this app in System Settings > Privacy & Security > Camera",
+            crate::media::CAMERA_ACCESS_DENIED
+        );
+        bench.side.connect_failed("avfoundation:0", denied, bench.now);
+        assert!(bench.camera_permission_relevant());
+        let buttons = footer_buttons(&bench);
+        let offered = buttons.iter().find(|(name, _)| name == label);
+        if reveal::camera_privacy_label().is_some() {
+            assert!(matches!(
+                offered.expect("the settings button").1,
+                Some(Message::OpenCameraPrivacy)
+            ));
+        } else {
+            assert!(offered.is_none(), "no page to open on this system");
+        }
+        // Connecting again retires the failure, and the button with it.
+        bench.side.connect_failures.remove("avfoundation:0");
+        assert!(!has(&footer_buttons(&bench), label));
     }
 
     #[test]

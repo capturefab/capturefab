@@ -3301,7 +3301,7 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
         || s.contains("not responding")
         || s.contains("already connected")
         || s.contains("controlled by another application")
-        || s.contains("camera access denied")
+        || s.contains(crate::media::CAMERA_ACCESS_DENIED)
         || s.contains("camera is in use by another application")
         || s.contains("is locked by another process")
     {

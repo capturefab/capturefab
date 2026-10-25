@@ -414,6 +414,66 @@ pub(super) fn identity(camera: &CameraInfo) -> String {
     }
 }
 
+/// What one of this computer's own media inputs is: a webcam, or a screen
+/// the system offers as a video input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HostKind {
+    Webcam,
+    Screen,
+}
+
+impl HostKind {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            HostKind::Webcam => "Webcam",
+            HostKind::Screen => "Screen",
+        }
+    }
+}
+
+/// The host backends' selector prefixes, as `capturefab native` lists them.
+const HOST_BACKENDS: [&str; 3] = ["avfoundation:", "v4l2:", "dshow:"];
+
+/// Whether the input `id` named `name` is one of this computer's media
+/// inputs, and which kind; `None` for streams, hubs and every other camera.
+/// AVFoundation calls its screen inputs "Capture screen N".
+pub(super) fn host_kind(id: &str, name: &str) -> Option<HostKind> {
+    HOST_BACKENDS
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+        .then(|| {
+            if name.starts_with("Capture screen") {
+                HostKind::Screen
+            } else {
+                HostKind::Webcam
+            }
+        })
+}
+
+/// `host_kind` of a discovered or connected camera.
+pub(super) fn host_device(camera: &CameraInfo) -> Option<HostKind> {
+    if camera.transport != crate::types::Transport::Media {
+        return None;
+    }
+    host_kind(&camera.id, &camera.model)
+}
+
+/// Where a host input is, in words: "Webcam · this computer" when its ID
+/// only repeats its name, else what tells it apart first ("/dev/video0 ·
+/// Webcam", "#4 · Webcam"), so two inputs of one name still differ.
+pub(super) fn host_place(id: &str, name: &str) -> Option<String> {
+    let kind = host_kind(id, name)?;
+    let (_, rest) = id.split_once(':')?;
+    let rest = rest.strip_prefix("video=").unwrap_or(rest);
+    Some(if rest == name || rest.is_empty() {
+        format!("{} · this computer", kind.label())
+    } else if rest.bytes().all(|byte| byte.is_ascii_digit()) {
+        format!("#{rest} · {}", kind.label())
+    } else {
+        format!("{rest} · {}", kind.label())
+    })
+}
+
 /// `identity(camera)` when another of the connected `cameras` is the same
 /// model, so its model alone would not tell them apart.
 pub(super) fn twin_identity(

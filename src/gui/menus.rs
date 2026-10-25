@@ -130,7 +130,7 @@ impl Workbench {
                     action(
                         "Discover Cameras",
                         Action::Discover,
-                        ready && !self.pending(Job::Discover),
+                        ready && !self.discovering_aloud(),
                     ),
                     None,
                     action(
