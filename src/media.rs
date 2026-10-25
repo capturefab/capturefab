@@ -450,6 +450,11 @@ thread_local! {
     static FAKE_FFMPEG: std::cell::RefCell<Option<Arc<Executable>>> =
         const { std::cell::RefCell::new(None) };
 }
+/// Makes `path` this test thread's FFmpeg, or, with `None`, stops.
+#[cfg(test)]
+pub(crate) fn set_fake_ffmpeg(path: Option<PathBuf>) {
+    FAKE_FFMPEG.set(path.map(|path| Arc::new(Executable::external(path))));
+}
 pub(crate) fn executable() -> Result<Arc<Executable>> {
     #[cfg(test)]
     if let Some(fake) = FAKE_FFMPEG.with_borrow(Clone::clone) {
@@ -861,6 +866,17 @@ fn hwaccel_available(exe: &Executable) -> bool {
     );
     // An FFmpeg that cannot run or finish the probe keeps `auto`.
     found.ok().flatten().unwrap_or(true)
+}
+/// Context for a decoder whose FFmpeg could not be extracted or started,
+/// unlike a source FFmpeg reached and failed on. Callers test for it with
+/// `error.downcast_ref::<FfmpegUnavailable>()`, never by message text:
+/// explained source failures quote FFmpeg's log too.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FfmpegUnavailable;
+impl std::fmt::Display for FfmpegUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cannot start FFmpeg decoder")
+    }
 }
 pub(crate) fn command(exe: &Executable) -> Command {
     let mut cmd = Command::new(&exe.path);
@@ -1349,7 +1365,7 @@ impl Decoder {
             !timeout.is_zero() && Instant::now().checked_add(timeout).is_some(),
             "media timeout must be positive and fit in the monotonic clock"
         );
-        let exe = executable()?;
+        let exe = executable().context(FfmpegUnavailable)?;
         let mut cmd = command(&exe);
         cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
         let configured = |name: &str| options.iter().any(|option| option == name);
@@ -1410,7 +1426,7 @@ impl Decoder {
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().context("cannot start FFmpeg decoder")?;
+        let mut child = cmd.spawn().context(FfmpegUnavailable)?;
         let stdout = child.stdout.take().unwrap();
         let log = Log::new();
         let log_thread = log.collect(child.stderr.take().unwrap());
@@ -2066,7 +2082,7 @@ fn network_failure(
         (
             ErrorKind::OperationFailed,
             format!(
-                "{host} rejected the username or password ({url}). Use {scheme}://USER:PASS@{at}{path}."
+                "{host} rejected the username or password ({url}). Check them, or add them as {scheme}://USER:PASS@{at}{path} if none were given."
             ),
             Some(said),
         )
@@ -2111,18 +2127,36 @@ fn network_failure(
             format!("{host} is not reachable from this computer ({url}).{hint}"),
             Some(said),
         )
-    } else {
-        // Anything else keeps FFmpeg's own error.
-        let said = line(&["connection timed out", "operation timed out"])
-            .or_else(|| (timed_out && log.trim().is_empty()).then_some(""))?;
+    } else if let Some(said) = line(&["connection timed out", "operation timed out"]) {
         (
             ErrorKind::Timeout,
             format!(
-                "No reply from {at} within {} s ({url}). Check it is on this network, or retry with --timeout-ms 10000.",
-                timeout.as_secs_f64()
+                "No reply from {at} ({url}). Check it is on this network and streaming{}.",
+                longer_wait(timeout)
+                    .map(|ms| format!(", or retry with a longer timeout (--timeout-ms {ms})"))
+                    .unwrap_or_default()
             ),
             Some(said),
         )
+    } else if timed_out && log.trim().is_empty() {
+        // FFmpeg logs only errors, so silence is also a stream that
+        // connected and is slow to send its first frame, such as a long
+        // GOP waiting for a keyframe.
+        (
+            ErrorKind::Timeout,
+            format!(
+                "No video arrived from {at} within {} s ({url}). It may be unreachable or slow to send its first frame; {}.",
+                timeout.as_secs_f64(),
+                longer_wait(timeout).map_or_else(
+                    || "check it is on this network and streaming".to_owned(),
+                    |ms| format!("retry with a longer timeout (--timeout-ms {ms})")
+                )
+            ),
+            None,
+        )
+    } else {
+        // Anything else keeps FFmpeg's own error.
+        return None;
     };
     let detail = said
         .map(ffmpeg_words)
@@ -2130,6 +2164,14 @@ fn network_failure(
         .map(|said| format!(" (FFmpeg: {said})"))
         .unwrap_or_default();
     Some(Categorized::error(kind, format!("{message}{detail}")))
+}
+/// A longer timeout in milliseconds to suggest, while one up to the 60 s
+/// limit is left to try: double the wait, and at least 10 s. The advice
+/// names the CLI flag in parentheses, after words the desktop reads too.
+fn longer_wait(timeout: Duration) -> Option<u128> {
+    let current = timeout.as_millis();
+    let suggested = (current * 2).clamp(10_000, 60_000);
+    (suggested > current).then_some(suggested)
 }
 /// A log line without FFmpeg's internals: its `[tcp @ 0x…]` component
 /// prefix and the `?timeout=` Capturefab passed, with any URL redacted.
@@ -5108,7 +5150,7 @@ exit 1"#,
         );
         assert_eq!(code, "operation_failed");
         assert!(
-            message.starts_with("127.0.0.1 rejected the username or password (rtsp://<redacted>@127.0.0.1:1/x). Use rtsp://USER:PASS@127.0.0.1:1/x."),
+            message.starts_with("127.0.0.1 rejected the username or password (rtsp://<redacted>@127.0.0.1:1/x). Check them, or add them as rtsp://USER:PASS@127.0.0.1:1/x if none were given."),
             "{message}"
         );
         let (code, message) = explained(
@@ -5142,12 +5184,35 @@ exit 1"#,
             message.starts_with("203.0.113.9 is not reachable from this computer"),
             "{message}"
         );
-        // Only silence within the wait is a timeout.
+        // Silence within the wait is a timeout, worded for a stream that
+        // may be merely slow: FFmpeg logs only errors.
         let (code, message) = explained("rtsp://user:pw@10.255.255.1/stream", "", true);
         assert_eq!(code, "timeout");
         assert_eq!(
             message,
-            "No reply from 10.255.255.1 within 2 s (rtsp://<redacted>@10.255.255.1/stream). Check it is on this network, or retry with --timeout-ms 10000."
+            "No video arrived from 10.255.255.1 within 2 s (rtsp://<redacted>@10.255.255.1/stream). It may be unreachable or slow to send its first frame; retry with a longer timeout (--timeout-ms 10000)."
+        );
+        // A connect that timed out says the host did not reply.
+        let (code, message) = explained(
+            "rtsp://10.255.255.1/stream",
+            "[tcp @ 0x3] Connection to tcp://10.255.255.1:554?timeout=2000000 failed: Operation timed out",
+            false,
+        );
+        assert_eq!(code, "timeout");
+        assert!(
+            message.starts_with("No reply from 10.255.255.1 (rtsp://10.255.255.1/stream). Check it is on this network and streaming, or retry with a longer timeout (--timeout-ms 10000). (FFmpeg: Connection to tcp://10.255.255.1:554 failed: Operation timed out)"),
+            "{message}"
+        );
+        // A longer wait is suggested only while one is left to try.
+        assert_eq!(longer_wait(Duration::from_secs(20)), Some(40_000));
+        assert_eq!(longer_wait(Duration::from_secs(40)), Some(60_000));
+        assert_eq!(longer_wait(Duration::from_secs(60)), None);
+        let (_, message) = network_failure(source, "", true, Duration::from_secs(60))
+            .map(|error| ((), format!("{error:#}")))
+            .unwrap();
+        assert!(
+            message.ends_with("It may be unreachable or slow to send its first frame; check it is on this network and streaming."),
+            "{message}"
         );
         for (log, timed_out) in [
             (refused, false),

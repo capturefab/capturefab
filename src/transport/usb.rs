@@ -127,10 +127,18 @@ fn access_error(
                 "USB3 Vision camera {name} disconnected while opening; reconnect it and discover again."
             ),
         ),
-        (Usb::Unsupported | Usb::NotFound | Usb::Other, "windows") => (
+        (Usb::Unsupported | Usb::NotFound, "windows") => (
             ErrorKind::Unavailable,
             format!(
-                "Windows is not using the WinUSB driver for the USB3 Vision interface of camera {name}. Install WinUSB for it; see https://capturefab.com/docs.html#discovery."
+                "Windows is not using the WinUSB driver for the USB3 Vision interface of camera {name}. Assign WinUSB to it; see https://capturefab.com/docs.html#winusb."
+            ),
+        ),
+        // Other is any unclassified failure: a camera that already uses
+        // WinUSB must not be sent to replace its driver.
+        (Usb::Other, "windows") => (
+            ErrorKind::OperationFailed,
+            format!(
+                "Cannot {doing} USB3 Vision camera {name}. If Windows is not using the WinUSB driver for its USB3 Vision interface, see https://capturefab.com/docs.html#winusb."
             ),
         ),
         (Usb::Unsupported | Usb::Other, "macos") => (
@@ -144,6 +152,18 @@ fn access_error(
             format!("Cannot {doing} USB3 Vision camera {name}{at}."),
         ),
     }
+}
+
+/// The camera as errors name it after "USB3 Vision camera": its product
+/// string, or without one its USB IDs, which tell cameras apart.
+fn display_name(product: Option<&str>, vendor_id: u16, product_id: u16) -> String {
+    product
+        .map(str::trim)
+        .filter(|product| !product.is_empty())
+        .map_or_else(
+            || format!("{vendor_id:04x}:{product_id:04x}"),
+            str::to_owned,
+        )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,10 +183,11 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         .wait()?
         .find(|d| camera_info(d).id == info.id)
         .context("USB3 Vision camera disconnected or its USB address changed; discover again")?;
-    let name = device_info
-        .product_string()
-        .unwrap_or("USB3 Vision camera")
-        .to_owned();
+    let name = display_name(
+        device_info.product_string(),
+        device_info.vendor_id(),
+        device_info.product_id(),
+    );
     let node = cfg!(target_os = "linux").then(|| {
         format!(
             "/dev/bus/usb/{}/{:03}",
@@ -844,7 +865,7 @@ mod tests {
                 Usb::NotFound,
                 "windows",
                 ErrorKind::Unavailable,
-                "Install WinUSB for it; see https://capturefab.com/docs.html#discovery",
+                "Assign WinUSB to it; see https://capturefab.com/docs.html#winusb",
             ),
             (
                 Stage::ClaimControl,
@@ -852,6 +873,13 @@ mod tests {
                 "windows",
                 ErrorKind::Unavailable,
                 "WinUSB",
+            ),
+            (
+                Stage::ClaimControl,
+                Usb::Other,
+                "windows",
+                ErrorKind::OperationFailed,
+                "Cannot claim the control interface of USB3 Vision camera acA. If Windows is not using",
             ),
             (
                 Stage::ClaimControl,
@@ -890,6 +918,17 @@ mod tests {
             access_error(Stage::Open, Usb::PermissionDenied, "acA", node, "linux");
         let error = Categorized::error(kind, message).context("connect usb:2676:ba02:1");
         assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+    }
+    #[test]
+    fn cameras_without_a_product_string_are_named_by_usb_ids() {
+        assert_eq!(display_name(Some(" acA1920 "), 0x2676, 0xba02), "acA1920");
+        assert_eq!(display_name(Some(""), 0x2676, 0xba02), "2676:ba02");
+        let name = display_name(None, 0x2676, 0xba02);
+        let (_, message) = access_error(Stage::Open, nusb::ErrorKind::Busy, &name, None, "linux");
+        assert!(
+            message.starts_with("USB3 Vision camera 2676:ba02 is in use"),
+            "{message}"
+        );
     }
     #[test]
     fn u3v_is_not_every_miscellaneous_device() {

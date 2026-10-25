@@ -322,7 +322,7 @@ pub(super) fn command_notice(
     match result {
         Ok(value) => outcome(job, value),
         Err(error) => {
-            let full = format!("{error:#}");
+            let full = desktop_words(format!("{error:#}"));
             Some((
                 format!("{}: {}", failure(job), first_line(&full)),
                 Some(full.clone()),

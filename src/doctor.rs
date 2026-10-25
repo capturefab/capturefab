@@ -156,8 +156,9 @@ struct Facts {
     /// IPv4 adapters, for the full report only: `serve`'s warnings never
     /// need them, and on Windows listing them runs PowerShell.
     interfaces: Option<Vec<NetworkInterface>>,
-    /// Whether FFmpeg runs, or why not.
-    ffmpeg: Result<FfmpegHealth, String>,
+    /// Whether FFmpeg runs, or why not, for the full report only: `serve`
+    /// would otherwise start FFmpeg (extracting it first) on every launch.
+    ffmpeg: Option<Result<FfmpegHealth, String>>,
     /// CAPTUREFAB_FFMPEG chose FFmpeg.
     ffmpeg_overridden: bool,
     /// The runtime or state directory, where it exists but sessions would
@@ -174,7 +175,8 @@ struct ServiceDir {
     running: Vec<String>,
 }
 impl Facts {
-    /// `report` also lists network adapters, which only `doctor` shows.
+    /// `report` also lists network adapters and runs FFmpeg, which only
+    /// `doctor` shows.
     fn gather(report: bool) -> Self {
         let state = crate::ipc::state_dir();
         let (budget, used) = ledger(&state);
@@ -189,7 +191,8 @@ impl Facts {
         }
         Self {
             interfaces: report.then(|| crate::network::interfaces().unwrap_or_default()),
-            ffmpeg: crate::media::ffmpeg_health().map_err(|error| format!("{error:#}")),
+            ffmpeg: report
+                .then(|| crate::media::ffmpeg_health().map_err(|error| format!("{error:#}"))),
             ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG").is_some(),
             private_dirs,
             efficiency: efficiency::current(),
@@ -319,7 +322,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     }
     writeln!(
         out,
-        "More: {GUIDE}. `capturefab network-scan` checks GigE adapters and camera links; `capturefab ffmpeg` lists codecs; doctor --json adds compiled features, scanners, JPEG encoders and network interfaces."
+        "More: {GUIDE}. See also network-scan and ffmpeg; --json adds features, scanners, JPEG encoders and interfaces."
     )?;
     if report["os"] == "linux" {
         writeln!(out, "Running it as a service: {LINE_COMPUTER}")?;
@@ -348,11 +351,12 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks.push(session_check(&facts.state, facts.session_dir_set));
     checks.extend(private_dirs_check(&facts.private_dirs));
     checks.extend(facts.interfaces.as_deref().map(camera_network_check));
-    checks.push(ffmpeg_check(
-        &facts.ffmpeg,
-        facts.ffmpeg_overridden,
-        cfg!(debug_assertions),
-    ));
+    checks.extend(
+        facts
+            .ffmpeg
+            .as_ref()
+            .map(|health| ffmpeg_check(health, facts.ffmpeg_overridden, cfg!(debug_assertions))),
+    );
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
     checks.extend(
@@ -603,11 +607,11 @@ fn camera_network_check(interfaces: &[NetworkInterface]) -> Check {
             let mut text = format!("{} {}/{prefix}", interface.name, interface.address);
             match interface.mtu {
                 Some(mtu) if mtu > 1500 => text.push_str(&format!(", MTU {mtu}")),
-                Some(mtu) => text.push_str(&format!(", MTU {mtu}: jumbo frames off")),
+                Some(mtu) => text.push_str(&format!(", MTU {mtu} (no jumbo frames)")),
                 None => {}
             }
             if interface.address.is_link_local() {
-                text.push_str(", a link-local address; cameras without DHCP use these too");
+                text.push_str(", link-local (used by cameras without DHCP)");
             }
             text
         })
@@ -615,7 +619,7 @@ fn camera_network_check(interfaces: &[NetworkInterface]) -> Check {
     Check::ok(
         "camera_network",
         if wired.is_empty() {
-            "No wired Ethernet adapter is up. GigE Vision cameras need one; webcams, USB3 and network streams do not. `capturefab network-scan` checks a camera link.".into()
+            "No wired Ethernet adapter is up. GigE Vision cameras need one; webcams, USB3 and network streams do not.".into()
         } else {
             format!("Wired Ethernet for GigE Vision: {}.", wired.join("; "))
         },
@@ -1399,14 +1403,14 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.message,
-            "Wired Ethernet for GigE Vision: en5 192.168.10.1/24, MTU 9000; en6 169.254.7.9/16, MTU 1500: jumbo frames off, a link-local address; cameras without DHCP use these too."
+            "Wired Ethernet for GigE Vision: en5 192.168.10.1/24, MTU 9000; en6 169.254.7.9/16, MTU 1500 (no jumbo frames), link-local (used by cameras without DHCP)."
         );
         let none = camera_network_check(&[wifi, vpn]);
         assert_eq!(none.level, Level::Ok);
         assert_eq!(none.fix, None);
         assert!(
             none.message.starts_with("No wired Ethernet adapter is up.")
-                && none.message.contains("`capturefab network-scan`"),
+                && !none.message.contains("network-scan"),
             "{}",
             none.message
         );

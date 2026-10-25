@@ -84,8 +84,24 @@ struct LinkMetadata {
 /// IPv4 addresses and link metadata; never changes host configuration. Unknown
 /// metadata is preserved rather than inferring Ethernet from an interface name.
 pub fn interfaces() -> Result<Vec<NetworkInterface>> {
+    interfaces_with(link_metadata())
+}
+
+/// [`interfaces`], waiting at most `limit` for link metadata: on macOS and
+/// Windows that runs other programs, and an error already late by a whole
+/// probe timeout should not wait seconds more. Without it, kinds are
+/// unknown and addresses and masks still come from the OS.
+pub(crate) fn interfaces_within(limit: Duration) -> Result<Vec<NetworkInterface>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    // The thread ends on its own once the bounded commands return.
+    std::thread::spawn(move || {
+        let _ = sender.send(link_metadata());
+    });
+    interfaces_with(receiver.recv_timeout(limit).unwrap_or_default())
+}
+
+fn interfaces_with(metadata: HashMap<String, LinkMetadata>) -> Result<Vec<NetworkInterface>> {
     let addresses = if_addrs::get_if_addrs().context("enumerating network interfaces")?;
-    let metadata = link_metadata();
     let mut interfaces = Vec::new();
     for interface in addresses {
         let if_addrs::IfAddr::V4(address) = interface.addr else {
@@ -428,6 +444,7 @@ macro_rules! local_network_text {
 /// reads as another category, so the error stays `unavailable`.
 pub const LOCAL_NETWORK_HINT: &str = local_network_text!();
 /// An unreachable reason for errors that carry only static text.
+#[cfg(any(feature = "hubs", test))]
 pub(crate) const NO_ROUTE_LOCAL_NETWORK: &str =
     concat!("no route to host; ", local_network_text!());
 
@@ -476,6 +493,10 @@ fn adapter_summary(interface: &NetworkInterface) -> String {
     format!("{} {}/{prefix}{kind}", interface.name, interface.address)
 }
 
+/// The advice a GigE connect error ends with when no adapter shares the
+/// camera's subnet. The desktop shows its Scan network button instead.
+pub(crate) const SCAN_ADVICE: &str = "run `capturefab network-scan`";
+
 /// What to do when the GigE Vision camera typed as `ip` did not answer within
 /// `waited`, or `refused` its control port, using this computer's adapters
 /// the way `network-scan` does.
@@ -486,15 +507,16 @@ pub(crate) fn explain_gige_unreachable(
     waited: Duration,
 ) -> String {
     let waited = wait_text(waited);
-    if refused || ip.is_loopback() {
+    if ip.is_loopback() {
+        // Nothing on this computer is a camera; a simulator may have been meant.
         let what = if refused {
-            format!(
-                "Something at {ip} refused GigE Vision control traffic; it may not be a GigE Vision camera."
-            )
+            format!("Nothing at {ip} accepts GigE Vision control traffic.")
         } else {
-            format!("No GigE Vision camera or camera simulator answered at {ip} within {waited}.")
+            format!("No GigE Vision camera simulator answered at {ip} within {waited}.")
         };
-        return format!("{what} For IP cameras, try onvif://{ip} or an rtsp:// URL.");
+        return format!(
+            "{what} Start one with `capturefab simulate run --preset gige --source PATH`, or connect sim:0 for the built-in test camera."
+        );
     }
     let adapters: Vec<&NetworkInterface> = interfaces
         .iter()
@@ -504,12 +526,7 @@ pub(crate) fn explain_gige_unreachable(
                 && interface.up != Some(false)
         })
         .collect();
-    if let Some(adapter) = adapters.iter().find(|interface| same_subnet(interface, ip)) {
-        return format!(
-            "No GigE Vision camera answered at {ip} within {waited} on {}. Check camera power and the Ethernet cable, allow GigE Vision UDP port 3956 through the firewall, and close other camera applications.",
-            adapter_summary(adapter)
-        );
-    }
+    let shared = adapters.iter().find(|interface| same_subnet(interface, ip));
     // VPN tunnels and virtual adapters are left out of the list: a camera
     // is not plugged into them.
     let physical: Vec<&&NetworkInterface> = adapters
@@ -529,8 +546,28 @@ pub(crate) fn explain_gige_unreachable(
         }
         names.join("; ")
     };
+    if refused {
+        // A router answers for an address off every local subnet too.
+        let subnet = match shared {
+            Some(_) => String::new(),
+            None => format!(
+                " No network adapter on this computer shares its subnet ({listed}), so the refusal may come from a router."
+            ),
+        };
+        return format!(
+            "Something at {ip} refused GigE Vision control traffic; it may not be a GigE Vision camera.{subnet} For IP cameras, try onvif://{ip} or an rtsp:// URL."
+        );
+    }
+    if let Some(adapter) = shared {
+        return format!(
+            "No GigE Vision camera answered at {ip} within {waited} on {}. Check camera power and the Ethernet cable, allow GigE Vision UDP port 3956 through the firewall, and close other camera applications.",
+            adapter_summary(adapter)
+        );
+    }
+    // The subnet leads: it is the likely cause, and the desktop's one-line
+    // slot shows only the start.
     format!(
-        "No GigE Vision camera answered at {ip} within {waited}. No network adapter on this computer shares the camera's subnet ({listed}). Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or run `capturefab network-scan`."
+        "No network adapter on this computer shares {ip}'s subnet ({listed}), and no GigE Vision camera answered there within {waited}. Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or {SCAN_ADVICE}."
     )
 }
 /// "2 s", "1.5 s", "300 ms".
@@ -567,10 +604,10 @@ pub(crate) fn explain_probe_failure(
     if !refused && unanswered.is_none() {
         return error;
     }
-    let interfaces = if refused || ip.is_loopback() {
+    let interfaces = if ip.is_loopback() {
         Vec::new()
     } else {
-        interfaces().unwrap_or_default()
+        interfaces_within(Duration::from_millis(500)).unwrap_or_default()
     };
     let message = explain_gige_unreachable(ip, &interfaces, refused, waited);
     let kind = if refused {
@@ -935,7 +972,7 @@ mod tests {
         );
         assert_eq!(
             elsewhere,
-            "No GigE Vision camera answered at 192.168.77.5 within 2 s. No network adapter on this computer shares the camera's subnet (en1 192.168.68.56/22, Wi-Fi). Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or run `capturefab network-scan`."
+            "No network adapter on this computer shares 192.168.77.5's subnet (en1 192.168.68.56/22, Wi-Fi), and no GigE Vision camera answered there within 2 s. Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or run `capturefab network-scan`."
         );
         // A /22 covers the camera: the adapter is named with the next steps.
         let near = explain_gige_unreachable(
@@ -969,15 +1006,32 @@ mod tests {
             listed.contains("en2 10.0.2.1/24, Ethernet; 2 more)"),
             "{listed}"
         );
-        // Something answered with a refusal, or nothing listens locally.
-        for (ip, refused) in [(camera, true), (Ipv4Addr::LOCALHOST, false)] {
-            let message = explain_gige_unreachable(ip, std::slice::from_ref(&wifi), refused, wait);
+        // Something answered with a refusal: on the camera's subnet it is
+        // the device, off every subnet perhaps a router.
+        let on = Ipv4Addr::new(192, 168, 69, 9);
+        let refused = explain_gige_unreachable(on, std::slice::from_ref(&wifi), true, wait);
+        assert_eq!(
+            refused,
+            "Something at 192.168.69.9 refused GigE Vision control traffic; it may not be a GigE Vision camera. For IP cameras, try onvif://192.168.69.9 or an rtsp:// URL."
+        );
+        let routed = explain_gige_unreachable(camera, std::slice::from_ref(&wifi), true, wait);
+        assert!(
+            routed.contains("it may not be a GigE Vision camera. No network adapter on this computer shares its subnet (en1 192.168.68.56/22, Wi-Fi), so the refusal may come from a router. For IP cameras, try onvif://192.168.77.5"),
+            "{routed}"
+        );
+        // Locally, only a simulator can answer.
+        for refused in [false, true] {
+            let message = explain_gige_unreachable(
+                Ipv4Addr::LOCALHOST,
+                std::slice::from_ref(&wifi),
+                refused,
+                wait,
+            );
             assert!(
-                message.ends_with(&format!(
-                    "For IP cameras, try onvif://{ip} or an rtsp:// URL."
-                )),
+                message.ends_with("Start one with `capturefab simulate run --preset gige --source PATH`, or connect sim:0 for the built-in test camera."),
                 "{message}"
             );
+            assert!(!message.contains("onvif"), "{message}");
         }
     }
 
@@ -990,7 +1044,7 @@ mod tests {
         let explained = explain_probe_failure(Ipv4Addr::LOCALHOST, wait, refused);
         assert_eq!(crate::cli::error_code(&explained), ("unavailable", 3));
         assert!(
-            explained.to_string().contains("onvif://127.0.0.1"),
+            explained.to_string().contains("capturefab simulate"),
             "{explained}"
         );
         let other = explain_probe_failure(

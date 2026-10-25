@@ -2345,7 +2345,7 @@ fn doctor_warns_when_ffmpeg_does_not_run_and_when_sessions_are_shared() {
 }
 
 #[test]
-fn an_address_without_a_gige_camera_suggests_other_sources() {
+fn a_local_address_without_a_gige_camera_suggests_the_simulator() {
     let dir = temp_root("gige-refused");
     let out = cmd(
         &dir,
@@ -2362,7 +2362,11 @@ fn an_address_without_a_gige_camera_suggests_other_sources() {
     assert_eq!(out.status.code(), Some(3), "{reply}");
     assert_eq!(reply["error"]["code"], "unavailable", "{reply}");
     let message = reply["error"]["message"].as_str().unwrap();
-    assert!(message.contains("onvif://127.0.0.1"), "{message}");
+    assert!(
+        message.contains("capturefab simulate run --preset gige"),
+        "{message}"
+    );
+    assert!(message.contains("sim:0"), "{message}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

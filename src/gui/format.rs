@@ -485,6 +485,24 @@ pub(super) fn first_line(error: &str) -> &str {
     error.lines().next().unwrap_or(error)
 }
 
+/// An error as the desktop shows it: advice to run a CLI command that has
+/// a button here names the button instead, and a CLI flag given in
+/// parentheses after its plain words is left out.
+pub(super) fn desktop_words(error: String) -> String {
+    let mut error = if error.contains(crate::network::SCAN_ADVICE) {
+        error.replace(crate::network::SCAN_ADVICE, "use Scan network")
+    } else {
+        error
+    };
+    while let Some(start) = error.find(" (--timeout-ms ") {
+        let Some(end) = error[start..].find(')') else {
+            break;
+        };
+        error.replace_range(start..start + end + 1, "");
+    }
+    error
+}
+
 /// A short span of time: "4 s", "3 min", "2 h".
 pub(super) fn span(duration: Duration) -> String {
     match duration.as_secs() {
@@ -914,6 +932,22 @@ mod tests {
         assert_eq!(plural(1204, "feature", "features"), "1,204 features");
         assert_eq!(first_line("no answer\nwithin 5 s"), "no answer");
         assert_eq!(first_line(""), "");
+    }
+
+    #[test]
+    fn errors_name_the_desktop_button_not_the_cli_command() {
+        assert_eq!(
+            desktop_words("Fix the subnet, then retry, or run `capturefab network-scan`.".into()),
+            "Fix the subnet, then retry, or use Scan network."
+        );
+        assert_eq!(
+            desktop_words(
+                "No video arrived; retry with a longer timeout (--timeout-ms 10000). (FFmpeg: x)"
+                    .into()
+            ),
+            "No video arrived; retry with a longer timeout. (FFmpeg: x)"
+        );
+        assert_eq!(desktop_words("busy".into()), "busy");
     }
 
     #[test]
