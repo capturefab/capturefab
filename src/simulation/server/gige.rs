@@ -28,6 +28,16 @@ const USER_NAME: u32 = 0x00e8;
 const MAX_STREAM_DELAY: u32 = 10_000_000;
 const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 type AcquisitionCommands = BTreeMap<u64, (u64, u64)>;
+/// SFNC transport layer features on the bootstrap registers, which keep
+/// their GigE Vision addresses and byte order.
+const TRANSPORT_FEATURES: &str = concat!(
+    r#"<Category Name="TransportLayerControl"><pFeature>GevSCPSPacketSize</pFeature><pFeature>GevSCPD</pFeature><pFeature>GevTimestampTickFrequency</pFeature></Category>"#,
+    r#"<Integer Name="GevSCPSPacketSize"><pValue>GevSCPSPacketSizeReg</pValue><Min>576</Min><Max>9000</Max><Unit>B</Unit></Integer>"#,
+    r#"<MaskedIntReg Name="GevSCPSPacketSizeReg"><Address>0xd04</Address><Length>4</Length><AccessMode>RW</AccessMode><pPort>Device</pPort><LSB>31</LSB><MSB>16</MSB><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></MaskedIntReg>"#,
+    r#"<Integer Name="GevSCPD"><pValue>GevSCPDReg</pValue><Min>0</Min><Max>10000000</Max></Integer>"#,
+    r#"<IntReg Name="GevSCPDReg"><Address>0xd08</Address><Length>4</Length><AccessMode>RW</AccessMode><pPort>Device</pPort><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>"#,
+    r#"<IntReg Name="GevTimestampTickFrequency"><Address>0x93c</Address><Length>8</Length><AccessMode>RO</AccessMode><pPort>Device</pPort><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></IntReg>"#,
+);
 
 /// A GVCP acknowledgement status and its reason.
 #[derive(Debug)]
@@ -709,30 +719,79 @@ fn wire_xml(source: &str) -> Result<(String, AcquisitionCommands)> {
         n.is_element()
             && matches!(
                 n.tag_name().name(),
-                "IntReg" | "FloatReg" | "StringReg" | "Register"
+                "IntReg" | "MaskedIntReg" | "FloatReg" | "StringReg" | "Register"
             )
     }) {
         if !register.children().any(|n| n.has_tag_name("pPort")) {
-            let close = source[register.range()]
-                .rfind("</")
-                .context("register closing tag missing")?
-                + register.range().start;
-            edits.push((close..close, "<pPort>Device</pPort>".into()));
+            // The schema places pPort right after AccessMode.
+            let at = match register.children().find(|n| n.has_tag_name("AccessMode")) {
+                Some(mode) => mode.range().end,
+                None => {
+                    source[register.range()]
+                        .rfind("</")
+                        .context("register closing tag missing")?
+                        + register.range().start
+                }
+            };
+            edits.push((at..at, "<pPort>Device</pPort>".into()));
         }
     }
+    let mut tail = String::new();
     if !doc
         .descendants()
         .any(|n| n.has_tag_name("Port") && n.attribute("Name") == Some("Device"))
     {
+        tail.push_str("<Port Name=\"Device\"/>");
+    }
+    if !doc.descendants().any(|n| {
+        n.attribute("Name")
+            .is_some_and(|name| name.starts_with("Gev"))
+    }) {
+        tail.push_str(TRANSPORT_FEATURES);
+        if let Some(root) = doc
+            .descendants()
+            .find(|n| n.has_tag_name("Category") && n.attribute("Name") == Some("Root"))
+            && let Some(close) = source[root.range()].rfind("</")
+        {
+            let close = close + root.range().start;
+            edits.push((
+                close..close,
+                "<pFeature>TransportLayerControl</pFeature>".into(),
+            ));
+        }
+    }
+    if !tail.is_empty() {
         let close = source
             .rfind("</RegisterDescription>")
             .context("camera XML root missing")?;
-        edits.push((close..close, "<Port Name=\"Device\"/>".into()));
+        edits.push((close..close, tail));
     }
     edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
     let mut result = source.to_owned();
     for (range, value) in edits {
         result.replace_range(range, &value);
+    }
+    // GenApi caches node maps by ProductGuid and VersionGuid, so the served
+    // version follows the served content. The root attribute precedes every
+    // other edit, so its range is unchanged.
+    if let Some(version) = doc.root_element().attribute_node("VersionGuid") {
+        use sha2::Digest;
+        let hex = sha2::Sha256::digest(result.as_bytes())
+            .iter()
+            .take(16)
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        result.replace_range(
+            version.range_value(),
+            &format!(
+                "{}-{}-{}-{}-{}",
+                &hex[..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..]
+            ),
+        );
     }
     Ok((result, commands))
 }
@@ -787,6 +846,20 @@ mod tests {
         assert_eq!(camera.get("Width").unwrap(), 64);
         camera.set("Gain", "3").unwrap();
         assert_eq!(camera.get("Gain").unwrap(), 3.0);
+        // Transport features read the bootstrap registers: the 64-bit tick
+        // frequency through READ_MEMORY, the masked packet size and SCPD
+        // through register commands.
+        assert_eq!(
+            camera.get("GevTimestampTickFrequency").unwrap(),
+            1_000_000_000
+        );
+        assert_eq!(camera.get("GevSCPSPacketSize").unwrap(), 1500);
+        camera.set("GevSCPD", "1000").unwrap();
+        assert_eq!(camera.get("GevSCPD").unwrap(), 1000);
+        assert_eq!(camera.get("AcquisitionMode").unwrap(), "Continuous");
+        camera.set("AcquisitionMode", "Continuous").unwrap();
+        camera.set("TLParamsLocked", "1").unwrap();
+        assert!(camera.set("TLParamsLocked", "2").is_err());
         camera.start().unwrap();
         let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(
@@ -824,6 +897,73 @@ mod tests {
         assert_eq!(camera.info.id, id);
         drop(camera);
         drop(server);
+    }
+
+    #[test]
+    fn served_xml_follows_the_genapi_schema_with_transport_features() {
+        let xml = |selector| {
+            let camera = Camera::open(selector, &[], Duration::from_millis(100)).unwrap();
+            (camera.xml().to_owned(), wire_xml(camera.xml()).unwrap().0)
+        };
+        let (source, served) = xml("sim:0");
+        let doc = roxmltree::Document::parse(&served).unwrap();
+        let root = doc.root_element();
+        assert_eq!(
+            root.tag_name().namespace(),
+            Some("http://www.genicam.org/GenApi/Version_1_1")
+        );
+        for (attribute, value) in [
+            ("ModelName", "Pattern_camera"),
+            ("StandardNameSpace", "None"),
+            ("SchemaMajorVersion", "1"),
+            ("SchemaMinorVersion", "1"),
+            ("SchemaSubMinorVersion", "0"),
+            ("MajorVersion", "1"),
+            ("ProductGuid", "a31ba2cf-1b8b-444e-a05a-e90ba9b67084"),
+        ] {
+            assert_eq!(root.attribute(attribute), Some(value), "{attribute}");
+        }
+        // GenApi caches node maps by GUID: other content, other version.
+        let version = |xml: &str| {
+            roxmltree::Document::parse(xml)
+                .unwrap()
+                .root_element()
+                .attribute("VersionGuid")
+                .unwrap()
+                .to_owned()
+        };
+        let served_version = version(&served);
+        assert_eq!(served_version.len(), 36);
+        assert_ne!(served_version, version(&source));
+        assert_ne!(served_version, version(&xml("sim:line").1));
+        for register in doc
+            .descendants()
+            .filter(|n| matches!(n.tag_name().name(), "IntReg" | "MaskedIntReg" | "FloatReg"))
+        {
+            let children: Vec<_> = register
+                .children()
+                .filter(|n| n.is_element())
+                .map(|n| n.tag_name().name())
+                .collect();
+            let mode = children.iter().position(|n| *n == "AccessMode").unwrap();
+            assert_eq!(children[mode + 1], "pPort", "{children:?}");
+            if let Some(sign) = children.iter().position(|n| *n == "Sign") {
+                assert!(children[sign..].contains(&"Endianess"), "{children:?}");
+            }
+        }
+        for feature in [
+            "TLParamsLocked",
+            "AcquisitionMode",
+            "GevSCPSPacketSize",
+            "GevSCPD",
+            "GevTimestampTickFrequency",
+        ] {
+            assert!(
+                doc.descendants()
+                    .any(|n| n.attribute("Name") == Some(feature)),
+                "{feature}"
+            );
+        }
     }
 
     fn loopback_camera() -> (super::super::VirtualCameraServer, SocketAddr) {

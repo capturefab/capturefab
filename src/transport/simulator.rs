@@ -92,26 +92,28 @@ impl SimKind {
 }
 
 const XML: &str = r#"<?xml version="1.0"?>
-<RegisterDescription ModelName="$Model" VendorName="Capturefab" StandardNameSpace="None">
+<RegisterDescription ModelName="$Model" VendorName="Capturefab" StandardNameSpace="None" SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="0" MajorVersion="1" MinorVersion="0" SubMinorVersion="0" ProductGuid="a31ba2cf-1b8b-444e-a05a-e90ba9b67084" VersionGuid="e1ec8b77-5fd9-421f-bf7a-8bdb85b89668" xmlns="http://www.genicam.org/GenApi/Version_1_1">
  <Category Name="Root"><pFeature>DeviceControl</pFeature><pFeature>ImageFormatControl</pFeature><pFeature>AcquisitionControl</pFeature>$SpecialCategory</Category>
  <Category Name="DeviceControl"><pFeature>DeviceScanType</pFeature></Category>
- <Enumeration Name="DeviceScanType"><Value>$ScanType</Value><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Areascan"><Value>0</Value></EnumEntry><EnumEntry Name="Linescan"><Value>1</Value></EnumEntry></Enumeration>
+ <Enumeration Name="DeviceScanType"><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Areascan"><Value>0</Value></EnumEntry><EnumEntry Name="Linescan"><Value>1</Value></EnumEntry><Value>$ScanType</Value></Enumeration>
  <Category Name="ImageFormatControl"><pFeature>Width</pFeature><pFeature>Height</pFeature><pFeature>PixelFormat</pFeature></Category>
- <Category Name="AcquisitionControl">$AnalogCategory<pFeature>$RateFeature</pFeature><pFeature>AcquisitionStart</pFeature><pFeature>AcquisitionStop</pFeature></Category>
+ <Category Name="AcquisitionControl"><pFeature>AcquisitionMode</pFeature>$AnalogCategory<pFeature>$RateFeature</pFeature><pFeature>AcquisitionStart</pFeature><pFeature>AcquisitionStop</pFeature></Category>
  <Integer Name="Width"><Description>Image width in pixels. Stop acquisition before changing.</Description><pValue>WidthReg</pValue><Min>64</Min><Max>1920</Max><Inc>1</Inc></Integer>
- <IntReg Name="WidthReg"><Address>0x100</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
+ <IntReg Name="WidthReg"><Address>0x100</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
  <Integer Name="Height"><Description>$HeightDescription</Description><pValue>HeightReg</pValue><Min>$HeightMin</Min><Max>1080</Max><Inc>1</Inc></Integer>
- <IntReg Name="HeightReg"><Address>0x104</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
- <Enumeration Name="PixelFormat"><pValue>PixelFormatReg</pValue>$PixelEntries</Enumeration>
- <IntReg Name="PixelFormatReg"><Address>0x108</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
+ <IntReg Name="HeightReg"><Address>0x104</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Enumeration Name="PixelFormat">$PixelEntries<pValue>PixelFormatReg</pValue></Enumeration>
+ <IntReg Name="PixelFormatReg"><Address>0x108</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
  $AnalogFeatures
  <Float Name="$RateFeature"><Description>$RateDescription</Description><pValue>RateReg</pValue><Min>1</Min><Max>$RateMax</Max><Unit>Hz</Unit></Float>
  <FloatReg Name="RateReg"><Address>0x120</Address><Length>8</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></FloatReg>
  <Integer Name="PayloadSize"><pValue>PayloadReg</pValue></Integer>
- <IntReg Name="PayloadReg"><Address>0x128</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
+ <IntReg Name="PayloadReg"><Address>0x128</Address><Length>4</Length><AccessMode>RO</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Enumeration Name="AcquisitionMode"><EnumEntry Name="Continuous"><Value>0</Value></EnumEntry><Value>0</Value></Enumeration>
  <Command Name="AcquisitionStart"><pValue>AcqReg</pValue><CommandValue>1</CommandValue></Command>
  <Command Name="AcquisitionStop"><pValue>AcqReg</pValue><CommandValue>0</CommandValue></Command>
- <IntReg Name="AcqReg"><Address>0x130</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
+ <IntReg Name="AcqReg"><Address>0x130</Address><Length>4</Length><AccessMode>WO</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Integer Name="TLParamsLocked"><Visibility>Invisible</Visibility><Value>0</Value><Min>0</Min><Max>1</Max></Integer>
  $SpecialFeatures
 </RegisterDescription>"#;
 
@@ -123,13 +125,13 @@ const ANALOG_FEATURES: &str = r#"
 
 const DEPTH_FEATURES: &str = r#"
  <Category Name="Scan3dControl"><pFeature>ComponentSelector</pFeature><pFeature>Scan3dOutputMode</pFeature><pFeature>Scan3dCoordinateScale</pFeature><pFeature>Scan3dCoordinateOffset</pFeature><pFeature>Scan3dCoordinateUnit</pFeature><pFeature>Scan3dInvalidDataFlag</pFeature><pFeature>Scan3dInvalidDataValue</pFeature></Category>
- <Enumeration Name="ComponentSelector"><Value>0</Value><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Range"><Value>0</Value></EnumEntry></Enumeration>
- <Enumeration Name="Scan3dOutputMode"><Value>0</Value><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="CalibratedC"><Value>0</Value></EnumEntry></Enumeration>
- <Float Name="Scan3dCoordinateScale"><Value>1</Value><ImposedAccessMode>RO</ImposedAccessMode></Float>
- <Float Name="Scan3dCoordinateOffset"><Value>0</Value><ImposedAccessMode>RO</ImposedAccessMode></Float>
- <Enumeration Name="Scan3dCoordinateUnit"><Value>0</Value><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Millimeter"><Value>0</Value></EnumEntry></Enumeration>
- <Boolean Name="Scan3dInvalidDataFlag"><Value>1</Value><ImposedAccessMode>RO</ImposedAccessMode></Boolean>
- <Float Name="Scan3dInvalidDataValue"><Description>Zero denotes an invalid depth sample.</Description><Value>0</Value><ImposedAccessMode>RO</ImposedAccessMode></Float>"#;
+ <Enumeration Name="ComponentSelector"><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Range"><Value>0</Value></EnumEntry><Value>0</Value></Enumeration>
+ <Enumeration Name="Scan3dOutputMode"><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="CalibratedC"><Value>0</Value></EnumEntry><Value>0</Value></Enumeration>
+ <Float Name="Scan3dCoordinateScale"><ImposedAccessMode>RO</ImposedAccessMode><Value>1</Value></Float>
+ <Float Name="Scan3dCoordinateOffset"><ImposedAccessMode>RO</ImposedAccessMode><Value>0</Value></Float>
+ <Enumeration Name="Scan3dCoordinateUnit"><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Millimeter"><Value>0</Value></EnumEntry><Value>0</Value></Enumeration>
+ <Boolean Name="Scan3dInvalidDataFlag"><ImposedAccessMode>RO</ImposedAccessMode><Value>1</Value></Boolean>
+ <Float Name="Scan3dInvalidDataValue"><Description>Zero denotes an invalid depth sample.</Description><ImposedAccessMode>RO</ImposedAccessMode><Value>0</Value></Float>"#;
 
 const MICROSCOPE_FEATURES: &str = r#"
  <Category Name="MicroscopeControl"><pFeature>FocusPosition</pFeature><pFeature>Magnification</pFeature><pFeature>IlluminationIntensity</pFeature></Category>
@@ -142,9 +144,9 @@ const MICROSCOPE_FEATURES: &str = r#"
 
 const THERMAL_FEATURES: &str = r#"
  <Category Name="TemperatureControl"><pFeature>TemperatureLinearMode</pFeature><pFeature>TemperatureLinearResolution</pFeature><pFeature>TemperatureUnit</pFeature></Category>
- <Enumeration Name="TemperatureLinearMode"><Value>1</Value><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="On"><Value>1</Value></EnumEntry></Enumeration>
- <Float Name="TemperatureLinearResolution"><Description>Multiply each raw pixel by this value to obtain Kelvin.</Description><Value>0.01</Value><ImposedAccessMode>RO</ImposedAccessMode><Unit>K</Unit></Float>
- <Enumeration Name="TemperatureUnit"><Value>0</Value><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Kelvin"><Value>0</Value></EnumEntry></Enumeration>"#;
+ <Enumeration Name="TemperatureLinearMode"><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="On"><Value>1</Value></EnumEntry><Value>1</Value></Enumeration>
+ <Float Name="TemperatureLinearResolution"><Description>Multiply each raw pixel by this value to obtain Kelvin.</Description><ImposedAccessMode>RO</ImposedAccessMode><Value>0.01</Value><Unit>K</Unit></Float>
+ <Enumeration Name="TemperatureUnit"><ImposedAccessMode>RO</ImposedAccessMode><EnumEntry Name="Kelvin"><Value>0</Value></EnumEntry><Value>0</Value></Enumeration>"#;
 
 const MONO12: u32 = 0x0110_0005;
 const MONO16: u32 = 0x0110_0007;
@@ -244,7 +246,8 @@ impl Simulator {
             _ => ("", ""),
         };
         let line = self.kind == SimKind::Line;
-        XML.replace("$Model", self.kind.model())
+        // GenApi model names are C identifiers.
+        XML.replace("$Model", &self.kind.model().replace(' ', "_"))
             .replace("$SpecialCategory", special_category)
             .replace("$SpecialFeatures", special_features)
             .replace("$ScanType", if line { "1" } else { "0" })
@@ -575,6 +578,12 @@ mod tests {
             assert_eq!(camera.info.profile.kind, kind, "{selector}");
             assert_eq!(camera.get(feature).unwrap(), expected, "{selector}");
             assert!(!camera.is_writable(feature), "{selector}");
+            // SFNC-mandatory acquisition features that clients set around
+            // AcquisitionStart.
+            assert_eq!(camera.get("AcquisitionMode").unwrap(), "Continuous");
+            camera.set("TLParamsLocked", "1").unwrap();
+            assert_eq!(camera.get("TLParamsLocked").unwrap(), 1);
+            assert!(camera.set("TLParamsLocked", "2").is_err(), "{selector}");
             camera.start().unwrap();
             let frame = camera.next_frame(Duration::from_secs(1)).unwrap();
             assert_eq!(
