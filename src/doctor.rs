@@ -1609,7 +1609,10 @@ mod tests {
             .collect();
         assert_eq!(rules, UDEV_RULES);
         // The desktop app and the USB open error offer the same command.
-        assert_eq!(fix_line(&with_usb_access_fix("x")), Some(usb_access_fix().as_str()));
+        assert_eq!(
+            fix_line(&with_usb_access_fix("x")),
+            Some(usb_access_fix().as_str())
+        );
     }
 
     #[test]
@@ -1624,7 +1627,9 @@ mod tests {
         let message = format!("{rebuilt:#}");
         assert_eq!(
             message.lines().next(),
-            Some("No permission to open USB3 Vision camera acA1920-155um (/dev/bus/usb/002/003). Run `capturefab doctor` for the udev rule that fixes it.")
+            Some(
+                "No permission to open USB3 Vision camera acA1920-155um (/dev/bus/usb/002/003). Run `capturefab doctor` for the udev rule that fixes it."
+            )
         );
         assert_eq!(fix_line(&message), Some(usb_access_fix().as_str()));
     }

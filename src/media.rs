@@ -7356,8 +7356,14 @@ Error opening input files: Input/output error
             "camera access denied: allow this app in System Settings > Privacy & Security > Camera"
         );
         for (source, log) in [
-            ("avfoundation:FaceTime HD Camera", "Cannot use FaceTime HD Camera"),
-            ("dshow:video=Integrated Webcam", "Error opening input: access denied"),
+            (
+                "avfoundation:FaceTime HD Camera",
+                "Cannot use FaceTime HD Camera",
+            ),
+            (
+                "dshow:video=Integrated Webcam",
+                "Error opening input: access denied",
+            ),
             ("v4l2:/dev/video0", "Permission denied"),
         ] {
             let denied = native_failure(log, false, source, timeout).unwrap();
@@ -7366,7 +7372,9 @@ Error opening input files: Input/output error
                 "connect avfoundation:0: {denied}\nmore detail"
             )));
         }
-        assert!(!is_camera_access_denied("camera is in use by another application"));
+        assert!(!is_camera_access_denied(
+            "camera is in use by another application"
+        ));
         assert!(!is_camera_access_denied("timed out\ncamera access denied"));
         assert_eq!(
             failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot Use FaceTime HD Camera").unwrap(),

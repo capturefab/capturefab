@@ -210,13 +210,12 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
             let message = format!("{message} (USB: {error})");
             // On Linux the udev rule fixes it; the desktop app offers to
             // copy that line.
-            let message = if error.kind() == nusb::ErrorKind::PermissionDenied
-                && cfg!(target_os = "linux")
-            {
-                crate::doctor::with_usb_access_fix(message)
-            } else {
-                message
-            };
+            let message =
+                if error.kind() == nusb::ErrorKind::PermissionDenied && cfg!(target_os = "linux") {
+                    crate::doctor::with_usb_access_fix(message)
+                } else {
+                    message
+                };
             Categorized::error(kind, message)
         }
     };
