@@ -1971,10 +1971,16 @@ fn merge(mut modes: Vec<Mode>, mode: Mode) -> Vec<Mode> {
                 .intervals
                 .zip(mode.intervals)
                 .map(|((a, c), (b, d))| (a.max(b), c.max(d)));
+            // Keep only sizes and rates one of the capabilities takes: the
+            // wider of two nested ranges, or what two crossed ones share.
             m.min_size = match (m.min_size, mode.min_size) {
-                (Some((a, low)), Some((b, other))) => {
-                    Some(((a.0.min(b.0), a.1.min(b.1)), low.min(other)))
-                }
+                (Some((a, low)), Some((b, other))) => Some(if a.0 <= b.0 && a.1 <= b.1 {
+                    (a, low)
+                } else if b.0 <= a.0 && b.1 <= a.1 {
+                    (b, other)
+                } else {
+                    ((a.0.max(b.0), a.1.max(b.1)), low.min(other))
+                }),
                 (a, b) => a.or(b),
             };
         }
@@ -8103,6 +8109,15 @@ Error opening input files: Input/output error
         assert!(open(&mut camera, (1920, 1080), 5.0));
         assert!(open(&mut camera, (640, 480), 30.0));
         assert!(!open(&mut camera, (640, 480), 5.0));
+        // Crossed ranges share only the sizes both reach.
+        let crossed = dshow_modes(concat!(
+            "[dshow @ 000002a3c8b4e0c0]   pixel_format=bgr24  min s=640x240 fps=1 max s=1920x1080 fps=60\n",
+            "[dshow @ 000002a3c8b4e0c0]   pixel_format=rgb32  min s=320x480 fps=1 max s=1920x1080 fps=60\n",
+        ));
+        assert_eq!(crossed[0].min_size, Some(((640, 480), 1.0)));
+        let mut camera = native("dshow:video=Capture Filter", crossed);
+        assert!(open(&mut camera, (800, 600), 30.0));
+        assert!(!open(&mut camera, (320, 240), 30.0));
     }
     #[test]
     fn v4l2_modes_take_a_compressed_format_where_raw_cannot_reach_the_rate() {
