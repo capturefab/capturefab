@@ -127,9 +127,9 @@ choices reflect frame rates the bundled FFmpeg input honors, and V4L2 choices th
 frame intervals its driver reports for each format and size; a driver that reports
 none leaves the accepted rates to the driver. V4L2 keeps sizes advertised across
 raw and compressed inputs and selects the matching input format when the mode or
-frame rate changes; when both offer the same size, raw is preferred unless the
-compressed input reaches a higher frame rate, as MJPEG does at HD sizes on USB 2.0
-webcams.
+frame rate changes; when both offer the same size, raw is chosen whenever it
+delivers the requested frame rate, and the fastest input when no rate is requested,
+such as MJPEG at HD sizes on USB 2.0 webcams.
 Unavailable cameras report permission, busy, or frame timeout diagnostics.
 Discovered host and ONVIF devices can also be selected by their unique serial;
 Capturefab uses the discovered locator and the matching transport to open them.

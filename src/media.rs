@@ -2590,8 +2590,20 @@ impl MediaBackend {
             });
             self.unsupported(width, height, self.fps)
         })?;
+        let index = options.fps.map_or(index, |fps| self.raw_first(index, fps));
         self.select(index, options.fps);
         Ok(())
+    }
+    /// The first listed V4L2 mode of the size at `index` that reaches `fps`.
+    /// Raw formats are listed first, so this is raw wherever a raw format
+    /// delivers the rate, rather than the faster compressed format ranking
+    /// prefers.
+    fn raw_first(&self, index: usize, fps: f64) -> usize {
+        let size = self.modes[index].size();
+        self.modes
+            .iter()
+            .position(|m| m.size() == size && m.honors(fps) && m.input_format.is_some())
+            .unwrap_or(index)
     }
     fn select(&mut self, index: usize, fps: Option<f64>) {
         let mode = self.modes[index];
@@ -2965,9 +2977,17 @@ impl RegisterIo for MediaBackend {
                                 m.height == h
                             }
                         })
-                        .max_by_key(|(_, m)| (m.size() == (w, h), m.honors(self.fps), m.rank()))
+                        .max_by_key(|&(index, m)| {
+                            let current = self.mode == Some(index);
+                            (m.size() == (w, h), m.honors(self.fps), current, m.rank())
+                        })
                         .map(|(index, _)| index)
                         .ok_or_else(|| self.unsupported(w, h, self.fps))?;
+                    let index = if self.mode == Some(index) {
+                        index
+                    } else {
+                        self.raw_first(index, self.fps)
+                    };
                     self.select(index, Some(self.fps));
                 }
             }
@@ -2981,7 +3001,13 @@ impl RegisterIo for MediaBackend {
                     self.fps = value;
                 } else {
                     let size = (self.width, self.height);
-                    let index = best(&self.modes, |m| m.size() == size && m.honors(value))
+                    let index = self
+                        .mode
+                        .filter(|&i| self.modes[i].size() == size && self.modes[i].honors(value))
+                        .or_else(|| {
+                            best(&self.modes, |m| m.size() == size && m.honors(value))
+                                .map(|i| self.raw_first(i, value))
+                        })
                         .ok_or_else(|| self.unsupported(size.0, size.1, value))?;
                     self.select(index, Some(value));
                 }
@@ -7706,6 +7732,58 @@ Error opening input files: Input/output error
         nodes.set(&mut camera, "VideoMode", "1280x720@10").unwrap();
         assert_eq!(camera.fps, 10.0);
         assert_eq!(camera.input_options()[5], "yuyv422");
+    }
+    #[test]
+    fn v4l2_raw_format_is_kept_where_it_reaches_the_requested_rate() {
+        // A C920's uvcvideo intervals: YUYV 1280x720 at 10, 7.5 and 5 fps,
+        // and MJPEG 1280x720 and both 640x480 formats at 30 down to 5.
+        let (modes, formats) = v4l2_modes(
+            concat!(
+                "[video4linux2,v4l2 @ 0x55d0c8a0c0] Raw       :     yuyv422 :           YUYV 4:2:2 : 640x480 1280x720\n",
+                "[video4linux2,v4l2 @ 0x55d0c8a0c0] Compressed:       mjpeg :          Motion-JPEG : 640x480 1280x720\n",
+            ),
+            |description, size| match (description, size) {
+                ("YUYV 4:2:2", (1280, 720)) => Some((5.0, 10.0)),
+                _ => Some((5.0, 30.0)),
+            },
+        );
+        assert_eq!(labels(&modes), ["640x480@30", "1280x720@10", "1280x720@30"]);
+        let mut camera = native("v4l2:/dev/video0", modes);
+        camera.formats = formats;
+        let format = |camera: &MediaBackend| camera.input_options()[5].clone();
+        for (fps, expected) in [
+            (Some(10.0), "yuyv422"),
+            (Some(30.0), "mjpeg"),
+            (None, "mjpeg"),
+        ] {
+            let size = Some((1280, 720));
+            camera.configure(NativeOptions { size, fps }).unwrap();
+            assert_eq!(format(&camera), expected, "{fps:?}");
+        }
+        let nodes = NodeMap::parse(&camera.xml().unwrap()).unwrap();
+        nodes.set(&mut camera, "VideoMode", "1280x720@10").unwrap();
+        nodes
+            .set(&mut camera, "AcquisitionFrameRate", "10")
+            .unwrap();
+        assert_eq!(nodes.get(&mut camera, "VideoMode").unwrap(), "1280x720@10");
+        assert_eq!(format(&camera), "yuyv422");
+        nodes.set(&mut camera, "VideoMode", "1280x720@30").unwrap();
+        nodes
+            .set(&mut camera, "AcquisitionFrameRate", "10")
+            .unwrap();
+        assert_eq!(nodes.get(&mut camera, "VideoMode").unwrap(), "1280x720@30");
+        nodes.set(&mut camera, "VideoMode", "640x480@30").unwrap();
+        nodes
+            .set(&mut camera, "AcquisitionFrameRate", "10")
+            .unwrap();
+        nodes.set(&mut camera, "Width", "1280").unwrap();
+        nodes.set(&mut camera, "Height", "720").unwrap();
+        assert_eq!(nodes.get(&mut camera, "VideoMode").unwrap(), "1280x720@10");
+        assert_eq!(format(&camera), "yuyv422");
+        nodes
+            .set(&mut camera, "AcquisitionFrameRate", "30")
+            .unwrap();
+        assert_eq!(format(&camera), "mjpeg");
     }
     #[test]
     #[cfg(unix)]
