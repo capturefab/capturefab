@@ -662,6 +662,16 @@ fn ack(packet: &[u8], id: u16) -> Result<(u16, &[u8])> {
     );
     Ok((le16(packet, 6)?, &packet[12..12 + length]))
 }
+/// Check a WriteMem acknowledgement. GenCP lets it carry the written length
+/// only when the camera's Device Capability bit 11 is set; otherwise it is
+/// empty.
+fn write_acknowledged(response: &[u8], len: usize) -> Result<()> {
+    ensure!(
+        response.is_empty() || (response.len() == 4 && le16(response, 2)? as usize == len),
+        "camera returned invalid UVCP write acknowledgement"
+    );
+    Ok(())
+}
 impl UsbBackend {
     fn transact(&mut self, cmd: u16, payload: &[u8]) -> Result<Vec<u8>> {
         self.id = self.id.wrapping_add(1).max(1);
@@ -832,10 +842,7 @@ impl RegisterIo for UsbBackend {
             request.extend_from_slice(&(address + (i * size) as u64).to_le_bytes());
             request.extend_from_slice(chunk);
             let response = self.transact(WRITE_CMD, &request)?;
-            ensure!(
-                response.len() == 4 && le16(&response, 2)? as usize == chunk.len(),
-                "camera returned invalid UVCP write acknowledgement"
-            );
+            write_acknowledged(&response, chunk.len())?;
         }
         Ok(())
     }
@@ -1138,6 +1145,20 @@ mod tests {
         assert!(ack(&response, 8).is_err());
         response[4] = 1;
         assert!(ack(&response, 7).is_err());
+    }
+    #[test]
+    fn write_acknowledgement_may_omit_the_written_length() {
+        // WRITEMEM_ACK with an empty SCD, and with length_written = 4.
+        let empty = [0x55, 0x33, 0x56, 0x43, 0, 0, 0x03, 0x08, 0, 0, 7, 0];
+        let (command, scd) = ack(&empty, 7).unwrap();
+        assert_eq!(command, WRITE_CMD + 1);
+        write_acknowledged(scd, 4).unwrap();
+        let mut counted = empty.to_vec();
+        counted[8] = 4;
+        counted.extend([0, 0, 4, 0]);
+        write_acknowledged(ack(&counted, 7).unwrap().1, 4).unwrap();
+        assert!(write_acknowledged(ack(&counted, 7).unwrap().1, 8).is_err());
+        assert!(write_acknowledged(&[0, 0], 4).is_err());
     }
     #[test]
     fn usb_leader_and_trailer_validation() {
