@@ -85,7 +85,7 @@ fn bytes(at: i32) -> u32 {
     let low = a.r | (a.g << 8u) | (a.b << 16u) | (a.a << 24u);
     let high = b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u);
     let i = u32(at & 3) * 8u;
-    return select((low >> i) | (high << (32u - i)), low, i == 0u);
+    return (low >> i) | ((high << (31u - i)) << 1u);
 }
 
 // The sample at p shifted to 8 bits and clamped: one texel, or unpacked from
