@@ -1432,9 +1432,14 @@ impl Decoder {
         };
         cmd.args(options);
         if matches!(scheme(source).as_deref(), Some("rtsp" | "rtsps")) {
+            // RTP interleaved over TCP first. A camera that answers SETUP with
+            // 461 Unsupported Transport gets RTP over UDP, the transport ONVIF
+            // requires of every camera; FFmpeg keeps rtsps on TCP.
             cmd.args([
+                "-rtsp_flags",
+                "prefer_tcp",
                 "-rtsp_transport",
-                "tcp",
+                "tcp+udp",
                 "-timeout",
                 &timeout.as_micros().max(1).to_string(),
             ]);
@@ -5579,6 +5584,11 @@ exit 1"#,
         let (kind, text) = code(open_url("rtsp://cam.local/live", timeout));
         assert_eq!(kind, Some("auth_required"), "{text}");
         assert!(text.contains("rtsp://cam.local/live"), "{text}");
+        // TCP first, then UDP for a camera that answers 461 to TCP.
+        assert_eq!(
+            fake.launches(&["-rtsp_flags prefer_tcp -rtsp_transport tcp+udp -timeout"]),
+            1
+        );
         let login = crate::logins::CameraLogin::new("ad min", "s3cret:pw").unwrap();
         let (kind, text) = code(open_url_with(
             "rtsp://cam.local/live",
