@@ -801,10 +801,7 @@ impl AutoController {
                     .map_or(physical, |budget| physical.min(budget as f64 / 0.92)),
             );
         }
-        self.caps.triggered = camera.get("TriggerMode").is_ok_and(|v| v == "On")
-            && camera
-                .get("TriggerSelector")
-                .map_or(true, |v| v == "FrameStart");
+        self.caps.triggered = frame_triggered(camera);
         self.caps.color = camera
             .get("PixelFormat")
             .is_ok_and(|v| v.as_str().is_some_and(|s| !s.starts_with("Mono")));
@@ -1831,6 +1828,36 @@ pub fn hold(camera: &mut Camera) -> Result<()> {
     result
 }
 
+/// Whether frames wait for a trigger: the FrameStart trigger, or a camera's
+/// only trigger, is On with a source other than the camera's own timing.
+/// Allied Vision cameras ship with TriggerMode On and TriggerSource Freerun,
+/// or FixedRate to run at AcquisitionFrameRateAbs.
+pub(crate) fn frame_triggered(camera: &mut Camera) -> bool {
+    let on = |camera: &mut Camera| {
+        camera.get("TriggerMode").is_ok_and(|v| v == "On")
+            && !camera
+                .get("TriggerSource")
+                .is_ok_and(|v| v == "Freerun" || v == "FixedRate")
+    };
+    if !camera.has("TriggerSelector") {
+        return on(camera);
+    }
+    let Ok(Value::String(selected)) = camera.get("TriggerSelector") else {
+        return false;
+    };
+    if selected == "FrameStart" {
+        return on(camera);
+    }
+    if !has_choice(camera, "TriggerSelector", "FrameStart")
+        || camera.set("TriggerSelector", "FrameStart").is_err()
+    {
+        return false;
+    }
+    let triggered = on(camera);
+    let _ = camera.set("TriggerSelector", &selected);
+    triggered
+}
+
 fn bounds(camera: &mut Camera, feature: Option<&str>) -> Bounds {
     feature
         .and_then(|f| camera.bounds(f).ok())
@@ -2524,6 +2551,51 @@ mod tests {
         auto.tick(&mut camera, Instant::now());
         assert!(auto.caps.triggered);
         assert_eq!(auto.status().target_fps, None);
+    }
+
+    #[test]
+    fn frame_start_trigger_is_read_under_its_selector_and_timer_sources_free_run() {
+        let mut fake = Fake::new(true);
+        let indexed = |name: &str, base: u64, entries: &str| {
+            format!(
+                "<Enumeration Name='{name}'>{entries}<pValue>{name}Reg</pValue></Enumeration><IntReg Name='{name}Reg'><Address>{base}</Address><pAddress>TriggerOffset</pAddress><Length>4</Length><AccessMode>RW</AccessMode></IntReg>"
+            )
+        };
+        let entry =
+            |e: &str, v: u32| format!("<EnumEntry Name='{e}'><Value>{v}</Value></EnumEntry>");
+        let nodes = [
+            format!(
+                "<Enumeration Name='TriggerSelector'>{}{}<pValue>SelectorReg</pValue></Enumeration><IntReg Name='SelectorReg'><Address>192</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
+                entry("FrameStart", 0),
+                entry("AcquisitionStart", 1)
+            ),
+            "<IntSwissKnife Name='TriggerOffset'><pVariable Name='S'>TriggerSelector</pVariable><Formula>S*4</Formula></IntSwissKnife>".into(),
+            indexed("TriggerMode", 176, &(entry("Off", 0) + &entry("On", 1))),
+            indexed(
+                "TriggerSource",
+                200,
+                &(entry("Freerun", 0) + &entry("Line1", 1) + &entry("FixedRate", 2)),
+            ),
+        ]
+        .concat();
+        fake.xml = fake.xml.replace(
+            "</RegisterDescription>",
+            &(nodes + "</RegisterDescription>"),
+        );
+        fake.set_u32(192, 1);
+        fake.set_u32(176, 1);
+        fake.set_u32(200, 1);
+        let mut camera = fake.camera();
+        assert!(frame_triggered(&mut camera));
+        assert_eq!(camera.get("TriggerSelector").unwrap(), "AcquisitionStart");
+        for source in [0, 2] {
+            fake.set_u32(200, source);
+            assert!(!frame_triggered(&mut camera));
+        }
+        fake.set_u32(200, 1);
+        fake.set_u32(176, 0);
+        fake.set_u32(180, 1);
+        assert!(!frame_triggered(&mut camera));
     }
 
     #[test]

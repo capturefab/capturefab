@@ -65,6 +65,7 @@ impl Pace {
     fn of(features: &[FeatureInfo]) -> Self {
         let mut pace = Pace::default();
         let mut rate_on = true;
+        let mut timed = false;
         for feature in features {
             match feature.name.as_str() {
                 "ExposureTime" | "ExposureTimeAbs" if pace.exposure.is_none() => {
@@ -100,9 +101,17 @@ impl Pace {
                     pace.triggered =
                         feature.value.as_ref().and_then(serde_json::Value::as_str) == Some("On");
                 }
+                // Allied Vision's own timing sources, with TriggerMode On.
+                "TriggerSource" => {
+                    timed = matches!(
+                        feature.value.as_ref().and_then(serde_json::Value::as_str),
+                        Some("Freerun" | "FixedRate")
+                    );
+                }
                 _ => {}
             }
         }
+        pace.triggered &= !timed;
         if !rate_on {
             pace.frame_interval = None;
         }
@@ -620,6 +629,15 @@ mod tests {
         // No frame ever comes: the chart stops promising one.
         report(&mut bench, start, RATE_WAIT, streaming_camera(0, 0, 0.0));
         assert!(!bench.rate_coming("sim:0"));
+    }
+
+    #[test]
+    fn timer_trigger_sources_are_not_waiting_for_triggers() {
+        let on = feature("TriggerMode", json!("On"));
+        assert!(Pace::of(&[on.clone(), feature("TriggerSource", json!("Line1"))]).triggered);
+        for source in ["Freerun", "FixedRate"] {
+            assert!(!Pace::of(&[feature("TriggerSource", json!(source)), on.clone()]).triggered);
+        }
     }
 
     #[test]

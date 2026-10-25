@@ -165,7 +165,7 @@ pub(super) fn apply(camera: &mut Camera, requested: u64) -> Result<NetworkTuning
     }
     // Average-rate fallback for free-running cameras. External trigger timing
     // belongs to the trigger source and cannot safely be changed here.
-    if !camera.get("TriggerMode").is_ok_and(|mode| mode == "On")
+    if !crate::auto::frame_triggered(camera)
         && let Some(payload) = read(camera, &["PayloadSize"])
     {
         for feature in ["AcquisitionFrameRate", "AcquisitionFrameRateAbs"] {
