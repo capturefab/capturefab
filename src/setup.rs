@@ -857,10 +857,9 @@ fn fit_skipped(setup: &mut Setup, mut dropped: usize) -> Result<()> {
     if dropped == 0 && fits(setup)? {
         return Ok(());
     }
-    while !setup.skipped.is_empty() && !fits(setup)? {
-        setup.skipped.pop();
-        dropped += 1;
-    }
+    // The longest run of entries that fits, found by halving: fewer
+    // entries never make a setup larger, and each check serializes it.
+    let mut all = std::mem::take(&mut setup.skipped);
     if !fits(setup)? {
         return Err(Categorized::error(
             ErrorKind::Unsupported,
@@ -871,6 +870,19 @@ fn fit_skipped(setup: &mut Setup, mut dropped: usize) -> Result<()> {
             ),
         ));
     }
+    let (mut low, mut high) = (0, all.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        setup.skipped = all[..mid].to_vec();
+        if fits(setup)? {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    dropped += all.len() - low;
+    all.truncate(low);
+    setup.skipped = all;
     loop {
         setup.skipped.push(Skipped {
             feature: "(more)".into(),
