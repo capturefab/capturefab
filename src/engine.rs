@@ -1086,15 +1086,17 @@ fn process_plain(
             // Capture without a file, name or log line: the frame only
             // reaches the shared ring.
             let result = (|| -> Result<Value> {
+                // A software-triggered camera sends no frames to meter.
                 let settled = was_streaming
                     || auto.is_none()
-                    || settle_auto(
-                        h,
-                        c,
-                        auto,
-                        deadline.saturating_duration_since(Instant::now()),
-                        true,
-                    )?;
+                    || (!c.software_triggered()
+                        && settle_auto(
+                            h,
+                            c,
+                            auto,
+                            deadline.saturating_duration_since(Instant::now()),
+                            true,
+                        )?);
                 ensure!(Instant::now() < deadline, GRAB_TIMEOUT);
                 c.request_frame()?;
                 let frame = next_frame(h, c, auto, deadline)?.context(GRAB_TIMEOUT)?;
@@ -1682,7 +1684,10 @@ fn process_plain(
                 let mut files = Vec::new();
                 let mut frames = Vec::new();
                 let mut status = None;
-                if !was_streaming && auto.is_some() && !settle_auto(h, c, auto, duration, false)? {
+                if !was_streaming
+                    && auto.is_some()
+                    && (c.software_triggered() || !settle_auto(h, c, auto, duration, false)?)
+                {
                     h.log(
                         "warn",
                         "Auto exposure had not settled; capturing anyway".into(),
@@ -2133,10 +2138,12 @@ fn tick_jobs(
                 }
                 job.next = Some(job.allocate(&h.names)?);
                 c.request_frame()?;
-                Ok(stopped)
+                // Auto exposure warms up a camera the job started, unless it
+                // sends frames only when triggered.
+                Ok(stopped && !c.software_triggered())
             })();
-            let stopped = match result {
-                Ok(stopped) => stopped,
+            let warm_up = match result {
+                Ok(warm_up) => warm_up,
                 Err(e) => {
                     job.info.status = "failed".into();
                     job.info.error = Some(format!("{e:#}"));
@@ -2150,7 +2157,7 @@ fn tick_jobs(
             job.info.status = "running".into();
             let timeout = Duration::from_millis(job.timeout_ms);
             job.deadline = Some(Instant::now() + timeout);
-            job.warm = (auto && stopped)
+            job.warm = (auto && warm_up)
                 .then(|| Instant::now() + (timeout / 2).min(Duration::from_secs(3)));
         }
         if job.deadline.is_some_and(|d| Instant::now() >= d) {
@@ -3977,6 +3984,54 @@ mod tests {
         tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
         assert!(!started && !camera.as_ref().unwrap().is_streaming());
         assert_eq!(count(), (1, 1));
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn captures_grabs_and_schedules_trigger_a_software_triggered_camera() {
+        use crate::camera::tests::{
+            Device, FRAME_TRIGGER_MODE, OPEN_ACQUISITION, TRIGGER_NODES, device_camera, events,
+            taken,
+        };
+        let device =
+            Device::new(&format!("{OPEN_ACQUISITION}{TRIGGER_NODES}")).with(FRAME_TRIGGER_MODE, 1);
+        let log = events(&device);
+        let mut camera = Some(device_camera(device));
+        let h = WorkerHandle::new();
+        let triggers = || {
+            taken(&log)
+                .iter()
+                .filter(|event| *event == "TriggerSoftware FrameStart")
+                .count()
+        };
+        let grabbed =
+            scanner_command(&h, &mut camera, SessionCommand::Grab { timeout_ms: 1000 }).unwrap();
+        assert_eq!(grabbed["frame"]["width"], 4);
+        assert_eq!(triggers(), 1);
+        let dir = temp_dir("software-trigger");
+        let captured = scanner_command(
+            &h,
+            &mut camera,
+            capture_to(&dir.join("shots"), 2, crate::naming::OnExists::Fail),
+        )
+        .unwrap();
+        assert_eq!(captured["files"].as_array().unwrap().len(), 2);
+        assert_eq!(triggers(), 2);
+        // A shot fires its trigger when due; auto exposure has no frames to
+        // warm up on, so the triggered frame is taken.
+        let mut job = armed(1, &dir);
+        job.deadline = None;
+        let mut jobs = vec![job];
+        let mut started = false;
+        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
+        assert!(started && jobs[0].deadline.is_some() && jobs[0].warm.is_none());
+        assert_eq!(triggers(), 1);
+        let frame = camera
+            .as_mut()
+            .unwrap()
+            .next_frame(Duration::from_secs(1))
+            .unwrap();
+        assert!(shoot(&h, &frame, &mut jobs, false, true).is_some());
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }

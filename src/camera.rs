@@ -95,6 +95,10 @@ const STREAM_COMMANDS: [&str; 7] = [
     "TransferAbort",
 ];
 
+/// Triggers that start an acquisition, a burst or a frame, in the order a
+/// software trigger fires them for one frame.
+const START_TRIGGERS: [&str; 3] = ["AcquisitionStart", "FrameBurstStart", "FrameStart"];
+
 pub struct Camera {
     pub info: CameraInfo,
     backend: Box<dyn Backend>,
@@ -108,6 +112,10 @@ pub struct Camera {
     /// Whether start executed TransferStart, which stop follows with
     /// TransferStop.
     transferring: bool,
+    /// Where TriggerSoftware starts a frame, read again after any write:
+    /// each TriggerSelector value to fire under, or `None` for a camera
+    /// without a selector.
+    software_triggers: Option<Vec<Option<String>>>,
 }
 /// Reject malformed known source forms without checking availability or build capabilities.
 /// Bare camera IDs and serials are resolved against discovery results on open.
@@ -498,6 +506,7 @@ impl Camera {
             network_budget_bytes_per_second: None,
             tl_locked: false,
             transferring: false,
+            software_triggers: None,
         })
     }
     pub fn features(&mut self) -> Vec<FeatureInfo> {
@@ -543,6 +552,7 @@ impl Camera {
         self.nodes.lock_released_by(name, others)
     }
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
+        self.software_triggers = None;
         self.nodes.set(self.backend.as_mut(), name, value)
     }
     pub fn validate_set(&mut self, name: &str, value: &str) -> Result<()> {
@@ -596,6 +606,7 @@ impl Camera {
             !STREAM_COMMANDS.contains(&name),
             "use start/stop to manage transport and acquisition together"
         );
+        self.software_triggers = None;
         self.nodes.execute(self.backend.as_mut(), name)
     }
     /// Start acquisition as a GenTL producer would: lock the transport
@@ -684,9 +695,115 @@ impl Camera {
         ensure!(self.streaming, "camera is not streaming");
         self.backend.next_frame(timeout)
     }
+    /// Ask for the next frame. A camera whose start trigger is On with a
+    /// Software source sends one only after TriggerSoftware; one waiting for
+    /// a hardware trigger still waits for its line.
     pub fn request_frame(&mut self) -> Result<()> {
         ensure!(self.streaming, "camera is not streaming");
+        self.trigger_software()?;
         self.backend.request_frame()
+    }
+    /// Whether the camera sends frames only when software triggered.
+    pub fn software_triggered(&mut self) -> bool {
+        !self.software_triggers().is_empty()
+    }
+    fn software_triggers(&mut self) -> Vec<Option<String>> {
+        if let Some(triggers) = &self.software_triggers {
+            return triggers.clone();
+        }
+        let triggers = self.find_software_triggers();
+        self.software_triggers = Some(triggers.clone());
+        triggers
+    }
+    /// The start triggers (SFNC TriggerSelector) set to On with a Software
+    /// source. A camera offering none of them is read at its selected
+    /// trigger, and one without a selector has a single trigger.
+    fn find_software_triggers(&mut self) -> Vec<Option<String>> {
+        if !["TriggerMode", "TriggerSource", "TriggerSoftware"]
+            .iter()
+            .all(|name| self.has(name))
+        {
+            return Vec::new();
+        }
+        let software = |camera: &mut Self| {
+            camera.get("TriggerMode").is_ok_and(|mode| mode == "On")
+                && camera
+                    .get("TriggerSource")
+                    .is_ok_and(|source| source == "Software")
+        };
+        if !self.has("TriggerSelector") {
+            return if software(self) {
+                vec![None]
+            } else {
+                Vec::new()
+            };
+        }
+        let Ok(serde_json::Value::String(selected)) = self.get("TriggerSelector") else {
+            return Vec::new();
+        };
+        let offered = self.choices("TriggerSelector").unwrap_or_default();
+        let mut candidates = START_TRIGGERS
+            .into_iter()
+            .filter(|trigger| offered.iter().any(|choice| choice == trigger))
+            .map(String::from)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            candidates.push(selected.clone());
+        }
+        let mut found = Vec::new();
+        let mut current = selected.clone();
+        for candidate in candidates {
+            if candidate != current {
+                if self.select_trigger(&candidate).is_err() {
+                    continue;
+                }
+                current = candidate.clone();
+            }
+            if software(self) {
+                found.push(Some(candidate));
+            }
+        }
+        if current != selected {
+            let _ = self.select_trigger(&selected);
+        }
+        found
+    }
+    fn select_trigger(&mut self, trigger: &str) -> Result<()> {
+        self.nodes
+            .set(self.backend.as_mut(), "TriggerSelector", trigger)
+    }
+    /// Execute TriggerSoftware for each software start trigger, then select
+    /// the trigger that was selected before.
+    fn trigger_software(&mut self) -> Result<()> {
+        let triggers = self.software_triggers();
+        if triggers.is_empty() {
+            return Ok(());
+        }
+        let before = if triggers.iter().any(Option::is_some) {
+            self.get("TriggerSelector")?.as_str().map(String::from)
+        } else {
+            None
+        };
+        let mut selected = before.clone();
+        let fired = (|| -> Result<()> {
+            for trigger in triggers {
+                if let Some(trigger) = trigger
+                    && selected.as_deref() != Some(trigger.as_str())
+                {
+                    self.select_trigger(&trigger)?;
+                    selected = Some(trigger);
+                }
+                self.nodes
+                    .execute(self.backend.as_mut(), "TriggerSoftware")?;
+            }
+            Ok(())
+        })();
+        match before {
+            Some(before) if selected.as_ref() != Some(&before) => {
+                fired.and(self.select_trigger(&before))
+            }
+            _ => fired,
+        }
     }
     pub fn is_scanner(&self) -> bool {
         self.info.transport == Transport::Scanner
@@ -718,6 +835,7 @@ impl Camera {
         self.backend.read_memory(address, length)
     }
     pub fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+        self.software_triggers = None;
         self.backend.write_memory(address, data)
     }
     pub fn is_streaming(&self) -> bool {
@@ -741,8 +859,13 @@ pub(crate) mod tests {
     const ACQUISITION_STOP: u64 = 0x08;
     const ACQUISITION_MODE: u64 = 0x0c;
     const FRAME_COUNT: u64 = 0x10;
+    const TRIGGER_SELECTOR: u64 = 0x14;
     const TRIGGER_MODE: u64 = 0x20;
     const TRIGGER_SOURCE: u64 = 0x30;
+    /// The FrameStart trigger's mode (1 is On) and source (0 is Software,
+    /// 1 is Line1).
+    pub(crate) const FRAME_TRIGGER_MODE: u64 = TRIGGER_MODE + 4;
+    pub(crate) const FRAME_TRIGGER_SOURCE: u64 = TRIGGER_SOURCE + 4;
     const TRIGGER_SOFTWARE: u64 = 0x40;
     const TRANSFER_MODE: u64 = 0x50;
     const TRANSFER_START: u64 = 0x54;
@@ -904,7 +1027,7 @@ pub(crate) mod tests {
 
     const TL_PARAMS_LOCKED: &str = r#"<Integer Name="TLParamsLocked"><ToolTip> Indicates whether a live grab is under way</ToolTip><Visibility>Invisible</Visibility><Value>0</Value><Min>0</Min><Max>1</Max></Integer>"#;
     /// Acquisition commands with no lock, as on cameras that never gate them.
-    const OPEN_ACQUISITION: &str = r#"<Command Name="AcquisitionStart"><pValue>AcquisitionStartReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionStartReg"><Address>0x04</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="AcquisitionStop"><pValue>AcquisitionStopReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionStopReg"><Address>0x08</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
+    pub(crate) const OPEN_ACQUISITION: &str = r#"<Command Name="AcquisitionStart"><pValue>AcquisitionStartReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionStartReg"><Address>0x04</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="AcquisitionStop"><pValue>AcquisitionStopReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionStopReg"><Address>0x08</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
     /// Basler ace GigE (acA1300-60gm): both commands locked by N411 until
     /// the transport layer sets TLParamsLocked.
     const BASLER_ACQUISITION: &str = r#"<Command Name="AcquisitionStart" NameSpace="Standard"><ToolTip>Starts the acquisition of images</ToolTip><pIsLocked>N411</pIsLocked><ImposedAccessMode>WO</ImposedAccessMode><pValue>N412</pValue><CommandValue>1</CommandValue></Command><Command Name="AcquisitionStop" NameSpace="Standard"><ToolTip>Stops the acquisition of images</ToolTip><pIsLocked>N411</pIsLocked><ImposedAccessMode>WO</ImposedAccessMode><pValue>N413</pValue><CommandValue>0</CommandValue></Command><IntSwissKnife Name="N411"><pVariable Name="P1">TLParamsLocked</pVariable><Formula>P1=0</Formula></IntSwissKnife><IntReg Name="N412"><Address>0x04</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><IntReg Name="N413"><Address>0x08</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
@@ -920,13 +1043,18 @@ pub(crate) mod tests {
     /// transport layer locks its parameters.
     const TRANSFER_NODES: &str = r#"<Enumeration Name="TransferControlMode" NameSpace="Standard"><ImposedAccessMode>RW</ImposedAccessMode><EnumEntry Name="Basic" NameSpace="Standard"><Value>0</Value></EnumEntry><EnumEntry Name="Automatic" NameSpace="Standard"><Value>1</Value></EnumEntry><EnumEntry Name="UserControlled" NameSpace="Standard"><Value>2</Value></EnumEntry><pValue>TransferControlMode_Val</pValue></Enumeration><IntReg Name="TransferControlMode_Val"><Address>0x50</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="TransferStart" NameSpace="Standard"><pIsLocked>TransferStart_Locked</pIsLocked><ImposedAccessMode>WO</ImposedAccessMode><pValue>XmitStart_Val</pValue><CommandValue>1</CommandValue></Command><IntSwissKnife Name="TransferStart_Locked"><pVariable Name="TLP">TLParamsLocked</pVariable><pVariable Name="LCK">XmitStart_Lck</pVariable><Formula>(TLP = 0) || LCK</Formula></IntSwissKnife><MaskedIntReg Name="XmitStart_Lck"><Address>0x60</Address><Length>4</Length><AccessMode>RO</AccessMode><Bit>4</Bit><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></MaskedIntReg><IntReg Name="XmitStart_Val"><Address>0x54</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="TransferStop" NameSpace="Standard"><ImposedAccessMode>WO</ImposedAccessMode><pValue>XmitStop_Val</pValue><CommandValue>1</CommandValue></Command><IntReg Name="XmitStop_Val"><Address>0x58</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
 
+    /// SFNC trigger control: TriggerMode, TriggerSource and TriggerSoftware
+    /// banked by TriggerSelector, with the start triggers FLIR and Basler
+    /// cameras offer.
+    pub(crate) const TRIGGER_NODES: &str = r#"<Enumeration Name="TriggerSelector" NameSpace="Standard"><EnumEntry Name="AcquisitionStart" NameSpace="Standard"><Value>0</Value></EnumEntry><EnumEntry Name="FrameStart" NameSpace="Standard"><Value>1</Value></EnumEntry><EnumEntry Name="FrameBurstStart" NameSpace="Standard"><Value>2</Value></EnumEntry><pValue>TriggerSelectorReg</pValue><pSelected>TriggerMode</pSelected><pSelected>TriggerSoftware</pSelected><pSelected>TriggerSource</pSelected></Enumeration><IntReg Name="TriggerSelectorReg"><Address>0x14</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Enumeration Name="TriggerMode" NameSpace="Standard"><EnumEntry Name="Off" NameSpace="Standard"><Value>0</Value></EnumEntry><EnumEntry Name="On" NameSpace="Standard"><Value>1</Value></EnumEntry><pValue>TriggerModeReg</pValue></Enumeration><IntReg Name="TriggerModeReg"><Address>0x20</Address><pIndex Offset="4">TriggerSelectorReg</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Enumeration Name="TriggerSource" NameSpace="Standard"><EnumEntry Name="Software" NameSpace="Standard"><Value>0</Value></EnumEntry><EnumEntry Name="Line1" NameSpace="Standard"><Value>1</Value></EnumEntry><pValue>TriggerSourceReg</pValue></Enumeration><IntReg Name="TriggerSourceReg"><Address>0x30</Address><pIndex Offset="4">TriggerSelectorReg</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="TriggerSoftware" NameSpace="Standard"><ImposedAccessMode>WO</ImposedAccessMode><pValue>TriggerSoftwareReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="TriggerSoftwareReg"><Address>0x40</Address><pIndex Offset="4">TriggerSelectorReg</pIndex><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
+
     pub(crate) fn device_camera(device: Device) -> Camera {
         Camera::from_backend(crate::transport::simulator::info(), Box::new(device)).unwrap()
     }
-    fn events(device: &Device) -> Arc<Mutex<Vec<String>>> {
+    pub(crate) fn events(device: &Device) -> Arc<Mutex<Vec<String>>> {
         device.events.clone()
     }
-    fn taken(events: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    pub(crate) fn taken(events: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
         std::mem::take(&mut *events.lock().unwrap())
     }
 
@@ -1087,6 +1215,75 @@ pub(crate) mod tests {
         }
         assert!(taken(&log).is_empty());
         assert!(camera.is_streaming());
+        camera.next_frame(Duration::from_millis(10)).unwrap();
+    }
+
+    #[test]
+    fn software_frame_triggers_fire_once_per_requested_frame() {
+        // Selected: AcquisitionStart, as a camera often is after setup.
+        let device = Device::new(&format!("{OPEN_ACQUISITION}{TRIGGER_NODES}"))
+            .with(TRIGGER_SELECTOR, 0)
+            .with(FRAME_TRIGGER_MODE, 1);
+        let log = events(&device);
+        let mut camera = device_camera(device);
+        camera.start().unwrap();
+        assert!(camera.software_triggered());
+        assert!(camera.next_frame(Duration::from_millis(10)).is_err());
+        for _ in 0..3 {
+            camera.request_frame().unwrap();
+            camera.next_frame(Duration::from_millis(10)).unwrap();
+        }
+        assert!(camera.next_frame(Duration::from_millis(10)).is_err());
+        assert_eq!(camera.get("TriggerSelector").unwrap(), "AcquisitionStart");
+        assert_eq!(
+            taken(&log),
+            [
+                "receive",
+                "AcquisitionStart",
+                "TriggerSoftware FrameStart",
+                "TriggerSoftware FrameStart",
+                "TriggerSoftware FrameStart"
+            ]
+        );
+        // Changing the trigger is seen on the next request.
+        camera.set("TriggerSelector", "FrameStart").unwrap();
+        camera.set("TriggerMode", "Off").unwrap();
+        assert!(!camera.software_triggered());
+        camera.request_frame().unwrap();
+        camera.next_frame(Duration::from_millis(10)).unwrap();
+        assert!(taken(&log).is_empty());
+    }
+
+    #[test]
+    fn hardware_and_free_running_cameras_get_no_software_trigger() {
+        for (mode, source) in [(1, 1), (0, 0)] {
+            let device = Device::new(&format!("{OPEN_ACQUISITION}{TRIGGER_NODES}"))
+                .with(TRIGGER_SELECTOR, 1)
+                .with(FRAME_TRIGGER_MODE, mode)
+                .with(FRAME_TRIGGER_SOURCE, source);
+            let log = events(&device);
+            let mut camera = device_camera(device);
+            camera.start().unwrap();
+            camera.request_frame().unwrap();
+            assert!(!camera.software_triggered());
+            // A camera waiting for Line1 still waits; a free-running one streams.
+            assert_eq!(
+                camera.next_frame(Duration::from_millis(10)).is_ok(),
+                mode == 0
+            );
+            assert_eq!(taken(&log), ["receive", "AcquisitionStart"]);
+        }
+    }
+
+    #[test]
+    fn a_camera_without_trigger_selector_fires_its_only_trigger() {
+        let device = Device::new(&format!(
+            r#"{OPEN_ACQUISITION}<Enumeration Name="TriggerMode"><EnumEntry Name="Off"><Value>0</Value></EnumEntry><EnumEntry Name="On"><Value>1</Value></EnumEntry><pValue>TriggerModeReg</pValue></Enumeration><IntReg Name="TriggerModeReg"><Address>0x24</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Enumeration Name="TriggerSource"><EnumEntry Name="Software"><Value>0</Value></EnumEntry><EnumEntry Name="Line1"><Value>1</Value></EnumEntry><pValue>TriggerSourceReg</pValue></Enumeration><IntReg Name="TriggerSourceReg"><Address>0x34</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="TriggerSoftware"><pValue>TriggerSoftwareReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="TriggerSoftwareReg"><Address>0x44</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#
+        ))
+        .with(FRAME_TRIGGER_MODE, 1);
+        let mut camera = device_camera(device);
+        camera.start().unwrap();
+        camera.request_frame().unwrap();
         camera.next_frame(Duration::from_millis(10)).unwrap();
     }
 
