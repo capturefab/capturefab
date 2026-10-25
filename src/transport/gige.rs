@@ -3,7 +3,9 @@
 //! Wire constants and layouts follow the GigE Vision bootstrap/GVCP/GVSP
 //! protocols (also documented in Aravis' protocol headers). This implementation
 //! does not link to, embed, or translate Aravis code.
-use crate::types::{Backend, CameraInfo, Frame, RegisterIo, Transport, TransportStats};
+use crate::types::{
+    Backend, CameraInfo, Categorized, Frame, RegisterIo, Transport, TransportStats,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Cursor, ErrorKind, Read};
@@ -1043,6 +1045,13 @@ impl Backend for GigE {
                     match result {
                         Ok(Some(frame)) => return Ok(frame),
                         Ok(None) => {}
+                        Err(error)
+                            if error.downcast_ref::<Categorized>().is_some_and(|error| {
+                                error.kind == crate::types::ErrorKind::Unsupported
+                            }) =>
+                        {
+                            return Err(error);
+                        }
                         Err(error) => last_error = Some(error.to_string()),
                     }
                 }
@@ -1337,15 +1346,16 @@ struct ImageLeader {
     x_padding: usize,
     y_padding: usize,
     wire_bytes: usize,
+    /// Chunk data follows the image (GigE Vision 2 extended chunk mode).
+    chunks: bool,
 }
 impl ImageLeader {
     fn parse(data: &[u8], payload_limit: usize) -> Result<Self> {
         ensure!(data.len() >= 36, "truncated GVSP image leader");
-        ensure!(
-            be16(data, 2) == 1,
-            "unsupported GVSP payload type 0x{:04x}; select image acquisition and disable chunks",
-            be16(data, 2)
-        );
+        let payload_type = be16(data, 2);
+        if payload_type & !0x4000 != 1 {
+            return Err(unsupported_payload(payload_type));
+        }
         let pixel_format = be32(data, 12);
         let width = be32(data, 16);
         let height = be32(data, 20);
@@ -1383,6 +1393,7 @@ impl ImageLeader {
             x_padding,
             y_padding,
             wire_bytes: wire_bytes.min(payload_limit as u64) as usize,
+            chunks: payload_type & 0x4000 != 0,
         })
     }
     /// The fewest bytes that hold `height` lines.
@@ -1394,6 +1405,24 @@ impl ImageLeader {
             (self.row_bytes + self.x_padding) * height as usize
         }
     }
+}
+
+fn unsupported_payload(payload_type: u16) -> anyhow::Error {
+    let (name, hint) = match payload_type & 0x3fff {
+        _ if payload_type & 0x8000 != 0 => ("device-specific", "select image acquisition"),
+        0x0004 | 0x0005 => ("chunk data", "disable chunk mode"),
+        0x0006 => ("JPEG", "select an uncompressed pixel format"),
+        0x0007 => ("JPEG 2000", "select an uncompressed pixel format"),
+        0x0008 => ("H.264", "select an uncompressed pixel format"),
+        0x0009 => ("multi-zone image", "disable multi-zone streaming"),
+        0x000a => ("multi-part", "disable multi-part streaming"),
+        0x000b | 0x000c => ("GenDC", "disable GenDC streaming"),
+        _ => ("not an image", "select image acquisition"),
+    };
+    Categorized::error(
+        crate::types::ErrorKind::Unsupported,
+        format!("unsupported GVSP payload type 0x{payload_type:04x} ({name}); {hint}"),
+    )
 }
 
 struct GvspPacket<'a> {
@@ -1448,7 +1477,8 @@ impl PartialFrame {
         self.leader.as_ref().is_some_and(|leader| {
             Some(self.count) == self.packets
                 && (self.trailer.is_some()
-                    || self.end >= leader.image_bytes(leader.height) + leader.y_padding)
+                    || (!leader.chunks
+                        && self.end >= leader.image_bytes(leader.height) + leader.y_padding))
         })
     }
 }
@@ -1486,7 +1516,7 @@ fn check_trailer(leader: &ImageLeader, block_size: usize, (id, height): (u32, u3
     let most = (leader.row_bytes + leader.x_padding) * height as usize + leader.y_padding;
     ensure!(
         packets * block_size >= leader.image_bytes(height)
-            && packets <= most.min(leader.wire_bytes).div_ceil(block_size),
+            && (leader.chunks || packets <= most.min(leader.wire_bytes).div_ceil(block_size)),
         "GVSP trailer packet ID does not match image size"
     );
     Ok(())
@@ -1635,11 +1665,15 @@ impl Assembler {
             "GVSP camera error status 0x{:04x}",
             packet.status
         );
-        ensure!(
-            (1..=3).contains(&packet.kind),
-            "unsupported GVSP packet content {}; multipart/GenDC/all-in packets are not supported",
-            packet.kind
-        );
+        if !(1..=3).contains(&packet.kind) {
+            return Err(Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                format!(
+                    "unsupported GVSP packet content {}; multipart/GenDC/all-in packets are not supported",
+                    packet.kind
+                ),
+            ));
+        }
         let (block_size, max_packets) =
             self.limits[packet.extended as usize].context("invalid GVSP packet size")?;
         ensure!(
@@ -1669,15 +1703,18 @@ impl Assembler {
                         "GVSP image requires too many packets"
                     );
                     // Only the highest packet can be short, so the highest
-                    // received ID describes every packet so far.
+                    // received ID describes every packet so far. Chunk data
+                    // makes the payload longer than the image.
                     ensure!(
-                        frame.end.div_ceil(block_size) <= packets,
+                        leader.chunks || frame.end.div_ceil(block_size) <= packets,
                         "GVSP payload packets do not match the image leader"
                     );
                     if let Some(trailer) = frame.trailer {
                         check_trailer(&leader, block_size, trailer)?;
                     }
-                    frame.packets.get_or_insert(packets);
+                    if !leader.chunks {
+                        frame.packets.get_or_insert(packets);
+                    }
                     frame.leader = Some(leader);
                     set_bit(&mut frame.received, 0);
                 }
@@ -1687,7 +1724,10 @@ impl Assembler {
                     packet.id > 1 && packet.data.len() >= 8,
                     "invalid GVSP image trailer"
                 );
-                ensure!(be32(packet.data, 0) == 1, "GVSP trailer is not an image");
+                ensure!(
+                    be16(packet.data, 2) & !0x4000 == 1,
+                    "GVSP trailer is not an image"
+                );
                 let trailer = (packet.id, be32(packet.data, 4));
                 if let Some(previous) = frame.trailer {
                     ensure!(previous == trailer, "conflicting duplicate GVSP trailer");
@@ -2454,7 +2494,7 @@ mod tests {
         }
         let mut huge = leader(u32::MAX, u32::MAX, RGB8);
         assert!(ImageLeader::parse(&huge, MAX_PAYLOAD).is_err());
-        huge[2..4].copy_from_slice(&0x4001u16.to_be_bytes());
+        huge[2..4].copy_from_slice(&0x0004u16.to_be_bytes());
         assert!(ImageLeader::parse(&huge, MAX_PAYLOAD).is_err());
     }
     #[test]
@@ -2900,6 +2940,65 @@ mod tests {
         assert!(ImageLeader::parse(&leader(5, 8, 0x010c_0047), 59).is_err());
     }
     #[test]
+    fn image_payloads_with_chunks_deliver_the_image() {
+        // Extended chunk mode (payload type 0x4001): the image, then chunk
+        // data, here a 64-bit timestamp chunk followed by its ID and length.
+        // The trailer adds the chunk payload length and chunk layout ID.
+        let mut metadata = leader(8, 2, MONO8);
+        metadata[2..4].copy_from_slice(&0x4001u16.to_be_bytes());
+        let pixels = image(8, 2);
+        let mut payload = pixels.clone();
+        payload.extend(0x0123_4567_89ab_cdefu64.to_be_bytes());
+        payload.extend(0x0a5a_0001u32.to_be_bytes());
+        payload.extend(8u32.to_be_bytes());
+        let mut tail = vec![0, 0, 0x40, 0x01];
+        tail.extend(2u32.to_be_bytes());
+        tail.extend(16u32.to_be_bytes());
+        tail.extend(1u32.to_be_bytes());
+        let mut packets = vec![gvsp(3, 0, 1, false, &metadata)];
+        for chunk in payload.chunks(8) {
+            packets.push(gvsp(3, packets.len() as u32, 3, false, chunk));
+        }
+        packets.push(gvsp(3, 5, 2, false, &tail));
+        for late_leader in [false, true] {
+            let mut assembler = Assembler::new(32, 44, 0);
+            let mut order: Vec<_> = packets.iter().collect();
+            if late_leader {
+                order.rotate_left(1);
+            }
+            let frame = order
+                .into_iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            assert_eq!((frame.height, frame.data), (2, pixels.clone()));
+        }
+        let start = Instant::now();
+        let mut assembler = Assembler::new(32, 44, 0);
+        for packet in &packets[..5] {
+            assembler.push_at(packet, start).unwrap();
+        }
+        assembler.poll(start + RESEND_IDLE);
+        assert!(assembler.ready.is_empty());
+        assert!(assembler.push(&packets[5]).unwrap().is_some());
+
+        for (payload_type, name) in [
+            (0x0004, "chunk data"),
+            (0x0006, "JPEG"),
+            (0x0008, "H.264"),
+            (0x000a, "multi-part"),
+            (0x000b, "GenDC"),
+            (0x8001, "device-specific"),
+        ] {
+            metadata[2..4].copy_from_slice(&(payload_type as u16).to_be_bytes());
+            let error = ImageLeader::parse(&metadata, 32).unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+            assert_eq!(
+                crate::types::error_transport_code(&error),
+                Some("unsupported")
+            );
+        }
+    }
+    #[test]
     fn receive_buffer_requests_halve_on_errors_and_note_small_buffers() {
         let mut sizes = Vec::new();
         request_receive_buffer(1 << 20, |size| {
@@ -3302,6 +3401,24 @@ mod tests {
                 stats.incomplete_frames
             ),
             (2, 0, 1)
+        );
+    }
+    #[test]
+    fn unsupported_payloads_fail_without_waiting_for_the_timeout() {
+        let (fake, mut gige) = streaming(|_| {});
+        let mut jpeg = leader(WIDTH, HEIGHT, MONO8);
+        jpeg[2..4].copy_from_slice(&0x0006u16.to_be_bytes());
+        let destination = fake.camera.lock().unwrap().destination();
+        fake.stream
+            .send_to(&gvsp(1, 0, 1, false, &jpeg), destination)
+            .unwrap();
+        let started = Instant::now();
+        let error = gige.next_frame(Duration::from_secs(5)).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("JPEG"), "{error}");
+        assert_eq!(
+            crate::types::error_transport_code(&error),
+            Some("unsupported")
         );
     }
     #[test]
