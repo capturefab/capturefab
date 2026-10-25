@@ -1312,7 +1312,7 @@ impl Stream {
     /// socket waits out the caller's timeout instead of waking every `POLL`.
     /// Each change is a system call, so a timeout close enough is kept.
     fn wait(&self, remaining: Duration) -> Duration {
-        if self.assembler.frames.is_empty() {
+        if !self.assembler.in_flight() {
             if self.timeout.abs_diff(remaining) <= POLL {
                 self.timeout
             } else {
@@ -1480,6 +1480,11 @@ impl PartialFrame {
                     || (!leader.chunks
                         && self.end >= leader.image_bytes(leader.height) + leader.y_padding))
         })
+    }
+    /// Some cameras send a leader at acquisition start or as soon as they are
+    /// armed for a trigger, long before the image data.
+    fn awaits_data(&self) -> bool {
+        self.leader.is_some() && self.count == 0 && self.trailer.is_none()
     }
 }
 fn bit(bits: &[u64], id: u32) -> bool {
@@ -1841,13 +1846,25 @@ impl Assembler {
         });
         self.frames.len() - 1
     }
+    /// Whether a frame needs `poll` for resends and expiry.
+    fn in_flight(&self) -> bool {
+        match self.frames.as_slice() {
+            [] => false,
+            [frame] => !frame.awaits_data(),
+            _ => true,
+        }
+    }
     fn poll(&mut self, now: Instant) {
         let idle = |frame: &PartialFrame| now.saturating_duration_since(frame.last_packet);
-        while let Some(index) = self.frames.iter().position(|frame| {
-            idle(frame) >= FRAME_IDLE
-                || (!frame.due && idle(frame) >= RESEND_IDLE)
-                || (frame.rounds > 0
-                    && now.saturating_duration_since(frame.requested_at) >= RESEND_RETRY)
+        // The newest frame does not age while only its leader has arrived;
+        // a newer block retires it.
+        while let Some(index) = (0..self.frames.len()).find(|&index| {
+            let frame = &self.frames[index];
+            !(index + 1 == self.frames.len() && frame.awaits_data())
+                && (idle(frame) >= FRAME_IDLE
+                    || (!frame.due && idle(frame) >= RESEND_IDLE)
+                    || (frame.rounds > 0
+                        && now.saturating_duration_since(frame.requested_at) >= RESEND_RETRY))
         }) {
             let frame = &self.frames[index];
             if idle(frame) >= FRAME_IDLE || frame.rounds >= RESEND_ROUNDS {
@@ -2700,6 +2717,34 @@ mod tests {
         assert_eq!(assembler.requests, [(5, false, 3, 3)]);
     }
     #[test]
+    fn early_leaders_wait_for_their_data() {
+        let start = Instant::now();
+        let at = |ms| start + Duration::from_millis(ms);
+        for resend in [false, true] {
+            let mut assembler = Assembler::new(48, 44, 0);
+            assembler.resend = resend;
+            let packets = frame_packets(1, false, 8, 6, 8);
+            assembler.push_at(&packets[0], at(0)).unwrap();
+            for ms in [10, 250, 1000] {
+                assembler.poll(at(ms));
+            }
+            assert!(assembler.requests.is_empty() && !assembler.in_flight());
+            let frame = packets[1..]
+                .iter()
+                .find_map(|packet| assembler.push_at(packet, at(1200)).unwrap())
+                .unwrap();
+            assert_eq!(frame.data, image(8, 6));
+            assert_eq!(assembler.stats.incomplete_frames, 0);
+            for (block, ms) in [(2, 1300), (3, 2100)] {
+                let packets = frame_packets(block, false, 8, 6, 8);
+                assembler.push_at(&packets[0], at(ms)).unwrap();
+                assembler.poll(at(ms + 300));
+            }
+            assert_eq!(assembler.frames.len(), 1);
+            assert_eq!(assembler.stats.incomplete_frames, 1);
+        }
+    }
+    #[test]
     fn heavy_loss_is_abandoned_without_requests() {
         let spread = |count: u32| (1..=count).map(|id| id * 2).collect::<Vec<_>>();
         for (packets, drops, abandoned) in [
@@ -3382,6 +3427,26 @@ mod tests {
         assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 1);
         assert!(gige.next_frame(Duration::from_millis(100)).is_err());
         assert!(timeout(&gige) > POLL * 8, "{:?}", timeout(&gige));
+    }
+    #[test]
+    fn a_leader_armed_for_a_trigger_waits_without_polling() {
+        let (fake, mut gige) = streaming(|camera| {
+            camera.registers.insert(GVCP_CAPABILITY, 0x4);
+        });
+        let destination = fake.camera.lock().unwrap().destination();
+        let packets = frame_packets(1, false, WIDTH, HEIGHT, 1464);
+        fake.stream.send_to(&packets[0], destination).unwrap();
+        assert!(gige.next_frame(Duration::from_millis(100)).is_err());
+        if !cfg!(windows) {
+            let timeout = gige.stream.as_ref().unwrap().timeout;
+            assert!(timeout > POLL * 8, "{timeout:?}");
+        }
+        assert!(gige.next_frame(Duration::from_millis(200)).is_err());
+        for packet in &packets[1..] {
+            fake.stream.send_to(packet, destination).unwrap();
+        }
+        assert_eq!(gige.next_frame(Duration::from_secs(1)).unwrap().id, 1);
+        assert!(fake.camera.lock().unwrap().requests.is_empty());
     }
     #[test]
     fn fake_camera_unavailable_packets_abandon_the_frame() {
