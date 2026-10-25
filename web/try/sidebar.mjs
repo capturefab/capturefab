@@ -170,6 +170,8 @@ class Sidebar {
   #last = null;
   #thumbUrl = null;
   #recording = null;
+  /** True while a start awaits its storage check, so a second press cannot start a second recorder. */
+  #recordStarting = false;
   #recordError = null;
   #listUrls = new Set();
   #listLimit = LIST_ROWS;
@@ -329,6 +331,8 @@ class Sidebar {
       await this.stopRecording();
       return;
     }
+    if (this.#recordStarting) return;
+    this.#recordStarting = true;
     try {
       await this.#startRecording();
     } catch (error) {
@@ -337,6 +341,8 @@ class Sidebar {
       this.#say(capitalize(firstLine(this.#recordError)));
       this.#renderVideo();
       throw error;
+    } finally {
+      this.#recordStarting = false;
     }
   }
 
@@ -541,6 +547,10 @@ class Sidebar {
     const tracks = (app.mediaStream?.()?.getVideoTracks?.() ?? []).filter((track) => track.readyState === 'live');
     if (tracks.length === 0 || !this.#state.running) throw new Error('Start the stream to record.');
     const { bytes: used } = await this.#library.check(RECORDING_MARGIN);
+    // The stream may have stopped, or the camera changed, during the storage check.
+    if (this.#state.source !== source || !this.#state.running || !tracks.every((track) => track.readyState === 'live')) {
+      throw new Error('Start the stream to record.');
+    }
     const room = Math.min(RECORDING_LIMIT, this.#library.budgetBytes - used - RECORDING_MARGIN);
     this.#recordError = null;
     let recorder;
