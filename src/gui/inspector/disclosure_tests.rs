@@ -986,6 +986,7 @@ fn the_saved_line_and_recording_card_read_as_they_progress() {
         dropped: 3,
         late: 0,
         stalled: false,
+        recording: None,
     });
     let video = snapshot(&app, Pane::Forward, &mut tree, &renderer);
     let shown = labels(&video);

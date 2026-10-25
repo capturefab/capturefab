@@ -1157,6 +1157,7 @@ mod tests {
             dropped,
             late: 0,
             stalled,
+            recording: None,
         };
         let stats = |progress: &crate::session::ForwardingProgress, id| {
             recording_stats(85_000, Some(1_000), Some(progress), Some(id), true)
