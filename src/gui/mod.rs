@@ -2384,8 +2384,10 @@ impl Workbench {
     }
 
     fn discover_command(&self) -> SessionCommand {
+        // GigE devices may delay discovery acknowledgements by up to 1 s
+        // (GevDiscoveryAckDelay), plus the round trip.
         SessionCommand::Discover {
-            timeout_ms: 700,
+            timeout_ms: 1100,
             simulated: self.include_simulator,
         }
     }

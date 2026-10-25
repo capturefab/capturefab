@@ -195,6 +195,14 @@ mod tests {
     }
 
     #[test]
+    fn discovery_outlasts_the_longest_gige_acknowledgement_delay() {
+        let SessionCommand::Discover { timeout_ms, .. } = bench().discover_command() else {
+            unreachable!()
+        };
+        assert!(timeout_ms > 1000, "{timeout_ms}");
+    }
+
+    #[test]
     fn a_quiet_round_starts_only_while_the_welcome_waits_in_a_focused_window() {
         let mut bench = started(&[]);
         bench.tick_rediscover();
