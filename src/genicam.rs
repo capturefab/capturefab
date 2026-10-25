@@ -1793,19 +1793,20 @@ pub fn decode_xml(data: &[u8]) -> Result<String> {
     ensure!(data.len() <= MAX_XML, "GenICam file exceeds 32 MiB limit");
     let bytes = if data.starts_with(b"PK\x03\x04") {
         let mut archive = zip::ZipArchive::new(Cursor::new(data)).context("invalid GenICam ZIP")?;
-        let indices = (0..archive.len())
-            .filter(|i| {
-                archive
-                    .by_index(*i)
-                    .map(|f| f.name().to_ascii_lowercase().ends_with(".xml") && !f.is_dir())
-                    .unwrap_or(false)
+        // Like the reference implementation, take the first file, preferring
+        // one named *.xml when the archive also holds other files.
+        let files = (0..archive.len())
+            .filter_map(|i| {
+                let file = archive.by_index(i).ok()?;
+                (!file.is_dir()).then(|| (i, file.name().to_ascii_lowercase().ends_with(".xml")))
             })
             .collect::<Vec<_>>();
-        ensure!(
-            indices.len() == 1,
-            "GenICam ZIP must contain exactly one XML file"
-        );
-        let index = indices[0];
+        let (index, _) = files
+            .iter()
+            .find(|(_, xml)| *xml)
+            .or(files.first())
+            .copied()
+            .context("GenICam ZIP contains no file")?;
         let file = archive.by_index(index)?;
         ensure!(
             file.size() <= MAX_XML as u64,
@@ -2415,7 +2416,7 @@ mod tests {
         assert_eq!(io.read_memory(0, 4).unwrap(), [1, 2, 170, 4]);
     }
     #[test]
-    fn zip_xml_limits_and_ambiguity() {
+    fn zip_xml_selects_the_first_xml_file() {
         use std::io::Write;
         let archive = |names: &[&str]| {
             let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
@@ -2430,8 +2431,32 @@ mod tests {
             decode_xml(&archive(&["model.xml"])).unwrap(),
             "<RegisterDescription/>"
         );
-        assert!(decode_xml(&archive(&["a.xml", "b.xml"])).is_err());
-        assert!(decode_xml(&archive(&["readme.txt"])).is_err());
+        let first = |names: &[(&str, &str)]| {
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for (name, body) in names {
+                zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(body.as_bytes()).unwrap();
+            }
+            decode_xml(&zip.finish().unwrap().into_inner())
+        };
+        assert_eq!(
+            first(&[("a.xml", "<A/>"), ("b.xml", "<B/>")]).unwrap(),
+            "<A/>"
+        );
+        assert_eq!(
+            first(&[("readme.txt", "notes"), ("Camera.XML", "<C/>")]).unwrap(),
+            "<C/>"
+        );
+        assert_eq!(first(&[("Camera_1_0", "<D/>")]).unwrap(), "<D/>");
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zip.add_directory("xml/", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.start_file("xml/Camera.xml", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"<E/>").unwrap();
+        let nested = zip.finish().unwrap().into_inner();
+        assert_eq!(decode_xml(&nested).unwrap(), "<E/>");
     }
     #[test]
     fn unavailable_and_locked_features_fail_closed() {
