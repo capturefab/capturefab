@@ -6,6 +6,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
+use sha2::{Sha256, Sha512_256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Read, Write},
@@ -267,7 +268,8 @@ fn read_line(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>> {
 }
 struct HttpResponse {
     status: u16,
-    headers: BTreeMap<String, String>,
+    /// Each `WWW-Authenticate` line, kept apart.
+    challenges: Vec<String>,
     body: String,
 }
 fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
@@ -278,6 +280,7 @@ fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
         .context("malformed ONVIF HTTP status")?
         .parse::<u16>()?;
     let mut headers: BTreeMap<String, String> = BTreeMap::new();
+    let mut challenges = Vec::new();
     let mut header_bytes = 0;
     loop {
         let line = read_line(&mut reader, 8192)?;
@@ -294,6 +297,9 @@ fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
             .split_once(':')
             .context("malformed ONVIF HTTP header")?;
         let name = name.to_ascii_lowercase();
+        if name == "www-authenticate" {
+            challenges.push(value.trim().to_owned());
+        }
         headers
             .entry(name)
             .and_modify(|v| {
@@ -343,7 +349,7 @@ fn parse_http(mut reader: impl BufRead) -> Result<HttpResponse> {
     }
     Ok(HttpResponse {
         status,
-        headers,
+        challenges,
         body: String::from_utf8(body).context("ONVIF response is not UTF-8")?,
     })
 }
@@ -472,47 +478,134 @@ fn security(credentials: &Credentials) -> Result<String> {
         STANDARD.encode(nonce)
     ))
 }
-fn digest_fields(challenge: &str) -> Result<BTreeMap<String, String>> {
-    let start = challenge
-        .to_ascii_lowercase()
-        .find("digest ")
-        .context("server did not offer HTTP Digest authentication")?;
-    let mut rest = &challenge[start + 7..];
-    let mut result = BTreeMap::new();
-    while !rest.trim().is_empty() {
-        rest = rest.trim_start_matches(|c: char| c == ',' || c.is_ascii_whitespace());
-        let Some((key, after)) = rest.split_once('=') else {
-            break;
-        };
-        let key = key.trim().to_ascii_lowercase();
-        let after = after.trim_start();
-        if let Some(quoted) = after.strip_prefix('"') {
-            let mut value = String::new();
-            let mut escaped = false;
-            let mut end = None;
-            for (i, c) in quoted.char_indices() {
-                if escaped {
-                    value.push(c);
-                    escaped = false
-                } else if c == '\\' {
-                    escaped = true
-                } else if c == '"' {
-                    end = Some(i);
-                    break;
-                } else {
-                    value.push(c)
+/// One HTTP authentication challenge: its scheme and parameters.
+#[derive(Debug)]
+pub(crate) struct Challenge {
+    pub(crate) scheme: String,
+    pub(crate) params: BTreeMap<String, String>,
+}
+/// Split `WWW-Authenticate` values into challenges (RFC 7235 4.1): a server
+/// may repeat the header, and one value may hold several challenges.
+pub(crate) fn challenges(values: &[String]) -> Result<Vec<Challenge>> {
+    let mut result = Vec::new();
+    for value in values {
+        let mut rest = value.as_str();
+        let mut current: Option<Challenge> = None;
+        loop {
+            rest = rest.trim_start_matches(|c: char| c == ',' || c.is_ascii_whitespace());
+            if rest.is_empty() {
+                break;
+            }
+            let end = rest
+                .find(|c: char| c == '=' || c == ',' || c.is_ascii_whitespace())
+                .unwrap_or(rest.len());
+            let token = &rest[..end];
+            let after = rest[end..].trim_start_matches([' ', '\t']);
+            match after
+                .strip_prefix('=')
+                .map(|v| v.trim_start_matches([' ', '\t']))
+            {
+                Some(value) if !value.is_empty() && !value.starts_with([',', '=']) => {
+                    let (value, next) = if let Some(quoted) = value.strip_prefix('"') {
+                        let mut text = String::new();
+                        let mut escaped = false;
+                        let mut end = None;
+                        for (i, c) in quoted.char_indices() {
+                            if escaped {
+                                text.push(c);
+                                escaped = false
+                            } else if c == '\\' {
+                                escaped = true
+                            } else if c == '"' {
+                                end = Some(i);
+                                break;
+                            } else {
+                                text.push(c)
+                            }
+                        }
+                        let end = end.context("unterminated HTTP authentication challenge")?;
+                        (text, &quoted[end + 1..])
+                    } else {
+                        let end = value.find(',').unwrap_or(value.len());
+                        (value[..end].trim().to_owned(), &value[end..])
+                    };
+                    if let Some(challenge) = &mut current {
+                        challenge.params.insert(token.to_ascii_lowercase(), value);
+                    }
+                    rest = next;
+                }
+                // A token68 credential, as in `Negotiate abc==`.
+                Some(_) => rest = after.trim_start_matches('='),
+                None => {
+                    result.extend(current.take());
+                    current = Some(Challenge {
+                        scheme: token.to_owned(),
+                        params: BTreeMap::new(),
+                    });
+                    rest = &rest[end..];
                 }
             }
-            let end = end.context("unterminated HTTP Digest challenge")?;
-            result.insert(key, value);
-            rest = &quoted[end + 1..];
-        } else {
-            let (value, next) = after.split_once(',').unwrap_or((after, ""));
-            result.insert(key, value.trim().into());
-            rest = next;
         }
+        result.extend(current);
     }
     Ok(result)
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum DigestHash {
+    Md5,
+    Sha256,
+    Sha512_256,
+}
+impl DigestHash {
+    /// The hash and whether it is a `-sess` variant, for an RFC 7616
+    /// algorithm token; an absent algorithm means MD5.
+    fn parse(algorithm: Option<&str>) -> Option<(Self, bool)> {
+        let name = algorithm.unwrap_or("MD5").to_ascii_lowercase();
+        let (base, sess) = match name.strip_suffix("-sess") {
+            Some(base) => (base, true),
+            None => (name.as_str(), false),
+        };
+        let hash = match base {
+            "md5" => Self::Md5,
+            "sha-256" => Self::Sha256,
+            "sha-512-256" => Self::Sha512_256,
+            _ => return None,
+        };
+        Some((hash, sess))
+    }
+    fn hex(self, text: &str) -> String {
+        match self {
+            Self::Md5 => format!("{:x}", Md5::digest(text.as_bytes())),
+            Self::Sha256 => format!("{:x}", Sha256::digest(text.as_bytes())),
+            Self::Sha512_256 => format!("{:x}", Sha512_256::digest(text.as_bytes())),
+        }
+    }
+}
+/// The Digest challenge to answer: the strongest algorithm this client can
+/// compute, the server's order of preference breaking ties.
+fn digest_challenge(challenges: &[Challenge]) -> Option<(&Challenge, DigestHash, bool)> {
+    let mut best: Option<(&Challenge, DigestHash, bool)> = None;
+    for challenge in challenges {
+        if !challenge.scheme.eq_ignore_ascii_case("digest")
+            || !challenge.params.contains_key("realm")
+            || !challenge.params.contains_key("nonce")
+            || challenge
+                .params
+                .get("qop")
+                .is_some_and(|qop| !qop.split(',').any(|q| q.trim() == "auth"))
+        {
+            continue;
+        }
+        let Some((hash, sess)) =
+            DigestHash::parse(challenge.params.get("algorithm").map(String::as_str))
+        else {
+            continue;
+        };
+        if best.is_none_or(|(_, strongest, _)| hash > strongest) {
+            best = Some((challenge, hash, sess));
+        }
+    }
+    best
 }
 
 fn validate_timeout(timeout: Duration) -> Result<()> {
@@ -536,73 +629,102 @@ fn validate_credentials(credentials: &Credentials) -> Result<()> {
     );
     Ok(())
 }
-fn md5_hex(s: &str) -> String {
-    format!("{:x}", Md5::digest(s.as_bytes()))
-}
 fn quoted(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
-fn digest_authorization(
-    challenge: &str,
+/// The Authorization value answering a 401: Digest (RFC 7616) with the
+/// challenge [`digest_challenge`] picks, else Basic when offered.
+fn http_authorization(
+    values: &[String],
     credentials: &Credentials,
+    method: &str,
     path: &str,
     cnonce: &str,
 ) -> Result<String> {
     ensure!(
-        !challenge.contains(['\r', '\n']) && !credentials.username.contains(['\r', '\n']),
-        "invalid HTTP Digest header characters"
+        !values.iter().any(|v| v.contains(['\r', '\n']))
+            && !credentials.username.contains(['\r', '\n']),
+        "invalid HTTP authentication header characters"
     );
-    let fields = digest_fields(challenge)?;
-    let realm = fields
-        .get("realm")
-        .context("HTTP Digest challenge has no realm")?;
-    let nonce = fields
-        .get("nonce")
-        .context("HTTP Digest challenge has no nonce")?;
-    let algorithm = fields.get("algorithm").map(String::as_str).unwrap_or("MD5");
-    ensure!(
-        matches!(algorithm.to_ascii_lowercase().as_str(), "md5" | "md5-sess"),
-        "unsupported HTTP Digest algorithm {algorithm}"
-    );
-    let qop = if let Some(qop) = fields.get("qop") {
-        ensure!(
-            qop.split(',').any(|q| q.trim() == "auth"),
-            "HTTP Digest auth-int is unsupported"
-        );
-        Some("auth")
-    } else {
-        None
-    };
-    let mut ha1 = md5_hex(&format!(
+    let challenges = challenges(values)?;
+    if let Some((challenge, hash, sess)) = digest_challenge(&challenges) {
+        return Ok(digest_authorization(
+            challenge,
+            hash,
+            sess,
+            credentials,
+            method,
+            path,
+            cnonce,
+        ));
+    }
+    if challenges
+        .iter()
+        .any(|c| c.scheme.eq_ignore_ascii_case("basic"))
+    {
+        return Ok(format!(
+            "Basic {}",
+            STANDARD.encode(format!("{}:{}", credentials.username, credentials.password))
+        ));
+    }
+    if let Some(digest) = challenges
+        .iter()
+        .find(|c| c.scheme.eq_ignore_ascii_case("digest"))
+    {
+        match digest.params.get("algorithm") {
+            Some(algorithm) if DigestHash::parse(Some(algorithm)).is_none() => {
+                bail!("unsupported HTTP Digest algorithm {algorithm}")
+            }
+            _ if digest.params.contains_key("qop") => bail!("HTTP Digest auth-int is unsupported"),
+            _ => bail!("HTTP Digest challenge has no realm or nonce"),
+        }
+    }
+    bail!("unsupported ONVIF HTTP authentication method")
+}
+fn digest_authorization(
+    challenge: &Challenge,
+    hash: DigestHash,
+    sess: bool,
+    credentials: &Credentials,
+    method: &str,
+    path: &str,
+    cnonce: &str,
+) -> String {
+    let param = |name: &str| challenge.params.get(name).map(String::as_str);
+    let realm = param("realm").unwrap_or_default();
+    let nonce = param("nonce").unwrap_or_default();
+    let qop = param("qop").is_some();
+    let mut ha1 = hash.hex(&format!(
         "{}:{realm}:{}",
         credentials.username, credentials.password
     ));
-    if algorithm.eq_ignore_ascii_case("MD5-sess") {
-        ha1 = md5_hex(&format!("{ha1}:{nonce}:{cnonce}"));
+    if sess {
+        ha1 = hash.hex(&format!("{ha1}:{nonce}:{cnonce}"));
     }
-    let ha2 = md5_hex(&format!("POST:{path}"));
-    let response = if qop.is_some() {
-        md5_hex(&format!("{ha1}:{nonce}:00000001:{cnonce}:auth:{ha2}"))
+    let ha2 = hash.hex(&format!("{method}:{path}"));
+    let response = if qop {
+        hash.hex(&format!("{ha1}:{nonce}:00000001:{cnonce}:auth:{ha2}"))
     } else {
-        md5_hex(&format!("{ha1}:{nonce}:{ha2}"))
+        hash.hex(&format!("{ha1}:{nonce}:{ha2}"))
     };
     let mut auth = format!(
-        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{response}\", algorithm={algorithm}",
+        "Digest username=\"{}\", realm=\"{}\", nonce=\"{}\", uri=\"{}\", response=\"{response}\", algorithm={}",
         quoted(&credentials.username),
         quoted(realm),
         quoted(nonce),
-        quoted(path)
+        quoted(path),
+        param("algorithm").unwrap_or("MD5")
     );
-    if qop.is_some() {
+    if qop {
         auth.push_str(&format!(
             ", qop=auth, nc=00000001, cnonce=\"{}\"",
             quoted(cnonce)
         ));
     }
-    if let Some(opaque) = fields.get("opaque") {
+    if let Some(opaque) = param("opaque") {
         auth.push_str(&format!(", opaque=\"{}\"", quoted(opaque)));
     }
-    Ok(auth)
+    auth
 }
 fn soap(
     endpoint: &str,
@@ -631,20 +753,17 @@ fn soap(
         let Some(credentials) = credentials else {
             return Err(refused(false));
         };
-        let challenge = first
-            .headers
-            .get("www-authenticate")
-            .context("ONVIF authentication challenge is missing")?;
-        let authorization = if challenge.to_ascii_lowercase().contains("digest ") {
-            digest_authorization(challenge, credentials, &url.path, &random_hex()?)?
-        } else if challenge.to_ascii_lowercase().contains("basic") {
-            format!(
-                "Basic {}",
-                STANDARD.encode(format!("{}:{}", credentials.username, credentials.password))
-            )
-        } else {
-            bail!("unsupported ONVIF HTTP authentication method")
-        };
+        ensure!(
+            !first.challenges.is_empty(),
+            "ONVIF authentication challenge is missing"
+        );
+        let authorization = http_authorization(
+            &first.challenges,
+            credentials,
+            "POST",
+            &url.path,
+            &random_hex()?,
+        )?;
         let second = request(&url, &action, &body, Some(&authorization), timeout)?;
         if second.status == 401 {
             return Err(refused(true));
@@ -1140,15 +1259,17 @@ mod tests {
     #[test]
     fn digest_auth_handles_quoted_commas() {
         let challenge =
-            "Digest realm=\"camera, network\", nonce=\"abc\", qop=\"auth,auth-int\", algorithm=MD5";
-        let fields = digest_fields(challenge).unwrap();
-        assert_eq!(fields["realm"], "camera, network");
-        let auth = digest_authorization(
-            challenge,
+            "Digest realm=\"camera, network\", nonce=\"abc\", qop=\"auth,auth-int\", algorithm=MD5"
+                .to_owned();
+        let parsed = challenges(std::slice::from_ref(&challenge)).unwrap();
+        assert_eq!(parsed[0].params["realm"], "camera, network");
+        let auth = http_authorization(
+            &[challenge],
             &Credentials {
                 username: "user".into(),
                 password: "pass".into(),
             },
+            "POST",
             "/onvif/device_service",
             "random",
         )
@@ -1157,6 +1278,106 @@ mod tests {
         assert!(!auth.contains("pass"));
         assert!(parse_url("https://camera/service").is_err());
         assert!(parse_url("http://user:pass@camera/service").is_err());
+    }
+    fn digest_response(authorization: &str) -> BTreeMap<String, String> {
+        let mut parsed = challenges(&[authorization.to_owned()]).unwrap();
+        assert_eq!(parsed.len(), 1, "{authorization}");
+        parsed.remove(0).params
+    }
+    #[test]
+    fn digest_answers_the_strongest_of_several_challenges() {
+        let mufasa = Credentials {
+            username: "Mufasa".into(),
+            password: "Circle of Life".into(),
+        };
+        let cnonce = "f2/wE4q74E6zIJEtWaHKaf5wv/H5QzzpXusqGemxURZJ";
+        let rfc = |algorithm: &str| {
+            format!(
+                "Digest realm=\"http-auth@example.org\", qop=\"auth, auth-int\", algorithm={algorithm}, nonce=\"7ypf/xlj9XXwfDPEoM4URrv/xwf94BcCAzFZH4GiTo0v\", opaque=\"FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS\""
+            )
+        };
+        // RFC 7616 3.9.1, in both header orders.
+        for lines in [
+            vec![rfc("SHA-256"), rfc("MD5")],
+            vec![rfc("MD5"), rfc("SHA-256")],
+        ] {
+            let auth =
+                http_authorization(&lines, &mufasa, "GET", "/dir/index.html", cnonce).unwrap();
+            let fields = digest_response(&auth);
+            assert_eq!(fields["algorithm"], "SHA-256");
+            assert_eq!(
+                fields["response"],
+                "753927fa0e85d155564e2e272a28d1802ca10daf4496794697cf8db5856cb6c1"
+            );
+            assert_eq!(
+                fields["opaque"],
+                "FQhe/qaU925kfnzjCev0ciny7QMkPqMAFRtzCUYo5tdS"
+            );
+        }
+        let auth =
+            http_authorization(&[rfc("MD5")], &mufasa, "GET", "/dir/index.html", cnonce).unwrap();
+        assert_eq!(
+            digest_response(&auth)["response"],
+            "8ca523f5e9506fed4657c9700eebdbec"
+        );
+        let credentials = Credentials {
+            username: "admin".into(),
+            password: "secret".into(),
+        };
+        // Realm first, two challenges on one line: the unsupported one is skipped.
+        let auth = http_authorization(
+            &["Digest realm=\"cam\", qop=\"auth\", algorithm=MD5, nonce=\"n1\", Digest realm=\"cam\", qop=\"auth\", algorithm=SHA-1, nonce=\"n2\"".into()],
+            &credentials,
+            "POST",
+            "/onvif/media",
+            "c",
+        )
+        .unwrap();
+        let fields = digest_response(&auth);
+        assert_eq!(
+            (fields["algorithm"].as_str(), fields["nonce"].as_str()),
+            ("MD5", "n1")
+        );
+        // Realm, nonce and opaque all come from the chosen challenge.
+        let auth = http_authorization(
+            &[
+                "Digest realm=\"one\", nonce=\"n1\", opaque=\"o1\", algorithm=MD5".into(),
+                "Digest realm=\"two\", nonce=\"n2\", opaque=\"o2\", algorithm=SHA-256".into(),
+            ],
+            &credentials,
+            "POST",
+            "/onvif/media",
+            "c",
+        )
+        .unwrap();
+        let fields = digest_response(&auth);
+        assert_eq!(
+            [&fields["realm"], &fields["nonce"], &fields["opaque"]],
+            ["two", "n2", "o2"]
+        );
+        let ha1 = format!("{:x}", Sha256::digest(b"admin:two:secret"));
+        let ha2 = format!("{:x}", Sha256::digest(b"POST:/onvif/media"));
+        assert_eq!(
+            fields["response"],
+            format!("{:x}", Sha256::digest(format!("{ha1}:n2:{ha2}").as_bytes()))
+        );
+        // Digest is preferred over Basic and token68 schemes in any order.
+        for line in [
+            "Basic realm=\"cam\", Digest realm=\"cam\", nonce=\"n\"",
+            "Negotiate abc==, Digest realm=\"cam\", nonce=\"n\", Basic realm=\"cam\"",
+        ] {
+            let auth = http_authorization(&[line.into()], &credentials, "POST", "/", "c").unwrap();
+            assert!(auth.starts_with("Digest "), "{auth}");
+        }
+        let error = http_authorization(
+            &["Digest realm=\"cam\", nonce=\"n\", algorithm=SHA-1".into()],
+            &credentials,
+            "POST",
+            "/",
+            "c",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("SHA-1"), "{error}");
     }
     #[test]
     fn soap_fault_is_an_error() {
@@ -1235,12 +1456,12 @@ mod tests {
                     assert!(headers["soapaction"].contains(operation));
                     if authenticated {
                         let supplied = &headers["authorization"];
-                        let fields = digest_fields(supplied).unwrap();
-                        let expected = digest_authorization(
-                            challenge,
+                        let expected = http_authorization(
+                            &[challenge.into()],
                             &server_credentials,
+                            "POST",
                             &path,
-                            &fields["cnonce"],
+                            &digest_response(supplied)["cnonce"],
                         )
                         .unwrap();
                         assert_eq!(*supplied, expected);
