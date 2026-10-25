@@ -22,6 +22,7 @@ const WRITE_REGISTER: u16 = 0x0082;
 const READ_MEMORY: u16 = 0x0084;
 const WRITE_MEMORY: u16 = 0x0086;
 const PENDING_ACK: u16 = 0x0089;
+const DEVICE_MODE: u32 = 0x0004;
 const CONTROL_PRIVILEGE: u32 = 0x0a00;
 const GVCP_CAPABILITY: u32 = 0x0934;
 const GVCP_CONFIGURATION: u32 = 0x0954;
@@ -360,6 +361,11 @@ struct Control {
     pending_limit: Option<Duration>,
     /// The GVCP configuration to restore after enabling PENDING_ACK.
     restore_configuration: Option<u32>,
+    /// Four-byte accesses use READREG/WRITEREG with network-order data, as
+    /// GenICam schema 1.0 devices expect; otherwise memory accesses pass
+    /// camera-order data as-is.
+    legacy_registers: bool,
+    little_endian: bool,
 }
 impl Control {
     fn connect(address: SocketAddrV4, timeout: Duration) -> Result<Self> {
@@ -375,6 +381,8 @@ impl Control {
             response: Duration::ZERO,
             pending_limit: None,
             restore_configuration: None,
+            legacy_registers: true,
+            little_endian: false,
         })
     }
     fn transact(&mut self, command: u16, payload: &[u8]) -> Result<Vec<u8>> {
@@ -489,7 +497,7 @@ impl Control {
             address.is_multiple_of(4) && length.is_multiple_of(4),
             "unaligned GVCP memory read"
         );
-        if length == 4 {
+        if length == 4 && self.legacy_registers {
             return Ok(self.read_register(address)?.to_be_bytes().to_vec());
         }
         let mut result = Vec::with_capacity(length);
@@ -522,13 +530,21 @@ impl Control {
             let current = address
                 .checked_add((index * MEMORY_CHUNK) as u32)
                 .context("GVCP address overflow")?;
+            // Register writes carry values, so camera-order data from a
+            // little-endian device is flipped back.
+            let flip = !self.legacy_registers && self.little_endian;
             let words = |control: &mut Self| -> Result<()> {
                 for (word, value) in bytes.as_chunks::<4>().0.iter().enumerate() {
-                    control.write_register(current + word as u32 * 4, be32(value, 0))?;
+                    let value = if flip {
+                        u32::from_le_bytes(*value)
+                    } else {
+                        u32::from_be_bytes(*value)
+                    };
+                    control.write_register(current + word as u32 * 4, value)?;
                 }
                 Ok(())
             };
-            if bytes.len() == 4 || !self.write_memory {
+            if (bytes.len() == 4 && self.legacy_registers) || !self.write_memory {
                 words(self)?;
                 continue;
             }
@@ -788,6 +804,9 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
             control.read_register(CONTROL_PRIVILEGE)? & 3 != 0,
             "camera did not grant controller privilege"
         );
+        control.little_endian = control
+            .read_register(DEVICE_MODE)
+            .is_ok_and(|mode| mode & 0x8000_0000 == 0);
         let capability = control.read_register(GVCP_CAPABILITY).ok();
         let resend = capability.is_some_and(|bits| bits & 0x4 != 0);
         control.write_memory = capability.is_none_or(|bits| bits & 0x2 != 0);
@@ -894,6 +913,10 @@ impl Backend for GigE {
             })();
             match result {
                 Ok(xml) => {
+                    self.control
+                        .lock()
+                        .map_err(|_| anyhow!("GVCP mutex poisoned"))?
+                        .legacy_registers = legacy_registers(&xml);
                     self.xml_cache = Some(xml.clone());
                     return Ok(xml);
                 }
@@ -1353,6 +1376,50 @@ fn ladder(mut test: impl FnMut(u32) -> Option<u32>, cap: u32, mtu_known: bool) -
         }
     }
     Some(low)
+}
+
+/// Devices whose XML claims schema 1.1 or newer while their registers follow
+/// the schema 1.0 GigE Vision convention (the list Aravis keeps).
+const LEGACY_REGISTER_DEVICES: [(&str, &str); 19] = [
+    ("AT_Automation_Technology_GmbH", "C6_X_GigE"),
+    ("DO3THINK", "MGV518"),
+    ("EVK", "HELIOS"),
+    ("IDS_Imaging_Development_Systems_GmbH", "GV_53FxLE_M"),
+    ("IDS_Imaging_Development_Systems_GmbH", "GV_58CxLE_M"),
+    ("IDS_Imaging_Development_Systems_GmbH", "GV_524xCP_NIR"),
+    ("IDS_Imaging_Development_Systems_GmbH", "GV_599xCP_C"),
+    ("Imperx", "IpxGEVCamera"),
+    ("KowaOptronics", "SC130ET3"),
+    ("NIT", "Tachyon16k"),
+    ("NIT", "NSC1601GIGE"),
+    ("PleoraTechnologiesInc", "CLTenFull"),
+    ("PleoraTechnologiesInc", "iPORTCLGigE"),
+    ("PleoraTechnologiesInc", "NTxGigE"),
+    ("Sony", "XCG_CGSeries"),
+    ("Sony", "XCG_CPSeries"),
+    ("TeledyneDALSA", "ICE"),
+    ("Xenics", "Wildcat"),
+    ("FLIR", "XscSeries"),
+];
+
+/// Whether four-byte accesses must use READREG/WRITEREG with network-order
+/// data. GenICam asks for this only for schema 1.0 XML; newer schemas read
+/// registers in camera order, which differs on little-endian devices. An
+/// unreadable root element keeps the legacy convention.
+fn legacy_registers(xml: &str) -> bool {
+    let root = (|| {
+        let start = xml.find("<RegisterDescription")?;
+        let tag = &xml[start..start + xml[start..].find('>')?];
+        let tag = format!("{}/>", tag.trim_end_matches('/'));
+        let document = roxmltree::Document::parse(&tag).ok()?;
+        let root = document.root_element();
+        let number = |name| root.attribute(name)?.trim().parse::<u32>().ok();
+        let schema = (number("SchemaMajorVersion")?, number("SchemaMinorVersion")?);
+        let attribute = |name| root.attribute(name).unwrap_or_default();
+        let device = (attribute("VendorName"), attribute("ModelName"));
+        Some((schema, LEGACY_REGISTER_DEVICES.contains(&device)))
+    })();
+    root.is_none_or(|(schema, listed)| schema < (1, 1) || listed)
 }
 
 struct LocalUrl {
@@ -2269,6 +2336,8 @@ mod tests {
         register_writes: Vec<(u32, u32)>,
         memory_writes: Vec<(u32, usize)>,
         no_write_memory: bool,
+        memory_reads: Vec<(u32, usize)>,
+        little_endian: bool,
         resend_status: u16,
         sticky_flags: u32,
         frames: HashMap<u64, Vec<Vec<u8>>>,
@@ -2418,13 +2487,33 @@ mod tests {
                                 status => ack(command + 1, id, status, &[]),
                             },
                         ),
+                        READ_MEMORY => {
+                            let (address, length) = (be32(packet, 8), be32(packet, 12));
+                            camera.memory_reads.push((address, length as usize));
+                            let mut data = address.to_be_bytes().to_vec();
+                            for word in (address..address + length).step_by(4) {
+                                let value = camera.register(word);
+                                data.extend(if camera.little_endian {
+                                    value.to_le_bytes()
+                                } else {
+                                    value.to_be_bytes()
+                                });
+                            }
+                            Some(ack(command + 1, id, 0, &data))
+                        }
                         WRITE_MEMORY if !camera.no_write_memory => {
                             let address = be32(packet, 8);
                             let data = &packet[12..];
                             camera.memory_writes.push((address, data.len()));
+                            let little_endian = camera.little_endian;
                             let status = data.chunks(4).enumerate().find_map(|(word, value)| {
                                 let address = address + word as u32 * 4;
-                                match camera.write(address, be32(value, 0), &mut outgoing) {
+                                let value = if little_endian {
+                                    u32::from_le_bytes(value.try_into().unwrap())
+                                } else {
+                                    be32(value, 0)
+                                };
+                                match camera.write(address, value, &mut outgoing) {
                                     0 => None,
                                     status => Some(status),
                                 }
@@ -2781,6 +2870,55 @@ mod tests {
         let camera = fake.camera.lock().unwrap();
         assert!(camera.memory_writes.is_empty());
         assert_eq!(camera.register_writes.len(), 4);
+    }
+    #[test]
+    fn register_access_follows_the_xml_schema_and_device_byte_order() {
+        let root = |attributes: &str| {
+            format!(
+                "<?xml version=\"1.0\"?>\n<RegisterDescription {attributes} \
+                 xmlns=\"http://www.genicam.org/GenApi/Version_1_1\" \
+                 xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" \
+                 xsi:schemaLocation=\"x\"><Category Name=\"Root\"/></RegisterDescription>"
+            )
+        };
+        for (attributes, legacy) in [
+            (
+                r#"ModelName="CD49M11" VendorName="TeledyneDALSA" SchemaMajorVersion="1" SchemaMinorVersion="1" SchemaSubMinorVersion="0""#,
+                false,
+            ),
+            (r#"SchemaMajorVersion="1" SchemaMinorVersion="0""#, true),
+            (r#"SchemaMajorVersion="2" SchemaMinorVersion="0""#, false),
+            (
+                r#"VendorName="Sony" ModelName="XCG_CGSeries" SchemaMajorVersion="1" SchemaMinorVersion="1""#,
+                true,
+            ),
+            ("", true),
+        ] {
+            assert_eq!(legacy_registers(&root(attributes)), legacy, "{attributes}");
+        }
+        assert!(legacy_registers("not xml"));
+
+        // A little-endian device holding 1 at a device register.
+        for (legacy, write_memory) in [(true, true), (false, true), (false, false)] {
+            let fake = Fake::new(|camera| {
+                camera.little_endian = true;
+                camera.no_write_memory = !write_memory;
+                camera.registers.insert(0x2000_0400, 1);
+            });
+            let mut control = Control::connect(fake.address, Duration::from_secs(1)).unwrap();
+            control.legacy_registers = legacy;
+            control.little_endian = true;
+            control.write_memory = write_memory;
+            let read = control.read_bytes(0x2000_0400, 4).unwrap();
+            // Schema 1.1 data is in camera order, as its XML declares it.
+            assert_eq!(read, if legacy { [0, 0, 0, 1] } else { [1, 0, 0, 0] });
+            let written = if legacy { [0, 0, 0, 2] } else { [2, 0, 0, 0] };
+            control.write_bytes(0x2000_0400, &written).unwrap();
+            assert_eq!(fake.register(0x2000_0400), 2, "{legacy} {write_memory}");
+            let camera = fake.camera.lock().unwrap();
+            assert_eq!(camera.memory_reads.is_empty(), legacy);
+            assert_eq!(camera.memory_writes.is_empty(), legacy || !write_memory);
+        }
     }
     #[test]
     fn local_url_hex_and_memory_ranges() {
