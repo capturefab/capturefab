@@ -287,7 +287,7 @@ pub(super) fn run_camera(cli: &Cli, client: &Client, command: &SetupCommand) -> 
                 return Err(InvalidInput(format!(
                     "This setup changes {}, which control how the camera triggers or signals other equipment. Review with capturefab setup diff {}, then pass --yes.",
                     disruptive.join(", "),
-                    quote(&setup.name)
+                    crate::hint::shell_quote(&setup.name)
                 ))
                 .into());
             }
@@ -320,26 +320,16 @@ pub(super) fn run_camera(cli: &Cli, client: &Client, command: &SetupCommand) -> 
     }
 }
 
-/// A word for a printed command line, quoted for POSIX shells when needed.
-fn quote(word: &str) -> String {
-    if !word.is_empty()
-        && word
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"-_.:/@%+=".contains(&b))
-    {
-        word.into()
-    } else {
-        format!("'{}'", word.replace('\'', "'\\''"))
-    }
-}
-
 /// "--session NAME " or "--camera ID " as this command named its camera,
 /// for a printed command that targets the same one; a placeholder otherwise.
 fn target(cli: &Cli) -> String {
     if let Some(session) = &cli.session {
-        format!("--session {} ", quote(session))
+        format!("--session {} ", crate::hint::shell_quote(session))
     } else if let Some(camera) = &cli.camera {
-        format!("--camera {} ", quote(&crate::media::redact_url(camera)))
+        format!(
+            "--camera {} ",
+            crate::hint::shell_quote(&crate::media::redact_url(camera))
+        )
     } else {
         "--camera ID ".into()
     }
@@ -520,7 +510,7 @@ pub(super) fn print_human(cli: &Cli, command: &SetupCommand, value: &Value) -> R
                 out,
                 "Network, user-set and file settings are never saved. Restore with: capturefab {}setup apply {}",
                 target(cli),
-                quote(setup["name"].as_str().unwrap_or_default())
+                crate::hint::shell_quote(setup["name"].as_str().unwrap_or_default())
             )?;
         }
         SetupCommand::List => {
@@ -654,7 +644,7 @@ pub(super) fn print_human(cli: &Cli, command: &SetupCommand, value: &Value) -> R
                 writeln!(
                     out,
                     "Undo with: capturefab --session {} undo",
-                    quote(session)
+                    crate::hint::shell_quote(session)
                 )?;
             }
         }

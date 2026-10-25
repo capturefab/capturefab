@@ -5792,7 +5792,7 @@ mod tests {
     fn named_setups_resolve_in_the_coordinator_and_pin_their_digest() {
         let h = crate::engine::WorkerHandle::new();
         h.request(SessionCommand::connect("sim:0".into(), 1000))
-        .unwrap();
+            .unwrap();
         let reading =
             serde_json::from_value(h.request(SessionCommand::ReadSetup).unwrap()).unwrap();
         h.shutdown();

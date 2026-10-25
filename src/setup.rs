@@ -605,30 +605,12 @@ pub fn from_read(name: &str, note: Option<String>, mut reading: Reading) -> Resu
     Ok(setup)
 }
 
-/// A name close to `name`, for "did you mean".
+/// The name closest to `name` among plausible typos, for "did you mean".
 fn closest<'a>(name: &str, names: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
-    fn distance(a: &str, b: &str) -> usize {
-        let (a, b) = (a.as_bytes(), b.as_bytes());
-        let mut row: Vec<usize> = (0..=b.len()).collect();
-        for (i, x) in a.iter().enumerate() {
-            let mut previous = row[0];
-            row[0] = i + 1;
-            for (j, y) in b.iter().enumerate() {
-                let current = row[j + 1];
-                row[j + 1] = (previous + usize::from(!x.eq_ignore_ascii_case(y)))
-                    .min(row[j] + 1)
-                    .min(current + 1);
-                previous = current;
-            }
-        }
-        row[b.len()]
-    }
     names
         .into_iter()
-        .map(|candidate| (distance(name, candidate), candidate))
-        .filter(|(distance, candidate)| *distance <= 2.max(candidate.len() / 4))
-        .min_by_key(|(distance, _)| *distance)
-        .map(|(_, candidate)| candidate)
+        .filter(|candidate| crate::hint::is_close(name, candidate))
+        .min_by_key(|candidate| crate::hint::edit_distance(name, candidate))
 }
 
 /// A setup name was taken and `replace` was not given.
