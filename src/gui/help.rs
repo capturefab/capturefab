@@ -634,9 +634,9 @@ fn step_button<'a>(
 /// The native camera scheme on this system, for the webcam note.
 fn webcam_scheme() -> &'static str {
     if cfg!(target_os = "macos") {
-        "avfoundation://"
+        "avfoundation:NAME"
     } else if cfg!(target_os = "windows") {
-        "dshow://"
+        "dshow:video=NAME"
     } else {
         "v4l2:/dev/videoN"
     }
@@ -735,6 +735,13 @@ fn connection_notes<'a>(hub_copied: bool, p: &'static Palette) -> Element<'a, Me
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_webcam_note_shows_a_locator_the_camera_opens_with() {
+        let syntax = webcam_scheme();
+        assert!(crate::media::is_host_camera(syntax));
+        assert!(!syntax.contains("//"), "{syntax}");
+    }
 
     #[test]
     fn quick_guide_first_step_actions_keep_readable_button_labels_in_compact_windows() {
