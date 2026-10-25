@@ -569,15 +569,26 @@ fn outcome(job: &Job, value: &Value) -> Option<(String, Option<String>, Level)> 
         }
         // The setup sheet shows what was read or compared.
         Job::ReadSetup | Job::SetupDiff => None,
-        Job::ApplySetup => done(format!(
-            "Restored {}: {}",
-            value["setup"].as_str().unwrap_or("the setup"),
-            plural(
-                value["applied"].as_u64().unwrap_or_default(),
-                "change",
-                "changes"
-            )
-        )),
+        Job::ApplySetup => {
+            let applied = value["applied"].as_u64().unwrap_or_default();
+            let auto = &value["auto_change"];
+            let auto = (value["auto_changed"] == true).then(|| match auto["saved"].as_f64() {
+                Some(balance) if auto["action"] == "balance" => {
+                    format!("auto exposure balance {balance:.2}")
+                }
+                Some(balance) => format!("auto exposure on, balance {balance:.2}"),
+                None => "auto exposure off".to_owned(),
+            });
+            let changed = match auto {
+                Some(auto) if applied == 0 => auto,
+                Some(auto) => format!("{} · {auto}", plural(applied, "change", "changes")),
+                None => plural(applied, "change", "changes"),
+            };
+            done(format!(
+                "Restored {}: {changed}",
+                value["setup"].as_str().unwrap_or("the setup")
+            ))
+        }
         Job::SetMany => done(match value["values"].as_array() {
             Some(values) => format!("Set {}", plural(values.len() as u64, "feature", "features")),
             None => "Features set".into(),
@@ -739,6 +750,26 @@ mod tests {
 
     fn notice(job: Job, value: Value) -> (String, Option<String>, Level) {
         command_notice(&job, &Ok(value)).expect("a notice")
+    }
+
+    #[test]
+    fn a_restore_names_the_auto_exposure_it_switched() {
+        let restored = |value: Value| notice(Job::ApplySetup, value).0;
+        assert_eq!(
+            restored(json!({"setup":"autos","applied":0,"auto_changed":true,
+                "auto_change":{"action":"enter","current":null,"saved":0.25}})),
+            "Restored autos: auto exposure on, balance 0.25"
+        );
+        assert_eq!(
+            restored(json!({"setup":"manual","applied":1,"auto_changed":true,
+                "auto_change":{"action":"release","current":0.25,"saved":null}})),
+            "Restored manual: 1 change · auto exposure off"
+        );
+        assert_eq!(
+            restored(json!({"setup":"bench","applied":3,"auto_changed":false,
+                "auto_change":{"action":"none","current":null,"saved":null}})),
+            "Restored bench: 3 changes"
+        );
     }
 
     #[test]

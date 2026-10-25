@@ -1908,7 +1908,8 @@ impl Workbench {
         self.result_stage(pending, result);
         self.result_inspector(pending, result);
         self.dataset_settled(pending, result);
-        self.setups_result(pending, result);
+        // A failed restore the setup sheet shows in place needs no notice.
+        let shown_in_sheet = self.setups_result(pending, result);
         let asks_sign_in = pending.job == Job::Connect
             && result
                 .as_ref()
@@ -1921,7 +1922,7 @@ impl Workbench {
             (self.side.discovery_issues != issues_before && !self.side.discovery_issues.is_empty())
                 .then(|| command_notice(&pending.job, result))
                 .flatten()
-        } else if asks_sign_in {
+        } else if asks_sign_in || shown_in_sheet {
             None
         } else {
             command_notice(&pending.job, result)

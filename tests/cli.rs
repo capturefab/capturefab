@@ -6859,7 +6859,7 @@ fn setup_hints_name_the_camera_in_a_session_with_several() {
     assert_eq!((gain("sim:0"), gain("sim:1")), (9.0, 5.0));
 }
 
-/// Restoring a change beyond the image needs --yes, by name and from a
+/// Restoring a change outside the known image settings needs --yes, by name and from a
 /// file; the refusal changes nothing and names the commands that review
 /// and confirm the same setup on the same camera.
 #[test]
@@ -6900,8 +6900,9 @@ fn saved_setups_require_yes_for_disruptive_changes() {
 
     let message = refused(&["setup", "apply", "line"]);
     assert!(
-        message
-            .contains("AcquisitionLineRate, which changes how the camera behaves beyond the image"),
+        message.contains(
+            "AcquisitionLineRate, which is not a known image setting and may change triggering"
+        ),
         "{message}"
     );
     assert!(!message.contains("triggers or signals"), "{message}");

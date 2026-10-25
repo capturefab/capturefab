@@ -47,7 +47,7 @@ pub enum SetupCommand {
         /// Apply to a camera of another model; only settings both share change
         #[arg(long)]
         allow_other_model: bool,
-        /// Confirm changes to triggering, I/O lines and other settings beyond the image
+        /// Confirm changes to settings outside the known image settings, such as triggering and I/O lines
         #[arg(long)]
         yes: bool,
     },
@@ -402,12 +402,12 @@ fn confirm_message(
         (None, name) => crate::hint::shell_quote(name.as_deref().unwrap_or_default()),
     };
     format!(
-        "This setup changes {}, which {} how the camera behaves beyond the image (such as triggering, I/O lines or acquisition rate). Review with capturefab {target}setup diff {source}, then run capturefab {target}setup apply {source}{}{} --yes",
+        "This setup changes {}, which {} and may change triggering, I/O lines or acquisition rate. Review with capturefab {target}setup diff {source}, then run capturefab {target}setup apply {source}{}{} --yes",
         disruptive.join(", "),
         if disruptive.len() == 1 {
-            "changes"
+            "is not a known image setting"
         } else {
-            "change"
+            "are not known image settings"
         },
         if allow_other_model {
             " --allow-other-model"
@@ -567,7 +567,7 @@ fn write_diff(out: &mut impl Write, diff: &Value, verb: &str) -> Result<()> {
     if changes(diff).any(|change| change["risk"] == "disruptive") {
         writeln!(
             out,
-            "  ! changes camera behavior beyond the image (such as triggering or I/O lines); restoring needs --yes"
+            "  ! not a known image setting (may change triggering or I/O lines); restoring needs --yes"
         )?;
     }
     let not_applied = diff["not_applied"].as_array().cloned().unwrap_or_default();
@@ -933,7 +933,7 @@ mod tests {
         );
         assert!(
             message.contains(
-                "AcquisitionLineRate, which changes how the camera behaves beyond the image"
+                "AcquisitionLineRate, which is not a known image setting and may change triggering"
             ),
             "{message}"
         );
@@ -958,7 +958,9 @@ mod tests {
             false,
         );
         assert!(
-            named.contains("TriggerMode, LineMode, which change how"),
+            named.contains(
+                "TriggerMode, LineMode, which are not known image settings and may change"
+            ),
             "{named}"
         );
         assert!(

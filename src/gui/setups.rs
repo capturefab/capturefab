@@ -9,6 +9,9 @@ use serde_json::Value;
 
 const NAME_FIELD: &str = "setup-name";
 const SHEET_WIDTH: f32 = 620.0;
+/// How long the confirm button ignores presses after it appears, so the
+/// second click of a double-click on Restore cannot confirm.
+const CONFIRM_ARM: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// The page the sheet shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -51,6 +54,10 @@ pub(super) enum Input {
     AllowOtherModel(bool),
     /// The primary button: restore, or ask to confirm disruptive changes.
     Restore,
+    /// The confirmation's own button: restore the changes it lists.
+    Confirm,
+    /// Leave the confirmation without restoring.
+    Disarm,
     ConfirmDelete(bool),
     Delete,
     Deleted(Result<String, String>),
@@ -88,6 +95,9 @@ pub(super) struct State {
     diff_key: Option<u64>,
     allow_other_model: bool,
     confirm: bool,
+    /// When the confirmation appeared; presses before `CONFIRM_ARM` passed
+    /// are ignored.
+    confirm_at: Option<std::time::Instant>,
     confirm_delete: bool,
     deleting: bool,
     matched_open: bool,
@@ -106,6 +116,20 @@ impl State {
 
     fn diff(&self) -> Option<&Value> {
         self.diff.as_ref()?.as_ref().ok()
+    }
+
+    /// Ask again before the next restore.
+    fn disarm(&mut self) {
+        self.confirm = false;
+        self.confirm_at = None;
+    }
+
+    /// Whether the confirmation has been shown long enough to take a press.
+    fn armed(&self, now: std::time::Instant) -> bool {
+        self.confirm
+            && self
+                .confirm_at
+                .is_some_and(|at| now.saturating_duration_since(at) >= CONFIRM_ARM)
     }
 }
 
@@ -222,6 +246,51 @@ fn disruptive(diff: &Value) -> bool {
     changes(diff).any(|change| change["risk"] == "disruptive")
 }
 
+/// How a restore changes Capturefab's software auto exposure, as the
+/// "Now" and "Setup" cells read: None when it stays as it is.
+fn auto_cells(diff: &Value) -> Option<(String, String)> {
+    let auto = &diff["auto_change"];
+    if matches!(auto["action"].as_str(), None | Some("none")) {
+        return None;
+    }
+    let cell = |balance: &Value| match balance.as_f64() {
+        Some(balance) => format!("On, balance {balance:.2}"),
+        None => "Off".to_owned(),
+    };
+    Some((cell(&auto["current"]), cell(&auto["saved"])))
+}
+
+/// The changes a restore makes: values, and auto exposure as one more.
+fn change_count(diff: &Value) -> usize {
+    changes(diff).count() + usize::from(auto_cells(diff).is_some())
+}
+
+/// A value in the comparison as the inspector shows it: numbers with the
+/// feature's unit, microseconds from 1,000 as milliseconds, and float
+/// noise from the camera rounded to 6 significant digits. A value of a
+/// feature the camera does not list reads as saved.
+fn diff_value(value: &Value, feature: Option<&FeatureInfo>) -> String {
+    let (Some(number), Some(feature)) = (value.as_f64().filter(|v| v.is_finite()), feature) else {
+        return shown(value);
+    };
+    let round = |value: f64| {
+        if value == 0.0 || value.fract() == 0.0 {
+            return value;
+        }
+        let scale = 10f64.powi(5 - value.abs().log10().floor() as i32);
+        (value * scale).round() / scale
+    };
+    let unit = feature_unit(feature);
+    if matches!(unit, Some("µs")) && number.abs() >= 1000.0 {
+        return format!("{} ms", range_number(round(number / 1000.0)));
+    }
+    let number = range_number(round(number));
+    match unit {
+        Some(unit) if !unit.is_empty() => format!("{number} {unit}"),
+        _ => number,
+    }
+}
+
 /// The names of changes that restart the stream, once each.
 fn locked(diff: &Value) -> Vec<&str> {
     let mut names = Vec::new();
@@ -282,6 +351,14 @@ impl Workbench {
             .map(|camera| &camera.info)
     }
 
+    /// The sheet camera's feature, for its unit; the features listed are
+    /// the selected camera's, so none while another camera is selected.
+    fn setup_feature(&self, name: &str) -> Option<&FeatureInfo> {
+        (self.snapshot.active_camera.is_some() && self.snapshot.active_camera == self.setups.camera)
+            .then(|| self.snapshot.features.iter().find(|f| f.name == name))
+            .flatten()
+    }
+
     fn read_setup(&mut self) {
         let Some(camera) = self.setups.camera.clone() else {
             return;
@@ -300,7 +377,7 @@ impl Workbench {
             return;
         };
         self.setups.diff_key = Some(self.setup_key());
-        self.setups.confirm = false;
+        self.setups.disarm();
         // The preview always shows what both cameras share; restoring to
         // another model still waits for the box below.
         if let Err(error) = self.try_submit(
@@ -435,9 +512,11 @@ impl Workbench {
             }
             Input::AllowOtherModel(allow) => {
                 state.allow_other_model = allow;
-                state.confirm = false;
+                state.disarm();
             }
-            Input::Restore => return self.restore_setup(),
+            Input::Restore => return self.restore_setup(false),
+            Input::Confirm => return self.restore_setup(true),
+            Input::Disarm => state.disarm(),
             Input::ConfirmDelete(confirm) => state.confirm_delete = confirm,
             Input::Delete => {
                 let Some(name) = state.chosen.clone() else {
@@ -479,7 +558,7 @@ impl Workbench {
         let state = &mut self.setups;
         state.page = page;
         state.scrolled = false;
-        state.confirm = false;
+        state.disarm();
         state.confirm_delete = false;
         let mut tasks = vec![operation::snap_to(
             SHEET_BODY,
@@ -515,22 +594,35 @@ impl Workbench {
         Task::batch(tasks)
     }
 
-    fn restore_setup(&mut self) -> Task<Message> {
+    /// `confirmed` is a press on the confirmation's own button. A restore
+    /// with disruptive changes first shows that confirmation; a press on
+    /// Restore while it shows, or on its button before `CONFIRM_ARM` passed,
+    /// does nothing, so a double-click never confirms.
+    fn restore_setup(&mut self, confirmed: bool) -> Task<Message> {
         let Some(diff) = self.setups.diff().cloned() else {
             return Task::none();
         };
         if !self.can_restore_setup(&diff) {
             return Task::none();
         }
-        if disruptive(&diff) && !self.setups.confirm {
-            self.setups.confirm = true;
-            return Task::none();
+        if disruptive(&diff) {
+            if !self.setups.confirm {
+                if !confirmed {
+                    self.setups.confirm = true;
+                    self.setups.confirm_at = Some(std::time::Instant::now());
+                    self.setups.confirm_delete = false;
+                }
+                return Task::none();
+            }
+            if !confirmed || !self.setups.armed(std::time::Instant::now()) {
+                return Task::none();
+            }
         }
         let (Some(camera), Some(name)) = (self.setups.camera.clone(), self.setups.chosen.clone())
         else {
             return Task::none();
         };
-        self.setups.confirm = false;
+        self.setups.disarm();
         self.setups.error = None;
         if self.setups.scene {
             return Task::none();
@@ -559,24 +651,27 @@ impl Workbench {
         Task::none()
     }
 
-    /// Whether the primary button can restore what the preview shows.
+    /// Whether the primary button can restore what the preview shows: a
+    /// value or auto exposure changes, nothing blocks it, and no other
+    /// camera change (an undo replay, a write, a stream start) is running.
     fn can_restore_setup(&self, diff: &Value) -> bool {
-        changes(diff).next().is_some()
+        change_count(diff) > 0
             && diff["blocked"].is_null()
             && (diff["match"] != "other_model" || self.setups.allow_other_model)
-            && !self.pending(Job::ApplySetup)
+            && !self.history_busy()
             && !self.pending(Job::SetupDiff)
     }
 
-    /// A reading, comparison or restore came back.
-    pub(super) fn setups_result(&mut self, pending: &Pending, result: &Result<Value>) {
+    /// A reading, comparison or restore came back. True when the sheet
+    /// shows a failure in place, so no notice repeats it.
+    pub(super) fn setups_result(&mut self, pending: &Pending, result: &Result<Value>) -> bool {
         if !matches!(
             pending.job,
             Job::ReadSetup | Job::SetupDiff | Job::ApplySetup
         ) || pending.camera != self.setups.camera
             || !self.setups.open
         {
-            return;
+            return false;
         }
         let outcome = match result {
             Ok(value) => Ok(value.clone()),
@@ -598,10 +693,12 @@ impl Workbench {
                 Err(error) => {
                     self.setups.error = Some(error);
                     self.compare_setup();
+                    return true;
                 }
             },
             _ => {}
         }
+        false
     }
 
     /// Read or compare again after the camera changed while the sheet is open.
@@ -957,6 +1054,11 @@ impl Workbench {
                 p,
             ));
         }
+        if state.confirm
+            && let Some(diff) = state.diff()
+        {
+            body = body.push(confirm_banner(diff, p));
+        }
         let diff = match &state.diff {
             None => {
                 return body
@@ -1029,7 +1131,7 @@ impl Workbench {
                 .color(p.secondary),
             );
         }
-        let count = changes(diff).count();
+        let count = change_count(diff);
         let mut section = column![heading_owned(format!("Changes ({count})"), p)].spacing(8);
         if count == 0 {
             section = section.push(
@@ -1040,7 +1142,7 @@ impl Workbench {
         } else {
             if disruptive(diff) {
                 section = section.push(
-                    text("Settings marked “Changes camera behavior” affect more than the image, such as triggering, I/O lines or acquisition rate.")
+                    text(format!("Settings marked “{CHECK}” are not on Capturefab's list of image settings, so they may change triggering, I/O lines or acquisition rate. Restoring asks you to confirm them."))
                         .size(style::SMALL)
                         .color(p.secondary),
                 );
@@ -1054,8 +1156,12 @@ impl Workbench {
             };
             section = section
                 .push(row![header("Feature", 5), header("Now", 3), header("Setup", 3)].spacing(10));
+            if let Some((now, saved)) = auto_cells(diff) {
+                section = section.push(auto_row(now, saved, p));
+            }
             for change in changes(diff) {
-                section = section.push(change_row(change, p));
+                let feature = self.setup_feature(change["feature"].as_str().unwrap_or_default());
+                section = section.push(change_row(change, feature, p));
             }
         }
         body = body.push(section);
@@ -1105,9 +1211,12 @@ impl Workbench {
                                 .color(p.text),
                             text(banks(row)).size(style::SMALL).color(p.secondary),
                             space::horizontal(),
-                            text(shown(&row["value"]))
-                                .size(style::SMALL)
-                                .color(p.secondary),
+                            text(diff_value(
+                                &row["value"],
+                                self.setup_feature(row["feature"].as_str().unwrap_or_default())
+                            ))
+                            .size(style::SMALL)
+                            .color(p.secondary),
                         ]
                         .spacing(6)
                         .align_y(Alignment::Center),
@@ -1156,32 +1265,66 @@ impl Workbench {
             .into();
         }
         let diff = state.diff();
-        let count = diff.map_or(0, |diff| changes(diff).count());
+        let count = diff.map_or(0, change_count);
         let applying = self.pending(Job::ApplySetup);
+        let enabled = diff.is_some_and(|diff| self.can_restore_setup(diff));
+        if state.confirm && !applying {
+            // Its own step: other buttons, words saying what is confirmed,
+            // and a confirm button that ignores the rest of a double-click.
+            let marked = diff.map_or(0, |diff| {
+                changes(diff)
+                    .filter(|change| change["risk"] == "disruptive")
+                    .count()
+            });
+            let back = button(text("Go Back").size(style::BODY))
+                .padding([7, 14])
+                .style(style::secondary)
+                .on_press(Message::Setups(Input::Disarm));
+            let label = format!("Confirm {}", plural(count as u64, "Change", "Changes"));
+            let confirm = button(text(label.clone()).size(style::BODY))
+                .name(label)
+                .padding([7, 18])
+                .style(style::danger)
+                .on_press_maybe(enabled.then_some(Message::Setups(Input::Confirm)));
+            let (first, second) = dialog_actions(back, confirm, false);
+            return row![
+                text(format!(
+                    "Restore {}, including {} marked “{CHECK}”?",
+                    plural(count as u64, "change", "changes"),
+                    if marked == 1 {
+                        "1".to_owned()
+                    } else {
+                        format!("the {marked}")
+                    }
+                ))
+                .size(style::SMALL)
+                .color(p.text)
+                .width(Fill),
+                first,
+                second
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into();
+        }
         let label = if applying {
             "Restoring…".to_owned()
-        } else if state.confirm {
-            "Confirm Restore".to_owned()
         } else if count == 0 {
             "Nothing to Change".to_owned()
         } else {
             format!("Restore {}", plural(count as u64, "Change", "Changes"))
         };
-        let enabled = diff.is_some_and(|diff| self.can_restore_setup(diff));
         let restore = button(text(label.clone()).size(style::BODY))
             .name(label)
             .padding([7, 18])
-            .style(if state.confirm {
-                style::danger
-            } else {
-                style::primary
-            })
+            .style(style::primary)
             .on_press_maybe(enabled.then_some(Message::Setups(Input::Restore)));
         let cancel = button(text("Cancel").size(style::BODY))
             .padding([7, 14])
             .style(style::secondary)
             .on_press(Message::Setups(Input::Open(None)));
         let (first, second) = dialog_actions(cancel, restore, false);
+        let waiting = !applying && count > 0 && self.history_busy();
         let footer = row![
             button(text("Delete Setup…").size(style::SMALL))
                 .name(format!("Delete setup {name}…"))
@@ -1195,6 +1338,15 @@ impl Workbench {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
+        let footer = if waiting {
+            footer.push(
+                text("Waiting for other camera changes…")
+                    .size(style::SMALL)
+                    .color(p.secondary),
+            )
+        } else {
+            footer
+        };
         footer.push(first).push(second).into()
     }
 
@@ -1230,12 +1382,25 @@ impl Workbench {
 
     /// Scenes: `setups` (two saved), `setup-save` (what is not saved, open),
     /// `setup-restore` (changes with a disruptive trigger mode, a value the
-    /// camera lacks and a stream restart), `setup-mismatch` (another model,
-    /// not yet allowed) and `setup-blocked` (a recording holds the stream).
+    /// camera lacks and a stream restart), `setup-confirm` (the same,
+    /// asking to confirm the trigger change), `setup-auto` (only auto
+    /// exposure changes), `setup-waiting` (an undo replay is running),
+    /// `setup-failed` (the restore was refused), `setup-mismatch` (another
+    /// model, not yet allowed), `setup-blocked` (a recording holds the
+    /// stream) and `setups-empty` (nothing saved yet).
     pub(super) fn scene_setups(&mut self, word: &str, late: bool) -> bool {
         if !matches!(
             word,
-            "setups" | "setup-save" | "setup-restore" | "setup-mismatch" | "setup-blocked"
+            "setups"
+                | "setups-empty"
+                | "setup-save"
+                | "setup-restore"
+                | "setup-confirm"
+                | "setup-auto"
+                | "setup-waiting"
+                | "setup-failed"
+                | "setup-mismatch"
+                | "setup-blocked"
         ) {
             return false;
         }
@@ -1258,6 +1423,7 @@ impl Workbench {
         });
         match word {
             "setups" => {}
+            "setups-empty" => self.setups.list = Some(Ok(Vec::new())),
             "setup-save" => {
                 self.setups.page = Page::Save;
                 self.setups.name = "line-2-mono".into();
@@ -1274,12 +1440,31 @@ impl Workbench {
                     "line-2-mono"
                 };
                 self.setups.chosen = Some(name.into());
-                self.setups.diff = Some(Ok(scene_diff(
-                    name,
-                    camera_json,
-                    mismatch,
-                    word == "setup-blocked",
-                )));
+                let mut diff = scene_diff(name, camera_json, mismatch, word == "setup-blocked");
+                match word {
+                    "setup-confirm" => {
+                        self.setups.confirm = true;
+                        self.setups.confirm_at = Some(std::time::Instant::now());
+                    }
+                    "setup-auto" => {
+                        diff["changes"] = serde_json::json!([]);
+                        diff["risk"] = "reversible".into();
+                        diff["restarts_stream"] = false.into();
+                        diff["auto_change"] = serde_json::json!({
+                            "current": null, "saved": 0.25, "action": "enter", "risk": "reversible"
+                        });
+                    }
+                    "setup-waiting" => self.history_replay = Some(true),
+                    "setup-failed" => {
+                        self.setups.error = Some(
+                            "Restoring setup line-2-mono failed; every value was put back: \
+                             TriggerMode did not take the value On"
+                                .into(),
+                        );
+                    }
+                    _ => {}
+                }
+                self.setups.diff = Some(Ok(diff));
             }
         }
         true
@@ -1406,6 +1591,7 @@ fn scene_diff(name: &str, camera: Value, mismatch: bool, blocked: bool) -> Value
         "risk": if disruptive { "disruptive" } else { "reversible" },
         "restarts_stream": true,
         "blocked": blocked.then_some("Stop recording first: this setup changes Width."),
+        "auto_change": {"current": null, "saved": null, "action": "none", "risk": "reversible"},
     })
 }
 
@@ -1448,9 +1634,82 @@ fn banner<'a>(warning: bool, message: String, p: &'static Palette) -> Element<'a
     accessibility::label(content, message, accessibility::Role::Status)
 }
 
-fn change_row<'a>(change: &Value, p: &'static Palette) -> Element<'a, Message> {
-    let feature = change["feature"].as_str().unwrap_or_default().to_owned();
-    let mut name = row![text(feature).size(style::BODY).color(p.text)]
+/// The pill on a change outside the known image settings.
+const CHECK: &str = "Check before restoring";
+
+/// What the confirmation asks about: each marked change, by feature, bank
+/// and values.
+fn confirm_banner<'a>(diff: &Value, p: &'static Palette) -> Element<'a, Message> {
+    let marked = changes(diff)
+        .filter(|change| change["risk"] == "disruptive")
+        .map(|change| {
+            let place = banks(change);
+            format!(
+                "{}{} {} → {}",
+                change["feature"].as_str().unwrap_or_default(),
+                if place.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {place}")
+                },
+                shown(&change["current"]),
+                shown(&change["saved"])
+            )
+        })
+        .collect::<Vec<_>>();
+    banner(
+        true,
+        format!(
+            "Confirm {}: {}. {} not on Capturefab's list of image settings and may change how the camera triggers or drives its I/O lines. Restore changes the camera now; Undo reverts it.",
+            if marked.len() == 1 {
+                "this change"
+            } else {
+                "these changes"
+            },
+            marked.join("; "),
+            if marked.len() == 1 {
+                "It is"
+            } else {
+                "They are"
+            }
+        ),
+        p,
+    )
+}
+
+/// Capturefab's software auto exposure, which a restore turns on or off.
+fn auto_row<'a>(now: String, saved: String, p: &'static Palette) -> Element<'a, Message> {
+    row![
+        column![
+            text("Auto exposure").size(style::BODY).color(p.text),
+            text("Run by Capturefab, not the camera")
+                .size(style::CAPTION)
+                .color(p.secondary),
+        ]
+        .spacing(3)
+        .width(Length::FillPortion(5)),
+        text(now)
+            .size(style::BODY)
+            .color(p.secondary)
+            .width(Length::FillPortion(3)),
+        text(saved)
+            .size(style::BODY)
+            .font(style::MEDIUM)
+            .color(p.text)
+            .width(Length::FillPortion(3)),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Start)
+    .into()
+}
+
+fn change_row<'a>(
+    change: &Value,
+    feature: Option<&FeatureInfo>,
+    p: &'static Palette,
+) -> Element<'a, Message> {
+    let label = change["feature"].as_str().unwrap_or_default().to_owned();
+    let mut name = row![text(label).size(style::BODY).color(p.text)]
         .spacing(5)
         .align_y(Alignment::Center);
     let place = banks(change);
@@ -1461,7 +1720,7 @@ fn change_row<'a>(change: &Value, p: &'static Palette) -> Element<'a, Message> {
     if change["risk"] == "disruptive" {
         cell = cell.push(
             container(
-                text("Changes camera behavior")
+                text(CHECK)
                     .size(style::CAPTION)
                     .font(style::MEDIUM)
                     .color(p.ink(p.warn)),
@@ -1479,11 +1738,11 @@ fn change_row<'a>(change: &Value, p: &'static Palette) -> Element<'a, Message> {
     }
     row![
         cell.width(Length::FillPortion(5)),
-        text(shown(&change["current"]))
+        text(diff_value(&change["current"], feature))
             .size(style::BODY)
             .color(p.secondary)
             .width(Length::FillPortion(3)),
-        text(shown(&change["saved"]))
+        text(diff_value(&change["saved"], feature))
             .size(style::BODY)
             .font(style::MEDIUM)
             .color(p.text)
@@ -1571,7 +1830,11 @@ mod tests {
         assert!(enabled(&bench, "Restore 4 Changes"));
         let _ = bench.setups_input(Input::Restore);
         assert!(bench.setups.confirm);
-        assert!(enabled(&bench, "Confirm Restore"));
+        assert!(enabled(&bench, "Confirm 4 Changes"));
+        assert!(enabled(&bench, "Go Back"));
+        let _ = bench.setups_input(Input::Disarm);
+        assert!(!bench.setups.confirm);
+        let _ = bench.setups_input(Input::Restore);
         // Changing the decision asks again.
         let _ = bench.setups_input(Input::AllowOtherModel(false));
         assert!(!bench.setups.confirm);
@@ -1613,6 +1876,200 @@ mod tests {
                 .iter()
                 .any(|message| matches!(message, Message::Setups(Input::Restore))),
             "Return restored a setup"
+        );
+    }
+
+    /// Every label the sheet gives assistive technology.
+    fn labels(bench: &Workbench) -> Vec<String> {
+        let renderer = renderer();
+        let mut view = bench.setups_sheet(Palette::of(false), 800.0);
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(1200.0, 800.0)),
+        );
+        accessibility::snapshot_widget(
+            view.as_widget_mut(),
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+        )
+        .0
+        .nodes
+        .into_iter()
+        .filter_map(|(_, node)| node.label().map(str::to_owned))
+        .collect()
+    }
+
+    #[test]
+    fn a_double_click_on_restore_never_confirms() {
+        let mut bench = bench("setup-restore");
+        // Both presses of a double-click on Restore, then a press on the
+        // confirm button that appeared under the pointer at once.
+        let _ = bench.setups_input(Input::Restore);
+        let _ = bench.setups_input(Input::Restore);
+        let _ = bench.setups_input(Input::Confirm);
+        assert!(bench.setups.confirm, "a double-click restored");
+        // The confirmation says what it confirms.
+        let labels = labels(&bench);
+        assert!(
+            labels.iter().any(|label| label.starts_with(
+                "Confirm this change: TriggerMode (TriggerSelector FrameStart) Off → On."
+            )),
+            "{labels:?}"
+        );
+        // Once it has been shown long enough, its button restores.
+        bench.setups.confirm_at =
+            Some(std::time::Instant::now() - CONFIRM_ARM - std::time::Duration::from_millis(1));
+        let _ = bench.setups_input(Input::Restore);
+        assert!(bench.setups.confirm, "Restore never confirms");
+        let _ = bench.setups_input(Input::Confirm);
+        assert!(!bench.setups.confirm);
+        // A restore with nothing to confirm needs no second step.
+        let mut bench = super::tests::bench("setup-mismatch");
+        let _ = bench.setups_input(Input::AllowOtherModel(true));
+        let _ = bench.setups_input(Input::Restore);
+        assert!(!bench.setups.confirm);
+    }
+
+    #[test]
+    fn the_marker_says_what_the_classifier_knows() {
+        let labels = labels(&bench("setup-restore"));
+        assert!(
+            labels.iter().any(|label| label.contains(
+                "Settings marked “Check before restoring” are not on Capturefab's list of image settings"
+            )),
+            "{labels:?}"
+        );
+        assert!(
+            !labels
+                .iter()
+                .any(|label| label.contains("affect more than the image")),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn an_auto_exposure_change_alone_can_be_restored() {
+        let bench = bench("setup-auto");
+        assert!(enabled(&bench, "Restore 1 Change"), "{:?}", buttons(&bench));
+        let labels = labels(&bench);
+        for expected in ["Changes (1)", "Auto exposure", "Off", "On, balance 0.25"] {
+            assert!(
+                labels.iter().any(|l| l == expected),
+                "{expected}: {labels:?}"
+            );
+        }
+        let release = serde_json::json!({"changes":[],
+            "auto_change":{"current":0.5,"saved":null,"action":"release"}});
+        assert_eq!(
+            auto_cells(&release),
+            Some(("On, balance 0.50".into(), "Off".into()))
+        );
+        assert_eq!(change_count(&release), 1);
+        let none = serde_json::json!({"changes":[],"auto_change":{"action":"none"}});
+        assert_eq!(auto_cells(&none), None);
+        assert_eq!(change_count(&none), 0);
+    }
+
+    #[test]
+    fn restore_waits_for_other_camera_changes() {
+        let mut bench = bench("setup-restore");
+        assert!(enabled(&bench, "Restore 4 Changes"));
+        bench.history_replay = Some(true);
+        assert!(!enabled(&bench, "Restore 4 Changes"));
+        assert!(
+            labels(&bench)
+                .iter()
+                .any(|label| label == "Waiting for other camera changes…")
+        );
+        let _ = bench.setups_input(Input::Restore);
+        assert!(!bench.setups.confirm, "a busy camera armed a restore");
+        bench.history_replay = None;
+        assert!(enabled(&bench, "Restore 4 Changes"));
+    }
+
+    #[test]
+    fn values_read_with_the_inspector_units() {
+        let feature = |name: &str, unit: &str| FeatureInfo {
+            name: name.into(),
+            display_name: name.into(),
+            kind: "Float".into(),
+            value: None,
+            writable: true,
+            description: String::new(),
+            unit: Some(unit.into()),
+            min: Some(0.0),
+            max: Some(1_000_000.0),
+            inc: None,
+            choices: Vec::new(),
+            error: None,
+        };
+        let exposure = feature("ExposureTime", "us");
+        let gain = feature("Gain", "dB");
+        let rate = feature("AcquisitionFrameRate", "Hz");
+        let shown = |value: Value, feature| diff_value(&value, feature);
+        assert_eq!(shown(5000.0.into(), Some(&exposure)), "5 ms");
+        assert_eq!(shown(10000.0.into(), Some(&exposure)), "10 ms");
+        assert_eq!(
+            shown(23098.821518760553.into(), Some(&exposure)),
+            "23.099 ms"
+        );
+        assert_eq!(shown(250.0.into(), Some(&exposure)), "250 µs");
+        assert_eq!(shown(3.0.into(), Some(&gain)), "3 dB");
+        assert_eq!(shown(0.0.into(), Some(&gain)), "0 dB");
+        assert_eq!(shown(29.999999.into(), Some(&rate)), "30 fps");
+        assert_eq!(shown(12345.678.into(), Some(&gain)), "12345.7 dB");
+        // Without the camera's feature, the value reads as saved.
+        assert_eq!(shown(23098.821518760553.into(), None), "23098.821518760553");
+        assert_eq!(shown("On".into(), Some(&gain)), "On");
+        assert_eq!(shown(Value::Null, Some(&gain)), "—");
+
+        let mut bench = bench("setup-restore");
+        bench.snapshot.features = vec![exposure, gain];
+        let labels = labels(&bench);
+        for expected in ["5 ms", "10 ms", "3 dB", "0 dB"] {
+            assert!(
+                labels.iter().any(|l| l == expected),
+                "{expected}: {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_shows_once_in_the_sheet() {
+        let failed = |bench: &mut Workbench| {
+            let pending = Pending {
+                camera: bench.setups.camera.clone(),
+                ..Pending::unanswered(Job::ApplySetup)
+            };
+            bench.settle(&pending, &Err(anyhow::anyhow!("boom")));
+        };
+        let mut bench = bench("setup-restore");
+        bench.notice = None;
+        failed(&mut bench);
+        assert_eq!(bench.setups.error.as_deref(), Some("boom"));
+        assert!(
+            bench
+                .notice
+                .as_ref()
+                .is_none_or(|notice| notice.level != Level::Error),
+            "{:?}",
+            bench.notice.as_ref().map(|notice| &notice.text)
+        );
+        // Closed before the reply, the failure has only the notice.
+        let mut bench = super::tests::bench("setup-restore");
+        let camera = bench.setups.camera.clone();
+        let _ = bench.setups_input(Input::Open(None));
+        bench.setups.camera = camera;
+        failed(&mut bench);
+        let notice = bench.notice.as_ref().expect("a notice");
+        assert_eq!(notice.level, Level::Error);
+        assert!(
+            notice.text.starts_with("Could not restore the setup"),
+            "{}",
+            notice.text
         );
     }
 
@@ -1698,8 +2155,13 @@ mod tests {
         }
         for (word, page) in [
             ("setups", Page::List),
+            ("setups-empty", Page::List),
             ("setup-save", Page::Save),
             ("setup-restore", Page::Restore),
+            ("setup-confirm", Page::Restore),
+            ("setup-auto", Page::Restore),
+            ("setup-waiting", Page::Restore),
+            ("setup-failed", Page::Restore),
             ("setup-mismatch", Page::Restore),
             ("setup-blocked", Page::Restore),
         ] {
