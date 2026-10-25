@@ -1803,7 +1803,7 @@ impl Operand for f64 {
             "+" => value,
             "-" => -value,
             "!" => f64::boolean(value == 0.0),
-            _ => (!exact_i64(value)?) as f64,
+            _ => (!bits(value)?) as f64,
         })
     }
     fn binary(op: &str, lhs: f64, rhs: f64) -> Result<f64> {
@@ -1820,9 +1820,7 @@ impl Operand for f64 {
                 lhs % rhs
             }
             "**" => lhs.powf(rhs),
-            "&" | "|" | "^" | "<<" | ">>" => {
-                i64::binary(op, exact_i64(lhs)?, exact_i64(rhs)?)? as f64
-            }
+            "&" | "|" | "^" | "<<" | ">>" => i64::binary(op, bits(lhs)?, bits(rhs)?)? as f64,
             _ => f64::boolean(comparison(op, lhs, rhs)),
         };
         ensure!(value.is_finite(), "non-finite formula result");
@@ -2118,12 +2116,14 @@ impl<T: Operand> Expr<'_, T> {
         Ok(lhs)
     }
 }
-fn exact_i64(v: f64) -> Result<i64> {
+/// Bitwise operators truncate a floating-point operand toward zero, like the
+/// C conversion to `int64_t` in GenApi implementations.
+fn bits(v: f64) -> Result<i64> {
     ensure!(
-        v.fract() == 0.0 && v.abs() <= (1u64 << 53) as f64,
-        "bitwise formula operand outside exact integer range"
+        v >= i64::MIN as f64 && v < i64::MAX as f64,
+        "bitwise formula operand outside the 64-bit integer range"
     );
-    Ok(v as i64)
+    Ok(v.trunc() as i64)
 }
 
 #[cfg(test)]
@@ -2341,6 +2341,29 @@ mod tests {
         assert_eq!(evaluate("X=7 ? EXP(LN(1)) : 0", &vars).unwrap(), 1.0);
         assert!(evaluate("X / 0", &vars).is_err());
         assert!(evaluate("X + ", &vars).is_err());
+    }
+    #[test]
+    fn float_bitwise_operands_truncate_toward_zero() {
+        let none = BTreeMap::new();
+        assert_eq!(evaluate::<f64>("~2.7", &none).unwrap(), -3.0);
+        assert_eq!(evaluate::<f64>("-2.5 & 0xFF", &none).unwrap(), 254.0);
+        assert!(evaluate::<f64>("1e19 & 1", &none).is_err());
+        let m = map(concat!(
+            "<Float Name='StrobeDelay'><pValue>StrobeDelayVal_Float</pValue><Unit>us</Unit></Float>",
+            "<Converter Name='StrobeDelayVal_Float'><pVariable Name='OLD'>StrobeLineDelay_Reg</pVariable><FormulaTo>( FROM * 1.024 ) &amp; 0x0000FFFF</FormulaTo><FormulaFrom>( TO / 1.024 + 0.5 ) &amp; 0x0000FFFF</FormulaFrom><pValue>StrobeLineDelay_Reg</pValue><Slope>Increasing</Slope></Converter>",
+            "<MaskedIntReg Name='StrobeLineDelay_Reg'><Address>0x1000</Address><Length>4</Length><AccessMode>RW</AccessMode><LSB>15</LSB><MSB>0</MSB><Sign>Unsigned</Sign><Endianess>BigEndian</Endianess></MaskedIntReg>",
+            "<Float Name='ContrastAbs'><pValue>N907</pValue></Float>",
+            "<Converter Name='N907'><FormulaTo>((FROM-1)*255)&gt;&gt;1</FormulaTo><FormulaFrom>((TO&lt;&lt;1)/255)+1</FormulaFrom><pValue>N908</pValue><Slope>Increasing</Slope></Converter>",
+            "<Integer Name='N908'><pValue>N1753</pValue></Integer>",
+            "<IntReg Name='N1753'><Address>0x2000</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>BigEndian</Endianess></IntReg>",
+        ));
+        let mut io = Memory::default();
+        io.write_memory(0x1000, &[0, 102, 0, 0]).unwrap();
+        assert_eq!(m.get(&mut io, "StrobeDelay").unwrap(), 100.0);
+        m.set(&mut io, "StrobeDelay", "100").unwrap();
+        assert_eq!(io.read_memory(0x1000, 4).unwrap(), [0, 102, 0, 0]);
+        m.set(&mut io, "ContrastAbs", "1.5").unwrap();
+        assert_eq!(io.read_memory(0x2000, 4).unwrap(), 63u32.to_be_bytes());
     }
     #[test]
     fn integer_formulas_use_64_bit_integer_arithmetic() {
