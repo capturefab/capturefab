@@ -822,6 +822,37 @@ mod tests {
     }
 
     #[test]
+    fn camera_sign_ins_never_reach_the_preferences_file() {
+        let dir = test_dir("sign-ins");
+        let path = dir.join(FILE);
+        let recent = |target: &str| Recent {
+            target: target.into(),
+            label: "Dock".into(),
+            detail: "Media".into(),
+            transport: crate::types::Transport::Media,
+        };
+        let mut prefs = Prefs::default();
+        // A remembered camera keeps its plain, credential-free address.
+        prefs.remember(recent("rtsp://cam.local/live"));
+        // A typed credential URL is stored only in its stripped form.
+        let typed = "rtsp://dock-admin:hunter2-pw@cam.local/dock";
+        prefs.remember(recent(typed));
+        prefs.remember(recent(&crate::logins::strip_userinfo(typed)));
+        save_to(&path, &prefs).unwrap();
+        let bytes = String::from_utf8(fs::read(&path).unwrap()).unwrap();
+        for secret in ["dock-admin", "hunter2-pw"] {
+            assert!(!bytes.contains(secret), "{bytes}");
+        }
+        let targets: Vec<_> = load_from(&path)
+            .recent
+            .into_iter()
+            .map(|r| r.target)
+            .collect();
+        assert_eq!(targets, ["rtsp://cam.local/dock", "rtsp://cam.local/live"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn prefs_without_open_sections_open_nothing() {
         let prefs: Prefs = serde_json::from_str(r#"{"tab": "capture"}"#).unwrap();
         assert!(prefs.open_sections.is_empty());

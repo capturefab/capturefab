@@ -29,6 +29,9 @@ pub enum Op {
     },
     Connect {
         selector: String,
+        /// False for assistant plans, which never use a sign-in saved on
+        /// this host; a camera a person connected stays usable.
+        saved_login: bool,
     },
     Command {
         camera: CameraRef,
@@ -69,7 +72,7 @@ impl Serialize for Op {
                 command,
                 dataset_from_plan,
             } => json!({"command":command,"dataset_from_plan":dataset_from_plan}),
-            Self::Connect { selector } => json!({"op":"connect","selector":selector}),
+            Self::Connect { selector, .. } => json!({"op":"connect","selector":selector}),
             Self::Command { camera, command } => {
                 json!({"camera":camera.selector(),"command":command})
             }
@@ -809,13 +812,26 @@ impl<'a> Executor<'a> {
                     self.acknowledged.push(redact::for_output(result.clone()));
                     super::read::bound(result)
                 }
-                Op::Connect { selector } => {
+                Op::Connect {
+                    selector,
+                    saved_login,
+                } => {
                     let command = SessionCommand::Connect {
                         camera: selector.clone(),
                         timeout_ms: 10_000,
+                        login: None,
+                        saved_login: *saved_login,
                     };
                     command.validate()?;
-                    let result = self.host.execute(None, command)?;
+                    let result = self.host.execute(None, command).map_err(|error| {
+                        if !*saved_login && crate::logins::is_auth_error(&error) {
+                            anyhow::anyhow!(
+                                "This camera needs a sign-in. Connect it in the app or with `capturefab connect`; the assistant can then use the connected camera."
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
                     let id = result["connected"]["id"]
                         .as_str()
                         .context("The connection did not return a camera ID.")?;
@@ -1704,6 +1720,7 @@ mod tests {
         checked.ops = vec![
             Op::Connect {
                 selector: "avfoundation:Test Camera?size=640x480&fps=30".into(),
+                saved_login: true,
             },
             Op::Command {
                 camera: CameraRef::Connected("avfoundation:Test Camera".into()),

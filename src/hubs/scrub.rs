@@ -1,6 +1,6 @@
-//! A last line of defence for hub secrets: every secret a process resolves
-//! (tokens, passwords, the Basic credentials and session tokens derived from
-//! them) is registered here, and text that leaves the process — worker
+//! A last line of defence for hub and camera secrets: every secret a process
+//! resolves (hub tokens, hub and camera passwords, the Basic credentials and
+//! session tokens derived from them) is registered here, and text that leaves the process — worker
 //! replies, discovery warnings, CLI errors, remote API error bodies — has
 //! each registered literal replaced. Hub errors are worded without secrets in
 //! the first place; this only catches what a dependency might echo.

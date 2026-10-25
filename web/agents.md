@@ -121,12 +121,14 @@ Keep credentials out of logs, command transcripts and generated configuration fi
 
 | Exit code | Meaning |
 | --- | --- |
-| 1 | `operation_failed` |
+| 1 | `operation_failed`, `auth_required`, `auth_rejected` |
 | 2 | `usage` |
 | 3 | `unavailable` |
 | 4 | `timeout` |
 | 5 | `unsupported` |
 | 6 | `storage_full` |
+
+`auth_required` means a camera asked for a user name and password and none was sent; `auth_rejected` means it refused the ones sent. Hub credential failures stay `operation_failed` and set the hub's `rejected` status.
 
 `--timeout-ms` sets each frame or transport timeout from 1 to 60000 ms.
 `--request-timeout 5m` sets the session request deadline.
@@ -688,6 +690,7 @@ The first Error issue's `IssueCode` determines the process exit code:
 | Issue code | JSON error category | Exit |
 | --- | --- | --- |
 | `operation_failed` | `operation_failed` | 1 |
+| | `auth_required`, `auth_rejected` (camera sign-in) | 1 |
 | `usage` | `usage` | 2 |
 | `unavailable` | `unavailable` | 3 |
 | `timeout` | `timeout` | 4 |
@@ -968,6 +971,25 @@ Published session metadata redacts credentials.
 ONVIF SOAP supports HTTP, WS UsernameToken PasswordDigest and HTTP Basic/Digest authentication.
 HTTPS SOAP and Media2-only devices are unsupported.
 
+### Password-protected cameras
+
+```sh
+capturefab login add 'rtsp://camera/live' --user admin --password-stdin --json
+capturefab login list --json
+capturefab login remove 'rtsp://camera/live' --json
+```
+
+A camera that asks for a user name and password fails with `auth_required`; one that refuses the credentials sent fails with `auth_rejected`. Both exit 1, and the message names the credential-free address (for ONVIF, the device service address, never a stream URI it returned). On either code, never ask the user to paste a password into chat: ask them to sign in in the desktop app (Remember on this computer) or to run `capturefab login add ADDRESS --user USER --password-stdin` themselves.
+
+`login` (alias `logins`) saves sign-ins for credential-free `rtsp://`, `rtsps://`, `onvif:http://…` and `onvif://HOST[:PORT][/PATH]` addresses in the OS credential store, service `capturefab-camera`, account `USER@ADDRESS`. ADDRESS is normalized to scheme, lowercase host, explicit port and path, without query or fragment; with `--session`, it may also be the ID or serial of an ONVIF camera that session discovered. `camera-logins.json` in the state directory (mode 0600) holds addresses and user names only. The camera worker uses a saved sign-in for any credential-free camera with that address; a credential store it cannot read fails the connection (exit 1, "unlock it and try again") rather than connecting without the password.
+
+- `login add ADDRESS --user USER (--password-stdin | CAPTUREFAB_CAMERA_PASSWORD) [--no-check]` returns `{login:{address,user,saved_at},replaced,check?:{ok:true,camera}}`. It connects once first and saves only if the camera accepts the sign-in; a refused check exits 1 with `auth_rejected` and saves nothing. `--password-stdin` takes one line; an empty line is an empty password.
+- `login list` returns `{logins:[{address,user,saved_at,last_used_at?}],supported}` and never reads the credential store.
+- `login remove ADDRESS` returns `{removed,secret_forgotten}`; an address with no saved sign-in is exit 3.
+- Exit 2 for an address with a user name or password in it, another scheme, no `--user`, or no or both password sources; exit 5 for `add` and `remove` in builds without the credential store (`features.keychain` false), where `list` returns `supported:false`.
+
+Session RPC `connect` accepts `login:{user,password}` beside a credential-free `camera`, and `saved_login` (default true; false skips saved sign-ins). This is for local session IPC only: the `serve --listen` remote API refuses `login`, and opens cameras with sign-ins saved on that computer only when started with `--allow-saved-sign-ins`. The built-in assistant and assistant-origin tool calls connect with `saved_login:false`, so they never use saved passwords; they can use a camera the user already connected.
+
 Native camera locators are `avfoundation:0` on macOS, `v4l2:/dev/video0` on Linux, and `dshow:video=Camera Name` on Windows. CSI cameras require an operating system driver exposing a suitable V4L2 device. Native enumeration and capture may require operating system camera permissions.
 
 Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`.
@@ -1021,7 +1043,7 @@ capturefab hub remove home --forget-secret --json
 
 `add-home-assistant` (alias `add-ha`) `NAME --url URL (--secret-stdin|--secret-env VAR)` takes a long-lived access token (Profile > Security); prefer one from a dedicated non-admin user. `add-frigate NAME --url URL [--user U (--secret-stdin|--secret-env VAR)] [--rtsp-port 8554]` uses `http://HOST:5000` without a user or `https://HOST:8971` with one; its restream port must allow unauthenticated RTSP. `add-go2rtc NAME --url URL [--user U (--secret-stdin|--secret-env VAR)]`. `add-unifi-protect` (alias `add-unifi`) `NAME --url https://CONSOLE (--secret-stdin|--secret-env VAR)` takes an API key from Settings > Control Plane > Integrations. Every add checks that the server answers and accepts the secret unless `--no-check`, and replaces a hub with the same name; a secret saved for that hub's previous server is deleted. Without a secret option, re-adding a keychain hub for the same server reuses its saved secret. For `https://` hubs, use at most one of `--certificate SHA256:...` (pin a fingerprint), `--accept-certificate` (trust the certificate presented now; prints its fingerprint to stderr and conflicts with `--no-check`; ask the user to confirm it with the server administrator) and `--tls-server-name NAME` (check an OS-trusted certificate against NAME).
 
-Secrets are never accepted on the command line. `--secret-stdin` stores the secret in the OS credential store, service `capturefab-hub`, account `KIND:NAME@SCHEME://[USER@]HOST:PORT[/PATH]`, so it is bound to that server; builds without the credential store (`features.keychain` false in `doctor --json`) refuse it with exit 5. `--secret-env VAR` saves only a name matching `CAPTUREFAB_HUB_[A-Z0-9_]{1,48}`. The variable is read in the process that opens or lists the camera: the GUI or `serve` session when the command goes through one, otherwise this CLI (`hub` commands always run in the CLI). It must also be set for the add check unless `--no-check`. A GUI started from the Dock, Finder or Start menu does not see shell variables. FFmpeg children never inherit `CAPTUREFAB_HUB_*` variables. `hubs.json` in the state directory (mode 0600) holds no secrets. Over `http://` a secret crosses the network unencrypted and the CLI warns on stderr; Frigate passwords are only sent over `https://`. `serve --listen` refuses remote `connect` of hub cameras, by selector, ID or serial, unless it was started with `--allow-hubs`.
+Secrets are never accepted on the command line. `--secret-stdin` stores the secret in the OS credential store, service `capturefab-hub`, account `KIND:NAME@SCHEME://[USER@]HOST:PORT[/PATH]`, so it is bound to that server; builds without the credential store (`features.keychain` false in `doctor --json`) refuse it with exit 5. `--secret-env VAR` saves only a name matching `CAPTUREFAB_HUB_[A-Z0-9_]{1,48}`. The variable is read in the process that opens or lists the camera: the GUI or `serve` session when the command goes through one, otherwise this CLI (`hub` commands always run in the CLI). It must also be set for the add check unless `--no-check`. A GUI started from the Dock, Finder or Start menu does not see shell variables. FFmpeg children never inherit `CAPTUREFAB_HUB_*` variables. `hubs.json` in the state directory (mode 0600) holds no secrets. Over `http://` a secret crosses the network unencrypted and the CLI warns on stderr; Frigate passwords are only sent over `https://`. `serve --listen` refuses remote `connect` of hub cameras, by selector, ID or serial, unless it was started with `--allow-hubs`. Camera sign-ins differ: a refused camera password is `auth_rejected` (exit 1), while a refused hub secret stays `operation_failed` and is recorded as the hub's `rejected` status.
 
 `hub list` returns `{hubs:[record]}`, where a record is `{name,kind,url,secret:"keychain"|"environment"|"none",insecure,user?,secret_env?,certificate?,tls_server_name?,rtsp_port?,rejected?:{at,status},secret_saved?}` and never contains a secret; `kind` is `home_assistant`, `frigate`, `go2rtc` or `unifi_protect`. `hub cameras [NAME]` returns `{cameras:[{id,hub,kind,camera,name,state,online,streams}],warnings}`; with NAME a failure is an error, without it each failing hub becomes a warning. `hub test NAME` returns `{ok:true,hub,kind,product,version,name,cameras,warnings}` (`cameras` is a count) and clears `rejected`. `add-*` returns `{hub:record,replaced,check?:{ok,product,version,name,cameras,warnings},certificate?:{fingerprint,trust:"pinned"|"accepted_on_first_use"},warnings}`; `check` is absent with `--no-check`. `remove NAME [--forget-secret]` returns `{removed,secret_forgotten,warnings}`.
 

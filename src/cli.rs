@@ -1,4 +1,5 @@
 pub(crate) mod assistant;
+pub mod login;
 mod resources;
 mod tools;
 pub use assistant::{AssistantCommand, AssistantTaskFailure};
@@ -615,6 +616,12 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::hubs::command::HubCommand,
     },
+    /// Save user names and passwords for rtsp://, rtsps:// and ONVIF cameras in the OS credential store
+    #[command(visible_alias = "logins")]
+    Login {
+        #[command(subcommand)]
+        command: login::LoginCommand,
+    },
     /// List mounted external, removable and network volumes
     Volumes,
     /// Manage CPU and camera-buffer limits; show current resource headroom
@@ -647,6 +654,9 @@ pub enum Command {
         /// Let remote clients open cameras on saved hubs with this computer's hub secrets
         #[arg(long, requires = "listen")]
         allow_hubs: bool,
+        /// Let remote clients open cameras with sign-ins saved on this computer
+        #[arg(long = "allow-saved-sign-ins", requires = "listen")]
+        allow_saved_sign_ins: bool,
         #[command(flatten)]
         auto: AutoArgs,
         #[command(flatten)]
@@ -811,10 +821,7 @@ impl<'a> Client<'a> {
                     let result = ipc::call_to_as(
                         name,
                         None,
-                        SessionCommand::Connect {
-                            camera: selector.clone(),
-                            timeout_ms: cli.timeout_ms,
-                        },
+                        SessionCommand::connect(selector.clone(), cli.timeout_ms),
                         request_timeout(cli, &SessionCommand::Status)?,
                         Some(&c.actor),
                     )?;
@@ -831,10 +838,7 @@ impl<'a> Client<'a> {
         if cli.session.is_none()
             && let Some(selector) = &cli.camera
         {
-            c.call(SessionCommand::Connect {
-                camera: selector.clone(),
-                timeout_ms: cli.timeout_ms,
-            })?;
+            c.call(SessionCommand::connect(selector.clone(), cli.timeout_ms))?;
         }
         Ok(c)
     }
@@ -1056,11 +1060,7 @@ fn prepare_with(
     if let Some(camera) = &cli.camera {
         crate::session::validate_selector(camera)?;
         if cli.session.is_none() {
-            SessionCommand::Connect {
-                camera: camera.clone(),
-                timeout_ms: cli.timeout_ms,
-            }
-            .validate()?;
+            SessionCommand::connect(camera.clone(), cli.timeout_ms).validate()?;
         }
     }
     if let Some(session) = &cli.session {
@@ -1092,6 +1092,10 @@ fn prepare_with(
         }
         Some(Command::Hub { command }) => {
             crate::hubs::command::prepare(command)?;
+            None
+        }
+        Some(Command::Login { command }) => {
+            login::prepare(command)?;
             None
         }
         Some(Command::Destination { command }) => {
@@ -1185,10 +1189,9 @@ fn prepare_with(
         Some(Command::Execute { feature }) => Some(SessionCommand::Execute {
             feature: feature.clone(),
         }),
-        Some(Command::Connect { camera }) => Some(SessionCommand::Connect {
-            camera: camera.clone(),
-            timeout_ms: cli.timeout_ms,
-        }),
+        Some(Command::Connect { camera }) => {
+            Some(SessionCommand::connect(camera.clone(), cli.timeout_ms))
+        }
         Some(Command::Select { camera }) => Some(SessionCommand::Select {
             camera: camera.clone(),
         }),
@@ -1375,7 +1378,10 @@ impl Drop for Client<'_> {
 pub fn run(mut cli: Cli) -> Result<()> {
     // Hub management never targets a camera. Ignore even a malformed stale
     // environment selector before path resolution and shape validation.
-    if matches!(cli.command, Some(Command::Hub { .. })) {
+    if matches!(
+        cli.command,
+        Some(Command::Hub { .. } | Command::Login { .. })
+    ) {
         cli.camera = None;
     }
     let base = std::env::current_dir()?;
@@ -1402,7 +1408,10 @@ pub fn run(mut cli: Cli) -> Result<()> {
     // Hub management and assistant setup do not target a camera.
     if !is_assistant
         && cli.session.is_none()
-        && !matches!(cli.command, Some(Command::Hub { .. }))
+        && !matches!(
+            cli.command,
+            Some(Command::Hub { .. } | Command::Login { .. })
+        )
         && let Some(camera) = &cli.camera
     {
         crate::camera::validate_selector(camera)?;
@@ -1630,6 +1639,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
             )?;
             return output(&cli, result);
         }
+        Some(Command::Login { command }) => {
+            let result = login::run(
+                command,
+                cli.session.as_deref(),
+                std::time::Duration::from_millis(cli.timeout_ms),
+            )?;
+            return output(&cli, result);
+        }
         Some(Command::Volumes) => {
             return output(&cli, json!({"volumes": crate::volumes::list()}));
         }
@@ -1705,6 +1722,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             listen,
             web_dir,
             allow_hubs,
+            allow_saved_sign_ins,
             auto,
             dataset,
         }) => {
@@ -1729,6 +1747,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         address,
                         web_root,
                         *allow_hubs,
+                        *allow_saved_sign_ins,
                     )
                 })
                 .transpose()?;
@@ -1871,10 +1890,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Command::Execute { feature } => client.call(SessionCommand::Execute {
             feature: feature.clone(),
         })?,
-        Command::Connect { camera } => client.call(SessionCommand::Connect {
-            camera: camera.clone(),
-            timeout_ms: cli.timeout_ms,
-        })?,
+        Command::Connect { camera } => {
+            client.call(SessionCommand::connect(camera.clone(), cli.timeout_ms))?
+        }
         Command::Select { camera } => client.call(SessionCommand::Select {
             camera: camera.clone(),
         })?,
@@ -2200,6 +2218,8 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             writeln!(out, "Browser: {url}")?;
         }
         writeln!(out, "Ctrl-C stops the session.")?;
+    } else if let Some(Command::Login { command }) = &cli.command {
+        write!(out, "{}", login::human(command, &value))?;
     } else if let Some(Command::Hub { command }) = &cli.command {
         for warning in value["warnings"].as_array().into_iter().flatten() {
             eprintln!("capturefab: {}", warning.as_str().unwrap_or_default());
@@ -2489,6 +2509,19 @@ fn command_schema(command: &clap::Command) -> Value {
 fn schema() -> Value {
     let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"gui","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder; see destination list and volumes"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized with GUI operations."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
+    contract["exit_codes"]["1"] = json!(
+        "operation or I/O failure; error.code operation_failed, auth_required or auth_rejected"
+    );
+    contract["error_codes"] = json!({
+        "auth_required": "exit 1: a camera asked for a user name and password and none was sent; sign in from the app or run `capturefab login add ADDRESS --user USER --password-stdin`",
+        "auth_rejected": "exit 1: a camera refused the user name and password that were sent",
+        "note": "hub credential failures stay operation_failed and set the hub's rejected status; see `hub list`",
+    });
+    contract["rpc"]["connect_sign_in"] = json!({
+        "login": {"user": "USER", "password": "PASSWORD"},
+        "saved_login": "default true: the worker may use a sign-in saved with `login add`; assistant connects send false",
+        "note": "local IPC only; the remote API refuses login, and uses saved sign-ins only with serve --allow-saved-sign-ins",
+    });
     contract["tools"] = tools::schema_contract();
     contract["assistant"] = assistant::schema_contract();
     let mut command = Cli::command();

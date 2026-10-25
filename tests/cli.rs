@@ -5634,3 +5634,227 @@ fn resource_limits_are_automatic_persisted_and_reject_invalid_values_without_cam
     assert!(reset["policy"].get("upload_bytes_per_second").is_none());
     let _ = std::fs::remove_dir_all(root);
 }
+
+fn login_cmd(dir: &PathBuf, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env_remove("CAPTUREFAB_CAMERA_PASSWORD")
+        .env("CAPTUREFAB_SESSION_DIR", dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
+        .envs(env.iter().copied())
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn temp_session_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-{name}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    dir
+}
+
+/// Camera sign-in management never touches a keychain in these cases: every
+/// one fails before saving, and listing reads only the index.
+#[test]
+fn login_commands_validate_before_touching_the_credential_store() {
+    let dir = temp_session_dir("login");
+    let out = login_cmd(&dir, &["--json", "login", "list"], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["result"]["logins"], serde_json::json!([]));
+    assert!(value["result"]["supported"].is_boolean());
+    for (args, env) in [
+        (
+            vec![
+                "login",
+                "add",
+                "rtsp://u:p@h/x",
+                "--user",
+                "u",
+                "--password-stdin",
+            ],
+            vec![],
+        ),
+        (
+            vec!["login", "add", "rtsp://h/x", "--password-stdin"],
+            vec![],
+        ),
+        (vec!["login", "add", "rtsp://h/x", "--user", "u"], vec![]),
+        (
+            vec![
+                "login",
+                "add",
+                "rtsp://h/x",
+                "--user",
+                "u",
+                "--password-stdin",
+            ],
+            vec![("CAPTUREFAB_CAMERA_PASSWORD", "x")],
+        ),
+        (
+            vec![
+                "login",
+                "add",
+                "http://h/x",
+                "--user",
+                "u",
+                "--password-stdin",
+            ],
+            vec![],
+        ),
+    ] {
+        let mut full = vec!["--json"];
+        full.extend(&args);
+        let out = login_cmd(&dir, &full, &env);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(value["error"]["code"], "usage", "{args:?}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("u:p@"));
+    }
+    let out = login_cmd(&dir, &["--json", "login", "remove", "rtsp://h/x"], &[]);
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let expected = if value["error"]["code"] == "unsupported" {
+        5
+    } else {
+        3
+    };
+    assert_eq!(out.status.code(), Some(expected), "{value}");
+    let schema = login_cmd(&dir, &["--json", "schema"], &[]);
+    let text = String::from_utf8_lossy(&schema.stdout);
+    for word in ["\"login\"", "auth_required", "auth_rejected"] {
+        assert!(text.contains(word), "schema lacks {word}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An ONVIF service that answers every request with a Digest challenge.
+fn refusing_onvif() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while let Ok(n) = stream.read(&mut buffer) {
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(head) = text.find("\r\n\r\n") {
+                        let length = text[..head]
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= head + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"Camera\", nonce=\"n\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            });
+        }
+    });
+    address
+}
+
+#[test]
+fn cameras_that_ask_for_a_sign_in_report_typed_errors() {
+    let dir = temp_session_dir("auth");
+    let address = refusing_onvif();
+    let camera = format!("onvif:http://{address}/onvif/device_service");
+    let out = login_cmd(&dir, &["--json", "--camera", &camera, "info"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "auth_required", "{value}");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("capturefab login add") || message.contains("include them in the address"),
+        "{message}"
+    );
+    let camera = format!("onvif://admin:secret-pw@{address}");
+    let out = login_cmd(&dir, &["--json", "--camera", &camera, "info"], &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "auth_rejected", "{value}");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("refused")
+    );
+    for stream in [&out.stdout, &out.stderr] {
+        assert!(!String::from_utf8_lossy(stream).contains("secret-pw"));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "saves to and removes from the real OS credential store"]
+fn login_add_saves_in_the_real_credential_store() {
+    let dir = temp_session_dir("login-real");
+    let out = login_cmd(
+        &dir,
+        &[
+            "--json",
+            "login",
+            "add",
+            "rtsp://capturefab-test.invalid/live",
+            "--user",
+            "test",
+            "--no-check",
+        ],
+        &[("CAPTUREFAB_CAMERA_PASSWORD", "capturefab-test-password")],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let out = login_cmd(
+        &dir,
+        &[
+            "--json",
+            "login",
+            "remove",
+            "rtsp://capturefab-test.invalid/live",
+        ],
+        &[],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

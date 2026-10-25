@@ -133,6 +133,8 @@ impl Workbench {
             discovery,
             rule::horizontal(1).style(style::line),
             self.api_keys_section(p),
+            rule::horizontal(1).style(style::line),
+            self.sign_ins_section(p),
         ]
         .spacing(20)
         .into()

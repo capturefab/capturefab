@@ -76,12 +76,9 @@ pub fn check(
                     }
                 }
             }
-            Op::Connect { selector } => {
-                if let Err(error) = (crate::session::SessionCommand::Connect {
-                    camera: selector.clone(),
-                    timeout_ms: 10000,
-                })
-                .validate()
+            Op::Connect { selector, .. } => {
+                if let Err(error) =
+                    crate::session::SessionCommand::connect(selector.clone(), 10000).validate()
                 {
                     checked.issues.push(command_issue(&error.to_string()));
                 }

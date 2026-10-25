@@ -2392,6 +2392,47 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     open_url(&source, timeout)
 }
 pub fn open_url(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
+    open_url_with(source, None, timeout)
+}
+/// FFmpeg's wording when an RTSP server asks for credentials or refuses them.
+/// 403 is left out: RTSP servers often answer it for an address or ACL
+/// restriction that no password changes.
+fn auth_refused(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("401 ") || reason.contains("unauthorized")
+}
+/// Open a media URL, with a camera sign-in given beside it. A sign-in request
+/// or refusal from an rtsp:// or rtsps:// server becomes a typed
+/// `auth_required` or `auth_rejected` error naming the address without
+/// credentials.
+pub fn open_url_with(
+    source: &str,
+    login: Option<&crate::logins::CameraLogin>,
+    timeout: Duration,
+) -> Result<Box<dyn Backend>> {
+    let url = match login {
+        Some(login) => crate::logins::with_credentials(source, login)?,
+        None => zeroize::Zeroizing::new(source.to_owned()),
+    };
+    open_source(&url, timeout).map_err(|error| {
+        let rtsp = scheme(source).is_some_and(|s| s == "rtsp" || s == "rtsps");
+        if rtsp && auth_refused(&format!("{error:#}")) {
+            let had_credentials = login.is_some()
+                || source.split_once('@').is_some_and(|(before, _)| {
+                    before
+                        .split_once("://")
+                        .is_some_and(|(_, authority)| !authority.contains('/'))
+                });
+            crate::logins::auth_error(
+                &redact_url(&crate::logins::strip_userinfo(source)),
+                had_credentials,
+            )
+        } else {
+            error
+        }
+    })
+}
+fn open_source(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
     validate_source(source)?;
     ensure!(
         !timeout.is_zero() && Instant::now().checked_add(timeout).is_some(),
@@ -4905,6 +4946,47 @@ exit 1"#,
             camera.reconnect.as_ref().unwrap().backoff,
             RECONNECT_BACKOFF_MAX
         );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn rtsp_sign_in_requests_and_refusals_are_typed() {
+        let fake = Fake::new(
+            "auth",
+            r#"echo "$*" >> "$dir/argv"
+case "$*" in
+  *missing*) echo '[rtsp @ 0x1] method DESCRIBE failed: 404 Not Found' >&2 ;;
+  *blocked*) echo '[rtsp @ 0x1] method DESCRIBE failed: 403 Forbidden' >&2 ;;
+  *) echo '[rtsp @ 0x1] method DESCRIBE failed: 401 Unauthorized' >&2 ;;
+esac
+exit 1"#,
+        );
+        let timeout = Duration::from_secs(2);
+        let code = |result: Result<Box<dyn Backend>>| {
+            let error = result.err().expect("open fails");
+            (
+                crate::types::error_transport_code(&error),
+                format!("{error:#}"),
+            )
+        };
+        let (kind, text) = code(open_url("rtsp://cam.local/live", timeout));
+        assert_eq!(kind, Some("auth_required"), "{text}");
+        assert!(text.contains("rtsp://cam.local/live"), "{text}");
+        let login = crate::logins::CameraLogin::new("ad min", "s3cret:pw").unwrap();
+        let (kind, text) = code(open_url_with(
+            "rtsp://cam.local/live",
+            Some(&login),
+            timeout,
+        ));
+        assert_eq!(kind, Some("auth_rejected"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
+        assert_eq!(fake.launches(&["ad%20min:s3cret%3Apw@cam.local/live"]), 1);
+        let (kind, text) = code(open_url("rtsp://admin:typed-pw@cam.local/live", timeout));
+        assert_eq!(kind, Some("auth_rejected"), "{text}");
+        assert!(!text.contains("typed-pw"), "{text}");
+        for other in ["rtsp://cam.local/missing", "rtsp://cam.local/blocked"] {
+            let (kind, text) = code(open_url(other, timeout));
+            assert_eq!(kind, None, "{text}");
+        }
     }
     #[test]
     fn a_stream_that_drops_again_soon_keeps_backing_off() {

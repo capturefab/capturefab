@@ -612,6 +612,7 @@ mod tests {
                 if let SessionCommand::Connect {
                     camera: selector,
                     timeout_ms,
+                    ..
                 } = command
                 {
                     assert!(target.is_none());

@@ -346,21 +346,27 @@ impl Workbench {
             extra += 30.0;
         }
         for entry in &recent {
+            let signed_in = self.saved_login_user(&entry.target);
             let forget = tip(
                 button(icon(Icon::Close, 11.0, p.secondary))
                     .name(format!("Forget {}", entry.label))
                     .padding(5)
                     .style(style::plain)
                     .on_press(Message::Forget(entry.target.clone())),
-                "Forget",
+                if signed_in.is_some() {
+                    "Forget camera and saved sign-in"
+                } else {
+                    "Forget"
+                },
             );
             cards = cards.push(hover(
-                self.welcome_card(
+                self.welcome_card_signed(
                     Icon::transport(entry.transport),
                     &entry.label,
                     recent_place(entry),
                     &entry.target,
                     self.connecting(&entry.target),
+                    signed_in,
                     p,
                 ),
                 container(forget)
@@ -454,6 +460,22 @@ impl Workbench {
         connecting: bool,
         p: &'static Palette,
     ) -> Element<'a, Message> {
+        self.welcome_card_signed(kind, title, detail, target, connecting, None, p)
+    }
+
+    /// `welcome_card`, with a lock before the detail line for a camera
+    /// whose sign-in is saved as `signed_in`.
+    #[allow(clippy::too_many_arguments)]
+    fn welcome_card_signed<'a>(
+        &self,
+        kind: Icon,
+        title: &'a str,
+        detail: String,
+        target: &'a str,
+        connecting: bool,
+        signed_in: Option<&str>,
+        p: &'static Palette,
+    ) -> Element<'a, Message> {
         let failure = (!connecting)
             .then(|| self.side.connect_failures.get(target))
             .flatten();
@@ -477,7 +499,22 @@ impl Workbench {
                 container(glyph).center_x(20).center_y(20),
                 column![
                     one_line(title, style::BODY, style::MEDIUM, p.text).width(Fill),
-                    one_line(detail, style::CAPTION, style::SANS, ink).width(Fill),
+                    match signed_in.filter(|_| !connecting && failure.is_none()) {
+                        Some(user) => Element::from(
+                            row![
+                                tip(
+                                    icon(Icon::Lock, 10.0, p.secondary),
+                                    format!("Signed in · user {user}"),
+                                ),
+                                one_line(detail, style::CAPTION, style::SANS, ink).width(Fill),
+                            ]
+                            .spacing(4)
+                            .align_y(Alignment::Center),
+                        ),
+                        None => one_line(detail, style::CAPTION, style::SANS, ink)
+                            .width(Fill)
+                            .into(),
+                    },
                 ]
                 .spacing(2)
                 .width(Fill),

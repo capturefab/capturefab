@@ -15,7 +15,7 @@ pub fn validate_secret(secret: &str) -> Result<()> {
 /// A server without a desktop login may have no Secret Service (D-Bus session).
 fn store_failed(action: &str, error: keyring::Error) -> anyhow::Error {
     anyhow!(
-        "cannot {action} the OS credential store: {error}; without one, as on a server with no desktop login, use provider environment credentials or hub --secret-env (CAPTUREFAB_HUB_* variables)"
+        "cannot {action} the OS credential store: {error}; without one, as on a server with no desktop login, use provider environment credentials or hub --secret-env (CAPTUREFAB_HUB_* variables), or put camera credentials in the address"
     )
 }
 
@@ -58,7 +58,11 @@ mod tests {
     fn a_failed_credential_store_names_what_works_without_one() {
         let error = store_failed("save the secret in", keyring::Error::NoDefaultStore);
         let message = format!("{error:#}");
-        for alternative in ["environment credentials", "CAPTUREFAB_HUB_*"] {
+        for alternative in [
+            "environment credentials",
+            "CAPTUREFAB_HUB_*",
+            "camera credentials in the address",
+        ] {
             assert!(message.contains(alternative), "{message}");
         }
         assert_eq!(

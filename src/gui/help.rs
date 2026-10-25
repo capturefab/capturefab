@@ -327,7 +327,14 @@ impl Workbench {
         let body = keyboard_history::background(body, self.sheet_open());
         let t = self.sheets.shown.get(self.now);
         let (height, spin, now) = (self.sheet_height(), self.spin(), self.now);
-        if self.settings_open && self.settings_window.is_none() {
+        if let Some(sheet) = self.sign_in_sheet(p) {
+            modal(
+                body,
+                sheet,
+                Some(Message::SignIn(sign_in::Input::Cancel)),
+                t,
+            )
+        } else if self.settings_open && self.settings_window.is_none() {
             modal(
                 body,
                 self.settings_sheet(p, height),

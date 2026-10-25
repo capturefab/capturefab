@@ -127,26 +127,39 @@ struct Service {
     /// Whether clients may open hub cameras, which use this computer's hub
     /// secrets.
     allow_hubs: bool,
+    /// Whether clients may open cameras with sign-ins saved on this host.
+    allow_saved_logins: bool,
 }
+
+const NO_REMOTE_LOGIN: &str = "camera passwords cannot be sent to the remote API, which has no TLS or authentication; save the sign-in on the host with `capturefab login add`, then start serve with --allow-saved-sign-ins";
+const SAVED_LOGIN_REFUSED: &str =
+    "this camera uses a sign-in saved on this host; start serve with --allow-saved-sign-ins";
 
 impl Server {
     /// Bind an explicit address. The CLI opts in with `--listen`; publishing on
     /// a tailnet uses the server's Tailscale address or a local HTTPS proxy.
     pub fn start(handle: SessionHandle, address: SocketAddr, web_root: WebRoot) -> Result<Self> {
-        Self::start_with(handle, address, web_root, false)
+        Self::start_with(handle, address, web_root, false, false)
     }
     /// Like [`Server::start`]; `allow_hubs` lets clients connect hub
-    /// cameras (`serve --allow-hubs`).
+    /// cameras (`serve --allow-hubs`), and `allow_saved_logins` cameras
+    /// with sign-ins saved on this host (`serve --allow-saved-sign-ins`).
     pub fn start_with(
         handle: SessionHandle,
         address: SocketAddr,
         web_root: WebRoot,
         allow_hubs: bool,
+        allow_saved_logins: bool,
     ) -> Result<Self> {
         let handle = if allow_hubs {
             handle
         } else {
             handle.without_hub_connect()
+        };
+        let handle = if allow_saved_logins {
+            handle
+        } else {
+            handle.deny_saved_logins()
         };
         let listener = TcpListener::bind(address).context("bind remote HTTP listener")?;
         let address = listener.local_addr()?;
@@ -158,6 +171,7 @@ impl Server {
             activity_waits: Arc::new(AtomicUsize::new(0)),
             previews: Previews::default(),
             allow_hubs,
+            allow_saved_logins,
         });
         let active = Arc::new(AtomicUsize::new(0));
         let (done, stopped) = mpsc::channel();
@@ -485,6 +499,10 @@ fn validate_remote_command(command: &SessionCommand) -> Result<()> {
             "remote capture requires a server-side file or destination"
         );
     }
+    ensure!(
+        !matches!(command, SessionCommand::Connect { login: Some(_), .. }),
+        NO_REMOTE_LOGIN
+    );
     command.validate()
 }
 
@@ -504,6 +522,27 @@ impl Service {
                             || device.serial == camera
                             || device.address.as_deref() == Some(camera))
                 })
+    }
+    /// Whether `camera` opens with a sign-in saved on this host, directly
+    /// or as the ID, serial or address of a discovered ONVIF camera.
+    fn opens_saved_login(&self, camera: &str) -> bool {
+        let snapshot = self.handle.snapshot_unwatched();
+        let target = snapshot
+            .devices
+            .iter()
+            .chain(snapshot.cameras.iter().map(|camera| &camera.info))
+            .find(|device| {
+                crate::onvif::is_source(&device.id)
+                    && (device.id == camera
+                        || device.serial == camera
+                        || device.address.as_deref() == Some(camera))
+            })
+            .map_or(camera, |device| device.id.as_str());
+        crate::logins::key(target).is_ok_and(|key| {
+            crate::logins::Logins::system()
+                .is_saved(&key.address)
+                .unwrap_or(true)
+        })
     }
     fn respond(&self, request: Request) -> Response {
         let (path, query) = request
@@ -662,6 +701,12 @@ impl Service {
                 400,
                 "hub cameras cannot be opened through the remote API; start serve with --allow-hubs to allow it",
             );
+        }
+        if !self.allow_saved_logins
+            && let SessionCommand::Connect { camera, .. } = &command.command
+            && self.opens_saved_login(camera)
+        {
+            return error(400, SAVED_LOGIN_REFUSED);
         }
         let actor = command.actor.unwrap_or_else(|| SessionActor {
             id: "http".into(),
@@ -1376,6 +1421,7 @@ mod tests {
             quitting: Arc::new(AtomicBool::new(false)),
             activity_waits: Arc::new(AtomicUsize::new(0)),
             allow_hubs: false,
+            allow_saved_logins: false,
             // Every request sees the newest frame unless a test shares encodes.
             previews: Previews {
                 share: Duration::ZERO,
@@ -1776,6 +1822,69 @@ mod tests {
             !handle.watching(),
             "permission checks are not preview viewers"
         );
+        handle.shutdown();
+    }
+
+    #[cfg(feature = "keychain")]
+    #[test]
+    fn saved_sign_ins_need_allow_saved_sign_ins() {
+        let root = TempWebRoot::new();
+        let handle = SessionHandle::new();
+        let service = service(handle.clone(), WebRoot::Folder(root.0.clone()));
+        let address = format!(
+            "rtsp://remote-saved-{}.invalid:554/live",
+            std::process::id()
+        );
+        crate::logins::Logins::system()
+            .save(
+                &address,
+                &crate::logins::CameraLogin::new("admin", "remote-test-pw").unwrap(),
+            )
+            .unwrap();
+        handle.set_devices_for_test(vec![crate::types::CameraInfo {
+            id: "onvif:http://saved-onvif.invalid/onvif/device_service".into(),
+            transport: crate::types::Transport::Media,
+            vendor: "ONVIF".into(),
+            model: "Cam".into(),
+            serial: "urn:uuid:saved".into(),
+            address: Some("http://saved-onvif.invalid/onvif/device_service".into()),
+            profile: Default::default(),
+        }]);
+        crate::logins::Logins::system()
+            .save(
+                "onvif:http://saved-onvif.invalid:80/onvif/device_service",
+                &crate::logins::CameraLogin::new("admin", "remote-test-pw").unwrap(),
+            )
+            .unwrap();
+        let post = |body: String| {
+            let mut post = parse_headers(
+                "POST /api/command HTTP/1.1\r\nHost: camera:7878\r\nContent-Type: application/json",
+            )
+            .unwrap();
+            post.body = body.into_bytes();
+            let response = service.respond(post);
+            let body: Value = serde_json::from_slice(&response.body).unwrap();
+            (
+                response.status,
+                body["error"]["message"].as_str().unwrap_or("").to_owned(),
+            )
+        };
+        for camera in [address.as_str(), "urn:uuid:saved"] {
+            let (status, message) = post(format!(
+                r#"{{"version":1,"command":{{"op":"connect","camera":"{camera}","timeout_ms":1000}}}}"#
+            ));
+            assert_eq!(status, 400, "{camera}");
+            assert!(message.contains("--allow-saved-sign-ins"), "{message}");
+        }
+        let (status, message) = post(
+            r#"{"version":1,"command":{"op":"connect","camera":"rtsp://other.invalid/x","timeout_ms":1000,"login":{"user":"admin","password":"pw"}}}"#.into(),
+        );
+        assert_eq!(status, 400);
+        assert!(
+            message.contains("cannot be sent to the remote API"),
+            "{message}"
+        );
+        assert!(!message.contains("\"pw\""), "{message}");
         handle.shutdown();
     }
 

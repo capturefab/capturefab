@@ -121,7 +121,7 @@ fn captures_connect_discovered_cameras_and_number_static_sequences() {
     let checked = run(&ctx, "capture_photos", input);
     ready(&checked);
     assert_eq!(checked.call.args["file_name"], "photo-{seq}.png");
-    assert!(matches!(&checked.ops[0], Op::Connect { selector } if selector == "sim:2"));
+    assert!(matches!(&checked.ops[0], Op::Connect { selector, .. } if selector == "sim:2"));
     assert!(matches!(&checked.ops[1], Op::Command { camera, .. } if camera.selector() == "sim:2"));
 }
 

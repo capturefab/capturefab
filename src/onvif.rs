@@ -619,8 +619,18 @@ fn soap(
     );
     let action = format!("{namespace}/{operation}");
     let first = request(&url, &action, &body, None, timeout)?;
+    // Named by the SOAP endpoint here; `connect_with` re-keys the error to
+    // the ONVIF address a sign-in is saved under.
+    let refused = |sent: bool| {
+        crate::logins::auth_error(
+            &format!("onvif:{}", crate::media::redact_url(endpoint)),
+            sent,
+        )
+    };
     let response = if first.status == 401 {
-        let credentials = credentials.context("ONVIF service requires credentials")?;
+        let Some(credentials) = credentials else {
+            return Err(refused(false));
+        };
         let challenge = first
             .headers
             .get("www-authenticate")
@@ -635,13 +645,25 @@ fn soap(
         } else {
             bail!("unsupported ONVIF HTTP authentication method")
         };
-        request(&url, &action, &body, Some(&authorization), timeout)?
+        let second = request(&url, &action, &body, Some(&authorization), timeout)?;
+        if second.status == 401 {
+            return Err(refused(true));
+        }
+        second
     } else {
         first
     };
     if !(200..300).contains(&response.status) {
         if !response.body.is_empty() {
-            xml_document(&response.body)?;
+            // Many cameras answer GetCapabilities anonymously and refuse
+            // GetProfiles with a NotAuthorized fault and a 400 or 500.
+            if let Err(error) = xml_document(&response.body) {
+                // A fault's subcode (ter:NotAuthorized) or its text.
+                if response.body.contains("NotAuthorized") {
+                    return Err(refused(credentials.is_some()));
+                }
+                return Err(error);
+            }
         }
         bail!("ONVIF HTTP request failed with status {}", response.status)
     }
@@ -788,42 +810,7 @@ pub fn is_source(source: &str) -> bool {
         .is_some_and(|protocol| protocol.eq_ignore_ascii_case("onvif:"))
 }
 fn percent_decode(text: &str) -> Result<String> {
-    let mut bytes = Vec::with_capacity(text.len());
-    let mut index = 0;
-    let input = text.as_bytes();
-    while index < input.len() {
-        if input[index] == b'%' {
-            ensure!(
-                index + 2 < input.len(),
-                "truncated ONVIF credential percent escape"
-            );
-            let hex = std::str::from_utf8(&input[index + 1..index + 3])?;
-            bytes.push(
-                u8::from_str_radix(hex, 16).context("invalid ONVIF credential percent escape")?,
-            );
-            index += 3;
-        } else {
-            bytes.push(input[index]);
-            index += 1;
-        }
-    }
-    let decoded = String::from_utf8(bytes).context("ONVIF credentials are not UTF-8")?;
-    ensure!(
-        !decoded.chars().any(char::is_control),
-        "ONVIF credentials must not contain control characters"
-    );
-    Ok(decoded)
-}
-fn percent_encode(text: &str) -> String {
-    text.bytes()
-        .map(|byte| {
-            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-                (byte as char).to_string()
-            } else {
-                format!("%{byte:02X}")
-            }
-        })
-        .collect()
+    crate::logins::percent_decode(text)
 }
 fn source_endpoint(source: &str) -> Result<(String, Option<Credentials>)> {
     source_endpoint_impl(source, false)
@@ -876,6 +863,31 @@ fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Opti
     Ok((endpoint, credentials))
 }
 
+/// The address a sign-in for this ONVIF camera is saved under:
+/// `onvif:http://HOST:PORT/PATH`, with the host lowercased, the port made
+/// explicit and any query dropped, so `onvif://cam` and
+/// `onvif:http://cam:80/onvif/device_service` are the same camera.
+pub fn endpoint_key(source: &str) -> Result<String> {
+    let (endpoint, credentials) = source_endpoint(source)?;
+    if credentials.is_some() {
+        return Err(crate::dataset::Usage(
+            "leave the user name and password out of the address; use --user and --password-stdin"
+                .into(),
+        )
+        .into());
+    }
+    let url = parse_url(&endpoint)?;
+    let host = if url.host.contains(':') {
+        format!("[{}]", url.host.to_ascii_lowercase())
+    } else {
+        url.host.to_ascii_lowercase()
+    };
+    let path = match url.path.split(['?', '#']).next().unwrap_or("") {
+        "" => "/",
+        path => path,
+    };
+    Ok(format!("onvif:http://{host}:{}{path}", url.port))
+}
 /// Validate a camera locator before discovery, authentication or camera changes.
 pub fn validate_source(source: &str) -> Result<()> {
     source_endpoint(source).map(|_| ())
@@ -888,21 +900,9 @@ fn authenticated_uri(uri: &str, credentials: Option<&Credentials>) -> Result<Str
     let Some(credentials) = credentials else {
         return Ok(uri.into());
     };
-    let (scheme, rest) = uri
-        .split_once("://")
-        .context("ONVIF stream URI has no authority")?;
-    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..end];
-    let host = authority
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(authority);
-    Ok(format!(
-        "{scheme}://{}:{}@{host}{}",
-        percent_encode(&credentials.username),
-        percent_encode(&credentials.password),
-        &rest[end..]
-    ))
+    ensure!(uri.contains("://"), "ONVIF stream URI has no authority");
+    let login = crate::logins::CameraLogin::new(&credentials.username, &credentials.password)?;
+    Ok(crate::logins::with_credentials(uri, &login)?.to_string())
 }
 /// Try profiles in the camera's advertised order. Opening a media source reads
 /// its first frame, so success establishes that this stream can actually decode.
@@ -911,26 +911,70 @@ fn open_stream<T>(
     mut open: impl FnMut(&OnvifStream) -> Result<T>,
 ) -> Result<(&OnvifStream, T)> {
     let mut last_error = None;
+    let mut auth_error = None;
     for stream in streams {
         match open(stream) {
             Ok(backend) => return Ok((stream, backend)),
+            // A sign-in problem says more than a later profile's failure.
+            Err(error) if auth_error.is_none() && crate::logins::is_auth_error(&error) => {
+                auth_error = Some(error)
+            }
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!("ONVIF camera exposes no stream profiles")))
-        .context("could not open any ONVIF stream profile")
+    Err(auth_error
+        .or(last_error)
+        .unwrap_or_else(|| anyhow!("ONVIF camera exposes no stream profiles")))
+    .context("could not open any ONVIF stream profile")
 }
 
 pub fn connect(
     source: &str,
     timeout: Duration,
 ) -> Result<(crate::types::CameraInfo, Box<dyn crate::types::Backend>)> {
-    let (endpoint, credentials) = source_endpoint(source)?;
-    let streams = resolve(&endpoint, credentials.as_ref(), None, timeout)?;
+    connect_with(source, None, timeout)
+}
+/// Open an ONVIF camera, with a sign-in given beside its address. Sign-in
+/// errors always name the ONVIF address, never a stream URI it reported,
+/// since the ONVIF address is what a sign-in is saved under.
+pub fn connect_with(
+    source: &str,
+    login: Option<&crate::logins::CameraLogin>,
+    timeout: Duration,
+) -> Result<(crate::types::CameraInfo, Box<dyn crate::types::Backend>)> {
+    let (endpoint, mut credentials) = source_endpoint(source)?;
+    if let Some(login) = login {
+        ensure!(
+            credentials.is_none(),
+            crate::dataset::Usage(
+                "leave the user name and password out of the address when signing in".into()
+            )
+        );
+        credentials = Some(Credentials {
+            username: login.user.clone(),
+            password: login.expose().to_owned(),
+        });
+    }
+    let sent = credentials.is_some();
+    let key = endpoint_key(source)
+        .or_else(|_| endpoint_key(&format!("onvif:{endpoint}")))
+        .unwrap_or_else(|_| format!("onvif:{}", crate::media::redact_url(&endpoint)));
+    let rekey = |error: anyhow::Error| {
+        if crate::logins::is_auth_error(&error) {
+            crate::logins::auth_error(&key, sent)
+        } else {
+            error
+        }
+    };
+    let streams = resolve(&endpoint, credentials.as_ref(), None, timeout).map_err(rekey)?;
     let (profile, backend) = open_stream(&streams, |profile| {
-        let uri = authenticated_uri(&profile.uri, credentials.as_ref())?;
+        let uri = zeroize::Zeroizing::new(authenticated_uri(&profile.uri, credentials.as_ref())?);
         crate::media::open_url(&uri, timeout)
-    })?;
+    })
+    .map_err(rekey)?;
+    if let Some(credentials) = &mut credentials {
+        zeroize::Zeroize::zeroize(&mut credentials.password);
+    }
     let safe_endpoint = crate::media::redact_url(&endpoint);
     let hash = safe_endpoint.bytes().fold(0xcbf29ce484222325u64, |h, b| {
         (h ^ b as u64).wrapping_mul(0x100000001b3)
@@ -1408,6 +1452,117 @@ mod tests {
         );
         assert!(start.elapsed() < Duration::from_secs(1));
         server.join().unwrap();
+    }
+    /// Answer each request in turn with a canned response.
+    fn answer(responses: Vec<String>) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                mock_request(&stream);
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        (format!("{address}"), server)
+    }
+    fn code(error: &anyhow::Error) -> Option<&'static str> {
+        crate::types::error_transport_code(error)
+    }
+    #[test]
+    fn sign_in_requests_and_refusals_are_typed_and_name_the_onvif_address() {
+        let challenge = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"Camera\", nonce=\"n\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned();
+        let timeout = Duration::from_secs(2);
+        // No credentials: auth_required, naming the ONVIF address.
+        let (address, server) = answer(vec![challenge.clone()]);
+        let error = connect(&format!("onvif://{address}"), timeout)
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(code(&error), Some("auth_required"), "{error:#}");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains(&format!("onvif:http://{address}/onvif/device_service")),
+            "{text}"
+        );
+        // Credentials refused after the Digest challenge: auth_rejected.
+        let (address, server) = answer(vec![challenge.clone(), challenge]);
+        let login = crate::logins::CameraLogin::new("admin", "onvif-secret-pw").unwrap();
+        let error = connect_with(&format!("onvif://{address}"), Some(&login), timeout)
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(code(&error), Some("auth_rejected"), "{error:#}");
+        assert!(!format!("{error:#}").contains("onvif-secret-pw"));
+        // GetCapabilities works anonymously, GetProfiles faults.
+        let media = format!("http://{address}/onvif/media");
+        let ok = |body: String| {
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let fault = "<Envelope><Body><Fault><Code><Subcode><Value>ter:NotAuthorized</Value></Subcode></Code><Reason><Text>Sender not Authorized</Text></Reason></Fault></Body></Envelope>";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let here = listener.local_addr().unwrap();
+        let media = media.replace(&address, &here.to_string());
+        let responses = vec![
+            ok(format!(
+                "<Envelope><Body><GetCapabilitiesResponse><Capabilities><Media><XAddr>{media}</XAddr></Media></Capabilities></GetCapabilitiesResponse></Body></Envelope>"
+            )),
+            format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{fault}",
+                fault.len()
+            ),
+        ];
+        let server = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                mock_request(&stream);
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        let error = connect(
+            &format!("onvif:http://{here}/onvif/device_service"),
+            timeout,
+        )
+        .err()
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(code(&error), Some("auth_required"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains(&format!("onvif:http://{here}/onvif/device_service"))
+        );
+        // Credentials in the address and beside it are a usage error.
+        let error = connect_with("onvif://u:p@127.0.0.1:9", Some(&login), timeout)
+            .err()
+            .unwrap();
+        assert_eq!(code(&error), Some("usage"));
+    }
+    #[test]
+    fn a_sign_in_failure_outranks_later_profile_failures() {
+        let streams = ["first", "second"].map(|token| OnvifStream {
+            token: token.into(),
+            name: token.into(),
+            encoding: None,
+            width: None,
+            height: None,
+            uri: format!("rtsp://camera/{token}"),
+        });
+        let error = open_stream::<()>(&streams, |stream| match stream.token.as_str() {
+            "first" => Err(crate::logins::auth_error("rtsp://camera/first", false)),
+            _ => bail!("decoder failed"),
+        })
+        .unwrap_err();
+        assert_eq!(code(&error), Some("auth_required"));
+        assert_eq!(
+            endpoint_key("onvif://Cam:8080").unwrap(),
+            "onvif:http://cam:8080/onvif/device_service"
+        );
+        assert_eq!(
+            code(&endpoint_key("onvif://u:p@cam").unwrap_err()),
+            Some("usage")
+        );
     }
     #[test]
     fn locator_credentials_roundtrip_and_never_publish() {

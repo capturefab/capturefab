@@ -457,7 +457,8 @@ impl Workbench {
     }
 
     pub(super) fn sheet_open(&self) -> bool {
-        self.help_open
+        self.sign_in.is_some()
+            || self.help_open
             || self.assistant.quick.open
             || self.network_open
             || self.analytics.open

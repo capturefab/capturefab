@@ -141,6 +141,8 @@ When the plan has steps, `--plan-out FILE` creates a private version-1 tool plan
 
 `ask --apply` is an explicit request to execute a restricted plan. Every step must be ready, every tool must be in the allowlist, and no step may send data off the computer. The default allowlist is `connect_camera,start_recording,stop_recording,capture_photos,schedule_captures,cancel_job`. `--allow-tools LIST` replaces it; it never permits egress. A refused plan exits 2 before execution. Review `error.details` for its plan and issues. Apply rechecks live state and stops at its first failure; earlier effects remain.
 
+Assistant connections never use camera sign-ins saved with `capturefab login` or the desktop app's Remember option: assistant-origin `connect_camera` calls send `saved_login:false`, and no tool takes a password argument. A camera that answers `auth_required` or `auth_rejected` gives the tool error "This camera needs a sign-in. Connect it in the app or with `capturefab connect`; the assistant can then use the connected camera." A camera the user already connected stays usable.
+
 ## Modes and approvals
 
 | Mode | Observe | Reversible and Bounded | Disruptive | HumanOnly |

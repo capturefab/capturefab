@@ -135,9 +135,20 @@ pub fn validate_selector(selector: &str) -> Result<()> {
 }
 impl Camera {
     pub fn open(selector: &str, known: &[CameraInfo], timeout: Duration) -> Result<Self> {
+        Self::open_with_login(selector, known, timeout, None)
+    }
+    /// Open a camera with a sign-in given beside its selector. Only ONVIF
+    /// and media URL cameras use it; the session rejects a sign-in for any
+    /// other kind before it gets here.
+    pub fn open_with_login(
+        selector: &str,
+        known: &[CameraInfo],
+        timeout: Duration,
+        login: Option<&crate::logins::CameraLogin>,
+    ) -> Result<Self> {
         validate_selector(selector)?;
         if crate::onvif::is_source(selector) {
-            let (info, backend) = crate::onvif::connect(selector, timeout)?;
+            let (info, backend) = crate::onvif::connect_with(selector, login, timeout)?;
             return Self::from_backend(info, backend);
         }
         if crate::hubs::is_source(selector) {
@@ -177,7 +188,7 @@ impl Camera {
             Transport::Scanner => crate::scanner::open(&info)?,
             Transport::Media => {
                 if crate::onvif::is_source(&info.id) {
-                    let (info, backend) = crate::onvif::connect(&info.id, timeout)?;
+                    let (info, backend) = crate::onvif::connect_with(&info.id, login, timeout)?;
                     return Self::from_backend(info, backend);
                 }
                 // A hub camera opened by its serial keeps the options its
@@ -188,7 +199,7 @@ impl Camera {
                     return Self::from_backend(info, backend);
                 }
                 if crate::media::is_source(selector) {
-                    crate::media::open_url(selector, timeout)?
+                    crate::media::open_url_with(selector, login, timeout)?
                 } else {
                     crate::media::open(&info, timeout)?
                 }

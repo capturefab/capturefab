@@ -105,6 +105,10 @@ pub enum ErrorKind {
     Unavailable,
     Timeout,
     Unsupported,
+    /// A camera asked for a user name and password and none was sent.
+    AuthRequired,
+    /// A camera refused the user name and password that were sent.
+    AuthRejected,
 }
 impl ErrorKind {
     /// The JSON error code and process exit code.
@@ -114,6 +118,8 @@ impl ErrorKind {
             Self::Unavailable => ("unavailable", 3),
             Self::Timeout => ("timeout", 4),
             Self::Unsupported => ("unsupported", 5),
+            Self::AuthRequired => ("auth_required", 1),
+            Self::AuthRejected => ("auth_rejected", 1),
         }
     }
     fn from_code(code: &str) -> Option<Self> {
@@ -122,6 +128,8 @@ impl ErrorKind {
             Self::Unavailable,
             Self::Timeout,
             Self::Unsupported,
+            Self::AuthRequired,
+            Self::AuthRejected,
         ]
         .into_iter()
         .find(|kind| kind.code().0 == code)
@@ -200,7 +208,12 @@ mod tests {
             message: "camera porch_disabled is offline".into(),
         })
         .context("connect");
+        let required = Categorized::error(ErrorKind::AuthRequired, "rtsp://cam needs a sign-in");
+        let rejected = Categorized::error(ErrorKind::AuthRejected, "rtsp://cam refused it")
+            .context("open camera");
         for (error, code) in [
+            (required, Some("auth_required")),
+            (rejected, Some("auth_rejected")),
             (usage, Some("usage")),
             (timeout, Some("timeout")),
             (wrapped, Some("unavailable")),

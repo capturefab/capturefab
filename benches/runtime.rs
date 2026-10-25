@@ -525,11 +525,8 @@ fn main() {
         unsafe { std::env::set_var("CAPTUREFAB_EXECUTABLE", env!("CARGO_BIN_EXE_capturefab")) };
         let h = SessionHandle::new();
         for camera in 0..8 {
-            h.request(SessionCommand::Connect {
-                camera: format!("sim:{camera}"),
-                timeout_ms: 5000,
-            })
-            .unwrap();
+            h.request(SessionCommand::connect(format!("sim:{camera}"), 5000))
+                .unwrap();
         }
         for _ in 0..200 {
             let missing = SessionCommand::Get {

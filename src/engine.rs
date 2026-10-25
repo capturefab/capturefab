@@ -110,6 +110,8 @@ pub struct WorkerHandle {
     forward_clock: Arc<Mutex<Option<ForwardClock>>>,
     /// Output numbers handed out, so concurrent captures never share a name.
     names: Arc<Mutex<crate::naming::Namer>>,
+    /// Saved camera sign-ins, read when a camera opens.
+    logins: crate::logins::Logins,
 }
 impl Default for WorkerHandle {
     fn default() -> Self {
@@ -118,12 +120,19 @@ impl Default for WorkerHandle {
 }
 impl WorkerHandle {
     pub fn new() -> Self {
-        Self::create(None)
+        Self::create(None, crate::logins::Logins::system())
     }
     pub fn with_ring(ring: Arc<Mutex<crate::shared_memory::SharedRing>>) -> Self {
-        Self::create(Some(ring))
+        Self::create(Some(ring), crate::logins::Logins::system())
     }
-    fn create(ring: Option<Arc<Mutex<crate::shared_memory::SharedRing>>>) -> Self {
+    #[cfg(all(test, feature = "keychain"))]
+    fn with_logins(logins: crate::logins::Logins) -> Self {
+        Self::create(None, logins)
+    }
+    fn create(
+        ring: Option<Arc<Mutex<crate::shared_memory::SharedRing>>>,
+        logins: crate::logins::Logins,
+    ) -> Self {
         let (sender, receiver) = mpsc::sync_channel(32);
         let handle = Self {
             sender,
@@ -139,6 +148,7 @@ impl WorkerHandle {
             recording: Arc::default(),
             forward_clock: Arc::default(),
             names: Arc::default(),
+            logins,
         };
         let worker_handle = handle.clone();
         let thread = std::thread::Builder::new()
@@ -1105,6 +1115,8 @@ fn process_plain(
         SessionCommand::Connect {
             camera: selector,
             timeout_ms,
+            login,
+            saved_login,
         } => {
             ensure!(
                 camera.is_none(),
@@ -1132,7 +1144,47 @@ fn process_plain(
                 }
                 h.state.write().unwrap_or_else(|e| e.into_inner()).devices = known.clone();
             }
-            *camera = Some(Camera::open(&selector, &known, duration)?);
+            // The address a sign-in is saved under: the selector itself, or
+            // the ONVIF address of a discovered camera named by its serial.
+            let key = crate::logins::key(&selector).ok().or_else(|| {
+                known
+                    .iter()
+                    .find(|d| {
+                        crate::onvif::is_source(&d.id) && (d.id == selector || d.serial == selector)
+                    })
+                    .and_then(|d| crate::logins::key(&d.id).ok())
+            });
+            let mut login = login;
+            let mut remembered = None;
+            if login.is_none()
+                && saved_login
+                && let Some(key) = &key
+            {
+                match h.logins.remembered(&key.address)? {
+                    crate::logins::Remembered::Login(saved) => {
+                        login = Some(saved);
+                        remembered = Some(key.address.clone());
+                    }
+                    crate::logins::Remembered::Missing { .. } => h.log(
+                        "warn",
+                        format!(
+                            "the saved sign-in for {} is missing from the OS credential store",
+                            crate::logins::short(&key.address)
+                        ),
+                    ),
+                    crate::logins::Remembered::None => {}
+                }
+            }
+            *camera = Some(Camera::open_with_login(
+                &selector,
+                &known,
+                duration,
+                login.as_ref(),
+            )?);
+            drop(login);
+            if let Some(address) = remembered {
+                h.logins.touch(&address);
+            }
             *h.frame.write().unwrap_or_else(|e| e.into_inner()) = None;
             {
                 h.counters.reset();
@@ -2373,10 +2425,7 @@ mod tests {
     fn active_jobs_reject_overlapping_output_files() {
         let handle = WorkerHandle::new();
         handle
-            .request(SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 100,
-            })
+            .request(SessionCommand::connect("sim:0".into(), 100))
             .unwrap();
         let root = std::env::temp_dir().join(format!(
             "capturefab-job-conflict-{}-{}",
@@ -2452,11 +2501,8 @@ mod tests {
         let mut paths = Vec::new();
         let handles: Vec<_> = (0..2).map(|_| WorkerHandle::new()).collect();
         for h in &handles {
-            h.request(SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 100,
-            })
-            .unwrap();
+            h.request(SessionCommand::connect("sim:0".into(), 100))
+                .unwrap();
             let reply = h.request(forward()).unwrap();
             paths.push(reply["path"].as_str().unwrap().to_owned());
         }
@@ -2529,10 +2575,7 @@ mod tests {
         run(
             &mut camera,
             &mut forwarder,
-            SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 100,
-            },
+            SessionCommand::connect("sim:0".into(), 100),
         )
         .unwrap();
         let target = Path::new("udp://127.0.0.1:9");
@@ -2654,10 +2697,7 @@ mod tests {
         run(
             &mut camera,
             &mut forwarder,
-            SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 100,
-            },
+            SessionCommand::connect("sim:0".into(), 100),
         )
         .unwrap();
         let target = Path::new("udp://127.0.0.1:9");
@@ -2799,10 +2839,7 @@ mod tests {
                     command,
                 )
             };
-        let connect = || SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 100,
-        };
+        let connect = || SessionCommand::connect("sim:0".into(), 100);
         run(&mut camera, &mut forwarder, connect()).unwrap();
         let hour = Some(3_600_000);
         // Stop-forward, stop and disconnect each clear the end time.
@@ -2900,10 +2937,7 @@ mod tests {
         run(
             &mut camera,
             &mut forwarder,
-            SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 100,
-            },
+            SessionCommand::connect("sim:0".into(), 100),
         )
         .unwrap();
         let template = root.join("{camera}-{seq}.mkv");
@@ -2981,11 +3015,8 @@ mod tests {
     #[test]
     fn session_simulator_configuration_and_acquisition() {
         let h = WorkerHandle::new();
-        h.request(SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 100,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect("sim:0".into(), 100))
+            .unwrap();
         h.request(SessionCommand::Set {
             feature: "Width".into(),
             value: "128".into(),
@@ -3038,11 +3069,8 @@ mod tests {
                 .unwrap();
             }
         };
-        h.request(SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 100,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect("sim:0".into(), 100))
+            .unwrap();
         size("64");
         // Nobody reads while it streams, so only a keep-alive is published,
         // and without force the capture would be skipped as well.
@@ -3094,11 +3122,8 @@ mod tests {
         let writer = crate::shared_memory::SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
         let mut reader = writer.reader().unwrap();
         let h = WorkerHandle::with_ring(Arc::new(Mutex::new(writer)));
-        h.request(SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 100,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect("sim:0".into(), 100))
+            .unwrap();
         for feature in ["Width", "Height"] {
             h.request(SessionCommand::Set {
                 feature: feature.into(),
@@ -3611,11 +3636,8 @@ mod tests {
         let fastest = (0..3)
             .map(|_| {
                 let h = WorkerHandle::new();
-                h.request(SessionCommand::Connect {
-                    camera: "sim:0".into(),
-                    timeout_ms: 100,
-                })
-                .unwrap();
+                h.request(SessionCommand::connect("sim:0".into(), 100))
+                    .unwrap();
                 let started = Instant::now();
                 h.shutdown();
                 started.elapsed()
@@ -3659,11 +3681,8 @@ mod tests {
     }
 
     fn connect(h: &WorkerHandle, exposure: &str) {
-        h.request(SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 100,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect("sim:0".into(), 100))
+            .unwrap();
         for (feature, value) in [
             ("Width", "128"),
             ("Height", "128"),
@@ -3795,11 +3814,8 @@ mod tests {
     #[test]
     fn microscope_focus_scores_peak_at_the_specimen() {
         let h = WorkerHandle::new();
-        h.request(SessionCommand::Connect {
-            camera: "sim:microscope".into(),
-            timeout_ms: 100,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect("sim:microscope".into(), 100))
+            .unwrap();
         set(&h, "Width", "256");
         set(&h, "Height", "192");
         let tenengrad = |position: &str| {
@@ -4475,11 +4491,8 @@ mod tests {
             .unwrap();
         assert!(made.success());
         let h = WorkerHandle::new();
-        h.request(SessionCommand::Connect {
-            camera: clip.to_string_lossy().into(),
-            timeout_ms: 3000,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect(clip.to_string_lossy().into(), 3000))
+            .unwrap();
         let started = Instant::now();
         h.request(SessionCommand::Start).unwrap();
         while h.snapshot().streaming {
@@ -4566,10 +4579,10 @@ esac"#;
                 std::thread::sleep(Duration::from_millis(20));
             }
         };
-        h.request(SessionCommand::Connect {
-            camera: "rtsp://user:secret@127.0.0.1:9/live".into(),
-            timeout_ms: 2000,
-        })
+        h.request(SessionCommand::connect(
+            "rtsp://user:secret@127.0.0.1:9/live".into(),
+            2000,
+        ))
         .unwrap();
         h.request(SessionCommand::Start).unwrap();
         wait("first loss", &|| said("Stream lost") == 1);
@@ -4602,6 +4615,53 @@ esac"#;
                 .iter()
                 .all(|log| !log.message.contains("secret"))
         );
+        h.shutdown();
+    }
+
+    #[cfg(feature = "keychain")]
+    #[test]
+    fn saved_sign_ins_are_read_only_when_allowed_and_never_fall_back() {
+        use crate::logins::{CameraLogin, Logins, MemoryStore};
+        use std::sync::atomic::Ordering;
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-engine-logins-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Arc::new(MemoryStore::default());
+        let logins = Logins::with(dir, store.clone());
+        let address = "rtsp://127.0.0.1:9/live";
+        logins
+            .save(
+                address,
+                &CameraLogin::new("admin", "engine-test-pw").unwrap(),
+            )
+            .unwrap();
+        store.reads.store(0, Ordering::SeqCst);
+        let h = WorkerHandle::with_logins(logins);
+        let connect = |saved_login| SessionCommand::Connect {
+            camera: "rtsp://127.0.0.1:9/live".into(),
+            timeout_ms: 1000,
+            login: None,
+            saved_login,
+        };
+        // An assistant connect never reads the store.
+        assert!(h.request(connect(false)).is_err());
+        assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+        // A saved sign-in is looked up when none was sent.
+        assert!(h.request(connect(true)).is_err());
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+        // A locked store fails the connect rather than trying anonymously.
+        store.fail.store(true, Ordering::SeqCst);
+        let error = h.request(connect(true)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unlock it and try again"),
+            "{error:#}"
+        );
+        assert!(!format!("{error:#}").contains("engine-test-pw"));
         h.shutdown();
     }
 }

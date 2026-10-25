@@ -43,6 +43,7 @@ mod scopes;
 mod secret;
 mod settings;
 mod sidebar;
+mod sign_in;
 mod sparkline;
 mod stage;
 mod storage_policy;
@@ -240,10 +241,7 @@ pub fn run_capture(
             for index in 0..if existing == 0 { count } else { 0 } {
                 app.send(
                     Job::Connect,
-                    SessionCommand::Connect {
-                        camera: format!("sim:{index}"),
-                        timeout_ms: 2000,
-                    },
+                    SessionCommand::connect(format!("sim:{index}"), 2000),
                 );
             }
         } else {
@@ -368,6 +366,11 @@ struct Pending {
     /// shared timeline rather than recording another edit.
     history_replay: Option<bool>,
     history_token: Option<String>,
+    /// A connect sent a sign-in (typed in the sheet or the address).
+    sent_login: bool,
+    /// The sign-in to save once the connect succeeds, only when the person
+    /// asked to remember it; dropped, and zeroized, with this entry.
+    login: Option<crate::logins::CameraLogin>,
 }
 
 impl Pending {
@@ -384,6 +387,8 @@ impl Pending {
             batch: false,
             history_replay: None,
             history_token: None,
+            sent_login: false,
+            login: None,
         }
     }
 
@@ -735,6 +740,9 @@ enum Message {
     AnalyticsScrolled(bool),
     AnalyticsHistory(analytics::HistoryInput),
     VideoAnalytics(video_analytics::Input),
+    SignIn(sign_in::Input),
+    /// Forget the saved sign-in for this address, from Settings.
+    ForgetSignIn(String),
     IncludeSimulator(bool),
     TrySimulator,
     EnterAddress,
@@ -930,6 +938,14 @@ struct Workbench {
     network_scrolled: bool,
     analytics: analytics::State,
     video_analytics: video_analytics::State,
+    /// The "Sign in to camera" sheet, while open.
+    sign_in: Option<sign_in::SignIn>,
+    /// Saved camera sign-ins, address to user name, from the index alone.
+    saved_logins: std::collections::BTreeMap<String, String>,
+    /// Background keychain saves and removals.
+    login_jobs: Vec<Receiver<sign_in::Reply>>,
+    /// A screenshot scene supplies `saved_logins`; never reload them.
+    scene_logins: bool,
     settings_open: bool,
     menu_editor: bool,
     popup_open: bool,
@@ -1144,6 +1160,10 @@ impl Workbench {
             network_scrolled: false,
             analytics: Default::default(),
             video_analytics,
+            sign_in: None,
+            saved_logins: Default::default(),
+            login_jobs: Vec::new(),
+            scene_logins: false,
             settings_open: false,
             menu_editor: false,
             popup_open: false,
@@ -1251,6 +1271,7 @@ impl Workbench {
             sheets: Default::default(),
         };
         bench.adopt(&prefs);
+        bench.load_saved_logins();
         bench.include_simulator |= simulated;
         // CAPTUREFAB_APPEARANCE=light|dark overrides the system, e.g. for screenshots.
         match std::env::var("CAPTUREFAB_APPEARANCE").as_deref() {
@@ -1783,8 +1804,14 @@ impl Workbench {
             };
             // In the order sent, so a newer write of a feature settles
             // after an older one (see `settles_row`).
-            let pending = self.pending.remove(i);
+            let mut pending = self.pending.remove(i);
+            let login = pending.login.take();
             self.settle(&pending, &result);
+            // A sign-in is saved only after the camera accepted it.
+            if let (Some(login), Ok(_), Some(target)) = (login, &result, &pending.target) {
+                let target = self.login_target(target);
+                self.save_sign_in(&target, login);
+            }
         }
     }
 
@@ -1802,8 +1829,15 @@ impl Workbench {
         self.result_stage(pending, result);
         self.result_inspector(pending, result);
         self.dataset_settled(pending, result);
+        let asks_sign_in = pending.job == Job::Connect
+            && result
+                .as_ref()
+                .err()
+                .is_some_and(crate::logins::is_auth_error);
         let notice = if pending.batch {
             self.batch_result(&pending.job, result)
+        } else if asks_sign_in {
+            None
         } else {
             command_notice(&pending.job, result)
         };
@@ -1857,6 +1891,14 @@ impl Workbench {
         let Some(target) = &pending.target else {
             return;
         };
+        if pending.job == Job::Connect
+            && self
+                .sign_in
+                .as_ref()
+                .is_some_and(|sheet| sheet.target == self.login_target(target))
+        {
+            self.sign_in = None;
+        }
         self.side.connect_failures.remove(target);
         if self.address.trim() == target {
             self.address.clear();
@@ -1901,6 +1943,20 @@ impl Workbench {
             self.inspect
                 .write_errors
                 .insert(feature.to_owned(), full.clone());
+        }
+        if pending.job == Job::Connect
+            && let Some(code @ ("auth_required" | "auth_rejected")) =
+                crate::types::error_transport_code(error)
+        {
+            // The sheet asks instead of a red failure on the card.
+            self.sign_in_needed(pending, code);
+            return;
+        }
+        if pending.job == Job::Connect
+            && let Some(sheet) = &mut self.sign_in
+            && pending.target.as_deref() == Some(sheet.target.as_str())
+        {
+            sheet.pending = false;
         }
         if let Some(target) = &pending.target {
             self.side.connect_failed(target, full, self.now);
@@ -1972,11 +2028,22 @@ impl Workbench {
         self.tick_inspector();
         self.tick_analytics();
         self.tick_video_analytics();
+        self.tick_sign_in();
         self.save_prefs();
+        let sign_in = if self
+            .sign_in
+            .as_mut()
+            .is_some_and(|sheet| std::mem::take(&mut sheet.focus))
+        {
+            self.focus_sign_in()
+        } else {
+            Task::none()
+        };
         Task::batch([
             pages,
             self.thumb_task(),
             self.next_number_task(),
+            sign_in,
             self.screenshot_tick(),
             // An unseen window may still draw.
             if self.sight_unknown() {
@@ -2210,27 +2277,63 @@ impl Workbench {
     }
 
     fn connect(&mut self, camera: String) {
+        self.connect_with(camera, None, false);
+    }
+
+    /// Connect, with a sign-in given beside the address. Credentials typed
+    /// into the address are split out first and sent once, never
+    /// remembered: the address field, history, failures and recents only
+    /// ever hold the credential-free address.
+    fn connect_with(
+        &mut self,
+        camera: String,
+        login: Option<crate::logins::CameraLogin>,
+        remember: bool,
+    ) {
+        let typed = camera;
+        let (camera, inline) = match crate::logins::split_userinfo(&typed) {
+            Ok(split) => split,
+            Err(error) => {
+                let camera = crate::logins::strip_userinfo(&typed);
+                if self.address.trim() == typed.trim() {
+                    self.address = camera.clone();
+                }
+                self.side
+                    .connect_failed(&camera, format!("{error:#}"), self.now);
+                return;
+            }
+        };
+        if inline.is_some() && self.address.trim() == typed.trim() {
+            self.address = camera.clone();
+        }
+        drop(typed);
+        let remember = remember && login.is_some();
+        let login = login.or(inline);
         self.side.connect_failures.remove(&camera);
+        let saved = remember.then(|| login.clone()).flatten();
+        let sent_login = login.is_some();
         let command = SessionCommand::Connect {
             camera: camera.clone(),
             timeout_ms: 5000,
+            login,
+            saved_login: true,
         };
         if let Err(error) = command.validate() {
             self.side
                 .connect_failed(&camera, format!("{error:#}"), self.now);
+            if let Some(sheet) = &mut self.sign_in {
+                sheet.pending = false;
+            }
             return;
         }
-        if let Some(pending) = self.submit(
-            None,
-            Job::Connect,
-            SessionCommand::Connect {
-                camera: camera.clone(),
-                timeout_ms: 5000,
-            },
-        ) {
+        if let Some(pending) = self.submit(None, Job::Connect, command) {
             pending.target = Some(camera);
+            pending.sent_login = sent_login;
+            pending.login = saved;
             self.edits.clear();
             self.edit_sources.clear();
+        } else if let Some(sheet) = &mut self.sign_in {
+            sheet.pending = false;
         }
     }
 
@@ -3045,6 +3148,9 @@ impl Workbench {
                 if open && !self.settings_open && self.sheet_open() {
                     return Task::none();
                 }
+                if open {
+                    self.load_saved_logins();
+                }
                 self.assistant.settings.set_visible(open);
                 if open && self.video_analytics.keys_section_open() {
                     self.video_analytics.refresh_credentials();
@@ -3245,7 +3351,17 @@ impl Workbench {
                 self.connect(self.free_simulator());
             }
             Message::EnterAddress => return self.enter_address(),
-            Message::Forget(target) => self.recent.retain(|recent| recent.target != target),
+            Message::Forget(target) => {
+                if let Some(key) = self
+                    .saved_login_user(&target)
+                    .and_then(|_| crate::logins::key(&self.login_target(&target)).ok())
+                {
+                    self.forget_sign_in(key.address);
+                }
+                self.recent.retain(|recent| recent.target != target);
+            }
+            Message::ForgetSignIn(address) => self.forget_sign_in(address),
+            Message::SignIn(input) => return self.sign_in_input(input),
             Message::CameraRow(id) => {
                 if self.snapshot.cameras.iter().any(|c| c.info.id == id) {
                     self.show_camera(Some(id));
@@ -3696,6 +3812,7 @@ impl Workbench {
             }
             Action::Undo => return self.replay_history(true),
             Action::Redo => return self.replay_history(false),
+            Action::Overview if self.sign_in.is_some() => self.sign_in = None,
             Action::Overview if self.help_open => self.help_open = false,
             Action::Overview if self.assistant.quick.open => {
                 return self.update_assistant(assistant::Input::Quick(
