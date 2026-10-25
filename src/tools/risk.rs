@@ -41,21 +41,27 @@ const MANAGED_CATEGORIES: [&str; 3] = [
 
 /// Features that change only how the image looks, frames or is sized:
 /// undo restores them, so tools treat writing them as Reversible.
-const IMAGE_QUALITY: [&str; 30] = [
+const IMAGE_QUALITY: [&str; 36] = [
     "ExposureTime",
     "ExposureTimeAbs",
+    "ExposureTimeRaw",
     "ExposureAuto",
     "Gain",
     "GainAbs",
+    "GainRaw",
     "GainAuto",
     "GainSelector",
     "BlackLevel",
+    "BlackLevelRaw",
     "Gamma",
     "BalanceRatio",
     "BalanceRatioSelector",
     "BalanceWhiteAuto",
     "AcquisitionFrameRate",
+    "AcquisitionFrameRateAbs",
     "AcquisitionFrameRateEnable",
+    "AcquisitionFrameRateEnabled",
+    "AcquisitionFrameRateMode",
     "LensPosition",
     "Width",
     "Height",
@@ -190,6 +196,9 @@ mod tests {
             "ZoomLevel",
             "IrisAperture",
             "AcquisitionFrameRateEnable",
+            "GainRaw",
+            "AcquisitionFrameRateAbs",
+            "AcquisitionFrameRateMode",
             "VideoMode",
             "Contrast",
         ] {

@@ -748,19 +748,22 @@ fn list_jobs(ctx: &Context, args: ListJobsArgs, origin: Origin) -> Result<Value,
 
 /// Imaging controls `get_camera_features` returns when asked for none in
 /// particular, by exact name.
-const CURATED: [&str; 32] = [
+const CURATED: [&str; 39] = [
     "ExposureAuto",
     "ExposureTime",
     "ExposureTimeAbs",
+    "ExposureTimeRaw",
     "GainAuto",
     "Gain",
     "GainAbs",
+    "GainRaw",
     "GainSelector",
     "BalanceWhiteAuto",
     "BalanceRatioSelector",
     "BalanceRatio",
     "Gamma",
     "BlackLevel",
+    "BlackLevelRaw",
     "PixelFormat",
     "Width",
     "Height",
@@ -769,8 +772,12 @@ const CURATED: [&str; 32] = [
     "WidthMax",
     "HeightMax",
     "AcquisitionFrameRate",
+    "AcquisitionFrameRateAbs",
     "AcquisitionFrameRateEnable",
+    "AcquisitionFrameRateEnabled",
+    "AcquisitionFrameRateMode",
     "ResultingFrameRate",
+    "ResultingFrameRateAbs",
     "TriggerMode",
     "TriggerSource",
     "TriggerSelector",
@@ -1730,6 +1737,21 @@ mod preflight_tests {
 
     fn wait(camera: Option<&str>, until: &str) -> Value {
         json!({"camera":camera,"until":until,"timeout":"1s","frames":null,"job_id":null})
+    }
+
+    #[test]
+    fn curated_view_includes_legacy_vendor_controls_that_are_reversible() {
+        for name in [
+            "GainRaw",
+            "ExposureTimeRaw",
+            "BlackLevelRaw",
+            "AcquisitionFrameRateAbs",
+            "AcquisitionFrameRateEnabled",
+            "AcquisitionFrameRateMode",
+        ] {
+            assert!(curated(name) && risk::image_quality(name), "{name}");
+        }
+        assert!(curated("ResultingFrameRateAbs"));
     }
 
     #[test]
