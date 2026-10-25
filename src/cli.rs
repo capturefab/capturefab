@@ -615,7 +615,7 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::hubs::command::HubCommand,
     },
-    /// List mounted external, removable and network volumes
+    /// List mounted, writable external, removable and network volumes
     Volumes,
     /// Manage CPU and camera-buffer limits; show current resource headroom
     Resources {

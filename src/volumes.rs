@@ -36,7 +36,7 @@ const NETWORK: [&str; 10] = [
     "9p",
 ];
 
-/// Mounted external, removable and network volumes, by name.
+/// Mounted, writable external, removable and network volumes, by name.
 pub fn list() -> Vec<Volume> {
     let mut volumes = platform();
     volumes.sort_by_key(|v| v.name.to_lowercase());
@@ -51,13 +51,8 @@ fn platform() -> Vec<Volume> {
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default();
-    let kind_of = |path: &Path| -> &'static str {
-        let needle = format!(" on {} (", path.display());
-        types
-            .lines()
-            .find(|line| line.contains(&needle))
-            .and_then(|line| line.split(&needle).nth(1))
-            .and_then(|rest| rest.split([',', ')']).next())
+    let kind_of = |line: Option<&str>| -> &'static str {
+        line.and_then(|options| options.split([',', ')']).next())
             .map_or("removable", |fs| {
                 if NETWORK.contains(&fs.trim()) {
                     "network"
@@ -77,16 +72,54 @@ fn platform() -> Vec<Volume> {
             if std::fs::canonicalize(&path).ok()? == Path::new("/") || !mounted(&path) {
                 return None;
             }
+            // Mounted disk images, Capturefab's own among them, and
+            // write-locked cards are read-only: no destination can live there.
+            let line = mount_line(&types, &path);
+            if line.is_some_and(read_only) {
+                return None;
+            }
             let (total_bytes, free_bytes) = space(&path);
             Some(Volume {
                 name: entry.file_name().to_string_lossy().into_owned(),
-                kind: kind_of(&path),
+                kind: kind_of(line),
                 path,
                 total_bytes,
                 free_bytes,
             })
         })
         .collect()
+}
+
+/// The options of `path`'s line in macOS `mount` output, after the opening
+/// parenthesis: `hfs, local, nodev, nosuid, read-only, ...)`.
+#[cfg(any(target_os = "macos", test))]
+fn mount_line<'a>(types: &'a str, path: &Path) -> Option<&'a str> {
+    let needle = format!(" on {} (", path.display());
+    types
+        .lines()
+        .find(|line| line.contains(&needle))
+        .and_then(|line| line.split(&needle).nth(1))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn read_only(options: &str) -> bool {
+    options.split(')').next().is_some_and(|options| {
+        options
+            .split(',')
+            .any(|option| option.trim() == "read-only")
+    })
+}
+
+/// Whether this executable runs from a mounted Capturefab disk image or a
+/// translocated copy, whose path stops working once the image is ejected.
+pub fn disk_image_install(exe: &Path) -> bool {
+    let path = exe.to_string_lossy();
+    cfg!(target_os = "macos") && in_disk_image(&path)
+}
+
+fn in_disk_image(path: &str) -> bool {
+    (path.starts_with("/Volumes/") && path.contains("/Capturefab.app/Contents/MacOS/"))
+        || path.contains("/AppTranslocation/")
 }
 
 /// Decode the octal escapes /proc/self/mounts uses for spaces and tabs.
@@ -462,6 +495,45 @@ mod tests {
                 Some(PathBuf::from("/media/ana/USB"))
             );
         }
+    }
+
+    #[test]
+    fn read_only_mounts_are_recognized() {
+        let table = "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n\
+            /dev/disk40s1 on /Volumes/Capturefab 0.5.0 (hfs, local, nodev, nosuid, read-only, noowners, quarantine, mounted by ana)\n\
+            /dev/disk41s1 on /Volumes/CARD (exfat, local, nodev, nosuid, noowners, mounted by ana)\n\
+            //ana@nas/share on /Volumes/share (smbfs, nodev, nosuid, mounted by ana)\n";
+        let image = mount_line(table, Path::new("/Volumes/Capturefab 0.5.0")).unwrap();
+        assert!(read_only(image));
+        let card = mount_line(table, Path::new("/Volumes/CARD")).unwrap();
+        assert!(!read_only(card));
+        assert!(card.starts_with("exfat"));
+        assert!(!read_only(
+            mount_line(table, Path::new("/Volumes/share")).unwrap()
+        ));
+        assert_eq!(mount_line(table, Path::new("/Volumes/Other")), None);
+        // An option list ends at its parenthesis; a later name never counts.
+        assert!(!read_only("hfs, local) read-only"));
+    }
+
+    #[test]
+    fn disk_image_installs_are_recognized() {
+        assert!(in_disk_image(
+            "/Volumes/Capturefab 0.5.0/Capturefab.app/Contents/MacOS/capturefab"
+        ));
+        assert!(in_disk_image(
+            "/private/var/folders/x/T/AppTranslocation/1A2B/d/Capturefab.app/Contents/MacOS/capturefab"
+        ));
+        assert!(!in_disk_image(
+            "/Applications/Capturefab.app/Contents/MacOS/capturefab"
+        ));
+        assert!(!in_disk_image("/Volumes/SSD/bin/capturefab"));
+        assert_eq!(
+            disk_image_install(Path::new(
+                "/Volumes/Capturefab 0.5.0/Capturefab.app/Contents/MacOS/capturefab"
+            )),
+            cfg!(target_os = "macos")
+        );
     }
 
     #[test]

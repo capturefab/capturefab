@@ -273,6 +273,15 @@ impl Workbench {
                 "welcome" => self.scene.welcome = true,
                 "side-hub" => self.scene.hubs = true,
                 "help" => self.help_open = true,
+                "agents" => self.show_agent_setup(true),
+                "from-disk-image" => {
+                    self.assistant.commands.from_disk_image = true;
+                    self.scene_notice(Some((
+                        agents::DISK_IMAGE_NOTICE.into(),
+                        Some(agents::DISK_IMAGE_DETAIL.into()),
+                        Level::Warning,
+                    )));
+                }
                 "analytics" => self.analytics.open = true,
                 "capture" | "forward" | "video" => {
                     self.tab = if *word == "capture" {
@@ -1016,6 +1025,17 @@ mod tests {
             bench.notice.as_ref().map(|n| n.text.as_str()),
             Some("Could not set Exposure Time: 5 is below the minimum of 10")
         );
+    }
+
+    #[test]
+    fn disk_image_scene_warns_and_marks_the_agent_commands() {
+        let mut bench = bench();
+        bench.apply_scene(&["from-disk-image", "agents"]);
+        let notice = bench.notice.clone().expect("a notice");
+        assert_eq!(notice.level, Level::Warning);
+        assert_eq!(notice.text, agents::DISK_IMAGE_NOTICE);
+        assert!(bench.assistant.commands.from_disk_image);
+        assert!(bench.sheets.agents);
     }
 
     #[test]

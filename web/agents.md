@@ -17,7 +17,7 @@ Your harness supplies model access; Capturefab provider credentials are unnecess
 The [built-in assistant](#use-the-ai-assistant) uses separate provider settings.
 Your harness controls whether its model receives camera images and tool results.
 
-1. Make the installed executable available to the harness through `PATH` or its full path.
+1. Make the installed executable available to the harness through `PATH` or its full path. On macOS the installed executable is /Applications/Capturefab.app/Contents/MacOS/capturefab.
 2. Examine the build and read the compact tool catalog.
 3. Read only the schemas for the tools your task uses.
 
@@ -1102,7 +1102,7 @@ An existing server such as MediaMTX can provide HLS from a forwarded stream.
 
 ## Save to saved folders
 
-A destination is a folder on the user's disk, a removable drive or a mounted network drive. With `--destination NAME`, `-o` is a relative name inside it. A missing external drive is exit code 3. Removing a saved destination leaves its files in place.
+A destination is a folder on the user's disk, a removable drive or a mounted network drive. With `--destination NAME`, `-o` is a relative name inside it. A missing external drive is exit code 3. Removing a saved destination leaves its files in place. `volumes` omits read-only volumes, such as mounted disk images.
 
 ```sh
 capturefab volumes --json

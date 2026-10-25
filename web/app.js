@@ -97,7 +97,8 @@
     armOneclick(selected);
     if ($('install-hint')) {
       const instructions = {
-        macos: 'Extract the ZIP file. Move Capturefab.app to Applications. Open Capturefab.app.',
+        // Releases from 0.5.0 ship a disk image; earlier ones a ZIP.
+        macos: /\.dmg$/i.test(selected.name) ? 'Open the downloaded .dmg file. Drag Capturefab to the Applications folder. Open Capturefab from Applications, then eject the disk image.' : 'Extract the ZIP file. Move Capturefab.app to Applications. Open Capturefab.app.',
         windows: 'Extract all files from the ZIP archive. Open capturefab.exe from the extracted folder, or run .\\capturefab.exe --help in PowerShell for the CLI.',
         linux: 'Extract the .tar.gz archive. From the extracted folder, run ./capturefab to open the desktop app, or ./capturefab --help for CLI options. On a computer with no display it lists the CLI commands.'
       };

@@ -48,7 +48,7 @@ PAGE = '''<!doctype html>
         <h1 id="downloads-title">All downloads</h1>
         <p class="lead">Every app download includes the desktop app and the CLI. Latest release: {status}.</p>
         <p>Choose your operating system and processor. ARM64 is for Apple silicon and 64-bit ARM systems. x64 is for Intel or AMD systems.</p>
-        <p>Compare the file's SHA-256 with the value below. Extract the archive before you open the app.</p>
+        <p>Compare the file's SHA-256 with the value below. On macOS, open the .dmg and drag Capturefab to Applications, or extract the .zip for earlier releases. On Windows and Linux, extract the archive before you open the app.</p>
         <p>Read the <a href="docs.html#installation">installation instructions</a> for system requirements, command-line setup and use without a display.</p>
       </section>
 {body}    </main>

@@ -22,7 +22,14 @@ impl Workbench {
 }
 
 impl Host {
-    pub(super) fn new(bench: Workbench) -> Self {
+    pub(super) fn new(mut bench: Workbench) -> Self {
+        if bench.assistant.commands.from_disk_image {
+            bench.put_notice(
+                agents::DISK_IMAGE_NOTICE.into(),
+                Some(agents::DISK_IMAGE_DETAIL.into()),
+                notice::Level::Warning,
+            );
+        }
         let focused = bench.main_window;
         Self {
             shared: bench.prefs().shared(),

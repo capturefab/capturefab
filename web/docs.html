@@ -152,22 +152,22 @@ capturefab --session line1 dataset export -o exports/shift-b --format csv</code>
           <p>Existing owned capture files remain subject to the storage budget. Retain backups of files and configuration when changing a production installation.</p>
         </article>
 
-        <article class="doc-section" id="installation" data-doc-section data-doc-title="Install and verify a release" data-doc-category="Start here" data-doc-tags="install,download,linux,macos,windows,arm64,checksum,headless">
+        <article class="doc-section" id="installation" data-doc-section data-doc-title="Install and verify a release" data-doc-category="Start here" data-doc-tags="install,download,linux,macos,windows,arm64,checksum,headless,dmg,disk image">
           <p class="eyebrow">Start here</p><h2>Install and verify a release</h2>
           <p class="doc-summary">Every download includes the app and the command-line interface (CLI). On a computer without a display, the same executable works as a CLI.</p>
           <p>For an existing installation, read the <a href="#upgrade-040">version 0.4.0 upgrade notes</a> before replacing the executable.</p>
           <p>The <a href="downloads.html">download page</a> lists release files and their SHA-256 checksums. Select the build for your installed operating system and processor architecture. Apple silicon uses ARM64. Intel and AMD PCs usually use x64. On Raspberry Pi and Jetson, a 64-bit processor can have a 32-bit operating system.</p>
           <div class="table-scroll"><table><caption>Verify the downloaded file</caption><thead><tr><th scope="col">System</th><th scope="col">Command</th></tr></thead><tbody><tr><td>Linux</td><td><code>sha256sum DOWNLOADED_FILE</code></td></tr><tr><td>macOS</td><td><code>shasum -a 256 DOWNLOADED_FILE</code></td></tr><tr><td>Windows PowerShell</td><td><code>Get-FileHash DOWNLOADED_FILE -Algorithm SHA256</code></td></tr></tbody></table></div>
-          <p>Compare the result with the checksum for the same release file. Then extract the archive. Keep the included license files with the application.</p>
-          <div class="table-scroll"><table><caption>Open the extracted download</caption><thead><tr><th scope="col">System</th><th scope="col">Steps</th></tr></thead><tbody>
-            <tr><td>macOS</td><td>Extract the <code>.zip</code> file. Open <code>Capturefab.app</code> from the extracted folder. For the CLI, run <code>./capturefab --help</code> from that folder. Keep this launcher beside the app.</td></tr>
+          <p>Compare the result with the checksum for the same release file. Then open the disk image (macOS) or extract the archive (Windows, Linux). Keep the included license files with the application; on macOS they are inside <code>Capturefab.app/Contents/Resources/licenses</code>.</p>
+          <div class="table-scroll"><table><caption>Install the download</caption><thead><tr><th scope="col">System</th><th scope="col">Steps</th></tr></thead><tbody>
+            <tr><td>macOS</td><td>Open the <code>.dmg</code> file and drag <code>Capturefab.app</code> to Applications. Open it from Applications, then eject the disk image. Releases before 0.5.0 were a <code>.zip</code> with a <code>./capturefab</code> launcher: extract it and move <code>Capturefab.app</code> to Applications.</td></tr>
             <tr><td>Windows</td><td>Extract the <code>.zip</code> file. Open <code>capturefab.exe</code> from the extracted folder. In PowerShell, run <code>.\capturefab.exe</code> from that folder.</td></tr>
             <tr><td>Linux</td><td>Extract the <code>.tar.gz</code> file. Open a terminal in the extracted folder. Run <code>./capturefab</code>. If necessary, set executable permission with <code>chmod +x ./capturefab</code>.</td></tr>
           </tbody></table></div>
-          <p>The extracted executable also provides the CLI. Add its directory to <code>PATH</code> to use the shorter commands in these guides.</p>
+          <p>The extracted executable also provides the CLI. Add its directory to <code>PATH</code> to use the shorter commands in these guides. On macOS, add <code>export PATH="/Applications/Capturefab.app/Contents/MacOS:$PATH"</code> to <code>~/.zprofile</code>.</p>
           <p>Without a display, running the executable with no subcommand prints CLI help. This includes SSH sessions on Linux. Use an explicit subcommand such as <code>doctor --json</code> or <code>serve</code>.</p>
           <p>To run <code>serve</code> as a Linux service, follow the <a href="https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md">line computer guide</a>. It covers Raspberry Pi, Jetson, industrial PCs and access from a laptop browser.</p>
-          <p>After moving the macOS app to Applications, use <code>/Applications/Capturefab.app/Contents/MacOS/capturefab</code> as the executable path. Run your harness under the same operating-system account as the local session.</p>
+          <p>After moving the macOS app to Applications, use <code>/Applications/Capturefab.app/Contents/MacOS/capturefab</code> as the executable path. A copy run straight from the mounted disk image has a <code>/Volumes</code> path that stops working when you eject it. Run your harness under the same operating-system account as the local session.</p>
           <div class="table-scroll"><table><caption>Minimum operating system versions</caption><thead><tr><th scope="col">Build</th><th scope="col">Minimum requirement</th></tr></thead><tbody>
             <tr><td>macOS ARM64</td><td>macOS 11.0</td></tr>
             <tr><td>macOS x64</td><td>macOS 10.15</td></tr>

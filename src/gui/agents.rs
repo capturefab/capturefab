@@ -34,7 +34,14 @@ pub(super) struct CommandContext {
     binary: Option<String>,
     session_directory: Option<String>,
     windows: bool,
+    /// The executable lives on a mounted disk image or a translocated copy,
+    /// so the commands below stop working once the image is ejected.
+    pub(super) from_disk_image: bool,
 }
+
+pub(super) const DISK_IMAGE_NOTICE: &str = "Capturefab is running from the disk image";
+pub(super) const DISK_IMAGE_DETAIL: &str =
+    "Drag it to Applications so the agent briefing and terminal path keep working after you eject.";
 
 pub(super) struct PlanPreview {
     pub(super) command: String,
@@ -44,11 +51,18 @@ pub(super) struct PlanPreview {
 
 impl Default for CommandContext {
     fn default() -> Self {
-        Self::capture(
-            std::env::current_exe().ok(),
-            std::env::var_os("CAPTUREFAB_SESSION_DIR").map(PathBuf::from),
-            cfg!(target_os = "windows"),
-        )
+        let exe = std::env::current_exe().ok();
+        let from_disk_image = exe
+            .as_deref()
+            .is_some_and(crate::volumes::disk_image_install);
+        Self {
+            from_disk_image,
+            ..Self::capture(
+                exe,
+                std::env::var_os("CAPTUREFAB_SESSION_DIR").map(PathBuf::from),
+                cfg!(target_os = "windows"),
+            )
+        }
     }
 }
 
@@ -69,6 +83,7 @@ impl CommandContext {
             binary,
             session_directory: session_directory.flatten(),
             windows,
+            from_disk_image: false,
         }
     }
     pub(super) fn prefix(&self, session: &str) -> Option<String> {
@@ -149,6 +164,7 @@ impl CommandContext {
             binary: binary.map(str::to_owned),
             session_directory: directory.map(str::to_owned),
             windows,
+            from_disk_image: false,
         }
     }
 }
@@ -207,9 +223,18 @@ impl Workbench {
                 .color(p.secondary)
                 .wrapping(text::Wrapping::WordOrGlyph)
         };
-        let mut body = column![
+        let mut body = column![];
+        if commands.from_disk_image {
+            body = body.push(
+                text(format!("{DISK_IMAGE_NOTICE}. {DISK_IMAGE_DETAIL}"))
+                    .size(style::BODY)
+                    .color(p.warn)
+                    .wrapping(text::Wrapping::WordOrGlyph),
+            );
+        }
+        let main: Vec<Element<'_, Message>> = vec![
             heading("Give your agent this workbench", p),
-            description("Use Claude Code, Codex, Antigravity or another harness that can run local commands. Your harness supplies its own model connection; no Capturefab API key is needed."),
+            description("Use Claude Code, Codex, Antigravity or another harness that can run local commands. Your harness supplies its own model connection; no Capturefab API key is needed.").into(),
             container(
                 column![
                     text(format!("Session: {}", self.session))
@@ -228,13 +253,14 @@ impl Workbench {
                     .padding([8, 12])
                     .on_press(Message::Copy(brief)),
                 ].spacing(10)
-            ).padding(14).width(Fill).style(style::well),
+            ).padding(14).width(Fill).style(style::well).into(),
             heading("Check the connection", p),
-            description("Run this in a terminal on the same computer and under the same user account. Keep this window open. Commands use the running application even when capturefab is not on PATH."),
+            description("Run this in a terminal on the same computer and under the same user account. Keep this window open. Commands use the running application even when capturefab is not on PATH.").into(),
             self.copyable(format!("{prefix} status --json"), p),
             text(format!("Commands are for {}.", commands.shell_name()))
-                .size(style::SMALL).color(p.secondary),
-        ].spacing(14);
+                .size(style::SMALL).color(p.secondary).into(),
+        ];
+        let mut body = body.extend(main).spacing(14);
         if commands.session_directory.is_some() {
             body = body.push(
                 text("Commands include this app's custom CAPTUREFAB_SESSION_DIR.")
