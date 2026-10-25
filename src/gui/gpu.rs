@@ -30,7 +30,8 @@ struct Uniforms {
     shift: i32,
     cfa: vec4<i32>,
     // x: the target is sRGB, so output linear light.
-    // y: texels in a row of folded packed RGB/BGR.
+    // y: texels in a row of a folded frame. z: bytes in a row of the frame.
+    // w: how a folded frame packs its samples: 1 PFNC lsb, 2 GigE Vision.
     flags: vec4<i32>,
 };
 
@@ -72,8 +73,41 @@ fn vs(@builtin(vertex_index) index: u32) -> Varyings {
     return out;
 }
 
+// Four bytes of a folded frame from byte `at`, the first in the low bits:
+// the frame's bytes in order, four to a texel, folded into rows of u.flags.y
+// texels.
+fn bytes(at: i32) -> u32 {
+    let fold = u.flags.y;
+    let word = at >> 2;
+    let next = min(word + 1, (u.flags.z * u.size.y - 1) >> 2);
+    let a = textureLoad(frame, vec2<i32>(word % fold, word / fold), 0);
+    let b = textureLoad(frame, vec2<i32>(next % fold, next / fold), 0);
+    let low = a.r | (a.g << 8u) | (a.b << 16u) | (a.a << 24u);
+    let high = b.r | (b.g << 8u) | (b.b << 16u) | (b.a << 24u);
+    let i = u32(at & 3) * 8u;
+    return select((low >> i) | (high << (32u - i)), low, i == 0u);
+}
+
+// The sample at p shifted to 8 bits and clamped: one texel, or unpacked from
+// a folded frame's row of u.shift + 8 bit samples.
 fn texel(p: vec2<i32>) -> u32 {
-    return textureLoad(frame, p, 0).r;
+    var t = 0u;
+    if (u.flags.w == 0) {
+        t = textureLoad(frame, p, 0).r;
+    } else if (u.flags.w == 1) {
+        let bits = u.shift + 8;
+        let bit = p.x * bits;
+        t = (bytes(p.y * u.flags.z + (bit >> 3u)) >> u32(bit & 7)) & ((1u << u32(bits)) - 1u);
+    } else {
+        // Two samples in three bytes: their high bits outside, low ones in
+        // the middle byte, the first sample's in its low nibble.
+        let b = bytes(p.y * u.flags.z + (p.x >> 1u) * 3);
+        let odd = (p.x & 1) == 1;
+        let high = select(b, b >> 16u, odd) & 0xffu;
+        let low = select(b >> 8u, b >> 12u, odd) & ((1u << u32(u.shift)) - 1u);
+        t = (high << u32(u.shift)) | low;
+    }
+    return min(t >> u32(u.shift), 255u);
 }
 
 fn cfa(p: vec2<i32>) -> i32 {
@@ -84,31 +118,43 @@ fn channel(c: i32) -> vec3<u32> {
     return select(vec3<u32>(0u), vec3<u32>(1u), vec3<bool>(c == 0, c == 1, c == 2));
 }
 
-// The three bytes of packed pixel p: the frame's bytes in order, four to a
-// texel, folded into rows of u.flags.y texels.
-fn packed(p: vec2<i32>) -> vec3<u32> {
-    let at = (p.y * u.size.x + p.x) * 3;
-    let fold = u.flags.y;
-    let word = at >> 2;
-    let next = min(word + 1, (u.size.x * u.size.y * 3 - 1) >> 2);
-    let a = textureLoad(frame, vec2<i32>(word % fold, word / fold), 0);
-    let b = textureLoad(frame, vec2<i32>(next % fold, next / fold), 0);
-    var bytes = array<u32, 8>(a.r, a.g, a.b, a.a, b.r, b.g, b.b, b.a);
-    let i = at & 3;
-    return vec3<u32>(bytes[i], bytes[i + 1], bytes[i + 2]);
+// Full-range BT.601 Y'CbCr 4:2:2 in 16-bit fixed point, as frame::ycbcr;
+// an odd last pixel has no Cr and takes it as neutral.
+fn yuv(p: vec2<i32>) -> vec3<u32> {
+    let b = bytes(p.y * u.flags.z + (p.x & ~1) * 2);
+    // Bit offsets of the first luma, Cb, the second luma and Cr.
+    let at = select(vec4<u32>(8u, 0u, 24u, 16u), vec4<u32>(0u, 8u, 16u, 24u), u.kind == 6);
+    let y = i32((b >> select(at.x, at.z, (p.x & 1) == 1)) & 0xffu);
+    let cb = i32((b >> at.y) & 0xffu) - 128;
+    let cr = select(i32((b >> at.w) & 0xffu), 128, (p.x | 1) >= u.size.x) - 128;
+    let rgb = vec3<i32>(
+        y + ((91881 * cr + 32768) >> 16u),
+        y + ((-22554 * cb - 46802 * cr + 32768) >> 16u),
+        y + ((116130 * cb + 32768) >> 16u),
+    );
+    return vec3<u32>(clamp(rgb, vec3<i32>(0), vec3<i32>(255)));
 }
 
-// Exactly frame::convert for one pixel: unpacked mono is shifted and clamped;
-// packed RGB/BGR is three bytes per pixel; Bayer averages the in-bounds 3x3
-// neighbors of each missing color with truncating integer division.
+// Exactly frame::convert for one pixel: mono samples are shifted and clamped;
+// RGB/BGR is three folded bytes per pixel and RGBa/BGRa one texel; YUV is
+// converted per pair of pixels; Bayer averages the in-bounds 3x3 neighbors of
+// each missing color with truncating integer division.
 fn decode(p: vec2<i32>) -> vec3<u32> {
     if (u.kind == 1 || u.kind == 2) {
-        let a = packed(p);
+        let b = bytes(p.y * u.flags.z + p.x * 3);
+        let a = vec3<u32>(b & 0xffu, (b >> 8u) & 0xffu, (b >> 16u) & 0xffu);
         return select(a.zyx, a, u.kind == 1);
+    }
+    if (u.kind == 4 || u.kind == 5) {
+        let a = textureLoad(frame, p, 0).rgb;
+        return select(a.zyx, a, u.kind == 4);
+    }
+    if (u.kind == 6 || u.kind == 7) {
+        return yuv(p);
     }
     let t = texel(p);
     if (u.kind == 0) {
-        return vec3<u32>(min(t >> u32(u.shift), 255u));
+        return vec3<u32>(t);
     }
     var sum = vec3<u32>(0u);
     var n = vec3<u32>(0u);
@@ -180,13 +226,18 @@ const BAYER: i32 = 3;
 struct Layout {
     format: wgpu::TextureFormat,
     bytes_per_texel: u32,
-    /// Packed RGB/BGR: the frame's bytes in order, four to a texel, folded
-    /// into rows as wide as a texture allows. Any width fits, wider than the
-    /// texture itself, up to four bytes for every texel it can hold.
+    /// The frame's bytes in order, four to a texel, folded into rows as wide
+    /// as a texture allows: RGB/BGR, YUV and packed samples. Any width fits,
+    /// wider than the texture itself, up to four bytes for every texel it
+    /// can hold.
     folded: bool,
+    /// The PFNC code, which gives a folded frame's bytes per row.
+    pixel_format: u32,
     kind: i32,
     shift: i32,
     cfa: [i32; 4],
+    /// How a folded frame packs its samples: 0 not, 1 PFNC lsb, 2 GigE Vision.
+    packing: i32,
 }
 
 impl Layout {
@@ -195,32 +246,69 @@ impl Layout {
             format,
             bytes_per_texel,
             folded: false,
+            pixel_format,
             kind: 0,
             shift,
             cfa: [0; 4],
+            packing: 0,
         };
         // 16-bit texels are read in host byte order; PFNC data is little-endian.
         let wide = |shift| {
             cfg!(target_endian = "little").then(|| gray(wgpu::TextureFormat::R16Uint, 2, shift))
         };
-        let packed = |kind| Self {
+        let folded = |kind| Self {
             folded: true,
             kind,
             ..gray(wgpu::TextureFormat::Rgba8Uint, 4, 0)
+        };
+        let mosaic = |layout: Self| Self {
+            kind: BAYER,
+            cfa: crate::frame::bayer_pattern(pixel_format).map(|c| c as i32),
+            ..layout
         };
         match pixel_format {
             MONO8 | 0x0108_00b1 | 0x0108_00c6 => Some(gray(wgpu::TextureFormat::R8Uint, 1, 0)),
             0x0110_0003 => wide(2),
             0x0110_0005 => wide(4),
+            0x0110_0025 => wide(6),
             0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => wide(8),
-            RGB8 => Some(packed(1)),
-            0x0218_0015 => Some(packed(2)),
-            0x0108_0008..=0x0108_000b => Some(Self {
-                kind: BAYER,
-                cfa: crate::frame::bayer_pattern(pixel_format).map(|c| c as i32),
-                ..gray(wgpu::TextureFormat::R8Uint, 1, 0)
+            RGB8 => Some(folded(1)),
+            0x0218_0015 => Some(folded(2)),
+            0x0220_0016 | 0x0220_0017 => Some(Self {
+                kind: if pixel_format == 0x0220_0016 { 4 } else { 5 },
+                ..gray(wgpu::TextureFormat::Rgba8Uint, 4, 0)
             }),
-            _ => None,
+            0x0210_0032 | 0x0210_003b => Some(folded(6)),
+            0x0210_001f | 0x0210_0043 => Some(folded(7)),
+            0x0108_0008..=0x0108_000b => Some(mosaic(gray(wgpu::TextureFormat::R8Uint, 1, 0))),
+            0x0110_000c..=0x0110_000f => wide(2).map(mosaic),
+            0x0110_0010..=0x0110_0013 => wide(4).map(mosaic),
+            0x0110_002e..=0x0110_0031 => wide(8).map(mosaic),
+            _ => {
+                let (_, bits, packing) = crate::frame::packing(pixel_format)?;
+                let layout = Self {
+                    shift: bits as i32 - 8,
+                    packing: match packing {
+                        crate::frame::Packing::Lsb => 1,
+                        crate::frame::Packing::GigE => 2,
+                    },
+                    ..folded(0)
+                };
+                Some(if crate::frame::is_bayer(pixel_format) {
+                    mosaic(layout)
+                } else {
+                    layout
+                })
+            }
+        }
+    }
+
+    /// Bytes in a texture row of folded bytes, or in a row of texels.
+    fn row(&self, width: u32) -> usize {
+        if self.folded {
+            crate::frame::row_bytes(width, self.pixel_format)
+        } else {
+            width as usize * self.bytes_per_texel as usize
         }
     }
 
@@ -245,8 +333,7 @@ impl Layout {
 
     /// Bytes of a `width` × `height` frame.
     fn bytes(&self, (width, height): (u32, u32)) -> usize {
-        let per_pixel = if self.folded { 3 } else { self.bytes_per_texel };
-        width as usize * height as usize * per_pixel as usize
+        self.row(width) * height as usize
     }
 }
 
@@ -686,8 +773,8 @@ impl shader::Primitive for Primitive {
                 } else {
                     0
                 },
-                0,
-                0,
+                slot.layout.row(slot.size.0) as i32,
+                slot.layout.packing,
             ],
         };
         queue.write_buffer(&slot.uniforms, 0, bytemuck::bytes_of(&uniforms));
@@ -858,22 +945,31 @@ mod tests {
 
     #[test]
     fn layouts_cover_every_cpu_format() {
+        // Every PFNC code of 8 to 32 bits a pixel the CPU decodes, and no other.
+        let sizes = [
+            0x0108, 0x010a, 0x010c, 0x0110, 0x0120, 0x0210, 0x0218, 0x0220,
+        ];
+        for format in sizes
+            .into_iter()
+            .flat_map(|size| (0..=0xff).map(move |id| size << 16 | id))
+        {
+            if cfg!(target_endian = "little") {
+                assert_eq!(
+                    Layout::of(format).is_some(),
+                    crate::frame::convertible(format),
+                    "{format:#x}"
+                );
+            }
+        }
         for format in [
             MONO8,
             RGB8,
-            0x0218_0015,
-            0x0110_0003,
-            0x0110_0005,
-            0x0110_0007,
-            0x0108_0008,
-            0x0108_0009,
-            0x0108_000a,
-            0x0108_000b,
+            0x0110_0025,
+            0x0110_0011,
+            0x010c_0047,
+            0x0210_0032,
         ] {
             assert!(crate::frame::convertible(format), "{format:#x}");
-            if cfg!(target_endian = "little") {
-                assert!(Layout::of(format).is_some(), "{format:#x}");
-            }
         }
         // Packed bytes fold four to a texel into rows as wide as allowed, so
         // 1080p fits a 2048-texel limit and 4K an 8192 one.
@@ -882,10 +978,21 @@ mod tests {
         assert_eq!(packed.extent((1920, 1080), 2048), Some((2048, 760)));
         assert_eq!(packed.extent((3840, 2160), 8192), Some((8192, 760)));
         assert_eq!(packed.extent((3840, 2160), 2048), None);
+        // Packed samples and YUV fold by their own bits a pixel, each row
+        // ending on a whole byte.
+        let mono12p = Layout::of(0x010c_0047).unwrap();
+        assert_eq!((mono12p.row(37), mono12p.bytes((37, 23))), (56, 56 * 23));
+        assert_eq!(mono12p.extent((37, 23), 2048), Some((322, 1)));
+        assert_eq!(
+            Layout::of(0x0210_001f).unwrap().bytes((37, 23)),
+            37 * 2 * 23
+        );
         // Others take a texel a pixel.
         let mono = Layout::of(MONO8).unwrap();
         assert_eq!(mono.extent((2048, 1536), 2048), Some((2048, 1536)));
         assert_eq!(mono.extent((2049, 1536), 2048), None);
+        let rgba = Layout::of(0x0220_0016).unwrap();
+        assert_eq!((rgba.folded, rgba.bytes((37, 23))), (false, 37 * 4 * 23));
         assert_eq!(std::mem::size_of::<Uniforms>(), 64);
     }
 
@@ -929,8 +1036,13 @@ mod tests {
             seed ^= seed << 5;
             seed
         };
+        // Zero bytes a pixel: random bytes, as many as the format takes.
         let mut frame = |pixel_format, (width, height): (u32, u32), bytes_per_pixel, mask| {
-            let samples = (width * height) as usize * if bytes_per_pixel == 3 { 3 } else { 1 };
+            let samples = match bytes_per_pixel {
+                0 => Layout::of(pixel_format).unwrap().bytes((width, height)),
+                3 => (width * height) as usize * 3,
+                _ => (width * height) as usize,
+            };
             let data: Vec<u8> = (0..samples)
                 .flat_map(|_| {
                     let value = noise() & mask;
@@ -960,9 +1072,28 @@ mod tests {
             (0x0108_0009, 1, 0xff),
             (0x0108_000a, 1, 0xff),
             (0x0108_000b, 1, 0xff),
+            (0x0110_0025, 2, 0x3fff),
+            (0x0110_000c, 2, 0x3ff),
+            (0x0110_0011, 2, 0xfff),
+            (0x0110_0031, 2, 0xffff),
+            (0x0220_0016, 0, 0xff),
+            (0x0220_0017, 0, 0xff),
+            (0x0210_001f, 0, 0xff),
+            (0x0210_0032, 0, 0xff),
+            (0x0210_003b, 0, 0xff),
+            (0x0210_0043, 0, 0xff),
+            (0x010a_0046, 0, 0xff),
+            (0x010c_0047, 0, 0xff),
+            (0x010c_0004, 0, 0xff),
+            (0x010c_0006, 0, 0xff),
+            (0x010a_0058, 0, 0xff),
+            (0x010c_0053, 0, 0xff),
+            (0x010c_0026, 0, 0xff),
+            (0x010c_002d, 0, 0xff),
         ];
         // Odd and even sizes exercise the edges of the Bayer neighborhood, row
-        // padding, and packed pixels split across texels.
+        // padding, packed pixels split across texels, and half-filled groups
+        // of packed samples and YUV pairs at the end of a row.
         for size in [(37, 23), (36, 23)] {
             for direct_only in [false, true] {
                 for (pixel_format, bytes, mask) in formats {
@@ -980,12 +1111,19 @@ mod tests {
         // Packed rows wider than a third of the texture limit, folded over
         // several texture rows and a part of one.
         let max = device.limits().max_texture_dimension_2d;
-        for pixel_format in [RGB8, 0x0218_0015] {
-            let wide = frame(pixel_format, (max - 3, 3), 3, 0xff);
+        for (pixel_format, bytes) in [
+            (RGB8, 3),
+            (0x0218_0015, 3),
+            (0x010c_0047, 0),
+            (0x0210_0032, 0),
+        ] {
+            let wide = frame(pixel_format, (max - 3, 3), bytes, 0xff);
             assert!(GpuFrames::default().accepts(&wide));
             let worst = render(&mut pipeline, (&device, &queue), &wide, true);
             assert!(worst <= 1, "{pixel_format:#010x} folded: off by {worst}");
-            assert_eq!(pipeline.slot("test").storage.1, 3);
+            let rows = Layout::of(pixel_format).unwrap().extent((max - 3, 3), max);
+            assert_eq!(pipeline.slot("test").storage.1, rows.unwrap().1);
+            assert!(bytes == 0 || rows.unwrap().1 == 3);
         }
         // Overview tiles shrink color and mono frames to RGB8 and Mono8.
         for (pixel_format, bytes, mask, factor) in [
