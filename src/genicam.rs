@@ -1422,28 +1422,34 @@ impl NodeMap {
         depth: usize,
     ) -> Result<T> {
         let mut vars = BTreeMap::new();
+        let mut expressions = BTreeMap::new();
         for p in &n.props {
             if matches!(p.tag.as_str(), "pVariable" | "Constant" | "Expression") {
                 let name = p
                     .attrs
                     .get("Name")
                     .context("formula variable missing Name")?;
-                let v = if p.tag == "pVariable" {
-                    T::variable(&self.numeric_value(io, &p.text, depth + 1)?)?
-                } else if p.tag == "Constant" {
-                    T::literal(&literal(&p.text)?)?
-                } else {
-                    evaluate(&p.text, &vars)?
-                };
-                vars.insert(name.clone(), v);
+                match p.tag.as_str() {
+                    "pVariable" => {
+                        let value = self.numeric_value(io, &p.text, depth + 1)?;
+                        vars.insert(name.clone(), T::variable(&value)?);
+                    }
+                    "Constant" => {
+                        vars.insert(name.clone(), T::literal(&literal(&p.text)?)?);
+                    }
+                    _ => {
+                        expressions.insert(name.clone(), p.text.clone());
+                    }
+                }
             }
         }
         if let Some((name, value)) = special {
             vars.insert(name.into(), value);
         }
-        evaluate(
+        evaluate_with(
             n.prop(key).ok_or_else(|| anyhow!("node missing {key}"))?,
             &vars,
+            &expressions,
         )
     }
 }
@@ -1985,6 +1991,16 @@ fn comparison<T: PartialOrd>(op: &str, lhs: T, rhs: T) -> bool {
     }
 }
 fn evaluate<T: Operand>(expression: &str, vars: &BTreeMap<String, T>) -> Result<T> {
+    evaluate_with(expression, vars, &BTreeMap::new())
+}
+/// Named `Expression` sub-formulas are evaluated where the formula uses them,
+/// with every variable bound, including a converter's TO or FROM. As the
+/// standard requires, they cannot refer to other sub-formulas.
+fn evaluate_with<T: Operand>(
+    expression: &str,
+    vars: &BTreeMap<String, T>,
+    expressions: &BTreeMap<String, String>,
+) -> Result<T> {
     ensure!(expression.len() <= 16384, "formula exceeds size limit");
     ensure!(
         expression.is_ascii(),
@@ -2058,6 +2074,7 @@ fn evaluate<T: Operand>(expression: &str, vars: &BTreeMap<String, T>) -> Result<
         tokens,
         pos: 0,
         vars,
+        expressions,
         depth: 0,
         skip: 0,
     };
@@ -2073,6 +2090,7 @@ struct Expr<'a, T> {
     tokens: Vec<Token>,
     pos: usize,
     vars: &'a BTreeMap<String, T>,
+    expressions: &'a BTreeMap<String, String>,
     depth: usize,
     /// Nonzero while parsing an operand whose value is discarded: the untaken
     /// branch of `?:` or the short-circuited side of `&&` and `||`. Its syntax
@@ -2118,12 +2136,14 @@ impl<T: Operand> Expr<'_, T> {
                         "wrong number of arguments for formula function {name}"
                     );
                     self.compute(|| T::call(&name, &args))?
+                } else if let Some(&value) = self.vars.get(&n) {
+                    value
+                } else if let Some(text) = self.expressions.get(&n) {
+                    self.compute(|| {
+                        evaluate(text, self.vars).with_context(|| format!("formula expression {n}"))
+                    })?
                 } else {
-                    self.vars
-                        .get(&n)
-                        .copied()
-                        .or_else(|| T::constant(&n))
-                        .ok_or_else(|| anyhow!("unknown formula variable {n}"))?
+                    T::constant(&n).ok_or_else(|| anyhow!("unknown formula variable {n}"))?
                 }
             }
             Token::L => {
@@ -2422,6 +2442,26 @@ mod tests {
         assert_eq!(m.get(&mut io, "Exposure").unwrap(), 100.0);
         assert!(m.get(&mut io, "Loop").is_err());
         assert_eq!(m.bounds(&mut io, "Loop").unwrap(), Bounds::default());
+    }
+    #[test]
+    fn formula_expressions_are_evaluated_where_they_are_used() {
+        let m = map(concat!(
+            "<Float Name='Exposure'><pValue>C</pValue></Float>",
+            "<Converter Name='C'><Expression Name='SCALED'>FROM*1000</Expression><pVariable Name='STEP'>Step</pVariable><Expression Name='BROKEN'>STEP/0</Expression>",
+            "<FormulaTo>SCALED/STEP</FormulaTo><FormulaFrom>TO*STEP/1000</FormulaFrom><pValue>R</pValue></Converter>",
+            "<Integer Name='Step'><Value>4</Value></Integer>",
+            "<IntReg Name='R'><Address>0</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
+            "<IntSwissKnife Name='Half'><Expression Name='HALF'>X/2</Expression><pVariable Name='X'>Step2</pVariable><Formula>HALF*2</Formula></IntSwissKnife>",
+            "<Integer Name='Step2'><Value>7</Value></Integer>",
+            "<IntSwissKnife Name='Nested'><Expression Name='A'>1</Expression><Expression Name='B'>A+1</Expression><Formula>B</Formula></IntSwissKnife>",
+        ));
+        let mut io = Memory::default();
+        m.set(&mut io, "Exposure", "2").unwrap();
+        assert_eq!(io.read_memory(0, 4).unwrap(), 500u32.to_le_bytes());
+        assert_eq!(m.get(&mut io, "Exposure").unwrap(), 2.0);
+        assert_eq!(m.get(&mut io, "Half").unwrap(), 6);
+        let error = format!("{:#}", m.get(&mut io, "Nested").unwrap_err());
+        assert!(error.contains("unknown formula variable A"), "{error}");
     }
     #[test]
     fn formula_fail_closed() {
