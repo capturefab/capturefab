@@ -1281,10 +1281,14 @@ fn parse_local_url(url: &str) -> Result<LocalUrl> {
         scheme.eq_ignore_ascii_case("local"),
         "unsupported XML URL scheme {scheme:?}; camera must expose a Local: XML URL"
     );
+    // An optional ?SchemaVersion=x.y.z query (GenTL URL grammar) or fragment
+    // ends the path, as in an RFC 3986 split.
+    let remainder = remainder.split(['?', '#']).next().unwrap_or_default();
     let mut parts = remainder.rsplitn(3, ';');
     let length = parts.next().context("missing local XML length")?;
     let address = parts.next().context("missing local XML address")?;
     let name = parts.next().context("missing local XML filename")?;
+    let name = name.trim().trim_start_matches('/');
     let parse_hex = |value: &str| -> Result<u64> {
         let value = value.trim();
         let digits = value
@@ -2581,6 +2585,52 @@ mod tests {
     fn local_url_hex_and_memory_ranges() {
         let url = parse_local_url("Local:Camera.xml;0x1000;400").unwrap();
         assert_eq!((url.address, url.length), (4096, 1024));
+        // Real device and GenTL URLs, including the optional SchemaVersion query.
+        for (text, name, address, length) in [
+            (
+                "Local:Basler_Ace_GigE_e7c9b87e_Version_3_3.zip;c0000000;10cca",
+                "Basler_Ace_GigE_e7c9b87e_Version_3_3.zip",
+                0xc000_0000,
+                0x10cca,
+            ),
+            (
+                "Local:Mikrotron_GmbH_MC206xS11_Rev0_00_007.zip;8001000;395C?SchemaVersion=1.1.0",
+                "Mikrotron_GmbH_MC206xS11_Rev0_00_007.zip",
+                0x800_1000,
+                0x395c,
+            ),
+            (
+                "Local:gigepro_1.12.008.00.xml.zip;FFC10000;0000AD5A?SchemaVersion=1.1.0",
+                "gigepro_1.12.008.00.xml.zip",
+                0xffc1_0000,
+                0xad5a,
+            ),
+            (
+                "local:tlguru_system_rev1.xml;F0F00000;3BF?SchemaVersion=1.0.0",
+                "tlguru_system_rev1.xml",
+                0xf0f0_0000,
+                0x3bf,
+            ),
+            (
+                "Local:///C4_2040_GigE_1.0.0.zip;0x8C400904;0x4D30#fragment",
+                "C4_2040_GigE_1.0.0.zip",
+                0x8c40_0904,
+                0x4d30,
+            ),
+            (
+                "Local: guide_gige_test.zip; 10000000; 1a2b",
+                "guide_gige_test.zip",
+                0x1000_0000,
+                0x1a2b,
+            ),
+        ] {
+            let url = parse_local_url(text).unwrap();
+            assert_eq!(
+                (url.name.as_str(), url.address, url.length),
+                (name, address, length),
+                "{text}"
+            );
+        }
         assert!(parse_local_url("http://camera.example/xml").is_err());
         assert!(parse_local_url("Local:a.xml;0;2000000").is_err());
         assert_eq!(memory_range(0x101, 5).unwrap(), (0x100, 8, 1));
