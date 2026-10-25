@@ -576,12 +576,34 @@ impl NodeMap {
         Ok(self.range(io, node, 0))
     }
     fn range(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Bounds {
-        let delegated = matches!(
-            n.kind.as_str(),
-            "Integer" | "Float" | "Converter" | "IntConverter"
-        ) && ["Min", "Max", "Inc", "pMin", "pMax", "pInc"]
-            .iter()
-            .all(|key| n.prop(key).is_none());
+        let specified = |key: &str| n.prop(key).is_some() || n.prop(&format!("p{key}")).is_some();
+        if matches!(n.kind.as_str(), "Integer" | "Float") {
+            // Each restriction not given falls back to the pValue target's.
+            let inner = if ["Min", "Max", "Inc"].into_iter().all(specified) {
+                Bounds::default()
+            } else {
+                self.resolve_value_link(io, n, depth)
+                    .ok()
+                    .flatten()
+                    .and_then(|link| self.node(link, depth + 1).ok())
+                    .map(|inner| self.range(io, inner, depth + 1))
+                    .unwrap_or_default()
+            };
+            let mut bound = |key, inherited| {
+                if specified(key) {
+                    self.property_number(io, n, key, depth).ok().flatten()
+                } else {
+                    inherited
+                }
+            };
+            return Bounds {
+                min: bound("Min", inner.min),
+                max: bound("Max", inner.max),
+                inc: bound("Inc", inner.inc),
+            };
+        }
+        let delegated = matches!(n.kind.as_str(), "Converter" | "IntConverter")
+            && !["Min", "Max", "Inc"].into_iter().any(specified);
         if !delegated {
             let mut own = |key| self.property_number(io, n, key, depth).ok().flatten();
             return Bounds {
@@ -601,9 +623,6 @@ impl NodeMap {
             .and_then(|link| self.node(link, depth + 1).ok())
             .map(|inner| self.range(io, inner, depth + 1))
             .unwrap_or_default();
-        if matches!(n.kind.as_str(), "Integer" | "Float") {
-            return inner;
-        }
         let mut from = |v: Option<f64>| {
             let v = v?;
             if n.kind == "IntConverter" {
@@ -1368,14 +1387,25 @@ impl NodeMap {
                         .transpose()
                 }
             };
-            validate_numeric(
-                name,
-                &n.kind,
-                value,
-                constraint("Min")?,
-                constraint("Max")?,
-                constraint("Inc")?,
-            )?;
+            let (mut min, max, inc) = (constraint("Min")?, constraint("Max")?, constraint("Inc")?);
+            // An increment steps from the effective minimum, which may be
+            // the pValue target's.
+            if min.is_none() && inc.is_some() && matches!(n.kind.as_str(), "Integer" | "Float") {
+                min = self
+                    .range(io, n, depth)
+                    .min
+                    .filter(|v| {
+                        n.kind == "Float" || (v.fract() == 0.0 && v.abs() < (1u64 << 53) as f64)
+                    })
+                    .map(|v| {
+                        if n.kind == "Float" {
+                            json!(v)
+                        } else {
+                            json!(v as i64)
+                        }
+                    });
+            }
+            validate_numeric(name, &n.kind, value, min, max, inc)?;
         }
         if let Some(link) = self.resolve_value_link(io, n, depth)? {
             let translated = if n.kind == "Converter" && self.integer_target(link, depth + 1)? {
@@ -2560,6 +2590,24 @@ mod tests {
         assert_eq!(m.get(&mut io, "Floating").unwrap(), true);
         m.set(&mut io, "Floating", "false").unwrap();
         assert_eq!(m.get(&mut io, "Floating").unwrap(), false);
+    }
+    #[test]
+    fn missing_restrictions_fall_back_to_the_value_target() {
+        let m = map(concat!(
+            "<Integer Name='Width'><pValue>WidthInner</pValue><pMax>WidthMax</pMax><Inc>16</Inc></Integer>",
+            "<Integer Name='WidthInner'><pValue>WidthReg</pValue><Min>8</Min><Max>4096</Max></Integer>",
+            "<Integer Name='WidthMax'><Value>1928</Value></Integer>",
+            "<IntReg Name='WidthReg'><Address>0</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg>",
+        ));
+        let mut io = Memory::default();
+        assert_eq!(
+            m.bounds(&mut io, "Width").unwrap(),
+            bounds(8.0, 1928.0, Some(16.0))
+        );
+        m.set(&mut io, "Width", "24").unwrap();
+        assert_eq!(m.get(&mut io, "Width").unwrap(), 24);
+        assert!(m.set(&mut io, "Width", "32").is_err());
+        assert!(m.set(&mut io, "Width", "1944").is_err());
     }
     #[test]
     fn literal_value_tables_keep_one_value_per_index() {
