@@ -338,6 +338,7 @@ pub(super) fn streaming_camera(frames: u64, lost: u64, fps: f64) -> CameraSnapsh
         forwarding_since_ms: None,
         forwarding_until_ms: None,
         forwarding_progress: None,
+        recording_path: None,
     }
 }
 

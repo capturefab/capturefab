@@ -264,6 +264,7 @@ A directory output continues its `frame-NNNNNN` numbers.
 Read saved names from `result.files` and `result.frames[].file`.
 `frames[].wall_ms` is UTC milliseconds.
 A recording result gives the resolved file in `path` and the start time in `since_ms`.
+While a local recording runs, `status` gives that resolved file in `recording_path`; `forwarding` keeps the requested output.
 Forward replies and active status include an opaque 32-character lowercase hexadecimal `forwarding_id`.
 RPC `{"op":"stop_forward_if","forwarding_id":"ID"}` stops only that instance and refuses a replacement.
 Timed CLI fallback and assistant recording cleanup use that identity. Explicit human stop-forward stops the current recording.

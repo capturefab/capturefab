@@ -718,6 +718,7 @@ fn end_forward(
     }
     s.forwarding = None;
     s.forwarding_id = None;
+    s.recording_path = None;
     s.forwarding_since_ms = None;
     s.forwarding_until_ms = None;
     stopped
@@ -1057,6 +1058,8 @@ fn process_plain(
                 });
                 s.forwarding_since_ms = Some(since_ms);
                 s.forwarding_until_ms = until_ms;
+                // `forwarding` keeps the requested output; this is the file it named.
+                s.recording_path = f_path.clone();
             }
             let mut value =
                 json!({"forwarding":shown,"forwarding_id":forwarding_id,"since_ms":since_ms});
@@ -2870,6 +2873,57 @@ mod tests {
             Some("Recording finished after 1 min 30 s")
         );
         h.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn status_names_the_file_a_recording_template_resolved_to() {
+        // No worker loop runs, so no frame reaches the encoder and FFmpeg
+        // is not needed; naming happens before it would start.
+        let root = temp_dir("recording-path");
+        let h = WorkerHandle::new();
+        let mut camera = None;
+        let mut forwarder = None;
+        let mut auto = None;
+        let mut run =
+            |camera: &mut Option<Camera>, forwarder: &mut Option<(Forwarder, f64)>, command| {
+                process(
+                    &h,
+                    camera,
+                    forwarder,
+                    &mut auto,
+                    &mut Vec::new(),
+                    &mut 1,
+                    &mut false,
+                    command,
+                )
+            };
+        run(
+            &mut camera,
+            &mut forwarder,
+            SessionCommand::Connect {
+                camera: "sim:0".into(),
+                timeout_ms: 100,
+            },
+        )
+        .unwrap();
+        let template = root.join("{camera}-{seq}.mkv");
+        let reply = run(&mut camera, &mut forwarder, timed_forward(&template, None)).unwrap();
+        let path = reply["path"].as_str().unwrap();
+        assert!(!path.contains('{'), "{path}");
+        let snapshot = h.snapshot();
+        assert_eq!(snapshot.recording_path.as_deref(), Some(path));
+        // `forwarding` still says what was asked for.
+        assert_eq!(
+            snapshot.forwarding.as_deref(),
+            Some(template.to_string_lossy().as_ref())
+        );
+        run(&mut camera, &mut forwarder, SessionCommand::StopForward).unwrap();
+        assert_eq!(h.snapshot().recording_path, None);
+        // A network forward names no file.
+        let target = Path::new("udp://127.0.0.1:9");
+        run(&mut camera, &mut forwarder, timed_forward(target, None)).unwrap();
+        assert_eq!(h.snapshot().recording_path, None);
+        run(&mut camera, &mut forwarder, SessionCommand::StopForward).unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
     #[test]

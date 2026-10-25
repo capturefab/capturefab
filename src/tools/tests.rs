@@ -210,6 +210,7 @@ pub(crate) fn camera(info: CameraInfo) -> CameraSnapshot {
         forwarding: None,
         forwarding_id: None,
         forwarding_progress: None,
+        recording_path: None,
         forwarding_since_ms: None,
         forwarding_until_ms: None,
         jobs: Vec::new(),

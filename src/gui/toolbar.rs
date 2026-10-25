@@ -66,7 +66,7 @@ fn shown_base() -> String {
 }
 
 /// `path` with a leading `home` folded to `~`.
-fn fold_home(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+pub(super) fn fold_home(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
     match home
         .filter(|home| !home.as_os_str().is_empty())
         .and_then(|home| path.strip_prefix(home).ok())
@@ -103,6 +103,52 @@ fn recording_clock(now: u64, since: u64, until: Option<u64>) -> String {
         ),
         None => clock_face(now.saturating_sub(since) / 1000),
     }
+}
+
+/// A running recording's progress in a line, "01:24 · 2,520 frames written",
+/// adding what it lost, and whether that line is a warning: frames dropped
+/// or the encoder stalled. A forward to a stream says its frames are "sent"
+/// rather than "written". Counters of another recording are not this one's.
+pub(super) fn recording_stats(
+    now: u64,
+    since: Option<u64>,
+    progress: Option<&crate::session::ForwardingProgress>,
+    forwarding_id: Option<&str>,
+    recording: bool,
+) -> Option<(String, bool)> {
+    let verb = if recording { "written" } else { "sent" };
+    let progress = progress.filter(|progress| Some(progress.id.as_str()) == forwarding_id);
+    let mut parts = Vec::new();
+    if let Some(since) = since {
+        parts.push(clock_face(now.saturating_sub(since) / 1000));
+    }
+    let mut warn = false;
+    if let Some(progress) = progress {
+        // `dropped` includes the frames lost while the encoder was busy.
+        let dropped = progress.dropped.max(progress.late);
+        if progress.stalled {
+            parts.push("Encoder stalled".to_owned());
+            warn = true;
+        } else if dropped > 0 {
+            // Short, so what was lost still fits beside it.
+            parts.push(format!("{} {verb}", grouped(progress.written)));
+        } else {
+            parts.push(format!(
+                "{} {} {verb}",
+                grouped(progress.written),
+                if progress.written == 1 {
+                    "frame"
+                } else {
+                    "frames"
+                }
+            ));
+        }
+        if dropped > 0 {
+            parts.push(format!("{} dropped", grouped(dropped)));
+            warn = true;
+        }
+    }
+    (!parts.is_empty()).then(|| (parts.join(" · "), warn))
 }
 
 /// The tooltip and accessible description of a timed recording's pill: how
@@ -199,6 +245,8 @@ impl Workbench {
                         style::SANS,
                         p.secondary,
                     )
+                    // The dated folder at its end says the most.
+                    .keep_ends()
                     .yield_room(),
                 ]
                 .spacing(6)
@@ -1099,6 +1147,54 @@ impl Workbench {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn recording_stats_say_how_far_it_got_and_what_it_lost() {
+        let progress = |written, dropped, stalled| crate::session::ForwardingProgress {
+            id: "a".into(),
+            accepted: written,
+            written,
+            dropped,
+            late: 0,
+            stalled,
+        };
+        let stats = |progress: &crate::session::ForwardingProgress, id| {
+            recording_stats(85_000, Some(1_000), Some(progress), Some(id), true)
+        };
+        assert_eq!(
+            stats(&progress(2_520, 0, false), "a"),
+            Some(("01:24 \u{b7} 2,520 frames written".into(), false))
+        );
+        assert_eq!(
+            stats(&progress(1, 0, false), "a"),
+            Some(("01:24 \u{b7} 1 frame written".into(), false))
+        );
+        assert_eq!(
+            stats(&progress(2_520, 3, false), "a"),
+            Some(("01:24 \u{b7} 2,520 written \u{b7} 3 dropped".into(), true))
+        );
+        assert_eq!(
+            stats(&progress(10, 0, true), "a"),
+            Some(("01:24 \u{b7} Encoder stalled".into(), true))
+        );
+        // Another recording's counters are not shown as this one's.
+        assert_eq!(
+            stats(&progress(2_520, 3, false), "b"),
+            Some(("01:24".into(), false))
+        );
+        // A forward to a stream sends its frames rather than writing them.
+        assert_eq!(
+            recording_stats(
+                85_000,
+                Some(1_000),
+                Some(&progress(2_490, 0, false)),
+                Some("a"),
+                false
+            ),
+            Some(("01:24 \u{b7} 2,490 frames sent".into(), false))
+        );
+        assert_eq!(recording_stats(0, None, None, None, true), None);
+    }
 
     #[test]
     fn shared_actions_are_announced_with_actor_camera_and_concurrent_work() {

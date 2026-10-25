@@ -566,6 +566,93 @@ enum Num {
     RetentionDays,
 }
 
+/// A template's next {seq}, read for a camera on a day, in the folder of
+/// its named destination when it has one.
+#[derive(Clone, Debug, Default)]
+struct NextNumber {
+    template: String,
+    destination: Option<String>,
+    camera: String,
+    date: String,
+    seq: Option<u32>,
+    /// The saves seen when the read started; a save since makes it stale.
+    generation: u64,
+}
+
+/// Where a template's number is read: the template and its destination.
+type NumberKey = (String, Option<String>);
+
+/// The next {seq} of each output template, as last read, so the preview
+/// shows the number a save takes rather than `####`.
+#[derive(Default)]
+struct NextNumbers {
+    known: HashMap<NumberKey, NextNumber>,
+    /// Templates to read again, as a save may have taken their number.
+    stale: std::collections::HashSet<NumberKey>,
+    /// A read is on its way.
+    busy: bool,
+    /// Saves seen so far, so a read that started before one stays stale.
+    generation: u64,
+}
+
+impl NextNumbers {
+    fn key(template: &str, destination: Option<&str>) -> NumberKey {
+        (template.to_owned(), destination.map(str::to_owned))
+    }
+
+    fn get(
+        &self,
+        template: &str,
+        destination: Option<&str>,
+        camera: &str,
+        date: &str,
+    ) -> Option<u32> {
+        self.known
+            .get(&Self::key(template, destination))
+            .filter(|read| read.camera == camera && read.date == date)?
+            .seq
+    }
+
+    /// Whether `template` needs reading for this destination, camera and day.
+    fn wanted(&self, template: &str, destination: Option<&str>, camera: &str, date: &str) -> bool {
+        let key = Self::key(template, destination);
+        self.stale.contains(&key)
+            || self
+                .known
+                .get(&key)
+                .is_none_or(|read| read.camera != camera || read.date != date)
+    }
+
+    fn settle(&mut self, read: NextNumber) {
+        self.busy = false;
+        if read.template.is_empty() {
+            return;
+        }
+        let key = Self::key(&read.template, read.destination.as_deref());
+        // A save while it was read may have taken this number: read again.
+        if read.generation == self.generation {
+            self.stale.remove(&key);
+        }
+        // Bounded: only the templates read most recently are kept.
+        if self.known.len() >= 8 && !self.known.contains_key(&key) {
+            self.known.clear();
+        }
+        self.known.insert(key, read);
+    }
+
+    /// A save may have taken the numbers shown: read them all again,
+    /// showing the old ones meanwhile.
+    fn saved(&mut self) {
+        self.generation += 1;
+        self.stale.extend(self.known.keys().cloned());
+    }
+}
+
+/// The day a template's {date} fills in with at `now`.
+fn day(now: chrono::DateTime<chrono::Local>) -> String {
+    now.format("%Y-%m-%d").to_string()
+}
+
 #[derive(Debug, Clone)]
 enum Message {
     Undo,
@@ -590,6 +677,10 @@ enum Message {
     /// The refresh interval the window's screen reports, if any.
     ScreenRefresh(Option<Duration>),
     StoragePolicy(storage_policy::Reply),
+    /// The thumbnail of the saved file named, made off the UI thread.
+    SavedThumb(String, Option<iced::widget::image::Handle>),
+    /// The number {seq} takes next in a template, for a camera and date.
+    NextNumber(NextNumber),
     SystemTheme(theme::Mode),
     Key {
         chord: Chord,
@@ -889,6 +980,14 @@ struct Workbench {
     copied: Option<(String, Instant)>,
     /// The last capture that saved files.
     last_saved: Option<Saved>,
+    /// Files each connected camera saved while this window watched it.
+    session_saved: HashMap<String, u64>,
+    /// The frame to shrink, off this thread, into the thumbnail of the
+    /// saved file named; taken by the next tick.
+    thumb_wanted: Option<(String, Arc<crate::types::Frame>)>,
+    /// The number {seq} takes next in each output template, read off the
+    /// UI thread.
+    next_numbers: NextNumbers,
     /// The file the last recording started here writes, and its camera.
     last_recording: Option<(Option<String>, String)>,
     /// Start the live view when a camera connects.
@@ -1081,6 +1180,9 @@ impl Workbench {
             notice_shown: Motion::new(0.0, motion::NOTICE_IN, motion::NOTICE_OUT, Kind::Fade),
             copied: None,
             last_saved: None,
+            session_saved: HashMap::new(),
+            thumb_wanted: None,
+            next_numbers: NextNumbers::default(),
             last_recording: None,
             auto_start: false,
             tags: Default::default(),
@@ -1723,11 +1825,12 @@ impl Workbench {
             && let Some(path) = result["path"].as_str()
         {
             self.last_recording = Some((pending.camera.clone(), path.to_owned()));
+            self.next_numbers.saved();
         }
         if pending.job == Job::Capture {
             self.shutter.replay(1.0, 0.0, self.now);
             if let Some(saved) = Saved::from_result(pending.camera.clone(), result, self.now) {
-                self.last_saved = Some(saved);
+                self.note_saved(saved);
             }
         }
         if pending.job == Job::Discover {
@@ -1870,6 +1973,8 @@ impl Workbench {
         self.save_prefs();
         Task::batch([
             pages,
+            self.thumb_task(),
+            self.next_number_task(),
             self.screenshot_tick(),
             // An unseen window may still draw.
             if self.sight_unknown() {
@@ -2324,14 +2429,23 @@ impl Workbench {
         self.preview_at(template, chrono::Local::now())
     }
 
-    /// `preview_of` at the time `now`.
-    fn preview_at(&self, template: &str, now: chrono::DateTime<chrono::Local>) -> String {
-        let camera = self
-            .snapshot
+    /// The camera label file names use for the selected camera.
+    fn name_label(&self) -> String {
+        self.snapshot
             .connected
             .as_ref()
-            .map_or_else(|| "camera".to_owned(), crate::naming::camera_label);
-        let preview = crate::naming::preview(template, &camera, now);
+            .map_or_else(|| "camera".to_owned(), crate::naming::camera_label)
+    }
+
+    /// `preview_of` at the time `now`, with {seq} as the number it takes
+    /// next once that is known for this camera and day.
+    fn preview_at(&self, template: &str, now: chrono::DateTime<chrono::Local>) -> String {
+        let camera = self.name_label();
+        let destination = self.destination_of(template);
+        let seq = self
+            .next_numbers
+            .get(template, destination, &camera, &day(now));
+        let preview = crate::naming::preview_numbered(template, &camera, now, seq);
         let home = prefs::capture_root();
         match home
             .parent()
@@ -2340,6 +2454,69 @@ impl Workbench {
             Some(rest) => format!("~{}{}", std::path::MAIN_SEPARATOR, rest.display()),
             None => preview,
         }
+    }
+
+    /// The named destination `template` saves under: the capture's for the
+    /// capture output, the recording's for the recording output.
+    fn destination_of(&self, template: &str) -> Option<&str> {
+        if template == self.output {
+            self.capture_to.selected.as_deref()
+        } else if template == self.forward_output {
+            self.record_to.selected.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Read the next {seq} of a capture or recording template that is not
+    /// known for this destination, camera and day, one at a time, on a worker thread:
+    /// folders may hold many files. Screenshots show `####`, whatever the
+    /// folder holds.
+    fn next_number_task(&mut self) -> Task<Message> {
+        if self.next_numbers.busy || self.screenshot.is_some() {
+            return Task::none();
+        }
+        let camera = self.name_label();
+        let now = chrono::Local::now();
+        let date = day(now);
+        let Some((template, destination)) = [
+            (&self.output, &self.capture_to.selected),
+            (&self.forward_output, &self.record_to.selected),
+        ]
+        .into_iter()
+        .find(|(template, destination)| {
+            self.next_numbers
+                .wanted(template, destination.as_deref(), &camera, &date)
+        })
+        .map(|(template, destination)| (template.clone(), destination.clone())) else {
+            return Task::none();
+        };
+        let generation = self.next_numbers.generation;
+        let (done, read) = iced::futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("capturefab-next-number".into())
+            .spawn(move || {
+                // A destination's output is inside its folder, not ours.
+                let seq = crate::destination::resolve(destination.as_deref(), &template)
+                    .ok()
+                    .and_then(|resolved| crate::naming::peek_next(&resolved.output, &camera, now));
+                let _ = done.send(NextNumber {
+                    template,
+                    destination,
+                    camera,
+                    date,
+                    seq,
+                    generation,
+                });
+            });
+        if spawned.is_err() {
+            return Task::none();
+        }
+        self.next_numbers.busy = true;
+        Task::perform(async move { read.await.ok() }, |read| match read {
+            Some(read) => Message::NextNumber(read),
+            None => Message::NextNumber(NextNumber::default()),
+        })
     }
 
     /// Validate the visible draft, including shortcuts and per-camera actions.
@@ -2849,6 +3026,8 @@ impl Workbench {
             Message::KeepOpen => self.dismiss_close_error(),
             Message::Menu(command) => return self.menu_command(command),
             Message::StoragePolicy(reply) => self.storage_status.update(reply, self.now),
+            Message::SavedThumb(path, thumb) => self.saved_thumb(&path, thumb),
+            Message::NextNumber(read) => self.next_numbers.settle(read),
             Message::DesktopMenu(input) => return self.desktop_menu_input(input),
             Message::EditorFocused(value) => {
                 self.window_editor_focus.insert(self.focused_window, value);

@@ -632,11 +632,23 @@ fn the_next_capture_names_its_file_and_folder_apart() {
             .iter()
             .any(|label| label.starts_with("Next file"))
     );
-    // From the chosen folder, so the dated subfolder shows too.
+    // The name whole, and the dated subfolder under the chosen folder on
+    // a line of its own, so neither cuts into the other.
     let root = app.fixed_folder(&app.output).unwrap();
     let shown = &preview[root.len() + 1..];
-    assert!(shown.ends_with(&file) && shown != file, "{shown}");
-    assert!(labels(&capture).contains(&shown), "{:?}", labels(&capture));
+    let (_, dated) = split_preview(shown);
+    assert!(!dated.is_empty(), "{shown}");
+    assert!(
+        labels(&capture).contains(&file.as_str()),
+        "{:?}",
+        labels(&capture)
+    );
+    let caption = format!("in {dated}/");
+    assert!(
+        labels(&capture).contains(&caption.as_str()),
+        "{:?}",
+        labels(&capture)
+    );
 }
 
 #[test]
@@ -933,4 +945,59 @@ fn quick_recording_ignores_an_unfinished_stream_url() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn the_saved_line_and_recording_card_read_as_they_progress() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let camera = app.snapshot.active_camera.clone();
+    app.last_saved = Saved::from_result(
+        camera.clone(),
+        &serde_json::json!({
+            "files": ["capture-0024.png"],
+            "frames": [{"width": 640, "height": 480}],
+        }),
+        app.now,
+    );
+    if let Some(camera) = &camera {
+        app.add_saved(camera, 24);
+    }
+    let mut tree = Tree::empty();
+    let capture = snapshot(&app, Pane::Capture, &mut tree, &renderer);
+    assert!(
+        labels(&capture).contains(&"24 saved this session \u{b7} 640\u{d7}480 PNG"),
+        "{:?}",
+        labels(&capture)
+    );
+
+    // A recording the CLI started: the session names its file.
+    let home = prefs::capture_root();
+    let template = home.join("{date}/{camera}-{seq}.mp4");
+    let file = home.join("2026-10-25/Sim-SIM0-0001.mp4");
+    app.snapshot.forwarding = Some(template.to_string_lossy().into_owned());
+    app.snapshot.recording_path = Some(file.to_string_lossy().into_owned());
+    app.snapshot.forwarding_id = Some("a".into());
+    app.snapshot.forwarding_since_ms = Some(super::epoch_ms().saturating_sub(84_500));
+    app.snapshot.forwarding_progress = Some(crate::session::ForwardingProgress {
+        id: "a".into(),
+        accepted: 2_520,
+        written: 2_520,
+        dropped: 3,
+        late: 0,
+        stalled: false,
+    });
+    let video = snapshot(&app, Pane::Forward, &mut tree, &renderer);
+    let shown = labels(&video);
+    assert!(shown.contains(&"Sim-SIM0-0001.mp4"), "{shown:?}");
+    assert!(
+        !shown.iter().any(|label| label.contains("{date}")),
+        "{shown:?}"
+    );
+    assert!(
+        shown
+            .iter()
+            .any(|label| label.ends_with("2,520 written \u{b7} 3 dropped")),
+        "{shown:?}"
+    );
 }

@@ -222,7 +222,7 @@ fn caption(text: impl Into<String>, tone: Tone) -> Caption {
 impl State {
     pub fn summary(&self, requested: &StoragePolicy) -> String {
         match self {
-            Self::Loading => "Checking app-wide policy…".into(),
+            Self::Loading => "Checking…".into(),
             Self::Unavailable(_) => "Policy unavailable".into(),
             Self::Available(global) => {
                 let effective = global.effective(requested);

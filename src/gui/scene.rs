@@ -129,6 +129,9 @@ pub(super) struct Scene {
     forwarding_since_ms: Option<u64>,
     /// When the session stops that forward by itself, if it does.
     forwarding_until_ms: Option<u64>,
+    /// The file that recording writes, and how far it has got.
+    recording_path: Option<String>,
+    forwarding_progress: Option<crate::session::ForwardingProgress>,
     /// The selected camera reports that it stopped streaming.
     stopped: bool,
     /// Turn on auto mode on every camera as the streams start.
@@ -196,27 +199,28 @@ impl Scene {
         for camera in selected {
             if self.forwarding.is_some() {
                 camera.forwarding = self.forwarding.clone();
-                camera.forwarding_id = self
-                    .forwarding
-                    .as_ref()
-                    .map(|_| "00000000000000000000000000000001".into());
+                camera.forwarding_id = self.forwarding.as_ref().map(|_| SCENE_FORWARDING_ID.into());
                 camera.forwarding_since_ms = self.forwarding_since_ms;
                 camera.forwarding_until_ms = self.forwarding_until_ms;
+                camera.recording_path = self.recording_path.clone();
+                camera.forwarding_progress = self.forwarding_progress.clone();
             }
             camera.streaming &= !self.stopped;
         }
         if self.forwarding.is_some() {
             snapshot.forwarding = self.forwarding.clone();
-            snapshot.forwarding_id = self
-                .forwarding
-                .as_ref()
-                .map(|_| "00000000000000000000000000000001".into());
+            snapshot.forwarding_id = self.forwarding.as_ref().map(|_| SCENE_FORWARDING_ID.into());
             snapshot.forwarding_since_ms = self.forwarding_since_ms;
             snapshot.forwarding_until_ms = self.forwarding_until_ms;
+            snapshot.recording_path = self.recording_path.clone();
+            snapshot.forwarding_progress = self.forwarding_progress.clone();
         }
         snapshot.streaming &= !self.stopped;
     }
 }
+
+/// The identity of the forward or recording a scene shows.
+const SCENE_FORWARDING_ID: &str = "00000000000000000000000000000001";
 
 /// An error long enough to test that notices stay on one line.
 const LONG_ERROR: &str = "Native camera discovery: this development build has no embedded \
@@ -236,12 +240,14 @@ impl Workbench {
     /// - activity: `searching` (with `welcome`: discovery never finishes),
     ///   `pending` (stopping the selected camera's stream never finishes),
     ///   `starting` (the selected camera stopped, and starting it never
-    ///   finishes), `saved` (the selected camera just saved a capture),
+    ///   finishes), `saved` (the selected camera just saved a capture, its
+    ///   24th this session),
     ///   `copied` (the session command was just copied), `stalled` (the
     ///   selected camera's frames stopped arriving), `auto` (every camera in
     ///   auto mode), `forwarding` (the selected camera forwards to a URL),
     ///   `recording` (the selected camera records to a file, for 1:23),
-    ///   `timed` (with `recording`: the session stops it after 1 h)
+    ///   `timed` (with `recording`: the session stops it after 1 h),
+    ///   `dropped` (with `recording`: the encoder dropped frames)
     /// - `tags`: the capture tags filled in and open; `dataset`: the Dataset
     ///   section open; `side-hub`: cameras from saved hubs in the camera
     ///   list (with `welcome`, on the welcome cards)
@@ -349,9 +355,30 @@ impl Workbench {
                     self.scene.forwarding_since_ms = Some(epoch_ms().saturating_sub(83_000));
                 }
                 "recording" => {
-                    self.scene.forwarding = Some(prefs::default_record_output());
+                    let output = prefs::default_record_output();
+                    // The session reports the file it named, so the card
+                    // shows it even for a recording started elsewhere.
+                    self.scene.recording_path = Some(crate::naming::preview_numbered(
+                        &output,
+                        "Sim-SIM0",
+                        chrono::Local::now(),
+                        Some(1),
+                    ));
+                    self.scene.forwarding = Some(output);
                     self.scene.forwarding_since_ms = Some(epoch_ms().saturating_sub(83_000));
+                    self.scene.forwarding_progress = Some(crate::session::ForwardingProgress {
+                        id: SCENE_FORWARDING_ID.into(),
+                        accepted: 2_490,
+                        written: 2_490,
+                        ..Default::default()
+                    });
                     self.scene.late.push("recording-file".into());
+                }
+                "dropped" => {
+                    if let Some(progress) = &mut self.scene.forwarding_progress {
+                        progress.dropped = 12;
+                        progress.late = 12;
+                    }
                 }
                 "timed" => {
                     let since = epoch_ms().saturating_sub(83_000);
@@ -448,8 +475,28 @@ impl Workbench {
             match word.as_str() {
                 "kind-scanner" | "kind-unknown" => self.scene_display_profile(&word),
                 "saved" => {
-                    let result = json!({"files": ["capture-0001.png"], "count": 1});
-                    self.last_saved = Saved::from_result(camera.clone(), &result, self.now);
+                    let result = json!({
+                        "files": ["capture-0001.png"],
+                        "frames": [{"width": 640, "height": 480}],
+                        "count": 1,
+                    });
+                    if let Some(id) = &camera {
+                        self.session_saved.insert(id.clone(), 23);
+                    }
+                    if let Some(saved) = Saved::from_result(camera.clone(), &result, self.now) {
+                        self.note_saved(saved);
+                    }
+                    // Made here, not on a worker: the shot is of the next frame.
+                    if let Some((path, frame)) = self.thumb_wanted.take()
+                        && let Ok((width, height, rgba)) = crate::frame::preview_rgba(
+                            &frame,
+                            super::notice::THUMB_BOUNDS.0,
+                            super::notice::THUMB_BOUNDS.1,
+                        )
+                    {
+                        let thumb = iced::widget::image::Handle::from_rgba(width, height, rgba);
+                        self.saved_thumb(&path, Some(thumb));
+                    }
                     self.scene_notice(command_notice(&Job::Capture, &Ok(result)));
                 }
                 "recording-file" => {
