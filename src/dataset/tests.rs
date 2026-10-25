@@ -1104,6 +1104,35 @@ fn export_media_preflight_refuses_before_writing() {
     let error = slot.reader().unwrap().export(&request).err().unwrap();
     assert_eq!(crate::cli::error_code(&error).1, 6, "{error}");
     assert!(!dir.join("out").exists());
+    // Media follows --tables: without captures, no images are copied.
+    let mut events = export_request(dir.join("events"), vec![ExportFormat::Csv]);
+    events.media = MediaExport::Images;
+    events.tables = vec!["events".into()];
+    let result = slot.reader().unwrap().export(&events).unwrap();
+    assert_eq!(result["media"]["copied"], 0, "{result}");
+    assert!(!dir.join("events/images").exists());
     slot.close().unwrap();
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn export_budget_errors_name_the_image_copies_in_readable_sizes() {
+    use export::{EXPORT_WITHOUT_MEDIA, over_budget};
+    let room = (2_000_000, 100);
+    assert_eq!(over_budget(room, (50_000, 4), (1_000_000, 10)), None);
+    // The data alone fits, so the copies are named with the way out.
+    let message = over_budget(room, (50_000, 4), (3_145_728, 4)).unwrap();
+    assert!(
+        message.starts_with("Storage full: copying the images needs 3.1 MB and 4 files")
+            && message.contains("budget has 2.0 MB and 100 files left")
+            && message.contains(EXPORT_WITHOUT_MEDIA),
+        "{message}"
+    );
+    // The data itself does not fit: leaving the images out would not help.
+    let message = over_budget(room, (2_500_000, 4), (1_000, 1)).unwrap();
+    assert!(
+        message.starts_with("Storage full: export needs 2.5 MB and 5 files")
+            && !message.contains(EXPORT_WITHOUT_MEDIA),
+        "{message}"
+    );
 }

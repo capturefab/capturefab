@@ -685,6 +685,9 @@ enum Message {
     ShowInspector,
     Search(String),
     InspectorDisclosure(inspector::Section),
+    /// Open Capture tags and focus a tag's field, for a save location that
+    /// needs it filled in.
+    FillTag(tags::TagField),
     /// Open every feature group, or close them all.
     ExpandFeatureGroups(bool),
     /// Show every row of a long feature group.
@@ -3192,6 +3195,10 @@ impl Workbench {
             }
             Message::Search(value) => self.search = value,
             Message::InspectorDisclosure(section) => self.toggle_inspector_section(section),
+            Message::FillTag(field) => {
+                self.open_capture_tags();
+                return operation::focus(format!("capture-tag-{}", field.key()));
+            }
             Message::ExpandFeatureGroups(open) => self.expand_feature_groups(open),
             Message::ShowFeatures(group) => return self.show_whole_group(group),
             Message::RefreshFeatures => {

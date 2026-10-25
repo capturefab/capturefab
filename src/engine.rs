@@ -877,6 +877,35 @@ fn acquisition(c: &mut Camera) -> Acquisition {
     }
 }
 
+/// The worker's last [`acquisition`] read, reused for scheduled shots until
+/// a command or auto exposure may have changed the camera, or for at most
+/// [`AcquisitionCache::MAX_AGE`] so camera-side auto features stay current.
+#[derive(Default)]
+struct AcquisitionCache {
+    read: Option<(Instant, Acquisition)>,
+}
+
+impl AcquisitionCache {
+    const MAX_AGE: Duration = Duration::from_secs(1);
+
+    fn invalidate(&mut self) {
+        self.read = None;
+    }
+
+    fn get(&mut self, c: &mut Camera, now: Instant) -> Acquisition {
+        match &self.read {
+            Some((at, cached)) if now.saturating_duration_since(*at) < Self::MAX_AGE => {
+                cached.clone()
+            }
+            _ => {
+                let fresh = acquisition(c);
+                self.read = Some((now, fresh.clone()));
+                fresh
+            }
+        }
+    }
+}
+
 fn bounded(text: &str, max: usize) -> String {
     text.chars().filter(|c| !c.is_control()).take(max).collect()
 }
@@ -1555,8 +1584,9 @@ fn process_plain(
                         status = auto.as_ref().map(|a| a.status().clone());
                     }
                     let wall_ms = crate::scheduling::now_ms();
-                    // Auto exposure changes the camera between frames.
-                    if index > 0 && auto.is_some() {
+                    // Auto exposure changes the camera between frames until
+                    // it settles.
+                    if index > 0 && auto.as_ref().is_some_and(|a| !a.converged()) {
                         settings = acquisition(c);
                     }
                     let mut metadata = serde_json::to_value(&frame)?;
@@ -2208,6 +2238,10 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
     let mut consecutive_errors = 0u32;
     let mut reconnecting = false;
     let mut progress_sampler = ForwardProgressSampler::default();
+    // The settings written into scheduled stills, read from the camera at
+    // most once a second instead of once per shot: reading them costs a
+    // register round trip per feature, which a fast schedule cannot spare.
+    let mut settings = AcquisitionCache::default();
     while !h.cancelled() {
         let receiving = camera.as_ref().is_some_and(|c| {
             c.is_streaming()
@@ -2242,6 +2276,8 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
                 h.log("error", format!("{err:#}"));
             }
             let _ = e.reply.send(result);
+            // Any command can connect, reconnect or change a feature.
+            settings.invalidate();
             rate_epoch = Instant::now();
             rate_count = 0;
             consecutive_errors = 0;
@@ -2278,6 +2314,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
                 Ok(frame) => {
                     if std::mem::take(&mut reconnecting) {
                         resumed(&h);
+                        settings.invalidate();
                     }
                     if let Some(controller) = auto.as_mut() {
                         controller.observe(&frame, Instant::now());
@@ -2285,9 +2322,13 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
                     let settled = auto.as_ref().is_none_or(AutoController::converged);
                     // A scanned page is never skipped: it waits for room.
                     let room = c.is_scanner() || saver.has_room();
+                    if !settled {
+                        // Auto exposure is still moving the camera.
+                        settings.invalidate();
+                    }
                     let shot =
                         shoot(&h, &frame, &mut jobs, settled, room).map(|shot| saver::Shot {
-                            acquisition: acquisition(c),
+                            acquisition: settings.get(c, Instant::now()),
                             ..shot
                         });
                     // Publish first: the forwarder then takes the sensor

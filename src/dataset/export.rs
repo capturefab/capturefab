@@ -20,6 +20,10 @@ use std::{
     time::Duration,
 };
 
+/// The advice a storage-full export gives when only its media copies do not
+/// fit. The desktop app replaces it with its own checkbox's name.
+pub(crate) const EXPORT_WITHOUT_MEDIA: &str = "export without them (--media none)";
+
 /// Room reserved in the storage budget for manifest.json and README.md.
 const METADATA_RESERVE: u64 = 64 * 1024;
 /// The "Summary for AI tools" section stays under this many bytes.
@@ -430,8 +434,8 @@ impl Reader {
         extra: (u64, u64),
         policy: &StoragePolicy,
     ) -> Result<()> {
-        let needed: u64 = staged.iter().map(|s| s.bytes).sum::<u64>() + METADATA_RESERVE + extra.0;
-        let count = staged.len() as u64 + 2 + extra.1;
+        let data: u64 = staged.iter().map(|s| s.bytes).sum::<u64>() + METADATA_RESERVE;
+        let data_files = staged.len() as u64 + 2;
         let status = crate::storage::quota_status()?;
         let configured: StoragePolicy =
             serde_json::from_value(status["policy"].clone()).unwrap_or_default();
@@ -439,14 +443,47 @@ impl Reader {
         let max_files = u64::from(policy.max_files.min(configured.max_files));
         let allocated = status["allocated_bytes"].as_u64().unwrap_or(0);
         let files = status["files"].as_u64().unwrap_or(0);
-        ensure!(
-            allocated.saturating_add(needed) <= max_bytes && files + count <= max_files,
-            "Storage full: export needs {needed} bytes and {count} files, but the storage budget has {} bytes and {} files left; raise --max-space or --max-files, or remove old captures",
-            max_bytes.saturating_sub(allocated),
-            max_files.saturating_sub(files)
-        );
-        Ok(())
+        match over_budget(
+            (
+                max_bytes.saturating_sub(allocated),
+                max_files.saturating_sub(files),
+            ),
+            (data, data_files),
+            extra,
+        ) {
+            Some(message) => Err(anyhow!(message)),
+            None => Ok(()),
+        }
     }
+}
+
+/// Why an export of `data` (bytes, files) plus its media copies `extra`
+/// does not fit in the `room` the storage budget has left, or `None`.
+pub(super) fn over_budget(room: (u64, u64), data: (u64, u64), extra: (u64, u64)) -> Option<String> {
+    let fits = |bytes: u64, count: u64| bytes <= room.0 && count <= room.1;
+    if fits(data.0.saturating_add(extra.0), data.1 + extra.1) {
+        return None;
+    }
+    let left = format!(
+        "the storage budget has {} and {} files left",
+        crate::tools::format_bytes(room.0),
+        room.1
+    );
+    // Name the copies when they alone tip the export over the budget,
+    // since leaving them out is the cheapest way to make it fit.
+    Some(if extra != (0, 0) && fits(data.0, data.1) {
+        format!(
+            "Storage full: copying the images needs {} and {} files, but {left}; {EXPORT_WITHOUT_MEDIA}, raise --max-space or --max-files, or remove old captures",
+            crate::tools::format_bytes(extra.0),
+            extra.1
+        )
+    } else {
+        format!(
+            "Storage full: export needs {} and {} files, but {left}; raise --max-space or --max-files, or remove old captures",
+            crate::tools::format_bytes(data.0.saturating_add(extra.0)),
+            data.1 + extra.1
+        )
+    })
 }
 
 /// Copy a staged file into a new ledger-tracked file; returns size and SHA-256.

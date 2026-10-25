@@ -860,6 +860,11 @@ enum Edit {
 
 /// The settings panel's hooks into the shared update cycle.
 impl Workbench {
+    /// Open Capture tags, whatever its state, so a field in it can take focus.
+    pub(super) fn open_capture_tags(&mut self) {
+        self.inspect.tags_open = true;
+    }
+
     pub(super) fn toggle_inspector_section(&mut self, section: Section) {
         match section {
             Section::Features(group) => {
@@ -2679,6 +2684,18 @@ impl Workbench {
         // A pattern that names a folder after a tag needs the tag filled in.
         if let Some(hint) = super::tags::missing_hint(&self.output, &self.tags) {
             action = action.push(text(hint).size(style::CAPTION).color(p.ink(p.warn)));
+            if let Some(field) = super::tags::missing_field(&self.output, &self.tags) {
+                action = action.push(
+                    button(
+                        text(format!("Fill in {}", field.label()))
+                            .size(style::SMALL)
+                            .font(style::MEDIUM),
+                    )
+                    .padding([3, 0])
+                    .style(style::link)
+                    .on_press(Message::FillTag(field)),
+                );
+            }
         }
         let mut head = column![section(capture_title(kind), None, p)].spacing(8);
         if let Some(guidance) = capture_guidance(kind) {

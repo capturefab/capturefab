@@ -88,12 +88,36 @@ pub(super) fn context(tags: &CaptureTags) -> crate::context::Context {
         .collect()
 }
 
+/// The first tag `output` names files after that is empty, if any.
+fn missing_key(output: &str, tags: &CaptureTags) -> Option<String> {
+    crate::naming::missing_tags(output, &context(tags))
+        .into_iter()
+        .next()
+}
+
+/// The capture tag field `output` needs filled in before it can save, for a
+/// link that opens Capture tags at that field.
+pub(super) fn missing_field(output: &str, tags: &CaptureTags) -> Option<TagField> {
+    let key = missing_key(output, tags)?;
+    TagField::ALL.into_iter().find(|field| field.key() == key)
+}
+
+/// What the save location still needs, in a few words for the toolbar,
+/// such as "needs a Label".
+pub(super) fn missing_short(output: &str, tags: &CaptureTags) -> Option<String> {
+    let key = missing_key(output, tags)?;
+    Some(
+        match TagField::ALL.into_iter().find(|field| field.key() == key) {
+            Some(field) => format!("needs a {}", field.label()),
+            None => format!("needs the {key} tag"),
+        },
+    )
+}
+
 /// What to fill in when `output` names files after a tag that is empty,
 /// such as "Fill in Label in Capture tags to choose the folder".
 pub(super) fn missing_hint(output: &str, tags: &CaptureTags) -> Option<String> {
-    let key = crate::naming::missing_tags(output, &context(tags))
-        .into_iter()
-        .next()?;
+    let key = missing_key(output, tags)?;
     let what = match TagField::ALL.into_iter().find(|field| field.key() == key) {
         Some(field) => format!("Fill in {} in Capture tags", field.label()),
         None => format!("Add the {key} tag (--context {key}=VALUE)"),
@@ -110,14 +134,18 @@ pub(super) fn missing_hint(output: &str, tags: &CaptureTags) -> Option<String> {
     Some(format!("{what} to choose {target}"))
 }
 
-/// Where the tags go: into each saved still, and into the dataset `file`
-/// when captures are being cataloged.
-pub(super) fn caption(file: Option<&str>) -> String {
+/// Where the tags go: with every capture and recording, into each saved
+/// still when `format` embeds metadata (PNG and JPEG do; raw, PGM and PPM
+/// carry none), and into the dataset `file` when captures are cataloged.
+pub(super) fn caption(format: &str, file: Option<&str>) -> String {
+    let embedded = if matches!(format, "png" | "jpeg" | "jpg") {
+        "Saved with every capture and recording, and written into each PNG and JPEG"
+    } else {
+        "Saved with every capture and recording. Raw, PGM and PPM files carry no tags"
+    };
     match file {
-        Some(file) => format!("Written into each saved PNG and JPEG, and cataloged in {file}."),
-        None => "Written into each saved PNG and JPEG. Turn on Catalog captures \
-                 automatically in Dataset to search them later."
-            .into(),
+        Some(file) => format!("{embedded}; cataloged in {file}."),
+        None => format!("{embedded}. Not cataloged in a dataset."),
     }
 }
 
@@ -153,26 +181,22 @@ pub(super) fn view<'a>(
     if !open {
         return Some(section.into());
     }
-    section = section.push(match dataset::catalog(bench) {
-        Some(file) => Element::from(
-            text(caption(Some(&file)))
-                .size(style::SMALL)
-                .color(p.secondary),
-        ),
-        None => {
-            let mut note =
-                column![text(caption(None)).size(style::SMALL).color(p.ink(p.warn))].spacing(2);
-            if !dataset_open {
-                note = note.push(
-                    button(text("Show Dataset").size(style::SMALL).font(style::MEDIUM))
-                        .padding([3, 0])
-                        .style(style::link)
-                        .on_press(Message::InspectorDisclosure(inspector::Section::Dataset)),
-                );
-            }
-            note.into()
-        }
-    });
+    let file = dataset::catalog(bench);
+    let mut note = column![
+        text(caption(bench.format, file.as_deref()))
+            .size(style::SMALL)
+            .color(p.secondary)
+    ]
+    .spacing(2);
+    if file.is_none() && !dataset_open {
+        note = note.push(
+            button(text("Show Dataset").size(style::SMALL).font(style::MEDIUM))
+                .padding([3, 0])
+                .style(style::link)
+                .on_press(Message::InspectorDisclosure(inspector::Section::Dataset)),
+        );
+    }
+    section = section.push(note);
     let invalid = crate::context::validate(&context).err();
     for field in TagField::ALL {
         section = section.push(
@@ -212,10 +236,16 @@ mod tests {
     #[test]
     fn caption_says_where_tags_go() {
         assert_eq!(
-            caption(Some("capturefab.duckdb")),
-            "Written into each saved PNG and JPEG, and cataloged in capturefab.duckdb."
+            caption("png", Some("capturefab.duckdb")),
+            "Saved with every capture and recording, and written into each PNG and JPEG; \
+             cataloged in capturefab.duckdb."
         );
-        assert!(caption(None).contains("Turn on Catalog captures automatically"));
+        assert_eq!(
+            caption("raw", None),
+            "Saved with every capture and recording. Raw, PGM and PPM files carry no tags. \
+             Not cataloged in a dataset."
+        );
+        assert!(caption("jpeg", None).contains("written into each PNG and JPEG"));
     }
 
     #[test]
@@ -226,8 +256,14 @@ mod tests {
             missing_hint(output, &tags).as_deref(),
             Some("Fill in Label in Capture tags to choose the folder")
         );
+        assert_eq!(missing_field(output, &tags), Some(TagField::Label));
+        assert_eq!(
+            missing_short(output, &tags).as_deref(),
+            Some("needs a Label")
+        );
         tags.label = "good".into();
         assert_eq!(missing_hint(output, &tags), None);
+        assert_eq!(missing_field(output, &tags), None);
         assert_eq!(missing_hint("/tmp/{seq}.png", &tags), None);
         assert_eq!(
             missing_hint("/tmp/{tag:shift}-{seq}.png", &tags).as_deref(),

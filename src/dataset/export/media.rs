@@ -66,7 +66,11 @@ impl ExportSource<'_> {
             MediaExport::All => &["captures", "recordings"],
         };
         let mut rows = Vec::new();
-        for &table in tables {
+        // Copy only files whose table the export includes, so every media
+        // row joins to a table in the folder.
+        let included =
+            |table: &str| request.tables.is_empty() || request.tables.iter().any(|t| t == table);
+        for &table in tables.iter().filter(|t| included(t)) {
             let mut statement = self.conn.prepare(&format!(
                 "SELECT id, path, file_name, sha256, bytes, context FROM {table}{} ORDER BY id LIMIT {}",
                 self.filter(table, request),

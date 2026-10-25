@@ -341,7 +341,7 @@ impl Workbench {
                 }
             }
             (Job::DatasetOpen | Job::DatasetClose | Job::DatasetExport, Err(error)) => {
-                self.dataset.error = Some(format!("{error:#}"));
+                self.dataset.error = Some(desktop_error(&format!("{error:#}")));
                 // A failed open cleared the automatic dataset; re-arm it.
                 if matches!(pending.job, Job::DatasetOpen)
                     && self.dataset.auto
@@ -353,6 +353,21 @@ impl Workbench {
             _ => {}
         }
     }
+}
+
+/// A dataset error in the desktop's words: an export that does not fit
+/// names the Include captured images box and the Keep at most setting
+/// instead of CLI flags.
+fn desktop_error(error: &str) -> String {
+    error
+        .replace(
+            crate::dataset::export::EXPORT_WITHOUT_MEDIA,
+            "turn off Include captured images",
+        )
+        .replace(
+            "raise --max-space or --max-files",
+            "raise Keep at most in Storage & retention",
+        )
 }
 
 /// The inspector's section, or `None` to leave it out.

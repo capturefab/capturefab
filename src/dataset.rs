@@ -763,6 +763,7 @@ pub fn schema_contract() -> Value {
         "export": "a new folder with data files, manifest.json (schema, units, sha256) and README.md (loading snippets and a summary for AI tools); an existing folder is refused",
         "export_media": {
             "modes": ["none", "images", "all"],
+            "tables": "images copies files of the captures table and all also of recordings; with --tables, only the listed ones among those are copied",
             "default": "none",
             "layout": "images/<file> for captures and videos/<file> for recordings; with group_by KEY, images/<tag value>/<file> (videos/<tag value>/<file>), and _unlabeled when the tag is empty",
             "index": "media.csv (plus media.<format> for each other requested format) with columns table, id, export_path (relative, forward slashes), sha256, bytes, group",
