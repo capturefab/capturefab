@@ -882,6 +882,12 @@ impl Backend for GigE {
                         self.camera_ip
                     ));
                 }
+                if big_endian {
+                    notes.push(
+                        "camera kept GevSCPSBigEndian set; 16- and 32-bit samples are swapped to little-endian"
+                            .into(),
+                    );
+                }
                 let mut assembler =
                     Assembler::new(payload_size, packet_size as usize, self.timestamp_frequency);
                 assembler.resend = self.resend;
@@ -1541,6 +1547,20 @@ impl PartialFrame {
         self.leader.is_some() && self.count == 0 && self.trailer.is_none()
     }
 }
+/// Bytes per sample of the formats made only of 16- or 32-bit samples, which
+/// a big-endian stream sends most significant byte first.
+fn sample_bytes(pixel_format: u32) -> Option<usize> {
+    match (pixel_format >> 16, pixel_format) {
+        // RGBa12p and BGRa12p pack 12-bit samples.
+        (_, 0x0230_0062 | 0x0230_004f) => None,
+        // Coord3D_AC16 and Coord3D_AC32f, also planar.
+        (_, 0x0220_00bb | 0x0220_00bc) => Some(2),
+        (_, 0x0240_00c2 | 0x0240_00c3) => Some(4),
+        (0x0110 | 0x0230 | 0x0240, _) => Some(2),
+        (0x0120 | 0x0260, _) => Some(4),
+        _ => None,
+    }
+}
 fn bit(bits: &[u64], id: u32) -> bool {
     bits.get(id as usize / 64)
         .is_some_and(|word| (word >> (id % 64)) & 1 != 0)
@@ -2034,14 +2054,15 @@ impl Assembler {
             }
         }
         data.truncate((leader.row_bytes * height as usize).min(frame.end));
-        // One or three 16-bit samples per pixel.
-        let sixteen_bit = matches!(leader.pixel_format >> 16, 0x0110 | 0x0230);
-        if (self.big_endian && sixteen_bit)
-            || (self.big_endian_mono16 && leader.pixel_format == MONO16)
-        {
-            for sample in data.as_chunks_mut::<2>().0 {
-                sample.swap(0, 1);
-            }
+        let swapped = if self.big_endian_mono16 && leader.pixel_format == MONO16 {
+            Some(2)
+        } else if self.big_endian {
+            sample_bytes(leader.pixel_format)
+        } else {
+            None
+        };
+        if let Some(bytes) = swapped {
+            data.chunks_exact_mut(bytes).for_each(<[u8]>::reverse);
         }
         let timestamp_ns = if self.timestamp_frequency == 0 {
             SystemTime::now()
@@ -3753,6 +3774,8 @@ mod tests {
         let (fake, mut gige) = streaming(|camera| camera.sticky_flags = SCPS_BIG_ENDIAN);
         let writes = fake.camera.lock().unwrap().scps_writes.clone();
         assert!(writes.iter().all(|value| value & SCPS_BIG_ENDIAN == 0));
+        let notes = gige.stats().unwrap().notes;
+        assert!(notes.iter().any(|note| note.contains("GevSCPSBigEndian")));
         let destination = fake.camera.lock().unwrap().destination();
         let mut packets = frame_packets(1, false, WIDTH, HEIGHT, 1464);
         packets[0] = gvsp(1, 0, 1, false, &leader(WIDTH / 2, HEIGHT, MONO16));
@@ -3784,13 +3807,21 @@ mod tests {
         let mono12 = 0x0110_0005;
         let rgb16 = 0x0230_0033;
         let yuv422 = 0x0210_0032;
-        for (pixel, width, big_endian, mono16, swapped) in [
-            (MONO16, 6, false, true, true),
-            (mono12, 6, false, true, false),
-            (mono12, 6, true, false, true),
-            (rgb16, 2, true, false, true),
-            (MONO8, 12, true, true, false),
-            (yuv422, 6, true, false, false),
+        let rgba12p = 0x0230_0062;
+        let rgba16 = 0x0240_0064;
+        let coord3d_ac16 = 0x0220_00bb;
+        let coord3d_c32f = 0x0120_00bf;
+        for (pixel, width, big_endian, mono16, sample) in [
+            (MONO16, 6, false, true, 2),
+            (mono12, 6, false, true, 1),
+            (mono12, 6, true, false, 2),
+            (rgb16, 2, true, false, 2),
+            (MONO8, 12, true, true, 1),
+            (yuv422, 6, true, false, 1),
+            (rgba12p, 2, true, false, 1),
+            (rgba16, 1, true, false, 2),
+            (coord3d_ac16, 3, true, false, 2),
+            (coord3d_c32f, 3, true, false, 4),
         ] {
             let mut assembler = Assembler::new(12, 48, 0);
             assembler.big_endian = big_endian;
@@ -3804,7 +3835,9 @@ mod tests {
                 .push(&gvsp(1, 2, 2, false, &trailer(1)))
                 .unwrap()
                 .unwrap();
-            assert_eq!(frame.data[..2] == [2, 1], swapped, "{pixel:08x}");
+            let mut expected = wire[..frame.data.len()].to_vec();
+            expected.chunks_exact_mut(sample).for_each(<[u8]>::reverse);
+            assert_eq!(frame.data, expected, "{pixel:08x}");
         }
     }
     #[test]
