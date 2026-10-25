@@ -2226,6 +2226,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     };
                     missing = None;
                     if !cli.json && job.captured > shown {
+                        // The poller can miss a frame when the interval is
+                        // shorter than its period; still count each one.
+                        for missed in shown + 1..job.captured {
+                            eprintln!("{missed}/{} saved", job.count);
+                        }
                         shown = job.captured;
                         eprintln!(
                             "{}",
