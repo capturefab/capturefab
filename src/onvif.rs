@@ -10,7 +10,7 @@ use sha2::{Sha256, Sha512_256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{BufRead, BufReader, Read, Write},
-    net::{Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -948,12 +948,22 @@ pub fn resolve(
     }
     let mut soap = Soap::new(endpoint, credentials, timeout);
     let services = media_services(&mut soap, endpoint)?;
+    let url = parse_url(endpoint)?;
+    let reached = Reached {
+        ips: (url.host.as_str(), url.port)
+            .to_socket_addrs()
+            .map(|addresses| addresses.map(|a| a.ip()).collect())
+            .unwrap_or_default(),
+        device: services.device.as_deref().and_then(host_and_port),
+        url,
+    };
     let mut first_error = None;
     for (media, address) in [(Media::V1, services.media1), (Media::V2, services.media2)] {
         let Some(address) = address else {
             continue;
         };
-        match media_streams(&mut soap, media, &address, profile) {
+        let address = reached.rewrite(&address);
+        match media_streams(&mut soap, media, &address, profile, &reached) {
             Ok(streams) => return Ok(streams),
             // Asking again with the same sign-in risks a lockout.
             Err(error) if crate::logins::is_auth_error(&error) => return Err(error),
@@ -966,8 +976,115 @@ pub fn resolve(
 }
 #[derive(Default)]
 struct Services {
+    device: Option<String>,
     media1: Option<String>,
     media2: Option<String>,
+}
+/// Where the device answered: its endpoint, the addresses that endpoint's
+/// host resolves to, and the host and port the device advertised for its
+/// own device service.
+struct Reached {
+    url: HttpUrl,
+    ips: Vec<IpAddr>,
+    device: Option<(String, u16)>,
+}
+/// Addresses reachable only from the device's own network.
+fn local_only(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                // Shared address space (RFC 6598) behind carrier-grade NAT.
+                || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
+        }
+        IpAddr::V6(ip) => match ip.to_ipv4_mapped() {
+            Some(ip) => local_only(IpAddr::V4(ip)),
+            None => {
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || ip.is_unique_local()
+                    || ip.is_unicast_link_local()
+            }
+        },
+    }
+}
+/// The host and port, with the scheme's default port, of an advertised URL.
+fn host_and_port(url: &str) -> Option<(String, u16)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    if authority.contains('@') {
+        return None;
+    }
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, after) = bracketed.split_once(']')?;
+        (host, after.strip_prefix(':'))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    let port = match port {
+        Some(port) => port.parse().ok()?,
+        None => match scheme.to_ascii_lowercase().as_str() {
+            "http" => 80,
+            "https" => 443,
+            "rtsp" => 554,
+            "rtsps" => 322,
+            _ => return None,
+        },
+    };
+    (!host.is_empty()).then(|| (host.to_owned(), port))
+}
+impl Reached {
+    /// `url` at the host the device answered on, when the advertised host
+    /// cannot be reached from here: an unspecified or loopback address, or a
+    /// private one while the device answered at a public or loopback address
+    /// (NAT, a port forward or a tunnel), as go2rtc and ONVIF Device Manager
+    /// do. The advertised port and path are kept, except that the device
+    /// service's own host and port become the endpoint's, since a port
+    /// forward covers every service the device serves there.
+    fn rewrite(&self, url: &str) -> String {
+        let Some((host, port)) = host_and_port(url) else {
+            return url.into();
+        };
+        let ip = if host.eq_ignore_ascii_case("localhost") {
+            IpAddr::V4(Ipv4Addr::LOCALHOST)
+        } else {
+            match host.parse::<IpAddr>() {
+                Ok(ip) => ip,
+                Err(_) => return url.into(),
+            }
+        };
+        let unreachable = ip.is_unspecified()
+            || ip.is_loopback()
+            || (local_only(ip)
+                && !self.ips.is_empty()
+                && self
+                    .ips
+                    .iter()
+                    .all(|ip| ip.is_loopback() || !local_only(*ip)));
+        if self.ips.contains(&ip) || !unreachable {
+            return url.into();
+        }
+        let endpoint = if self.url.host.contains(':') {
+            format!("[{}]", self.url.host)
+        } else {
+            self.url.host.clone()
+        };
+        let port = if self.device.as_ref().is_some_and(|(device, device_port)| {
+            device.eq_ignore_ascii_case(&host) && *device_port == port
+        }) {
+            self.url.port
+        } else {
+            port
+        };
+        let (scheme, rest) = url.split_once("://").unwrap_or_default();
+        let path = &rest[rest.find(['/', '?', '#']).unwrap_or(rest.len())..];
+        format!("{scheme}://{endpoint}:{port}{path}")
+    }
 }
 /// The Media1 and Media2 service addresses from GetServices (Core 8.1.2.2),
 /// or from GetCapabilities on older devices, which list Media1 only.
@@ -991,6 +1108,7 @@ fn media_services(soap: &mut Soap, endpoint: &str) -> Result<Services> {
                         .map(|text| text.trim().to_owned())
                 };
                 let slot = match field("Namespace").as_deref() {
+                    Some(DEVICE_NS) => &mut services.device,
                     Some(MEDIA_NS) => &mut services.media1,
                     Some(MEDIA2_NS) => &mut services.media2,
                     _ => continue,
@@ -1010,14 +1128,17 @@ fn media_services(soap: &mut Soap, endpoint: &str) -> Result<Services> {
         endpoint,
         DEVICE_NS,
         "GetCapabilities",
-        "<tds:GetCapabilities><tds:Category>Media</tds:Category></tds:GetCapabilities>",
+        "<tds:GetCapabilities><tds:Category>All</tds:Category></tds:GetCapabilities>",
     )?;
     let doc = xml_document(&capabilities)?;
-    services.media1 = doc
-        .descendants()
-        .find(|n| n.is_element() && n.tag_name().name() == "Media")
-        .and_then(|n| child_text(n, "XAddr"))
-        .map(str::to_owned);
+    let xaddr = |name: &str| {
+        doc.descendants()
+            .find(|n| n.is_element() && n.tag_name().name() == name)
+            .and_then(|n| child_text(n, "XAddr"))
+            .map(str::to_owned)
+    };
+    services.device = xaddr("Device");
+    services.media1 = xaddr("Media");
     Ok(services)
 }
 #[derive(Clone, Copy)]
@@ -1064,6 +1185,7 @@ fn media_streams(
     media: Media,
     address: &str,
     profile: Option<&str>,
+    reached: &Reached,
 ) -> Result<Vec<OnvifStream>> {
     let profiles = soap.call(
         address,
@@ -1124,6 +1246,7 @@ fn media_streams(
                 ),
                 "ONVIF camera returned an unsupported streaming URI"
             );
+            let uri = reached.rewrite(&uri);
             crate::media::validate_source(&uri)?;
             Ok(uri)
         })();
@@ -2101,6 +2224,96 @@ mod tests {
                 "rtsp://camera.example:554/Streaming/Channels/101"
             );
         }
+    }
+    #[test]
+    fn unreachable_advertised_hosts_become_the_reached_host() {
+        let reached = |endpoint: &str, ips: &[&str], device: &str| Reached {
+            url: parse_url(endpoint).unwrap(),
+            ips: ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+            device: host_and_port(device),
+        };
+        // Through a port forward: 203.0.113.5:8080 reaches 192.168.1.64:80.
+        let forward = reached(
+            "http://203.0.113.5:8080/onvif/device_service",
+            &["203.0.113.5"],
+            "http://192.168.1.64/onvif/device_service",
+        );
+        for (advertised, expected) in [
+            (
+                "http://192.168.1.64/onvif/Media",
+                "http://203.0.113.5:8080/onvif/Media",
+            ),
+            (
+                "http://192.168.1.64:8999/onvif/media2?x=1",
+                "http://203.0.113.5:8999/onvif/media2?x=1",
+            ),
+            (
+                "rtsp://192.168.1.64:554/Streaming/Channels/101",
+                "rtsp://203.0.113.5:554/Streaming/Channels/101",
+            ),
+            ("rtsp://192.168.1.64/live", "rtsp://203.0.113.5:554/live"),
+            ("rtsp://127.0.0.1:8554/live", "rtsp://203.0.113.5:8554/live"),
+            // Public, named and credential-bearing addresses stay.
+            ("rtsp://198.51.100.7/live", "rtsp://198.51.100.7/live"),
+            ("rtsp://camera.example/live", "rtsp://camera.example/live"),
+            (
+                "rtsp://u:p@192.168.1.64/live",
+                "rtsp://u:p@192.168.1.64/live",
+            ),
+        ] {
+            assert_eq!(forward.rewrite(advertised), expected);
+        }
+        // On the camera's LAN: only an unspecified or loopback host is wrong.
+        let lan = reached(
+            "http://192.168.1.64/onvif/device_service",
+            &["192.168.1.64"],
+            "http://0.0.0.0/onvif/device_service",
+        );
+        for (advertised, expected) in [
+            (
+                "http://0.0.0.0/onvif/media",
+                "http://192.168.1.64:80/onvif/media",
+            ),
+            (
+                "http://0.0.0.0:8999/onvif/media",
+                "http://192.168.1.64:8999/onvif/media",
+            ),
+            ("rtsp://0.0.0.0:554/live", "rtsp://192.168.1.64:554/live"),
+            ("rtsp://192.168.1.64/live", "rtsp://192.168.1.64/live"),
+            // A recorder elsewhere on the network serves the stream.
+            ("rtsp://10.0.0.5/live", "rtsp://10.0.0.5/live"),
+        ] {
+            assert_eq!(lan.rewrite(advertised), expected);
+        }
+        // A tunnel to IPv6, and a device behind it with a unique local address.
+        let tunnel = reached(
+            "http://[::1]:9000/onvif/device_service",
+            &["::1"],
+            "http://[fd00::40]/onvif/device_service",
+        );
+        assert_eq!(
+            tunnel.rewrite("http://[fd00::40]/onvif/media"),
+            "http://[::1]:9000/onvif/media"
+        );
+    }
+    #[test]
+    fn resolution_uses_the_reached_host_for_private_advertised_addresses() {
+        // Reached at loopback (a tunnel), the device advertises its LAN address.
+        let (address, server) = serve(3, |operation, headers, _| {
+            let port = headers["host"].rsplit(':').next().unwrap().to_owned();
+            let response = match operation {
+                "GetServices" => format!(
+                    "<Envelope><Body><GetServicesResponse><Service><Namespace>{DEVICE_NS}</Namespace><XAddr>http://10.255.255.1:{port}/onvif/device_service</XAddr></Service><Service><Namespace>{MEDIA_NS}</Namespace><XAddr>http://10.255.255.1:{port}/onvif/media</XAddr></Service></GetServicesResponse></Body></Envelope>"
+                ),
+                "GetProfiles" => "<Envelope><Body><GetProfilesResponse><Profiles token='main'><Name>Main</Name></Profiles></GetProfilesResponse></Body></Envelope>".into(),
+                _ => "<Envelope><Body><GetStreamUriResponse><MediaUri><Uri>rtsp://10.255.255.1:554/live</Uri></MediaUri></GetStreamUriResponse></Body></Envelope>".into(),
+            };
+            http_reply("200 OK", "", &response)
+        });
+        let endpoint = format!("http://{address}/onvif/device_service");
+        let streams = resolve(&endpoint, None, None, Duration::from_millis(500)).unwrap();
+        server.join().unwrap();
+        assert_eq!(streams[0].uri, "rtsp://127.0.0.1:554/live");
     }
     #[test]
     fn soap_http_basic_and_timeout() {
