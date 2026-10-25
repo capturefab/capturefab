@@ -9,6 +9,7 @@ The installed binary's `schema` and `--help` output define its supported command
 Read the [user guides](docs.html) for procedures.
 Use the [command reference](reference.html) for command names and options.
 Use the [desktop reference](desktop.html) for app controls and settings.
+[Try it in your browser](https://capturefab.com/#try) is for people only: it runs in a browser tab and adds no CLI, session, RPC or JSON contract.
 
 ## Start with an external harness
 

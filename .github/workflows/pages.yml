@@ -12,6 +12,8 @@ on:
       - scripts/test-site-ui.js
       - scripts/site-release.py
       - scripts/install-template.*
+      - scripts/build-try.py
+      - scripts/try-tests/**
       - .github/workflows/pages.yml
   workflow_dispatch:
 
@@ -38,6 +40,9 @@ jobs:
       - run: node --check web/docs.js
       - run: node scripts/test-docs-search.js
       - run: node scripts/test-site-ui.js
+      - run: for f in web/try/*.mjs; do node --check "$f"; done
+      # The committed web/try/capturefab.wasm against the golden results, before it is published.
+      - run: node --test scripts/try-tests/*.test.mjs
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24

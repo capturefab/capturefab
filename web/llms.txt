@@ -29,6 +29,7 @@ Use the built-in simulators to try commands without camera hardware.
 - [Source and build guide](https://github.com/capturefab/capturefab): Rust source, build instructions and MIT license.
 - [FFmpeg build notes](https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md): Media dependencies, corresponding source and build provenance.
 - [Remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md): Local browser interface and HTTP activity observation.
+- [Try it in your browser](https://capturefab.com/#try): A webcam or the Pattern camera simulator with histogram, focus scores, features, capture and recording, run locally in a browser tab for people; it has no CLI, session or JSON interface.
 - [Line computer guide](https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md): Headless `serve` as a Linux service on a Raspberry Pi, Jetson or industrial PC: archive choice, camera permissions, systemd, storage budget and efficiency mode.
 
 ## Try it with the simulator

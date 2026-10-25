@@ -1,4 +1,4 @@
-/* Static release selection and optional copy buttons. No telemetry or remote dependencies. */
+/* Static release selection, optional copy buttons and the on-request in-browser workbench. No telemetry or remote dependencies. */
 (() => {
   'use strict';
   document.documentElement.dataset.js = 'true';
@@ -364,4 +364,73 @@
     catch (_) { button.textContent = 'Select text'; button.dataset.state = 'warning'; }
     window.setTimeout(() => { button.textContent = 'Copy'; button.removeAttribute('data-state'); }, 1800);
   }));
+
+  // "Try with your webcam" runs Capturefab in this tab. Its modules, styles and
+  // WebAssembly load from this site only when a button asks for them, and frames
+  // never leave the computer. The click is the gesture that lets the workbench ask
+  // for the camera at once; data-try-launch="welcome" and the #try link open its
+  // welcome screen instead, which asks before it uses a camera.
+  const launchers = [...document.querySelectorAll('[data-try-launch]')];
+  if (launchers.length) {
+    const page = window.location || {};
+    const modules = typeof HTMLScriptElement !== 'undefined' && 'noModule' in HTMLScriptElement.prototype;
+    const fromFile = page.protocol === 'file:';
+    const blocked = fromFile ? 'Browsers do not load its modules from a file. Serve the web folder over http, for example with python3 -m http.server -d web.'
+      : !modules ? 'This browser cannot load JavaScript modules. Update the browser, or download Capturefab.'
+      : window.isSecureContext !== true ? 'This page is not secure. Open it with https, or from localhost.' : '';
+    // A file: preview keeps the buttons, so the layout stays true and a click explains the limit.
+    if (modules && (fromFile || !blocked)) {
+      launchers.forEach((button) => { button.hidden = false; });
+      document.querySelectorAll('[data-try-note]').forEach((note) => { note.hidden = false; });
+    }
+    // Each button names its role="status" line with aria-describedby, so the reason
+    // is announced at once and stays in the button's description.
+    const statusFor = (button) => $(button.getAttribute('aria-describedby') || '');
+    const report = (status, reason) => {
+      if (!status) return;
+      const lead = document.createElement('strong');
+      lead.textContent = 'Capturefab could not start in this browser.';
+      status.replaceChildren(lead, document.createTextNode(` ${reason}`));
+    };
+    // The workbench throws Error(message) with words for people; other errors are defects.
+    const reasonOf = (error) => {
+      if (error?.name === 'Error' && typeof error.message === 'string' && error.message.trim()) return error.message.trim();
+      window.console?.error?.(error);
+      return 'An unexpected error stopped it. Reload the page, then try again.';
+    };
+    const loadReason = (error) => {
+      window.console?.error?.(error);
+      return error?.name === 'SyntaxError' ? 'This browser cannot run its JavaScript. Update the browser, or download Capturefab.'
+        : 'Its files did not load. Make sure that you are online, then try again.';
+    };
+    let loading = false;
+    // Launchers hold plain text, so the label can show progress while the modules load.
+    const open = (button, autostart) => {
+      if (loading) return;
+      const status = statusFor(button);
+      status?.replaceChildren();
+      if (blocked) { report(status, blocked); return; }
+      loading = true;
+      const label = button.textContent;
+      button.textContent = 'Starting…';
+      const loaded = () => { loading = false; button.textContent = label; };
+      import('./try/try.mjs').then((module) => {
+        loaded();
+        // A synchronous throw and a rejected launch end the same way.
+        return new Promise((resolve) => resolve(module.launch(button, { autostart }))).catch((error) => report(status, reasonOf(error)));
+      }, (error) => { loaded(); report(status, loadReason(error)); });
+    };
+    launchers.forEach((button) => button.addEventListener('click', () => open(button, button.dataset.tryLaunch !== 'welcome')));
+    // A shared https://capturefab.com/#try link opens the first launcher's welcome screen.
+    // The link is used up as it opens, so Back or a reload after closing the workbench
+    // does not open it again; replaceState fires no hashchange, and a later #try link
+    // on the page still does.
+    const openFromLink = () => {
+      if (page.hash !== '#try') return;
+      window.history?.replaceState?.(null, '', `${page.pathname ?? ''}${page.search ?? ''}`);
+      open(launchers[0], false);
+    };
+    openFromLink();
+    window.addEventListener?.('hashchange', openFromLink);
+  }
 })();
