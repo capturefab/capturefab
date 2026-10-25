@@ -44,6 +44,10 @@ pub enum Icon {
     Network,
     Usb,
     Video,
+    /// This computer's own camera.
+    Webcam,
+    /// A screen the system offers as a video input.
+    Monitor,
     Cube,
     Check,
     /// An error: a mark in a circle. Warnings use the triangle, so severity
@@ -101,6 +105,8 @@ impl Icon {
             Icon::Network => (REGULAR, '\u{edde}'),
             Icon::Usb => (REGULAR, '\u{e956}'),
             Icon::Video => (REGULAR, '\u{e4da}'),
+            Icon::Webcam => (REGULAR, '\u{e9b2}'),
+            Icon::Monitor => (REGULAR, '\u{e32e}'),
             Icon::Cube => (REGULAR, '\u{e1da}'),
             Icon::Check => (REGULAR, '\u{e184}'),
             Icon::Warning => (REGULAR, '\u{e4e2}'),

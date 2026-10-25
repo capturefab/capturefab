@@ -352,6 +352,7 @@ impl Workbench {
                 if saved.count > 1 {
                     self.thumb_wanted = None;
                 }
+                self.captured_series |= saved.count > 1;
                 if let Some(camera) = saved.camera.clone().filter(|_| more > 0) {
                     self.add_saved(&camera, more);
                 }
@@ -424,6 +425,8 @@ impl Workbench {
         self.prune_saved();
         if let Some(saved) = saved {
             self.shutter.replay(1.0, 0.0, self.now);
+            // A schedule ran: the guide's series step is done.
+            self.captured_series = true;
             self.show_saved(saved);
         }
     }

@@ -149,6 +149,66 @@ pub(super) struct Scene {
     /// Cameras on saved hubs are on the welcome screen, as discovery finds
     /// them (synthetic: no hub is contacted).
     hubs: bool,
+    /// What the welcome screen's discovery finds instead of three
+    /// simulated cameras (synthetic: nothing is enumerated).
+    found: Option<Found>,
+    /// The selected camera streams, but no frame ever reaches the screen.
+    pub(super) no_picture: bool,
+    /// The selected camera reads as GigE Vision (display only).
+    gige: bool,
+}
+
+/// What a welcome scene's discovery finds; see `Scene::found`.
+#[derive(Clone, Copy)]
+enum Found {
+    /// One simulated camera.
+    One,
+    /// More cameras than fit, of every kind, in discovery's ID order.
+    Mixed,
+}
+
+/// `Found::Mixed`: screens and webcams sort first by ID, as on a Mac.
+fn mixed_devices() -> Vec<crate::types::CameraInfo> {
+    use crate::types::{CameraInfo, Transport};
+    let device =
+        |id: &str, transport: Transport, vendor: &str, model: &str, address: Option<&str>| {
+            CameraInfo {
+                id: id.into(),
+                transport,
+                vendor: vendor.into(),
+                model: model.into(),
+                serial: id.rsplit(':').next().unwrap_or(id).into(),
+                address: address.map(str::to_owned),
+                profile: Default::default(),
+            }
+        };
+    let host = |id: &str, model: &str| device(id, Transport::Media, "macos", model, Some(id));
+    vec![
+        host("avfoundation:Capture screen 0", "Capture screen 0"),
+        host("avfoundation:FaceTime HD Camera", "FaceTime HD Camera"),
+        host("avfoundation:HD Pro Webcam C920", "HD Pro Webcam C920"),
+        device(
+            "gige:192.168.10.21",
+            Transport::GigE,
+            "Example Vision",
+            "Area camera (display fixture)",
+            Some("192.168.10.21"),
+        ),
+        device(
+            "scanner:flatbed",
+            Transport::Scanner,
+            "Example Imaging",
+            "Flatbed",
+            None,
+        ),
+        device(
+            "usb:EX0042",
+            Transport::Usb3,
+            "Example Vision",
+            "USB3 camera (display fixture)",
+            None,
+        ),
+    ]
 }
 
 impl Scene {
@@ -156,14 +216,20 @@ impl Scene {
     /// after every refresh, so it never reverts.
     pub(super) fn patch(&self, snapshot: &mut SessionSnapshot) {
         if self.welcome {
-            snapshot.devices = if self.searching {
-                Vec::new()
-            } else {
-                ["sim:0", "sim:line", "sim:thermal"]
+            snapshot.devices = match (self.searching, self.found) {
+                (true, _) => Vec::new(),
+                (false, Some(Found::One)) => vec![crate::transport::simulator::info_named("sim:0")],
+                (false, Some(Found::Mixed)) => mixed_devices(),
+                (false, None) => ["sim:0", "sim:line", "sim:thermal"]
                     .into_iter()
                     .map(crate::transport::simulator::info_named)
-                    .collect()
+                    .collect(),
             };
+        }
+        if self.gige
+            && let Some(connected) = &mut snapshot.connected
+        {
+            connected.transport = crate::types::Transport::GigE;
         }
         if self.hubs
             && !snapshot
@@ -264,6 +330,13 @@ impl Workbench {
     ///   `analytics-measurements-populated`, `analytics-invalid`,
     ///   `close-error`;
     ///   `sheet-bottom` and `inspector-bottom` expose their lower content
+    /// - welcome: `side-one` (with `welcome`: discovery finds one simulated
+    ///   camera), `side-mixed` (finds more cameras than fit, of every kind),
+    ///   `camera-denied` (the system refused a webcam), `usb-denied` (with
+    ///   `side-mixed`: Linux refused the USB3 camera, whose udev rule the
+    ///   footer offers to copy)
+    /// - first frame: `no-first-frame` (the selected camera streams, but its
+    ///   first frame is late), `side-gige` (it reads as GigE Vision)
     /// - failures: `write-error` (setting the selected camera's exposure
     ///   time was refused) and `connect-failed` (connecting to a typed
     ///   address failed), each with its error notice; `editor` (the folder
@@ -277,6 +350,36 @@ impl Workbench {
                 // run_capture connects no cameras. The snapshot supplies only
                 // built-in simulator cards, without real device discovery.
                 "welcome" => self.scene.welcome = true,
+                "side-one" => self.scene.found = Some(Found::One),
+                "side-mixed" => self.scene.found = Some(Found::Mixed),
+                "side-gige" => self.scene.gige = true,
+                "camera-denied" => {
+                    // As connecting to a webcam the system refused would.
+                    let target = "avfoundation:0";
+                    self.scene_settle(
+                        Pending {
+                            target: Some(target.into()),
+                            ..Pending::unanswered(Job::Connect)
+                        },
+                        Err(anyhow::anyhow!(
+                            "{}: allow this app in System Settings > Privacy & Security > Camera",
+                            crate::media::CAMERA_ACCESS_DENIED
+                        )),
+                    );
+                }
+                "usb-denied" => {
+                    // As connecting to a USB3 camera Linux refused would.
+                    self.scene_settle(
+                        Pending {
+                            target: Some("usb:EX0042".into()),
+                            ..Pending::unanswered(Job::Connect)
+                        },
+                        Err(crate::doctor::usb_access_error(
+                            "USB3 camera (display fixture)",
+                            std::path::Path::new("/dev/bus/usb/002/003"),
+                        )),
+                    );
+                }
                 "side-hub" => self.scene.hubs = true,
                 "help" => self.help_open = true,
                 "agents" => self.show_agent_setup(true),
@@ -452,7 +555,7 @@ impl Workbench {
                         .update(destinations::Message::Save, &mut self.output);
                 }
                 "saved" | "copied" | "pending" | "starting" | "write-error" | "kind-scanner"
-                | "kind-unknown" => self.scene.late.push((*word).into()),
+                | "kind-unknown" | "no-first-frame" => self.scene.late.push((*word).into()),
                 word if self.area_scene(word, false) => {
                     let controls = match word {
                         "quick-command-exported" => Some((
@@ -505,6 +608,13 @@ impl Workbench {
         for word in std::mem::take(&mut self.scene.late) {
             match word.as_str() {
                 "kind-scanner" | "kind-unknown" => self.scene_display_profile(&word),
+                "no-first-frame" => {
+                    // Streaming with no frame on screen, silent past its
+                    // limit: the first frame is late.
+                    self.scene.no_picture = true;
+                    self.shown = None;
+                    self.scene.stalled = true;
+                }
                 "saved" => {
                     let result = json!({
                         "files": ["capture-0001.png"],

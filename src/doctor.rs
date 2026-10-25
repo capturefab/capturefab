@@ -748,14 +748,68 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
             "No read/write access to USB3 Vision camera {}.",
             names.join(", ")
         ),
-        // One rule for the USB3 Vision class covers every camera plugged in
-        // later. The note is a shell comment, so the whole line still pastes
-        // and runs.
-        format!(
-            "printf '%s\\n' '{}' '{}' | sudo tee /etc/udev/rules.d/{UDEV_RULE_FILE} >/dev/null && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add  # services also need their user in the plugdev group; see {LINE_COMPUTER}",
-            UDEV_RULES[0], UDEV_RULES[1]
-        ),
+        usb_access_fix(),
     ))
+}
+
+/// The paste-ready command that gives this user read/write access to USB3
+/// Vision cameras through the shipped udev rule. It uses sudo, so it is only
+/// ever shown or copied, never run.
+pub fn usb_access_fix() -> String {
+    // One rule for the USB3 Vision class covers every camera plugged in
+    // later. The note is a shell comment, so the whole line still pastes
+    // and runs.
+    format!(
+        "printf '%s\\n' '{}' '{}' | sudo tee /etc/udev/rules.d/{UDEV_RULE_FILE} >/dev/null && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add  # services also need their user in the plugdev group; see {LINE_COMPUTER}",
+        UDEV_RULES[0], UDEV_RULES[1]
+    )
+}
+
+/// How the error for a USB3 Vision camera this user may not open or claim
+/// starts (see `transport::usb`).
+pub const USB_ACCESS_DENIED: &str = "No permission to";
+
+/// `message` with [`usb_access_fix`] on a line of its own (see
+/// [`fix_line`]), so the desktop app can offer to copy it.
+pub fn with_usb_access_fix(message: impl std::fmt::Display) -> String {
+    format!("{message}\n{FIX_PREFIX}{}", usb_access_fix())
+}
+
+/// The error for a USB3 Vision camera Linux refused to open, at usbfs
+/// `node`, as `transport::usb` reports it: unavailable, carrying the fix.
+pub fn usb_access_error(name: &str, node: &Path) -> anyhow::Error {
+    crate::types::Categorized::error(
+        crate::types::ErrorKind::Unavailable,
+        with_usb_access_fix(format!(
+            "{USB_ACCESS_DENIED} open USB3 Vision camera {name} ({}). Run `capturefab doctor` for the udev rule that fixes it.",
+            node.display()
+        )),
+    )
+}
+
+/// What starts the line of an error message that carries a paste-ready fix,
+/// as `doctor` prints it; see [`fix_line`].
+pub const FIX_PREFIX: &str = "Fix: ";
+
+/// The fix an error message carries on a line of its own, if any.
+pub fn fix_line(message: &str) -> Option<&str> {
+    message
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix(FIX_PREFIX))
+        .map(str::trim)
+        .filter(|fix| !fix.is_empty())
+}
+
+/// Whether this user lacks read/write access to the usbfs `node`
+/// (`/dev/bus/usb/BBB/DDD`). A permission check only: it opens nothing.
+#[cfg(all(target_os = "linux", feature = "usb"))]
+pub fn usb_access_denied(node: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(node.as_os_str().as_bytes()).is_ok_and(|path| {
+        // SAFETY: a NUL-terminated path; access only checks permissions.
+        let status = unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) };
+        status != 0
+    })
 }
 
 /// Whether the part of the budget not yet used fits on the disk captures
@@ -910,7 +964,6 @@ fn limits() -> Limits {
 /// this user may open their usbfs nodes.
 #[cfg(all(target_os = "linux", feature = "usb"))]
 fn usb_cameras() -> Vec<UsbCamera> {
-    use std::os::unix::ffi::OsStrExt;
     let root = Path::new("/sys/bus/usb/devices");
     let read = |path: PathBuf| {
         std::fs::read_to_string(path)
@@ -940,9 +993,7 @@ fn usb_cameras() -> Vec<UsbCamera> {
             let bus: u32 = read(dir.join("busnum")).parse().ok()?;
             let number: u32 = read(dir.join("devnum")).parse().ok()?;
             let node = PathBuf::from(format!("/dev/bus/usb/{bus:03}/{number:03}"));
-            let path = std::ffi::CString::new(node.as_os_str().as_bytes()).ok()?;
-            // SAFETY: a NUL-terminated path; access only checks permissions.
-            let accessible = unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) } == 0;
+            let accessible = !usb_access_denied(&node);
             let product = read(dir.join("product"));
             Some(UsbCamera {
                 name: if product.is_empty() { device } else { product },
@@ -1557,6 +1608,35 @@ mod tests {
             .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
             .collect();
         assert_eq!(rules, UDEV_RULES);
+        // The desktop app and the USB open error offer the same command.
+        assert_eq!(fix_line(&with_usb_access_fix("x")), Some(usb_access_fix().as_str()));
+    }
+
+    #[test]
+    fn a_refused_camera_is_unavailable_and_keeps_its_fix_across_processes() {
+        let error = usb_access_error("acA1920-155um", Path::new("/dev/bus/usb/002/003"));
+        assert_eq!(crate::cli::error_code(&error).1, 3);
+        let code = crate::types::error_transport_code(&error);
+        assert_eq!(code, Some("unavailable"));
+        // As a worker reply carries it to the coordinator and the GUI.
+        let rebuilt = crate::types::error_from_transport(code, format!("{error:#}"));
+        assert_eq!(crate::cli::error_code(&rebuilt).1, 3);
+        let message = format!("{rebuilt:#}");
+        assert_eq!(
+            message.lines().next(),
+            Some("No permission to open USB3 Vision camera acA1920-155um (/dev/bus/usb/002/003). Run `capturefab doctor` for the udev rule that fixes it.")
+        );
+        assert_eq!(fix_line(&message), Some(usb_access_fix().as_str()));
+    }
+
+    #[test]
+    fn a_fix_line_is_read_back_from_an_error_message() {
+        assert_eq!(fix_line("camera busy"), None);
+        assert_eq!(
+            fix_line("connect: no access\nFix: sudo true"),
+            Some("sudo true")
+        );
+        assert_eq!(fix_line("no access\nFix:   "), None);
     }
 
     #[test]

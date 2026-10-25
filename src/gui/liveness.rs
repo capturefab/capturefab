@@ -202,6 +202,11 @@ impl Liveness {
         self.busy = false;
     }
 
+    /// Read as waiting for triggers, as a camera with TriggerMode On is.
+    #[cfg(test)]
+    pub(super) fn pace_triggered_for_tests(&mut self) {
+        self.pace.triggered = true;
+    }
     /// Whether its counters are too old to tell anything at `now`: its
     /// worker has been busy for longer than `BUSY_GRACE`.
     fn unknown(&self, now: Instant) -> bool {

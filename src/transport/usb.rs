@@ -207,7 +207,17 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
                 std::env::consts::OS,
             );
             // The OS's own words stay on the line for whoever debugs it.
-            Categorized::error(kind, format!("{message} (USB: {error})"))
+            let message = format!("{message} (USB: {error})");
+            // On Linux the udev rule fixes it; the desktop app offers to
+            // copy that line.
+            let message = if error.kind() == nusb::ErrorKind::PermissionDenied
+                && cfg!(target_os = "linux")
+            {
+                crate::doctor::with_usb_access_fix(message)
+            } else {
+                message
+            };
+            Categorized::error(kind, message)
         }
     };
     let device = device_info.open().wait().map_err(refused(Stage::Open))?;
@@ -918,6 +928,17 @@ mod tests {
             access_error(Stage::Open, Usb::PermissionDenied, "acA", node, "linux");
         let error = Categorized::error(kind, message).context("connect usb:2676:ba02:1");
         assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+        // The desktop app recognizes the refusal by doctor's wording.
+        let (_, message) = access_error(
+            Stage::Open,
+            Usb::PermissionDenied,
+            "acA",
+            Some("/dev/bus/usb/002/003"),
+            "linux",
+        );
+        let doctor =
+            crate::doctor::usb_access_error("acA", std::path::Path::new("/dev/bus/usb/002/003"));
+        assert_eq!(format!("{doctor:#}").lines().next(), Some(message.as_str()));
     }
     #[test]
     fn cameras_without_a_product_string_are_named_by_usb_ids() {

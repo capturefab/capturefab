@@ -21,6 +21,54 @@ pub(super) enum Command {
     Quit,
     AgentSetup,
     CheckUpdates,
+    /// Open a page about Capturefab in the browser.
+    Link(Link),
+    /// The version, where the system's app menu has no About item.
+    About,
+}
+
+/// The Help menu's pages on the web.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Link {
+    Documentation,
+    Troubleshooting,
+    ReleaseNotes,
+    /// A new GitHub issue from the bug template, filled in with only the
+    /// version and system; the reporter adds the rest in the browser.
+    ReportProblem,
+}
+
+const SITE: &str = "https://capturefab.com";
+const REPOSITORY: &str = "https://github.com/capturefab/capturefab";
+
+/// This build and the system it runs on, as a bug report asks for them:
+/// nothing private, so it may go in a URL.
+pub(super) fn version_line() -> String {
+    format!(
+        "Capturefab {} on {} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
+impl Link {
+    pub(super) fn url(self) -> String {
+        match self {
+            Self::Documentation => format!("{SITE}/docs.html"),
+            Self::Troubleshooting => format!("{SITE}/docs.html#troubleshooting"),
+            Self::ReleaseNotes => {
+                format!("{REPOSITORY}/releases/tag/v{}", env!("CARGO_PKG_VERSION"))
+            }
+            // Issue forms fill a field from the query parameter of its id.
+            Self::ReportProblem => format!(
+                "{REPOSITORY}/issues/new?template=bug.yml&version={}&os={}%20{}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -147,7 +195,7 @@ impl Workbench {
                     action(
                         "Discover Cameras",
                         Action::Discover,
-                        ready && !self.pending(Job::Discover),
+                        ready && !self.discovering_aloud(),
                     ),
                     None,
                     action(
@@ -368,18 +416,46 @@ impl Workbench {
             Menu {
                 title: "Help",
                 items: vec![
+                    action("Capturefab Help", Action::Help, ready || self.help_open),
                     Some(Item::command(
                         "Connect an Agent…",
                         Command::AgentSetup,
                         ready,
                     )),
-                    action("Capturefab Help", Action::Help, ready || self.help_open),
+                    None,
+                    Some(Item::command(
+                        "Documentation",
+                        Command::Link(Link::Documentation),
+                        true,
+                    )),
+                    Some(Item::command(
+                        "Troubleshooting",
+                        Command::Link(Link::Troubleshooting),
+                        true,
+                    )),
+                    Some(Item::command(
+                        "Release Notes",
+                        Command::Link(Link::ReleaseNotes),
+                        true,
+                    )),
+                    None,
+                    Some(Item::command(
+                        "Report a Problem…",
+                        Command::Link(Link::ReportProblem),
+                        true,
+                    )),
                 ],
             },
         ];
+        // macOS has About and Check for Updates in the app menu.
         if !cfg!(target_os = "macos") {
             let help = menus.len() - 1;
             menus[help].items.push(None);
+            menus[help].items.push(Some(Item::command(
+                "About Capturefab",
+                Command::About,
+                true,
+            )));
             menus[help].items.push(Some(self.updates_menu_item()));
             menus[0].items.push(None);
             menus[0].items.push(Some(Item {
@@ -419,6 +495,25 @@ impl Workbench {
             Command::AgentSetup => self.handle_message(Message::AgentSetup(true)),
             // Before the guard: the handler itself refuses to stack sheets.
             Command::CheckUpdates => self.handle_message(Message::Updates(updates::Input::Open)),
+            Command::Link(link) => {
+                let url = link.url();
+                if let Err(error) = reveal::open_url(&url) {
+                    self.set_notice(
+                        "Could not open the browser",
+                        Some(format!("{url}\n{error}")),
+                        Level::Error,
+                    );
+                }
+                Task::none()
+            }
+            Command::About => {
+                self.set_notice(
+                    version_line(),
+                    Some(format!("{}\nMIT license · {SITE}", version_line())),
+                    Level::Done,
+                );
+                Task::none()
+            }
             Command::Edit(command) => {
                 let serial = self
                     .menu_edit
@@ -479,6 +574,63 @@ mod tests {
 
     fn bench() -> Workbench {
         Workbench::new(SessionHandle::new(), "menu-test".into(), false, None)
+    }
+
+    /// Help leads to the documentation, release notes and a bug report on
+    /// the web; the report carries the version and system, nothing more.
+    #[test]
+    fn help_leads_to_the_docs_and_a_report_without_private_data() {
+        let app = bench();
+        let help = app
+            .command_menus()
+            .into_iter()
+            .find(|menu| menu.title == "Help")
+            .unwrap();
+        let titles: Vec<_> = help
+            .items
+            .iter()
+            .flatten()
+            .map(|item| item.title.as_str())
+            .collect();
+        for title in [
+            "Documentation",
+            "Troubleshooting",
+            "Release Notes",
+            "Report a Problem…",
+        ] {
+            assert!(titles.contains(&title), "{titles:?}");
+        }
+        assert_eq!(
+            titles.contains(&"About Capturefab"),
+            !cfg!(target_os = "macos"),
+            "the app menu has it on macOS"
+        );
+        for link in [
+            Link::Documentation,
+            Link::Troubleshooting,
+            Link::ReleaseNotes,
+            Link::ReportProblem,
+        ] {
+            assert!(link.url().starts_with("https://"), "{link:?}");
+        }
+        assert!(
+            Link::ReleaseNotes
+                .url()
+                .ends_with(&format!("/v{}", env!("CARGO_PKG_VERSION")))
+        );
+        let report = Link::ReportProblem.url();
+        assert!(report.contains("/issues/new?template=bug.yml&version="));
+        let query = report.split_once('?').unwrap().1;
+        assert!(
+            !query.contains('/') && !query.contains('@') && !query.contains('\\'),
+            "no paths or addresses: {query}"
+        );
+        assert!(!query.contains(&*std::env::temp_dir().to_string_lossy()));
+        // The issue form names these fields.
+        let template = include_str!("../../.github/ISSUE_TEMPLATE/bug.yml");
+        for field in ["id: version", "id: os"] {
+            assert!(template.contains(field), "{field}");
+        }
     }
 
     #[test]

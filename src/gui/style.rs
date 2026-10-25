@@ -898,6 +898,21 @@ pub fn on_glass(active: bool, shown: f32) -> impl Fn(&Theme, button::Status) -> 
     }
 }
 
+/// A secondary button straight on the dark stage, with a visible resting
+/// fill and edge, where `on_glass` would read as a caption.
+pub fn on_stage(_theme: &Theme, status: button::Status) -> button::Style {
+    let (fill, text) = match status {
+        button::Status::Active => (0.08, ON_STAGE),
+        button::Status::Hovered => (0.14, ON_STAGE),
+        button::Status::Pressed => (0.22, ON_STAGE),
+        button::Status::Disabled => (0.04, alpha(ON_STAGE, 0.35)),
+    };
+    button::Style {
+        border: hairline(alpha(Color::WHITE, 0.14), RADIUS),
+        ..button_base(Some(alpha(Color::WHITE, fill)), text, RADIUS)
+    }
+}
+
 /// A segment of a segmented control on dark glass.
 pub fn glass_segment(
     selected: bool,

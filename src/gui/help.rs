@@ -163,13 +163,31 @@ impl Workbench {
     }
 
     /// Which of the guide's first steps are done: a camera connected, a
-    /// stream started, a frame captured.
-    pub(super) fn guide_steps(&self) -> [bool; 3] {
+    /// stream started, a frame captured, then a series: several frames in
+    /// one capture, or a scheduled capture. That one stays done once it was.
+    pub(super) fn guide_steps(&self) -> [bool; 4] {
         [
             !self.snapshot.cameras.is_empty(),
             self.snapshot.cameras.iter().any(|camera| camera.streaming),
             self.last_saved.is_some(),
+            self.captured_series
+                || self
+                    .last_saved
+                    .as_ref()
+                    .is_some_and(|saved| saved.count > 1),
         ]
+    }
+
+    /// The guide's next step after one frame: close it and put the
+    /// keyboard in the Capture panel's frame count.
+    pub(super) fn set_frame_count(&mut self) -> Task<Message> {
+        if self.help_open {
+            self.show_help(false);
+        }
+        self.tab = Tab::Capture;
+        self.show_sidebar();
+        let id = format!("number:{:?}", Num::Count);
+        Task::batch([operation::focus(id.clone()), operation::select_all(id)])
     }
 
     /// The guide's first steps, each marked once done; the first one not
@@ -187,9 +205,14 @@ impl Workbench {
             step_button(label, Some(key.key_label(os)), name, on, p)
         };
         let mut steps = column![].spacing(4);
-        for (index, label) in ["Connect a camera", "Start the stream", "Capture a frame"]
-            .into_iter()
-            .enumerate()
+        for (index, label) in [
+            "Connect a camera",
+            "Start the stream",
+            "Capture a frame",
+            "Capture a series",
+        ]
+        .into_iter()
+        .enumerate()
         {
             let mark: Element<'_, Message> = if done[index] {
                 icon(Icon::Check, 14.0, p.ink(p.live))
@@ -250,7 +273,7 @@ impl Workbench {
                                 .then_some(Message::ToggleStream),
                         ));
                     }
-                    _ => {
+                    2 => {
                         step = step.push(keyed(
                             "Capture",
                             Action::Capture,
@@ -260,7 +283,35 @@ impl Workbench {
                             .then_some(Message::Capture),
                         ));
                     }
+                    _ => {
+                        // In the Capture panel's words for this camera.
+                        let label = match self.camera_kind() {
+                            CameraKind::DocumentScanner => "Set Pages",
+                            CameraKind::LineScan => "Set Blocks",
+                            _ => "Set Frames",
+                        };
+                        step = step.push(link(
+                            label,
+                            "Set the frame count",
+                            Some(Message::SetFrameCount),
+                        ));
+                        step = step.push(
+                            text("then Capture, or capture on a schedule")
+                                .size(style::SMALL)
+                                .color(p.secondary),
+                        );
+                    }
                 }
+            } else if index == 2
+                && done[index]
+                && let Some(saved) = &self.last_saved
+            {
+                // Where the last capture went, once there is one.
+                step = step.push(space().width(4)).push(link(
+                    reveal::label(),
+                    "Show the captured file",
+                    Some(Message::Reveal(saved.path.clone().into())),
+                ));
             }
             steps = steps.push(step.wrap().vertical_spacing(6));
         }
@@ -460,12 +511,8 @@ impl Workbench {
         let [editing, cameras, acquisition, view, panels, window] = Action::SECTIONS;
         let more = self.sheets.more;
         let mut body = column![
+            // Only while a newer version is available.
             self.updates_help_row(p),
-            button(text("Connect an external agent…").size(style::BODY))
-                .name("Open agent setup")
-                .style(style::secondary)
-                .padding([7, 12])
-                .on_press(Message::AgentSetup(true)),
             self.guide_steps_view(p),
             disclosure(
                 "Connecting cameras",
@@ -477,7 +524,7 @@ impl Workbench {
         ]
         .spacing(14);
         if more {
-            body = body.push(connection_notes(p));
+            body = body.push(connection_notes(self.just_copied(HUB_COMMAND), p));
         }
         let body = body
             .push(
@@ -501,7 +548,20 @@ impl Workbench {
                     .size(style::BODY),
             )
             .push(self.copyable(self.session_command(), p))
-            .push(self.copyable("capturefab --help".into(), p));
+            .push(self.copyable("capturefab --help".into(), p))
+            .push(
+                button(text("Connect an external agent…").size(style::BODY))
+                    .name("Open agent setup")
+                    .style(style::secondary)
+                    .padding([7, 12])
+                    .on_press(Message::AgentSetup(true)),
+            )
+            // For a bug report: Help > Report a Problem fills it in.
+            .push(
+                text(menus::version_line())
+                    .size(style::CAPTION)
+                    .color(p.secondary),
+            );
         sheet_frame("Quick guide", Message::Help(false), body, p)
             .mark(Icon::Keyboard)
             .size(700.0, height)
@@ -568,9 +628,14 @@ fn webcam_scheme() -> &'static str {
     }
 }
 
+/// How the guide's notes save a hub, as README.md shows it: the secret
+/// comes from a file on standard input, never the command line.
+const HUB_COMMAND: &str = "capturefab hub add-home-assistant home --url http://homeassistant.local:8123 --secret-stdin < token.txt";
+
 /// The guide's notes on connecting cameras: one short line per kind of
-/// source, what to type for it in small monospace.
-fn connection_notes<'a>(p: &'static Palette) -> Element<'a, Message> {
+/// source, what to type for it in small monospace. `hub_copied`: the hub
+/// command was just copied.
+fn connection_notes<'a>(hub_copied: bool, p: &'static Palette) -> Element<'a, Message> {
     let note = |kind: &'static str, about: &'static str, syntax: Option<&'static str>| {
         let mut detail = column![
             text(about)
@@ -611,12 +676,31 @@ fn connection_notes<'a>(p: &'static Palette) -> Element<'a, Message> {
             "Loop a file, or a folder's frames by name (not subfolders).",
             Some("sim:replay:PATH")
         ),
-        note("Webcams", "Built-in and USB webcams.", Some(webcam_scheme())),
+        note(
+            "Webcams",
+            "Built-in and USB webcams appear with the other cameras once the system allows camera access.",
+            Some(webcam_scheme())
+        ),
         note(
             "Hubs",
-            "Cameras from Home Assistant, Frigate, go2rtc and UniFi Protect, after you save the server with capturefab hub add-home-assistant (or add-frigate, add-go2rtc, add-unifi-protect).",
+            "Save a Home Assistant server once in a terminal; its cameras then appear with the others.",
             Some("hub:NAME/CAMERA")
         ),
+        row![
+            space().width(100),
+            column![
+                container(code_block(HUB_COMMAND.into(), hub_copied, p)).width(Fill),
+                text(
+                    "For Frigate, go2rtc or UniFi Protect, use add-frigate, add-go2rtc or add-unifi-protect (see capturefab hub --help)."
+                )
+                .size(style::SMALL)
+                .color(p.secondary)
+                .width(Fill)
+                .wrapping(text::Wrapping::WordOrGlyph),
+            ]
+            .spacing(4)
+            .width(Fill),
+        ],
         note("GigE", "Use an address on the camera's subnet.", None).push(tip(
             step_button("Check network", None, "Check network", Some(Message::ScanNetwork), p),
             "Tunes connected GigE cameras for the available bandwidth and checks network adapters. Live previews may pause briefly.",
@@ -664,34 +748,45 @@ mod tests {
             }
         }
         let renderer = renderer();
-        let app = bench();
-        let mut baseline = vec![];
-        for (index, width) in [1000.0, 480.0, 480.0 / UiScale::Larger.factor()]
-            .into_iter()
-            .enumerate()
-        {
-            let mut view = app.guide_steps_view(Palette::of(false));
-            let mut tree = Tree::new(view.as_widget());
-            let node = view.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(width, 1000.0)),
-            );
-            let mut actions = Actions::default();
-            view.as_widget_mut()
-                .operate(&mut tree, Layout::new(&node), &renderer, &mut actions);
-            assert_eq!(actions.0.len(), 2);
-            if index == 0 {
-                baseline = actions.0;
-                continue;
-            }
-            for (name, bounds) in actions.0 {
-                let natural = baseline.iter().find(|(label, _)| label == &name).unwrap().1;
-                assert!(
-                    bounds.width + 0.5 >= natural.width && bounds.height <= natural.height + 0.5,
-                    "{name} keeps its label at {width} logical pixels: {bounds:?}; natural {natural:?}"
+        // The first step's offers, then the last step's with the file link.
+        let mut later = bench();
+        later.snapshot.cameras = vec![super::super::liveness::streaming_camera(10, 0, 30.0)];
+        later.last_saved =
+            Saved::from_result(None, &serde_json::json!({ "files": ["f.png"] }), later.now);
+        for app in [bench(), later] {
+            let mut baseline = vec![];
+            for (index, width) in [1000.0, 480.0, 480.0 / UiScale::Larger.factor()]
+                .into_iter()
+                .enumerate()
+            {
+                let mut view = app.guide_steps_view(Palette::of(false));
+                let mut tree = Tree::new(view.as_widget());
+                let node = view.as_widget_mut().layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(width, 1000.0)),
                 );
-                assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.5);
+                let mut actions = Actions::default();
+                view.as_widget_mut().operate(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &mut actions,
+                );
+                assert_eq!(actions.0.len(), 2);
+                if index == 0 {
+                    baseline = actions.0;
+                    continue;
+                }
+                for (name, bounds) in actions.0 {
+                    let natural = baseline.iter().find(|(label, _)| label == &name).unwrap().1;
+                    assert!(
+                        bounds.width + 0.5 >= natural.width
+                            && bounds.height <= natural.height + 0.5,
+                        "{name} keeps its label at {width} logical pixels: {bounds:?}; natural {natural:?}"
+                    );
+                    assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= width + 0.5);
+                }
             }
         }
     }
@@ -719,7 +814,7 @@ mod tests {
         }
 
         let mut renderer = renderer();
-        let mut baseline = connection_notes(Palette::of(false));
+        let mut baseline = connection_notes(false, Palette::of(false));
         let mut baseline_tree = Tree::new(baseline.as_widget());
         let baseline_node = baseline.as_widget_mut().layout(
             &mut baseline_tree,
@@ -733,10 +828,10 @@ mod tests {
             &renderer,
             &mut baseline_geometry,
         );
-        for dark in [false, true] {
+        for (dark, copied) in [(false, false), (true, false), (false, true), (true, true)] {
             for scale in UiScale::ALL {
                 let viewport = Size::new(480.0, 1200.0) / scale.factor();
-                let mut view = connection_notes(Palette::of(dark));
+                let mut view = connection_notes(copied, Palette::of(dark));
                 let mut tree = Tree::new(view.as_widget());
                 let node = view.as_widget_mut().layout(
                     &mut tree,
@@ -776,8 +871,9 @@ mod tests {
                 }
                 render_artifact_themed(
                     &format!(
-                        "connection-notes-{}-{scale}",
-                        if dark { "dark" } else { "light" }
+                        "connection-notes-{}{}-{scale}",
+                        if dark { "dark" } else { "light" },
+                        if copied { "-copied" } else { "" }
                     ),
                     &view,
                     &tree,
@@ -788,6 +884,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The hub command the guide offers to copy reads its secret from a
+    /// file, so no credential is ever on the clipboard or in shell history.
+    #[test]
+    fn the_hub_command_carries_no_secret() {
+        assert!(HUB_COMMAND.contains("--secret-stdin < token.txt"));
+        let url = HUB_COMMAND
+            .split_whitespace()
+            .skip_while(|word| *word != "--url")
+            .nth(1)
+            .unwrap();
+        assert!(!url.contains('@') && !url.contains("token="), "{url}");
+        assert!(
+            include_str!("../../README.md").contains(HUB_COMMAND),
+            "matches the README"
+        );
     }
 
     fn bench() -> Workbench {
@@ -884,13 +997,29 @@ mod tests {
     #[test]
     fn the_guide_marks_its_first_steps_as_they_are_done() {
         let mut bench = bench();
-        assert_eq!(bench.guide_steps(), [false; 3]);
+        assert_eq!(bench.guide_steps(), [false; 4]);
         let mut camera = super::super::liveness::streaming_camera(10, 0, 30.0);
         camera.streaming = false;
         bench.snapshot.cameras = vec![camera];
-        assert_eq!(bench.guide_steps(), [true, false, false]);
+        assert_eq!(bench.guide_steps(), [true, false, false, false]);
         bench.snapshot.cameras[0].streaming = true;
-        assert_eq!(bench.guide_steps(), [true, true, false]);
+        assert_eq!(bench.guide_steps(), [true, true, false, false]);
+        bench.last_saved = Saved::from_result(
+            None,
+            &serde_json::json!({ "files": ["frame-1.png"] }),
+            bench.now,
+        );
+        assert_eq!(bench.guide_steps(), [true, true, true, false]);
+        // Two files from one capture, as `finished` records them.
+        let pending = Pending::unanswered(Job::Capture);
+        bench.finished(
+            &pending,
+            &serde_json::json!({ "files": ["frame-2.png", "frame-3.png"] }),
+        );
+        assert_eq!(bench.guide_steps(), [true; 4]);
+        // The saved line goes; the series stays done.
+        bench.last_saved = None;
+        assert_eq!(bench.guide_steps(), [true, true, false, true]);
     }
 
     /// The guide's controls by name and what each sends, at the sheet's
@@ -954,6 +1083,16 @@ mod tests {
             buttons.iter().all(|(label, _)| !label.is_empty()),
             "{buttons:?}"
         );
+        // The steps lead; connecting an agent waits under Automation.
+        let at = |name: &str| buttons.iter().position(|(label, _)| label == name);
+        assert!(
+            at("Enter an address") < at("Open agent setup"),
+            "{buttons:?}"
+        );
+        assert!(matches!(
+            sent(&buttons, "Open agent setup"),
+            Some(Message::AgentSetup(true))
+        ));
         assert!(matches!(
             sent(&buttons, "Enter an address"),
             Some(Message::EnterAddress)
@@ -994,6 +1133,20 @@ mod tests {
             "the streaming camera can capture: {:?}",
             sent(&buttons, "Capture a frame")
         );
+        // One frame captured: the next step sets the frame count, and the
+        // captured file is a click away.
+        bench.last_saved =
+            Saved::from_result(None, &serde_json::json!({ "files": ["f.png"] }), bench.now);
+        let buttons = guide_buttons(&bench);
+        assert!(matches!(
+            sent(&buttons, "Set the frame count"),
+            Some(Message::SetFrameCount)
+        ));
+        assert!(matches!(
+            sent(&buttons, "Show the captured file"),
+            Some(Message::Reveal(path)) if path == std::path::Path::new("f.png")
+        ));
+        assert!(!buttons.iter().any(|(label, _)| label == "Capture a frame"));
         // The notes hold the network check.
         bench.sheets.more = true;
         let buttons = guide_buttons(&bench);
@@ -1015,6 +1168,14 @@ mod tests {
         assert!(
             !bench.help_open && bench.network_open,
             "the report takes its place"
+        );
+        let _ = bench.handle_message(Message::NetworkReport(false));
+        let _ = bench.handle_message(Message::Help(true));
+        bench.tab = Tab::Forward;
+        let _ = bench.handle_message(Message::SetFrameCount);
+        assert!(
+            !bench.help_open && bench.tab == Tab::Capture && bench.sidebar_open,
+            "the Capture panel's frame count is under the guide"
         );
     }
 

@@ -739,6 +739,9 @@ struct SessionLog {
     taken: BTreeMap<u64, u64>,
     coordinator: u64,
     revision: u64,
+    /// The last discovery's warnings, so a round that repeats them, such as
+    /// the desktop's quiet rediscovery, does not log them again.
+    discovery_warnings: Vec<String>,
 }
 impl SessionLog {
     fn add(&mut self, source: u64, seq: u64, entry: LogEntry) {
@@ -2847,8 +2850,11 @@ impl SessionHandle {
                 )?;
                 self.edit_state().devices = devices.clone();
                 let mut log = locked(&self.inner.log);
-                for warning in &warnings {
-                    log.note(LogEntry::now_local("warn", warning.clone()));
+                if log.discovery_warnings != warnings {
+                    for warning in &warnings {
+                        log.note(LogEntry::now_local("warn", warning.clone()));
+                    }
+                    log.discovery_warnings = warnings.clone();
                 }
                 drop(log);
                 Ok(json!({"devices":devices,"warnings":warnings}))
