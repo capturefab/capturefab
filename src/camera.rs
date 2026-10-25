@@ -485,6 +485,29 @@ impl Camera {
         let nodes = NodeMap::parse(&xml).context("parse camera GenICam XML")?;
         let mut profile_metadata = nodes.profile_features(backend.as_mut());
         info.profile = crate::camera_profile::detect(&info, &profile_metadata);
+        // Feature evidence must be implemented and available now. Only the
+        // few evidence nodes are checked, not every node at connection.
+        for _ in 0..4 {
+            if info.profile.source != crate::camera_profile::DetectionSource::Features {
+                break;
+            }
+            let hidden: Vec<_> = info
+                .profile
+                .evidence
+                .iter()
+                .filter(|name| {
+                    nodes.has(name)
+                        && nodes.availability(backend.as_mut(), name)
+                            != crate::genicam::Availability::Available
+                })
+                .cloned()
+                .collect();
+            if hidden.is_empty() {
+                break;
+            }
+            profile_metadata.retain(|feature| !hidden.contains(&feature.name));
+            info.profile = crate::camera_profile::detect(&info, &profile_metadata);
+        }
         // Devices may keep their identifying nodes outside Root or Invisible.
         // Preserve those declarations when normal feature snapshots omit them.
         profile_metadata.retain(|feature| {
@@ -1423,6 +1446,47 @@ pub(crate) mod tests {
         assert!(!camera.features().iter().any(|f| f.name == "DeviceScanType"));
         assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
         assert_eq!(camera.info.profile.source, DetectionSource::DeviceMetadata);
+    }
+
+    #[test]
+    fn unavailable_line_rate_node_does_not_classify_an_area_camera() {
+        struct Fixture(&'static str);
+        impl crate::types::RegisterIo for Fixture {
+            fn read_memory(&mut self, _: u64, length: usize) -> Result<Vec<u8>> {
+                Ok(vec![0; length])
+            }
+            fn write_memory(&mut self, _: u64, _: &[u8]) -> Result<()> {
+                Ok(())
+            }
+        }
+        impl Backend for Fixture {
+            fn xml(&mut self) -> Result<String> {
+                Ok(self.0.into())
+            }
+            fn start(&mut self, _: usize) -> Result<()> {
+                Ok(())
+            }
+            fn next_frame(&mut self, _: Duration) -> Result<Frame> {
+                anyhow::bail!("no frames")
+            }
+            fn stop(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        // An area sensor whose line scan mode is off hides its line rate.
+        let xml = r#"<RegisterDescription>
+            <Integer Name="Width"><Value>640</Value></Integer>
+            <Integer Name="Height"><Value>480</Value></Integer>
+            <Float Name="AcquisitionFrameRate"><Value>30</Value></Float>
+            <Float Name="AcquisitionLineRate"><Value>5000</Value><pIsAvailable>LinescanMode</pIsAvailable></Float>
+            <IntReg Name="LinescanMode"><Address>0</Address><Length>4</Length><AccessMode>RO</AccessMode></IntReg>
+            </RegisterDescription>"#;
+        let info = crate::transport::simulator::info();
+        let mut camera = Camera::from_backend(info, Box::new(Fixture(xml))).unwrap();
+        assert_eq!(camera.info.profile.kind, CameraKind::AreaScan);
+        assert!(!camera.info.profile.supports(CameraCapability::LineRate));
+        camera.features();
+        assert_eq!(camera.info.profile.kind, CameraKind::AreaScan);
     }
 
     fn device(id: &str, model: &str, serial: &str) -> CameraInfo {

@@ -285,7 +285,8 @@ fn specialty_features(features: &[FeatureInfo]) -> Option<(CameraKind, Vec<Strin
         let mut found: Vec<_> = features
             .iter()
             .filter(|f| {
-                names.contains(&f.name.as_str()) || prefixes.iter().any(|p| f.name.starts_with(p))
+                (names.contains(&f.name.as_str()) || prefixes.iter().any(|p| f.name.starts_with(p)))
+                    && !hidden(f)
             })
             .map(|f| f.name.clone())
             .collect();
@@ -334,6 +335,15 @@ fn specialty_features(features: &[FeatureInfo]) -> Option<(CameraKind, Vec<Strin
         return Some((CameraKind::LineScan, line));
     }
     None
+}
+
+/// A feature its XML does not implement, or hides in the current mode, is
+/// no evidence of what the camera is.
+fn hidden(feature: &FeatureInfo) -> bool {
+    feature.value.is_none()
+        && feature.error.as_deref().is_some_and(|e| {
+            e.contains("feature is not implemented") || e.contains("feature is unavailable")
+        })
 }
 
 fn identity_kind(info: &CameraInfo) -> Option<CameraKind> {
@@ -411,7 +421,14 @@ pub fn detect(info: &CameraInfo, features: &[FeatureInfo]) -> CameraProfile {
             vec![evidence.clone()],
         );
     }
-    if let Some((kind, evidence)) = specialty_features(features) {
+    // An area scan declaration outranks line-rate nodes, which some area
+    // cameras declare for a line scan sensor mode they are not using.
+    if let Some((kind, evidence)) = specialty_features(features)
+        && !(kind == CameraKind::LineScan
+            && scan
+                .as_ref()
+                .is_some_and(|(k, _)| *k == CameraKind::AreaScan))
+    {
         return profile(kind, DetectionSource::Features, evidence);
     }
     if let Some((kind, evidence)) = declared.or(scan) {
@@ -512,6 +529,31 @@ mod tests {
             )
             .kind,
             CameraKind::Microscope
+        );
+    }
+
+    #[test]
+    fn area_declaration_and_hidden_nodes_outrank_line_rate_nodes() {
+        let p = detect(
+            &camera("Camera"),
+            &[
+                f("DeviceScanType", json!("Areascan")),
+                f("AcquisitionLineRate", json!(5000)),
+            ],
+        );
+        assert_eq!(p.kind, CameraKind::AreaScan);
+        assert_eq!(p.source, DetectionSource::DeviceMetadata);
+        let mut hidden = f("Scan3dCoordinateScale", json!(0));
+        hidden.value = None;
+        hidden.error = Some("Scan3dCoordinateScale: feature is not implemented".into());
+        let p = detect(
+            &camera("Camera"),
+            &[f("DeviceScanType", json!("Areascan")), hidden],
+        );
+        assert_eq!(p.kind, CameraKind::AreaScan);
+        assert_eq!(
+            detect(&camera("Camera"), &[f("AcquisitionLineRate", json!(5000))]).kind,
+            CameraKind::LineScan
         );
     }
 
