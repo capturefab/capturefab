@@ -31,7 +31,7 @@ Each target builds one executable with the default features. There is no separat
 
 There is no 32-bit ARM target: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS and the ARM64 build. Releases before 0.2.2 listed Linux ARMv7 as unavailable.
 
-From 0.5.0, macOS releases are a read-only disk image (`.dmg`) whose root holds
+From the release after 0.4.0, macOS releases are a read-only disk image (`.dmg`) whose root holds
 exactly `Capturefab.app`, an `Applications` link to `/Applications` and
 `README.txt`; users drag the app to Applications and eject the image. The
 executable is stored once, at `Capturefab.app/Contents/MacOS/capturefab`, which

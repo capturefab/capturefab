@@ -274,13 +274,15 @@ impl Workbench {
                 "side-hub" => self.scene.hubs = true,
                 "help" => self.help_open = true,
                 "agents" => self.show_agent_setup(true),
-                "from-disk-image" => {
-                    self.assistant.commands.from_disk_image = true;
-                    self.scene_notice(Some((
-                        agents::DISK_IMAGE_NOTICE.into(),
-                        Some(agents::DISK_IMAGE_DETAIL.into()),
-                        Level::Warning,
-                    )));
+                "from-disk-image" | "translocated" => {
+                    let location = if *word == "translocated" {
+                        crate::volumes::InstallLocation::Translocated
+                    } else {
+                        crate::volumes::InstallLocation::DiskImage
+                    };
+                    self.assistant.commands.install = Some(location);
+                    let (notice, detail) = agents::install_notice(location);
+                    self.scene_notice(Some((notice.into(), Some(detail.into()), Level::Warning)));
                 }
                 "analytics" => self.analytics.open = true,
                 "capture" | "forward" | "video" => {
@@ -1033,8 +1035,11 @@ mod tests {
         bench.apply_scene(&["from-disk-image", "agents"]);
         let notice = bench.notice.clone().expect("a notice");
         assert_eq!(notice.level, Level::Warning);
-        assert_eq!(notice.text, agents::DISK_IMAGE_NOTICE);
-        assert!(bench.assistant.commands.from_disk_image);
+        assert_eq!(notice.text, "Capturefab is running from the disk image");
+        assert_eq!(
+            bench.assistant.commands.install,
+            Some(crate::volumes::InstallLocation::DiskImage)
+        );
         assert!(bench.sheets.agents);
     }
 

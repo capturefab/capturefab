@@ -462,20 +462,38 @@ def make_dmg(source, output, volume):
     if result.returncode != 0:
         raise RuntimeError(f'hdiutil verify exited with status {result.returncode}')
 
+def detach(mountpoint):
+    """Detach an image, forcing it when a plain detach fails or times out.
+    Returns whether the image is detached."""
+    for force in ([], ['-force']):
+        try:
+            if hdiutil('detach', mountpoint, *force).returncode == 0:
+                return True
+        except RuntimeError as error:
+            print(f'warning: {error}', file=sys.stderr)
+    return False
+
 @contextlib.contextmanager
 def attached(dmg):
-    with tempfile.TemporaryDirectory(prefix='capturefab-dmg-') as temp:
-        mountpoint = Path(temp) / 'mount'
-        mountpoint.mkdir()
-        # -nobrowse keeps the image out of Finder and Capturefab's volume list.
-        result = hdiutil('attach', '-readonly', '-nobrowse', '-noautoopen', '-mountpoint', mountpoint, dmg)
-        if result.returncode != 0:
-            raise RuntimeError(f'hdiutil attach exited with status {result.returncode}')
-        try:
-            yield mountpoint
-        finally:
-            if hdiutil('detach', mountpoint).returncode != 0:
-                hdiutil('detach', mountpoint, '-force')
+    # The folder is removed only once nothing is mounted in it: removing a
+    # mounted image's folder would fail and hide the error that matters.
+    temp = Path(tempfile.mkdtemp(prefix='capturefab-dmg-'))
+    mountpoint = temp / 'mount'
+    mountpoint.mkdir()
+    # -nobrowse keeps the image out of Finder and Capturefab's volume list.
+    result = hdiutil('attach', '-readonly', '-nobrowse', '-noautoopen', '-mountpoint', mountpoint, dmg)
+    if result.returncode != 0:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise RuntimeError(f'hdiutil attach exited with status {result.returncode}')
+    try:
+        yield mountpoint
+    except BaseException:
+        if detach(mountpoint):
+            shutil.rmtree(temp, ignore_errors=True)
+        raise
+    if not detach(mountpoint):
+        raise RuntimeError(f'hdiutil detach failed; the image is still mounted at {mountpoint}')
+    shutil.rmtree(temp, ignore_errors=True)
 
 def dmg_extract(dmg, member, dest):
     with attached(dmg) as mountpoint:

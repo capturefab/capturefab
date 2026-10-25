@@ -1706,6 +1706,9 @@ impl Workbench {
         if let Some((text, detail, level)) = notice {
             self.set_notice(text, detail, level);
         }
+        if pending.job == Job::Discover {
+            self.startup_install_warning();
+        }
         if let Ok(value) = result
             && let Some(reason) = value["history_unavailable"].as_str()
         {

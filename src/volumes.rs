@@ -37,6 +37,7 @@ const NETWORK: [&str; 10] = [
 ];
 
 /// Mounted, writable external, removable and network volumes, by name.
+/// macOS and Linux leave out read-only mounts; Windows lists every drive.
 pub fn list() -> Vec<Volume> {
     let mut volumes = platform();
     volumes.sort_by_key(|v| v.name.to_lowercase());
@@ -110,16 +111,59 @@ fn read_only(options: &str) -> bool {
     })
 }
 
-/// Whether this executable runs from a mounted Capturefab disk image or a
-/// translocated copy, whose path stops working once the image is ejected.
-pub fn disk_image_install(exe: &Path) -> bool {
-    let path = exe.to_string_lossy();
-    cfg!(target_os = "macos") && in_disk_image(&path)
+/// Where a macOS app runs from when its path stops working later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallLocation {
+    /// A mounted, read-only disk image: gone once the image is ejected.
+    DiskImage,
+    /// A temporary copy macOS made of a quarantined app (App Translocation).
+    Translocated,
 }
 
-fn in_disk_image(path: &str) -> bool {
-    (path.starts_with("/Volumes/") && path.contains("/Capturefab.app/Contents/MacOS/"))
-        || path.contains("/AppTranslocation/")
+/// Whether this executable runs from a mounted Capturefab disk image or a
+/// translocated copy, whose path stops working once the image is ejected or
+/// the app quits. `None` on other systems and for a real install.
+pub fn install_location(exe: &Path) -> Option<InstallLocation> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = exe.to_string_lossy();
+        // `mount` runs only for an app under /Volumes, to read its volume's options.
+        let mounts = if path.starts_with("/Volumes/") {
+            std::process::Command::new("/sbin/mount")
+                .output()
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        classify_install(&path, &mounts)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = exe;
+        None
+    }
+}
+
+/// `path`'s install location, given macOS `mount` output. An app under
+/// /Volumes counts as a disk image only on a read-only volume, so an app kept
+/// on a writable external drive does not; without a mount line for it, the
+/// volume name decides (the disk image's is "Capturefab VERSION").
+#[cfg(any(target_os = "macos", test))]
+fn classify_install(path: &str, mounts: &str) -> Option<InstallLocation> {
+    if path.contains("/AppTranslocation/") {
+        return Some(InstallLocation::Translocated);
+    }
+    let rest = path.strip_prefix("/Volumes/")?;
+    if !path.contains("/Capturefab.app/Contents/MacOS/") {
+        return None;
+    }
+    let name = rest.split('/').next()?;
+    let image = match mount_line(mounts, &Path::new("/Volumes").join(name)) {
+        Some(line) => read_only(line),
+        None => name.starts_with("Capturefab"),
+    };
+    image.then_some(InstallLocation::DiskImage)
 }
 
 /// Decode the octal escapes /proc/self/mounts uses for spaces and tabs.
@@ -160,9 +204,14 @@ fn from_mounts(table: &str) -> Vec<(String, PathBuf, &'static str)> {
     let mut found = Vec::new();
     for line in table.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let [_, mount, fs, ..] = fields[..] else {
+        let [_, mount, fs, options, ..] = fields[..] else {
             continue;
         };
+        // Read-only mounts (an ISO, a squashfs image, a write-locked card)
+        // cannot hold a destination.
+        if options.split(',').any(|option| option == "ro") {
+            continue;
+        }
         let path = PathBuf::from(unescape(mount));
         let text = path.to_string_lossy();
         let network = NETWORK.contains(&fs);
@@ -403,7 +452,10 @@ mod tests {
                      nas:/export /srv/nas nfs4 rw 0 0\n\
                      tmpfs /mnt/scratch tmpfs rw 0 0\n\
                      /dev/sdc1 /mnt/archive ext4 rw 0 0\n\
-                     //nas/share /home/ana/share cifs rw 0 0\n";
+                     //nas/share /home/ana/share cifs rw 0 0\n\
+                     /dev/sr0 /media/ana/DISC iso9660 ro,nosuid,nodev 0 0\n\
+                     /dev/sdd1 /run/media/ana/LOCKED vfat ro,relatime 0 0\n\
+                     /dev/sde1 /media/ana/ROOM ext4 rw,errors=remount-ro 0 0\n";
         let found = from_mounts(table);
         let names: Vec<_> = found.iter().map(|(n, _, k)| (n.as_str(), *k)).collect();
         assert_eq!(
@@ -414,6 +466,7 @@ mod tests {
                 ("nas", "network"),
                 ("archive", "removable"),
                 ("share", "network"),
+                ("ROOM", "removable"),
             ]
         );
         assert_eq!(found[0].1, PathBuf::from("/media/ana/CAM DISK"));
@@ -518,22 +571,51 @@ mod tests {
 
     #[test]
     fn disk_image_installs_are_recognized() {
-        assert!(in_disk_image(
-            "/Volumes/Capturefab 0.5.0/Capturefab.app/Contents/MacOS/capturefab"
-        ));
-        assert!(in_disk_image(
-            "/private/var/folders/x/T/AppTranslocation/1A2B/d/Capturefab.app/Contents/MacOS/capturefab"
-        ));
-        assert!(!in_disk_image(
-            "/Applications/Capturefab.app/Contents/MacOS/capturefab"
-        ));
-        assert!(!in_disk_image("/Volumes/SSD/bin/capturefab"));
+        let mounts = "/dev/disk40s1 on /Volumes/Capturefab 0.5.0 (hfs, local, nodev, nosuid, read-only, noowners, quarantine, mounted by ana)\n\
+            /dev/disk41s1 on /Volumes/SSD (apfs, local, nodev, nosuid, journaled, noowners, mounted by ana)\n";
+        let image = "/Volumes/Capturefab 0.5.0/Capturefab.app/Contents/MacOS/capturefab";
         assert_eq!(
-            disk_image_install(Path::new(
-                "/Volumes/Capturefab 0.5.0/Capturefab.app/Contents/MacOS/capturefab"
-            )),
-            cfg!(target_os = "macos")
+            classify_install(image, mounts),
+            Some(InstallLocation::DiskImage)
         );
+        // Without `mount` output, the image's volume name still tells.
+        assert_eq!(
+            classify_install(image, ""),
+            Some(InstallLocation::DiskImage)
+        );
+        assert_eq!(
+            classify_install(
+                "/private/var/folders/x/T/AppTranslocation/1A2B/d/Capturefab.app/Contents/MacOS/capturefab",
+                ""
+            ),
+            Some(InstallLocation::Translocated)
+        );
+        // An app kept on a writable external drive is installed there.
+        assert_eq!(
+            classify_install(
+                "/Volumes/SSD/Applications/Capturefab.app/Contents/MacOS/capturefab",
+                mounts
+            ),
+            None
+        );
+        assert_eq!(
+            classify_install(
+                "/Volumes/SSD/Applications/Capturefab.app/Contents/MacOS/capturefab",
+                ""
+            ),
+            None
+        );
+        assert_eq!(
+            classify_install("/Applications/Capturefab.app/Contents/MacOS/capturefab", ""),
+            None
+        );
+        assert_eq!(
+            classify_install("/Volumes/SSD/bin/capturefab", mounts),
+            None
+        );
+        if !cfg!(target_os = "macos") {
+            assert_eq!(install_location(Path::new(image)), None);
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ Version 0.4.0 removes built-in S3, FTP and SFTP uploads and industrial signal so
 
 ## Start here
 
-Download the matching binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases). The [project site](https://capturefab.com/) selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links. From 0.5.0 on, macOS downloads are a disk image: drag Capturefab to Applications.
+Download the matching binary from [GitHub Releases](https://github.com/capturefab/capturefab/releases). The [project site](https://capturefab.com/) selects from published artifacts, with explicit architecture choices and SHA-256 checksums. Until a release is actually published, the site displays that state instead of fabricated download links. Newer macOS downloads are a disk image: drag Capturefab to Applications.
 
 Choose how to drive the capture. Each route can share a visible desktop session for review and manual intervention.
 
@@ -381,7 +381,7 @@ Recovery refuses a running owner. Copies preserve the database and any WAL toget
 
 ## Save to drives and folders
 
-Captures, schedules and local recordings can go to a saved **destination**: a folder on your disk, an external or removable drive, or a mounted network drive. In the GUI, **Save to** in the Capture and Video panels lists saved folders and connected external drives. Choosing a drive saves to its `Capturefab` folder. **Manage…** adds a folder with the system folder picker and tests access. `capturefab volumes` omits read-only volumes, such as mounted disk images.
+Captures, schedules and local recordings can go to a saved **destination**: a folder on your disk, an external or removable drive, or a mounted network drive. In the GUI, **Save to** in the Capture and Video panels lists saved folders and connected external drives. Choosing a drive saves to its `Capturefab` folder. **Manage…** adds a folder with the system folder picker and tests access. On macOS and Linux, `capturefab volumes` omits read-only volumes, such as mounted disk images.
 
 ```sh
 capturefab volumes --json

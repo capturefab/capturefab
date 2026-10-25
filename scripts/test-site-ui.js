@@ -157,7 +157,7 @@ async function downloads() {
   assert.equal(page.ids.get('verify-box').hidden, true);
   assert.equal(page.ids.get('install-hint').hidden, true);
 
-  // A disk image release (0.5.0 and later) gets drag-to-Applications steps.
+  // A disk image release (after 0.4.0) gets drag-to-Applications steps.
   const imaged = structuredClone(published);
   imaged.releases.find((release) => release.version === imaged.latest).assets
     .filter((asset) => asset.os === 'macos').forEach((asset) => { asset.name = asset.name.replace(/\.zip$/, '.dmg'); });
@@ -165,6 +165,7 @@ async function downloads() {
   await dmg.settle();
   assert.match(dmg.ids.get('install-hint').textContent, /Drag Capturefab to the Applications folder/);
   assert.doesNotMatch(dmg.ids.get('install-hint').textContent, /Extract/);
+  assert.ok(dmg.ids.get('install-hint').textContent.includes('/Applications/Capturefab.app/Contents/MacOS/capturefab --help'));
   dmg.change('os-select', 'windows');
   assert.ok(dmg.ids.get('install-hint').textContent.includes('.\\capturefab.exe --help'));
 

@@ -36,12 +36,28 @@ pub(super) struct CommandContext {
     windows: bool,
     /// The executable lives on a mounted disk image or a translocated copy,
     /// so the commands below stop working once the image is ejected.
-    pub(super) from_disk_image: bool,
+    pub(super) install: Option<InstallLocation>,
+    /// The startup notice about `install` waits for the first camera search
+    /// to report, so that search's outcome does not replace it at once.
+    pub(super) startup_warning: bool,
 }
 
-pub(super) const DISK_IMAGE_NOTICE: &str = "Capturefab is running from the disk image";
-pub(super) const DISK_IMAGE_DETAIL: &str =
-    "Drag it to Applications so the agent briefing and terminal path keep working after you eject.";
+use crate::volumes::InstallLocation;
+
+/// What to say about an app that runs from where it will not stay: the
+/// notice, then what to do.
+pub(super) fn install_notice(location: InstallLocation) -> (&'static str, &'static str) {
+    match location {
+        InstallLocation::DiskImage => (
+            "Capturefab is running from the disk image",
+            "Drag it to Applications so the agent briefing and terminal path keep working after you eject.",
+        ),
+        InstallLocation::Translocated => (
+            "Capturefab is running from a temporary copy macOS made",
+            "Move Capturefab.app to Applications and open it from there so the agent briefing and terminal path keep working.",
+        ),
+    }
+}
 
 pub(super) struct PlanPreview {
     pub(super) command: String,
@@ -52,11 +68,10 @@ pub(super) struct PlanPreview {
 impl Default for CommandContext {
     fn default() -> Self {
         let exe = std::env::current_exe().ok();
-        let from_disk_image = exe
-            .as_deref()
-            .is_some_and(crate::volumes::disk_image_install);
+        let install = exe.as_deref().and_then(crate::volumes::install_location);
         Self {
-            from_disk_image,
+            install,
+            startup_warning: install.is_some(),
             ..Self::capture(
                 exe,
                 std::env::var_os("CAPTUREFAB_SESSION_DIR").map(PathBuf::from),
@@ -83,7 +98,8 @@ impl CommandContext {
             binary,
             session_directory: session_directory.flatten(),
             windows,
-            from_disk_image: false,
+            install: None,
+            startup_warning: false,
         }
     }
     pub(super) fn prefix(&self, session: &str) -> Option<String> {
@@ -164,7 +180,8 @@ impl CommandContext {
             binary: binary.map(str::to_owned),
             session_directory: directory.map(str::to_owned),
             windows,
-            from_disk_image: false,
+            install: None,
+            startup_warning: false,
         }
     }
 }
@@ -195,6 +212,22 @@ fn briefing(prefix: &str) -> String {
 }
 
 impl Workbench {
+    /// Warn once that the app runs from where it will not stay, after the
+    /// startup camera search reports so its outcome does not replace the
+    /// warning at once. An error showing then defers it to a later search.
+    pub(super) fn startup_install_warning(&mut self) {
+        let commands = &mut self.assistant.commands;
+        let Some(location) = commands.install.filter(|_| commands.startup_warning) else {
+            return;
+        };
+        if self.error_showing() {
+            return;
+        }
+        self.assistant.commands.startup_warning = false;
+        let (notice, detail) = install_notice(location);
+        self.set_notice(notice, Some(detail.into()), notice::Level::Warning);
+    }
+
     pub(super) fn show_agent_setup(&mut self, open: bool) {
         if open && !self.help_open && self.sheet_open() {
             return;
@@ -224,14 +257,27 @@ impl Workbench {
                 .wrapping(text::Wrapping::WordOrGlyph)
         };
         let mut body = column![];
-        if commands.from_disk_image {
+        if let Some(location) = commands.install {
+            let (notice, detail) = install_notice(location);
             body = body.push(
-                text(format!("{DISK_IMAGE_NOTICE}. {DISK_IMAGE_DETAIL}"))
-                    .size(style::BODY)
-                    .color(p.warn)
-                    .wrapping(text::Wrapping::WordOrGlyph),
+                container(
+                    row![
+                        notice::Level::Warning.mark(15.0, p),
+                        text(format!("{notice}. {detail}"))
+                            .size(style::BODY)
+                            .color(p.text)
+                            .width(Fill)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                    ]
+                    .spacing(10),
+                )
+                .padding([10, 14])
+                .width(Fill)
+                .style(style::callout(p.warn)),
             );
         }
+        // A briefing copied now names a path that is about to go away.
+        let moving = commands.install.is_some();
         let main: Vec<Element<'_, Message>> = vec![
             heading("Give your agent this workbench", p),
             description("Use Claude Code, Codex, Antigravity or another harness that can run local commands. Your harness supplies its own model connection; no Capturefab API key is needed.").into(),
@@ -240,7 +286,11 @@ impl Workbench {
                     text(format!("Session: {}", self.session))
                         .size(style::BODY)
                         .font(style::SEMIBOLD),
-                    description("Paste the briefing into your harness, then describe what you want to capture. It includes this app's executable path and session."),
+                    description(if moving {
+                        "This briefing names the app's current, temporary path. After you move the app to Applications, open it from there, reopen this sheet and copy the briefing again."
+                    } else {
+                        "Paste the briefing into your harness, then describe what you want to capture. It includes this app's executable path and session."
+                    }),
                     button(
                         row![
                             icon(if copied { Icon::Check } else { Icon::Copy }, 15.0, Color::WHITE),
@@ -255,7 +305,11 @@ impl Workbench {
                 ].spacing(10)
             ).padding(14).width(Fill).style(style::well).into(),
             heading("Check the connection", p),
-            description("Run this in a terminal on the same computer and under the same user account. Keep this window open. Commands use the running application even when capturefab is not on PATH.").into(),
+            description(if moving {
+                "Run this in a terminal on the same computer and under the same user account. Keep this window open. It stops working once the app moves; copy it again from the installed app."
+            } else {
+                "Run this in a terminal on the same computer and under the same user account. Keep this window open. Commands use the running application even when capturefab is not on PATH."
+            }).into(),
             self.copyable(format!("{prefix} status --json"), p),
             text(format!("Commands are for {}.", commands.shell_name()))
                 .size(style::SMALL).color(p.secondary).into(),
@@ -292,6 +346,33 @@ impl Workbench {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_warning_outlasts_the_startup_camera_search() {
+        let mut bench = Workbench::new(SessionHandle::new(), "test".into(), false, None);
+        bench.assistant.commands.install = Some(InstallLocation::DiskImage);
+        bench.assistant.commands.startup_warning = true;
+        assert!(bench.notice.is_none(), "it waits for the camera search");
+        let search = Pending::unanswered(Job::Discover);
+        // A failed search keeps its error showing; the warning waits.
+        bench.settle(&search, &Err(anyhow::anyhow!("no network")));
+        assert_eq!(bench.notice.as_ref().unwrap().level, notice::Level::Error);
+        assert!(bench.assistant.commands.startup_warning);
+        // Dealt with: the next search's outcome may show.
+        bench.notice = None;
+        let found = serde_json::json!({"devices": [], "warnings": []});
+        bench.settle(&search, &Ok(found.clone()));
+        let shown = bench.notice.clone().expect("the warning");
+        assert_eq!(shown.level, notice::Level::Warning);
+        assert_eq!(shown.text, install_notice(InstallLocation::DiskImage).0);
+        assert!(!bench.assistant.commands.startup_warning);
+        // Once is enough: later searches report as usual.
+        bench.settle(&search, &Ok(found));
+        assert_ne!(
+            bench.notice.as_ref().unwrap().text,
+            install_notice(InstallLocation::DiskImage).0
+        );
+    }
 
     #[test]
     fn setup_keeps_copy_and_close_visible_and_reveals_lower_actions_by_keyboard() {

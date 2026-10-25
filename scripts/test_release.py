@@ -471,6 +471,36 @@ class ReleaseTests(unittest.TestCase):
                 create = run.call_args_list[0].args[0]
                 self.assertEqual(create[create.index('-format') + 1], 'ULFO')
 
+    def test_attached_forces_a_stuck_detach_and_keeps_a_mounted_folder(self):
+        good = SimpleNamespace(returncode=0, stdout='')
+        bad = SimpleNamespace(returncode=1, stdout='hdiutil: detach failed - Resource busy\n')
+        timeout = subprocess.TimeoutExpired(['hdiutil', 'detach'], release.HDIUTIL_TIMEOUT)
+        for replies, error in [([good, good], None),
+                               ([good, timeout, good], None),
+                               ([good, bad, good], None),
+                               ([good, bad, timeout], 'hdiutil detach failed; the image is still mounted')]:
+            with self.subTest(replies=replies), \
+                    mock.patch.object(release.subprocess, 'run', side_effect=replies) as run, \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                if error:
+                    with self.assertRaisesRegex(RuntimeError, error):
+                        with release.attached(Path('image.dmg')) as mountpoint:
+                            pass
+                    self.assertTrue(mountpoint.is_dir(), 'a mounted folder must not be removed')
+                    shutil.rmtree(mountpoint.parent)
+                else:
+                    with release.attached(Path('image.dmg')) as mountpoint:
+                        pass
+                    self.assertFalse(mountpoint.parent.exists())
+                self.assertEqual([c.args[0][1] for c in run.call_args_list], ['attach'] + ['detach'] * (len(replies) - 1))
+        # An error inside the block is the one reported, even when detach fails.
+        with mock.patch.object(release.subprocess, 'run', side_effect=[good, bad, bad]), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(RuntimeError, 'disk image root'):
+                with release.attached(Path('image.dmg')) as mountpoint:
+                    raise RuntimeError('disk image root holds []')
+        shutil.rmtree(mountpoint.parent)
+
     def test_hdiutil_timeout_is_runtime_error(self):
         timeout = subprocess.TimeoutExpired(['hdiutil', 'create'], release.HDIUTIL_TIMEOUT)
         with mock.patch.object(release.subprocess, 'run', side_effect=timeout):
