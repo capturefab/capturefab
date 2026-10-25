@@ -13,6 +13,7 @@ use std::{
 
 const MAX_XML: usize = 32 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
+const MAX_FORMULA_DEPTH: usize = 128;
 
 /// Features a camera cannot change while it streams: the image's geometry
 /// and format.
@@ -2092,12 +2093,10 @@ impl<T: Operand> Expr<'_, T> {
         self.skip -= usize::from(skip);
         value
     }
-    fn expr(&mut self, min: u8) -> Result<T> {
-        self.depth += 1;
-        ensure!(self.depth <= MAX_DEPTH, "formula nesting exceeds limit");
+    fn operand(&mut self) -> Result<T> {
         let token = self.tokens[self.pos].clone();
         self.pos += 1;
-        let mut lhs = match token {
+        Ok(match token {
             Token::Num(n) => T::literal(&n)?,
             Token::Name(n) => {
                 if self.tokens[self.pos] == Token::L {
@@ -2141,19 +2140,35 @@ impl<T: Operand> Expr<'_, T> {
                 self.compute(|| T::unary(&op, v))?
             }
             _ => bail!("expected formula operand"),
-        };
+        })
+    }
+    /// Each nested sub-expression counts toward the depth limit, but the else
+    /// branch of `?:` continues in the same frame, so long right-nested
+    /// selector chains such as `(F=1)?(A):((F=2)?(B):(...))` stay shallow.
+    fn expr(&mut self, min: u8) -> Result<T> {
+        self.depth += 1;
+        ensure!(
+            self.depth <= MAX_FORMULA_DEPTH,
+            "formula nesting exceeds limit"
+        );
+        let skip = self.skip;
+        let mut chosen = None;
+        let mut lhs = self.operand()?;
         loop {
             if self.tokens[self.pos] == Token::Q && min == 0 {
                 self.pos += 1;
-                let taken = lhs.truth();
+                let taken = self.skip == 0 && lhs.truth();
                 let yes = self.discard(!taken, 0)?;
                 ensure!(
                     self.tokens[self.pos] == Token::Colon,
                     "expected ':' in formula"
                 );
                 self.pos += 1;
-                let no = self.discard(taken, 0)?;
-                lhs = if taken { yes } else { no };
+                if taken {
+                    chosen = Some(yes);
+                    self.skip += 1;
+                }
+                lhs = self.operand()?;
                 continue;
             }
             let Token::Op(op) = &self.tokens[self.pos] else {
@@ -2189,8 +2204,9 @@ impl<T: Operand> Expr<'_, T> {
                 _ => self.compute(|| T::binary(&op, lhs, rhs))?,
             };
         }
+        self.skip = skip;
         self.depth -= 1;
-        Ok(lhs)
+        Ok(chosen.unwrap_or(lhs))
     }
 }
 /// Bitwise operators truncate a floating-point operand toward zero, like the
@@ -2482,6 +2498,49 @@ mod tests {
         m.set(&mut io, "AutoExposureTimeAbsLowerLimit", "1000")
             .unwrap();
         assert_eq!(io.read_memory(0x100, 4).unwrap(), 1015u32.to_be_bytes());
+    }
+    #[test]
+    fn long_selector_chains_do_not_exhaust_the_nesting_limit() {
+        let m = map(concat!(
+            "<Enumeration Name='PixelFormat'><pValue>N195</pValue><EnumEntry Name='Mono8'><Value>0x01080001</Value></EnumEntry><EnumEntry Name='BayerRG8'><Value>0x01080009</Value></EnumEntry><EnumEntry Name='YUV422Packed'><Value>0x0210001f</Value></EnumEntry></Enumeration>",
+            "<IntConverter Name='N195'><FormulaTo>(FROM=0x01080001)?(1):((FROM=0x01100003)?(3):((FROM=0x010a0046)?(4):((FROM=0x01100005)?(5):((FROM=0x010C0006)?(6):((FROM=0x01080008)?(10):((FROM=0x01080009)?(11):((FROM=0x0108000a)?(12):((FROM=0x0108000b)?(13):((FROM=0x0110000c)?(14):((FROM=0x0110000d)?(15):((FROM=0x0110000e)?(16):((FROM=0x0110000f)?(17):((FROM=0x010a0056)?(51):((FROM=0x010a0058)?(52):((FROM=0x010a0052)?(54):((FROM=0x010a0054)?(53):((FROM=0x01100010)?(18):((FROM=0x01100011)?(20):((FROM=0x01100012)?(22):((FROM=0x01100013)?(24):((FROM=0x010c002a)?(19):((FROM=0x010c002b)?(21):((FROM=0x010c002c)?(23):((FROM=0x010c002d)?(25):((FROM=0x0210001f)?(43):((FROM=0x02100032)?(44):((FROM=0x02180014)?(30):((FROM=0x02180015)?(31):((FROM=0x02200017)?(33):(0xffffffff))))))))))))))))))))))))))))))</FormulaTo>",
+            "<FormulaFrom>(TO=1)?(0x01080001):((TO=3)?(0x01100003):((TO=4)?(0x010a0046):((TO=5)?(0x01100005):((TO=6)?(0x010C0006):((TO=10)?(0x01080008):((TO=11)?(0x01080009):((TO=12)?(0x0108000a):((TO=13)?(0x0108000b):((TO=14)?(0x0110000c):((TO=15)?(0x0110000d):((TO=16)?(0x0110000e):((TO=17)?(0x0110000f):((TO=51)?(0x010a0056):((TO=52)?(0x010a0058):((TO=54)?(0x010a0052):((TO=53)?(0x010a0054):((TO=18)?(0x01100010):((TO=20)?(0x01100011):((TO=22)?(0x01100012):((TO=24)?(0x01100013):((TO=19)?(0x010c002a):((TO=21)?(0x010c002b):((TO=23)?(0x010c002c):((TO=25)?(0x010c002d):((TO=43)?(0x0210001f):((TO=44)?(0x02100032):((TO=30)?(0x02180014):((TO=31)?(0x02180015):((TO=33)?(0x02200017):(0xffffffff))))))))))))))))))))))))))))))</FormulaFrom>",
+            "<pValue>N1528</pValue><Slope>Varying</Slope></IntConverter>",
+            "<IntReg Name='N1528'><Address>0x30024</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>BigEndian</Endianess></IntReg>",
+        ));
+        let mut io = Memory::default();
+        io.write_memory(0x30024, &11u32.to_be_bytes()).unwrap();
+        assert_eq!(m.get(&mut io, "PixelFormat").unwrap(), "BayerRG8");
+        m.set(&mut io, "PixelFormat", "YUV422Packed").unwrap();
+        assert_eq!(io.read_memory(0x30024, 4).unwrap(), 43u32.to_be_bytes());
+
+        let chain = |levels: usize| {
+            let mut formula = "(0)".to_string();
+            for level in (1..=levels).rev() {
+                formula = format!("(TO={level})?({level}):({formula})");
+            }
+            formula
+        };
+        let vars = BTreeMap::from([("TO".to_string(), 90i64)]);
+        assert_eq!(evaluate(&chain(100), &vars).unwrap(), 90);
+        assert_eq!(
+            evaluate(&chain(100).replace(['(', ')'], ""), &vars).unwrap(),
+            90
+        );
+        let flat = (1..=1000)
+            .map(|level| format!("TO={level}?{level}:"))
+            .collect::<String>()
+            + "0";
+        assert_eq!(evaluate(&flat, &vars).unwrap(), 90);
+        for deep in [
+            format!("{}1{}", "(".repeat(200), ")".repeat(200)),
+            format!("{}1", "-".repeat(200)),
+            format!("2{}", "**2".repeat(200)),
+            chain(200),
+        ] {
+            let error = evaluate::<i64>(&deep, &vars).unwrap_err().to_string();
+            assert!(error.contains("nesting"), "{error}");
+        }
     }
     #[test]
     fn untaken_formula_branches_cannot_fail() {
