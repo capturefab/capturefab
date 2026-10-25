@@ -124,7 +124,9 @@ struct Element {
 struct Node {
     kind: String,
     props: Vec<Element>,
-    stored: RefCell<Option<Value>>,
+    /// Host-side values written to floating Value, ValueIndexed and
+    /// ValueDefault elements, by element position.
+    stored: RefCell<BTreeMap<usize, Value>>,
 }
 impl Node {
     fn prop(&self, key: &str) -> Option<&str> {
@@ -140,17 +142,23 @@ impl Node {
         matches!(
             self.kind.as_str(),
             "Integer" | "Float" | "String" | "Boolean" | "Enumeration"
-        ) && self.prop("Value").is_some()
+        ) && self
+            .props
+            .iter()
+            .any(|p| matches!(p.tag.as_str(), "Value" | "ValueIndexed" | "ValueDefault"))
     }
-    fn value(&self, text: &str) -> Result<Value> {
-        if let Some(stored) = self.stored.borrow().clone() {
-            return Ok(stored);
+    /// The host value held by the element at `index`.
+    fn value(&self, index: usize) -> Result<Value> {
+        if let Some(stored) = self.stored.borrow().get(&index) {
+            return Ok(stored.clone());
         }
+        let text = &self.props[index].text;
         // A Boolean's Value is an xs:boolean.
-        match text.trim() {
-            "true" if self.kind == "Boolean" => Ok(json!(true)),
-            "false" if self.kind == "Boolean" => Ok(json!(false)),
-            text => literal(text),
+        match (self.kind.as_str(), text.trim()) {
+            ("String", _) => Ok(json!(text)),
+            ("Boolean", "true") => Ok(json!(true)),
+            ("Boolean", "false") => Ok(json!(false)),
+            (_, text) => literal(text),
         }
     }
 }
@@ -932,12 +940,8 @@ impl NodeMap {
                     } else {
                         self.numeric_value(io, link, depth + 1)
                     }
-                } else if let Some(value) = n.prop("Value") {
-                    if n.kind == "String" {
-                        Ok(n.stored.borrow().clone().unwrap_or_else(|| json!(value)))
-                    } else {
-                        n.value(value)
-                    }
+                } else if let Some(index) = self.host_entry(io, n, depth)? {
+                    n.value(index)
                 } else {
                     bail!("{name} has no supported pValue or Value")
                 }
@@ -1016,8 +1020,8 @@ impl NodeMap {
             } else {
                 self.get_inner(io, link, depth + 1)
             }
-        } else if let Some(v) = n.prop("Value") {
-            n.value(v)
+        } else if let Some(index) = self.host_entry(io, n, depth)? {
+            n.value(index)
         } else {
             bail!("node has no numeric value")
         }
@@ -1044,8 +1048,31 @@ impl NodeMap {
         n: &'a Node,
         depth: usize,
     ) -> Result<Option<&'a str>> {
-        if !n.props.iter().any(|p| p.tag == "pValueIndexed") {
+        let Some(index) = self.indexed_branch(io, n, depth)? else {
             return Ok(n.prop("pValue").or_else(|| n.prop("pValueDefault")));
+        };
+        let branch = &n.props[index];
+        Ok(branch.tag.starts_with('p').then_some(branch.text.as_str()))
+    }
+    /// The position of the element holding a node's host value now: its
+    /// Value, or the ValueIndexed or ValueDefault its pIndex selects.
+    fn host_entry(&self, io: &mut dyn RegisterIo, n: &Node, depth: usize) -> Result<Option<usize>> {
+        if let Some(index) = self.indexed_branch(io, n, depth)? {
+            return Ok((!n.props[index].tag.starts_with('p')).then_some(index));
+        }
+        Ok(n.props.iter().position(|p| p.tag == "Value"))
+    }
+    /// For a value table, the position of the (p)ValueIndexed entry matching
+    /// the pIndex value, else of the (p)ValueDefault. The forms may be mixed.
+    fn indexed_branch(
+        &self,
+        io: &mut dyn RegisterIo,
+        n: &Node,
+        depth: usize,
+    ) -> Result<Option<usize>> {
+        let indexed = |p: &Element| matches!(p.tag.as_str(), "pValueIndexed" | "ValueIndexed");
+        if !n.props.iter().any(indexed) {
+            return Ok(None);
         }
         let selector = n
             .prop("pIndex")
@@ -1056,32 +1083,34 @@ impl NodeMap {
             "indexed value selector is not an exact integer"
         );
         let mut selected = None;
-        for entry in n.props.iter().filter(|p| p.tag == "pValueIndexed") {
+        for (position, entry) in n.props.iter().enumerate().filter(|(_, p)| indexed(p)) {
             let candidate = number(&literal(
                 entry
                     .attrs
                     .get("Index")
-                    .context("pValueIndexed has no Index")?,
+                    .with_context(|| format!("{} has no Index", entry.tag))?,
             )?)?;
             ensure!(
                 candidate.fract() == 0.0 && candidate.abs() <= (1u64 << 53) as f64,
-                "pValueIndexed Index is not an exact integer"
+                "{} Index is not an exact integer",
+                entry.tag
             );
             if candidate == index {
                 ensure!(
                     selected.is_none(),
-                    "duplicate pValueIndexed branch for index {index}"
+                    "duplicate indexed value branch for index {index}"
                 );
-                selected = Some(entry.text.as_str());
+                selected = Some(position);
             }
         }
-        Ok(Some(
-            selected
-                .or_else(|| n.prop("pValueDefault"))
-                .ok_or_else(|| {
-                    anyhow!("indexed value has no branch or default for index {index}")
-                })?,
-        ))
+        selected
+            .or_else(|| {
+                n.props
+                    .iter()
+                    .position(|p| matches!(p.tag.as_str(), "pValueDefault" | "ValueDefault"))
+            })
+            .map(Some)
+            .ok_or_else(|| anyhow!("indexed value has no branch or default for index {index}"))
     }
     fn property_number(
         &self,
@@ -1362,13 +1391,16 @@ impl NodeMap {
             return self.set_inner(io, link, &translated, depth + 1, write);
         }
         if n.host_value() {
+            let index = self
+                .host_entry(io, n, depth)?
+                .with_context(|| format!("{name} has no writable value"))?;
             let stored = if n.kind == "Integer" {
                 json!(signed_integer(&translated)?)
             } else {
                 translated
             };
             if write {
-                n.stored.replace(Some(stored));
+                n.stored.borrow_mut().insert(index, stored);
             }
             return Ok(());
         }
@@ -2538,6 +2570,32 @@ mod tests {
         assert_eq!(m.get(&mut io, "Floating").unwrap(), true);
         m.set(&mut io, "Floating", "false").unwrap();
         assert_eq!(m.get(&mut io, "Floating").unwrap(), false);
+    }
+    #[test]
+    fn literal_value_tables_keep_one_value_per_index() {
+        let m = map(concat!(
+            "<Integer Name='Table'><pIndex>TableSelector</pIndex><ValueIndexed Index='10'>100</ValueIndexed><ValueIndexed Index='20'>200</ValueIndexed><ValueDefault>600</ValueDefault></Integer>",
+            "<Integer Name='TableSelector'><Value>20</Value></Integer>",
+            "<Float Name='FloatTable'><pIndex>TableSelector</pIndex><ValueIndexed Index='10'>100.1</ValueIndexed><pValueIndexed Index='20'>Shared</pValueIndexed><pValueDefault>Shared</pValueDefault></Float>",
+            "<Float Name='Shared'><Value>600.6</Value></Float>",
+        ));
+        let mut io = Memory::default();
+        assert_eq!(m.get(&mut io, "Table").unwrap(), 200);
+        m.set(&mut io, "Table", "150").unwrap();
+        assert_eq!(m.get(&mut io, "Table").unwrap(), 150);
+        m.set(&mut io, "TableSelector", "-1").unwrap();
+        assert_eq!(m.get(&mut io, "Table").unwrap(), 600);
+        m.set(&mut io, "TableSelector", "10").unwrap();
+        assert_eq!(m.get(&mut io, "Table").unwrap(), 100);
+        assert_eq!(m.get(&mut io, "FloatTable").unwrap(), 100.1);
+        m.set(&mut io, "FloatTable", "1.5").unwrap();
+        assert_eq!(m.get(&mut io, "Shared").unwrap(), 600.6);
+        m.set(&mut io, "TableSelector", "20").unwrap();
+        assert_eq!(m.get(&mut io, "Table").unwrap(), 150);
+        assert_eq!(m.get(&mut io, "FloatTable").unwrap(), 600.6);
+        m.set(&mut io, "TableSelector", "10").unwrap();
+        assert_eq!(m.get(&mut io, "FloatTable").unwrap(), 1.5);
+        assert!(m.is_writable(&mut io, "Table"));
     }
     #[test]
     fn indexed_value_routes_read_write_and_default_without_changing_register_indexing() {
