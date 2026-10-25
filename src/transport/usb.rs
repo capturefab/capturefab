@@ -272,16 +272,15 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     if data.alternate != 0 {
         data_interface.set_alt_setting(data.alternate).wait()?;
     }
+    let channel = ControlEndpoints {
+        input: control_interface.endpoint::<Bulk, In>(control.input)?,
+        output: control_interface.endpoint::<Bulk, Out>(control.output.unwrap())?,
+    };
     let mut backend = UsbBackend {
-        control_in: control_interface.endpoint::<Bulk, In>(control.input)?,
-        control_out: control_interface.endpoint::<Bulk, Out>(control.output.unwrap())?,
+        control: Control::new(channel, timeout.max(Duration::from_millis(20))),
         stream_in: data_interface.endpoint::<Bulk, In>(data.input)?,
         stream_interface: data_interface,
         _control_interface: control_interface,
-        timeout: timeout.max(Duration::from_millis(20)),
-        id: 0,
-        max_command: 65548,
-        max_ack: 65548,
         sirm: 0,
         stream: None,
     };
@@ -290,16 +289,18 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         response_ms <= 60000,
         "camera reports an invalid maximum response time"
     );
-    backend.timeout = backend
-        .timeout
-        .max(Duration::from_millis(response_ms as u64));
+    let control = &mut backend.control;
+    control.response = Duration::from_millis(response_ms as u64);
+    control.timeout = control.timeout.max(control.response);
     let sbrm = backend.u64(0x01d8)?;
-    backend.max_command = backend.u32(sbrm + 0x14)? as usize;
-    backend.max_ack = backend.u32(sbrm + 0x18)? as usize;
+    let max_command = backend.u32(sbrm + 0x14)? as usize;
+    let max_ack = backend.u32(sbrm + 0x18)? as usize;
     ensure!(
-        (24..=65548).contains(&backend.max_command) && (16..=65548).contains(&backend.max_ack),
+        (24..=65548).contains(&max_command) && (16..=65548).contains(&max_ack),
         "invalid USB3 Vision control transfer limits"
     );
+    backend.control.max_command = max_command;
+    backend.control.max_ack = max_ack;
     backend.sirm = backend.u64(sbrm + 0x20)?;
     ensure!(
         backend.sirm != 0,
@@ -309,15 +310,10 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
 }
 
 struct UsbBackend {
-    control_in: Endpoint<Bulk, In>,
-    control_out: Endpoint<Bulk, Out>,
+    control: Control<ControlEndpoints>,
     stream_in: Endpoint<Bulk, In>,
     stream_interface: Interface,
     _control_interface: Interface,
-    timeout: Duration,
-    id: u16,
-    max_command: usize,
-    max_ack: usize,
     sirm: u64,
     stream: Option<Stream>,
 }
@@ -630,14 +626,17 @@ fn le64(data: &[u8], offset: usize) -> Result<u64> {
             .try_into()?,
     ))
 }
-fn command(cmd: u16, id: u16, payload: &[u8]) -> Result<Vec<u8>> {
+/// A command packet. Every command asks for an acknowledgement; a resend
+/// keeps the original request ID and sets the CommandResend flag.
+fn command(cmd: u16, id: u16, resend: bool, payload: &[u8]) -> Result<Vec<u8>> {
     ensure!(
         payload.len() <= u16::MAX as usize,
         "UVCP command payload exceeds 65535 bytes"
     );
+    let flags = if resend { 0xc000u16 } else { 0x4000 };
     let mut packet = Vec::with_capacity(12 + payload.len());
     packet.extend_from_slice(&MAGIC.to_le_bytes());
-    packet.extend_from_slice(&0x4000u16.to_le_bytes());
+    packet.extend_from_slice(&flags.to_le_bytes());
     packet.extend_from_slice(&cmd.to_le_bytes());
     packet.extend_from_slice(&(payload.len() as u16).to_le_bytes());
     packet.extend_from_slice(&id.to_le_bytes());
@@ -686,33 +685,133 @@ fn write_acknowledged(response: &[u8], len: usize) -> Result<()> {
     );
     Ok(())
 }
-impl UsbBackend {
+/// The camera's control endpoints, which carry UVCP commands out and their
+/// acknowledgements back.
+trait Channel: Send {
+    /// Returns how many bytes were sent.
+    fn send(&mut self, packet: Vec<u8>, timeout: Duration) -> Result<usize, TransferError>;
+    fn receive(&mut self, len: usize, timeout: Duration) -> Result<Vec<u8>, TransferError>;
+    fn clear_halt(&mut self);
+}
+struct ControlEndpoints {
+    input: Endpoint<Bulk, In>,
+    output: Endpoint<Bulk, Out>,
+}
+impl Channel for ControlEndpoints {
+    fn send(&mut self, packet: Vec<u8>, timeout: Duration) -> Result<usize, TransferError> {
+        let completion = self.output.transfer_blocking(packet.into(), timeout);
+        completion.status.map(|()| completion.actual_len)
+    }
+    fn receive(&mut self, len: usize, timeout: Duration) -> Result<Vec<u8>, TransferError> {
+        let size = aligned(len, self.input.max_packet_size())
+            .map_err(|_| TransferError::InvalidArgument)?;
+        self.input
+            .transfer_blocking(Buffer::new(size), timeout)
+            .into_result()
+            .map(Buffer::into_vec)
+    }
+    fn clear_halt(&mut self) {
+        let _ = self.output.clear_halt().wait();
+        let _ = self.input.clear_halt().wait();
+    }
+}
+/// Sends per command: GenCP asks a sender to retry a failed command three
+/// times.
+const ATTEMPTS: u32 = 4;
+const STATUS_BUSY: u16 = 0x8007;
+const STATUS_RESEND_NOT_SUPPORTED: u16 = 0xa001;
+/// UVCP commands over a camera's control channel.
+struct Control<C> {
+    channel: C,
+    id: u16,
+    /// How long a command may take, at least the camera's maximum response
+    /// time.
+    timeout: Duration,
+    /// The camera's maximum response time, once read from it.
+    response: Duration,
+    max_command: usize,
+    max_ack: usize,
+}
+impl<C: Channel> Control<C> {
+    fn new(channel: C, timeout: Duration) -> Self {
+        Self {
+            channel,
+            id: 0,
+            timeout,
+            response: Duration::ZERO,
+            max_command: 65548,
+            max_ack: 65548,
+        }
+    }
+    /// Send a command and wait for its acknowledgement. As GenCP describes,
+    /// a lost or corrupt acknowledgement or a failed transfer resends the
+    /// command after the response time with the same request ID and the
+    /// CommandResend flag, so a late acknowledgement still answers it. A
+    /// busy camera, or one that cannot take a resend, gets it again as a new
+    /// command.
     fn transact(&mut self, cmd: u16, payload: &[u8]) -> Result<Vec<u8>> {
-        self.id = self.id.wrapping_add(1).max(1);
-        let packet = command(cmd, self.id, payload)?;
         ensure!(
-            packet.len() <= self.max_command,
+            12 + payload.len() <= self.max_command,
             "UVCP command exceeds camera transfer limit"
         );
-        let sent = self
-            .control_out
-            .transfer_blocking(packet.clone().into(), self.timeout)
-            .into_result()
-            .context("USB control write failed or timed out")?;
-        ensure!(sent.len() == packet.len(), "short USB control write");
-        let mut deadline = Instant::now() + self.timeout;
+        let window = self.response.max(self.timeout / ATTEMPTS);
         let hard_deadline = Instant::now() + self.timeout.max(Duration::from_secs(60));
+        self.id = self.id.wrapping_add(1).max(1);
+        let mut resend = false;
+        let mut failure = anyhow!("USB3 Vision command was not sent");
+        for _ in 0..ATTEMPTS {
+            let error = match self.attempt(cmd, payload, resend, window, hard_deadline) {
+                Ok(data) => return Ok(data),
+                Err(error) => error,
+            };
+            match error.downcast_ref::<UvcpStatus>().map(|status| status.0) {
+                Some(STATUS_BUSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    self.id = self.id.wrapping_add(1).max(1);
+                    resend = false;
+                }
+                Some(STATUS_RESEND_NOT_SUPPORTED) if resend => {
+                    self.id = self.id.wrapping_add(1).max(1);
+                    resend = false;
+                }
+                Some(_) => return Err(error),
+                None if error
+                    .chain()
+                    .any(|cause| cause.downcast_ref() == Some(&TransferError::Disconnected)) =>
+                {
+                    return Err(error);
+                }
+                None => resend = true,
+            }
+            failure = error;
+        }
+        Err(failure.context(format!("USB3 Vision command failed {ATTEMPTS} times")))
+    }
+    fn attempt(
+        &mut self,
+        cmd: u16,
+        payload: &[u8],
+        resend: bool,
+        window: Duration,
+        hard_deadline: Instant,
+    ) -> Result<Vec<u8>> {
+        let packet = command(cmd, self.id, resend, payload)?;
+        let len = packet.len();
+        let sent = self.channel.send(packet, window);
+        let sent = self
+            .unhalt(sent)
+            .context("USB control write failed or timed out")?;
+        ensure!(sent == len, "short USB control write");
+        let mut deadline = Instant::now() + window;
         for _ in 0..64 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             ensure!(
                 !remaining.is_zero(),
                 "USB camera control acknowledgement timed out"
             );
-            let size = aligned(self.max_ack, self.control_in.max_packet_size())?;
+            let response = self.channel.receive(self.max_ack, remaining);
             let response = self
-                .control_in
-                .transfer_blocking(Buffer::new(size), remaining)
-                .into_result()
+                .unhalt(response)
                 .context("USB control read failed or timed out")?;
             // A stale response may remain after a timed-out operation.
             if response.len() >= 12 && le16(&response, 10)? != self.id {
@@ -737,6 +836,59 @@ impl UsbBackend {
         }
         bail!("too many pending or stale UVCP acknowledgements")
     }
+    /// Clear a halt the camera signalled before the command is sent again.
+    fn unhalt<T>(&mut self, result: Result<T, TransferError>) -> Result<T, TransferError> {
+        if let Err(TransferError::Stall) = result {
+            self.channel.clear_halt();
+        }
+        result
+    }
+}
+impl<C: Channel> RegisterIo for Control<C> {
+    fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+        ensure!(length <= MAX_FRAME, "USB memory request exceeds size limit");
+        address
+            .checked_add(length as u64)
+            .context("USB memory range overflow")?;
+        let chunk_size = self.max_ack.saturating_sub(12).min(u16::MAX as usize);
+        ensure!(chunk_size > 0, "invalid USB read transfer limit");
+        let mut result = Vec::with_capacity(length);
+        while result.len() < length {
+            let len = (length - result.len()).min(chunk_size);
+            let mut request = Vec::with_capacity(12);
+            request.extend_from_slice(&(address + result.len() as u64).to_le_bytes());
+            request.extend_from_slice(&0u16.to_le_bytes());
+            request.extend_from_slice(&(len as u16).to_le_bytes());
+            let bytes = self.transact(READ_CMD, &request)?;
+            ensure!(bytes.len() == len, "camera returned short UVCP memory data");
+            result.extend_from_slice(&bytes);
+        }
+        Ok(result)
+    }
+    fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+        ensure!(
+            data.len() <= MAX_FRAME,
+            "USB memory write exceeds size limit"
+        );
+        address
+            .checked_add(data.len() as u64)
+            .context("USB memory range overflow")?;
+        let size = self
+            .max_command
+            .saturating_sub(20)
+            .min(u16::MAX as usize - 8);
+        ensure!(size > 0, "invalid USB write transfer limit");
+        for (i, chunk) in data.chunks(size).enumerate() {
+            let mut request = Vec::with_capacity(8 + chunk.len());
+            request.extend_from_slice(&(address + (i * size) as u64).to_le_bytes());
+            request.extend_from_slice(chunk);
+            let response = self.transact(WRITE_CMD, &request)?;
+            write_acknowledged(&response, chunk.len())?;
+        }
+        Ok(())
+    }
+}
+impl UsbBackend {
     fn u32(&mut self, address: u64) -> Result<u32> {
         le32(&self.read_memory(address, 4)?, 0)
     }
@@ -796,7 +948,10 @@ impl UsbBackend {
     fn reset_stream_endpoint(&mut self) -> Result<()> {
         let _ = self
             .stream_interface
-            .control_out(halt(self.stream_in.endpoint_address()), self.timeout)
+            .control_out(
+                halt(self.stream_in.endpoint_address()),
+                self.control.timeout,
+            )
             .wait();
         self.stream_in
             .clear_halt()
@@ -808,7 +963,7 @@ impl UsbBackend {
     /// submit the transfers again before enabling it.
     fn restart_stream(&mut self) -> Result<()> {
         self.put32(SIRM_CONTROL, 0)?;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.control.timeout;
         let stream = self.stream.as_mut().context("USB acquisition stopped")?;
         stream.drain(&mut self.stream_in, deadline)?;
         self.reset_stream_endpoint()?;
@@ -819,46 +974,10 @@ impl UsbBackend {
 }
 impl RegisterIo for UsbBackend {
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
-        ensure!(length <= MAX_FRAME, "USB memory request exceeds size limit");
-        address
-            .checked_add(length as u64)
-            .context("USB memory range overflow")?;
-        let chunk_size = self.max_ack.saturating_sub(12).min(u16::MAX as usize);
-        ensure!(chunk_size > 0, "invalid USB read transfer limit");
-        let mut result = Vec::with_capacity(length);
-        while result.len() < length {
-            let len = (length - result.len()).min(chunk_size);
-            let mut request = Vec::with_capacity(12);
-            request.extend_from_slice(&(address + result.len() as u64).to_le_bytes());
-            request.extend_from_slice(&0u16.to_le_bytes());
-            request.extend_from_slice(&(len as u16).to_le_bytes());
-            let bytes = self.transact(READ_CMD, &request)?;
-            ensure!(bytes.len() == len, "camera returned short UVCP memory data");
-            result.extend_from_slice(&bytes);
-        }
-        Ok(result)
+        self.control.read_memory(address, length)
     }
     fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
-        ensure!(
-            data.len() <= MAX_FRAME,
-            "USB memory write exceeds size limit"
-        );
-        address
-            .checked_add(data.len() as u64)
-            .context("USB memory range overflow")?;
-        let size = self
-            .max_command
-            .saturating_sub(20)
-            .min(u16::MAX as usize - 8);
-        ensure!(size > 0, "invalid USB write transfer limit");
-        for (i, chunk) in data.chunks(size).enumerate() {
-            let mut request = Vec::with_capacity(8 + chunk.len());
-            request.extend_from_slice(&(address + (i * size) as u64).to_le_bytes());
-            request.extend_from_slice(chunk);
-            let response = self.transact(WRITE_CMD, &request)?;
-            write_acknowledged(&response, chunk.len())?;
-        }
-        Ok(())
+        self.control.write_memory(address, data)
     }
 }
 /// The address and size of each manifest entry for a raw or zipped device
@@ -1009,7 +1128,7 @@ impl Backend for UsbBackend {
         self.stream_in.cancel_all();
         // nusb cancellation completes outstanding requests asynchronously. Drain
         // them before allowing a later start to create a fresh ordered queue.
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + self.control.timeout;
         while self.stream_in.pending() != 0 {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1163,12 +1282,14 @@ mod tests {
     #[test]
     fn uvcp_little_endian_wire_packet() {
         let payload = [0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0];
-        let packet = command(READ_CMD, 7, &payload).unwrap();
+        let packet = command(READ_CMD, 7, false, &payload).unwrap();
         assert_eq!(
             &packet[..12],
             &[0x55, 0x33, 0x56, 0x43, 0, 0x40, 0, 8, 12, 0, 7, 0]
         );
-        let mut response = command(READ_CMD + 1, 7, &[1, 2, 3, 4]).unwrap();
+        let resend = command(READ_CMD, 7, true, &payload).unwrap();
+        assert_eq!(&resend[4..6], &[0, 0xc0]);
+        let mut response = command(READ_CMD + 1, 7, false, &[1, 2, 3, 4]).unwrap();
         response[4..6].fill(0);
         assert_eq!(ack(&response, 7).unwrap(), (0x0801, &[1, 2, 3, 4][..]));
         assert!(ack(&response, 8).is_err());
@@ -1216,6 +1337,103 @@ mod tests {
             device_xml_entries(&manifest).unwrap(),
             [(0x2000, 200), (0x3000, 300)]
         );
+    }
+    /// A camera's control endpoints, replying to each read from a script.
+    #[derive(Default)]
+    struct Script {
+        sent: Vec<Vec<u8>>,
+        replies: VecDeque<Result<Vec<u8>, TransferError>>,
+        halts_cleared: usize,
+    }
+    impl Channel for Script {
+        fn send(&mut self, packet: Vec<u8>, _timeout: Duration) -> Result<usize, TransferError> {
+            self.sent.push(packet);
+            Ok(self.sent.last().unwrap().len())
+        }
+        fn receive(&mut self, _len: usize, _timeout: Duration) -> Result<Vec<u8>, TransferError> {
+            // A read with nothing to receive times out.
+            self.replies
+                .pop_front()
+                .unwrap_or(Err(TransferError::Cancelled))
+        }
+        fn clear_halt(&mut self) {
+            self.halts_cleared += 1;
+        }
+    }
+    fn reply(status: u16, command: u16, id: u16, scd: &[u8]) -> Result<Vec<u8>, TransferError> {
+        let mut packet = MAGIC.to_le_bytes().to_vec();
+        packet.extend(status.to_le_bytes());
+        packet.extend(command.to_le_bytes());
+        packet.extend((scd.len() as u16).to_le_bytes());
+        packet.extend(id.to_le_bytes());
+        packet.extend(scd);
+        Ok(packet)
+    }
+    fn control(
+        replies: impl IntoIterator<Item = Result<Vec<u8>, TransferError>>,
+    ) -> Control<Script> {
+        let script = Script {
+            replies: replies.into_iter().collect(),
+            ..Script::default()
+        };
+        Control::new(script, Duration::from_secs(1))
+    }
+    /// The flags and request ID of each command sent.
+    fn sent(control: &Control<Script>) -> Vec<(u16, u16)> {
+        let field = |packet: &[u8], at| le16(packet, at).unwrap();
+        let sent = control.channel.sent.iter();
+        sent.map(|p| (field(p, 4), field(p, 10))).collect()
+    }
+    #[test]
+    fn lost_or_corrupt_acknowledgements_resend_the_command() {
+        let value = 2000u32.to_le_bytes();
+        // No acknowledgement: resend with the same ID and CommandResend.
+        let mut lost = control([Err(TransferError::Cancelled), reply(0, 0x0801, 1, &value)]);
+        assert_eq!(lost.read_memory(0x1cc, 4).unwrap(), value);
+        assert_eq!(sent(&lost), [(0x4000, 1), (0xc000, 1)]);
+        // A corrupt acknowledgement, then a stall the endpoint must clear.
+        let mut corrupt = reply(0, 0x0801, 1, &value).unwrap();
+        corrupt[0] = 0;
+        let mut flaky = control([
+            Ok(corrupt),
+            Err(TransferError::Stall),
+            reply(0, 0x0801, 1, &value),
+        ]);
+        assert_eq!(flaky.read_memory(0x1cc, 4).unwrap(), value);
+        assert_eq!(flaky.channel.sent.len(), 3);
+        assert_eq!(flaky.channel.halts_cleared, 1);
+        // A busy camera gets the command again under a new ID, as does one
+        // that cannot take a resend.
+        let mut busy = control([
+            reply(STATUS_BUSY, 0x0801, 1, &[]),
+            reply(0, 0x0801, 2, &value),
+        ]);
+        assert_eq!(busy.read_memory(0x1cc, 4).unwrap(), value);
+        assert_eq!(sent(&busy), [(0x4000, 1), (0x4000, 2)]);
+        let mut plain = control([
+            Err(TransferError::Cancelled),
+            reply(STATUS_RESEND_NOT_SUPPORTED, 0x0801, 1, &[]),
+            reply(0, 0x0801, 2, &value),
+        ]);
+        assert_eq!(plain.read_memory(0x1cc, 4).unwrap(), value);
+        assert_eq!(sent(&plain), [(0x4000, 1), (0xc000, 1), (0x4000, 2)]);
+        // A camera that writes without reporting the written length.
+        let mut write = control([reply(0, 0x0803, 1, &[])]);
+        write.write_memory(0x10_0004, &[1, 0, 0, 0]).unwrap();
+    }
+    #[test]
+    fn definite_failures_are_not_resent() {
+        let mut rejected = control([reply(0x8003, 0x0801, 1, &[])]);
+        let error = rejected.read_memory(0x1cc, 4).unwrap_err();
+        assert_eq!(error.downcast_ref::<UvcpStatus>().unwrap().0, 0x8003);
+        assert_eq!(rejected.channel.sent.len(), 1);
+        let mut gone = control([Err(TransferError::Disconnected)]);
+        assert!(gone.read_memory(0x1cc, 4).is_err());
+        assert_eq!(gone.channel.sent.len(), 1);
+        let mut silent = control([]);
+        let error = silent.read_memory(0x1cc, 4).unwrap_err();
+        assert!(format!("{error:#}").contains("timed out"));
+        assert_eq!(silent.channel.sent.len(), ATTEMPTS as usize);
     }
     #[test]
     fn usb_leader_and_trailer_validation() {
