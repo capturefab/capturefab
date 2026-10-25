@@ -1037,13 +1037,13 @@ impl UsbBackend {
     }
     /// Halt the stream endpoint, then clear the halt, as Aravis and the NI
     /// driver reset it, so the camera drops any partly sent block. A host
-    /// may refuse to halt it; clearing the halt still resets it.
+    /// or camera may ignore the halt; clearing it still resets the endpoint.
     fn reset_stream_endpoint(&mut self) -> Result<()> {
         let _ = self
             .stream_interface
             .control_out(
                 halt(self.stream_in.endpoint_address()),
-                self.control.timeout,
+                Duration::from_millis(500),
             )
             .wait();
         self.stream_in
