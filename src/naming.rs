@@ -172,16 +172,52 @@ pub fn camera_label(info: &CameraInfo) -> String {
 
 /// Show what a template expands to now; {seq} is shown as `####`.
 pub fn preview(template: &str, camera: &str, now: DateTime<Local>) -> String {
+    preview_numbered(template, camera, now, None)
+}
+
+/// `preview` with {seq} as `seq` when it is known, else `####`.
+pub fn preview_numbered(
+    template: &str,
+    camera: &str,
+    now: DateTime<Local>,
+    seq: Option<u32>,
+) -> String {
     let Ok(tokens) = tokens(template) else {
         return template.into();
     };
     tokens
         .iter()
-        .map(|t| match t {
-            Token::Seq => "####".into(),
-            t => expand(t, camera, &now, 0),
+        .map(|t| match (t, seq) {
+            (Token::Seq, Some(seq)) => format!("{seq:04}"),
+            (Token::Seq, None) => "####".into(),
+            (t, _) => expand(t, camera, &now, 0),
         })
         .collect()
+}
+
+/// The number {seq} would take in `template`'s next file now: one past the
+/// highest already in its folder, past any taken name. Read-only: it
+/// reserves nothing, creates nothing, and shares no state with the namer
+/// that saves, so the file saved may still take a later number. `None`
+/// when the template has no {seq} or names no file.
+pub fn peek_next(template: &str, camera: &str, now: DateTime<Local>) -> Option<u32> {
+    if !tokens(template).ok()?.contains(&Token::Seq) {
+        return None;
+    }
+    let input = NameInput {
+        camera,
+        now,
+        index: 0,
+    };
+    let mut namer = Namer::default();
+    namer
+        .candidate(
+            &Plan::Template(template.to_owned()),
+            &input,
+            OnExists::Number,
+        )
+        .ok()?;
+    namer.next.values().next().copied()
 }
 
 fn expand(token: &Token, camera: &str, now: &DateTime<Local>, index: u32) -> String {
@@ -676,6 +712,33 @@ mod tests {
         input.now = fixed_time() + chrono::Duration::seconds(1);
         let second = namer.candidate(&plan, &input, OnExists::Fail).unwrap();
         assert_eq!(second, dir.join("A-20261017-101501-0014.png"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn peeking_the_next_number_reads_without_reserving() {
+        let dir = temp("peek");
+        let template = format!("{}/{{camera}}-{{datetime}}-{{seq}}.png", dir.display());
+        assert_eq!(peek_next(&template, "A", fixed_time()), Some(1));
+        let missing = format!("{}/missing/{{camera}}-{{seq}}.png", dir.display());
+        assert_eq!(peek_next(&missing, "A", fixed_time()), Some(1));
+        for name in ["A-20261017-101500-0007.png", "A-20261017-101501-0012.png"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        assert_eq!(peek_next(&template, "A", fixed_time()), Some(13));
+        // Nothing was reserved, and nothing was created.
+        assert_eq!(peek_next(&template, "A", fixed_time()), Some(13));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        let fixed = format!("{}/{{camera}}.png", dir.display());
+        assert_eq!(peek_next(&fixed, "A", fixed_time()), None);
+        assert_eq!(
+            preview_numbered("{camera}-{seq}.png", "A", fixed_time(), Some(13)),
+            "A-0013.png"
+        );
+        assert_eq!(
+            preview("{camera}-{seq}.png", "A", fixed_time()),
+            "A-####.png"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

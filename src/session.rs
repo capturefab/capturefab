@@ -915,6 +915,10 @@ pub struct CameraSnapshot {
     pub forwarding_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_progress: Option<ForwardingProgress>,
+    /// The absolute file a local recording writes, with its template
+    /// expanded; unset for network forwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_path: Option<String>,
     /// When the current recording or forward started, UTC Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_since_ms: Option<u64>,
@@ -986,6 +990,10 @@ pub struct SessionSnapshot {
     pub forwarding_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_progress: Option<ForwardingProgress>,
+    /// The absolute file a local recording writes, with its template
+    /// expanded; unset for network forwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_path: Option<String>,
     /// When the current recording or forward started, UTC Unix milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_since_ms: Option<u64>,
@@ -1032,6 +1040,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.forwarding = camera.forwarding.clone();
         state.forwarding_id = camera.forwarding_id.clone();
         state.forwarding_progress = camera.forwarding_progress.clone();
+        state.recording_path = camera.recording_path.clone();
         state.forwarding_since_ms = camera.forwarding_since_ms;
         state.forwarding_until_ms = camera.forwarding_until_ms;
         state.jobs = camera.jobs.clone();
@@ -1052,6 +1061,7 @@ fn project_selected(state: &mut SessionSnapshot) {
         state.forwarding = None;
         state.forwarding_id = None;
         state.forwarding_progress = None;
+        state.recording_path = None;
         state.forwarding_since_ms = None;
         state.forwarding_until_ms = None;
         state.jobs.clear();
@@ -1337,6 +1347,7 @@ impl Report {
             forwarding: s.forwarding.clone(),
             forwarding_id: s.forwarding_id.clone(),
             forwarding_progress: s.forwarding_progress.clone(),
+            recording_path: s.recording_path.clone(),
             forwarding_since_ms: s.forwarding_since_ms,
             forwarding_until_ms: s.forwarding_until_ms,
             jobs: s.jobs.clone(),
@@ -3755,6 +3766,7 @@ mod tests {
             error_logged: None,
             forwarding_id: Some(format!("{frames:032x}")),
             forwarding_progress: None,
+            recording_path: None,
             forwarding_since_ms: Some(frames * 1000),
             forwarding_until_ms: Some(frames * 1000 + 60_000),
         }

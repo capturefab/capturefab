@@ -1503,6 +1503,8 @@ mod tests {
             camera: Some("sim:1".into()),
             path: "capture.png".into(),
             count: 1,
+            size: None,
+            thumb: None,
             at: start,
         });
         assert_eq!(bench.flash("sim:1", false), 1.0);

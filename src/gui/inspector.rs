@@ -1429,9 +1429,27 @@ impl Workbench {
     }
 }
 
-/// The next file a capture or recording saves, on one line: a folder glyph,
-/// `label`, and the file name cut in the middle so the camera and the
-/// extension both stay. Its folder, the whole path and `about` on hover.
+/// How tall a saved file's thumbnail shows, in layout units.
+const THUMB_HEIGHT: f32 = 40.0;
+
+/// A thumbnail's width at `height`, keeping its shape, but never wider
+/// than twice its height, which a line-scan strip would otherwise be.
+fn thumb_width(handle: &iced::widget::image::Handle, height: f32) -> f32 {
+    match handle {
+        iced::widget::image::Handle::Rgba {
+            width,
+            height: tall,
+            ..
+        } if *tall > 0 => (height * *width as f32 / *tall as f32).clamp(height / 2.0, height * 2.0),
+        _ => height,
+    }
+}
+
+/// The next file a capture or recording saves: a folder glyph, `label`,
+/// and the file name cut in the middle so the camera and the number both
+/// stay. A subfolder it goes in under the chosen folder ("2026-10-17")
+/// shows on a line below rather than eating into the name. Its folder, the
+/// whole path and `about` on hover.
 fn file_preview<'a>(
     label: &'static str,
     preview: &str,
@@ -1440,31 +1458,53 @@ fn file_preview<'a>(
     p: &'static Palette,
 ) -> Element<'a, Message> {
     let (leaf, folder) = split_preview(preview);
-    // Under the chosen folder, the path from it ("2026-10-17/clip.png"), so
-    // a dated subfolder shows; else just the file name.
-    let file = (!root.is_empty())
-        .then(|| preview.strip_prefix(root))
-        .flatten()
-        .and_then(|rest| rest.strip_prefix(['/', '\\']))
-        .filter(|rest| !rest.is_empty())
-        .map_or(leaf, str::to_owned);
+    let subfolder = subfolder(preview, root);
     let hover = if folder.is_empty() {
         format!("{preview}\n{about}")
     } else {
         format!("In {folder}\n{preview}\n{about}")
     };
-    tip(
-        row![
-            icon(Icon::Folder, 12.0, p.secondary),
-            text(label).size(style::SMALL).color(p.secondary),
-            one_line(file, style::SMALL, style::SANS, p.text)
+    let line = row![
+        icon(Icon::Folder, 12.0, p.secondary),
+        text(label).size(style::SMALL).color(p.secondary),
+        one_line(leaf, style::SMALL, style::SANS, p.text)
+            .keep_ends()
+            .width(Fill),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    let content: Element<'a, Message> = match subfolder {
+        Some(subfolder) => column![
+            line,
+            row![
+                // Under the label, past the glyph and its gap.
+                space().width(18),
+                one_line(
+                    format!("in {subfolder}"),
+                    style::CAPTION,
+                    style::SANS,
+                    p.secondary
+                )
                 .keep_ends()
                 .width(Fill),
+            ],
         ]
-        .spacing(6)
-        .align_y(Alignment::Center),
-        hover,
-    )
+        .spacing(2)
+        .into(),
+        None => line.into(),
+    };
+    tip(content, hover)
+}
+
+/// The folders between the chosen `root` and the file `preview` names
+/// ("2026-10-17"), if it goes in any.
+fn subfolder(preview: &str, root: &str) -> Option<String> {
+    let rest = preview
+        .strip_prefix(root)
+        .filter(|_| !root.is_empty())?
+        .strip_prefix(['/', '\\'])?;
+    let (_, folder) = split_preview(rest);
+    (!folder.is_empty()).then_some(folder)
 }
 
 /// A home-shortened path split into its file name and its folder, at the
@@ -2882,44 +2922,83 @@ impl Workbench {
             summary = format!("{summary} · {destination}");
         }
         let copied = self.just_copied(&copy);
-        Some(
-            row![
-                icon(
-                    Icon::Check,
+        let line = row![
+            icon(
+                Icon::Check,
+                12.0,
+                if capturing {
+                    p.secondary
+                } else {
+                    p.ink(p.live)
+                }
+            ),
+            tip(
+                one_line(summary, style::SMALL, style::SANS, p.secondary).width(Fill),
+                copy.clone(),
+            ),
+            tip(
+                button(icon(
+                    if copied { Icon::Check } else { Icon::Copy },
                     12.0,
-                    if capturing {
-                        p.secondary
-                    } else {
-                        p.ink(p.live)
-                    }
-                ),
-                tip(
-                    one_line(summary, style::SMALL, style::SANS, p.secondary).width(Fill),
-                    copy.clone(),
-                ),
-                tip(
-                    button(icon(
-                        if copied { Icon::Check } else { Icon::Copy },
-                        12.0,
-                        if copied { p.ink(p.live) } else { p.secondary },
-                    ))
+                    if copied { p.ink(p.live) } else { p.secondary },
+                ))
+                .padding(4)
+                .style(style::plain)
+                .on_press(Message::Copy(copy)),
+                if copied { "Copied" } else { "Copy path" },
+            ),
+            tip(
+                button(icon(Icon::Folder, 12.0, p.secondary))
+                    .name(super::reveal::label())
                     .padding(4)
                     .style(style::plain)
-                    .on_press(Message::Copy(copy)),
-                    if copied { "Copied" } else { "Copy path" },
-                ),
+                    .on_press(Message::Reveal(saved.path.clone().into())),
+                super::reveal::label(),
+            ),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        let total = self
+            .saved_count(saved.camera.as_deref())
+            .max(saved.count as u64);
+        let details = column![
+            line,
+            one_line(
+                super::notice::tally_caption(saved, total),
+                style::CAPTION,
+                style::SANS,
+                p.secondary
+            )
+            .width(Fill),
+        ]
+        .spacing(2)
+        .width(Fill);
+        let thumb = saved
+            .thumb
+            .as_ref()
+            .filter(|_| saved.count == 1)
+            .map(|handle| {
+                let width = thumb_width(handle, THUMB_HEIGHT);
                 tip(
-                    button(icon(Icon::Folder, 12.0, p.secondary))
-                        .name(super::reveal::label())
-                        .padding(4)
-                        .style(style::plain)
-                        .on_press(Message::Reveal(saved.path.clone().into())),
+                    button(
+                        iced::widget::image(handle.clone())
+                            .width(width)
+                            .height(THUMB_HEIGHT)
+                            .content_fit(iced::ContentFit::Cover)
+                            .border_radius(4.0),
+                    )
+                    .name(super::reveal::label())
+                    .padding(0)
+                    .style(style::plain)
+                    .on_press(Message::Reveal(saved.path.clone().into())),
                     super::reveal::label(),
-                ),
-            ]
-            .spacing(6)
-            .align_y(Alignment::Center)
-            .into(),
+                )
+            });
+        Some(
+            row![thumb, details]
+                .spacing(8)
+                .align_y(Alignment::Center)
+                .into(),
         )
     }
 
@@ -3364,6 +3443,39 @@ impl Workbench {
         }
     }
 
+    /// What the forward card says it writes: the file a recording writes,
+    /// as this window started it or else as the session reports it, so one
+    /// the CLI or assistant started also shows its real name rather than
+    /// the template; and where it goes, with its tooltip: the folder of
+    /// that file (home folded to `~`), else the redacted requested output.
+    fn forward_place<'a>(
+        &'a self,
+        destination: &str,
+        recording: bool,
+    ) -> (Option<&'a str>, String, String) {
+        let file = recording
+            .then(|| {
+                self.recording_file()
+                    .or(self.snapshot.recording_path.as_deref())
+            })
+            .flatten();
+        match file.map(std::path::Path::new) {
+            Some(path) => {
+                let folder = path.parent().unwrap_or(path);
+                (
+                    file,
+                    super::toolbar::fold_home(folder, prefs::capture_root().parent()),
+                    path.display().to_string(),
+                )
+            }
+            None => (
+                None,
+                redact_address(destination),
+                redact_address(destination),
+            ),
+        }
+    }
+
     /// While forwarding: where to, with what, and how to stop. Its settings
     /// cannot change mid-stream, so the form gives way to this.
     fn forward_card<'a>(
@@ -3383,19 +3495,16 @@ impl Workbench {
                 "Stop forwarding",
             )
         };
+        let (file, place, place_tip) = self.forward_place(destination, recording);
         let mut card = column![
             row![mark, text(title).size(style::BODY).font(style::SEMIBOLD)]
                 .spacing(8)
                 .align_y(Alignment::Center),
             tip(
-                one_line(
-                    redact_address(destination),
-                    style::SMALL,
-                    style::MONO,
-                    p.secondary
-                )
-                .width(Fill),
-                redact_address(destination),
+                one_line(place, style::SMALL, style::MONO, p.secondary)
+                    .keep_ends()
+                    .width(Fill),
+                place_tip,
             ),
         ]
         .spacing(6);
@@ -3409,7 +3518,7 @@ impl Workbench {
         {
             card = card.push(text(summary.as_str()).size(style::SMALL).color(p.secondary));
         }
-        if recording && let Some(file) = self.recording_file() {
+        if let Some(file) = file {
             let name = std::path::Path::new(file).file_name().map_or_else(
                 || file.to_owned(),
                 |name| name.to_string_lossy().into_owned(),
@@ -3417,7 +3526,9 @@ impl Workbench {
             card = card.push(
                 row![
                     tip(
-                        one_line(name, style::SMALL, style::MONO, p.secondary).width(Fill),
+                        one_line(name, style::SMALL, style::MONO, p.secondary)
+                            .keep_ends()
+                            .width(Fill),
                         file.to_owned(),
                     ),
                     tip(
@@ -3428,6 +3539,27 @@ impl Workbench {
                             .on_press(Message::Reveal(file.into())),
                         super::reveal::label(),
                     ),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            );
+        }
+        if let Some((stats, warn)) = super::toolbar::recording_stats(
+            epoch_ms(),
+            self.snapshot.forwarding_since_ms,
+            self.snapshot.forwarding_progress.as_ref(),
+            self.snapshot.forwarding_id.as_deref(),
+        ) {
+            card = card.push(
+                row![
+                    warn.then(|| icon(Icon::Warning, 12.0, p.ink(p.warn))),
+                    one_line(
+                        stats,
+                        style::SMALL,
+                        style::SANS,
+                        if warn { p.ink(p.warn) } else { p.secondary }
+                    )
+                    .width(Fill),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -4651,6 +4783,106 @@ mod tests {
         assert!(bench.asked("Gain").is_none(), "another camera's");
         bench.pending.clear();
         assert!(bench.asked("TriggerMode").is_none());
+    }
+
+    #[test]
+    fn the_next_file_keeps_its_dated_folder_out_of_its_name() {
+        let root = "~/Capturefab";
+        let preview = "~/Capturefab/2026-10-25/Pattern-SIM0-20261025-101500-0013.png";
+        assert_eq!(subfolder(preview, root).as_deref(), Some("2026-10-25"));
+        assert_eq!(
+            split_preview(preview).0,
+            "Pattern-SIM0-20261025-101500-0013.png"
+        );
+        assert_eq!(subfolder("~/Capturefab/frame.png", root), None);
+        assert_eq!(subfolder("frame.png", ""), None);
+        assert_eq!(
+            subfolder("~/Capturefab/a/b/frame.png", root).as_deref(),
+            Some("a/b")
+        );
+    }
+
+    #[test]
+    fn the_preview_shows_the_next_number_once_it_is_read() {
+        let mut bench = bench();
+        let now = chrono::Local::now();
+        let template = "/captures/{camera}-{seq}.png".to_owned();
+        bench.output = template.clone();
+        let camera = bench.name_label();
+        assert!(bench.preview_at(&template, now).ends_with("-####.png"));
+        assert!(bench.next_numbers.wanted(&template, &camera, &day(now)));
+        bench.next_numbers.busy = true;
+        bench.next_numbers.settle(NextNumber {
+            template: template.clone(),
+            camera: camera.clone(),
+            date: day(now),
+            seq: Some(13),
+        });
+        assert!(!bench.next_numbers.busy);
+        assert!(!bench.next_numbers.wanted(&template, &camera, &day(now)));
+        assert!(bench.preview_at(&template, now).ends_with("-0013.png"));
+        // Another day's folder is read again; until then, `####`.
+        assert!(bench.next_numbers.wanted(&template, &camera, "2000-01-01"));
+        // A save asks for the number again, showing the old one meanwhile.
+        bench.next_numbers.saved();
+        assert!(bench.next_numbers.wanted(&template, &camera, &day(now)));
+        assert!(bench.preview_at(&template, now).ends_with("-0013.png"));
+    }
+
+    #[test]
+    fn a_recording_card_names_the_resolved_file_not_the_template() {
+        let mut bench = bench();
+        let home = prefs::capture_root();
+        let template = home.join("{date}/{camera}-{datetime}-{seq}.mp4");
+        let file = home.join("2026-10-25/Sim-SIM0-20261025-101500-0001.mp4");
+        let template = template.to_string_lossy().into_owned();
+        // Started by the CLI: this window has no `last_recording`.
+        bench.snapshot.forwarding = Some(template.clone());
+        bench.snapshot.recording_path = Some(file.to_string_lossy().into_owned());
+        let (shown, place, about) = bench.forward_place(&template, true);
+        assert_eq!(shown, bench.snapshot.recording_path.as_deref());
+        assert!(
+            !place.contains('{') && place.ends_with("2026-10-25"),
+            "{place}"
+        );
+        assert!(
+            about.ends_with("Sim-SIM0-20261025-101500-0001.mp4"),
+            "{about}"
+        );
+        // A network forward still shows its redacted address.
+        let url = "rtsp://operator:secret@192.168.1.20:8554/line-1";
+        let (shown, place, _) = bench.forward_place(url, false);
+        assert_eq!(shown, None);
+        assert!(!place.contains("secret"), "{place}");
+    }
+
+    #[test]
+    fn the_saved_line_tallies_this_camera_with_its_frame_shape() {
+        let mut bench = bench();
+        let capture = |camera: &str| Pending {
+            camera: Some(camera.into()),
+            ..Pending::unanswered(Job::Capture)
+        };
+        let reply = json!({
+            "files": ["frame-0001.png"],
+            "frames": [{"width": 640, "height": 480}],
+            "count": 1,
+        });
+        bench.settle(&capture("sim:0"), &Ok(reply.clone()));
+        bench.settle(&capture("sim:0"), &Ok(reply.clone()));
+        bench.settle(&capture("sim:1"), &Ok(reply));
+        let saved = bench.last_saved.clone().unwrap();
+        assert_eq!(saved.size, Some((640, 480)));
+        assert_eq!(bench.saved_count(Some("sim:0")), 2);
+        assert_eq!(bench.saved_count(Some("sim:1")), 1, "per camera");
+        assert_eq!(
+            super::super::notice::tally_caption(&saved, 1),
+            "1 saved this session \u{b7} 640\u{d7}480 PNG"
+        );
+        assert_eq!(
+            super::super::notice::tally_caption(&saved, 2_400),
+            "2,400 saved this session \u{b7} 640\u{d7}480 PNG"
+        );
     }
 
     #[test]

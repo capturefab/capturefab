@@ -93,6 +93,11 @@ pub(super) struct Saved {
     pub(super) path: String,
     /// How many files were written.
     pub(super) count: usize,
+    /// The first frame's size, when the result reports it.
+    pub(super) size: Option<(u32, u32)>,
+    /// A small picture of the frame shown as it saved; one at a time, as
+    /// it replaces the last.
+    pub(super) thumb: Option<iced::widget::image::Handle>,
     pub(super) at: Instant,
 }
 
@@ -101,13 +106,46 @@ impl Saved {
     pub(super) fn from_result(camera: Option<String>, result: &Value, at: Instant) -> Option<Self> {
         let files = result["files"].as_array()?;
         let path = files.first()?.as_str()?.to_owned();
+        let frame = &result["frames"][0];
+        let side = |key| {
+            frame[key]
+                .as_u64()
+                .and_then(|side| u32::try_from(side).ok())
+                .filter(|side| *side > 0)
+        };
         Some(Self {
             camera,
             path,
             count: files.len(),
+            size: side("width").zip(side("height")),
+            thumb: None,
             at,
         })
     }
+
+    /// "640×480 PNG": the frame size and the file's format, as known.
+    pub(super) fn shape(&self) -> Option<String> {
+        let format = std::path::Path::new(&self.path)
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_uppercase())
+            .filter(|extension| !extension.is_empty());
+        let size = self
+            .size
+            .map(|(width, height)| format!("{width}\u{d7}{height}"));
+        match (size, format) {
+            (Some(size), Some(format)) => Some(format!("{size} {format}")),
+            (size, format) => size.or(format),
+        }
+    }
+}
+
+/// "24 saved this session · 640×480 PNG", under the last saved file.
+pub(super) fn tally_caption(saved: &Saved, total: u64) -> String {
+    let mut caption = format!("{} saved this session", grouped(total.max(1)));
+    if let Some(shape) = saved.shape() {
+        caption = format!("{caption} \u{b7} {shape}");
+    }
+    caption
 }
 
 /// The `copied` key for the whole activity log.
@@ -142,7 +180,82 @@ impl Batch {
     }
 }
 
+/// The most a saved file's thumbnail keeps each way, in pixels: enough for
+/// its row on a high-density display, and no more.
+pub(super) const THUMB_BOUNDS: (u32, u32) = (128, 96);
+
 impl Workbench {
+    /// A capture saved files: it becomes the last saved, adds to its
+    /// camera's tally and, for a single frame, asks for a thumbnail of the
+    /// frame on show, so nothing reads the file back.
+    pub(super) fn note_saved(&mut self, saved: Saved) {
+        let camera = saved
+            .camera
+            .clone()
+            .or_else(|| self.snapshot.active_camera.clone());
+        if let Some(camera) = &camera {
+            self.add_saved(camera, saved.count as u64);
+        }
+        self.thumb_wanted = camera
+            .filter(|_| saved.count == 1 && !self.scanner_selected())
+            .and_then(|camera| self.handle.latest_frame_for(&camera))
+            .map(|frame| (saved.path.clone(), frame));
+        self.last_saved = Some(saved);
+        self.next_numbers.saved();
+    }
+
+    /// Count `files` more saved by `camera` this session.
+    pub(super) fn add_saved(&mut self, camera: &str, files: u64) {
+        *self.session_saved.entry(camera.to_owned()).or_default() += files;
+    }
+
+    /// Files `camera` saved this session, as far as this window saw.
+    pub(super) fn saved_count(&self, camera: Option<&str>) -> u64 {
+        camera
+            .or(self.snapshot.active_camera.as_deref())
+            .and_then(|camera| self.session_saved.get(camera))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// A camera that is no longer connected starts its tally over.
+    pub(super) fn prune_saved(&mut self) {
+        let cameras = &self.snapshot.cameras;
+        self.session_saved
+            .retain(|id, _| cameras.iter().any(|camera| camera.info.id == *id));
+    }
+
+    /// Shrink the wanted frame on a worker thread; the view never waits.
+    pub(super) fn thumb_task(&mut self) -> Task<Message> {
+        let Some((path, frame)) = self.thumb_wanted.take() else {
+            return Task::none();
+        };
+        let (done, thumb) = iced::futures::channel::oneshot::channel();
+        let spawned = std::thread::Builder::new()
+            .name("capturefab-thumbnail".into())
+            .spawn(move || {
+                let (width, height) = THUMB_BOUNDS;
+                let small = crate::frame::preview_rgba(&frame, width, height).ok();
+                let _ = done.send(small.map(|(width, height, rgba)| {
+                    iced::widget::image::Handle::from_rgba(width, height, rgba)
+                }));
+            });
+        if spawned.is_err() {
+            return Task::none();
+        }
+        Task::perform(async move { thumb.await.ok().flatten() }, move |thumb| {
+            Message::SavedThumb(path.clone(), thumb)
+        })
+    }
+
+    /// A thumbnail arrived: it belongs to the last saved file only if
+    /// nothing has replaced it since.
+    pub(super) fn saved_thumb(&mut self, path: &str, thumb: Option<iced::widget::image::Handle>) {
+        if let Some(saved) = self.last_saved.as_mut().filter(|saved| saved.path == path) {
+            saved.thumb = thumb;
+        }
+    }
+
     /// Show a notice. One already showing swaps its text in place rather
     /// than fading out and in again.
     pub(super) fn set_notice(
@@ -684,6 +797,60 @@ mod tests {
             failed(Job::Forward { recording: true }),
             "Could not start recording: busy"
         );
+    }
+
+    #[test]
+    fn scheduled_saves_count_once_and_a_gone_camera_starts_over() {
+        let mut bench = bench();
+        let job = |captured| crate::scheduling::CaptureJob {
+            id: 1,
+            status: "running".into(),
+            output: "frame-{seq}.png".into(),
+            count: 10,
+            captured,
+            skipped: 0,
+            retries: 0,
+            first_at_ms: 0,
+            interval_ms: 1000,
+            next_at_ms: 0,
+            last_file: Some(format!("frame-{captured}.png")),
+            error: None,
+            destination: None,
+            context: Default::default(),
+        };
+        let mut camera = super::super::liveness::streaming_camera(0, 0, 30.0);
+        let id = camera.info.id.clone();
+        bench.add_saved(&id, 2);
+        camera.jobs = vec![job(3)];
+        bench.snapshot.cameras = vec![camera];
+        bench.sync_scheduled_captures();
+        assert_eq!(bench.saved_count(Some(&id)), 5);
+        // The same report again adds nothing; a later one adds its delta.
+        bench.sync_scheduled_captures();
+        assert_eq!(bench.saved_count(Some(&id)), 5);
+        bench.snapshot.cameras[0].jobs = vec![job(4)];
+        bench.sync_scheduled_captures();
+        assert_eq!(bench.saved_count(Some(&id)), 6);
+        assert_eq!(bench.last_saved.as_ref().unwrap().path, "frame-4.png");
+        // Disconnected: its tally goes with it.
+        bench.snapshot.cameras.clear();
+        bench.sync_scheduled_captures();
+        assert_eq!(bench.saved_count(Some(&id)), 0);
+    }
+
+    #[test]
+    fn saved_frames_report_their_shape_when_they_can() {
+        let at = Instant::now();
+        let saved = |result| Saved::from_result(None, &result, at).unwrap();
+        let full = saved(json!({
+            "files": ["a/b.tiff"], "frames": [{"width": 2448, "height": 2048}]
+        }));
+        assert_eq!(full.size, Some((2448, 2048)));
+        assert_eq!(full.shape().as_deref(), Some("2448\u{d7}2048 TIFF"));
+        let bare = saved(json!({"files": ["frame"]}));
+        assert_eq!((bare.size, bare.shape()), (None, None));
+        let zero = saved(json!({"files": ["x.png"], "frames": [{"width": 0, "height": 4}]}));
+        assert_eq!(zero.shape().as_deref(), Some("PNG"));
     }
 
     fn bench() -> Workbench {

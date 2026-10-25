@@ -346,7 +346,15 @@ impl Workbench {
                 && entry.state == ActivityState::Succeeded
                 && let Some(saved) = &mut self.last_saved
             {
+                // The entry lists only its first files; it counts them all.
+                let more = entry.file_count.saturating_sub(saved.count) as u64;
                 saved.count = entry.file_count;
+                if saved.count > 1 {
+                    self.thumb_wanted = None;
+                }
+                if let Some(camera) = saved.camera.clone().filter(|_| more > 0) {
+                    self.add_saved(&camera, more);
+                }
             }
         }
         let level = if effective_state(entry) == ActivityState::Failed {
@@ -379,7 +387,7 @@ impl Workbench {
         self.set_notice(text, detail, level);
     }
 
-    fn sync_scheduled_captures(&mut self) {
+    pub(super) fn sync_scheduled_captures(&mut self) {
         let mut saved = None;
         let mut kept = HashSet::new();
         for camera in &self.snapshot.cameras {
@@ -398,6 +406,8 @@ impl Workbench {
                         camera: Some(camera.info.id.clone()),
                         path: path.clone(),
                         count: (job.captured - previous) as usize,
+                        size: None,
+                        thumb: None,
                         at: self.now,
                     });
                 }
@@ -406,9 +416,10 @@ impl Workbench {
         self.client_activity
             .job_frames
             .retain(|key, _| kept.contains(key));
+        self.prune_saved();
         if let Some(saved) = saved {
             self.shutter.replay(1.0, 0.0, self.now);
-            self.last_saved = Some(saved);
+            self.note_saved(saved);
         }
     }
 
