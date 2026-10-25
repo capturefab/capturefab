@@ -345,6 +345,8 @@ pub(crate) fn summary(report: Value) -> Value {
         "blocked",
         "applied",
         "auto",
+        "auto_change",
+        "auto_changed",
         "restarted_stream",
         "camera_change",
         "before",
@@ -1317,6 +1319,19 @@ mod tests {
         let text = summary.to_string();
         assert!(!text.contains("SN-"), "{text}");
         assert!(text.len() <= crate::tools::MAX_OUTPUT_BYTES);
+    }
+
+    #[test]
+    fn a_restore_that_only_changes_auto_exposure_says_so() {
+        let auto =
+            json!({"current":null,"saved":{"balance":0.5},"action":"enter","risk":"reversible"});
+        let preview =
+            summary(json!({"setup":"bench","changes":[],"unchanged":4,"auto_change":auto}));
+        assert_eq!(preview["change_count"], 0);
+        assert_eq!(preview["auto_change"], auto);
+        let applied =
+            summary(json!({"setup":"bench","applied":0,"auto_change":auto,"auto_changed":true}));
+        assert_eq!(applied["auto_changed"], true);
     }
 
     #[test]
