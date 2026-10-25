@@ -1,0 +1,5 @@
+macOS downloads are now a disk image: drag Capturefab to Applications.
+Password-protected RTSP and ONVIF cameras ask you to sign in, and the password can be kept in the system credential store.
+Save a tuned camera setup and restore it later, with a preview of every change and one-step undo.
+Capturefab tells you when a new version is available; turn it off in Settings › Updates.
+Clearer first-run guidance, camera connection help and doctor checks for networks, permissions and installs.

@@ -472,6 +472,8 @@ jobs:
           set -- --version "$VERSION" --input dist/builds --output dist/release --repository "$GITHUB_REPOSITORY" --download-base "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/v$VERSION"
           if [ -n "$GPG_KEY" ]; then set -- "$@" --gpg-key "$GPG_KEY"; fi
           if [ "$PROVENANCE" = true ]; then set -- "$@" --provenance; fi
+          # The in-app update check shows these lines.
+          if [ -f "docs/releases/$VERSION.txt" ]; then set -- "$@" --highlights "docs/releases/$VERSION.txt"; fi
           python3 scripts/release.py assemble "$@"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
