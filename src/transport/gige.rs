@@ -112,6 +112,23 @@ fn parse_ack(packet: &[u8]) -> Result<Ack<'_>> {
     })
 }
 
+/// A GVCP command that went unanswered through all its attempts.
+#[derive(Debug)]
+pub(crate) struct GvcpTimeout {
+    pub(crate) command: u16,
+    waited: Duration,
+}
+impl std::fmt::Display for GvcpTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "GVCP command 0x{:04x} timed out after {:?} (three attempts); check camera address, network and firewall",
+            self.command, self.waited
+        )
+    }
+}
+impl std::error::Error for GvcpTimeout {}
+
 #[derive(Debug)]
 pub(crate) struct GvcpStatus(pub(crate) u16);
 impl std::fmt::Display for GvcpStatus {
@@ -179,6 +196,8 @@ pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
     let request = command_packet(DISCOVERY, 0xffff, 0x11, &[]);
     let mut sockets = Vec::new();
     let mut local_addresses = HashSet::new();
+    // Set when a send failed in a way macOS Local Network privacy explains.
+    let mut hint = None;
     for interface in if_addrs::get_if_addrs().context("enumerating IPv4 interfaces")? {
         let if_addrs::IfAddr::V4(v4) = interface.addr else {
             continue;
@@ -194,13 +213,17 @@ pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
         }
         // Probe the local interface too: camera simulators and software GigE
         // producers often bind to a unicast or loopback interface.
-        let mut sent = socket
-            .send_to(&request, SocketAddrV4::new(v4.ip, GVCP_PORT))
-            .is_ok();
+        let mut send =
+            |to: Ipv4Addr| match socket.send_to(&request, SocketAddrV4::new(to, GVCP_PORT)) {
+                Ok(_) => true,
+                Err(error) => {
+                    hint = hint.or(crate::network::local_network_hint(&error, Some(to.into())));
+                    false
+                }
+            };
+        let mut sent = send(v4.ip);
         if let Some(broadcast) = v4.broadcast {
-            sent |= socket
-                .send_to(&request, SocketAddrV4::new(broadcast, GVCP_PORT))
-                .is_ok();
+            sent |= send(broadcast);
         }
         if sent {
             sockets.push(socket);
@@ -210,16 +233,23 @@ pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
     if let Ok(socket) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         && socket.set_broadcast(true).is_ok()
         && socket.set_nonblocking(true).is_ok()
-        && socket
-            .send_to(&request, (Ipv4Addr::BROADCAST, GVCP_PORT))
-            .is_ok()
     {
-        sockets.push(socket);
+        match socket.send_to(&request, (Ipv4Addr::BROADCAST, GVCP_PORT)) {
+            Ok(_) => sockets.push(socket),
+            Err(error) => {
+                hint = hint.or(crate::network::local_network_hint(
+                    &error,
+                    Some(Ipv4Addr::BROADCAST.into()),
+                ));
+            }
+        }
     }
-    ensure!(
-        !sockets.is_empty(),
-        "no usable IPv4 broadcast socket; check network interfaces"
-    );
+    if sockets.is_empty() {
+        bail!(
+            "no usable IPv4 broadcast socket; {}",
+            hint.unwrap_or("check network interfaces")
+        );
+    }
     let mut cameras = BTreeMap::new();
     let mut packet = [0u8; 2048];
     while Instant::now() < deadline {
@@ -258,6 +288,13 @@ pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
             );
         }
     }
+    // Nothing found after macOS refused some of the broadcasts: say why
+    // instead of reporting an empty network.
+    if let Some(hint) = hint
+        && cameras.is_empty()
+    {
+        bail!("some GigE Vision discovery broadcasts could not be sent; {hint}");
+    }
     Ok(cameras.into_values().collect())
 }
 
@@ -289,7 +326,14 @@ impl Control {
             if Instant::now() >= deadline {
                 break;
             }
-            self.socket.send(&packet).context("sending GVCP command")?;
+            if let Err(error) = self.socket.send(&packet) {
+                let context = crate::network::with_local_network_hint(
+                    "sending GVCP command",
+                    &error,
+                    self.socket.peer_addr().ok().map(|peer| peer.ip()),
+                );
+                return Err(anyhow::Error::new(error).context(context));
+            }
             let mut attempt_deadline = (Instant::now() + retry_wait).min(deadline);
             loop {
                 let remaining = attempt_deadline.saturating_duration_since(Instant::now());
@@ -321,17 +365,25 @@ impl Control {
                     }
                     Err(error) if is_receive_timeout(&error) => break,
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error).context("receiving GVCP acknowledgement"),
+                    Err(error) => {
+                        let context = crate::network::with_local_network_hint(
+                            "receiving GVCP acknowledgement",
+                            &error,
+                            self.socket.peer_addr().ok().map(|peer| peer.ip()),
+                        );
+                        return Err(anyhow::Error::new(error).context(context));
+                    }
                 }
             }
             if attempt == 2 {
                 break;
             }
         }
-        bail!(
-            "GVCP command 0x{command:04x} timed out after {:?} (three attempts); check camera address, network and firewall",
-            self.timeout
-        )
+        Err(GvcpTimeout {
+            command,
+            waited: self.timeout,
+        }
+        .into())
     }
     fn read_register(&mut self, address: u32) -> Result<u32> {
         ensure!(address.is_multiple_of(4), "unaligned GVCP register address");
@@ -482,6 +534,10 @@ pub fn probe(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
         "expected a unicast camera IPv4 address"
     );
     let timeout = bounded_timeout(timeout);
+    probe_identity(ip, timeout)
+        .map_err(|error| crate::network::explain_probe_failure(ip, timeout, error))
+}
+fn probe_identity(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
     let mut control = Control::connect(SocketAddrV4::new(ip, GVCP_PORT), timeout / 2)?;
     if let Ok(payload) = control.transact(DISCOVERY, &[]) {
         return discovery_info(&payload, ip);

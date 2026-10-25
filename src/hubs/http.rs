@@ -842,7 +842,17 @@ fn connect(
                     ms: budget.as_millis(),
                 };
             }
-            Err(error) => last = classify_io(&error),
+            Err(error) => {
+                last = match classify_io(&error) {
+                    Problem::Unreachable(_)
+                        if crate::network::local_network_hint(&error, Some(addr.ip()))
+                            .is_some() =>
+                    {
+                        Problem::Unreachable(crate::network::NO_ROUTE_LOCAL_NETWORK)
+                    }
+                    problem => problem,
+                }
+            }
         }
     }
     Err(last)

@@ -400,7 +400,7 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 /// A real directory that only this user can enter. One another user owns,
 /// such as a squatted /tmp or /dev/shm name, is refused even if private.
-fn check_private_dir(path: &Path) -> Result<()> {
+pub(crate) fn check_private_dir(path: &Path) -> Result<()> {
     let m = fs::symlink_metadata(path)?;
     ensure!(
         m.is_dir() && !m.file_type().is_symlink(),

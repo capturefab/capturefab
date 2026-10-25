@@ -1,0 +1,13 @@
+# Capturefab: read/write access to USB3 Vision cameras (interface class
+# ef/05/00) for the user logged in at the seat (uaccess) and for members of
+# the plugdev group, such as a service account. One rule covers every vendor.
+#
+# Install:  sudo install -m 644 70-capturefab-usb3vision.rules /etc/udev/rules.d/
+#           sudo udevadm control --reload
+#           sudo udevadm trigger --subsystem-match=usb --action=add
+# then replug the camera. On a distribution without a plugdev group, create
+# one or put a group of your own in its place.
+#
+# 70 sorts after 50-udev-default, which imports usb_id and so sets
+# ID_USB_INTERFACES, and before 73-seat-late, which applies uaccess.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ef0500:*", MODE="0660", GROUP="plugdev", TAG+="uaccess"

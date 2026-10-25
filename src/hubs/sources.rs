@@ -297,7 +297,7 @@ impl SourceFactory for RtspSource {
             return Err(Failure::transient(ErrorKind::OperationFailed, "cancelled"));
         }
         let mut backend = crate::media::open_url(&self.url, RTSP_OPEN).map_err(|error| {
-            let missing = format!("{error:#}").contains("FFmpeg");
+            let missing = error.downcast_ref::<crate::media::FfmpegUnavailable>().is_some();
             Failure::transient(
                 ErrorKind::OperationFailed,
                 format!(
@@ -387,6 +387,7 @@ impl FrameSession for RtspSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn a_cancelled_rtsp_open_never_resolves_or_starts_ffmpeg() {
@@ -404,5 +405,49 @@ mod tests {
         };
         assert_eq!(failure.message, "cancelled");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Only an FFmpeg that could not start is called missing: an explained
+    /// source failure quotes FFmpeg's log, which names FFmpeg too.
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_restream_does_not_say_ffmpeg_is_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir =
+            std::env::temp_dir().join(format!("capturefab-hub-rtsp-{}-{port}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ffmpeg = dir.join("ffmpeg");
+        std::fs::write(
+            &ffmpeg,
+            format!(
+                "#!/bin/sh\necho '[tcp @ 0x1] Connection to tcp://127.0.0.1:{port} failed: Connection refused' >&2\nexit 1\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = RtspSource {
+            url: format!("rtsp://127.0.0.1:{port}/live"),
+            host: "127.0.0.1".into(),
+            port,
+            label: "camera live on hub test".into(),
+        };
+        let open = |path: PathBuf| {
+            crate::media::set_fake_ffmpeg(Some(path));
+            let result = source.open(&Cx::new());
+            crate::media::set_fake_ffmpeg(None);
+            match result {
+                Ok(_) => panic!("the restream opened"),
+                Err(failure) => failure.message,
+            }
+        };
+        let refused = open(ffmpeg.clone());
+        assert!(refused.contains("RTSP needs FFmpeg and"), "{refused}");
+        assert!(!refused.contains("cannot find"), "{refused}");
+        let missing = open(dir.join("absent"));
+        assert!(missing.contains("cannot find"), "{missing}");
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1891,7 +1891,7 @@ impl Workbench {
     /// Shared bookkeeping for a command that failed, before its notice: the
     /// failure kept where the control that sent it can show it.
     fn failed(&mut self, pending: &Pending, error: &anyhow::Error) {
-        let full = format!("{error:#}");
+        let full = format::desktop_words(format!("{error:#}"));
         if pending.job == Job::Discover {
             self.side.discovery_issues = vec![full.clone()];
         }

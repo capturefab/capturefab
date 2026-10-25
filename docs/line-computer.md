@@ -39,14 +39,15 @@ The service below runs `/usr/local/bin/capturefab`. Give it a system path with `
 
 ## 2. Give the service account the cameras
 
-**USB3 Vision.** A camera's `/dev/bus/usb` node must be readable and writable by the account that runs Capturefab. With the camera plugged in, `capturefab doctor` names any it cannot open and prints the rule for its vendor. By hand, find the vendor ID (the four hex digits before the colon) with `lsusb`, then:
+**USB3 Vision.** A camera's `/dev/bus/usb` node must be readable and writable by the account that runs Capturefab. One udev rule covers every USB3 Vision camera, whatever its vendor, by matching the USB3 Vision interface class. The Linux download ships it as `share/udev/rules.d/70-capturefab-usb3vision.rules`; install it and add the service account to `plugdev`:
 
 ```sh
-echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="VVVV", MODE="0660", GROUP="plugdev", TAG+="uaccess"' \
-  | sudo tee /etc/udev/rules.d/60-capturefab-VVVV.rules >/dev/null
-sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb
+sudo install -m 644 capturefab-VERSION-linux-aarch64/share/udev/rules.d/70-capturefab-usb3vision.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add
 sudo usermod -aG plugdev pi
 ```
+
+With a camera plugged in that it cannot open, `capturefab doctor` names it and prints the same rule as a one-line fix. On a distribution without a `plugdev` group, create one (`sudo groupadd plugdev`) or put a group of your own in the rule.
 
 `TAG+="uaccess"` covers someone logged in at the computer; a service has no seat, so it relies on the `plugdev` group. A new group applies to new logins and to the service once it restarts. Unplugging and replugging the camera also applies the rule.
 

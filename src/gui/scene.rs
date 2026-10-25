@@ -419,8 +419,27 @@ impl Workbench {
                             target: Some(target.into()),
                             ..Pending::unanswered(Job::Connect)
                         },
-                        Err(anyhow::anyhow!(
-                            "no GigE Vision camera answered at 192.168.10.50 within 5 s"
+                        // The copy a real unanswered probe shows, from a
+                        // computer whose only adapter is on another subnet.
+                        Err(crate::types::Categorized::error(
+                            crate::types::ErrorKind::Timeout,
+                            format!(
+                                "{} (GVCP command 0x0084 went unanswered)",
+                                crate::network::explain_gige_unreachable(
+                                    std::net::Ipv4Addr::new(192, 168, 10, 50),
+                                    &[crate::network::NetworkInterface {
+                                        name: "en0".into(),
+                                        address: std::net::Ipv4Addr::new(192, 168, 1, 23),
+                                        netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
+                                        mtu: Some(1500),
+                                        speed_mbps: None,
+                                        kind: crate::network::InterfaceKind::Wireless,
+                                        up: Some(true),
+                                    }],
+                                    false,
+                                    std::time::Duration::from_secs(5),
+                                )
+                            ),
                         )),
                     );
                 }

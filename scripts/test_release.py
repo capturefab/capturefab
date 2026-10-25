@@ -232,6 +232,11 @@ class ReleaseTests(unittest.TestCase):
                     items.append(release.package(args, binary))
                     with tarfile.open(temp / 'out' / items[-1]['name']) as archive:
                         readmes.append(archive.extractfile('capturefab-1.2.3-linux-aarch64/README.txt').read().decode())
+                        rule = archive.extractfile('capturefab-1.2.3-linux-aarch64/share/udev/rules.d/70-capturefab-usb3vision.rules').read()
+                        self.assertEqual(rule, (release.ROOT / 'assets/udev/70-capturefab-usb3vision.rules').read_bytes())
+                        install = archive.extractfile('capturefab-1.2.3-linux-aarch64/INSTALL-DESKTOP.txt').read().decode()
+                        self.assertIn('sudo install -m 644 share/udev/rules.d/70-capturefab-usb3vision.rules /etc/udev/rules.d/', install)
+                        self.assertIn('does not install', install)
             self.assertEqual([item.get('browser_client') for item in items], [True, None])
             self.assertEqual(licensed, [True, False])
             self.assertIn('serve --name line1 --listen', readmes[0])

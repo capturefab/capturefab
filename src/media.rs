@@ -1,7 +1,9 @@
 //! FFmpeg-backed media inputs and bounded frame forwarding. The optional FFmpeg
 //! executable is embedded at build time and extracted into a private directory.
 //! No shell is involved in launching decoders or encoders.
-use crate::types::{Backend, CameraInfo, Frame, RGB8, RegisterIo, Transport};
+use crate::types::{
+    Backend, CameraInfo, Categorized, ErrorKind, Frame, RGB8, RegisterIo, Transport,
+};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -448,6 +450,11 @@ thread_local! {
     static FAKE_FFMPEG: std::cell::RefCell<Option<Arc<Executable>>> =
         const { std::cell::RefCell::new(None) };
 }
+/// Makes `path` this test thread's FFmpeg, or, with `None`, stops.
+#[cfg(test)]
+pub(crate) fn set_fake_ffmpeg(path: Option<PathBuf>) {
+    FAKE_FFMPEG.set(path.map(|path| Arc::new(Executable::external(path))));
+}
 pub(crate) fn executable() -> Result<Arc<Executable>> {
     #[cfg(test)]
     if let Some(fake) = FAKE_FFMPEG.with_borrow(Clone::clone) {
@@ -860,6 +867,17 @@ fn hwaccel_available(exe: &Executable) -> bool {
     // An FFmpeg that cannot run or finish the probe keeps `auto`.
     found.ok().flatten().unwrap_or(true)
 }
+/// Context for a decoder whose FFmpeg could not be extracted or started,
+/// unlike a source FFmpeg reached and failed on. Callers test for it with
+/// `error.downcast_ref::<FfmpegUnavailable>()`, never by message text:
+/// explained source failures quote FFmpeg's log too.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FfmpegUnavailable;
+impl std::fmt::Display for FfmpegUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cannot start FFmpeg decoder")
+    }
+}
 pub(crate) fn command(exe: &Executable) -> Command {
     let mut cmd = Command::new(&exe.path);
     #[cfg(windows)]
@@ -945,6 +963,43 @@ fn timed_output(
         String::from_utf8_lossy(&bytes).to_string(),
         timed_out,
     ))
+}
+/// Which FFmpeg this process would run, and whether it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FfmpegHealth {
+    /// "bundled", or "CAPTUREFAB_FFMPEG" for an override.
+    pub source: &'static str,
+    pub path: String,
+    /// FFmpeg's first `-version` line, such as `ffmpeg version 7.1 ...`.
+    pub version: String,
+}
+/// Run FFmpeg's `-version` with a 3 s deadline, for `doctor`. Extracting
+/// the bundled copy goes to the cache directory, as for any first use.
+pub(crate) fn ffmpeg_health() -> Result<FfmpegHealth> {
+    let source = if std::env::var_os("CAPTUREFAB_FFMPEG").is_some() {
+        "CAPTUREFAB_FFMPEG"
+    } else {
+        "bundled"
+    };
+    let exe = executable()?;
+    let (ok, output) = bounded_output(&exe, &["-version".into()], Duration::from_secs(3))
+        .with_context(|| format!("cannot run {}", exe.path.display()))?;
+    let version = output.lines().next().unwrap_or_default().trim().to_owned();
+    ensure!(
+        ok && version.to_ascii_lowercase().starts_with("ffmpeg version"),
+        "{} -version failed{}",
+        exe.path.display(),
+        if version.is_empty() {
+            String::new()
+        } else {
+            format!(": {version}")
+        }
+    );
+    Ok(FfmpegHealth {
+        source,
+        path: exe.path.display().to_string(),
+        version,
+    })
 }
 pub fn ffmpeg_info() -> Result<Value> {
     let exe = executable()?;
@@ -1310,7 +1365,7 @@ impl Decoder {
             !timeout.is_zero() && Instant::now().checked_add(timeout).is_some(),
             "media timeout must be positive and fit in the monotonic clock"
         );
-        let exe = executable()?;
+        let exe = executable().context(FfmpegUnavailable)?;
         let mut cmd = command(&exe);
         cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
         let configured = |name: &str| options.iter().any(|option| option == name);
@@ -1371,7 +1426,7 @@ impl Decoder {
             ])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().context("cannot start FFmpeg decoder")?;
+        let mut child = cmd.spawn().context(FfmpegUnavailable)?;
         let stdout = child.stdout.take().unwrap();
         let log = Log::new();
         let log_thread = log.collect(child.stderr.take().unwrap());
@@ -1955,6 +2010,196 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
     }
 }
 
+/// The scheme, host, explicit port and path of a network source, without
+/// its credentials or query.
+fn network_parts(source: &str) -> Option<(String, String, Option<u16>, String)> {
+    let (scheme, rest) = source.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..end];
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            (host, port.parse().ok())
+        }
+        _ => (host_port, None),
+    };
+    let path = rest[end..].split(['?', '#']).next().unwrap_or_default();
+    (!host.is_empty()).then(|| {
+        (
+            scheme.to_ascii_lowercase(),
+            host.to_owned(),
+            port,
+            path.to_owned(),
+        )
+    })
+}
+
+/// Why a network stream failed to open, in one sentence with its likely
+/// fix, from FFmpeg's log of the attempt. `timed_out` is when no frame came
+/// within `timeout` while FFmpeg still ran. The category is decided here, so
+/// exit codes no longer depend on FFmpeg's wording: refused, unresolved,
+/// unreachable and missing streams are `unavailable`, rejected credentials
+/// `operation_failed` (as before: asking again cannot fix them) and silence
+/// `timeout`. None keeps the error FFmpeg gave, for logs this does not know.
+fn network_failure(
+    source: &str,
+    log: &str,
+    timed_out: bool,
+    timeout: Duration,
+) -> Option<anyhow::Error> {
+    let (scheme, host, port, path) = network_parts(source)?;
+    let url = redact_url(source);
+    let at = match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host.clone(),
+    };
+    // The first log line saying one of `texts`, which follows the
+    // explanation as FFmpeg's own words.
+    let line = |texts: &[&str]| {
+        log.lines().find(|line| {
+            let line = line.to_ascii_lowercase();
+            texts.iter().any(|text| line.contains(text))
+        })
+    };
+    let (kind, message, said) = if let Some(said) =
+        line(&["connection refused", "actively refused"])
+    {
+        let hint = if scheme == "rtsp" && port.is_none() {
+            " RTSP normally uses port 554."
+        } else {
+            ""
+        };
+        (
+            ErrorKind::Unavailable,
+            format!(
+                "Nothing accepted a connection at {at} ({url}). Check the camera's stream port and that streaming is turned on.{hint}"
+            ),
+            Some(said),
+        )
+    } else if let Some(said) = log.lines().find(|line| refused(line)) {
+        (
+            ErrorKind::OperationFailed,
+            format!(
+                "{host} rejected the username or password ({url}). Check them, or add them as {scheme}://USER:PASS@{at}{path} if none were given."
+            ),
+            Some(said),
+        )
+    } else if let Some(said) = line(&["404 not found", "failed: 404", "stream not found"]) {
+        let path = if path.is_empty() { "/" } else { path.as_str() };
+        (
+            ErrorKind::Unavailable,
+            format!(
+                "{at} answered but has no stream at {path} ({url}). Check the path in the camera's settings, or use onvif://USER:PASS@{host}/onvif/device_service to look it up."
+            ),
+            Some(said),
+        )
+    } else if let Some(said) = line(&[
+        "failed to resolve hostname",
+        "nodename nor servname",
+        "name or service not known",
+        "no such host",
+        "temporary failure in name resolution",
+    ]) {
+        (
+            ErrorKind::Unavailable,
+            format!("Cannot resolve {host} ({url}). Check the address."),
+            Some(said),
+        )
+    } else if let Some(said) = line(&["no route to host", "network is unreachable", "host is down"])
+    {
+        let hint = host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .ok()
+            .filter(|_| said.to_ascii_lowercase().contains("no route to host"))
+            .and_then(|ip| {
+                crate::network::local_network_hint(
+                    &std::io::Error::from(std::io::ErrorKind::HostUnreachable),
+                    Some(ip),
+                )
+            })
+            .map(|hint| format!(" {hint}."))
+            .unwrap_or_default();
+        (
+            ErrorKind::Unavailable,
+            format!("{host} is not reachable from this computer ({url}).{hint}"),
+            Some(said),
+        )
+    } else if let Some(said) = line(&["connection timed out", "operation timed out"]) {
+        (
+            ErrorKind::Timeout,
+            format!(
+                "No reply from {at} ({url}). Check it is on this network and streaming{}.",
+                longer_wait(timeout)
+                    .map(|ms| format!(", or retry with a longer timeout (--timeout-ms {ms})"))
+                    .unwrap_or_default()
+            ),
+            Some(said),
+        )
+    } else if timed_out && log.trim().is_empty() {
+        // FFmpeg logs only errors, so silence is also a stream that
+        // connected and is slow to send its first frame, such as a long
+        // GOP waiting for a keyframe.
+        (
+            ErrorKind::Timeout,
+            format!(
+                "No video arrived from {at} within {} s ({url}). It may be unreachable or slow to send its first frame; {}.",
+                timeout.as_secs_f64(),
+                longer_wait(timeout).map_or_else(
+                    || "check it is on this network and streaming".to_owned(),
+                    |ms| format!("retry with a longer timeout (--timeout-ms {ms})")
+                )
+            ),
+            None,
+        )
+    } else {
+        // Anything else keeps FFmpeg's own error.
+        return None;
+    };
+    let detail = said
+        .map(ffmpeg_words)
+        .filter(|said| !said.is_empty())
+        .map(|said| format!(" (FFmpeg: {said})"))
+        .unwrap_or_default();
+    Some(Categorized::error(kind, format!("{message}{detail}")))
+}
+/// A longer timeout in milliseconds to suggest, while one up to the 60 s
+/// limit is left to try: double the wait, and at least 10 s. The advice
+/// names the CLI flag in parentheses, after words the desktop reads too.
+fn longer_wait(timeout: Duration) -> Option<u128> {
+    let current = timeout.as_millis();
+    let suggested = (current * 2).clamp(10_000, 60_000);
+    (suggested > current).then_some(suggested)
+}
+/// A log line without FFmpeg's internals: its `[tcp @ 0x…]` component
+/// prefix and the `?timeout=` Capturefab passed, with any URL redacted.
+fn ffmpeg_words(line: &str) -> String {
+    let mut line = line.trim();
+    while let Some((_, rest)) = line
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .filter(|(component, _)| component.contains(" @ 0x"))
+    {
+        line = rest.trim_start();
+    }
+    line.split(' ')
+        .map(|word| {
+            let word = match word.find("?timeout=") {
+                Some(query) => &word[..query],
+                None => word,
+            };
+            if word.contains("://") {
+                redact_url(word)
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[derive(Clone, Copy, Default)]
 struct NativeOptions {
     size: Option<(u32, u32)>,
@@ -2352,7 +2597,20 @@ impl MediaBackend {
                     .map_or(error, |message| anyhow!(message))
             })?
         } else {
-            decoder.next(self.timeout).context("open media input")?
+            decoder.next(self.timeout).map_err(|error| {
+                if !self.reconnects() {
+                    return error.context("open media input");
+                }
+                let timed_out = !error.chain().any(|cause| cause.is::<StreamEnded>());
+                decoder.stop();
+                let log = decoder.log.text(&self.source);
+                match network_failure(&self.source, &log, timed_out, self.timeout) {
+                    // FFmpeg's own words stay below the explanation, for
+                    // `{error:#}` and whoever debugs it.
+                    Some(explained) => explained,
+                    None => error.context("open media input"),
+                }
+            })?
         };
         if self.native && (self.requested_size || self.mode.is_some()) {
             ensure!(
@@ -4863,6 +5121,149 @@ exit 1"#,
         assert_eq!(cancelled.message, "cancelled");
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(fake.read("launches").lines().count(), 1);
+    }
+    #[test]
+    fn first_open_failures_explain_ffmpeg_in_one_sentence() {
+        let wait = Duration::from_secs(2);
+        let source = "rtsp://user:pw@127.0.0.1:1/x";
+        let explained = |source: &str, log: &str, timed_out: bool| {
+            let error = network_failure(source, log, timed_out, wait).expect(log);
+            (crate::cli::error_code(&error).0, format!("{error:#}"))
+        };
+        let refused = "[tcp @ 0x7b8820000] Connection to tcp://127.0.0.1:1?timeout=2000000 failed: Connection refused\n[in#0 @ 0x993014000] Error opening input: Connection refused\nError opening input file rtsp://<redacted>@127.0.0.1:1/x.";
+        let (code, message) = explained(source, refused, false);
+        assert_eq!(code, "unavailable");
+        assert_eq!(
+            message,
+            "Nothing accepted a connection at 127.0.0.1:1 (rtsp://<redacted>@127.0.0.1:1/x). Check the camera's stream port and that streaming is turned on. (FFmpeg: Connection to tcp://127.0.0.1:1 failed: Connection refused)"
+        );
+        // Without a port, RTSP's default is the likely fix.
+        let (_, message) = explained("rtsp://10.0.0.5/live", "Connection refused", false);
+        assert!(
+            message.contains("RTSP normally uses port 554."),
+            "{message}"
+        );
+        let (code, message) = explained(
+            source,
+            "[rtsp @ 0x1] method DESCRIBE failed: 401 Unauthorized",
+            false,
+        );
+        assert_eq!(code, "operation_failed");
+        assert!(
+            message.starts_with("127.0.0.1 rejected the username or password (rtsp://<redacted>@127.0.0.1:1/x). Check them, or add them as rtsp://USER:PASS@127.0.0.1:1/x if none were given."),
+            "{message}"
+        );
+        let (code, message) = explained(
+            source,
+            "[rtsp @ 0x1] method DESCRIBE failed: 404 Not Found",
+            false,
+        );
+        assert_eq!(code, "unavailable");
+        assert!(
+            message.starts_with("127.0.0.1:1 answered but has no stream at /x"),
+            "{message}"
+        );
+        assert!(message.contains("onvif://USER:PASS@127.0.0.1/onvif/device_service"));
+        let (code, message) = explained(
+            "rtsp://nonexistent.invalid/live",
+            "[tcp @ 0x2] Failed to resolve hostname nonexistent.invalid: nodename nor servname provided, or not known",
+            false,
+        );
+        assert_eq!(code, "unavailable");
+        assert!(
+            message.starts_with("Cannot resolve nonexistent.invalid"),
+            "{message}"
+        );
+        let (code, message) = explained(
+            "srt://203.0.113.9:9000",
+            "Connection to tcp://203.0.113.9:9000 failed: No route to host",
+            false,
+        );
+        assert_eq!(code, "unavailable");
+        assert!(
+            message.starts_with("203.0.113.9 is not reachable from this computer"),
+            "{message}"
+        );
+        // Silence within the wait is a timeout, worded for a stream that
+        // may be merely slow: FFmpeg logs only errors.
+        let (code, message) = explained("rtsp://user:pw@10.255.255.1/stream", "", true);
+        assert_eq!(code, "timeout");
+        assert_eq!(
+            message,
+            "No video arrived from 10.255.255.1 within 2 s (rtsp://<redacted>@10.255.255.1/stream). It may be unreachable or slow to send its first frame; retry with a longer timeout (--timeout-ms 10000)."
+        );
+        // A connect that timed out says the host did not reply.
+        let (code, message) = explained(
+            "rtsp://10.255.255.1/stream",
+            "[tcp @ 0x3] Connection to tcp://10.255.255.1:554?timeout=2000000 failed: Operation timed out",
+            false,
+        );
+        assert_eq!(code, "timeout");
+        assert!(
+            message.starts_with("No reply from 10.255.255.1 (rtsp://10.255.255.1/stream). Check it is on this network and streaming, or retry with a longer timeout (--timeout-ms 10000). (FFmpeg: Connection to tcp://10.255.255.1:554 failed: Operation timed out)"),
+            "{message}"
+        );
+        // A longer wait is suggested only while one is left to try.
+        assert_eq!(longer_wait(Duration::from_secs(20)), Some(40_000));
+        assert_eq!(longer_wait(Duration::from_secs(40)), Some(60_000));
+        assert_eq!(longer_wait(Duration::from_secs(60)), None);
+        let (_, message) = network_failure(source, "", true, Duration::from_secs(60))
+            .map(|error| ((), format!("{error:#}")))
+            .unwrap();
+        assert!(
+            message.ends_with("It may be unreachable or slow to send its first frame; check it is on this network and streaming."),
+            "{message}"
+        );
+        for (log, timed_out) in [
+            (refused, false),
+            ("", true),
+            ("method DESCRIBE failed: 401 Unauthorized", false),
+        ] {
+            let (_, message) = explained(source, log, timed_out);
+            for internal in ["@ 0x", "?timeout=", "user:pw", "\n"] {
+                assert!(!message.contains(internal), "{message}");
+            }
+        }
+        // Anything else keeps FFmpeg's own error.
+        assert!(
+            network_failure(
+                source,
+                "Invalid data found when processing input",
+                false,
+                wait
+            )
+            .is_none()
+        );
+        assert!(network_failure(source, "", false, wait).is_none());
+        assert!(network_failure("file:/tmp/x.mp4", refused, false, wait).is_none());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_first_open_says_so_in_one_line() {
+        let _fake = Fake::new(
+            "first-open-refused",
+            r#"case "$*" in *rtsp*) ;; *) exit 0 ;; esac
+echo '[tcp @ 0x7b8820000] Connection to tcp://127.0.0.1:1?timeout=2000000 failed: Connection refused' >&2
+exit 1"#,
+        );
+        let error = match open_url("rtsp://user:secret@127.0.0.1:1/x", Duration::from_secs(2)) {
+            Err(error) => error,
+            Ok(_) => panic!("a refused stream opened"),
+        };
+        let message = format!("{error:#}");
+        assert_eq!(
+            crate::cli::error_code(&error),
+            ("unavailable", 3),
+            "{message}"
+        );
+        assert!(
+            message.starts_with("Nothing accepted a connection at 127.0.0.1:1"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("secret") && !message.contains('\n'),
+            "{message}"
+        );
     }
     #[test]
     fn reconnecting_stops_after_repeated_refusals() {
