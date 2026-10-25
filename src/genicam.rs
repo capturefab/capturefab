@@ -1851,18 +1851,8 @@ fn validate_numeric(
                 "{name} violates Max={max}; enter {max} or less"
             );
         }
-        if let Some(inc) = inc.as_ref().map(number).transpose()? {
-            ensure!(inc > 0.0, "{name} has invalid camera increment {inc}");
-            let base = min.unwrap_or(0.0);
-            let steps = (value - base) / inc;
-            let nearest = base + steps.round() * inc;
-            let tolerance = (8.0 * f64::EPSILON * value.abs().max(base.abs()).max(nearest.abs()))
-                .min(inc * 1e-7);
-            ensure!(
-                nearest.is_finite() && (value - nearest).abs() <= tolerance,
-                "{name} requires increment {inc} from {base}; nearest value is {nearest}"
-            );
-        }
+        // GenApi does not verify a float increment on writes; the camera
+        // rounds the value itself.
     }
     Ok(())
 }
@@ -3079,23 +3069,16 @@ mod tests {
         assert!(m.set(&mut io, "Signed", "-0x8000000000000001").is_err());
     }
     #[test]
-    fn float_inputs_allow_roundoff_but_reject_off_increment_and_nonfinite_values() {
+    fn float_inputs_check_bounds_but_not_increment_and_reject_nonfinite_values() {
         let m = map(
             "<Float Name='Level'><pValue>R</pValue><Min>0</Min><Max>1</Max><Inc>0.1</Inc></Float><FloatReg Name='R'><Address>0</Address><Length>8</Length></FloatReg>",
         );
         let mut io = Memory::default();
+        m.set(&mut io, "Level", "0.15").unwrap();
+        assert_eq!(m.get(&mut io, "Level").unwrap(), 0.15);
         m.set(&mut io, "Level", "0.3").unwrap();
         let before = io.bytes.clone();
-        for value in [
-            "0.300000001",
-            "0.15",
-            "-0.1",
-            "1.1",
-            "NaN",
-            "inf",
-            "-inf",
-            "",
-        ] {
+        for value in ["-0.1", "1.1", "NaN", "inf", "-inf", ""] {
             assert!(m.set(&mut io, "Level", value).is_err(), "{value}");
             assert_eq!(io.bytes, before);
         }
@@ -3104,8 +3087,9 @@ mod tests {
             .into_iter()
             .find(|f| f.name == "Level")
             .unwrap();
-        assert!(feature.validate_input("0.3").is_ok());
-        assert!(feature.validate_input("0.300000001").is_err());
+        assert_eq!(feature.inc, Some(0.1));
+        assert!(feature.validate_input("0.300000001").is_ok());
+        assert!(feature.validate_input("1.1").is_err());
     }
     #[test]
     fn preflight_does_not_mutate_values_and_allows_temporary_auto_locks() {
