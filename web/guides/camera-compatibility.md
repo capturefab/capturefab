@@ -110,7 +110,8 @@ capturefab --camera avfoundation:0 capture -o webcam.png
 # Linux: select the actual capture node from native discovery
 capturefab --camera v4l2:/dev/video0 capture -o webcam.png
 
-# Windows: use the enumerated device name
+# Windows: use the enumerated device name; cameras that share a name are
+# listed by their DirectShow moniker, with its ? written %3F
 capturefab --camera 'dshow:video=Camera Name' capture -o webcam.png
 ```
 
