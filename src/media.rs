@@ -4081,40 +4081,94 @@ fn decode_file_url_path(path: &str) -> Result<String> {
     );
     Ok(decoded)
 }
-/// How a camera frame is handed to FFmpeg unchanged: its rawvideo pixel format,
-/// bytes per pixel and whether it carries color. Sending sensor-native bytes
+/// How a camera frame is handed to FFmpeg: its rawvideo pixel format, bytes
+/// per pixel and whether it carries color. Sending sensor-native bytes
 /// avoids a CPU conversion on the camera thread and, for mono and Bayer, moves
-/// a third of the bytes RGB24 would through the pipe.
+/// a third of the bytes RGB24 would through the pipe. FFmpeg reads no packed
+/// samples and no 10- or 12-bit Bayer, so those are unpacked and widened to
+/// its 16-bit formats first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RawInput {
     pixel_format: u32,
     ffmpeg: &'static str,
     bytes_per_pixel: usize,
     color: bool,
+    /// Packed samples, unpacked before the pipe.
+    unpack: bool,
+    /// Bits each 16-bit sample is shifted up to span the full range.
+    widen: u32,
+    /// Full-range BT.601 Y'CbCr, as PFNC defines its YUV and YCbCr formats.
+    full_range: bool,
 }
 impl RawInput {
     fn for_format(pixel_format: u32) -> Result<Self> {
-        let (ffmpeg, bytes_per_pixel, color) = match pixel_format {
+        let unpacked = crate::frame::packing(pixel_format).map_or(pixel_format, |(v, ..)| v);
+        let (ffmpeg, bytes_per_pixel, color) = match unpacked {
             crate::types::MONO8 => ("gray", 1, false),
             0x0110_0003 => ("gray10le", 2, false),
             0x0110_0005 => ("gray12le", 2, false),
+            0x0110_0025 => ("gray14le", 2, false),
             0x0110_0007 => ("gray16le", 2, false),
             crate::types::RGB8 => ("rgb24", 3, true),
             0x0218_0015 => ("bgr24", 3, true),
+            0x0220_0016 => ("rgba", 4, true),
+            0x0220_0017 => ("bgra", 4, true),
+            0x0210_001f | 0x0210_0043 => ("uyvy422", 2, true),
+            0x0210_0032 | 0x0210_003b => ("yuyv422", 2, true),
             0x0108_0008 => ("bayer_grbg8", 1, true),
             0x0108_0009 => ("bayer_rggb8", 1, true),
             0x0108_000a => ("bayer_gbrg8", 1, true),
             0x0108_000b => ("bayer_bggr8", 1, true),
-            v => bail!(
-                "unsupported PFNC format 0x{v:08x}; capture with --format raw to preserve bytes"
+            0x0110_000c | 0x0110_0010 | 0x0110_002e => ("bayer_grbg16le", 2, true),
+            0x0110_000d | 0x0110_0011 | 0x0110_002f => ("bayer_rggb16le", 2, true),
+            0x0110_000e | 0x0110_0012 | 0x0110_0030 => ("bayer_gbrg16le", 2, true),
+            0x0110_000f | 0x0110_0013 | 0x0110_0031 => ("bayer_bggr16le", 2, true),
+            _ => bail!(
+                "unsupported PFNC format 0x{pixel_format:08x}; capture with --format raw to preserve bytes"
             ),
+        };
+        let widen = match unpacked {
+            0x0110_000c..=0x0110_000f => 6,
+            0x0110_0010..=0x0110_0013 => 4,
+            _ => 0,
         };
         Ok(Self {
             pixel_format,
             ffmpeg,
             bytes_per_pixel,
             color,
+            unpack: unpacked != pixel_format,
+            widen,
+            full_range: matches!(ffmpeg, "uyvy422" | "yuyv422"),
         })
+    }
+    /// FFmpeg input options for the frames' color range and matrix.
+    fn color_options(&self) -> &'static [&'static str] {
+        if self.full_range {
+            &["-color_range", "pc", "-colorspace", "bt470bg"]
+        } else {
+            &[]
+        }
+    }
+    /// The bytes FFmpeg reads for `frame`; the sensor buffer itself unless
+    /// its samples are packed or widened.
+    fn bytes(&self, frame: Frame) -> Result<Vec<u8>> {
+        let length = frame.width as usize * frame.height as usize * self.bytes_per_pixel;
+        let name = crate::frame::pixel_format_name(frame.pixel_format);
+        let mut data = if self.unpack {
+            crate::frame::unpacked(&frame)?.into_owned().data
+        } else {
+            frame.data
+        };
+        ensure!(data.len() >= length, "truncated {name} frame");
+        data.truncate(length);
+        if self.widen > 0 {
+            for sample in data.as_chunks_mut::<2>().0 {
+                let value = u16::from_le_bytes(*sample).min(u16::MAX >> self.widen);
+                *sample = (value << self.widen).to_le_bytes();
+            }
+        }
+        Ok(data)
     }
 }
 impl Forwarder {
@@ -4270,6 +4324,9 @@ impl Forwarder {
                 &fps,
                 "-use_wallclock_as_timestamps",
                 "1",
+            ]);
+            cmd.args(raw.color_options());
+            cmd.args([
                 "-i",
                 "pipe:0",
                 "-an",
@@ -4533,22 +4590,12 @@ impl Forwarder {
                 process.log.text(&self.config.output).trim()
             );
         }
-        let length = frame.width as usize * frame.height as usize * process.raw.bytes_per_pixel;
-        ensure!(
-            frame.data.len() >= length,
-            "truncated {} frame",
-            crate::frame::pixel_format_name(frame.pixel_format)
-        );
         // FFmpeg converts on its own threads with SIMD swscale (or the encoder
         // hardware), so the sensor buffer itself is queued for the pipe.
         // Jetson's converter takes RGBA or I420, built here in one pass.
         let bytes = match process.jetson {
             Some(input) => input.bytes(&frame)?,
-            None => {
-                let mut data = frame.data;
-                data.truncate(length);
-                data
-            }
+            None => process.raw.bytes(frame)?,
         };
         let queue = &process.queue;
         let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -6274,6 +6321,77 @@ esac"#
         assert!(jetson_encoder("nvv4l2h264enc") && !jetson_encoder("h264_nvenc"));
     }
     #[test]
+    fn raw_inputs_unpack_and_widen_what_ffmpeg_cannot_read() {
+        let frame = |pixel_format, width, data| Frame {
+            id: 1,
+            width,
+            height: 1,
+            pixel_format,
+            timestamp_ns: 0,
+            data,
+        };
+        let le =
+            |samples: &[u16]| -> Vec<u8> { samples.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        // Mono12p 0xabc, 0x123 as gray12le; Mono12Packed the same samples.
+        for (format, data) in [
+            (0x010c_0047, vec![0xbc, 0x3a, 0x12]),
+            (0x010c_0006, vec![0xab, 0x3c, 0x12]),
+        ] {
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!(
+                (raw.ffmpeg, raw.bytes_per_pixel, raw.color),
+                ("gray12le", 2, false)
+            );
+            assert_eq!(
+                raw.bytes(frame(format, 2, data)).unwrap(),
+                le(&[0xabc, 0x123])
+            );
+        }
+        // 10- and 12-bit Bayer fill FFmpeg's 16-bit Bayer formats.
+        let raw = RawInput::for_format(0x0110_0011).unwrap();
+        assert_eq!(raw.ffmpeg, "bayer_rggb16le");
+        let samples = frame(0x0110_0011, 2, le(&[0xfff, 0x001]));
+        assert_eq!(raw.bytes(samples).unwrap(), le(&[0xfff0, 0x0010]));
+        let raw = RawInput::for_format(0x010c_0029).unwrap();
+        assert_eq!(raw.ffmpeg, "bayer_bggr16le");
+        let packed = frame(0x010c_0029, 2, vec![0x55, 0x21, 0xaa]);
+        assert_eq!(raw.bytes(packed).unwrap(), le(&[0x155 << 6, 0x2aa << 6]));
+        assert!(raw.bytes(frame(0x010c_0029, 2, vec![0x55, 0x21])).is_err());
+        for (format, ffmpeg) in [
+            (0x0110_0025, "gray14le"),
+            (0x0110_002e, "bayer_grbg16le"),
+            (0x010a_0056, "bayer_grbg16le"),
+            (0x010c_002d, "bayer_bggr16le"),
+            (0x0220_0016, "rgba"),
+            (0x0220_0017, "bgra"),
+        ] {
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!((raw.ffmpeg, raw.full_range), (ffmpeg, false));
+            assert!(raw.color_options().is_empty());
+        }
+        // YUV and YCbCr 4:2:2 go as they are, tagged full-range BT.601.
+        for (format, ffmpeg) in [
+            (0x0210_001f, "uyvy422"),
+            (0x0210_0043, "uyvy422"),
+            (0x0210_0032, "yuyv422"),
+            (0x0210_003b, "yuyv422"),
+        ] {
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!(
+                (raw.ffmpeg, raw.bytes_per_pixel, raw.color),
+                (ffmpeg, 2, true)
+            );
+            assert_eq!(
+                raw.color_options(),
+                ["-color_range", "pc", "-colorspace", "bt470bg"]
+            );
+            let pair = vec![1, 2, 3, 4, 5];
+            assert_eq!(raw.bytes(frame(format, 2, pair)).unwrap(), [1, 2, 3, 4]);
+        }
+        let error = RawInput::for_format(0x0110_0099).unwrap_err().to_string();
+        assert!(error.contains("0x01100099") && error.contains("--format raw"));
+    }
+    #[test]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
     fn ffmpeg_raw_inputs_decode_like_capturefab() {
         // Forwarding hands sensor bytes to FFmpeg. Each mapping must describe
@@ -6294,27 +6412,103 @@ esac"#
                 .flat_map(|p| (luma(p) << shift).to_le_bytes())
                 .collect()
         };
-        let formats: [(u32, Vec<u8>); 10] = [
+        let lumas: Vec<u16> = rgb.iter().map(luma).collect();
+        let deep = |samples: &[u8], shift: u16| -> Vec<u16> {
+            samples.iter().map(|&v| u16::from(v) << shift).collect()
+        };
+        let mosaic = |cfa| bayer(&rgb, width, cfa);
+        let (gr, rg, gb, bg) = ([1, 0, 2, 1], [0, 1, 1, 2], [1, 2, 0, 1], [2, 1, 1, 0]);
+        // JFIF Y'CbCr, the chroma of each pair averaged, in `order`.
+        let yuv = |order: [usize; 4]| -> Vec<u8> {
+            let ycbcr = |p: &[u8; 3]| {
+                let [r, g, b] = p.map(f64::from);
+                [
+                    0.299 * r + 0.587 * g + 0.114 * b,
+                    -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0,
+                    0.5 * r - 0.418688 * g - 0.081312 * b + 128.0,
+                ]
+            };
+            rgb.as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|[a, b]| {
+                    let (a, b) = (ycbcr(a), ycbcr(b));
+                    let values = [a[0], (a[1] + b[1]) / 2.0, b[0], (a[2] + b[2]) / 2.0];
+                    order.map(|i| values[i].round().clamp(0.0, 255.0) as u8)
+                })
+                .collect()
+        };
+        let formats: Vec<(u32, Vec<u8>)> = vec![
             (
                 crate::types::MONO8,
                 rgb.iter().map(|p| luma(p) as u8).collect(),
             ),
             (0x0110_0003, wide(2)),
             (0x0110_0005, wide(4)),
+            (0x0110_0025, wide(6)),
             (0x0110_0007, wide(8)),
             (crate::types::RGB8, rgb.iter().flatten().copied().collect()),
             (
                 0x0218_0015,
                 rgb.iter().flat_map(|p| [p[2], p[1], p[0]]).collect(),
             ),
-            (0x0108_0008, bayer(&rgb, width, [1, 0, 2, 1])),
-            (0x0108_0009, bayer(&rgb, width, [0, 1, 1, 2])),
-            (0x0108_000a, bayer(&rgb, width, [1, 2, 0, 1])),
-            (0x0108_000b, bayer(&rgb, width, [2, 1, 1, 0])),
+            (
+                0x0220_0016,
+                rgb.iter().flat_map(|p| [p[0], p[1], p[2], 0x80]).collect(),
+            ),
+            (
+                0x0220_0017,
+                rgb.iter().flat_map(|p| [p[2], p[1], p[0], 0x80]).collect(),
+            ),
+            (0x0108_0008, mosaic(gr)),
+            (0x0108_0009, mosaic(rg)),
+            (0x0108_000a, mosaic(gb)),
+            (0x0108_000b, mosaic(bg)),
+            (0x010c_0047, lsb(&deep_luma(&lumas, 4), 12)),
+            (0x010c_0004, gige(&deep_luma(&lumas, 2), 10)),
+            (0x0110_0011, le(&deep(&mosaic(rg), 4))),
+            (0x0110_0030, le(&deep(&mosaic(gb), 8))),
+            (0x010a_0052, lsb(&deep(&mosaic(bg), 2), 10)),
+            (0x010c_002a, gige(&deep(&mosaic(gr), 4), 12)),
+            (0x0210_0032, yuv([0, 1, 2, 3])),
+            (0x0210_0043, yuv([1, 0, 3, 2])),
         ];
         fn bayer(rgb: &[[u8; 3]], width: usize, cfa: [usize; 4]) -> Vec<u8> {
             (0..rgb.len())
                 .map(|i| rgb[i][cfa[((i / width) & 1) * 2 + ((i % width) & 1)]])
+                .collect()
+        }
+        fn deep_luma(lumas: &[u16], shift: u16) -> Vec<u16> {
+            lumas.iter().map(|v| v << shift).collect()
+        }
+        fn le(samples: &[u16]) -> Vec<u8> {
+            samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+        }
+        // PFNC lsb packing, bit by bit; rows of 64 samples end on whole bytes.
+        fn lsb(samples: &[u16], bits: usize) -> Vec<u8> {
+            let mut out = vec![0u8; (samples.len() * bits).div_ceil(8)];
+            for (i, &v) in samples.iter().enumerate() {
+                for b in (0..bits).filter(|b| v >> b & 1 == 1) {
+                    out[(i * bits + b) / 8] |= 1 << ((i * bits + b) % 8);
+                }
+            }
+            out
+        }
+        // GigE Vision Packed: high bits outside, low bits in the middle byte.
+        fn gige(samples: &[u16], bits: u16) -> Vec<u8> {
+            let low = bits - 8;
+            let mask = (1 << low) - 1;
+            samples
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|&[a, b]| {
+                    [
+                        (a >> low) as u8,
+                        (a & mask | (b & mask) << 4) as u8,
+                        (b >> low) as u8,
+                    ]
+                })
                 .collect()
         }
         for (pixel_format, data) in formats {
@@ -6338,6 +6532,7 @@ esac"#
                     "-pix_fmt",
                 ])
                 .arg(raw.ffmpeg)
+                .args(raw.color_options())
                 .args(["-video_size", &format!("{width}x{height}"), "-i", "pipe:0"])
                 .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
                 .stdin(Stdio::piped())
@@ -6345,7 +6540,7 @@ esac"#
                 .spawn()
                 .unwrap();
             let mut stdin = child.stdin.take().unwrap();
-            let bytes = frame.data.clone();
+            let bytes = raw.bytes(frame).unwrap();
             let feeder = thread::spawn(move || stdin.write_all(&bytes));
             let output = child.wait_with_output().unwrap();
             feeder.join().unwrap().unwrap();
