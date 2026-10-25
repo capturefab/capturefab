@@ -45,6 +45,15 @@ fields! {
     image_mode: bool, recent: Vec<Recent>, auto_start: bool, tags: CaptureTags,
 }
 
+impl Values {
+    /// Undo history never holds a password typed into the address: only
+    /// its credential-free form is kept, even mid-typing.
+    fn sanitized(mut self) -> Self {
+        self.address = crate::logins::strip_userinfo(&self.address);
+        self
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct LocalState {
     values: Values,
@@ -61,7 +70,7 @@ impl LocalState {
         let mut edits = app.edit_sources.clone();
         edits.extend(app.edits.clone());
         Self {
-            values: Values::capture(app),
+            values: Values::capture(app).sanitized(),
             drafts: app.drafts.clone(),
             edits,
             camera: app.snapshot.active_camera.clone(),
@@ -710,7 +719,12 @@ impl Workbench {
             }
             return Task::none();
         }
-        if self.help_open || self.network_open || self.analytics.open || self.assistant.quick.open {
+        if self.help_open
+            || self.network_open
+            || self.analytics.open
+            || self.assistant.quick.open
+            || self.sign_in.is_some()
+        {
             return Task::none();
         }
         let entry = if undo {
@@ -911,6 +925,30 @@ mod tests {
     }
 
     #[test]
+    fn typed_camera_passwords_never_enter_undo_history() {
+        let mut app = bench();
+        let url = "rtsp://admin:pw@cam/live";
+        for end in 1..=url.len() {
+            update(&mut app, Message::Address(url[..end].into()));
+            if end % 5 == 0 {
+                update(&mut app, Message::FocusNext(false));
+            }
+        }
+        let mut seen = vec![app.address.clone()];
+        for _ in 0..40 {
+            update(&mut app, Message::Undo);
+            seen.push(app.address.clone());
+        }
+        for _ in 0..40 {
+            update(&mut app, Message::Redo);
+            seen.push(app.address.clone());
+        }
+        for (index, address) in seen.iter().enumerate().skip(1) {
+            assert!(!address.contains("pw"), "{index}: {address}");
+        }
+    }
+
+    #[test]
     fn each_focus_drag_is_one_separate_reversible_gesture() {
         let mut app = bench();
         let original = app.focus.region;
@@ -1057,10 +1095,7 @@ mod tests {
     fn shared_session_camera_edits_and_external_replays_are_visible_in_the_window() {
         let worker = crate::engine::WorkerHandle::new();
         let command = |command| worker.request(command).unwrap();
-        command(SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 1000,
-        });
+        command(SessionCommand::connect("sim:0".into(), 1000));
         let mut app = bench();
         let sync = |app: &mut Workbench| {
             app.now = Instant::now();
@@ -1112,10 +1147,7 @@ mod tests {
     fn set_many_changes_from_rpc_join_the_window_history_and_replay_by_token() {
         let worker = crate::engine::WorkerHandle::new();
         worker
-            .request(SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 1000,
-            })
+            .request(SessionCommand::connect("sim:0".into(), 1000))
             .unwrap();
         let changed = worker
             .request(SessionCommand::SetMany {
@@ -1151,10 +1183,7 @@ mod tests {
     fn external_undo_and_redo_between_polls_reposition_the_shared_entry() {
         let worker = crate::engine::WorkerHandle::new();
         worker
-            .request(SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 1000,
-            })
+            .request(SessionCommand::connect("sim:0".into(), 1000))
             .unwrap();
         worker
             .request(SessionCommand::Set {

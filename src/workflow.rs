@@ -145,6 +145,13 @@ fn validate_step(step: &Step) -> Result<()> {
             "this command does not accept a step camera; connect/select use command.camera and discover/network_scan address the session"
         );
     }
+    if let SessionCommand::Connect { login: Some(_), .. } = &step.command {
+        return Err(crate::dataset::Usage(
+            "workflows cannot carry camera passwords; save the sign-in with `capturefab login add`"
+                .into(),
+        )
+        .into());
+    }
     if let SessionCommand::Capture { output, .. } = &step.command {
         ensure!(
             output != "-",
@@ -263,9 +270,19 @@ impl Workflow {
 }
 
 impl Step {
-    fn context(&self, index: usize) -> Value {
+    /// The command as JSON, never with a sign-in (validation refuses one;
+    /// this is a second safeguard).
+    fn command_value(&self) -> Value {
         let mut command =
             serde_json::to_value(&self.command).expect("validated session command must serialize");
+        if let Some(fields) = command.as_object_mut() {
+            fields.remove("login");
+        }
+        command
+    }
+
+    fn context(&self, index: usize) -> Value {
+        let mut command = self.command_value();
         redact_value(&mut command);
         let mut context = json!({"step": index, "command": command});
         if let Some(camera) = &self.camera {
@@ -275,12 +292,19 @@ impl Step {
     }
 
     fn redact_error(&self, message: &str) -> String {
-        let mut known =
-            serde_json::to_value(&self.command).expect("validated session command must serialize");
+        let mut known = self.command_value();
         if let Some(camera) = &self.camera {
             known = json!([camera, known]);
         }
-        redact_error(message, &known)
+        let mut message = redact_error(message, &known);
+        if let SessionCommand::Connect {
+            login: Some(login), ..
+        } = &self.command
+            && !login.expose().is_empty()
+        {
+            message = message.replace(login.expose(), "<redacted>");
+        }
+        message
     }
 }
 
@@ -402,6 +426,38 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn camera_passwords_never_ride_in_workflows() {
+        let connect = json!({"op":"connect","camera":"rtsp://cam.local/live","timeout_ms":1000,
+            "login":{"user":"admin","password":"hunter2"}});
+        let error = parse(json!({"version":1,"steps":[{"command":connect}]})).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("capturefab login add"),
+            "{error:#}"
+        );
+        // Should a sign-in get past validation, the plan still leaves it out.
+        let workflow = Workflow {
+            steps: vec![Step {
+                camera: None,
+                command: SessionCommand::Connect {
+                    camera: "rtsp://cam.local/live".into(),
+                    timeout_ms: 1000,
+                    login: Some(crate::logins::CameraLogin::new("admin", "hunter2").unwrap()),
+                    saved_login: true,
+                },
+            }],
+        };
+        let plan = workflow.plan().to_string();
+        assert!(
+            !plan.contains("hunter2") && !plan.contains("login"),
+            "{plan}"
+        );
+        let failure = workflow
+            .apply(|_, _| anyhow::bail!("camera echoed hunter2"))
+            .unwrap_err();
+        assert!(!format!("{failure}").contains("hunter2"), "{failure}");
     }
 
     #[test]
@@ -612,6 +668,7 @@ mod tests {
                 if let SessionCommand::Connect {
                     camera: selector,
                     timeout_ms,
+                    ..
                 } = command
                 {
                     assert!(target.is_none());

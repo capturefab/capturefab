@@ -159,6 +159,7 @@ impl Workbench {
                     && !busy
                     && !self.help_open
                     && !self.network_open
+                    && self.sign_in.is_none()
                     && !self.assistant.quick.open
                     && !self.analytics.open
                     && !self.resources.open,

@@ -562,10 +562,7 @@ fn connect(ctx: &Context, plan: &mut PlanState, checked: &mut Checked, args: Con
         });
         selector.push_str(&fps.to_string());
     }
-    let cmd = SessionCommand::Connect {
-        camera: selector.clone(),
-        timeout_ms: 3_000,
-    };
+    let cmd = SessionCommand::connect(selector.clone(), 3_000);
     if let Err(error) = cmd.validate() {
         checked.error("camera", sentence(&format!("{error:#}")));
         return;
@@ -576,6 +573,7 @@ fn connect(ctx: &Context, plan: &mut PlanState, checked: &mut Checked, args: Con
     plan.connected.insert(selector.clone());
     checked.ops.push(Op::Connect {
         selector: selector.clone(),
+        saved_login: plan.origin != Origin::Assistant,
     });
     checked.summary = format!("Connect {}.", super::redact::for_output_text(&selector));
 }
@@ -1391,6 +1389,6 @@ mod tests {
             json!({"camera":"sim:8","size":null,"fps":null}),
         );
         assert!(result.ready(), "{:?}", result.issues);
-        assert!(matches!(&result.ops[..],[Op::Connect {selector}] if selector=="sim:8"));
+        assert!(matches!(&result.ops[..],[Op::Connect {selector, ..}] if selector=="sim:8"));
     }
 }

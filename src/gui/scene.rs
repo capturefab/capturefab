@@ -648,6 +648,7 @@ impl Workbench {
             || self.scene_resources(word, late)
             || self.scene_updates(word, late)
             || self.scene_sheets(word, late)
+            || self.scene_sign_in(word, late)
     }
 
     /// Settle `pending` with `result`, as if it had just finished, and keep

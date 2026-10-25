@@ -42,6 +42,7 @@ pub mod ipc;
 pub mod jpeg;
 #[cfg(feature = "keychain")]
 pub mod keychain;
+pub mod logins;
 pub mod media;
 pub mod naming;
 pub mod network;

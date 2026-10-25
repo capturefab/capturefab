@@ -144,6 +144,7 @@ impl Harness {
             recording: Arc::default(),
             forward_clock: Arc::default(),
             names: Arc::default(),
+            logins: crate::logins::Logins::system(),
         };
         let mut harness = Self {
             handle,

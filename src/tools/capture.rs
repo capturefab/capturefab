@@ -571,6 +571,7 @@ fn camera_for(
                 if connect {
                     checked.ops.push(Op::Connect {
                         selector: camera.selector().into(),
+                        saved_login: plan.origin != super::Origin::Assistant,
                     });
                     plan.connected.insert(camera.selector().into());
                 } else {

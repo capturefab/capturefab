@@ -99,6 +99,9 @@ A source build without the `gui` feature exits 5 when run without a subcommand.
 
 Exit codes are 1 `operation_failed`, 2 `usage`, 3 `unavailable`, 4 `timeout`, 5 `unsupported` and 6 `storage_full`.
 Argument-parsing usage errors add `error.details` with `kind`, `invalid`, `suggestions` (best first), `valid_values` and `usage` when known.
+A camera that asks for a sign-in fails with `auth_required`, and one that refuses the credentials sent with `auth_rejected`; both exit 1. Hub credential failures stay `operation_failed`.
+On either code, never ask for a password in chat: the user signs in in the app or runs `capturefab login add ADDRESS --user USER --password-stdin`.
+`login add|list|remove` saves camera sign-ins for credential-free rtsp://, rtsps:// and ONVIF addresses in the OS credential store; the camera worker uses them automatically, and assistant connects never do.
 Capturefab rejects malformed supplied fields before connection and before capture/forward `--set` or `--auto` changes.
 RPC and workflow commands reject unknown fields.
 Valid feature writes run in order; a later live failure does not reverse earlier writes.
@@ -550,7 +553,7 @@ Frigate and go2rtc try RTSP then snapshots; UniFi Protect uses snapshots.
 Each attempt allows at least 12 seconds for its first frame, or 15 seconds for RTSP.
 API calls and fallback attempts add to connection time.
 Hub camera settings are read-only; Home Assistant MJPEG sends nothing while the image is unchanged, so use `stream=snapshot` for time-lapses.
-`serve --listen` refuses hub cameras unless it was started with `--allow-hubs`.
+`serve --listen` refuses hub cameras unless it was started with `--allow-hubs`, and cameras with saved sign-ins unless it was started with `--allow-saved-sign-ins`; it never accepts camera passwords.
 Exit codes: 1 secret or certificate refused, 2 invalid name, URL, flags or selector, 3 hub or camera unavailable, 4 timeout, 5 hubs or the credential store not compiled in.
 
 ## Camera types and limits

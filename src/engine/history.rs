@@ -910,11 +910,8 @@ mod tests {
 
     fn connected() -> WorkerHandle {
         let h = WorkerHandle::new();
-        h.request(SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 100,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect("sim:0".into(), 100))
+            .unwrap();
         h
     }
     fn get(h: &WorkerHandle, feature: &str) -> Value {
@@ -1174,11 +1171,8 @@ mod tests {
             .unwrap()
             .to_owned();
         h.request(SessionCommand::Disconnect).unwrap();
-        h.request(SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 100,
-        })
-        .unwrap();
+        h.request(SessionCommand::connect("sim:0".into(), 100))
+            .unwrap();
         assert!(
             h.request(SessionCommand::ReplayCameraChange { token, undo: true })
                 .is_err()

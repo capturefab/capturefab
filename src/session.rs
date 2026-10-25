@@ -45,6 +45,14 @@ pub enum SessionCommand {
     Connect {
         camera: String,
         timeout_ms: u64,
+        /// A camera sign-in sent beside a credential-free selector. Local
+        /// IPC and the worker pipe only: the remote API refuses it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        login: Option<crate::logins::CameraLogin>,
+        /// Whether the worker may use a sign-in saved on this host when no
+        /// `login` is sent. Assistant connects send false.
+        #[serde(default = "yes", skip_serializing_if = "is_true")]
+        saved_login: bool,
     },
     Select {
         camera: String,
@@ -437,7 +445,22 @@ impl<'de> Deserialize<'de> for StrictValue {
         deserializer.deserialize_any(Visitor)
     }
 }
+fn yes() -> bool {
+    true
+}
+fn is_true(value: &bool) -> bool {
+    *value
+}
 impl SessionCommand {
+    /// A plain connect: no sign-in sent, saved sign-ins allowed.
+    pub fn connect(camera: String, timeout_ms: u64) -> Self {
+        Self::Connect {
+            camera,
+            timeout_ms,
+            login: None,
+            saved_login: true,
+        }
+    }
     pub fn from_json_slice(data: &[u8]) -> Result<Self> {
         let mut deserializer = serde_json::Deserializer::from_slice(data);
         let command = deserialize_command(&mut deserializer)?;
@@ -464,9 +487,17 @@ impl SessionCommand {
                     "network budget must be 1..125000000000 bytes per second"
                 );
             }
-            Self::Connect { camera, timeout_ms } => {
+            Self::Connect {
+                camera,
+                timeout_ms,
+                login,
+                ..
+            } => {
                 validate_selector(camera)?;
                 validate_timeout(*timeout_ms)?;
+                if login.is_some() {
+                    validate_login_selector(camera)?;
+                }
                 maximum_cameras()?;
                 frame_capacity(FrameClass::Default)?;
             }
@@ -666,6 +697,39 @@ pub fn validate_timeout(timeout_ms: u64) -> Result<()> {
 }
 pub fn validate_selector(camera: &str) -> Result<()> {
     crate::camera::validate_selector_shape(camera)
+}
+/// A sign-in goes only with an rtsp://, rtsps:// or onvif: address, or a bare
+/// name the coordinator may resolve to a discovered ONVIF camera; never
+/// with credentials already in the address.
+fn validate_login_selector(camera: &str) -> Result<()> {
+    let usage = |message: &str| -> anyhow::Error { crate::dataset::Usage(message.into()).into() };
+    if crate::logins::split_userinfo(camera).is_ok_and(|(_, login)| login.is_some())
+        || camera.split_once("://").is_some_and(|(_, rest)| {
+            rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())].contains('@')
+        })
+    {
+        return Err(usage(
+            "leave the user name and password out of the address when signing in",
+        ));
+    }
+    let other = camera.starts_with("sim:")
+        || camera.starts_with("gige:")
+        || camera.starts_with("usb:")
+        || camera.parse::<std::net::Ipv4Addr>().is_ok()
+        || crate::hubs::is_source(camera)
+        || crate::scanner::is_source(camera)
+        || crate::media::is_host_camera(camera)
+        || camera.to_ascii_lowercase().starts_with("file:");
+    // A bare name may be the ID or serial of a discovered ONVIF camera,
+    // which only the coordinator can resolve; a path or another URL scheme
+    // is never one.
+    let alias = !camera.contains("://") && !camera.contains(['/', '\\']);
+    if other || !(crate::logins::key(camera).is_ok() || alias) {
+        return Err(usage(
+            "sign-in is supported for rtsp://, rtsps:// and onvif: cameras",
+        ));
+    }
+    Ok(())
 }
 fn validate_feature(feature: &str) -> Result<()> {
     ensure!(
@@ -1824,6 +1888,9 @@ pub struct SessionHandle {
     /// A permission on this client handle, inherited by its command tasks.
     /// Remote clients opt in separately from local IPC/GUI clients.
     allow_hub_connect: bool,
+    /// Whether cameras may open with a sign-in saved on this host. Remote
+    /// clients opt in with `serve --allow-saved-sign-ins`.
+    allow_saved_logins: bool,
 }
 impl Default for SessionHandle {
     fn default() -> Self {
@@ -1834,6 +1901,7 @@ impl SessionHandle {
     pub fn new() -> Self {
         let h = Self {
             allow_hub_connect: true,
+            allow_saved_logins: true,
             inner: Arc::new(Coordinator {
                 analytics: crate::analytics::Analytics::new(),
                 started: Instant::now(),
@@ -1874,6 +1942,7 @@ impl SessionHandle {
                     let h = Self {
                         inner,
                         allow_hub_connect: true,
+                        allow_saved_logins: true,
                     };
                     h.refresh_workers();
                     h.store_snapshot();
@@ -1944,6 +2013,10 @@ impl SessionHandle {
             .wrapping_add(self.inner.activity.revision())
     }
     /// The stored state, for an edit outside a status poll.
+    #[cfg(test)]
+    pub(crate) fn set_devices_for_test(&self, devices: Vec<CameraInfo>) {
+        self.edit_state().devices = devices;
+    }
     fn edit_state(&self) -> std::sync::RwLockWriteGuard<'_, SessionSnapshot> {
         self.inner.revision.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -1982,6 +2055,31 @@ impl SessionHandle {
             }
             _ => camera,
         }
+    }
+    pub(crate) fn deny_saved_logins(mut self) -> Self {
+        self.allow_saved_logins = false;
+        self
+    }
+    /// Refuse a camera whose sign-in is saved on this host when this client
+    /// may not use saved sign-ins. Reads only the index.
+    fn check_saved_login_connect(&self, camera: &str) -> Result<()> {
+        if self.allow_saved_logins {
+            return Ok(());
+        }
+        let Ok(key) = crate::logins::key(camera) else {
+            return Ok(());
+        };
+        if crate::logins::Logins::system()
+            .is_saved(&key.address)
+            .unwrap_or(true)
+        {
+            return Err(crate::dataset::Usage(
+                "this camera uses a sign-in saved on this host; start serve with --allow-saved-sign-ins"
+                    .into(),
+            )
+            .into());
+        }
+        Ok(())
     }
     fn check_hub_connect(&self, camera: &str) -> Result<()> {
         ensure!(
@@ -2030,6 +2128,24 @@ impl SessionHandle {
     /// The worker already showing hub camera `camera`, if any. One camera
     /// has one worker, so asking for it with other options is refused rather
     /// than replacing the stream others are using.
+    /// The ONVIF address of a discovered or connected ONVIF camera named by
+    /// its ID or serial; any other selector unchanged.
+    fn onvif_alias(&self, camera: String) -> String {
+        if crate::onvif::is_source(&camera) || camera.contains("://") {
+            return camera;
+        }
+        let state = self.inner.state.read().unwrap_or_else(|e| e.into_inner());
+        state
+            .devices
+            .iter()
+            .chain(state.cameras.iter().map(|camera| &camera.info))
+            .find(|device| {
+                crate::onvif::is_source(&device.id)
+                    && (device.id == camera || device.serial == camera)
+            })
+            .map(|device| device.id.clone())
+            .unwrap_or(camera)
+    }
     fn connected_hub_camera(&self, camera: &str) -> Result<Option<Value>> {
         if !crate::hubs::is_source(camera) {
             return Ok(None);
@@ -2905,7 +3021,12 @@ impl SessionHandle {
                 drop(log);
                 Ok(json!({"devices":devices,"warnings":warnings}))
             }
-            SessionCommand::Connect { camera, timeout_ms } => {
+            SessionCommand::Connect {
+                camera,
+                timeout_ms,
+                login,
+                saved_login,
+            } => {
                 let _connect = self
                     .inner
                     .connecting
@@ -2929,14 +3050,25 @@ impl SessionHandle {
                         .map(|device| device.address.clone().unwrap_or_else(|| device.id.clone()))
                         .unwrap_or(camera)
                 };
+                // A discovered ONVIF camera named by its serial or ID opens
+                // by its ONVIF address, which is what a sign-in is saved
+                // under.
+                let camera = self.onvif_alias(camera);
                 // A unique loose name ("C920") among cached cameras becomes
                 // that camera's ID, so connected workers and the permission
                 // check below see one identity. Hub cameras never match.
                 let camera = self.loose_camera(camera);
+                if login.is_some() && crate::logins::key(&camera).is_err() {
+                    return Err(crate::dataset::Usage(
+                        "sign-in is supported for rtsp://, rtsps:// and onvif: cameras".into(),
+                    )
+                    .into());
+                }
                 // Discovery and queued commands can change aliases after
                 // the HTTP server validates a request. Enforce the client's
                 // permission on the identity actually being connected.
                 self.check_hub_connect(&camera)?;
+                self.check_saved_login_connect(&camera)?;
                 if let Some(connected) = self.connected_hub_camera(&camera)? {
                     return Ok(connected);
                 }
@@ -2949,6 +3081,9 @@ impl SessionHandle {
                         .clone()
                         .context("worker has no camera")?;
                     self.check_hub_connect(&info.id)?;
+                    // A camera the desktop opened with a saved password is
+                    // not handed to a client that may not use one.
+                    self.check_saved_login_connect(&info.id)?;
                     self.edit_state().active_camera = Some(info.id.clone());
                     return Ok(json!({"connected":info,"worker_pid":p.child.id()}));
                 }
@@ -2978,7 +3113,13 @@ impl SessionHandle {
                     FrameClass::Default
                 };
                 let mut p = Process::spawn(class, self.inner.revision.clone())?;
-                let result = p.call(SessionCommand::Connect { camera, timeout_ms })?;
+                let result = p.call(SessionCommand::Connect {
+                    camera,
+                    timeout_ms,
+                    login,
+                    // Belt and braces: the index can change between checks.
+                    saved_login: saved_login && self.allow_saved_logins,
+                })?;
                 let info = p
                     .report
                     .snapshot
@@ -3542,10 +3683,7 @@ mod tests {
     fn remote_hub_permission_is_checked_after_a_queued_alias_is_resolved() {
         let handle = SessionHandle::new();
         let remote = handle.clone().without_hub_connect();
-        let command = SessionCommand::Connect {
-            camera: "home/camera.front_door".into(),
-            timeout_ms: 1000,
-        };
+        let command = SessionCommand::connect("home/camera.front_door".into(), 1000);
         // Keep Connect queued while discovery publishes a previously
         // unknown serial alias. An HTTP-only preflight check sees no hub.
         let turn = handle.command_turn(None, &command).unwrap();
@@ -4192,10 +4330,7 @@ mod tests {
             SessionCommand::OptimizeNetwork {
                 bytes_per_second: u64::MAX,
             },
-            SessionCommand::Connect {
-                camera: "sim:0".into(),
-                timeout_ms: 0,
-            },
+            SessionCommand::connect("sim:0".into(), 0),
             SessionCommand::Select { camera: " ".into() },
             SessionCommand::Auto {
                 balance: Some(f64::NAN),
@@ -4594,13 +4729,7 @@ mod tests {
             .command_turn(Some("192.0.2.1"), &SessionCommand::Disconnect)
             .unwrap();
         let connect = handle
-            .command_turn(
-                None,
-                &SessionCommand::Connect {
-                    camera: "serial-a".into(),
-                    timeout_ms: 1000,
-                },
-            )
+            .command_turn(None, &SessionCommand::connect("serial-a".into(), 1000))
             .unwrap();
         let select = handle
             .command_turn(
@@ -4932,10 +5061,7 @@ mod tests {
             );
             reply
         };
-        let connected = step(Some(SessionCommand::Connect {
-            camera: "sim:0".into(),
-            timeout_ms: 1000,
-        }));
+        let connected = step(Some(SessionCommand::connect("sim:0".into(), 1000)));
         assert!(
             !connected["snapshot"]["features"]
                 .as_array()
@@ -5139,10 +5265,10 @@ mod tests {
             // a usage error. Its type must survive the worker pipe alongside
             // the unchanged snapshot's kept fields.
             let error = worker
-                .call(SessionCommand::Connect {
-                    camera: "hub:merge-test/camera.timeout?invalid=1".into(),
-                    timeout_ms: 100,
-                })
+                .call(SessionCommand::connect(
+                    "hub:merge-test/camera.timeout?invalid=1".into(),
+                    100,
+                ))
                 .unwrap_err();
             assert_eq!(crate::types::error_transport_code(&error), Some("usage"));
             assert!(!worker.quiet, "failed replies must always be read");
@@ -5446,5 +5572,98 @@ mod tests {
             wait,
         );
         assert_eq!(refused.to_string(), "camera payload exceeds 256 MiB limit");
+    }
+
+    #[test]
+    fn sign_ins_go_only_with_camera_addresses_that_take_them() {
+        let login = || Some(crate::logins::CameraLogin::new("admin", "pw").unwrap());
+        let connect = |camera: &str| SessionCommand::Connect {
+            camera: camera.into(),
+            timeout_ms: 1000,
+            login: login(),
+            saved_login: true,
+        };
+        for camera in [
+            "rtsp://cam/live",
+            "rtsps://cam/live",
+            "onvif://cam",
+            "onvif:http://cam/onvif/device_service",
+            "urn:uuid:1234",
+            "ACME-SERIAL-1",
+        ] {
+            connect(camera).validate().unwrap();
+        }
+        for camera in [
+            "sim:0",
+            "gige:192.168.1.10",
+            "192.168.1.10",
+            "hub:home/front",
+            "rtsp://admin:x@cam/live",
+            "/tmp/clip.mp4",
+            "file:///tmp/clip.mp4",
+            "avfoundation:Camera",
+        ] {
+            let error = connect(camera).validate().unwrap_err();
+            assert_eq!(
+                crate::types::error_transport_code(&error),
+                Some("usage"),
+                "{camera}: {error:#}"
+            );
+        }
+        let text = r#"{"op":"connect","camera":"rtsp://cam/x","timeout_ms":1000,"login":{"user":"a","password":"b"},"saved_login":false}"#;
+        let command = SessionCommand::from_json_slice(text.as_bytes()).unwrap();
+        assert!(matches!(
+            &command,
+            SessionCommand::Connect { login: Some(login), saved_login: false, .. } if login.user == "a"
+        ));
+        assert_eq!(serde_json::to_string(&command).unwrap(), text);
+        let plain = serde_json::to_string(&SessionCommand::connect("sim:0".into(), 5)).unwrap();
+        assert_eq!(plain, r#"{"op":"connect","camera":"sim:0","timeout_ms":5}"#);
+        assert!(
+            SessionCommand::from_json_slice(
+                br#"{"op":"connect","camera":"sim:0","timeout_ms":5,"bogus":1}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn onvif_serials_resolve_to_their_address_and_saved_sign_ins_need_permission() {
+        let handle = SessionHandle::new();
+        handle.set_devices_for_test(vec![CameraInfo {
+            id: "onvif:http://session-onvif.invalid/onvif/device_service".into(),
+            transport: crate::types::Transport::Media,
+            vendor: "ONVIF".into(),
+            model: "Cam".into(),
+            serial: "urn:uuid:session".into(),
+            address: None,
+            profile: Default::default(),
+        }]);
+        assert_eq!(
+            handle.onvif_alias("urn:uuid:session".into()),
+            "onvif:http://session-onvif.invalid/onvif/device_service"
+        );
+        assert_eq!(handle.onvif_alias("sim:0".into()), "sim:0");
+        #[cfg(feature = "keychain")]
+        {
+            let address = "rtsp://session-saved.invalid:554/live";
+            crate::logins::Logins::system()
+                .save(
+                    address,
+                    &crate::logins::CameraLogin::new("admin", "session-pw").unwrap(),
+                )
+                .unwrap();
+            let remote = handle.clone().deny_saved_logins();
+            let error = remote
+                .request(SessionCommand::connect(address.into(), 1000))
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("--allow-saved-sign-ins"),
+                "{error:#}"
+            );
+            assert!(remote.check_saved_login_connect("sim:0").is_ok());
+            assert!(handle.check_saved_login_connect(address).is_ok());
+        }
+        handle.shutdown();
     }
 }

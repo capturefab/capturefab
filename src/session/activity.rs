@@ -939,10 +939,7 @@ mod tests {
             .begin(
                 ActivityOrigin::Client,
                 None,
-                &SessionCommand::Connect {
-                    camera: "SIM0".into(),
-                    timeout_ms: 1000,
-                },
+                &SessionCommand::connect("SIM0".into(), 1000),
             )
             .unwrap();
         assert_eq!(activity.snapshot().activity[0].state, ActivityState::Queued);
@@ -1036,16 +1033,37 @@ mod tests {
         );
     }
     #[test]
+    fn activity_never_records_a_camera_sign_in() {
+        let activity = Arc::new(Activity::default());
+        let command = SessionCommand::Connect {
+            camera: "rtsp://camera.local/live".into(),
+            timeout_ms: 1000,
+            login: Some(
+                crate::logins::CameraLogin::new("activity-user", "activity-password").unwrap(),
+            ),
+            saved_login: true,
+        };
+        let (_, label) = describe(&command);
+        assert!(!label.contains("activity-"), "{label}");
+        let mut entry = activity
+            .begin(ActivityOrigin::Client, None, &command)
+            .unwrap();
+        entry.finish(&Err(anyhow::anyhow!("camera refused the sign-in")));
+        let serialized = serde_json::to_string(&activity.snapshot()).unwrap();
+        assert!(!serialized.contains("activity-password"), "{serialized}");
+        assert!(!serialized.contains("activity-user"), "{serialized}");
+    }
+    #[test]
     fn activity_redacts_all_urls_and_keeps_capture_results() {
         let activity = Arc::new(Activity::default());
         let mut command = activity
             .begin(
                 ActivityOrigin::Client,
                 None,
-                &SessionCommand::Connect {
-                    camera: "rtsp://user:password@camera/live?token=secret".into(),
-                    timeout_ms: 1000,
-                },
+                &SessionCommand::connect(
+                    "rtsp://user:password@camera/live?token=secret".into(),
+                    1000,
+                ),
             )
             .unwrap();
         command.finish(&Err(anyhow::anyhow!(
