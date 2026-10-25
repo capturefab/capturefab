@@ -359,15 +359,8 @@ pub fn sort_values(values: &mut [SetupValue]) {
 /// Setup names make their file names, so they avoid names some file
 /// systems reserve.
 pub fn validate_name(name: &str) -> Result<()> {
-    let stem = name.split('.').next().unwrap_or_default();
-    let reserved = ["con", "prn", "aux", "nul"]
-        .iter()
-        .any(|r| stem.eq_ignore_ascii_case(r))
-        || (stem.len() == 4
-            && ["com", "lpt"]
-                .iter()
-                .any(|p| stem[..3].eq_ignore_ascii_case(p))
-            && stem.as_bytes()[3].is_ascii_digit());
+    const RULE: &str = "Setup names are 1-64 letters, digits, '.', '-' and '_', cannot start or end with '.', and cannot be a reserved Windows name such as con or nul";
+    // The character set first: the reserved-name check below slices bytes.
     ensure!(
         !name.is_empty()
             && name.len() <= 64
@@ -375,10 +368,19 @@ pub fn validate_name(name: &str) -> Result<()> {
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
             && !name.starts_with('.')
-            && !name.ends_with('.')
-            && !reserved,
-        "Setup names are 1-64 letters, digits, '.', '-' and '_', cannot start or end with '.', and cannot be a reserved Windows name such as con or nul"
+            && !name.ends_with('.'),
+        RULE
     );
+    let stem = name.split('.').next().unwrap_or_default();
+    let reserved = ["con", "prn", "aux", "nul"]
+        .iter()
+        .any(|r| stem.eq_ignore_ascii_case(r))
+        || (stem.len() == 4
+            && ["com", "lpt"]
+                .iter()
+                .any(|p| stem.get(..3).is_some_and(|s| s.eq_ignore_ascii_case(p)))
+            && stem.as_bytes().get(3).is_some_and(u8::is_ascii_digit));
+    ensure!(!reserved, RULE);
     Ok(())
 }
 
@@ -510,10 +512,29 @@ pub fn validate(setup: &Setup) -> Result<()> {
     Ok(())
 }
 
-/// Parse a setup document strictly and validate it.
+/// Parse a setup document strictly and validate it. The `--json` envelope
+/// `setup show NAME --json` prints, `{"version":1,"ok":true,"result":DOCUMENT}`,
+/// is accepted too, so its output can be imported or applied as is.
 pub fn parse(bytes: &[u8]) -> Result<Setup> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope {
+        version: u32,
+        ok: bool,
+        result: serde_json::Value,
+    }
     ensure!(bytes.len() <= MAX_SETUP_BYTES, "a setup is at most 256 KiB");
-    let setup: Setup = serde_json::from_slice(bytes).context("not a valid setup document")?;
+    let setup = match serde_json::from_slice::<Setup>(bytes) {
+        Ok(setup) => setup,
+        Err(error) => match serde_json::from_slice::<Envelope>(bytes) {
+            Ok(Envelope {
+                version: 1,
+                ok: true,
+                result,
+            }) => serde_json::from_value(result).context("not a valid setup document")?,
+            _ => return Err(anyhow::Error::new(error).context("not a valid setup document")),
+        },
+    };
     validate(&setup)?;
     Ok(setup)
 }
@@ -832,6 +853,7 @@ pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session
             digest: expected,
             allow_other_model,
             strict,
+            confirmed_disruptive,
         } => {
             let setup = load(&name, setup)?;
             if let (Some(expected), Some(setup)) = (&expected, &setup)
@@ -851,6 +873,7 @@ pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session
                 digest: expected,
                 allow_other_model,
                 strict,
+                confirmed_disruptive,
             }
         }
         command => command,
@@ -932,6 +955,10 @@ mod tests {
             "bench.",
             "a b",
             "a/b",
+            "1€",
+            "é",
+            "€€",
+            "com€",
             &"x".repeat(65),
         ] {
             let error = validate_name(bad).unwrap_err().to_string();
@@ -954,6 +981,31 @@ mod tests {
             parse(&serde_json::to_vec(&json).unwrap()).unwrap_err()
         );
         assert!(error.contains("version 2"), "{error}");
+        // The --json envelope of setup show is accepted; its document is
+        // still strict, and a failed envelope is not.
+        let envelope = serde_json::json!({"version":1,"ok":true,"result":setup});
+        assert_eq!(
+            parse(&serde_json::to_vec(&envelope).unwrap()).unwrap(),
+            setup
+        );
+        for bad in [
+            serde_json::json!({"version":1,"ok":false,"result":setup}),
+            serde_json::json!({"version":2,"ok":true,"result":setup}),
+            serde_json::json!({"version":1,"ok":true,"result":setup,"extra":1}),
+        ] {
+            assert!(parse(&serde_json::to_vec(&bad).unwrap()).is_err(), "{bad}");
+        }
+        let mut inner = serde_json::to_value(&setup).unwrap();
+        inner["extra"] = serde_json::json!(1);
+        let error = format!(
+            "{:#}",
+            parse(
+                &serde_json::to_vec(&serde_json::json!({"version":1,"ok":true,"result":inner}))
+                    .unwrap()
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("not a valid setup document"), "{error}");
         for bad in [
             serde_json::json!([1]),
             serde_json::json!({"a":1}),
@@ -976,11 +1028,17 @@ mod tests {
         ] {
             let mut setup = setup("bench");
             setup.values[1] = value("ExposureTime", serde_json::json!(float));
-            let parsed = parse(&serde_json::to_vec_pretty(&setup).unwrap()).unwrap();
-            let Scalar::Number(number) = &parsed.values[1].value else {
-                panic!()
-            };
-            assert_eq!(number.as_f64().unwrap().to_bits(), float.to_bits());
+            let envelope = serde_json::json!({"version":1,"ok":true,"result":setup});
+            for bytes in [
+                serde_json::to_vec_pretty(&setup).unwrap(),
+                serde_json::to_vec(&envelope).unwrap(),
+            ] {
+                let parsed = parse(&bytes).unwrap();
+                let Scalar::Number(number) = &parsed.values[1].value else {
+                    panic!()
+                };
+                assert_eq!(number.as_f64().unwrap().to_bits(), float.to_bits());
+            }
         }
     }
 
@@ -997,6 +1055,7 @@ mod tests {
             digest: Some(digest(&big)),
             allow_other_model: true,
             strict: true,
+            confirmed_disruptive: Some(vec!["TriggerMode".into(); 8]),
         })
         .unwrap();
         assert!(line.len() < 1024 * 1024);

@@ -739,8 +739,9 @@ pub(super) fn process(
             allow_other_model,
             ..
         } => {
+            let holders = setup::stream_holders(forwarder, jobs);
             let c = camera_mut(camera)?;
-            let plan = setup::plan(c, auto, busy, document, *allow_other_model)?;
+            let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
             return Ok(setup::report(&plan, &c.info));
         }
         SessionCommand::SetupDiff { .. } | SessionCommand::ApplySetup { setup: None, .. } => {
@@ -811,10 +812,13 @@ pub(super) fn process(
             setup: Some(document),
             allow_other_model,
             strict,
+            confirmed_disruptive,
             ..
         } => {
-            let plan = setup::plan(c, auto, busy, document, *allow_other_model)?;
+            let holders = setup::stream_holders(forwarder, jobs);
+            let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
             plan.check(*strict)?;
+            plan.confirm(confirmed_disruptive.as_deref())?;
             Some(plan)
         }
         _ => None,

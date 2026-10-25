@@ -214,8 +214,9 @@ camera change:
 applied; `allow_other_model` applies the settings two different camera models
 share. Workflow steps skip the CLI's `--yes` confirmation for trigger and I/O
 changes, so review the setup with `capturefab setup diff NAME` first. The
-`setup` field accepts the document `capturefab setup show NAME --json` prints
-instead of `name`, so a workflow can carry its own setup.
+`setup` field takes a setup document instead of `name`, so a workflow can
+carry its own setup: the `result` object that `capturefab setup show NAME
+--json` prints, without the `{"version":1,"ok":true,...}` envelope around it.
 
 ## Catalog captures
 

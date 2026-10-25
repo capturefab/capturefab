@@ -106,6 +106,12 @@ pub enum SessionCommand {
         /// cannot write or would not accept.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         strict: bool,
+        /// The disruptive features a person confirmed from a reviewed diff.
+        /// When given, the worker refuses, before any write, a restore whose
+        /// fresh comparison changes another disruptive feature. Absent, no
+        /// confirmation is checked (RPC and workflow callers).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirmed_disruptive: Option<Vec<String>>,
     },
     Auto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -533,11 +539,24 @@ impl SessionCommand {
                     crate::setup::validate(setup)?;
                 }
                 if let Self::ApplySetup {
-                    digest: Some(digest),
+                    digest,
+                    confirmed_disruptive,
                     ..
                 } = self
                 {
-                    crate::setup::validate_digest(digest)?;
+                    if let Some(digest) = digest {
+                        crate::setup::validate_digest(digest)?;
+                    }
+                    if let Some(confirmed) = confirmed_disruptive {
+                        ensure!(
+                            confirmed.len() <= crate::setup::MAX_SETUP_VALUES,
+                            "confirmed_disruptive names at most {} features",
+                            crate::setup::MAX_SETUP_VALUES
+                        );
+                        for feature in confirmed {
+                            validate_feature(feature)?;
+                        }
+                    }
                 }
             }
             Self::Auto {
@@ -2506,8 +2525,6 @@ impl SessionHandle {
         if let Some(camera) = &target {
             validate_selector(camera)?;
         }
-        // The worker never reads the state directory: load a named setup here.
-        let command = crate::setup::resolve(command)?;
         ensure!(
             !self.inner.quitting.load(Ordering::Relaxed),
             "session is shutting down"
@@ -2570,7 +2587,10 @@ impl SessionHandle {
                 let result = if h.inner.quitting.load(Ordering::Acquire) {
                     Err(anyhow::anyhow!("session is shutting down"))
                 } else {
-                    h.process(target.as_deref(), command, origin, actor)
+                    // The worker never reads the state directory: a named
+                    // setup is loaded here, off the caller's (UI) thread.
+                    crate::setup::resolve(command)
+                        .and_then(|command| h.process(target.as_deref(), command, origin, actor))
                 };
                 // An inspection's failure is its caller's to report; a slow
                 // or triggered camera must not fill the session log.
@@ -5429,6 +5449,8 @@ mod tests {
             r#"{"op":"setup_diff","name":"bench"}"#,
             r#"{"op":"setup_diff","name":"bench","allow_other_model":true}"#,
             r#"{"op":"apply_setup","name":"bench","strict":true}"#,
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":["TriggerMode"]}"#,
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[]}"#,
             r#"{"op":"apply_setup","name":"bench","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
         ] {
             SessionCommand::from_json_slice(valid.as_bytes())
@@ -5450,6 +5472,7 @@ mod tests {
             r#"{"op":"apply_setup"}"#,
             r#"{"op":"apply_setup","name":"con"}"#,
             r#"{"op":"apply_setup","name":"bench","digest":"sha256:abc"}"#,
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":["Trigger Mode"]}"#,
             r#"{"op":"setup_diff","name":"bench","setup":{"version":1,"name":"bench","saved_at":"x","camera":{"transport":"simulator"},"values":[{"feature":"Width","value":1}]}}"#,
             r#"{"op":"setup_diff","setup":{"version":1,"name":"bench","saved_at":"x","camera":{"transport":"simulator"},"values":[{"feature":"GevSCDA","value":1}]}}"#,
         ] {
@@ -5488,6 +5511,7 @@ mod tests {
             digest,
             allow_other_model: false,
             strict: false,
+            confirmed_disruptive: None,
         };
         let resolved = crate::setup::resolve(apply(Some(crate::setup::digest(&setup)))).unwrap();
         assert!(
@@ -5504,10 +5528,10 @@ mod tests {
             crate::types::error_transport_code(&stale),
             Some("operation_failed")
         );
-        // A missing setup fails before it is queued.
+        // A missing setup fails on the command thread, before the worker.
         let handle = SessionHandle::new();
         let missing = handle
-            .submit(SessionCommand::SetupDiff {
+            .request(SessionCommand::SetupDiff {
                 name: Some("no-such-setup".into()),
                 setup: None,
                 allow_other_model: false,

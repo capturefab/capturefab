@@ -49,11 +49,56 @@ fn address_of(value: &SetupValue) -> Address {
             .collect(),
     }
 }
+/// Longest skip reason a setup stores, in bytes; below the document's limit.
+const MAX_REASON: usize = 240;
+
+/// A skip reason fit to store in a setup: one line without control
+/// characters, bounded on a char boundary.
+fn reason_text(reason: &str) -> String {
+    let line = reason
+        .split(|c: char| c.is_control() || c.is_whitespace())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if line.len() <= MAX_REASON {
+        return line;
+    }
+    let mut end = MAX_REASON - '…'.len_utf8();
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", line[..end].trim_end())
+}
+
+/// Why a value could not be read, without the camera's error text: that
+/// can name the camera's address, which a setup never holds. The full error
+/// goes to the session log.
+fn unreadable(h: &WorkerHandle, feature: &str, at: &[Bank], error: &anyhow::Error) -> String {
+    let place = if at.is_empty() {
+        String::new()
+    } else {
+        format!(" at {}", bank_text(at))
+    };
+    h.log(
+        "warn",
+        format!("Setup: could not read {feature}{place}: {error:#}"),
+    );
+    let timed_out = crate::types::error_transport_code(error) == Some("timeout")
+        || format!("{error:#}")
+            .to_ascii_lowercase()
+            .contains("timed out");
+    if timed_out {
+        "could not read: timed out".into()
+    } else {
+        "could not read".into()
+    }
+}
+
 fn skip(feature: &str, at: Vec<Bank>, reason: impl Into<String>) -> Skipped {
     Skipped {
         feature: feature.into(),
         at,
-        reason: reason.into(),
+        reason: reason_text(&reason.into()),
     }
 }
 
@@ -149,21 +194,15 @@ pub(super) fn read(
                 match addresses(camera, &name, &|_| false) {
                     Ok(addresses) => addresses,
                     Err(error) => {
-                        skipped.push(skip(
-                            &name,
-                            Vec::new(),
-                            format!("could not read: {error:#}"),
-                        ));
+                        let reason = unreadable(h, &name, &[], &error);
+                        skipped.push(skip(&name, Vec::new(), reason));
                         continue;
                     }
                 }
             }
             Err(error) => {
-                skipped.push(skip(
-                    &name,
-                    Vec::new(),
-                    format!("could not read: {error:#}"),
-                ));
+                let reason = unreadable(h, &name, &[], &error);
+                skipped.push(skip(&name, Vec::new(), reason));
                 continue;
             }
         };
@@ -196,11 +235,7 @@ pub(super) fn read(
                     None
                 })
             });
-            let place = if at.is_empty() {
-                String::new()
-            } else {
-                format!(" at {}", bank_text(&at))
-            };
+            // The bank is stored beside the reason, so the reason omits it.
             match read {
                 Ok(Some(value)) => match Scalar::from_value(&value) {
                     Some(Scalar::String(text)) if text.len() > MAX_STRING => {
@@ -216,9 +251,10 @@ pub(super) fn read(
                     }
                     None => skipped.push(skip(&name, at, "not a value a setup can hold")),
                 },
-                Ok(None) => read_only.push(skip(&name, at, format!("read-only{place}"))),
+                Ok(None) => read_only.push(skip(&name, at, "read-only")),
                 Err(error) => {
-                    skipped.push(skip(&name, at, format!("could not read{place}: {error:#}")))
+                    let reason = unreadable(h, &name, &at, &error);
+                    skipped.push(skip(&name, at, reason));
                 }
             }
         }
@@ -321,6 +357,33 @@ impl Plan {
             ));
         }
         Ok(())
+    }
+    /// Refuse, before any write, disruptive changes nobody confirmed: the
+    /// camera may have changed since the reviewed diff. `None` checks
+    /// nothing (RPC and workflow callers).
+    pub(super) fn confirm(&self, confirmed: Option<&[String]>) -> Result<()> {
+        let Some(confirmed) = confirmed else {
+            return Ok(());
+        };
+        let mut unconfirmed = Vec::new();
+        for row in self.changes() {
+            let feature = row.address.feature.as_str();
+            if risk_of(feature) == "disruptive"
+                && !confirmed.iter().any(|name| name == feature)
+                && !unconfirmed.contains(&feature)
+            {
+                unconfirmed.push(feature);
+            }
+        }
+        if unconfirmed.is_empty() {
+            return Ok(());
+        }
+        Err(crate::dataset::Usage(format!(
+            "Restoring {} now also changes {}, which was not confirmed; the camera changed after the preview. Nothing changed; preview it again.",
+            self.name,
+            unconfirmed.join(", ")
+        ))
+        .into())
     }
 }
 
@@ -527,10 +590,30 @@ fn row(
 
 /// Compare `setup` with the camera. A setup from another model is refused
 /// unless `allow_other_model`.
+/// What holds a running stream, in words: "recording", "forwarding",
+/// "scheduled captures". A geometry restore is refused while any does.
+pub(super) fn stream_holders(
+    forwarder: &Option<(Forwarder, f64)>,
+    jobs: &[Scheduled],
+) -> Vec<&'static str> {
+    let mut holders = Vec::new();
+    if let Some((forwarder, _)) = forwarder {
+        holders.push(if forwarder.recording_path().is_some() {
+            "recording"
+        } else {
+            "forwarding"
+        });
+    }
+    if jobs.iter().any(|job| job.info.active()) {
+        holders.push("scheduled captures");
+    }
+    holders
+}
+
 pub(super) fn plan(
     camera: &mut Camera,
     auto: &Option<AutoController>,
-    busy: bool,
+    holders: &[&str],
     setup: &Setup,
     allow_other_model: bool,
 ) -> Result<Plan> {
@@ -562,9 +645,10 @@ pub(super) fn plan(
         matched,
         warnings,
         restarts_stream,
-        blocked: (restarts_stream && busy).then(|| {
+        blocked: (restarts_stream && !holders.is_empty()).then(|| {
             format!(
-                "Stop recording and scheduled captures first: this setup changes {}.",
+                "Stop {} first: this setup changes {}.",
+                holders.join(" and "),
                 locked.join(", ")
             )
         }),
@@ -584,6 +668,7 @@ fn risk_of(feature: &str) -> &'static str {
 pub(super) fn report(plan: &Plan, info: &crate::types::CameraInfo) -> Value {
     let mut changes = Vec::new();
     let mut not_applied = Vec::new();
+    let mut matched = Vec::new();
     let mut unchanged = 0usize;
     let mut disruptive = false;
     for row in &plan.rows {
@@ -592,7 +677,11 @@ pub(super) fn report(plan: &Plan, info: &crate::types::CameraInfo) -> Value {
             entry["at"] = json!(row.at);
         }
         match row.status {
-            Status::Same => unchanged += 1,
+            Status::Same => {
+                unchanged += 1;
+                entry["value"] = row.target.clone();
+                matched.push(entry);
+            }
             Status::Change => {
                 let risk = risk_of(&row.address.feature);
                 disruptive |= risk == "disruptive";
@@ -621,6 +710,7 @@ pub(super) fn report(plan: &Plan, info: &crate::types::CameraInfo) -> Value {
         "warnings": plan.warnings,
         "changes": changes,
         "unchanged": unchanged,
+        "matched": matched,
         "not_applied": not_applied,
         "risk": if disruptive {"disruptive"} else {"reversible"},
         "restarts_stream": plan.restarts_stream,
@@ -834,6 +924,7 @@ mod tests {
             digest: None,
             allow_other_model: false,
             strict: false,
+            confirmed_disruptive: None,
         })
     }
 
@@ -941,11 +1032,9 @@ mod tests {
             }
         }
         let blocked = diff(&h, &narrow).unwrap();
-        assert!(
-            blocked["blocked"]
-                .as_str()
-                .unwrap()
-                .contains("changes Width")
+        assert_eq!(
+            blocked["blocked"],
+            "Stop scheduled captures first: this setup changes Width."
         );
         let error = apply(&h, &narrow).unwrap_err();
         assert_eq!(
@@ -1012,6 +1101,7 @@ mod tests {
                 digest: None,
                 allow_other_model: false,
                 strict: true,
+                confirmed_disruptive: None,
             })
             .unwrap_err();
         assert_eq!(
@@ -1105,6 +1195,78 @@ mod tests {
         assert_eq!(restored["auto"]["balance"], 0.25, "{restored}");
         assert_eq!(h.snapshot().auto.unwrap().balance, 0.25);
         h.shutdown();
+    }
+
+    #[test]
+    fn skip_reasons_are_one_bounded_line() {
+        let long = format!("timed out\nat {}\tend\u{7}", "€".repeat(400));
+        let reason = reason_text(&long);
+        assert!(reason.len() <= MAX_REASON, "{}", reason.len());
+        assert!(!reason.chars().any(char::is_control), "{reason}");
+        assert!(reason.starts_with("timed out at €"), "{reason}");
+        assert!(reason.ends_with('…'));
+        assert_eq!(reason_text("read-only"), "read-only");
+        let h = WorkerHandle::new();
+        let error =
+            anyhow::anyhow!("GVCP read to 192.168.1.20:3956\nfailed").context("read LineSource");
+        assert_eq!(unreadable(&h, "LineSource", &[], &error), "could not read");
+        let timeout = Categorized::error(ErrorKind::Timeout, "camera 10.0.0.7 did not answer");
+        assert_eq!(
+            unreadable(&h, "LineSource", &[], &timeout),
+            "could not read: timed out"
+        );
+        // A setup holding the reason still validates.
+        let setup = crate::setup::from_read(
+            "reasons",
+            None,
+            Reading {
+                camera: SavedCamera::from_info(&crate::transport::simulator::info()),
+                auto: None,
+                values: vec![SetupValue {
+                    feature: "Gain".into(),
+                    value: Scalar::Number(1.into()),
+                    at: Vec::new(),
+                }],
+                skipped: vec![skip("LineSource", Vec::new(), long)],
+            },
+        )
+        .unwrap();
+        assert!(setup.skipped[0].reason.len() <= MAX_REASON);
+        h.shutdown();
+    }
+
+    #[test]
+    fn unconfirmed_disruptive_changes_are_refused_before_any_write() {
+        let mut rig = Rig::new();
+        let reading: crate::setup::Reading =
+            serde_json::from_value(rig.run(SessionCommand::ReadSetup).unwrap()).unwrap();
+        let setup = crate::setup::from_read("confirm", None, reading).unwrap();
+        // Reviewed with only Gain differing; TriggerMode changes afterwards.
+        rig.c().set("Gain", "40").unwrap();
+        rig.c().set("TriggerMode", "On").unwrap();
+        let apply = |confirmed: Option<Vec<String>>| SessionCommand::ApplySetup {
+            name: None,
+            setup: Some(setup.clone()),
+            digest: None,
+            allow_other_model: false,
+            strict: false,
+            confirmed_disruptive: confirmed,
+        };
+        let refused = rig.run(apply(Some(Vec::new()))).unwrap_err();
+        assert_eq!(crate::types::error_transport_code(&refused), Some("usage"));
+        assert!(
+            refused.to_string().contains("also changes TriggerMode"),
+            "{refused}"
+        );
+        assert_eq!(rig.c().get("Gain").unwrap(), 40);
+        assert_eq!(rig.c().get("TriggerMode").unwrap(), "On");
+        rig.run(apply(Some(vec!["TriggerMode".into()]))).unwrap();
+        assert_eq!(rig.c().get("TriggerMode").unwrap(), "Off");
+        rig.c().set("TriggerMode", "On").unwrap();
+        // Without the field (RPC, workflows), nothing is checked.
+        rig.run(apply(None)).unwrap();
+        assert_eq!(rig.c().get("TriggerMode").unwrap(), "Off");
+        rig.h.shutdown();
     }
 
     #[test]
@@ -1274,6 +1436,7 @@ mod tests {
                 digest: None,
                 allow_other_model: false,
                 strict: false,
+                confirmed_disruptive: None,
             })
             .unwrap();
         assert_eq!(applied["applied"], 3, "{applied}");
@@ -1344,6 +1507,7 @@ mod tests {
                 digest: None,
                 allow_other_model: false,
                 strict: true,
+                confirmed_disruptive: None,
             })
             .is_err()
         );

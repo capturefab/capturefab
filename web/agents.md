@@ -776,25 +776,26 @@ capturefab setup show bench --json
 ```
 
 Always preview with `setup diff` or `setup apply --dry-run` first.
-`changes[]` lists `{feature, at?, saved, current, risk, stream_locked, warning?}`.
+`changes[]` lists `{feature, at?, saved, current, risk, stream_locked, warning?}`; `matched[]` lists `{feature, at?, value}` for settings that already match.
 `not_applied[]` lists values this camera lacks, cannot write or would not accept, each with `status` and `reason`.
 `match` is `same_camera`, `same_model`, `other_model` or `unknown_source`; read `warnings` before applying.
 `restarts_stream` means a running stream stops and restarts once; `blocked` explains a refusal while recording, forwarding or scheduled captures run.
 
 The CLI refuses changes with `risk: "disruptive"`, such as trigger and I/O line settings, without `--yes`.
 Pass `--yes` only after the person approved those exact changes.
-A setup from another model needs `--allow-other-model`.
+`setup apply` with a setup from another model needs `--allow-other-model`; `setup diff` previews it anyway and warns on stderr.
 `--strict` refuses, changing nothing, when any value cannot be applied.
 `apply_setup` with the `digest` from a reviewed diff refuses a setup edited since that review.
+The CLI also sends the reviewed disruptive features as `confirmed_disruptive`; the restore is refused (exit 2), changing nothing, if the camera changed since and the restore would now make another disruptive change.
 
 RPC `read_setup`, `setup_diff` and `apply_setup` take a setup `name` or an inline `setup` document.
-Workflows restore a setup with the step `{"op":"apply_setup","name":"bench"}`.
+Workflows restore a setup with the step `{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}}`.
 RPC and workflow callers skip the `--yes` confirmation, as `set_many` does, but the model, node-kind and recording checks always apply.
 A failed restore puts every value back; exit 1.
-A missing setup exits 3; another model through the CLI exits 2 and through RPC exits 5; a strict refusal exits 5; a blocked restore exits 3.
+A missing setup exits 3; another model through `setup apply` exits 2 and through RPC exits 5; a strict refusal exits 5; a blocked restore exits 3.
 
 Do not save, replace, import or delete setups unless the person asked; they are the person's saved state.
-Back up a setup with `setup show NAME --json > FILE`; `setup import FILE` restores it.
+Back up a setup with `setup show NAME --json > FILE`; `setup import FILE` and `--file FILE` read that file as is.
 
 ## Discover, inspect, configure, acquire
 

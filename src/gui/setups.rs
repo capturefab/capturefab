@@ -55,6 +55,8 @@ pub(super) enum Input {
     Delete,
     Deleted(Result<String, String>),
     Skipped,
+    /// Show or hide the settings that already match.
+    Matched,
 }
 
 #[derive(Default)]
@@ -78,6 +80,8 @@ pub(super) struct State {
     taken: bool,
     saving: bool,
     skipped_open: bool,
+    /// Save was opened from the list, so its back arrow returns there.
+    save_from_list: bool,
     // Restore page.
     chosen: Option<String>,
     diff: Option<Result<Value, String>>,
@@ -86,6 +90,7 @@ pub(super) struct State {
     confirm: bool,
     confirm_delete: bool,
     deleting: bool,
+    matched_open: bool,
     error: Option<String>,
 }
 
@@ -194,6 +199,18 @@ fn shown(value: &Value) -> String {
         Value::Null => "—".into(),
         Value::String(text) => text.clone(),
         value => value_text(value),
+    }
+}
+
+/// A skip reason without the " at Selector = Value" that older setups
+/// repeat after the bank already shown beside it.
+fn without_bank(reason: &str) -> String {
+    match reason.split_once(" at ") {
+        Some((head, tail)) if tail.contains(" = ") => match tail.split_once(": ") {
+            Some((_, rest)) => format!("{head}: {rest}"),
+            None => head.to_owned(),
+        },
+        _ => reason.to_owned(),
     }
 }
 
@@ -327,7 +344,10 @@ impl Workbench {
                 }
                 state.open = false;
             }
-            Input::Show(page) => return self.setups_page(page),
+            Input::Show(page) => {
+                state.save_from_list = page == Page::Save && state.page == Page::List;
+                return self.setups_page(page);
+            }
             Input::Scrolled(scrolled) => state.scrolled = scrolled,
             Input::Listed(result) => {
                 state.listing = false;
@@ -450,6 +470,7 @@ impl Workbench {
                 }
             }
             Input::Skipped => state.skipped_open = !state.skipped_open,
+            Input::Matched => state.matched_open = !state.matched_open,
         }
         Task::none()
     }
@@ -515,6 +536,12 @@ impl Workbench {
             return Task::none();
         }
         let allow_other_model = diff["match"] == "other_model";
+        // Only the disruptive changes this preview showed were confirmed; the
+        // worker refuses any that appeared since.
+        let confirmed = changes(&diff)
+            .filter(|change| change["risk"] == "disruptive")
+            .filter_map(|change| change["feature"].as_str().map(str::to_owned))
+            .collect();
         if let Err(error) = self.try_submit(
             Some(&camera),
             Job::ApplySetup,
@@ -524,6 +551,7 @@ impl Workbench {
                 digest: diff["digest"].as_str().map(str::to_owned),
                 allow_other_model,
                 strict: false,
+                confirmed_disruptive: Some(confirmed),
             },
         ) {
             self.setups.error = Some(format!("{error:#}"));
@@ -631,7 +659,10 @@ impl Workbench {
         };
         sheet_frame(title, Message::Setups(Input::Open(None)), body, p)
             .mark(Icon::Sliders)
-            .back((state.page == Page::Restore).then_some(Message::Setups(Input::Show(Page::List))))
+            .back(
+                (state.page == Page::Restore || state.page == Page::Save && state.save_from_list)
+                    .then_some(Message::Setups(Input::Show(Page::List))),
+            )
             .size(SHEET_WIDTH.min((self.width - 48.0).max(0.0)), height)
             .footer(footer)
             // Restoring needs a deliberate click: Return never applies.
@@ -844,7 +875,10 @@ impl Workbench {
             }
             name_group = name_group.push(line);
         }
-        body = body.push(name_group).push(note);
+        let caption = |label: &'static str| text(label).size(style::SMALL).color(p.secondary);
+        body = body
+            .push(column![caption("Name"), name_group].spacing(4))
+            .push(column![caption("Note (optional)"), note].spacing(4));
         if let Some(error) = &state.error {
             body = body.push(field_error(error.clone(), p));
         }
@@ -861,21 +895,19 @@ impl Workbench {
             .spacing(6);
             if state.skipped_open {
                 for row in &reading.skipped {
-                    let at = row
-                        .at
-                        .iter()
-                        .map(|bank| bank.value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let name = if at.is_empty() {
-                        row.feature.clone()
-                    } else {
-                        format!("{} at {at}", row.feature)
-                    };
+                    let place = serde_json::to_value(row)
+                        .map(|row| banks(&row))
+                        .unwrap_or_default();
                     skipped = skipped.push(
-                        text(format!("{name}: {}", row.reason))
-                            .size(style::SMALL)
-                            .color(p.secondary),
+                        row![
+                            text(row.feature.clone()).size(style::SMALL).color(p.text),
+                            text(place).size(style::SMALL).color(p.secondary),
+                            text(format!("· {}", without_bank(&row.reason)))
+                                .size(style::SMALL)
+                                .color(p.secondary),
+                        ]
+                        .spacing(5)
+                        .align_y(Alignment::Center),
                     );
                 }
             }
@@ -1053,8 +1085,37 @@ impl Workbench {
             }
             body = body.push(section);
         }
+        let matched = diff["matched"].as_array().cloned().unwrap_or_default();
         let unchanged = diff["unchanged"].as_u64().unwrap_or_default();
-        if unchanged > 0 {
+        if !matched.is_empty() {
+            let mut section = column![disclosure(
+                format!("Already matching ({})", matched.len()),
+                None,
+                if state.matched_open { 1.0 } else { 0.0 },
+                Message::Setups(Input::Matched),
+                p,
+            )]
+            .spacing(6);
+            if state.matched_open {
+                for row in &matched {
+                    section = section.push(
+                        row![
+                            text(row["feature"].as_str().unwrap_or_default().to_owned())
+                                .size(style::SMALL)
+                                .color(p.text),
+                            text(banks(row)).size(style::SMALL).color(p.secondary),
+                            space::horizontal(),
+                            text(shown(&row["value"]))
+                                .size(style::SMALL)
+                                .color(p.secondary),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    );
+                }
+            }
+            body = body.push(section);
+        } else if unchanged > 0 {
             body = body.push(
                 text(format!(
                     "{} already {}.",
@@ -1294,13 +1355,9 @@ fn scene_reading(live: Option<&CameraInfo>) -> Reading {
             skip(
                 "LineSource",
                 Some(("LineSelector", "Line3")),
-                "could not read at LineSelector = Line3: timed out",
+                "could not read: timed out",
             ),
-            skip(
-                "LineSource",
-                Some(("LineSelector", "Line0")),
-                "read-only at LineSelector = Line0",
-            ),
+            skip("LineSource", Some(("LineSelector", "Line0")), "read-only"),
         ],
     }
 }
@@ -1325,6 +1382,17 @@ fn scene_diff(name: &str, camera: Value, mismatch: bool, blocked: bool) -> Value
         ]
     };
     let disruptive = changes.iter().any(|change| change["risk"] == "disruptive");
+    let mut matched = vec![
+        serde_json::json!({"feature":"PixelFormat","value":"Mono8"}),
+        serde_json::json!({"feature":"Height","value":480}),
+        serde_json::json!({"feature":"AcquisitionFrameRate","value":30.0}),
+        serde_json::json!({"feature":"BlackLevel","at":[{"selector":"BlackLevelSelector","value":"All"}],"value":4.0}),
+    ];
+    if !mismatch {
+        for line in 0..4 {
+            matched.push(serde_json::json!({"feature":"LineInverter","at":[{"selector":"LineSelector","value":format!("Line{line}")}],"value":false}));
+        }
+    }
     serde_json::json!({
         "setup": name,
         "digest": format!("sha256:{}", "0".repeat(64)),
@@ -1332,11 +1400,12 @@ fn scene_diff(name: &str, camera: Value, mismatch: bool, blocked: bool) -> Value
         "match": if mismatch { "other_model" } else { "same_camera" },
         "warnings": [],
         "changes": changes,
-        "unchanged": if mismatch { 9 } else { 30 },
+        "unchanged": matched.len(),
+        "matched": matched,
         "not_applied": not_applied,
         "risk": if disruptive { "disruptive" } else { "reversible" },
         "restarts_stream": true,
-        "blocked": blocked.then_some("Stop recording and scheduled captures first: this setup changes Width."),
+        "blocked": blocked.then_some("Stop recording first: this setup changes Width."),
     })
 }
 
@@ -1569,6 +1638,40 @@ mod tests {
         // Escape closes it.
         let _ = bench.dispatch_action(Action::Overview);
         assert!(!bench.sheet_open());
+    }
+
+    #[test]
+    fn matching_settings_are_listed_on_request_and_save_returns_to_the_list() {
+        let mut opened = bench("setups");
+        let _ = opened.setups_input(Input::Open(Some(Page::Save)));
+        assert!(!opened.setups.save_from_list);
+        let mut bench = bench("setup-restore");
+        assert_eq!(
+            bench.setups.diff().unwrap()["matched"]
+                .as_array()
+                .unwrap()
+                .len(),
+            8
+        );
+        assert!(!bench.setups.matched_open);
+        let _ = bench.setups_input(Input::Matched);
+        assert!(bench.setups.matched_open);
+        let _ = bench.setups_input(Input::Show(Page::List));
+        let _ = bench.setups_input(Input::Show(Page::Save));
+        assert!(bench.setups.save_from_list);
+        assert!(enabled(&bench, "Back"), "{:?}", buttons(&bench));
+        assert_eq!(
+            without_bank("could not read at LineSelector = Line3: timed out"),
+            "could not read: timed out"
+        );
+        assert_eq!(
+            without_bank("read-only at LineSelector = Line0"),
+            "read-only"
+        );
+        assert_eq!(
+            without_bank("set by ExposureAuto = Continuous"),
+            "set by ExposureAuto = Continuous"
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ pub enum SetupCommand {
     },
     /// List saved setups and the folder that holds them
     List,
-    /// Show a saved setup's values; --json prints the document itself (redirect it to back up or share)
+    /// Show a saved setup's values; --json prints the document (redirect it to a file to back up or share; import and --file read that file)
     Show { name: String },
     /// Preview what restoring a setup would change on the camera; changes nothing
     Diff {
@@ -181,26 +181,33 @@ fn load(name: &Option<String>, file: &Option<PathBuf>) -> Result<(Option<String>
     }
 }
 
-/// Refuse a setup from another model before asking the camera, as a usage
-/// error; the camera worker checks again for every other caller.
-fn precheck(client: &Client, setup: &Setup, allow_other_model: bool) -> Result<()> {
+/// The refusal for a setup from another model, if the connected camera is
+/// one; the camera worker checks again for every other caller.
+fn other_model(client: &Client, setup: &Setup, allow_other_model: bool) -> Result<Option<String>> {
     if allow_other_model {
-        return Ok(());
+        return Ok(None);
     }
     let status = client.call(SessionCommand::Status)?;
-    if let Ok(info) =
+    Ok(
         serde_json::from_value::<crate::types::CameraInfo>(status["connected"].clone())
-        && setups::matching(&setup.camera, &info).0 == setups::Match::OtherModel
-    {
-        return Err(
-            InvalidInput(setups::other_model_message(setup, &info).replace(
-                "Pass allow_other_model (CLI: --allow-other-model)",
-                "Pass --allow-other-model",
-            ))
-            .into(),
-        );
+            .ok()
+            .filter(|info| setups::matching(&setup.camera, info).0 == setups::Match::OtherModel)
+            .map(|info| {
+                setups::other_model_message(setup, &info).replace(
+                    "Pass allow_other_model (CLI: --allow-other-model)",
+                    "Pass --allow-other-model",
+                )
+            }),
+    )
+}
+
+/// Refuse a setup from another model before asking the camera, as a usage
+/// error.
+fn precheck(client: &Client, setup: &Setup, allow_other_model: bool) -> Result<()> {
+    match other_model(client, setup, allow_other_model)? {
+        Some(message) => Err(InvalidInput(message).into()),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn inline(name: &Option<String>, setup: &Setup) -> Option<Setup> {
@@ -227,11 +234,21 @@ pub(super) fn run_camera(cli: &Cli, client: &Client, command: &SetupCommand) -> 
             allow_other_model,
         } => {
             let (name, setup) = load(name, file)?;
-            precheck(client, &setup, *allow_other_model)?;
+            // A preview changes nothing: another model is compared too, with
+            // a warning, so the person sees what --allow-other-model applies.
+            if let Some(message) = other_model(client, &setup, *allow_other_model)? {
+                eprintln!(
+                    "capturefab: {}",
+                    message.replace(
+                        "Pass --allow-other-model to apply",
+                        "setup apply needs --allow-other-model to apply"
+                    )
+                );
+            }
             client.call(SessionCommand::SetupDiff {
                 setup: inline(&name, &setup),
                 name,
-                allow_other_model: *allow_other_model,
+                allow_other_model: true,
             })
         }
         SetupCommand::Apply {
@@ -274,12 +291,15 @@ pub(super) fn run_camera(cli: &Cli, client: &Client, command: &SetupCommand) -> 
                 ))
                 .into());
             }
+            // The worker compares again; a disruptive change that appeared
+            // since this diff was not confirmed and is refused.
             let result = client.call(SessionCommand::ApplySetup {
                 setup: inline(&name, &setup),
                 name,
                 digest: diff["digest"].as_str().map(str::to_owned),
                 allow_other_model: *allow_other_model,
                 strict: *strict,
+                confirmed_disruptive: Some(disruptive),
             })?;
             if !cli.json {
                 let skipped = result["not_applied"].as_array().map_or(0, Vec::len);
@@ -313,14 +333,36 @@ fn quote(word: &str) -> String {
     }
 }
 
+/// "--session NAME " or "--camera ID " as this command named its camera,
+/// for a printed command that targets the same one; a placeholder otherwise.
+fn target(cli: &Cli) -> String {
+    if let Some(session) = &cli.session {
+        format!("--session {} ", quote(session))
+    } else if let Some(camera) = &cli.camera {
+        format!("--camera {} ", quote(&crate::media::redact_url(camera)))
+    } else {
+        "--camera ID ".into()
+    }
+}
+
 fn changes(diff: &Value) -> impl Iterator<Item = &Value> {
     diff["changes"].as_array().into_iter().flatten()
 }
 
+/// A value as people read it; whole floats without ".0", as the desktop
+/// shows them.
 fn shown(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Null => "?".into(),
+        Value::Number(number) => {
+            let text = number.to_string();
+            match text.strip_suffix(".0") {
+                Some("-0") => "0".into(),
+                Some(whole) => whole.into(),
+                None => text,
+            }
+        }
         value => value.to_string(),
     }
 }
@@ -348,12 +390,27 @@ fn banks(row: &Value) -> String {
 fn write_diff(out: &mut impl Write, diff: &Value, verb: &str) -> Result<()> {
     let count = diff["changes"].as_array().map_or(0, Vec::len);
     let unchanged = diff["unchanged"].as_u64().unwrap_or(0);
-    writeln!(
-        out,
-        "{verb} {count} on {}, {unchanged} already {}.",
-        diff["camera"]["id"].as_str().unwrap_or("the camera"),
-        if unchanged == 1 { "matches" } else { "match" }
-    )?;
+    let camera = diff["camera"]["id"].as_str().unwrap_or("the camera");
+    if count == 0 {
+        let setup = diff["setup"].as_str().unwrap_or("this setup");
+        match unchanged {
+            0 => writeln!(out, "Nothing to change on {camera}.")?,
+            1 => writeln!(
+                out,
+                "Nothing to change: the 1 setting in {setup} already matches {camera}."
+            )?,
+            n => writeln!(
+                out,
+                "Nothing to change: all {n} settings in {setup} already match {camera}."
+            )?,
+        }
+    } else {
+        writeln!(
+            out,
+            "{verb} {count} on {camera}, {unchanged} already {}.",
+            if unchanged == 1 { "matches" } else { "match" }
+        )?;
+    }
     for warning in diff["warnings"].as_array().into_iter().flatten() {
         writeln!(out, "  Note: {}", shown(warning))?;
     }
@@ -461,7 +518,8 @@ pub(super) fn print_human(cli: &Cli, command: &SetupCommand, value: &Value) -> R
             }
             writeln!(
                 out,
-                "Network, user-set and file settings are never saved. Restore with: capturefab setup apply {}",
+                "Network, user-set and file settings are never saved. Restore with: capturefab {}setup apply {}",
+                target(cli),
                 quote(setup["name"].as_str().unwrap_or_default())
             )?;
         }
@@ -538,14 +596,20 @@ pub(super) fn print_human(cli: &Cli, command: &SetupCommand, value: &Value) -> R
         SetupCommand::Diff { .. } => write_diff(&mut out, value, "Would change")?,
         SetupCommand::Apply { dry_run: true, .. } => write_diff(&mut out, value, "Would change")?,
         SetupCommand::Apply { .. } => {
-            writeln!(
-                out,
-                "Restored {} on {}: {} changed, {} already matched.",
-                value["setup"].as_str().unwrap_or_default(),
-                value["camera"]["id"].as_str().unwrap_or("the camera"),
-                value["applied"],
-                value["unchanged"]
-            )?;
+            let setup = value["setup"].as_str().unwrap_or_default();
+            let camera = value["camera"]["id"].as_str().unwrap_or("the camera");
+            if value["applied"].as_u64() == Some(0) {
+                writeln!(
+                    out,
+                    "{camera} already matches {setup}; nothing was changed."
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "Restored {setup} on {camera}: {} changed, {} already matched.",
+                    value["applied"], value["unchanged"]
+                )?;
+            }
             for warning in value["warnings"].as_array().into_iter().flatten() {
                 writeln!(out, "  Note: {}", shown(warning))?;
             }
@@ -611,16 +675,16 @@ pub(super) fn extend_schema(contract: &mut Value) {
     contract["setup"] = json!({
         "cli":"setup save NAME [--note TEXT] [--replace] | list | show NAME | diff NAME [--file PATH] [--allow-other-model] | apply NAME [--file PATH] [--dry-run] [--strict] [--allow-other-model] [--yes] | delete NAME | import FILE [--name NAME] [--replace]; save, diff and apply need --camera or --session",
         "purpose":"A setup is a named, host-side snapshot of one camera's writable configuration values. It is previewed as a diff against a connected camera and restored as one camera change with one undo token. Camera user sets are never read or written.",
-        "store":{"dir":"setups/ in the state directory (setup list --json reports dir); one <lowercase name>.json per setup, private (0700 directory, 0600 files)","backup":"setup show NAME --json > FILE prints the document; setup import FILE restores it","names":"1-64 ASCII letters, digits, '.', '-' and '_'; not starting or ending with '.'; not a reserved Windows device name such as con or nul; unique ignoring case"},
+        "store":{"dir":"setups/ in the state directory (setup list --json reports dir); one <lowercase name>.json per setup, private (0700 directory, 0600 files)","backup":"setup show NAME --json > FILE writes the document inside the --json envelope; setup import FILE and setup diff|apply --file FILE accept that file or the bare document (the envelope's result). An inline setup field (RPC, workflows) takes the bare document","names":"1-64 ASCII letters, digits, '.', '-' and '_'; not starting or ending with '.'; not a reserved Windows device name such as con or nul; unique ignoring case"},
         "limits":{"bytes":crate::setup::MAX_SETUP_BYTES,"values":crate::setup::MAX_SETUP_VALUES,"setups":crate::setup::MAX_SETUPS,"note_chars":crate::setup::MAX_NOTE,"string_bytes":crate::setup::MAX_STRING,"selectors_per_value":crate::setup::MAX_BANKS},
         "document":{"version":1,"name":"bench","saved_at":"2026-10-25T14:03:11Z","note":"Ring light at 60%","camera":{"transport":"simulator","vendor":"Capturefab","model":"Pattern camera","serial":"SIM0","kind":"area_scan"},"auto":null,"values":[{"feature":"PixelFormat","value":"Mono8"},{"feature":"Width","value":640},{"feature":"Gain","value":2.5,"at":[{"selector":"GainSelector","value":"All"}]},{"feature":"ExposureTime","value":10000.0}],"skipped":[{"feature":"BalanceRatio","reason":"set by BalanceWhiteAuto = Continuous"}]},
         "captured":"Every writable configuration value at the selected bank, and every bank of GainSelector, BlackLevelSelector, BalanceRatioSelector, TriggerSelector, LineSelector, UserOutputSelector, CounterSelector and TimerSelector. Never: transport, network, user-set, file, chunk and event settings, commands, registers, DeviceUserID, values a firmware auto drives, values Capturefab auto exposure manages (auto records its balance instead), stream state, capture settings, credentials or addresses. Banks that cannot be read are listed in skipped. Media sources store only transport and model.",
-        "match":{"same_camera":"same vendor, model and serial (hub cameras: same hub:NAME/CAMERA id); transport is ignored","same_model":"same vendor and model, another serial; applies with a warning","other_model":"refused unless allow_other_model (CLI --allow-other-model); then only settings both cameras share change","unknown_source":"a webcam, stream or file of the same kind; Capturefab cannot tell whether it is the same source; applies with a warning"},
-        "diff":{"fields":["setup","digest","camera","match","warnings","changes[{feature,at?,saved,current,risk,stream_locked,warning?}]","unchanged","not_applied[{feature,at?,status,saved,reason}]","risk","restarts_stream","blocked"],"status":["missing","read_only","invalid","skipped","refused"],"risk":"reversible when every change only affects the image (exposure, gain, white balance, ...); disruptive otherwise, such as trigger and I/O line settings"},
-        "apply":{"result":"the diff fields plus applied, restarted_stream, auto and camera_change","order":"geometry and pixel format first, then Enable/Mode switches, other values, auto flags and selectors last; up to 4 passes retry values an earlier write unlocked, then every value is verified","failure":"any value that does not take within 4 passes or 90 s restores every captured value; nothing is recorded in history","stream":"a running stream is stopped once and started again when the setup changes Width, Height, PixelFormat, binning, decimation, offsets or a video mode; refused while recording, forwarding or scheduled captures run","strict":"refuses, changing nothing, when any value is missing, read-only, invalid or refused","digest":"apply_setup with digest refuses a setup changed since that digest was reviewed","confirmation":"The CLI refuses disruptive changes without --yes. RPC, browser and workflow callers have no --yes gate (as with set_many), but the model, kind and busy checks always apply."},
-        "rpc":{"read_setup":"read-only: the values a new setup would save","setup_diff":"read-only: {name} or {setup: DOCUMENT}, optional allow_other_model","apply_setup":"{name} or {setup: DOCUMENT}, optional digest, allow_other_model, strict"},
-        "workflow":{"op":"apply_setup","name":"bench"},
-        "exit_codes":{"missing setup":3,"other model (CLI)":2,"other model (RPC)":5,"disruptive without --yes":2,"name taken, invalid name or document":2,"blocked by recording or schedules":3,"strict refusal":5,"setup changed since review":1,"restore failed (rolled back)":1}
+        "match":{"same_camera":"same vendor, model and serial (hub cameras: same hub:NAME/CAMERA id); transport is ignored","same_model":"same vendor and model, another serial; applies with a warning","other_model":"apply is refused unless allow_other_model (CLI --allow-other-model); then only settings both cameras share change. CLI setup diff previews it anyway, with a warning on stderr","unknown_source":"a webcam, stream or file of the same kind; Capturefab cannot tell whether it is the same source; applies with a warning"},
+        "diff":{"fields":["setup","digest","camera","match","warnings","changes[{feature,at?,saved,current,risk,stream_locked,warning?}]","unchanged","matched[{feature,at?,value}]","not_applied[{feature,at?,status,saved,reason}]","risk","restarts_stream","blocked"],"status":["missing","read_only","invalid","skipped","refused"],"risk":"reversible when every change only affects the image (exposure, gain, white balance, ...); disruptive otherwise, such as trigger and I/O line settings"},
+        "apply":{"result":"the diff fields plus applied, restarted_stream, auto and camera_change","order":"geometry and pixel format first, then Enable/Mode switches, other values, auto flags and selectors last; up to 4 passes retry values an earlier write unlocked, then every value is verified","failure":"any value that does not take within 4 passes or 90 s restores every captured value; nothing is recorded in history","stream":"a running stream is stopped once and started again when the setup changes Width, Height, PixelFormat, binning, decimation, offsets or a video mode; refused while recording, forwarding or scheduled captures run","strict":"refuses, changing nothing, when any value is missing, read-only, invalid or refused","digest":"apply_setup with digest refuses a setup changed since that digest was reviewed","confirmation":"The CLI refuses disruptive changes without --yes, and sends the reviewed disruptive features as confirmed_disruptive; the worker compares again and refuses (exit 2), changing nothing, a disruptive change outside that list. RPC, browser and workflow callers that omit confirmed_disruptive have no confirmation gate (as with set_many), but the model, kind and busy checks always apply."},
+        "rpc":{"read_setup":"read-only: the values a new setup would save","setup_diff":"read-only: {name} or {setup: DOCUMENT}, optional allow_other_model","apply_setup":"{name} or {setup: DOCUMENT}, optional digest, allow_other_model, strict, confirmed_disruptive: [FEATURE]"},
+        "workflow":{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}},
+        "exit_codes":{"missing setup":3,"other model (CLI apply)":2,"other model (CLI diff)":0,"other model (RPC)":5,"disruptive without --yes":2,"disruptive change not in confirmed_disruptive":2,"name taken, invalid name or document":2,"blocked by recording, forwarding or schedules":3,"strict refusal":5,"setup changed since review":1,"restore failed (rolled back)":1}
     });
     if let Some(commands) = contract["rpc"]["commands"].as_array_mut() {
         commands.extend([
@@ -653,7 +717,8 @@ mod tests {
                 .validate()
                 .unwrap();
         }
-        let workflow = contract["setup"]["workflow"].to_string();
+        let workflow = contract["setup"]["workflow"]["command"].to_string();
+        assert!(contract["setup"]["workflow"]["camera"].is_string());
         SessionCommand::from_json_slice(workflow.as_bytes())
             .unwrap()
             .validate()
