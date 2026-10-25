@@ -1460,13 +1460,16 @@ fn validate_fragment(
         id > 0 && id as usize <= packet_count,
         "GVSP payload packet lies beyond image"
     );
-    let expected = if id as usize == packet_count {
+    // The last packet may be padded up to a full block; the padding is not
+    // part of the image.
+    let last = id as usize == packet_count;
+    let expected = if last {
         leader.wire_bytes - (packet_count - 1) * block_size
     } else {
         block_size
     };
     ensure!(
-        length == expected,
+        length == expected || (last && length > expected),
         "GVSP payload packet has wrong length ({length} != {expected})"
     );
     Ok(())
@@ -1659,14 +1662,13 @@ impl Assembler {
                         packets <= MAX_FRAME_PACKETS,
                         "GVSP image requires too many packets"
                     );
-                    let short = if bit(&frame.received, packets as u32) {
-                        packets * block_size - leader.wire_bytes
-                    } else {
-                        0
-                    };
+                    // Only the highest packet can be short, so the highest
+                    // received ID and its end describe every packet so far.
                     ensure!(
-                        frame.end <= leader.wire_bytes
-                            && frame.bytes + short == frame.count * block_size,
+                        frame.end.div_ceil(block_size) <= packets
+                            && frame.packets.is_none_or(|known| known == packets)
+                            && (!bit(&frame.received, packets as u32)
+                                || frame.end >= leader.wire_bytes),
                         "GVSP payload packets do not match the image leader"
                     );
                     if let Some(trailer) = frame.trailer {
@@ -1709,26 +1711,39 @@ impl Assembler {
                 );
                 let offset = (packet.id as usize - 1) * block_size;
                 ensure!(
-                    offset + length <= self.payload_limit,
+                    offset < self.payload_limit,
                     "GVSP payload exceeds configured bounds"
                 );
                 if let Some(leader) = &frame.leader {
                     validate_fragment(leader, block_size, packet.id, length)?;
                 }
-                let range = offset..offset + length;
+                // Padding in a last packet may run past the payload size;
+                // only bytes inside it are kept.
+                let range = offset..(offset + length).min(self.payload_limit);
+                let kept = &packet.data[..range.len()];
                 if bit(&frame.received, packet.id) {
                     ensure!(
-                        frame.data[range] == *packet.data,
+                        length == (frame.end - offset).min(block_size)
+                            && frame.data[range] == *kept,
                         "conflicting duplicate GVSP payload packet"
                     );
                 } else {
+                    ensure!(
+                        length == block_size
+                            || (frame.end <= offset
+                                && frame.trailer.is_none_or(|(id, _)| id == packet.id + 1)),
+                        "GVSP payload packet is short but not the last"
+                    );
+                    if length < block_size {
+                        frame.packets = Some(packet.id as usize);
+                    }
                     if frame.data.is_empty() {
                         frame.data = vec![0; self.payload_limit];
                     }
-                    frame.data[range].copy_from_slice(packet.data);
+                    frame.data[range].copy_from_slice(kept);
                     set_bit(&mut frame.received, packet.id);
                     frame.count += 1;
-                    frame.bytes += length;
+                    frame.bytes += kept.len();
                     frame.end = frame.end.max(offset + length);
                     if bit(&frame.requested, packet.id) {
                         self.stats.resend_recovered += 1;
@@ -2728,14 +2743,52 @@ mod tests {
         assert!(assembler.push(&gvsp(3, 2, 3, false, &[1; 8])).is_err());
         assembler.push(&gvsp(1, 1, 3, false, &[1; 8])).unwrap();
         assert!(assembler.push(&gvsp(1, 1, 3, false, &[2; 8])).is_err());
-        assembler.push(&gvsp(2, 1, 3, false, &[1; 4])).unwrap();
         assembler.push(&gvsp(2, 2, 3, false, &[1; 8])).unwrap();
+        assert!(assembler.push(&gvsp(2, 1, 3, false, &[1; 4])).is_err());
+        assembler.push(&gvsp(4, 1, 3, false, &[1; 4])).unwrap();
+        assert!(assembler.push(&gvsp(4, 2, 3, false, &[1; 8])).is_err());
+        assembler.push(&gvsp(5, 2, 3, false, &[1; 4])).unwrap();
         assert!(
             assembler
-                .push(&gvsp(2, 0, 1, false, &leader(4, 3, MONO8)))
+                .push(&gvsp(5, 0, 1, false, &leader(4, 1, MONO8)))
                 .is_err()
         );
         assert!(assembler.frames.is_empty());
+    }
+    #[test]
+    fn padded_last_packets_are_accepted_inside_and_beyond_the_payload_size() {
+        // Teledyne DALSA Genie Nano M1450: 728x544 Mono8 at a 1500-byte packet
+        // size reports PayloadSize 396,744 = 271 full 1464-byte blocks; the
+        // image needs 396,032, so the last packet carries 712 padding bytes.
+        let (width, height, block) = (728, 544, 1464);
+        let pixels = image(width, height);
+        let mut packets = vec![gvsp(1, 0, 1, false, &leader(width, height, MONO8))];
+        for chunk in pixels.chunks(block) {
+            let mut data = chunk.to_vec();
+            data.resize(block, 0);
+            packets.push(gvsp(1, packets.len() as u32, 3, false, &data));
+        }
+        assert_eq!(packets.len() - 1, 271);
+        packets.push(gvsp(1, 272, 2, false, &trailer(height)));
+        for payload in [396_744, 396_032] {
+            for late_leader in [false, true] {
+                let mut assembler = Assembler::new(payload, 1500, 0);
+                let mut order: Vec<_> = packets.iter().collect();
+                if late_leader {
+                    order.rotate_left(1);
+                }
+                let delivered: Vec<_> = order
+                    .into_iter()
+                    .filter_map(|packet| assembler.push(packet).unwrap())
+                    .collect();
+                assert_eq!(delivered.len(), 1, "{payload} {late_leader}");
+                assert_eq!(delivered[0].data, pixels);
+            }
+        }
+        let mut assembler = Assembler::new(396_744, 1500, 0);
+        assembler.push(&packets[0]).unwrap();
+        let short = gvsp(1, 271, 3, false, &pixels[270 * block..][..700]);
+        assert!(assembler.push(&short).is_err());
     }
     #[test]
     fn receive_buffer_requests_halve_on_errors_and_note_small_buffers() {
