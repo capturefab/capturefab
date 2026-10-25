@@ -632,6 +632,8 @@ impl NextNumbers {
         // A save while it was read may have taken this number: read again.
         if read.generation == self.generation {
             self.stale.remove(&key);
+        } else {
+            self.stale.insert(key.clone());
         }
         // Bounded: only the templates read most recently are kept.
         if self.known.len() >= 8 && !self.known.contains_key(&key) {
@@ -3973,6 +3975,23 @@ fn num_requirement(key: Num) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_first_read_overtaken_by_a_save_is_read_again() {
+        let mut numbers = NextNumbers::default();
+        let read = NextNumber {
+            template: "shot-{seq}.png".into(),
+            destination: None,
+            camera: "sim:0".into(),
+            date: "2026-10-25".into(),
+            seq: Some(1),
+            generation: numbers.generation,
+        };
+        // A save lands before the template's first read returns.
+        numbers.saved();
+        numbers.settle(read);
+        assert!(numbers.wanted("shot-{seq}.png", None, "sim:0", "2026-10-25"));
+    }
 
     #[test]
     fn opening_panels_build_their_editors_before_animation_frames() {
