@@ -2049,8 +2049,10 @@ fn network_failure(
     timed_out: bool,
     timeout: Duration,
 ) -> Option<anyhow::Error> {
-    let (scheme, host, port, path) = network_parts(source)?;
+    // Parsed from the redacted URL, so the path suggested back never
+    // carries an RTMP stream key or a query token.
     let url = redact_url(source);
+    let (scheme, host, port, path) = network_parts(&url)?;
     let at = match port {
         Some(port) => format!("{host}:{port}"),
         None => host.clone(),
@@ -5164,6 +5166,14 @@ exit 1"#,
             "{message}"
         );
         assert!(message.contains("onvif://USER:PASS@127.0.0.1/onvif/device_service"));
+        // An RTMP stream key never comes back in the suggested URL or path.
+        for log in [
+            "[rtmp @ 0x1] Server error: 401 Unauthorized",
+            "[rtmp @ 0x1] stream not found",
+        ] {
+            let (_, message) = explained("rtmp://10.0.0.5/live/SECRETKEY", log, false);
+            assert!(!message.contains("SECRETKEY"), "{message}");
+        }
         let (code, message) = explained(
             "rtsp://nonexistent.invalid/live",
             "[tcp @ 0x2] Failed to resolve hostname nonexistent.invalid: nodename nor servname provided, or not known",

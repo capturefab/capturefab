@@ -30,7 +30,12 @@ const LINE_COMPUTER: &str = concat!(
 /// The udev rule Linux archives ship in share/udev/rules.d, and the fix for
 /// `usb_access` writes: the logged-in seat user and the plugdev group may
 /// open any device with a USB3 Vision interface (class ef/05/00).
-const UDEV_RULE: &str = r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ef0500:*", MODE="0660", GROUP="plugdev", TAG+="uaccess""#;
+/// The first rule imports usb_id, which sets ID_USB_INTERFACES, as not every
+/// distribution has by the time rules sorted at 70 run.
+const UDEV_RULES: [&str; 2] = [
+    r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", IMPORT{builtin}="usb_id""#,
+    r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ef0500:*", MODE="0660", GROUP="plugdev", TAG+="uaccess""#,
+];
 const UDEV_RULE_FILE: &str = "70-capturefab-usb3vision.rules";
 /// Room for two frames of a 16 MiB GigE camera; the value the GigE transport
 /// already suggests when its receive buffer comes up short.
@@ -741,7 +746,8 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
         // later. The note is a shell comment, so the whole line still pastes
         // and runs.
         format!(
-            "echo '{UDEV_RULE}' | sudo tee /etc/udev/rules.d/{UDEV_RULE_FILE} >/dev/null && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add  # services also need their user in the plugdev group; see {LINE_COMPUTER}"
+            "printf '%s\\n' '{}' '{}' | sudo tee /etc/udev/rules.d/{UDEV_RULE_FILE} >/dev/null && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add  # services also need their user in the plugdev group; see {LINE_COMPUTER}",
+            UDEV_RULES[0], UDEV_RULES[1]
         ),
     ))
 }
@@ -1544,7 +1550,7 @@ mod tests {
             .lines()
             .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
             .collect();
-        assert_eq!(rules, [UDEV_RULE]);
+        assert_eq!(rules, UDEV_RULES);
     }
 
     #[test]

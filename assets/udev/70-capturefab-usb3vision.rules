@@ -8,6 +8,8 @@
 # then replug the camera. On a distribution without a plugdev group, create
 # one or put a group of your own in its place.
 #
-# 70 sorts after 50-udev-default, which imports usb_id and so sets
-# ID_USB_INTERFACES, and before 73-seat-late, which applies uaccess.
+# The first line imports usb_id, which sets ID_USB_INTERFACES, as not every
+# distribution has done so by now. 70 sorts before 73-seat-late, which
+# applies uaccess.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", IMPORT{builtin}="usb_id"
 SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ef0500:*", MODE="0660", GROUP="plugdev", TAG+="uaccess"
