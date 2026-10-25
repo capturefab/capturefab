@@ -696,6 +696,9 @@ fn diagnose(
                     .any(|interface| same_subnet(interface, address))
                 {
                     details.push(format!("No host interface shares the camera's subnet ({address}). Give the camera and a wired adapter compatible IPv4 addresses and subnet masks, then scan again."));
+                    if address.is_link_local() {
+                        details.push("The camera fell back to a link-local address. Adding a 169.254.0.0/16 address to the adapter it is plugged into reaches it without reconfiguring the camera.".into());
+                    }
                 } else {
                     details.push("Check the Ethernet cable, camera power and firewall access for GigE Vision UDP traffic; another application may own camera control.".into());
                 }
@@ -1497,7 +1500,30 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("Discovery can succeed"))
         );
-        assert_eq!(budget_bytes_per_second(&camera, &[interface], 1), 0);
+        assert_eq!(
+            budget_bytes_per_second(&camera, std::slice::from_ref(&interface), 1),
+            0
+        );
+        assert!(
+            !camera
+                .details
+                .iter()
+                .any(|detail| detail.contains("link-local"))
+        );
+        let link_local = diagnose(
+            self::camera("one", "169.254.10.20"),
+            false,
+            std::slice::from_ref(&interface),
+            Some(Ipv4Addr::new(169, 254, 10, 20)),
+            Some(interface.address),
+            Err(anyhow::anyhow!("timed out")),
+        );
+        assert!(
+            link_local
+                .details
+                .iter()
+                .any(|detail| detail.contains("169.254.0.0/16"))
+        );
     }
 
     #[test]
