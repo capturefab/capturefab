@@ -215,6 +215,12 @@ class SidecarTests(unittest.TestCase):
         with self.assertRaisesRegex(media.MediaError, r'duplicated \[0\]'):
             media.parse_sidecar(self.write([entry(0, 0), entry(0, 5)]), 2, self.root)
 
+    def test_rejects_a_missing_or_null_index(self):
+        for index in (None, '1'):
+            path = self.write([entry(0, 0), dict(entry(1, 33), index=index)])
+            with self.assertRaisesRegex(media.MediaError, 'integer index'):
+                media.parse_sidecar(path, 2, self.root)
+
     def test_rejects_paths(self):
         path = self.write([entry(0, 0), dict(entry(1, 33), file='../frame-0001.png')])
         with self.assertRaisesRegex(media.MediaError, 'non-local'):

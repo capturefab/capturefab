@@ -34,6 +34,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_FPS = 30
+EXE = ".exe" if os.name == "nt" else ""
 MIN_CAPTURE_FPS = 24
 MAX_GAP_MS = 100
 MIN_DISTINCT_FRACTION = 0.8
@@ -125,7 +126,7 @@ def resolve_ffmpeg(explicit=None, environ=os.environ, root=ROOT, triple=None):
         return Path(explicit)
     if environ.get("CAPTUREFAB_FFMPEG"):
         return Path(environ["CAPTUREFAB_FFMPEG"])
-    path = root / "target/ffmpeg" / (triple or host_triple()) / "bin/ffmpeg"
+    path = root / "target/ffmpeg" / (triple or host_triple()) / f"bin/ffmpeg{EXE}"
     if not path.is_file():
         raise MediaError(f"No pinned FFmpeg at {path}; run scripts/build-ffmpeg.sh, or pass --ffmpeg")
     return path
@@ -163,7 +164,10 @@ def build_binary():
     target = Path(os.environ.get("CARGO_TARGET_DIR") or ROOT / "target")
     if not target.is_absolute():
         target = ROOT / target
-    return target / "release/capturefab"
+    binary = target / f"release/capturefab{EXE}"
+    if not binary.is_file():
+        raise MediaError(f"cargo build did not produce {binary}")
+    return binary
 
 
 def sequence_timeout(frames, fps):
@@ -189,7 +193,9 @@ def read_sidecar_lines(path):
 def parse_sidecar(path, frames, directory):
     """Every frame 0..frames-1 exactly once, each naming a bare file that exists."""
     entries = read_sidecar_lines(path)
-    indexes = sorted(entry.get("index") for entry in entries)
+    if not all(isinstance(entry, dict) and type(entry.get("index")) is int for entry in entries):
+        raise MediaError("Renderer timing has a frame without an integer index")
+    indexes = sorted(entry["index"] for entry in entries)
     if indexes != list(range(frames)):
         missing = sorted(set(range(frames)) - set(indexes))
         duplicates = sorted({index for index in indexes if indexes.count(index) > 1})
@@ -282,7 +288,7 @@ def record(binary, scene, temp, frames, fps):
 def act(binary, env, temp, after, latest_ms, arguments):
     """Run one real session CLI command and verify what it saved."""
     arguments = [part.replace("{temp}", str(temp)) for part in arguments]
-    command = [str(binary), "--json", "--session", "website-media", "--actor", "Website demo", *arguments]
+    command = [str(binary), "--json", "--session", "website-media", "--actor", "CLI", *arguments]
     result = run(command, env=env, timeout=15)
     value = json.loads(result.stdout)["result"]
     saved = None
@@ -512,7 +518,7 @@ def main():
         output = args.output.resolve()
         output.mkdir(parents=True, exist_ok=True)
         manifest = record_all(binary, ffmpeg, encoder, output, frames, args)
-    except (MediaError, subprocess.CalledProcessError) as error:
+    except (MediaError, subprocess.CalledProcessError, OSError) as error:
         detail = getattr(error, "stderr", None)
         if isinstance(detail, bytes):
             detail = detail.decode(errors="replace")

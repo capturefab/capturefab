@@ -2000,7 +2000,13 @@ impl Workbench {
             } else {
                 Task::none()
             },
-            if self.screenshot.is_none() {
+            // Video sequences run in isolated session dirs, so the summary
+            // settles deterministically instead of reading "Checking…".
+            if self
+                .screenshot
+                .as_ref()
+                .is_none_or(|request| request.sequence.is_video())
+            {
                 // A destination's own picker shows its free space.
                 let folder = self
                     .capture_to
