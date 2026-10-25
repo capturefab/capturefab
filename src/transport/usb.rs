@@ -847,6 +847,24 @@ impl RegisterIo for UsbBackend {
         Ok(())
     }
 }
+/// The address and size of each manifest entry for a raw or zipped device
+/// XML, newest version first. GenCP puts the file type in bits 0-2 of the
+/// entry's second word, where 1 is a Buffer XML holding only chunk nodes,
+/// and the 6-bit file format in bits 10-15.
+fn device_xml_entries(entries: &[u8]) -> Result<Vec<(u64, u64)>> {
+    let mut candidates = Vec::new();
+    for entry in entries.as_chunks::<64>().0 {
+        let schema = le32(entry, 4)?;
+        if schema & 7 == 0 && (schema >> 10) & 0x3f <= 1 {
+            candidates.push((le32(entry, 0)?, le64(entry, 8)?, le64(entry, 16)?));
+        }
+    }
+    candidates.sort_by_key(|e| std::cmp::Reverse(e.0));
+    Ok(candidates
+        .into_iter()
+        .map(|(_, address, size)| (address, size))
+        .collect())
+}
 fn parse_leader(bytes: &[u8]) -> Result<Frame> {
     ensure!(
         le32(bytes, 0)? == LEADER_MAGIC,
@@ -915,16 +933,8 @@ impl Backend for UsbBackend {
                 .context("manifest address overflow")?,
             count * 64,
         )?;
-        let mut candidates = Vec::new();
-        for entry in entries.as_chunks::<64>().0 {
-            let schema = (le32(entry, 4)? >> 10) & 31;
-            if schema <= 1 {
-                candidates.push((le32(entry, 0)?, le64(entry, 8)?, le64(entry, 16)?));
-            }
-        }
-        candidates.sort_by_key(|e| std::cmp::Reverse(e.0));
-        let mut last_error = anyhow!("USB manifest contains no raw or ZIP GenICam XML entry");
-        for (_, address, size) in candidates {
+        let mut last_error = anyhow!("USB manifest contains no raw or ZIP device XML entry");
+        for (address, size) in device_xml_entries(&entries)? {
             if size == 0 || size > 32 * 1024 * 1024 {
                 last_error = anyhow!("GenICam manifest XML size is outside 1..32 MiB");
                 continue;
@@ -1159,6 +1169,30 @@ mod tests {
         write_acknowledged(ack(&counted, 7).unwrap().1, 4).unwrap();
         assert!(write_acknowledged(ack(&counted, 7).unwrap().1, 8).is_err());
         assert!(write_acknowledged(&[0, 0], 4).is_err());
+    }
+    #[test]
+    fn manifest_selects_the_device_xml_over_a_newer_buffer_xml() {
+        let entry = |version: u32, schema: u32, address: u64, size: u64| {
+            let mut entry = [0u8; 64];
+            entry[..4].copy_from_slice(&version.to_le_bytes());
+            entry[4..8].copy_from_slice(&schema.to_le_bytes());
+            entry[8..16].copy_from_slice(&address.to_le_bytes());
+            entry[16..24].copy_from_slice(&size.to_le_bytes());
+            entry
+        };
+        // Schema 1.1 in the top half; file type in bits 0-2, format at 10.
+        let schema = |file_type: u32, format: u32| 0x0101_0000 | format << 10 | file_type;
+        let manifest = [
+            entry(0x0200_0000, schema(1, 0), 0x1000, 100),
+            entry(0x0100_0002, schema(0, 1), 0x2000, 200),
+            entry(0x0100_0001, schema(0, 0), 0x3000, 300),
+            entry(0x0300_0000, schema(0, 33), 0x4000, 400),
+        ]
+        .concat();
+        assert_eq!(
+            device_xml_entries(&manifest).unwrap(),
+            [(0x2000, 200), (0x3000, 300)]
+        );
     }
     #[test]
     fn usb_leader_and_trailer_validation() {
