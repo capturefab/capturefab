@@ -1354,16 +1354,25 @@ impl ImageLeader {
             width > 0 && height > 0 && bits_per_pixel > 0 && bits_per_pixel <= 64,
             "invalid GVSP image dimensions or pixel format"
         );
-        let row_bytes = (width as u64 * bits_per_pixel as u64).div_ceil(8);
+        let row_bits = width as u64 * bits_per_pixel as u64;
+        let row_bytes = row_bits.div_ceil(8);
         let x_padding = be16(data, 32) as usize;
         let y_padding = be16(data, 34) as usize;
         let wire_bytes = (row_bytes + x_padding as u64)
             .checked_mul(height as u64)
             .and_then(|v| v.checked_add(y_padding as u64))
             .context("GVSP image size overflow")?;
+        // PFNC leaves it to the transport whether a packed row ending inside
+        // a byte is padded or runs on into the next line; with no x padding
+        // either layout is accepted.
+        let smallest = if x_padding == 0 {
+            (row_bits as u128 * height as u128).div_ceil(8) as u64 + y_padding as u64
+        } else {
+            wire_bytes
+        };
         ensure!(
-            wire_bytes <= payload_limit as u64,
-            "GVSP image exceeds configured payload size ({wire_bytes} > {payload_limit})"
+            smallest <= payload_limit as u64,
+            "GVSP image exceeds configured payload size ({smallest} > {payload_limit})"
         );
         Ok(Self {
             width,
@@ -1373,12 +1382,17 @@ impl ImageLeader {
             row_bytes: row_bytes as usize,
             x_padding,
             y_padding,
-            wire_bytes: wire_bytes as usize,
+            wire_bytes: wire_bytes.min(payload_limit as u64) as usize,
         })
     }
-    /// Bytes that hold `height` lines.
+    /// The fewest bytes that hold `height` lines.
     fn image_bytes(&self, height: u32) -> usize {
-        (self.row_bytes + self.x_padding) * height as usize
+        if self.x_padding == 0 {
+            let bits_per_pixel = (self.pixel_format >> 16) & 0xff;
+            (self.width as usize * bits_per_pixel as usize * height as usize).div_ceil(8)
+        } else {
+            (self.row_bytes + self.x_padding) * height as usize
+        }
     }
 }
 
@@ -1874,7 +1888,7 @@ impl Assembler {
                 );
             }
         }
-        data.truncate(leader.row_bytes * height as usize);
+        data.truncate((leader.row_bytes * height as usize).min(frame.end));
         let timestamp_ns = if self.timestamp_frequency == 0 {
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2859,6 +2873,31 @@ mod tests {
                 .try_for_each(|packet| assembler.push(packet).map(drop));
             assert!(result.is_err(), "{height} {last}");
         }
+    }
+    #[test]
+    fn packed_rows_may_be_padded_per_line_or_per_image() {
+        // 5 Mono12p or 6 Mono10p pixels are 60 bits: 8 bytes per line when
+        // each line is padded, 60 bytes for 8 lines when lines run on.
+        let send = |pixel, width, payload, bytes: usize| {
+            let mut assembler = Assembler::new(payload, 48, 0);
+            let wire: Vec<u8> = (1..=bytes as u8).collect();
+            let mut packets = vec![gvsp(1, 0, 1, false, &leader(width, 8, pixel))];
+            for chunk in wire.chunks(12) {
+                packets.push(gvsp(1, packets.len() as u32, 3, false, chunk));
+            }
+            packets.push(gvsp(1, packets.len() as u32, 2, false, &trailer(8)));
+            let frame = packets
+                .iter()
+                .find_map(|packet| assembler.push(packet).unwrap())
+                .unwrap();
+            assert_eq!(frame.data, wire, "{pixel:08x} {payload} {bytes}");
+        };
+        for (pixel, width) in [(0x010c_0047, 5), (0x010a_0046, 6)] {
+            send(pixel, width, 60, 60);
+            send(pixel, width, 64, 60);
+            send(pixel, width, 64, 64);
+        }
+        assert!(ImageLeader::parse(&leader(5, 8, 0x010c_0047), 59).is_err());
     }
     #[test]
     fn receive_buffer_requests_halve_on_errors_and_note_small_buffers() {
