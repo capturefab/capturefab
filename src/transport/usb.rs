@@ -615,7 +615,13 @@ impl Stream {
         if bytes.is_empty() {
             return Ok(None);
         }
-        if is_header(bytes, LEADER_MAGIC, 52, self.leader) {
+        // A transfer holding exactly the rest of an open image is image data,
+        // even when its pixels start like a leader or trailer.
+        let rest = self
+            .frame
+            .as_ref()
+            .is_some_and(|frame| frame.data.len() + bytes.len() == self.expected);
+        if !rest && is_header(bytes, LEADER_MAGIC, 52, self.leader) {
             let open = self.frame.take().is_some();
             let mut frame = parse_leader(bytes)?;
             frame.data.reserve(self.expected);
@@ -628,7 +634,7 @@ impl Stream {
         let Some(frame) = self.frame.as_mut() else {
             return Ok(None);
         };
-        let trailer = if is_header(bytes, TRAILER_MAGIC, 28, self.trailer) {
+        let trailer = if !rest && is_header(bytes, TRAILER_MAGIC, 28, self.trailer) {
             bytes
         } else {
             let image = (self.expected - frame.data.len()).min(bytes.len());
@@ -1690,6 +1696,21 @@ mod tests {
             bus.send(&[]);
             bus.send(&trailer(id, 12 * MPS));
             assert_eq!(next(&mut stream, &mut bus).unwrap().id, id);
+        }
+    }
+    #[test]
+    fn image_ending_like_a_header_is_image_data() {
+        let block = 4 * MPS;
+        // A short last transfer, and a tiny image in one transfer.
+        for expected in [8 * MPS + 64, 64] {
+            let (mut stream, mut bus) = streaming(expected, block);
+            for (id, header) in [(1, leader(9, 4, 2)), (2, trailer(9, 8))] {
+                let mut pixels = image(id, expected);
+                pixels[expected - 64..][..header.len()].copy_from_slice(&header);
+                bus.frame(id, &pixels, block);
+                let frame = next(&mut stream, &mut bus).unwrap();
+                assert_eq!((frame.id, frame.data), (id, pixels));
+            }
         }
     }
     #[test]
