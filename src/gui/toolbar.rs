@@ -177,6 +177,8 @@ fn is_relative(preview: &str) -> bool {
 /// is in its tooltip.
 fn save_summary(preview: &str, destination: Option<&str>, base: &str) -> String {
     let separators = ['/', '\\'];
+    // Only the folders before an unfilled `{tag:KEY}` are known yet.
+    let preview = preview.find("{tag:").map_or(preview, |at| &preview[..at]);
     let parent = preview
         .rfind(separators)
         .map(|end| &preview[..end])
@@ -226,6 +228,16 @@ fn faded(
 }
 
 impl Workbench {
+    /// [`save_summary`] for the next capture, saying which tag it still
+    /// needs instead of showing a `{tag:KEY}` placeholder as a folder.
+    fn save_summary(&self, preview: &str) -> String {
+        let summary = save_summary(preview, self.capture_to.selected.as_deref(), &shown_base());
+        match super::tags::missing_short(&self.output, &self.tags) {
+            Some(needs) => format!("{summary} · {needs}"),
+            None => summary,
+        }
+    }
+
     pub(super) fn toolbar(&self, p: &'static Palette) -> Element<'_, Message> {
         let snapshot = &self.snapshot;
         let os = Os::CURRENT;
@@ -240,7 +252,7 @@ impl Workbench {
                 row![
                     icon(Icon::Folder, 14.0, p.secondary),
                     one_line(
-                        save_summary(&preview, self.capture_to.selected.as_deref(), &shown_base()),
+                        self.save_summary(&preview),
                         style::SMALL,
                         style::SANS,
                         p.secondary,
@@ -601,7 +613,9 @@ impl Workbench {
             } else if !connected {
                 "Select a camera to capture from".to_owned()
             } else if let Some(problem) = problem {
-                problem.to_string()
+                // An empty tag in the file names says which field to fill in.
+                super::tags::missing_hint(&self.output, &self.tags)
+                    .unwrap_or_else(|| problem.to_string())
             } else {
                 Action::Capture.hint("Capture from this camera", os)
             },
@@ -651,7 +665,9 @@ impl Workbench {
             if capturing {
                 "Capturing from every camera…".to_owned()
             } else if let Some(problem) = problem {
-                problem.to_string()
+                // An empty tag in the file names says which field to fill in.
+                super::tags::missing_hint(&self.output, &self.tags)
+                    .unwrap_or_else(|| problem.to_string())
             } else {
                 Action::CaptureAll.hint(
                     "Capture one frame from every connected camera at once",
@@ -1441,6 +1457,11 @@ mod tests {
         );
         // Never a sequence number: that is the tooltip's, as ####.
         assert!(!save_summary("cam-####.png", None, root).contains('#'));
+        // An unfilled tag folder is left out, not shown as a placeholder.
+        assert_eq!(
+            save_summary("~/Capturefab/{tag:label}/cam-####.png", None, root),
+            "Saves to ~/Capturefab"
+        );
     }
 
     #[test]

@@ -17,9 +17,12 @@ capturefab --session line1 --camera sim:0 capture -o 'line1/{date}/{camera}-{dat
 capturefab --session line1 dataset note "shift B start" --context line=L1
 capturefab --session line1 dataset query "SELECT camera_id, path, wall_ms FROM captures LIMIT 20" --json
 capturefab --session line1 dataset export -o exports/shift-b --format csv
+capturefab --session line1 dataset export -o exports/shift-b-images --media images --group-by part
 ```
 
-The export contains capture and recording metadata, notes, a manifest and a README. Images and videos stay at their recorded paths. Exports and captures never overwrite existing outputs.
+The export contains capture and recording metadata, notes, a manifest and a README. By default images and videos stay at their recorded paths; `--media images` copies the images into `images/` (one folder per `part` with `--group-by part`) and lists each copy in `media.csv`, so the folder can be moved as a whole. Exports and captures never overwrite existing outputs.
+
+To sort images into a folder per class while capturing, put a tag in the file name: `-o 'parts/{tag:label}/{camera}-{seq}.png' --context label=defect`, or choose **File names › One folder per label** in the desktop and fill in **Label**.
 
 ## Use the desktop
 

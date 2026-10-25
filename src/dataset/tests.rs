@@ -371,7 +371,9 @@ fn validate_command_bounds() {
         tables: vec!["nope".into()],
         since_ms: None,
         until_ms: None,
-        storage: Default::default()
+        storage: Default::default(),
+        media: Default::default(),
+        group_by: None,
     }));
     assert!(!ok(C::DatasetExport {
         output: "/x".into(),
@@ -379,8 +381,28 @@ fn validate_command_bounds() {
         tables: vec![],
         since_ms: Some(2),
         until_ms: Some(1),
-        storage: Default::default()
+        storage: Default::default(),
+        media: Default::default(),
+        group_by: None,
     }));
+    for (media, group_by) in [
+        (MediaExport::None, Some("part")),
+        (MediaExport::Images, Some("Part")),
+        (MediaExport::Images, Some("../x")),
+    ] {
+        let error = validate_command(&C::DatasetExport {
+            output: "/x".into(),
+            formats: vec![],
+            tables: vec![],
+            since_ms: None,
+            until_ms: None,
+            storage: Default::default(),
+            media,
+            group_by: group_by.map(Into::into),
+        })
+        .unwrap_err();
+        assert!(error.is::<Usage>(), "{error}");
+    }
     for (id, accepted) in [
         ("0123456789abcdef0123456789abcdef", true),
         ("", false),
@@ -447,6 +469,8 @@ fn export_request(output: PathBuf, formats: Vec<ExportFormat>) -> export::Export
         since_ms: None,
         until_ms: None,
         storage: Default::default(),
+        media: Default::default(),
+        group_by: None,
     }
 }
 
@@ -954,4 +978,161 @@ fn bounded_export_enforces_the_pinned_capture_root() {
     drop(reader);
     slot.close().unwrap();
     let _ = fs::remove_dir_all(dir);
+}
+
+/// Saved files with real contents, cataloged with their size and SHA-256.
+fn media_files(dir: &std::path::Path, parts: &[Option<&str>], size: usize) -> Vec<SavedFile> {
+    use sha2::Digest;
+    parts
+        .iter()
+        .enumerate()
+        .map(|(i, part)| {
+            let path = dir.join(format!("saved/{i}/0001.png"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = vec![i as u8; size];
+            fs::write(&path, &bytes).unwrap();
+            let mut file = capture(path.to_str().unwrap(), 100 + i as u64);
+            file.bytes = bytes.len() as u64;
+            file.sha256 = Some(format!("{:x}", sha2::Sha256::digest(&bytes)));
+            file.context = part
+                .map(|part| [("part".to_string(), part.to_string())].into())
+                .unwrap_or_default();
+            file
+        })
+        .collect()
+}
+
+#[test]
+fn export_media_copies_images_into_tag_folders() {
+    use sha2::Digest;
+    let dir = temp_dir("media");
+    let slot = Slot::new();
+    slot.open(&dir.join("m.duckdb"), OpenMode::Create, None)
+        .unwrap();
+    let parts = [
+        Some("A"),
+        Some("A"),
+        Some("B"),
+        Some("../x"),
+        Some("a/b"),
+        Some("B"),
+        None,
+    ];
+    let files = media_files(&dir, &parts, 64);
+    // One cataloged file went away before the export.
+    fs::remove_file(&files[5].path).unwrap();
+    slot.record_saved(batch(files), 0);
+    let output = dir.join("bundle");
+    let mut request = export_request(output.clone(), vec![ExportFormat::Csv]);
+    request.media = MediaExport::Images;
+    request.group_by = Some("part".into());
+    let result = slot.reader().unwrap().export(&request).unwrap();
+    let media = &result["media"];
+    assert_eq!(
+        (media["copied"].as_u64(), media["skipped"].as_u64()),
+        (Some(6), Some(1)),
+        "{media}"
+    );
+    assert_eq!(media["skipped_files"][0]["reason"], "missing");
+    assert_eq!(media["bytes"], 6 * 64);
+    for expected in [
+        "images/A/0001.png",
+        "images/A/0001-2.png",
+        "images/B/0001.png",
+        "images/_.._x/0001.png",
+        "images/a_b/0001.png",
+        "images/_unlabeled/0001.png",
+    ] {
+        assert!(output.join(expected).is_file(), "{expected}");
+    }
+    let index = fs::read_to_string(output.join("media.csv")).unwrap();
+    let mut lines = index.lines();
+    assert_eq!(
+        lines.next(),
+        Some("table,id,export_path,sha256,bytes,group")
+    );
+    let mut rows = 0;
+    for line in lines {
+        let fields: Vec<&str> = line.split(',').collect();
+        let relative = std::path::Path::new(fields[2]);
+        assert!(
+            relative.is_relative()
+                && relative
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_))),
+            "{line}"
+        );
+        let copy = fs::read(output.join(relative)).unwrap();
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(&copy)), fields[3]);
+        assert_eq!(fields[0], "captures");
+        rows += 1;
+    }
+    assert_eq!(rows, 6);
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(output.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["media"]["copied"], 6);
+    assert_eq!(manifest["media"]["group_by"], "part");
+    assert_eq!(manifest["media"]["index"][0]["path"], "media.csv");
+    let readme = fs::read_to_string(output.join("README.md")).unwrap();
+    assert!(
+        readme.contains("images/<part>/<file>") && readme.contains("moved or zipped"),
+        "{readme}"
+    );
+    // Without --media the bundle stays data-only and says how to copy.
+    let plain = slot
+        .reader()
+        .unwrap()
+        .export(&export_request(dir.join("plain"), vec![ExportFormat::Csv]))
+        .unwrap();
+    assert!(plain.get("media").is_none() && !dir.join("plain/images").exists());
+    let readme = fs::read_to_string(dir.join("plain/README.md")).unwrap();
+    assert!(readme.contains("--media images"), "{readme}");
+    slot.close().unwrap();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn export_media_preflight_refuses_before_writing() {
+    let dir = temp_dir("media-quota");
+    let slot = Slot::new();
+    slot.open(&dir.join("q.duckdb"), OpenMode::Create, None)
+        .unwrap();
+    slot.record_saved(batch(media_files(&dir, &[None, None, None], 1 << 20)), 0);
+    let mut request = export_request(dir.join("out"), vec![ExportFormat::Csv]);
+    request.media = MediaExport::Images;
+    request.storage.max_bytes = 2 << 20;
+    let error = slot.reader().unwrap().export(&request).err().unwrap();
+    assert_eq!(crate::cli::error_code(&error).1, 6, "{error}");
+    assert!(!dir.join("out").exists());
+    // Media follows --tables: without captures, no images are copied.
+    let mut events = export_request(dir.join("events"), vec![ExportFormat::Csv]);
+    events.media = MediaExport::Images;
+    events.tables = vec!["events".into()];
+    let result = slot.reader().unwrap().export(&events).unwrap();
+    assert_eq!(result["media"]["copied"], 0, "{result}");
+    assert!(!dir.join("events/images").exists());
+    slot.close().unwrap();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn export_budget_errors_name_the_image_copies_in_readable_sizes() {
+    use export::{EXPORT_WITHOUT_MEDIA, over_budget};
+    let room = (2_000_000, 100);
+    assert_eq!(over_budget(room, (50_000, 4), (1_000_000, 10)), None);
+    // The data alone fits, so the copies are named with the way out.
+    let message = over_budget(room, (50_000, 4), (3_145_728, 4)).unwrap();
+    assert!(
+        message.starts_with("Storage full: copying the images needs 3.1 MB and 4 files")
+            && message.contains("budget has 2.0 MB and 100 files left")
+            && message.contains(EXPORT_WITHOUT_MEDIA),
+        "{message}"
+    );
+    // The data itself does not fit: leaving the images out would not help.
+    let message = over_budget(room, (2_500_000, 4), (1_000, 1)).unwrap();
+    assert!(
+        message.starts_with("Storage full: export needs 2.5 MB and 5 files")
+            && !message.contains(EXPORT_WITHOUT_MEDIA),
+        "{message}"
+    );
 }

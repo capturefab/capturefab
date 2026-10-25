@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 pub enum Naming {
     /// `{date}/{camera}-{datetime}-{seq}.ext`, the default.
     DatedCameraTime,
+    /// `{tag:label}/{camera}-{datetime}-{seq}.ext`: one folder per label.
+    ByLabel,
     /// `{camera}-{datetime}-{seq}.ext`.
     CameraTime,
     /// `capture-{seq}.ext`.
@@ -21,15 +23,17 @@ pub enum Naming {
 }
 
 impl Naming {
-    pub const ALL: [Naming; 4] = [
+    pub const ALL: [Naming; 5] = [
         Naming::DatedCameraTime,
+        Naming::ByLabel,
         Naming::CameraTime,
         Naming::Numbered,
         Naming::Custom,
     ];
     /// The presets `join` can build, most specific suffix first.
-    pub const PRESETS: [Naming; 3] = [
+    pub const PRESETS: [Naming; 4] = [
         Naming::DatedCameraTime,
+        Naming::ByLabel,
         Naming::CameraTime,
         Naming::Numbered,
     ];
@@ -39,6 +43,10 @@ impl Naming {
         match self {
             Naming::DatedCameraTime => Some(vec![
                 "{date}".into(),
+                format!("{{camera}}-{{datetime}}-{{seq}}.{ext}"),
+            ]),
+            Naming::ByLabel => Some(vec![
+                "{tag:label}".into(),
                 format!("{{camera}}-{{datetime}}-{{seq}}.{ext}"),
             ]),
             Naming::CameraTime => Some(vec![format!("{{camera}}-{{datetime}}-{{seq}}.{ext}")]),
@@ -53,6 +61,7 @@ impl fmt::Display for Naming {
         // {seq} grows as needed, so promise no particular width.
         f.write_str(match self {
             Naming::DatedCameraTime => "By date, camera and time (recommended)",
+            Naming::ByLabel => "One folder per label",
             Naming::CameraTime => "Camera and time",
             Naming::Numbered => "Numbered (capture-1, capture-2…)",
             Naming::Custom => "Custom pattern…",
@@ -224,6 +233,8 @@ mod tests {
             "/tmp/shots/mycapture-{seq}.png",
             "/tmp/shots/capture-{seq}.jpeg",
             "/tmp/shots/capture-{seq}.png/",
+            "/tmp/{tag:part}/{camera}-{datetime}-{seq}.png",
+            "/tmp/{tag:label}/{date}/{camera}-{datetime}-{seq}.png",
             "",
         ] {
             let (folder, naming) = split(output, "png");

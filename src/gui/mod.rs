@@ -792,6 +792,9 @@ enum Message {
     ShowInspector,
     Search(String),
     InspectorDisclosure(inspector::Section),
+    /// Open Capture tags and focus a tag's field, for a save location that
+    /// needs it filled in.
+    FillTag(tags::TagField),
     /// Open every feature group, or close them all.
     ExpandFeatureGroups(bool),
     /// Show every row of a long feature group.
@@ -1377,6 +1380,7 @@ impl Workbench {
             tags: self.tags.clone(),
             dataset_path: self.dataset.path.clone(),
             dataset_auto: self.dataset.auto,
+            dataset_export_images: self.dataset.export_images,
             open_sections: self.open_section_keys(),
             // Not yet mirrored on the workbench: keep what was loaded.
         }
@@ -2521,7 +2525,13 @@ impl Workbench {
         let seq = self
             .next_numbers
             .get(template, destination, &camera, &day(now));
-        let preview = crate::naming::preview_numbered(template, &camera, now, seq);
+        let preview = crate::naming::preview_numbered(
+            template,
+            &camera,
+            &tags::context(&self.tags),
+            now,
+            seq,
+        );
         let home = prefs::capture_root();
         match home
             .parent()
@@ -3180,6 +3190,7 @@ impl Workbench {
                 self.adopt(&prefs);
                 self.dataset.path = prefs.dataset_path.clone();
                 self.dataset.auto = prefs.dataset_auto;
+                self.dataset.export_images = prefs.dataset_export_images;
                 self.video_analytics.preferences = prefs.video_analytics.clone();
                 self.saved = self.saved.take().map(|saved| (*prefs).with_layout(&saved));
             }
@@ -3457,6 +3468,10 @@ impl Workbench {
             }
             Message::Search(value) => self.search = value,
             Message::InspectorDisclosure(section) => self.toggle_inspector_section(section),
+            Message::FillTag(field) => {
+                self.open_capture_tags();
+                return operation::focus(format!("capture-tag-{}", field.key()));
+            }
             Message::ExpandFeatureGroups(open) => self.expand_feature_groups(open),
             Message::ShowFeatures(group) => return self.show_whole_group(group),
             Message::RefreshFeatures => {

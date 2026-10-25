@@ -1,7 +1,9 @@
 //! Output file naming: templates with {camera}, {date}, {time}, {datetime},
-//! {seq} and {frame}, and what to do when a name is taken. Names are picked
-//! only in the camera worker; the CLI and GUI validate and preview.
-use crate::{storage::OutputExists, types::CameraInfo};
+//! {seq}, {frame} and {tag:KEY}, and what to do when a name is taken. Names
+//! are picked only in the camera worker; the CLI and GUI validate and preview.
+//! {tag:KEY} is the capture context value for KEY made into one safe path
+//! component, so a label such as `defect` can choose a folder.
+use crate::{context::Context, storage::OutputExists, types::CameraInfo};
 use anyhow::{Context as _, Result, bail, ensure};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
@@ -34,7 +36,9 @@ pub const MAX_ATTEMPTS: u32 = 64;
 pub const MAX_SCAN_ENTRIES: usize = 200_000;
 pub const MAX_SEQ: u32 = 99_999_999;
 const CACHE_KEYS: usize = 256;
-const PLACEHOLDER_ERROR: &str = "capture output supports only the {camera}, {date}, {time}, {datetime}, {seq} and {frame} placeholders";
+const PLACEHOLDER_ERROR: &str = "capture output supports only the {camera}, {date}, {time}, {datetime}, {seq}, {frame} and {tag:KEY} placeholders";
+/// The longest expanded {tag:KEY} value, in bytes.
+pub const MAX_TAG_COMPONENT: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Token {
@@ -45,6 +49,8 @@ enum Token {
     DateTime,
     Seq,
     Frame,
+    /// A capture context value, by key.
+    Tag(String),
 }
 
 fn tokens(template: &str) -> Result<Vec<Token>> {
@@ -63,6 +69,15 @@ fn tokens(template: &str) -> Result<Vec<Token>> {
             "datetime" => Token::DateTime,
             "seq" => Token::Seq,
             "frame" => Token::Frame,
+            tag if tag.starts_with("tag:") => {
+                let key = &tag[4..];
+                ensure!(
+                    crate::context::is_valid_key(key),
+                    "{{tag:{}}} needs a tag key that starts with a lowercase letter and uses only a-z, 0-9 and _, such as {{tag:label}}",
+                    key.escape_debug()
+                );
+                Token::Tag(key.into())
+            }
             _ => bail!(PLACEHOLDER_ERROR),
         });
         rest = &rest[close + 1..];
@@ -93,9 +108,9 @@ pub fn validate_template(output: &str) -> Result<()> {
         Some(Token::Lit(s)) if s.starts_with(|c: char| c.is_ascii_digit()) => {
             bail!("{{seq}} cannot be followed directly by a digit")
         }
-        Some(Token::Date | Token::Time | Token::DateTime | Token::Frame) => {
+        Some(Token::Date | Token::Time | Token::DateTime | Token::Frame | Token::Tag(_)) => {
             bail!(
-                "{{seq}} cannot be followed directly by {{date}}, {{time}}, {{datetime}} or {{frame}}"
+                "{{seq}} cannot be followed directly by {{date}}, {{time}}, {{datetime}}, {{frame}} or {{tag:KEY}}"
             )
         }
         _ => Ok(()),
@@ -103,9 +118,90 @@ pub fn validate_template(output: &str) -> Result<()> {
 }
 
 pub fn has_placeholder(output: &str) -> bool {
-    PLACEHOLDERS
-        .iter()
-        .any(|p| output.contains(&format!("{{{p}}}")))
+    output.contains("{tag:")
+        || PLACEHOLDERS
+            .iter()
+            .any(|p| output.contains(&format!("{{{p}}}")))
+}
+
+/// The tag keys a template uses, in order, without repeats.
+pub fn tag_keys(template: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    for token in tokens(template).unwrap_or_default() {
+        if let Token::Tag(key) = token
+            && !keys.contains(&key)
+        {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+/// The tag keys a template uses that have no usable value in `context`.
+pub fn missing_tags(template: &str, context: &Context) -> Vec<String> {
+    tag_keys(template)
+        .into_iter()
+        .filter(|key| tag_value(key, context).is_err())
+        .collect()
+}
+
+/// Make a tag value one safe file or folder name: separators and characters
+/// Windows refuses become `_`, trailing dots and spaces go, `.`, `..` and
+/// empty values are refused, a leading dot (a hidden name) and device names
+/// such as `CON` get a `_` prefix, and the result is at most
+/// [`MAX_TAG_COMPONENT`] bytes.
+pub fn sanitize_component(value: &str) -> Result<String> {
+    let mut out: String = value
+        .trim()
+        .chars()
+        .map(|c| {
+            if std::path::is_separator(c)
+                || matches!(c, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*')
+                || c.is_control()
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    if out.len() > MAX_TAG_COMPONENT {
+        let mut end = MAX_TAG_COMPONENT;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+    }
+    let out = out.trim_end_matches(['.', ' ']).trim_start();
+    ensure!(
+        !out.is_empty() && out != "." && out != "..",
+        "tag value '{}' cannot be used as a file or folder name",
+        value.escape_debug()
+    );
+    let stem = out.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.len() == 4
+            && stem.as_bytes()[3].is_ascii_digit()
+            && stem.as_bytes()[3] != b'0');
+    Ok(if reserved || out.starts_with('.') {
+        format!("_{out}")
+    } else {
+        out.to_owned()
+    })
+}
+
+/// The safe path component for {tag:KEY}, or a usage error naming the key
+/// when the tag is empty or missing.
+fn tag_value(key: &str, context: &Context) -> Result<String> {
+    let value = context.get(key).map(|v| v.trim()).unwrap_or_default();
+    if value.is_empty() {
+        return Err(crate::dataset::Usage(format!(
+            "capture output uses {{tag:{key}}} but the capture tag '{key}' is empty; fill it in (--context {key}=VALUE) or change the file name pattern"
+        ))
+        .into());
+    }
+    sanitize_component(value).map_err(|e| crate::dataset::Usage(format!("{e:#}")).into())
 }
 
 /// Whether `output` ends in a path separator, naming a folder to fill.
@@ -205,13 +301,16 @@ pub fn validate_request(
     output: &str,
     count: u32,
     on_exists: OnExists,
-    context: &crate::context::Context,
+    context: &Context,
 ) -> Result<()> {
     crate::context::validate(context)?;
     // Network URLs keep their own checks, which refuse braces.
     if output != "-" && crate::media::is_recording(output) {
         validate_template(output)?;
         validate_for_count(output, count, on_exists)?;
+        for key in tag_keys(output) {
+            tag_value(&key, context)?;
+        }
     }
     Ok(())
 }
@@ -249,27 +348,38 @@ pub fn camera_label(info: &CameraInfo) -> String {
     }
 }
 
-/// Show what a template expands to now; {seq} is shown as `####`.
-pub fn preview(template: &str, camera: &str, now: DateTime<Local>) -> String {
-    preview_numbered(template, camera, now, None)
+/// Show what a template expands to now; {seq} is shown as `####`, and a
+/// {tag:KEY} without a usable value stays visible as `{tag:KEY}`.
+pub fn preview(template: &str, camera: &str, context: &Context, now: DateTime<Local>) -> String {
+    preview_numbered(template, camera, context, now, None)
 }
 
 /// `preview` with {seq} as `seq` when it is known, else `####`.
 pub fn preview_numbered(
     template: &str,
     camera: &str,
+    context: &Context,
     now: DateTime<Local>,
     seq: Option<u32>,
 ) -> String {
     let Ok(tokens) = tokens(template) else {
         return template.into();
     };
+    let input = NameInput {
+        camera,
+        now,
+        index: 0,
+        context,
+    };
     tokens
         .iter()
         .map(|t| match (t, seq) {
             (Token::Seq, Some(seq)) => format!("{seq:04}"),
             (Token::Seq, None) => "####".into(),
-            (t, _) => expand(t, camera, &now, 0),
+            (Token::Tag(key), _) => {
+                tag_value(key, context).unwrap_or_else(|_| format!("{{tag:{key}}}"))
+            }
+            (t, _) => expand(t, &input).unwrap_or_default(),
         })
         .collect()
 }
@@ -278,15 +388,19 @@ pub fn preview_numbered(
 /// highest already in its folder, past any taken name. Read-only: it
 /// reserves nothing, creates nothing, and shares no state with the namer
 /// that saves, so the file saved may still take a later number. `None`
-/// when the template has no {seq} or names no file.
+/// when the template has no {seq}, names no file, or uses {tag:KEY}, whose
+/// folder and count depend on the tags of the capture.
 pub fn peek_next(template: &str, camera: &str, now: DateTime<Local>) -> Option<u32> {
-    if !tokens(template).ok()?.contains(&Token::Seq) {
+    let tokens = tokens(template).ok()?;
+    if !tokens.contains(&Token::Seq) || tokens.iter().any(|t| matches!(t, Token::Tag(_))) {
         return None;
     }
+    let context = Context::new();
     let input = NameInput {
         camera,
         now,
         index: 0,
+        context: &context,
     };
     let mut namer = Namer::default();
     namer
@@ -299,16 +413,17 @@ pub fn peek_next(template: &str, camera: &str, now: DateTime<Local>) -> Option<u
     namer.next.values().next().copied()
 }
 
-fn expand(token: &Token, camera: &str, now: &DateTime<Local>, index: u32) -> String {
-    match token {
+fn expand(token: &Token, input: &NameInput) -> Result<String> {
+    Ok(match token {
         Token::Lit(s) => s.clone(),
-        Token::Camera => camera.into(),
-        Token::Date => now.format("%Y-%m-%d").to_string(),
-        Token::Time => now.format("%H%M%S").to_string(),
-        Token::DateTime => now.format("%Y%m%d-%H%M%S").to_string(),
-        Token::Frame => format!("{:06}", index.saturating_add(1)),
+        Token::Camera => input.camera.into(),
+        Token::Date => input.now.format("%Y-%m-%d").to_string(),
+        Token::Time => input.now.format("%H%M%S").to_string(),
+        Token::DateTime => input.now.format("%Y%m%d-%H%M%S").to_string(),
+        Token::Frame => format!("{:06}", input.index.saturating_add(1)),
+        Token::Tag(key) => tag_value(key, input.context)?,
         Token::Seq => unreachable!("{{seq}} is chosen by the namer"),
-    }
+    })
 }
 
 /// `Ok` when nothing is at `path`; `OutputExists` when anything is, even a
@@ -357,7 +472,8 @@ impl Plan {
             Plan::File(with_extension(output, format).into())
         }
     }
-    /// Whether every frame's name is known in advance.
+    /// Whether every frame's name is known in advance. A {tag:KEY} name
+    /// depends on the request's context, so it is not.
     pub fn is_static(&self) -> bool {
         match self {
             Plan::File(_) => true,
@@ -393,6 +509,8 @@ pub struct NameInput<'a> {
     pub camera: &'a str,
     pub now: DateTime<Local>,
     pub index: u32,
+    /// The capture context that fills {tag:KEY}.
+    pub context: &'a Context,
 }
 
 /// One part of a numbered file name. A stamp matches any text of its length
@@ -434,24 +552,24 @@ impl Namer {
             Plan::Template(template) => {
                 let tokens = tokens(template)?;
                 let Some(seq) = tokens.iter().position(|t| *t == Token::Seq) else {
-                    let name: String = tokens
+                    let name = tokens
                         .iter()
-                        .map(|t| expand(t, input.camera, &input.now, input.index))
-                        .collect();
+                        .map(|t| expand(t, input))
+                        .collect::<Result<String>>()?;
                     return self.fixed(name.into(), on_exists, plan);
                 };
                 // {seq} is in the final component: split the text before it
                 // at the last separator into the folder and the name prefix.
-                let before: String = tokens[..seq]
+                let before = tokens[..seq]
                     .iter()
-                    .map(|t| expand(t, input.camera, &input.now, input.index))
-                    .collect();
+                    .map(|t| expand(t, input))
+                    .collect::<Result<String>>()?;
                 let split = before.rfind(std::path::is_separator).map_or(0, |i| i + 1);
                 let dir = PathBuf::from(&before[..split]);
                 let mut parts = Vec::new();
                 let mut lit = String::new();
                 for t in tokens[..seq].iter().rev() {
-                    let text = expand(t, input.camera, &input.now, input.index);
+                    let text = expand(t, input)?;
                     match t {
                         Token::Date | Token::Time | Token::DateTime => {
                             if let Some(i) = text.rfind(std::path::is_separator) {
@@ -478,7 +596,7 @@ impl Namer {
                 parts.reverse();
                 parts.push(Part::Seq);
                 for t in &tokens[seq + 1..] {
-                    let text = expand(t, input.camera, &input.now, input.index);
+                    let text = expand(t, input)?;
                     match t {
                         Token::Date | Token::Time | Token::DateTime => {
                             parts.push(Part::Stamp(text))
@@ -678,11 +796,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
+    static NO_TAGS: Context = Context::new();
     fn input(now: DateTime<Local>) -> NameInput<'static> {
         NameInput {
             camera: "Model-SN1",
             now,
             index: 0,
+            context: &NO_TAGS,
         }
     }
     fn fixed_time() -> DateTime<Local> {
@@ -757,10 +877,13 @@ mod tests {
     fn expansion_and_preview() {
         let now = fixed_time();
         assert_eq!(
-            preview("{date}/{camera}-{datetime}-{seq}.png", "A-1", now),
+            preview("{date}/{camera}-{datetime}-{seq}.png", "A-1", &NO_TAGS, now),
             "2026-10-17/A-1-20261017-101500-####.png"
         );
-        assert_eq!(preview("t{time}-{frame}", "c", now), "t101500-000001");
+        assert_eq!(
+            preview("t{time}-{frame}", "c", &NO_TAGS, now),
+            "t101500-000001"
+        );
         let dir = temp("expand");
         let template = format!("{}/{{date}}/{{camera}}-{{frame}}.png", dir.display());
         let path = Namer::default()
@@ -814,11 +937,11 @@ mod tests {
         let fixed = format!("{}/{{camera}}.png", dir.display());
         assert_eq!(peek_next(&fixed, "A", fixed_time()), None);
         assert_eq!(
-            preview_numbered("{camera}-{seq}.png", "A", fixed_time(), Some(13)),
+            preview_numbered("{camera}-{seq}.png", "A", &NO_TAGS, fixed_time(), Some(13)),
             "A-0013.png"
         );
         assert_eq!(
-            preview("{camera}-{seq}.png", "A", fixed_time()),
+            preview("{camera}-{seq}.png", "A", &NO_TAGS, fixed_time()),
             "A-####.png"
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -925,6 +1048,113 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.downcast_ref::<OutputExists>().is_some());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn tag_placeholders_parse() {
+        for ok in [
+            "{tag:label}/{seq}.png",
+            "{tag:part}-{camera}-{seq}.png",
+            "{tag:a_1}/{tag:b}/x-{frame}.png",
+        ] {
+            validate_template(ok).unwrap();
+            assert!(has_placeholder(ok), "{ok}");
+        }
+        for bad in [
+            "{tag:}/x.png",
+            "{tag:Bad}/x.png",
+            "{tag:1a}/x.png",
+            "{tag:a-b}/x.png",
+            "{seq}{tag:label}.png",
+            "{tag}/x.png",
+        ] {
+            assert!(validate_template(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            tag_keys("{tag:label}/{tag:part}-{tag:label}-{seq}.png"),
+            ["label", "part"]
+        );
+        assert_eq!(
+            Plan::new("{tag:label}/x.png", 1, "png"),
+            Plan::Template("{tag:label}/x.png".into())
+        );
+        assert!(!Plan::new("{tag:label}/x.png", 1, "png").is_static());
+    }
+
+    #[test]
+    fn tag_values_become_safe_components() {
+        for (value, safe) in [
+            ("good", "good"),
+            ("  defect  ", "defect"),
+            ("a/b", "a_b"),
+            ("a\\b", "a_b"),
+            ("../x", "_.._x"),
+            (".hidden", "_.hidden"),
+            ("x:y*?", "x_y__"),
+            ("trailing. .", "trailing"),
+            ("CON", "_CON"),
+            ("com1.txt", "_com1.txt"),
+            ("COM0", "COM0"),
+        ] {
+            assert_eq!(sanitize_component(value).unwrap(), safe, "{value}");
+        }
+        for bad in ["", " ", ".", "..", "...", " . "] {
+            assert!(sanitize_component(bad).is_err(), "{bad:?}");
+        }
+        let long = sanitize_component(&"é".repeat(100)).unwrap();
+        assert!(long.len() <= MAX_TAG_COMPONENT && long.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn missing_tags_are_usage_errors_and_previews_show_them() {
+        let now = fixed_time();
+        let template = "shots/{tag:label}/{camera}-{seq}.png";
+        let error = validate_request(template, 1, OnExists::Fail, &NO_TAGS).unwrap_err();
+        assert!(error.is::<crate::dataset::Usage>(), "{error}");
+        assert!(error.to_string().contains("'label' is empty"), "{error}");
+        let blank = Context::from([("label".into(), "  ".into())]);
+        assert!(validate_request(template, 1, OnExists::Fail, &blank).is_err());
+        assert_eq!(missing_tags(template, &blank), ["label"]);
+        assert_eq!(
+            preview(template, "c", &NO_TAGS, now),
+            "shots/{tag:label}/c-####.png"
+        );
+        let good = Context::from([("label".into(), "a/b".into())]);
+        validate_request(template, 1, OnExists::Fail, &good).unwrap();
+        assert!(missing_tags(template, &good).is_empty());
+        assert_eq!(preview(template, "c", &good, now), "shots/a_b/c-####.png");
+        // Network outputs keep refusing braces elsewhere and are not expanded.
+        validate_request("rtsp://host/live", 1, OnExists::Fail, &NO_TAGS).unwrap();
+    }
+
+    #[test]
+    fn seq_counts_per_label_folder() {
+        let dir = temp("labels");
+        std::fs::create_dir_all(dir.join("defect")).unwrap();
+        std::fs::write(dir.join("defect/x-0041.png"), b"x").unwrap();
+        let plan = Plan::new(
+            &format!("{}/{{tag:label}}/x-{{seq}}.png", dir.display()),
+            1,
+            "png",
+        );
+        let mut namer = Namer::default();
+        let good = Context::from([("label".into(), "good".into())]);
+        let defect = Context::from([("label".into(), "defect".into())]);
+        let mut name = |context: &Context| {
+            let mut input = input(fixed_time());
+            input.context = context;
+            namer.candidate(&plan, &input, OnExists::Fail).unwrap()
+        };
+        assert_eq!(name(&good), dir.join("good/x-0001.png"));
+        assert_eq!(name(&defect), dir.join("defect/x-0042.png"));
+        assert_eq!(name(&good), dir.join("good/x-0002.png"));
+        let traversal = Context::from([("label".into(), "../x".into())]);
+        assert_eq!(name(&traversal), dir.join("_.._x/x-0001.png"));
+        let error = namer
+            .candidate(&plan, &input(fixed_time()), OnExists::Fail)
+            .unwrap_err();
+        assert!(error.is::<crate::dataset::Usage>());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

@@ -1002,3 +1002,38 @@ fn the_saved_line_and_recording_card_read_as_they_progress() {
         "{shown:?}"
     );
 }
+
+#[test]
+fn capture_tags_say_whether_the_dataset_catalogs_them() {
+    let renderer = destinations::layout_tests::renderer();
+    let mut app = app();
+    let _ = app.update(Message::InspectorDisclosure(Section::CaptureTags));
+    let mut tree = Tree::empty();
+    let off = snapshot(&app, Pane::Capture, &mut tree, &renderer);
+    let caption = super::super::tags::caption(app.format, None);
+    assert!(
+        labels(&off).contains(&caption.as_str()),
+        "{:?}",
+        labels(&off)
+    );
+    named(&off, "Show Dataset");
+    let _ = app.update(Message::Dataset(super::super::dataset::Msg::Auto(true)));
+    let on = snapshot(&app, Pane::Capture, &mut tree, &renderer);
+    let caption = super::super::tags::caption(app.format, Some("capturefab.duckdb"));
+    assert!(labels(&on).contains(&caption.as_str()), "{:?}", labels(&on));
+    assert!(!labels(&on).contains(&"Show Dataset"));
+}
+
+#[test]
+fn fill_in_label_opens_capture_tags_and_stays_open() {
+    let mut app = app();
+    app.output = "/tmp/shots/{tag:label}/{camera}-{seq}.png".into();
+    assert_eq!(
+        super::super::tags::missing_field(&app.output, &app.tags),
+        Some(super::super::tags::TagField::Label)
+    );
+    for _ in 0..2 {
+        let _ = app.update(Message::FillTag(super::super::tags::TagField::Label));
+        assert!(app.inspect.tags_open);
+    }
+}

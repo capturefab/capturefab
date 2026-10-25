@@ -3119,7 +3119,42 @@ fn capture_outputs_number_templates_and_carry_context() {
         assert_eq!(v["result"]["frames"][0]["file"], v["result"]["files"][0]);
         assert!(v["result"]["frames"][0]["wall_ms"].as_u64().unwrap() > 0);
         assert_eq!(v["result"]["context"]["line"], "L1");
+        let frame = &v["result"]["frames"][0];
+        assert_eq!(frame["pixel_format_name"], "Mono8");
+        assert!(frame["settings"]["ExposureTime"].is_number(), "{frame}");
+        // The tags and settings travel inside the file, without a dataset.
+        let reader = png::Decoder::new(std::fs::File::open(path).unwrap())
+            .read_info()
+            .unwrap();
+        assert_eq!(reader.info().color_type, png::ColorType::Grayscale);
+        let embedded = reader
+            .info()
+            .utf8_text
+            .iter()
+            .find(|chunk| chunk.keyword == "capturefab")
+            .unwrap()
+            .get_text()
+            .unwrap();
+        let embedded: Value = serde_json::from_str(&embedded).unwrap();
+        assert_eq!(embedded["context"]["line"], "L1");
+        assert_eq!(embedded["frame_id"], frame["id"]);
+        assert_eq!(embedded["settings"], frame["settings"]);
     }
+    let jpeg = out.join("tagged.jpeg");
+    let output = capture(&[
+        "-o",
+        jpeg.to_str().unwrap(),
+        "--format",
+        "jpeg",
+        "--context",
+        "part=B-7",
+    ]);
+    files(&output);
+    let bytes = std::fs::read(&jpeg).unwrap();
+    let at = bytes.windows(2).position(|w| w == [0xFF, 0xFE]).unwrap();
+    let length = u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]) as usize;
+    let embedded: Value = serde_json::from_slice(&bytes[at + 4..at + 2 + length]).unwrap();
+    assert_eq!(embedded["context"]["part"], "B-7");
     // A directory continues its numbering.
     let frames = out.join("frames");
     for _ in 0..2 {
@@ -6387,4 +6422,135 @@ fn a_timed_recording_reports_its_final_stats() {
         "{result}"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `{tag:KEY}` sorts captures into tag folders, a missing tag is a usage
+/// error, and `dataset export --media images --group-by` copies the
+/// cataloged images into a self-contained folder.
+#[test]
+fn tag_folders_and_dataset_export_with_images() {
+    let root = naming_root("tag-export");
+    let dir = root.join("sessions");
+    let out = root.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let dataset = root.join("parts.duckdb");
+    let template = out.join("{tag:label}/{seq}.png");
+    let template = template.to_str().unwrap();
+    let capture = |label: Option<&str>| {
+        let mut args = vec![
+            "--json",
+            "--camera",
+            "sim:0",
+            "capture",
+            "-o",
+            template,
+            "--dataset",
+            dataset.to_str().unwrap(),
+        ];
+        let context;
+        if let Some(label) = label {
+            context = format!("label={label}");
+            args.extend(["--context", context.as_str()]);
+        }
+        cmd(&dir, &args)
+    };
+    for (label, folder) in [
+        ("good", "good"),
+        ("defect", "defect"),
+        ("good", "good"),
+        ("../x", "_.._x"),
+    ] {
+        let output = capture(Some(label));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let v: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let file = std::path::PathBuf::from(v["result"]["files"][0].as_str().unwrap());
+        assert_eq!(
+            file.parent().unwrap().file_name().unwrap(),
+            folder,
+            "{file:?}"
+        );
+        assert!(file.is_file());
+    }
+    assert!(out.join("good/0002.png").is_file());
+    let missing = capture(None);
+    assert_eq!(missing.status.code(), Some(2));
+    let v: Value = serde_json::from_slice(&missing.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "usage");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("{tag:label}"),
+        "{v}"
+    );
+    // --group-by needs --media.
+    let export = root.join("export");
+    let refused = cmd(
+        &dir,
+        &[
+            "--json",
+            "dataset",
+            "export",
+            "--file",
+            dataset.to_str().unwrap(),
+            "-o",
+            export.to_str().unwrap(),
+            "--group-by",
+            "label",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(!export.exists());
+    let result = json(
+        &dir,
+        &[
+            "--json",
+            "dataset",
+            "export",
+            "--file",
+            dataset.to_str().unwrap(),
+            "-o",
+            export.to_str().unwrap(),
+            "--format",
+            "csv",
+            "--media",
+            "images",
+            "--group-by",
+            "label",
+        ],
+    );
+    let media = &result["media"];
+    assert_eq!(media["mode"], "images");
+    assert_eq!(media["group_by"], "label");
+    assert_eq!(media["copied"], 4);
+    assert_eq!(media["skipped"], 0);
+    assert!(media["bytes"].as_u64().unwrap() > 0);
+    for copy in [
+        "images/good/0001.png",
+        "images/good/0002.png",
+        "images/defect/0001.png",
+        "images/_.._x/0001.png",
+        "media.csv",
+    ] {
+        assert!(export.join(copy).is_file(), "{copy}");
+    }
+    assert!(
+        result["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["path"] == "media.csv" && f["rows"] == 4)
+    );
+    let help = cmd(&dir, &["dataset", "export", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("New folder to create; must not exist"),
+        "{help}"
+    );
+    assert!(help.contains("--media"), "{help}");
+    let _ = std::fs::remove_dir_all(root);
 }

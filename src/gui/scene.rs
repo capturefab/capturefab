@@ -315,7 +315,9 @@ impl Workbench {
     ///   `timed` (with `recording`: the session stops it after 1 h),
     ///   `dropped` (with `recording`: the encoder dropped frames)
     /// - `tags`: the capture tags filled in and open; `dataset`: the Dataset
-    ///   section open; `side-hub`: cameras from saved hubs in the camera
+    ///   section open; `catalog`: Catalog captures automatically ticked;
+    ///   `by-label`: "One folder per label" file names, one folder per Label tag;
+    ///   `side-hub`: cameras from saved hubs in the camera
     ///   list (with `welcome`, on the welcome cards)
     /// - review fixtures: `network`, `network-empty`, `network-error`,
     ///   `destinations-remove`, `folder-error`, `settings-credentials`,
@@ -475,6 +477,7 @@ impl Workbench {
                     self.scene.recording_path = Some(crate::naming::preview_numbered(
                         &output,
                         "Sim-SIM0",
+                        &Default::default(),
                         chrono::Local::now(),
                         Some(1),
                     ));
@@ -500,6 +503,7 @@ impl Workbench {
                 }
                 "tags" => {
                     self.tags = prefs::CaptureTags {
+                        label: "good".into(),
                         line: "L1".into(),
                         station: "Inspection 2".into(),
                         part: "A-100".into(),
@@ -510,9 +514,20 @@ impl Workbench {
                         inspector::Section::CaptureTags,
                     ));
                 }
+                // The "One folder per label" file names, one folder per Label tag.
+                "by-label" => {
+                    self.output = prefs::capture_root()
+                        .join("{tag:label}")
+                        .join("{camera}-{datetime}-{seq}.png")
+                        .to_string_lossy()
+                        .into_owned();
+                }
                 "dataset" => {
                     let _ = self
                         .handle_message(Message::InspectorDisclosure(inspector::Section::Dataset));
+                }
+                "catalog" => {
+                    let _ = self.handle_message(Message::Dataset(dataset::Msg::Auto(true)));
                 }
                 "connect-failed" => {
                     let target = "192.168.10.50";
@@ -644,6 +659,7 @@ impl Workbench {
                     let path = crate::naming::preview(
                         &prefs::default_record_output(),
                         "Sim-SIM0",
+                        &Default::default(),
                         chrono::Local::now(),
                     )
                     .replace("####", "0001");

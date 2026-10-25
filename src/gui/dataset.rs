@@ -1,12 +1,13 @@
 //! The Dataset section: the session's catalog file, its counts, and New,
-//! Open, Close, Export and Reveal actions (Slice B).
+//! Open, Close, Export and Reveal actions (Slice B). Export copies the
+//! captured images in too unless "Include captured images" is unticked.
 use super::*;
 use crate::dataset::{DatasetStatus, OpenMode};
 use iced::widget::column;
 use std::path::{Path, PathBuf};
 
 /// What the dataset section remembers between frames.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct DatasetUi {
     /// The dataset opened here, reopened at the next start.
     pub(super) path: Option<PathBuf>,
@@ -15,6 +16,18 @@ pub(super) struct DatasetUi {
     pub(super) auto: bool,
     /// Why the last dataset action failed.
     pub(super) error: Option<String>,
+    /// Copy the captured images into `images/` in exports.
+    pub(super) export_images: bool,
+}
+impl Default for DatasetUi {
+    fn default() -> Self {
+        Self {
+            path: None,
+            auto: false,
+            error: None,
+            export_images: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +40,7 @@ pub(super) enum Msg {
     ExportPicked(Option<PathBuf>),
     Reveal,
     Auto(bool),
+    ExportImages(bool),
 }
 
 /// The automatic dataset, beside the captures.
@@ -69,6 +83,16 @@ impl Auto {
     }
 }
 
+/// The dataset file captures are cataloged in, or will be on the first
+/// save; `None` when nothing catalogs them.
+pub(super) fn catalog(bench: &Workbench) -> Option<String> {
+    match (bench.snapshot.dataset.as_ref(), Auto::of(&bench.handle)) {
+        (Some(status), _) => Some(file_name(&status.path)),
+        (None, Auto::Armed) => Some(file_name(&auto_path().to_string_lossy())),
+        _ => None,
+    }
+}
+
 fn summary(status: Option<&DatasetStatus>, auto: &Auto) -> String {
     match status {
         None => match auto {
@@ -106,6 +130,7 @@ impl DatasetUi {
                 .filter(|p| p.is_absolute() && p.extension().is_some_and(|e| e == "duckdb")),
             auto: prefs.dataset_auto,
             error: None,
+            export_images: prefs.dataset_export_images,
         };
         // `gui --dataset` already opened one; it wins over the preference.
         if handle.dataset().status_cached().is_none()
@@ -250,6 +275,12 @@ impl Workbench {
                         since_ms: None,
                         until_ms: None,
                         storage: crate::storage::configured_policy().unwrap_or_default(),
+                        media: if self.dataset.export_images {
+                            crate::dataset::MediaExport::Images
+                        } else {
+                            crate::dataset::MediaExport::None
+                        },
+                        group_by: None,
                     },
                 );
             }
@@ -264,6 +295,7 @@ impl Workbench {
                     );
                 }
             }
+            Msg::ExportImages(on) => self.dataset.export_images = on,
             Msg::Auto(on) => {
                 self.dataset.auto = on;
                 let open = self.handle.dataset().status_cached();
@@ -309,7 +341,7 @@ impl Workbench {
                 }
             }
             (Job::DatasetOpen | Job::DatasetClose | Job::DatasetExport, Err(error)) => {
-                self.dataset.error = Some(format!("{error:#}"));
+                self.dataset.error = Some(desktop_error(&format!("{error:#}")));
                 // A failed open cleared the automatic dataset; re-arm it.
                 if matches!(pending.job, Job::DatasetOpen)
                     && self.dataset.auto
@@ -321,6 +353,21 @@ impl Workbench {
             _ => {}
         }
     }
+}
+
+/// A dataset error in the desktop's words: an export that does not fit
+/// names the Include captured images box and the Keep at most setting
+/// instead of CLI flags.
+fn desktop_error(error: &str) -> String {
+    error
+        .replace(
+            crate::dataset::export::EXPORT_WITHOUT_MEDIA,
+            "turn off Include captured images",
+        )
+        .replace(
+            "raise --max-space or --max-files",
+            "raise Keep at most in Storage & retention",
+        )
 }
 
 /// The inspector's section, or `None` to leave it out.
@@ -412,6 +459,14 @@ pub(super) fn view<'a>(
                 .wrap()
                 .vertical_spacing(6),
             );
+            section = section.push(tip(
+                checkbox_maybe(
+                    "Include captured images",
+                    bench.dataset.export_images,
+                    (!busy).then_some(|on| Message::Dataset(Msg::ExportImages(on))),
+                ),
+                "Copy the images into images/ in the export, so the folder can be moved or zipped",
+            ));
         }
         None => {
             section = section

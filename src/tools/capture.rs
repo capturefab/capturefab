@@ -882,9 +882,11 @@ fn file_fact(ctx: &Context, checked: &mut Checked, camera: &CameraRef, output: &
         .find(|info| info.id == camera.selector())
         .map(crate::naming::camera_label)
         .unwrap_or_else(|| "camera".into());
+    // Tool file names refuse ':', so they never hold {tag:KEY}.
     let preview = crate::naming::preview(
         output,
         &label,
+        &Default::default(),
         ctx.zone.at(ctx.now_ms).with_timezone(&chrono::Local),
     );
     let preview = match &checked.destination {

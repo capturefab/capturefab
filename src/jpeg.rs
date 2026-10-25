@@ -268,9 +268,58 @@ pub fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
     false
 }
 
+/// Add a COM (comment) segment holding `payload` to an encoded JPEG, after
+/// SOI and any leading APPn segments so a JFIF or EXIF header stays first.
+/// It works on the finished bytes, so the comment does not depend on which
+/// encoder ran.
+pub fn insert_com(jpeg: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        payload.len() <= usize::from(u16::MAX) - 2,
+        "JPEG comment is too long"
+    );
+    anyhow::ensure!(
+        jpeg.len() >= 4 && jpeg[..2] == [0xFF, 0xD8],
+        "not a JPEG image"
+    );
+    let mut at = 2;
+    while let [0xFF, 0xE0..=0xEF, high, low, ..] = jpeg[at..] {
+        let length = usize::from(u16::from_be_bytes([high, low]));
+        anyhow::ensure!(
+            length >= 2 && at + 2 + length <= jpeg.len(),
+            "malformed JPEG header"
+        );
+        at += 2 + length;
+    }
+    let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+    out.extend_from_slice(&jpeg[..at]);
+    out.extend_from_slice(&[0xFF, 0xFE]);
+    out.extend_from_slice(&(payload.len() as u16 + 2).to_be_bytes());
+    out.extend_from_slice(payload);
+    out.extend_from_slice(&jpeg[at..]);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn comments_follow_app_segments() {
+        // SOI, APP0 of length 4, a frame header, EOI.
+        let jpeg = [
+            0xFF, 0xD8, 0xFF, 0xE0, 0, 4, 1, 2, 0xFF, 0xC0, 0, 2, 0xFF, 0xD9,
+        ];
+        let out = insert_com(&jpeg, b"{\"a\":1}").unwrap();
+        assert_eq!(&out[..8], &jpeg[..8]);
+        assert_eq!(&out[8..12], &[0xFF, 0xFE, 0, 9]);
+        assert_eq!(&out[12..19], b"{\"a\":1}");
+        assert_eq!(&out[19..], &jpeg[8..]);
+        // Straight after SOI when there is no APPn.
+        let bare = insert_com(&[0xFF, 0xD8, 0xFF, 0xD9], b"x").unwrap();
+        assert_eq!(bare, [0xFF, 0xD8, 0xFF, 0xFE, 0, 3, b'x', 0xFF, 0xD9]);
+        assert!(insert_com(&jpeg, &vec![0; 65_534]).is_err());
+        assert!(insert_com(b"\x89PNG", b"x").is_err());
+        assert!(insert_com(&[0xFF, 0xD8, 0xFF, 0xE0, 0, 40, 0xFF, 0xD9], b"x").is_err());
+    }
     #[cfg(feature = "jpeg")]
     use crate::types::RGB8;
     fn frame(pixel_format: u32, width: u32, height: u32, bytes: usize) -> Frame {

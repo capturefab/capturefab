@@ -1,5 +1,6 @@
-//! Capture context: short key/value tags (line, station, part, lot, note)
-//! carried with captures, recordings and dataset notes.
+//! Capture context: short key/value tags (label, line, station, part, lot,
+//! note) carried with captures, recordings and dataset notes, and usable in
+//! output names as {tag:KEY}.
 use anyhow::{Result, ensure};
 
 pub type Context = std::collections::BTreeMap<String, String>;
@@ -22,12 +23,17 @@ pub fn validate(context: &Context) -> Result<()> {
     Ok(())
 }
 
-fn validate_key(key: &str) -> Result<()> {
+/// Whether `key` matches `^[a-z][a-z0-9_]{0,31}$`.
+pub fn is_valid_key(key: &str) -> bool {
     let mut bytes = key.bytes();
+    key.len() <= MAX_KEY
+        && bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+        && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn validate_key(key: &str) -> Result<()> {
     ensure!(
-        key.len() <= MAX_KEY
-            && bytes.next().is_some_and(|b| b.is_ascii_lowercase())
-            && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+        is_valid_key(key),
         "context key '{}' must start with a lowercase letter and use only a-z, 0-9 and _ (at most {MAX_KEY} characters)",
         key.escape_debug()
     );

@@ -251,8 +251,9 @@ Failed copies can leave partial output; examine it before retrying.
 ## Name and tag captures
 
 Capture and local recording outputs accept a file, a directory or a template.
-Placeholders are `{camera}`, `{date}`, `{time}`, `{datetime}`, `{seq}` and `{frame}`.
+Placeholders are `{camera}`, `{date}`, `{time}`, `{datetime}`, `{seq}`, `{frame}` and `{tag:KEY}`.
 `{seq}` selects the next free number for that folder and pattern.
+`{tag:KEY}` is the `--context` value for KEY made into one safe folder or file name; an empty or missing tag is a usage error (exit 2).
 `{camera}` is the sanitized model and serial, never the address.
 Times use local time when the frame is requested.
 Other placeholders cause a usage error (exit 2).
@@ -261,6 +262,7 @@ Other placeholders cause a usage error (exit 2).
 capturefab --camera sim:0 capture -o 'line1/{date}/{camera}-{datetime}-{seq}.png' --json
 capturefab --camera sim:0 capture -o shot.png --on-exists number --json
 capturefab --camera sim:0 capture -o 'qa/{camera}-{seq}.png' --context line=L1 --context part=A-100 --json
+capturefab --camera sim:0 capture -o 'data/{tag:label}/{camera}-{seq}.png' --context label=defect --json
 ```
 
 `--on-exists fail` is the CLI and RPC default.
@@ -274,6 +276,9 @@ A taken name fails before acquisition; `error.details.hint` names the `{seq}` te
 Capture frames carry `pixel_format_name` (`Mono8`) and `file_bytes` (saved size) beside the raw `pixel_format` and `bytes`.
 A burst that fails part way keeps its saved frames; the message starts `saved N of M frames to FOLDER` and the exit code is unchanged.
 `--context KEY=VALUE` tags captures and recordings; keys match `^[a-z][a-z0-9_]{0,31}$`.
+Saved PNG and JPEG files embed compact JSON with frame fields, camera vendor and model, `settings` and `context`: PNG iTXt `capturefab`, JPEG COM.
+The embedded JSON never holds a serial, address or URL; tags, including `note`, travel with the file.
+`frames[].settings` gives allowlisted acquisition features (ExposureTime, Gain, AcquisitionFrameRate and similar) when the camera has them; `frames[].pixel_format_name` names the pixel format.
 Read saved names from `result.files` and `result.frames[].file`.
 `frames[].wall_ms` is UTC milliseconds.
 A recording result gives the resolved file in `path` and the start time in `since_ms`.
@@ -284,6 +289,8 @@ Timed CLI fallback and assistant recording cleanup use that identity. Explicit h
 A timed recording result also gives the nominal UTC deadline in `until_ms`; `status` shows it in `forwarding_until_ms`.
 When the session stops a timed recording on time, `record --duration` returns `"stopped":{"forwarding":null,"by":"duration","stats":{...}}`.
 The desktop saves to `~/Capturefab/{date}/{camera}-{datetime}-{seq}.png` by default.
+Its Capture tags send `label`, `line`, `station`, `part`, `lot` and `note`; "One folder per label" file names put each Label in its own folder.
+A schedule keeps the tags it was created with.
 
 ## Catalog and export datasets
 
@@ -292,6 +299,7 @@ capturefab --session bench dataset open /data/plant.duckdb --json
 capturefab --session bench dataset note "nozzle changed" --context line=L1 --json
 capturefab --session bench dataset query "SELECT * FROM captures LIMIT 20" --json
 capturefab --session bench dataset export -o /data/exports/shift-b --json
+capturefab --session bench dataset export -o /data/exports/parts --media images --group-by part --json
 capturefab dataset query --file /data/plant.duckdb "SELECT count(*) FROM captures" --json
 ```
 
@@ -303,6 +311,9 @@ Queries accept one read-only SELECT or WITH statement and return at most 10,000 
 `--file` on a dataset that a session holds fails with exit 3; use `--session`.
 Exports go to a new folder: Parquet and CSV files, `manifest.json` and `README.md`.
 Give the export `README.md` and `manifest.json` to an analysis model first.
+`--media images` copies captured images into `images/` (`all` adds recordings in `videos/`); `--group-by KEY` uses one folder per tag value, `_unlabeled` for none.
+`media.csv` maps each copy's relative `export_path` and SHA-256 to its row; the result adds `media: {mode,group_by,copied,bytes,skipped,skipped_files}`.
+Copies count against the storage budget, never overwrite, and missing or changed files are skipped.
 An existing export folder fails with exit 1; a full storage budget fails with exit 6 before writing.
 RPC operations are `dataset_open`, `dataset_close`, `dataset_status`, `dataset_note`, `dataset_query` and `dataset_export`.
 Workflow files can use these operations too.

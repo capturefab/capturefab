@@ -11,6 +11,8 @@ pub(super) struct Shot {
     pub(super) frame: Frame,
     /// When the frame arrived, UTC Unix milliseconds.
     pub(super) wall_ms: u64,
+    /// The camera's settings when the frame arrived, written into the files.
+    pub(super) acquisition: Acquisition,
     pub(super) saves: Vec<Save>,
 }
 
@@ -127,11 +129,13 @@ impl Drop for Saver {
 /// Encode and write one job's file for a shot, then report it. Returns the
 /// path it was saved at.
 fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<String> {
-    let bytes = crate::frame::encode(&shot.frame, &save.format)?;
+    let meta = still_meta(&shot.frame, shot.wall_ms, &shot.acquisition, &save.context);
+    let bytes = crate::frame::encode_with_meta(&shot.frame, &save.format, Some(&meta))?;
     let input = crate::naming::NameInput {
         camera: &save.camera,
         now: save.now,
         index: save.index,
+        context: &save.context,
     };
     let (path, stored) = crate::naming::save_named(
         &h.names,

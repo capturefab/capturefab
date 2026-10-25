@@ -338,24 +338,40 @@ pub enum DatasetCommand {
         #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=10_000))]
         limit: u32,
     },
-    /// Write data files, manifest.json and README.md into a new folder
+    /// Write data files, manifest.json and README.md into a new folder;
+    /// --media images also copies the images, so the folder can be moved
     Export {
+        /// Read a dataset file that no session holds
         #[arg(long)]
         file: Option<PathBuf>,
+        /// New folder to create; must not exist
         #[arg(short = 'o', long)]
         output: PathBuf,
+        /// Data file formats, comma separated (default: parquet,csv; csv
+        /// without Parquet support)
         #[arg(long, value_enum, value_delimiter = ',')]
         format: Vec<crate::dataset::ExportFormat>,
+        /// Tables to export, comma separated: captures, recordings, events
         #[arg(long, value_delimiter = ',')]
         tables: Vec<String>,
+        /// Copy saved files into the export: images (captures into images/)
+        /// or all (also recordings into videos/)
+        #[arg(long, value_enum, default_value = "none")]
+        media: crate::dataset::MediaExport,
+        /// With --media, put files in folders named after this capture tag,
+        /// such as part or label (images/A-100/...); untagged files go in
+        /// _unlabeled
+        #[arg(long, value_name = "TAG_KEY")]
+        group_by: Option<String>,
         /// Only rows at or after this time (RFC 3339 with timezone)
         #[arg(long, value_parser = parse_at_text)]
         since: Option<String>,
         /// Only rows at or before this time (RFC 3339 with timezone)
         #[arg(long, value_parser = parse_at_text)]
         until: Option<String>,
+        // Boxed so the subcommand stays small.
         #[command(flatten)]
-        storage: StorageArgs,
+        storage: Box<StorageArgs>,
     },
 }
 #[derive(Debug, Subcommand)]
@@ -594,7 +610,7 @@ pub enum Command {
         after_help = "Examples:\n  capturefab -c sim:0 capture -o shot.png\n  capturefab -c sim:0 capture -n 50 --interval 2s -o 'line1/{camera}-{seq}.jpg'\n  capturefab -c sim:0 capture -n 10 -o frames/            A folder of frame-NNNNNN.png files\n  capturefab --direct -c sim:0 capture -o - > frame.png   One image to a pipe or file"
     )]
     Capture {
-        /// File, folder (an existing one, or a name ending in /), or template with {camera} {date} {time} {datetime} {seq} {frame}; a name without an extension gets the format's; '-' writes one image to stdout
+        /// File, folder (an existing one, or a name ending in /), or template with {camera} {date} {time} {datetime} {seq} {frame} {tag:KEY}; a name without an extension gets the format's; '-' writes one image to stdout
         #[arg(short = 'o', long)]
         output: String,
         /// Number of frames (1-100000). With more than 1, give a folder (frames/ holds frame-NNNNNN files) or a template with {seq} or {frame}; one image name such as shot.jpg is refused
@@ -2863,6 +2879,8 @@ fn schema() -> Value {
         "date":"YYYY-MM-DD","time":"HHMMSS","datetime":"YYYYMMDD-HHMMSS",
         "seq":"next free number in that folder for that pattern, 4 or more digits; file name only",
         "frame":"1-based index within the request, 6 digits",
+        "tag:KEY":"the capture context value for KEY (--context KEY=VALUE) as one path component: trimmed, / \\ < > : \" | ? * become _, trailing dots and spaces removed, a leading dot or Windows device name prefixed with _, at most 128 bytes; an empty or missing tag is a usage error (exit 2); {seq} cannot directly follow it",
+        "schedules":"a schedule keeps the context it was created with, so changing tags later does not move its files",
         "clock":"local time when the frame is requested; wall_ms is UTC milliseconds"
     });
     contract["capture"]["on_exists"] = json!({
@@ -2875,10 +2893,21 @@ fn schema() -> Value {
         "cli":"--context KEY=VALUE (repeatable)","keys":"^[a-z][a-z0-9_]{0,31}$",
         "max_entries":crate::context::MAX_ENTRIES,"max_value_bytes":crate::context::MAX_VALUE,
         "duplicate_key":"usage error (exit 2)",
-        "recorded":"echoed in the capture result, kept on scheduled jobs and stored with each file in an open dataset"
+        "recorded":"echoed in the capture result, kept on scheduled jobs and stored with each file in an open dataset",
+        "embedded":"written into each saved PNG (iTXt 'capturefab' JSON, and Description as key=value; ...) and JPEG (COM JSON), including note"
+    });
+    contract["capture"]["metadata"] = json!({
+        "png":"iTXt chunk with keyword 'capturefab' holding compact JSON; tags also in iTXt 'Description'",
+        "jpeg":"COM segment holding the same JSON",
+        "none":["raw","pgm","ppm"],
+        "fields":"{capturefab:version,frame_id,timestamp_ns,wall_ms,width,height,pixel_format:name,camera?:{vendor,model},settings?,context?}",
+        "settings":crate::engine::ACQUISITION_FEATURES,
+        "excludes":"serial numbers, addresses and source URLs",
+        "max_bytes":crate::frame::MAX_META,
+        "channels":"monochrome PNG and PGM are one 8-bit gray channel; color and Bayer PNG are 8-bit RGB"
     });
     contract["capture"]["result"] = json!({
-        "capture":"{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,file_bytes?,wall_ms,file?}],count,context?,destination?}; bytes is the raw acquired frame size, file_bytes the saved file size (absent for stdout). A burst that fails part way keeps its saved frames and its error category; the message starts with saved N of M frames to FOLDER (names)",
+        "capture":"{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,file_bytes?,wall_ms,settings?,file?}],count,context?,destination?}; bytes is the raw acquired frame size, file_bytes the saved file size (absent for stdout); settings maps the camera's allowlisted acquisition features to their values. A burst that fails part way keeps its saved frames and its error category; the message starts with saved N of M frames to FOLDER (names)",
         "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\",stats?:{accepted,written,dropped,late,stalled,recording?:{path,bytes,started_ms,ended_ms,encoder}}} when the session ended it on time (stats is absent from a worker that does not report them), else the conditional-stop result",
         "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, forwarding_until_ms while a timed recording or forward runs, and recording_path (the resolved absolute file; forwarding keeps the requested output) while a local recording runs",
         "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback and assistant cleanup use this form; explicit human stop-forward stops the current instance."},
@@ -3157,6 +3186,8 @@ fn prepare_dataset(cli: &Cli) -> Result<Option<SessionCommand>> {
             output,
             format,
             tables,
+            media,
+            group_by,
             since,
             until,
             storage,
@@ -3186,6 +3217,8 @@ fn prepare_dataset(cli: &Cli) -> Result<Option<SessionCommand>> {
                     .map(crate::scheduling::parse_at)
                     .transpose()?,
                 storage: storage.policy()?,
+                media: *media,
+                group_by: group_by.clone(),
             }
         }
     };
@@ -3224,6 +3257,8 @@ fn dataset_file(command: &DatasetCommand, prepared: Option<SessionCommand>) -> R
             since_ms,
             until_ms,
             storage,
+            media,
+            group_by,
         }) => dataset
             .reader()?
             .export(&crate::dataset::export::ExportRequest {
@@ -3233,7 +3268,10 @@ fn dataset_file(command: &DatasetCommand, prepared: Option<SessionCommand>) -> R
                 since_ms,
                 until_ms,
                 storage,
-            }),
+                media,
+                group_by,
+            })
+            .map_err(usage),
         _ => Ok(serde_json::to_value(dataset.status())?),
     }
 }

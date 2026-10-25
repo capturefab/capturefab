@@ -84,6 +84,8 @@ pub fn run(slot: &Arc<Slot>, command: SessionCommand) -> Result<Value> {
             since_ms,
             until_ms,
             storage,
+            media,
+            group_by,
         } => {
             let output = absolute(&output, "export folder")?;
             slot.reader()?.export(&ExportRequest {
@@ -93,6 +95,8 @@ pub fn run(slot: &Arc<Slot>, command: SessionCommand) -> Result<Value> {
                 since_ms,
                 until_ms,
                 storage,
+                media,
+                group_by,
             })
         }
         SessionCommand::DatasetExportIf {
@@ -120,6 +124,9 @@ pub fn run(slot: &Arc<Slot>, command: SessionCommand) -> Result<Value> {
                     since_ms,
                     until_ms,
                     storage,
+                    // Checked exports for agents stay data-only.
+                    media: Default::default(),
+                    group_by: None,
                 },
                 max_bytes,
                 timeout_ms,

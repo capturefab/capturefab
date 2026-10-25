@@ -214,6 +214,24 @@ pub enum ExportFormat {
     Jsonl,
 }
 
+/// Which saved files `dataset export` copies into the export folder.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaExport {
+    /// Data files only; images and videos stay where they were saved
+    #[default]
+    None,
+    /// Copy captured images into images/
+    Images,
+    /// Copy captured images into images/ and recordings into videos/
+    All,
+}
+impl MediaExport {
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+}
+
 pub fn default_query_limit() -> u32 {
     1000
 }
@@ -544,6 +562,23 @@ fn check_path(path: &str, what: &str) -> Result<()> {
 /// Check the shape of a dataset command's fields.
 pub fn validate_command(command: &crate::session::SessionCommand) -> Result<()> {
     use crate::session::SessionCommand as C;
+    if let C::DatasetExport {
+        media,
+        group_by: Some(key),
+        ..
+    } = command
+    {
+        if media.is_none() {
+            return Err(Usage("--group-by needs --media images or --media all".into()).into());
+        }
+        if !crate::context::is_valid_key(key) {
+            return Err(Usage(format!(
+                "--group-by {} needs a tag key that starts with a lowercase letter and uses only a-z, 0-9 and _, such as part or label",
+                key.escape_debug()
+            ))
+            .into());
+        }
+    }
     let slot_id = match command {
         C::DatasetOpenIf {
             expected_slot_id, ..
@@ -678,6 +713,7 @@ pub fn validate_command(command: &crate::session::SessionCommand) -> Result<()> 
             since_ms,
             until_ms,
             storage,
+            ..
         }
         | C::DatasetExportIf {
             output,
@@ -725,6 +761,15 @@ pub fn schema_contract() -> Value {
         "formats": if cfg!(feature = "parquet") { json!(["csv", "parquet", "json", "jsonl"]) } else { json!(["csv"]) },
         "default_formats": if cfg!(feature = "parquet") { json!(["parquet", "csv"]) } else { json!(["csv"]) },
         "export": "a new folder with data files, manifest.json (schema, units, sha256) and README.md (loading snippets and a summary for AI tools); an existing folder is refused",
+        "export_media": {
+            "modes": ["none", "images", "all"],
+            "tables": "images copies files of the captures table and all also of recordings; with --tables, only the listed ones among those are copied",
+            "default": "none",
+            "layout": "images/<file> for captures and videos/<file> for recordings; with group_by KEY, images/<tag value>/<file> (videos/<tag value>/<file>), and _unlabeled when the tag is empty",
+            "index": "media.csv (plus media.<format> for each other requested format) with columns table, id, export_path (relative, forward slashes), sha256, bytes, group",
+            "storage": "copies go through the storage budget and are preflighted with the data files; nothing is overwritten; missing, resized or changed source files are skipped and listed in manifest.json media.skipped",
+            "result": "media: {mode, group_by, copied, bytes, skipped, skipped_files[{table,id,reason}] (first 100)}; present only when mode is not none",
+        },
         "query": "one SELECT/WITH statement; read-only; external files blocked; rolled back",
         "model_query": "dataset_model_query_if copies all six standard base tables into a bounded private in-memory engine, validates their exact schema before scanning, removes camera serials and normalizes private locator metadata before arbitrary SQL, and blocks external access, extensions, persistent secrets and target spill; transfer limits and engine memory settings are not a process-memory or shared-source disk quota; unsupported builds and exceeded limits fail without a raw-query fallback",
         "limits": {
@@ -761,6 +806,7 @@ pub fn rpc_examples() -> Vec<Value> {
         json!({"op":"dataset_note","text":"shift B start","context":{"line":"L1"}}),
         json!({"op":"dataset_query","sql":"SELECT count(*) FROM captures"}),
         json!({"op":"dataset_export","output":"/data/export-1","formats":["csv"]}),
+        json!({"op":"dataset_export","output":"/data/export-images","formats":["csv"],"media":"images","group_by":"part"}),
         json!({"op":"dataset_open_if","expected_slot_id":null,"path":"/data/plant.duckdb"}),
         json!({"op":"dataset_close_if","slot_id":"0123456789abcdef0123456789abcdef"}),
         json!({"op":"dataset_note_if","slot_id":"0123456789abcdef0123456789abcdef","text":"shift B start"}),

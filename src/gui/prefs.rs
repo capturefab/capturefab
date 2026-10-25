@@ -513,6 +513,8 @@ pub struct Prefs {
     pub dataset_path: Option<PathBuf>,
     /// Catalog captures in a dataset under the capture folder when none is open.
     pub dataset_auto: bool,
+    /// Copy the captured images into dataset exports.
+    pub dataset_export_images: bool,
     /// The settings panel's disclosures the user left open, by stable key
     /// ("features:Image", "storage"); unknown keys are ignored on load.
     pub open_sections: Vec<String>,
@@ -521,6 +523,8 @@ pub struct Prefs {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CaptureTags {
+    /// A general class or condition, such as `good` or `defect`.
+    pub label: String,
     pub line: String,
     pub station: String,
     pub part: String,
@@ -575,6 +579,7 @@ impl Default for Prefs {
             tags: CaptureTags::default(),
             dataset_path: None,
             dataset_auto: true,
+            dataset_export_images: true,
             open_sections: Vec::new(),
         }
     }
