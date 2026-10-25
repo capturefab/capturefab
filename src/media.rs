@@ -4142,6 +4142,10 @@ impl RawInput {
             full_range: matches!(ffmpeg, "uyvy422" | "yuyv422"),
         })
     }
+    /// YUV 4:2:2, where each two pixels share one Cb and one Cr.
+    fn pairs(&self) -> bool {
+        matches!(self.ffmpeg, "uyvy422" | "yuyv422")
+    }
     /// FFmpeg input options for the frames' color range and matrix.
     fn color_options(&self) -> &'static [&'static str] {
         if self.full_range {
@@ -4151,9 +4155,11 @@ impl RawInput {
         }
     }
     /// The bytes FFmpeg reads for `frame`; the sensor buffer itself unless
-    /// its samples are packed or widened.
+    /// its samples are packed or widened, or its 4:2:2 rows end in half a
+    /// pixel pair.
     fn bytes(&self, frame: Frame) -> Result<Vec<u8>> {
-        let length = frame.width as usize * frame.height as usize * self.bytes_per_pixel;
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        let length = width * height * self.bytes_per_pixel;
         let name = crate::frame::pixel_format_name(frame.pixel_format);
         let mut data = if self.unpack {
             crate::frame::unpacked(&frame)?.into_owned().data
@@ -4167,6 +4173,19 @@ impl RawInput {
                 let value = u16::from_le_bytes(*sample).min(u16::MAX >> self.widen);
                 *sample = (value << self.widen).to_le_bytes();
             }
+        }
+        if self.pairs() && !width.is_multiple_of(2) {
+            // A camera ends each odd-width 4:2:2 row with a lone pixel and its
+            // Cb, but FFmpeg reads rows of whole pairs, 4 * ceil(width / 2)
+            // bytes. Each row gets the missing luma, which lies outside the
+            // image, and a neutral Cr, as `frame::unpacked` decodes that pixel.
+            let row = width * 2;
+            let mut padded = Vec::with_capacity((row + 2) * height);
+            for line in data.chunks_exact(row) {
+                padded.extend_from_slice(line);
+                padded.extend_from_slice(&[128, 128]);
+            }
+            data = padded;
         }
         Ok(data)
     }
@@ -6390,6 +6409,100 @@ esac"#
         }
         let error = RawInput::for_format(0x0110_0099).unwrap_err().to_string();
         assert!(error.contains("0x01100099") && error.contains("--format raw"));
+    }
+    #[test]
+    fn odd_width_yuv_422_rows_fill_whole_pixel_pairs() {
+        // FFmpeg reads 4:2:2 rows of 4 * ceil(width / 2) bytes; a 3x2 frame
+        // has rows of 6, so each gains an outside luma and a neutral Cr.
+        for format in [0x0210_0032, 0x0210_001f, 0x0210_003b, 0x0210_0043] {
+            let raw = RawInput::for_format(format).unwrap();
+            let frame = |width, height, data| Frame {
+                id: 1,
+                width,
+                height,
+                pixel_format: format,
+                timestamp_ns: 0,
+                data,
+            };
+            let padded = raw.bytes(frame(3, 2, (1..=13).collect())).unwrap();
+            assert_eq!(
+                padded,
+                [1, 2, 3, 4, 5, 6, 128, 128, 7, 8, 9, 10, 11, 12, 128, 128],
+                "{format:x}"
+            );
+            assert_eq!(
+                raw.bytes(frame(1, 1, vec![9, 7])).unwrap(),
+                [9, 7, 128, 128]
+            );
+            assert!(raw.bytes(frame(3, 2, vec![0; 11])).is_err());
+            // Even widths and other formats pass through unchanged.
+            let even = (1..=8).collect::<Vec<u8>>();
+            assert_eq!(raw.bytes(frame(2, 2, even.clone())).unwrap(), even);
+        }
+        let mono = RawInput::for_format(crate::types::MONO8).unwrap();
+        let odd = Frame {
+            id: 1,
+            width: 3,
+            height: 1,
+            pixel_format: crate::types::MONO8,
+            timestamp_ns: 0,
+            data: vec![1, 2, 3],
+        };
+        assert_eq!(mono.bytes(odd).unwrap(), [1, 2, 3]);
+    }
+    #[test]
+    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
+    fn ffmpeg_reads_odd_width_yuv_422_like_capturefab() {
+        // Chroma is constant along each row, with Cr neutral, so the lone last
+        // pixel decodes the same whichever way FFmpeg spreads chroma.
+        let exe = executable().unwrap();
+        let (width, height) = (5usize, 3usize);
+        for (format, order) in [(0x0210_0032, [0, 1, 2, 3]), (0x0210_001f, [1, 0, 3, 2])] {
+            let raw = RawInput::for_format(format).unwrap();
+            let data = (0..height)
+                .flat_map(|y| {
+                    let cb = 60 + 40 * y as u8;
+                    (0..width).step_by(2).flat_map(move |x| {
+                        let pair = [40 + 30 * x as u8, cb, 55 + 30 * x as u8, 128];
+                        let bytes = order.map(|i| pair[i]);
+                        bytes.into_iter().take(if x + 1 < width { 4 } else { 2 })
+                    })
+                })
+                .collect::<Vec<u8>>();
+            assert_eq!(data.len(), width * height * 2);
+            let frame = Frame {
+                id: 1,
+                width: width as u32,
+                height: height as u32,
+                pixel_format: format,
+                timestamp_ns: 0,
+                data,
+            };
+            let expected = crate::frame::rgb(&frame).unwrap();
+            let mut child = command(&exe)
+                .args(["-hide_banner", "-loglevel", "error", "-f", "rawvideo"])
+                .args(["-pix_fmt", raw.ffmpeg])
+                .args(raw.color_options())
+                .args(["-video_size", &format!("{width}x{height}"), "-i", "pipe:0"])
+                .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let bytes = raw.bytes(frame).unwrap();
+            let feeder = thread::spawn(move || stdin.write_all(&bytes));
+            let output = child.wait_with_output().unwrap();
+            feeder.join().unwrap().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{}: {stderr}", raw.ffmpeg);
+            assert_eq!(output.stdout.len(), expected.len(), "{}", raw.ffmpeg);
+            for (i, (got, want)) in output.stdout.iter().zip(&expected).enumerate() {
+                let difference = got.abs_diff(*want);
+                assert!(difference <= 3, "{} byte {i}: {got} vs {want}", raw.ffmpeg);
+            }
+        }
     }
     #[test]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
