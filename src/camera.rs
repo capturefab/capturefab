@@ -82,6 +82,19 @@ pub fn discover_with(
     Ok((devices, warnings))
 }
 
+/// Commands that change the acquisition or transfer state, which only start
+/// and stop may run, together with the transport: an AcquisitionAbort from
+/// outside would leave the receiver running for a camera that has stopped.
+const STREAM_COMMANDS: [&str; 7] = [
+    "AcquisitionStart",
+    "AcquisitionStop",
+    "AcquisitionAbort",
+    "AcquisitionArm",
+    "TransferStart",
+    "TransferStop",
+    "TransferAbort",
+];
+
 pub struct Camera {
     pub info: CameraInfo,
     backend: Box<dyn Backend>,
@@ -580,7 +593,7 @@ impl Camera {
     }
     pub fn execute(&mut self, name: &str) -> Result<()> {
         ensure!(
-            !["AcquisitionStart", "AcquisitionStop"].contains(&name),
+            !STREAM_COMMANDS.contains(&name),
             "use start/stop to manage transport and acquisition together"
         );
         self.nodes.execute(self.backend.as_mut(), name)
@@ -1057,6 +1070,24 @@ pub(crate) mod tests {
                 ["receive", "AcquisitionStart", "AcquisitionStop", "release"]
             );
         }
+    }
+
+    #[test]
+    fn acquisition_and_transfer_commands_are_left_to_start_and_stop() {
+        let device = Device::new(&format!(
+            r#"{OPEN_ACQUISITION}{TRANSFER_NODES}<Command Name="AcquisitionAbort"><pValue>AcquisitionAbortReg</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionAbortReg"><Address>0x5c</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#
+        ));
+        let log = events(&device);
+        let mut camera = device_camera(device);
+        camera.start().unwrap();
+        taken(&log);
+        for command in ["AcquisitionAbort", "TransferStop", "AcquisitionStart"] {
+            let error = camera.execute(command).unwrap_err();
+            assert!(error.to_string().contains("use start/stop"), "{error:#}");
+        }
+        assert!(taken(&log).is_empty());
+        assert!(camera.is_streaming());
+        camera.next_frame(Duration::from_millis(10)).unwrap();
     }
 
     #[test]
