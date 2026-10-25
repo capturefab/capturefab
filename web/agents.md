@@ -116,6 +116,9 @@ The session path is the runtime directory.
 `limits` reports Linux `rmem_max` and `usbfs_memory_mb`, or null elsewhere.
 `graphics` reports graphics information.
 `checks` contains `{id,level:"ok"|"warn",message,fix}` entries.
+Check ids include `efficiency`, `graphics`, `runtime_dir`, `session_storage`, `private_dirs`, `camera_network`, `ffmpeg`, `receive_buffer`, `usb_access` and `storage_budget`; checks that do not apply are omitted.
+`camera_network` lists wired Ethernet adapters for GigE Vision and is never a warning.
+`ffmpeg` warns when FFmpeg, which webcams, streams, files and recording need, does not run.
 Plain `doctor` prints those checks with suggested fixes.
 Keep credentials out of logs, command transcripts and generated configuration files.
 

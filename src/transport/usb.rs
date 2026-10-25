@@ -2,7 +2,7 @@
 //! UVCP/UVSP wire fields and bootstrap register addresses follow USB3 Vision.
 use crate::{
     genicam::decode_xml,
-    types::{Backend, CameraInfo, Frame, RegisterIo, Transport},
+    types::{Backend, CameraInfo, Categorized, ErrorKind, Frame, RegisterIo, Transport},
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use nusb::{
@@ -77,6 +77,75 @@ pub fn discover() -> Result<Vec<CameraInfo>> {
     result.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(result)
 }
+/// Where opening a camera stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    Open,
+    ClaimControl,
+    ClaimStream,
+}
+
+/// What a failed open or interface claim means on `os`, in plain words with
+/// the one next step, and how scripts see it. Permission, a busy device and
+/// a missing driver are all states of this computer the user can change, so
+/// they are `unavailable` (exit 3), the Windows driver case included.
+/// `node` is the usbfs path on Linux.
+fn access_error(
+    stage: Stage,
+    kind: nusb::ErrorKind,
+    name: &str,
+    node: Option<&str>,
+    os: &str,
+) -> (ErrorKind, String) {
+    use nusb::ErrorKind as Usb;
+    let doing = match stage {
+        Stage::Open => "open",
+        Stage::ClaimControl => "claim the control interface of",
+        Stage::ClaimStream => "claim the stream interface of",
+    };
+    let at = node.map(|node| format!(" ({node})")).unwrap_or_default();
+    match (kind, os) {
+        (Usb::PermissionDenied, "linux") => (
+            ErrorKind::Unavailable,
+            format!(
+                "No permission to {doing} USB3 Vision camera {name}{at}. Run `capturefab doctor` for the udev rule that fixes it."
+            ),
+        ),
+        (Usb::PermissionDenied, _) => (
+            ErrorKind::Unavailable,
+            format!("No permission to {doing} USB3 Vision camera {name}. Run `capturefab doctor`."),
+        ),
+        (Usb::Busy, _) => (
+            ErrorKind::Unavailable,
+            format!(
+                "USB3 Vision camera {name} is in use by another application (for example a vendor viewer or SDK). Close it and connect again."
+            ),
+        ),
+        (Usb::Disconnected, _) => (
+            ErrorKind::Unavailable,
+            format!(
+                "USB3 Vision camera {name} disconnected while opening; reconnect it and discover again."
+            ),
+        ),
+        (Usb::Unsupported | Usb::NotFound | Usb::Other, "windows") => (
+            ErrorKind::Unavailable,
+            format!(
+                "Windows is not using the WinUSB driver for the USB3 Vision interface of camera {name}. Install WinUSB for it; see https://capturefab.com/docs.html#discovery."
+            ),
+        ),
+        (Usb::Unsupported | Usb::Other, "macos") => (
+            ErrorKind::Unavailable,
+            format!(
+                "macOS did not give Capturefab the USB interface of camera {name}; another driver or app may hold it. Close other camera software and run `capturefab doctor`."
+            ),
+        ),
+        _ => (
+            ErrorKind::OperationFailed,
+            format!("Cannot {doing} USB3 Vision camera {name}{at}."),
+        ),
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct InterfaceEndpoints {
     number: u8,
@@ -94,10 +163,33 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         .wait()?
         .find(|d| camera_info(d).id == info.id)
         .context("USB3 Vision camera disconnected or its USB address changed; discover again")?;
-    let device = device_info
-        .open()
-        .wait()
-        .context("cannot open USB camera; check OS USB permissions and driver binding")?;
+    let name = device_info
+        .product_string()
+        .unwrap_or("USB3 Vision camera")
+        .to_owned();
+    let node = cfg!(target_os = "linux").then(|| {
+        format!(
+            "/dev/bus/usb/{}/{:03}",
+            device_info.bus_id(),
+            device_info.device_address()
+        )
+    });
+    let refused = |stage: Stage| {
+        let name = name.clone();
+        let node = node.clone();
+        move |error: nusb::Error| {
+            let (kind, message) = access_error(
+                stage,
+                error.kind(),
+                &name,
+                node.as_deref(),
+                std::env::consts::OS,
+            );
+            // The OS's own words stay on the line for whoever debugs it.
+            Categorized::error(kind, format!("{message} (USB: {error})"))
+        }
+    };
+    let device = device_info.open().wait().map_err(refused(Stage::Open))?;
     let config = device
         .active_configuration()
         .context("USB camera has no active configuration")?;
@@ -131,7 +223,10 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     }
     let control = control.context("USB3 Vision control bulk endpoints not found")?;
     let data = data.context("USB3 Vision stream bulk endpoint not found")?;
-    let control_interface = device.claim_interface(control.number).wait().context("cannot claim camera control interface; close other camera software and check USB permissions/driver")?;
+    let control_interface = device
+        .claim_interface(control.number)
+        .wait()
+        .map_err(refused(Stage::ClaimControl))?;
     if control.alternate != 0 {
         control_interface
             .set_alt_setting(control.alternate)
@@ -143,7 +238,7 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         device
             .claim_interface(data.number)
             .wait()
-            .context("cannot claim camera stream interface")?
+            .map_err(refused(Stage::ClaimStream))?
     };
     if data.alternate != 0 {
         data_interface.set_alt_setting(data.alternate).wait()?;
@@ -703,6 +798,99 @@ impl Drop for UsbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_failures_name_the_fix_for_this_os() {
+        use nusb::ErrorKind as Usb;
+        let node = Some("/dev/bus/usb/002/003");
+        let cases = [
+            (
+                Stage::Open,
+                Usb::PermissionDenied,
+                "linux",
+                ErrorKind::Unavailable,
+                "/dev/bus/usb/002/003). Run `capturefab doctor` for the udev rule",
+            ),
+            (
+                Stage::Open,
+                Usb::PermissionDenied,
+                "macos",
+                ErrorKind::Unavailable,
+                "Run `capturefab doctor`.",
+            ),
+            (
+                Stage::ClaimControl,
+                Usb::Busy,
+                "linux",
+                ErrorKind::Unavailable,
+                "in use by another application",
+            ),
+            (
+                Stage::ClaimStream,
+                Usb::Busy,
+                "windows",
+                ErrorKind::Unavailable,
+                "Close it and connect again.",
+            ),
+            (
+                Stage::Open,
+                Usb::Disconnected,
+                "macos",
+                ErrorKind::Unavailable,
+                "reconnect it and discover again",
+            ),
+            (
+                Stage::Open,
+                Usb::NotFound,
+                "windows",
+                ErrorKind::Unavailable,
+                "Install WinUSB for it; see https://capturefab.com/docs.html#discovery",
+            ),
+            (
+                Stage::ClaimControl,
+                Usb::Unsupported,
+                "windows",
+                ErrorKind::Unavailable,
+                "WinUSB",
+            ),
+            (
+                Stage::ClaimControl,
+                Usb::Other,
+                "macos",
+                ErrorKind::Unavailable,
+                "another driver or app may hold it",
+            ),
+            (
+                Stage::Open,
+                Usb::Other,
+                "linux",
+                ErrorKind::OperationFailed,
+                "Cannot open USB3 Vision camera acA (/dev/bus/usb/002/003).",
+            ),
+        ];
+        for (stage, kind, os, category, says) in cases {
+            let (got, message) = access_error(stage, kind, "acA", node, os);
+            assert_eq!(got, category, "{kind:?} on {os}: {message}");
+            assert!(message.contains(says), "{kind:?} on {os}: {message}");
+            assert!(message.contains("acA"), "{message}");
+        }
+        assert!(
+            access_error(
+                Stage::ClaimStream,
+                Usb::PermissionDenied,
+                "acA",
+                None,
+                "linux"
+            )
+            .1
+            .starts_with("No permission to claim the stream interface of USB3 Vision camera acA. ")
+        );
+        // The category is typed, so the exit code holds whatever the words.
+        let (kind, message) =
+            access_error(Stage::Open, Usb::PermissionDenied, "acA", node, "linux");
+        let error = Categorized::error(kind, message).context("connect usb:2676:ba02:1");
+        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+    }
     #[test]
     fn u3v_is_not_every_miscellaneous_device() {
         assert!(is_u3v_interface(0xef, 5, 0));

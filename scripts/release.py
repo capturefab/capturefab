@@ -21,6 +21,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 LINE_COMPUTER = re.search(r'^repository\s*=\s*"([^"]+)"', (ROOT / 'Cargo.toml').read_text(), re.M)[1] + '/blob/main/docs/line-computer.md'
+# The udev rule for USB3 Vision cameras, shipped in Linux archives under share/udev/rules.d.
+UDEV_RULE = '70-capturefab-usb3vision.rules'
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
 # No 32-bit ARM: Raspberry Pi 3 and later run the 64-bit Raspberry Pi OS.
 TARGETS = [(os_, arch) for os_, arches in [('linux', ['x86_64', 'aarch64']), ('macos', ['x86_64', 'aarch64']), ('windows', ['x86_64', 'aarch64'])] for arch in arches]
@@ -501,10 +503,17 @@ def package(args, binary):
                 icons = stage / 'share/icons/hicolor' / size / 'apps'
                 icons.mkdir(parents=True)
                 shutil.copy2(ROOT / f'assets/icons/capturefab.{suffix}', icons / f'capturefab.{suffix}')
+            rules = stage / 'share/udev/rules.d'
+            rules.mkdir(parents=True)
+            shutil.copy2(ROOT / f'assets/udev/{UDEV_RULE}', rules / UDEV_RULE)
             (stage / 'INSTALL-DESKTOP.txt').write_text(
                 'To add Capturefab to your application launcher, install capturefab on your PATH,\n'
                 'then copy the contents of share/ into ~/.local/share/ (or /usr/local/share/\n'
                 'for all users). Keep the applications/ and icons/ subdirectories intact.\n'
+                '\n'
+                'USB3 Vision cameras: copying share/ into ~/.local/share does not install the\n'
+                'udev rule that lets you open them. Install it once, then replug the camera:\n'
+                '  sudo install -m 644 share/udev/rules.d/70-capturefab-usb3vision.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add\n'
             )
         path = output / (stem + ('.zip' if args.os in ['macos', 'windows'] else '.tar.gz'))
         archive_tree(stage, path, stem)

@@ -7,6 +7,8 @@
 use crate::analytics::human_bytes;
 use crate::efficiency::{self, Mode, Resolved};
 use crate::ipc::LoginDir;
+use crate::media::FfmpegHealth;
+use crate::network::{InterfaceKind, NetworkInterface};
 use crate::storage::{FREE_SPACE_FLOOR, StoragePolicy};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -25,6 +27,11 @@ const LINE_COMPUTER: &str = concat!(
     env!("CARGO_PKG_REPOSITORY"),
     "/blob/main/docs/line-computer.md"
 );
+/// The udev rule Linux archives ship in share/udev/rules.d, and the fix for
+/// `usb_access` writes: the logged-in seat user and the plugdev group may
+/// open any device with a USB3 Vision interface (class ef/05/00).
+const UDEV_RULE: &str = r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ef0500:*", MODE="0660", GROUP="plugdev", TAG+="uaccess""#;
+const UDEV_RULE_FILE: &str = "70-capturefab-usb3vision.rules";
 /// Room for two frames of a 16 MiB GigE camera; the value the GigE transport
 /// already suggests when its receive buffer comes up short.
 const GIGE_RECEIVE_BUFFER: u64 = 32 << 20;
@@ -115,7 +122,6 @@ pub struct Limits {
 struct UsbCamera {
     name: String,
     node: PathBuf,
-    vendor: String,
     accessible: bool,
 }
 
@@ -147,6 +153,16 @@ struct Facts {
     working_directory: Place,
     /// The default capture folder's disk, where `storage --json` measures.
     captures: Place,
+    /// IPv4 adapters, for the full report only: `serve`'s warnings never
+    /// need them, and on Windows listing them runs PowerShell.
+    interfaces: Option<Vec<NetworkInterface>>,
+    /// Whether FFmpeg runs, or why not.
+    ffmpeg: Result<FfmpegHealth, String>,
+    /// CAPTUREFAB_FFMPEG chose FFmpeg.
+    ffmpeg_overridden: bool,
+    /// The runtime or state directory, where it exists but sessions would
+    /// refuse it, and why.
+    private_dirs: Vec<(PathBuf, String)>,
 }
 /// Where a service started without XDG_RUNTIME_DIR keeps sessions, out of
 /// this login's sight, the login runtime directory it passes over and why,
@@ -158,10 +174,24 @@ struct ServiceDir {
     running: Vec<String>,
 }
 impl Facts {
-    fn gather() -> Self {
+    /// `report` also lists network adapters, which only `doctor` shows.
+    fn gather(report: bool) -> Self {
         let state = crate::ipc::state_dir();
         let (budget, used) = ledger(&state);
+        let mut private_dirs = Vec::new();
+        for dir in [crate::ipc::runtime_dir(), state.clone()] {
+            if dir.exists()
+                && !private_dirs.iter().any(|(seen, _)| *seen == dir)
+                && let Err(error) = crate::ipc::check_private_dir(&dir)
+            {
+                private_dirs.push((dir, format!("{error:#}")));
+            }
+        }
         Self {
+            interfaces: report.then(|| crate::network::interfaces().unwrap_or_default()),
+            ffmpeg: crate::media::ffmpeg_health().map_err(|error| format!("{error:#}")),
+            ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG").is_some(),
+            private_dirs,
             efficiency: efficiency::current(),
             #[cfg(feature = "gui")]
             desktop: crate::gui::saved_performance(),
@@ -209,7 +239,7 @@ impl HostReport {
         }
     }
     pub fn finish(self, report: &mut Value) {
-        let mut facts = Facts::gather();
+        let mut facts = Facts::gather(true);
         facts.graphics = self.graphics.map(|probe| {
             probe
                 .join()
@@ -235,7 +265,7 @@ impl HostReport {
 
 /// For `serve`: one line naming what `doctor` warns about.
 pub fn print_warnings() {
-    let warnings: Vec<String> = checks(&Facts::gather())
+    let warnings: Vec<String> = checks(&Facts::gather(false))
         .into_iter()
         .filter(|check| check.level == Level::Warn)
         .map(|check| check.message)
@@ -289,7 +319,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     }
     writeln!(
         out,
-        "More: {GUIDE}. doctor --json adds compiled features, scanners, JPEG encoders and network interfaces."
+        "More: {GUIDE}. `capturefab network-scan` checks GigE adapters and camera links; `capturefab ffmpeg` lists codecs; doctor --json adds compiled features, scanners, JPEG encoders and network interfaces."
     )?;
     if report["os"] == "linux" {
         writeln!(out, "Running it as a service: {LINE_COMPUTER}")?;
@@ -316,6 +346,13 @@ fn checks(facts: &Facts) -> Vec<Check> {
         )
     }));
     checks.push(session_check(&facts.state, facts.session_dir_set));
+    checks.extend(private_dirs_check(&facts.private_dirs));
+    checks.extend(facts.interfaces.as_deref().map(camera_network_check));
+    checks.push(ffmpeg_check(
+        &facts.ffmpeg,
+        facts.ffmpeg_overridden,
+        cfg!(debug_assertions),
+    ));
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
     checks.extend(
@@ -510,6 +547,122 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
     check
 }
 
+/// A runtime or state directory that sessions refuse to use.
+fn private_dirs_check(problems: &[(PathBuf, String)]) -> Option<Check> {
+    if problems.is_empty() {
+        return None;
+    }
+    let messages: Vec<&str> = problems.iter().map(|(_, why)| why.as_str()).collect();
+    let foreign = problems
+        .iter()
+        .any(|(_, why)| why.contains("belongs to another user") || why.contains("real directory"));
+    let dirs: Vec<String> = problems
+        .iter()
+        .map(|(dir, _)| shell_word(&dir.display().to_string()))
+        .collect();
+    Some(Check::warn(
+        "private_dirs",
+        format!(
+            "Sessions, captures and discovery cannot start: {}.",
+            messages.join("; ")
+        ),
+        if foreign {
+            "Set CAPTUREFAB_SESSION_DIR to a folder of your own.".into()
+        } else {
+            format!(
+                "chmod 700 {}  # or set CAPTUREFAB_SESSION_DIR to another folder",
+                dirs.join(" ")
+            )
+        },
+    ))
+}
+/// `word` quoted for a POSIX shell when it needs it.
+fn shell_word(word: &str) -> String {
+    if word
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"/._-+:@".contains(&b))
+    {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// Wired adapters a GigE Vision camera could use. Never a warning: most
+/// computers have none and need none, and `serve` prints every warning.
+fn camera_network_check(interfaces: &[NetworkInterface]) -> Check {
+    let wired: Vec<String> = interfaces
+        .iter()
+        .filter(|interface| {
+            interface.kind == InterfaceKind::Wired
+                && interface.up != Some(false)
+                && !interface.address.is_loopback()
+        })
+        .map(|interface| {
+            let prefix = u32::from(interface.netmask).count_ones();
+            let mut text = format!("{} {}/{prefix}", interface.name, interface.address);
+            match interface.mtu {
+                Some(mtu) if mtu > 1500 => text.push_str(&format!(", MTU {mtu}")),
+                Some(mtu) => text.push_str(&format!(", MTU {mtu}: jumbo frames off")),
+                None => {}
+            }
+            if interface.address.is_link_local() {
+                text.push_str(", a link-local address; cameras without DHCP use these too");
+            }
+            text
+        })
+        .collect();
+    Check::ok(
+        "camera_network",
+        if wired.is_empty() {
+            "No wired Ethernet adapter is up. GigE Vision cameras need one; webcams, USB3 and network streams do not. `capturefab network-scan` checks a camera link.".into()
+        } else {
+            format!("Wired Ethernet for GigE Vision: {}.", wired.join("; "))
+        },
+    )
+}
+
+/// Whether FFmpeg, which every webcam, stream, file and recording goes
+/// through, starts. `dev` is a development build, which embeds whatever
+/// `scripts/build-ffmpeg.sh` left.
+fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, dev: bool) -> Check {
+    match health {
+        Ok(health) => {
+            let named = match health
+                .version
+                .strip_prefix("ffmpeg version ")
+                .and_then(|rest| rest.split_whitespace().next())
+            {
+                Some(version) => format!("FFmpeg {version}"),
+                None => "FFmpeg".into(),
+            };
+            let from = if health.source == "bundled" {
+                "bundled".to_owned()
+            } else {
+                format!("{}={}", health.source, health.path)
+            };
+            Check::ok(
+                "ffmpeg",
+                format!("{named} ({from}) runs; webcams, RTSP/SRT, files and recording use it."),
+            )
+        }
+        Err(error) => Check::warn(
+            "ffmpeg",
+            format!(
+                "Webcams, RTSP/SRT, files and recording need FFmpeg, which does not run: {}.",
+                error.trim_end_matches('.')
+            ),
+            if overridden {
+                "Set CAPTUREFAB_FFMPEG to the absolute path of an FFmpeg executable, or unset it to use the bundled one.".into()
+            } else if dev {
+                "Run scripts/build-ffmpeg.sh and rebuild, or set CAPTUREFAB_FFMPEG to an FFmpeg executable.".into()
+            } else {
+                "Reinstall Capturefab from https://capturefab.com/downloads.html, or set CAPTUREFAB_FFMPEG to an FFmpeg executable.".into()
+            },
+        ),
+    }
+}
+
 fn receive_buffer_check(rmem_max: u64) -> Check {
     let frame = human_bytes(rmem_max / 2);
     if rmem_max < GIGE_RECEIVE_BUFFER {
@@ -550,29 +703,17 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
         .iter()
         .map(|c| format!("{} ({})", c.name, c.node.display()))
         .collect();
-    let mut vendors: Vec<&str> = denied.iter().map(|c| c.vendor.as_str()).collect();
-    vendors.sort_unstable();
-    vendors.dedup();
-    // One file per vendor, so a later fix for another camera cannot replace
-    // the rule an earlier one wrote.
-    let rules: Vec<String> = vendors
-        .iter()
-        .map(|vendor| {
-            format!(
-                "echo 'SUBSYSTEM==\"usb\", ATTR{{idVendor}}==\"{vendor}\", MODE=\"0660\", GROUP=\"plugdev\", TAG+=\"uaccess\"' | sudo tee /etc/udev/rules.d/60-capturefab-{vendor}.rules >/dev/null"
-            )
-        })
-        .collect();
     Some(Check::warn(
         "usb_access",
         format!(
             "No read/write access to USB3 Vision camera {}.",
             names.join(", ")
         ),
-        // The note is a shell comment, so the whole line still pastes and runs.
+        // One rule for the USB3 Vision class covers every camera plugged in
+        // later. The note is a shell comment, so the whole line still pastes
+        // and runs.
         format!(
-            "{} && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb  # services also need their user in the plugdev group; see {LINE_COMPUTER}",
-            rules.join(" && ")
+            "echo '{UDEV_RULE}' | sudo tee /etc/udev/rules.d/{UDEV_RULE_FILE} >/dev/null && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add  # services also need their user in the plugdev group; see {LINE_COMPUTER}"
         ),
     ))
 }
@@ -766,7 +907,6 @@ fn usb_cameras() -> Vec<UsbCamera> {
             Some(UsbCamera {
                 name: if product.is_empty() { device } else { product },
                 node,
-                vendor: read(dir.join("idVendor")),
                 accessible,
             })
         })
@@ -1168,7 +1308,6 @@ mod tests {
         let camera = UsbCamera {
             name: "acA1920-155um".into(),
             node: "/dev/bus/usb/002/003".into(),
-            vendor: "2676".into(),
             accessible: true,
         };
         assert_eq!(
@@ -1179,16 +1318,36 @@ mod tests {
             accessible: false,
             ..camera
         };
-        let check = usb_check(&[denied.clone(), denied.clone()]).unwrap();
+        let other = UsbCamera {
+            name: "BFS-U3-16S2M".into(),
+            node: "/dev/bus/usb/002/004".into(),
+            accessible: false,
+        };
+        let check = usb_check(&[denied, other]).unwrap();
         assert_eq!(check.level, Level::Warn);
-        assert!(
-            check
-                .message
-                .contains("acA1920-155um (/dev/bus/usb/002/003)")
-        );
+        for name in [
+            "acA1920-155um (/dev/bus/usb/002/003)",
+            "BFS-U3-16S2M (/dev/bus/usb/002/004)",
+        ] {
+            assert!(check.message.contains(name), "{}", check.message);
+        }
+        // One class rule, whatever the vendors, so a camera plugged in later
+        // needs no fix of its own.
         let fix = check.fix.unwrap();
-        assert_eq!(fix.matches("idVendor").count(), 1, "{fix}");
-        assert!(fix.contains(r#"ATTR{idVendor}=="2676""#), "{fix}");
+        assert_eq!(
+            fix.matches("/etc/udev/rules.d/70-capturefab-usb3vision.rules")
+                .count(),
+            1,
+            "{fix}"
+        );
+        assert!(
+            fix.contains(r#"ENV{ID_USB_INTERFACES}=="*:ef0500:*""#),
+            "{fix}"
+        );
+        assert!(
+            !fix.contains("60-capturefab-") && !fix.contains("idVendor"),
+            "{fix}"
+        );
         assert!(fix.contains("udevadm trigger"), "{fix}");
         assert!(
             fix.ends_with("  # services also need their user in the plugdev group; see https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md"),
@@ -1207,28 +1366,141 @@ mod tests {
                 String::from_utf8_lossy(&parsed.stderr)
             );
         }
-        // Each vendor gets its own file, so fixing a camera plugged in later
-        // keeps the rule that already gives this one access.
-        let other = UsbCamera {
-            name: "BFS-U3-16S2M".into(),
-            node: "/dev/bus/usb/002/004".into(),
-            vendor: "1e10".into(),
-            accessible: false,
-        };
-        let fix = usb_check(std::slice::from_ref(&other))
-            .unwrap()
-            .fix
-            .unwrap();
+    }
+
+    fn adapter(
+        name: &str,
+        address: [u8; 4],
+        prefix: u32,
+        kind: InterfaceKind,
+        mtu: u32,
+    ) -> NetworkInterface {
+        NetworkInterface {
+            name: name.into(),
+            address: address.into(),
+            netmask: std::net::Ipv4Addr::from(u32::MAX << (32 - prefix)),
+            mtu: Some(mtu),
+            speed_mbps: Some(1000),
+            kind,
+            up: Some(true),
+        }
+    }
+
+    #[test]
+    fn camera_network_lists_wired_adapters_without_warning() {
+        let wifi = adapter("en0", [192, 168, 1, 23], 24, InterfaceKind::Wireless, 1500);
+        let vpn = adapter("utun3", [10, 8, 0, 2], 24, InterfaceKind::Other, 1380);
+        let lo = adapter("lo0", [127, 0, 0, 1], 8, InterfaceKind::Loopback, 16384);
+        let jumbo = adapter("en5", [192, 168, 10, 1], 24, InterfaceKind::Wired, 9000);
+        let standard = adapter("en6", [169, 254, 7, 9], 16, InterfaceKind::Wired, 1500);
+        let mut down = adapter("en7", [192, 168, 20, 1], 24, InterfaceKind::Wired, 1500);
+        down.up = Some(false);
+        let check = camera_network_check(&[wifi.clone(), jumbo, standard, down, vpn.clone(), lo]);
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(
+            check.message,
+            "Wired Ethernet for GigE Vision: en5 192.168.10.1/24, MTU 9000; en6 169.254.7.9/16, MTU 1500: jumbo frames off, a link-local address; cameras without DHCP use these too."
+        );
+        let none = camera_network_check(&[wifi, vpn]);
+        assert_eq!(none.level, Level::Ok);
+        assert_eq!(none.fix, None);
         assert!(
-            fix.contains("sudo tee /etc/udev/rules.d/60-capturefab-1e10.rules"),
+            none.message.starts_with("No wired Ethernet adapter is up.")
+                && none.message.contains("`capturefab network-scan`"),
+            "{}",
+            none.message
+        );
+    }
+
+    #[test]
+    fn ffmpeg_check_says_what_needs_it_and_how_to_get_it() {
+        let bundled = Ok(FfmpegHealth {
+            source: "bundled",
+            path: "/home/pi/.cache/capturefab/ffmpeg-0123/ffmpeg".into(),
+            version: "ffmpeg version 7.1.1 Copyright (c) 2000-2025 the FFmpeg developers".into(),
+        });
+        let check = ffmpeg_check(&bundled, false, false);
+        assert_eq!(
+            (check.level, check.message.as_str()),
+            (
+                Level::Ok,
+                "FFmpeg 7.1.1 (bundled) runs; webcams, RTSP/SRT, files and recording use it."
+            )
+        );
+        let chosen = Ok(FfmpegHealth {
+            source: "CAPTUREFAB_FFMPEG",
+            path: "/opt/ffmpeg/bin/ffmpeg".into(),
+            version: "ffmpeg version n7.0".into(),
+        });
+        assert_eq!(
+            ffmpeg_check(&chosen, true, false).message,
+            "FFmpeg n7.0 (CAPTUREFAB_FFMPEG=/opt/ffmpeg/bin/ffmpeg) runs; webcams, RTSP/SRT, files and recording use it."
+        );
+        let missing =
+            Err("cannot launch FFmpeg: No such file or directory (os error 2)".to_owned());
+        let check = ffmpeg_check(&missing, true, false);
+        assert_eq!(check.level, Level::Warn);
+        assert_eq!(
+            check.message,
+            "Webcams, RTSP/SRT, files and recording need FFmpeg, which does not run: cannot launch FFmpeg: No such file or directory (os error 2)."
+        );
+        assert!(check.fix.unwrap().contains("unset it"));
+        assert!(
+            ffmpeg_check(&missing, false, true)
+                .fix
+                .unwrap()
+                .starts_with("Run scripts/build-ffmpeg.sh")
+        );
+        assert!(
+            ffmpeg_check(&missing, false, false)
+                .fix
+                .unwrap()
+                .starts_with("Reinstall Capturefab")
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_shared_session_directory_warns_with_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("capturefab-doctor-private-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let problem = crate::ipc::check_private_dir(&dir).unwrap_err();
+        let check = private_dirs_check(&[(dir.clone(), format!("{problem:#}"))]).unwrap();
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.message.contains("must be private"),
+            "{}",
+            check.message
+        );
+        let fix = check.fix.unwrap();
+        assert!(
+            fix.starts_with(&format!("chmod 700 {}", dir.display())),
             "{fix}"
         );
-        assert!(!fix.contains("2676"), "{fix}");
-        assert!(!fix.contains("tee /etc/udev/rules.d/60-capturefab.rules"));
-        let both = usb_check(&[denied, other]).unwrap().fix.unwrap();
-        for file in ["60-capturefab-2676.rules", "60-capturefab-1e10.rules"] {
-            assert_eq!(both.matches(file).count(), 1, "{both}");
-        }
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(crate::ipc::check_private_dir(&dir).is_ok());
+        assert_eq!(private_dirs_check(&[]), None);
+        let foreign = private_dirs_check(&[(
+            dir.clone(),
+            "session directory /tmp/x belongs to another user".into(),
+        )])
+        .unwrap();
+        assert!(foreign.fix.unwrap().contains("CAPTUREFAB_SESSION_DIR"));
+        assert_eq!(shell_word("/tmp/a b"), "'/tmp/a b'");
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn the_shipped_udev_rule_is_the_one_doctor_writes() {
+        let shipped = include_str!("../assets/udev/70-capturefab-usb3vision.rules");
+        let rules: Vec<&str> = shipped
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+            .collect();
+        assert_eq!(rules, [UDEV_RULE]);
     }
 
     #[test]

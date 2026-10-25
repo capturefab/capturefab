@@ -2229,7 +2229,17 @@ fn doctor_reports_destination_features() {
             && matches!(check["level"].as_str(), Some("ok" | "warn"))
             && check["message"].is_string()
     }));
-    assert!(checks.iter().any(|check| check["id"] == "efficiency"));
+    for id in ["efficiency", "camera_network", "ffmpeg"] {
+        assert!(checks.iter().any(|check| check["id"] == id), "{id}");
+    }
+    // A private session directory raises nothing.
+    assert!(!checks.iter().any(|check| check["id"] == "private_dirs"));
+    // camera_network informs; serve prints every warning at start.
+    assert!(
+        checks
+            .iter()
+            .any(|check| check["id"] == "camera_network" && check["level"] == "ok")
+    );
     assert!(
         doctor["graphics"]["available"].is_boolean(),
         "{}",
@@ -2275,6 +2285,109 @@ fn doctor_reports_destination_features() {
     let text = schema.to_string();
     assert!(text.contains("add-folder"));
     assert!(schema.get("uploads").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn doctor_warns_when_ffmpeg_does_not_run_and_when_sessions_are_shared() {
+    let dir = temp_root("doctor-ffmpeg");
+    std::fs::create_dir_all(&dir).unwrap();
+    let missing = dir.join("missing-ffmpeg");
+    let env = [("CAPTUREFAB_FFMPEG", missing.to_str().unwrap())];
+    let doctor = json_env(&dir, &env, &["--json", "doctor"]);
+    let check = |id: &str| {
+        doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} check: {doctor}"))
+    };
+    let ffmpeg = check("ffmpeg");
+    assert_eq!(ffmpeg["level"], "warn", "{ffmpeg}");
+    assert!(
+        ffmpeg["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Webcams, RTSP/SRT, files and recording need FFmpeg"),
+        "{ffmpeg}"
+    );
+    assert!(
+        ffmpeg["fix"]
+            .as_str()
+            .unwrap()
+            .contains("CAPTUREFAB_FFMPEG")
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let doctor = json(&dir, &["--json", "doctor"]);
+        let private = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["id"] == "private_dirs")
+            .cloned()
+            .unwrap_or_else(|| panic!("{doctor}"));
+        assert_eq!(private["level"], "warn");
+        assert!(
+            private["fix"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("chmod 700 {}", dir.display())),
+            "{private}"
+        );
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_address_without_a_gige_camera_suggests_other_sources() {
+    let dir = temp_root("gige-refused");
+    let out = cmd(
+        &dir,
+        &[
+            "--json",
+            "--timeout-ms",
+            "500",
+            "info",
+            "--camera",
+            "127.0.0.1",
+        ],
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(3), "{reply}");
+    assert_eq!(reply["error"]["code"], "unavailable", "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("onvif://127.0.0.1"), "{message}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_refused_rtsp_stream_explains_itself_in_one_line() {
+    let dir = temp_root("rtsp-refused");
+    let out = cmd(
+        &dir,
+        &[
+            "--json",
+            "info",
+            "--camera",
+            "rtsp://user:secret@127.0.0.1:1/x",
+        ],
+    );
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(3), "{reply}");
+    assert_eq!(reply["error"]["code"], "unavailable", "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("127.0.0.1:1"), "{message}");
+    assert!(
+        !message.contains('\n') && !message.contains("secret") && !message.contains("@ 0x"),
+        "{message}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
