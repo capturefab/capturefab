@@ -1961,27 +1961,55 @@ fn merge(mut modes: Vec<Mode>, mode: Mode) -> Vec<Mode> {
     }
     modes
 }
+/// The modes FFmpeg's AVFoundation input can open, from its listing of each
+/// format's frame rate ranges. It makes the last format of the requested
+/// size active and applies the range of any same-size format whose maximum
+/// is the requested rate, which the active format accepts when one of its
+/// own ranges holds it.
 fn avfoundation_modes(log: &str) -> Vec<Mode> {
-    let mut modes: Vec<Mode> = Vec::new();
-    for mode in log.lines().filter_map(|line| {
+    type Format = ((u32, u32), Vec<(f64, f64)>);
+    let mut formats: Vec<Format> = Vec::new();
+    for (size, range) in log.lines().filter_map(|line| {
         let (head, tail) = line.trim_end().split_once("@[")?;
-        let (width, height) = dimensions(head.rsplit(' ').next()?)?;
-        let high = rate(tail.strip_suffix("]fps")?.split_once(' ')?.1)?;
-        Some(Mode {
-            width,
-            height,
-            fps: Some((high, high)),
-            input_format: None,
-            intervals: None,
-        })
+        let size = dimensions(head.rsplit(' ').next()?)?;
+        let (low, high) = tail.strip_suffix("]fps")?.split_once(' ')?;
+        Some((size, (rate(low)?, rate(high)?)))
     }) {
-        if modes
-            .last()
-            .is_none_or(|last| last.size() != mode.size() || last.fps <= mode.fps)
-        {
-            modes.retain(|m| m.size() != mode.size());
+        // A format lists its ranges from the fastest down.
+        match formats.last_mut() {
+            Some((last, ranges))
+                if *last == size && ranges.last().is_some_and(|r| r.1 > range.1) =>
+            {
+                ranges.push(range)
+            }
+            _ => formats.push((size, vec![range])),
         }
-        modes.push(mode);
+    }
+    let mut modes: Vec<Mode> = Vec::new();
+    for (index, (size, ranges)) in formats.iter().enumerate() {
+        if formats[index + 1..].iter().any(|(other, _)| other == size) {
+            continue;
+        }
+        let earlier = formats[..index]
+            .iter()
+            .filter(|(other, _)| other == size)
+            .flat_map(|(_, earlier)| earlier.iter().map(|range| range.1))
+            .filter(|&high| {
+                ranges
+                    .iter()
+                    .any(|&(low, top)| high > low - 0.01 && high < top + 0.01)
+            });
+        for high in ranges.iter().map(|range| range.1).chain(earlier) {
+            if !modes.iter().any(|m| m.size() == *size && m.honors(high)) {
+                modes.push(Mode {
+                    width: size.0,
+                    height: size.1,
+                    fps: Some((high, high)),
+                    input_format: None,
+                    intervals: None,
+                });
+            }
+        }
     }
     modes
 }
@@ -7677,11 +7705,33 @@ Error opening input files: Input/output error
             ]
         );
         let iphone = avfoundation_modes(IPHONE_MODES);
+        // Continuity Camera: the 60 fps format of each size also runs at the
+        // 30 fps its sibling format lists.
         assert_eq!(
             labels(&iphone),
-            ["640x480@60", "1280x720@60", "1920x1080@60", "1920x1440@30"]
+            [
+                "640x480@60",
+                "640x480@30",
+                "1280x720@60",
+                "1280x720@30",
+                "1920x1080@60",
+                "1920x1080@30",
+                "1920x1440@30"
+            ]
         );
         assert!(iphone[0].honors(59.995) && !iphone[0].honors(59.98) && !iphone[0].honors(30.0));
+        assert!(iphone[1].honors(30.0) && !iphone.iter().any(|m| m.honors(45.0)));
+        let mut camera = native("avfoundation:iPhone Camera", iphone.clone());
+        camera
+            .configure(NativeOptions {
+                size: Some((1920, 1080)),
+                fps: Some(30.0),
+            })
+            .unwrap();
+        assert_eq!(
+            camera.input_options()[..4],
+            ["-framerate", "30", "-video_size", "1920x1080"]
+        );
         assert_eq!(
             iphone[best(&iphone, |_| true).unwrap()].label(),
             "1920x1440@30"
