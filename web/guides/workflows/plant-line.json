@@ -1,0 +1,44 @@
+{
+  "version": 1,
+  "steps": [
+    {
+      "command": {
+        "op": "dataset_open",
+        "path": "plant/line1.duckdb",
+        "mode": "auto"
+      }
+    },
+    {
+      "command": {
+        "op": "connect",
+        "camera": "sim:0",
+        "timeout_ms": 2000
+      }
+    },
+    {
+      "command": {
+        "op": "dataset_note",
+        "text": "shift A start",
+        "context": {
+          "line": "L1"
+        }
+      }
+    },
+    {
+      "camera": "sim:0",
+      "command": {
+        "op": "capture",
+        "output": "plant/{date}/{camera}-{datetime}-{seq}.png",
+        "count": 1,
+        "timeout_ms": 2000,
+        "format": "png",
+        "on_exists": "number",
+        "context": {
+          "line": "L1",
+          "station": "S2",
+          "part": "A-100"
+        }
+      }
+    }
+  ]
+}

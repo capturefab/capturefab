@@ -9,7 +9,7 @@
 <link rel="icon" href="favicon.svg" type="image/svg+xml"><link rel="canonical" href="https://capturefab.com/desktop.html">
 <script src="app.js" defer></script><script src="docs.js" defer></script>
 </head><body class="docs-page"><a class="skip-link" href="#main">Skip to documentation</a><div class="shell">
-<header class="site-header"><a class="wordmark" href="index.html" aria-label="Capturefab home"><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</a><nav aria-label="Main navigation"><a href="index.html">Product</a><a href="docs.html" aria-current="page">Documentation</a><a href="downloads.html">Downloads</a><a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a></nav><a class="search-trigger" href="docs.html#search" aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a></header>
+<header class="site-header"><a class="wordmark" href="index.html" aria-label="Capturefab home"><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</a><nav aria-label="Main navigation"><a href="index.html">Product</a><a href="docs.html" aria-current="page">Documentation</a><a href="downloads.html">Downloads</a><a href="downloads.html#source">Source</a></nav><a class="search-trigger" href="docs.html#search" aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a></header>
 <main id="main" class="docs-layout"><aside class="docs-sidebar" aria-label="Documentation navigation"><div class="sidebar-group"><p>Desktop and browser</p><a href="#windows">Open cameras in separate windows</a><a href="#menus">Find desktop commands</a><a href="#settings">Change desktop preferences</a><a href="#camera-controls">Connect, configure and examine cameras</a><a href="#image-view">Read the image view</a><a href="#capture-controls">Save and review desktop output</a><a href="#performance">Control preview performance</a><a href="#resources">Measure resource use and set limits</a><a href="#acquisition-analytics">Read session acquisition analytics</a><a href="#prompt-measurements">Collect numeric measurements with a model</a><a href="#keyboard">Use keyboard controls</a><a href="#remote-browser">Control a server from a browser</a><a href="#remote-monitoring">Read server monitoring endpoints</a></div><a class="sidebar-source" href="docs.html">All documentation topics</a><a class="sidebar-source" href="reference.html">CLI and automation reference</a></aside><div class="docs-content"><details class="docs-mobile-nav"><summary>Browse desktop and browser topics</summary><nav aria-label="Desktop and browser topics"><a href="#windows">Open cameras in separate windows</a><a href="#menus">Find desktop commands</a><a href="#settings">Change desktop preferences</a><a href="#camera-controls">Connect, configure and examine cameras</a><a href="#image-view">Read the image view</a><a href="#capture-controls">Save and review desktop output</a><a href="#performance">Control preview performance</a><a href="#resources">Measure resource use and set limits</a><a href="#acquisition-analytics">Read session acquisition analytics</a><a href="#prompt-measurements">Collect numeric measurements with a model</a><a href="#keyboard">Use keyboard controls</a><a href="#remote-browser">Control a server from a browser</a><a href="#remote-monitoring">Read server monitoring endpoints</a><a href="docs.html">All documentation topics</a></nav></details>
 <header class="docs-head"><p class="eyebrow">Documentation / Reference</p><h1>Desktop and browser controls</h1><p class="lead">Find an action, understand its effect and read its limits. Use the task guides for step-by-step capture workflows.</p></header>
 <article class="doc-section" id="windows" data-doc-section data-doc-title="Open cameras in separate windows" data-doc-category="Desktop and browser" data-doc-tags="desktop,windows,multiple cameras,close,quit,preferences"><h2>Open cameras in separate windows</h2>
@@ -27,17 +27,17 @@
 <div class="table-scroll"><table><caption>Desktop menu reference</caption><thead><tr><th>Menu</th><th>Actions</th></tr></thead><tbody>
 <tr><td>File</td><td>Connect to Camera…, Enter Camera Address, Quick Command…, Discover Cameras, Capture and Save, Start/Stop Recording, Schedule Capture, Set Up Recording or Forwarding…, Manage Destinations…, Close Window.</td></tr>
 <tr><td>Edit</td><td>Undo, Redo, Cut, Copy, Paste, Select All, Find Camera Feature…, Copy Session Command.</td></tr>
-<tr><td>View</td><td>Show Sidebar, Show Inspector, Show Activity, Camera Features, Capture, Record and Forward, Zoom In/Out, Zoom to Fit, Actual Pixels, Show Histogram, Show Focus Region, Image Only, Full Screen.</td></tr>
+<tr><td>View</td><td>Show Sidebar, Show Inspector, Show Activity, Camera Features, Capture, Record and Forward, Zoom In/Out, Zoom to Fit, Actual Pixels, Show Histogram, Show Focus Region, Image Only, Enter/Exit Full Screen.</td></tr>
 <tr><td>Camera</td><td>Start/Stop Stream, Use Auto/Manual Exposure, Refresh Features, Save Setup…, Restore Setup…, Start/Stop All Streams, Capture All, Record All Cameras, Stop All Recordings, Use Auto/Manual Exposure for All, Disconnect Camera.</td></tr>
-<tr><td>Help</td><td>Connect an Agent…, Capturefab Help and, on Windows and Linux, Check for Updates….</td></tr>
+<tr><td>Help</td><td>Capturefab Help, Connect an Agent…, Documentation, Troubleshooting, Release Notes, Report a Problem… and, on Windows and Linux, About Capturefab and Check for Updates….</td></tr>
 </tbody></table></div>
-<p>On macOS, the application menu contains Check for Updates…, Settings and Quit. On Windows and Linux, File contains Exit or Quit. When a check finds a new version, the item reads <strong>Update Available: VERSION…</strong>; see <a href="#settings-updates">update checks</a>.</p>
+<p>On macOS, the application menu contains About Capturefab, Check for Updates…, Settings… and Quit Capturefab. On Windows and Linux, File contains Exit or Quit. When a check finds a new version, the item reads <strong>Update Available: VERSION…</strong>; see <a href="#settings-updates">update checks</a>.</p>
 <p><strong>Capture All</strong> saves from every connected camera. The other “All” commands operate on eligible connected cameras. Document scanners do not stream or record video.</p>
 <p>Use <strong>Copy Session Command</strong> to give a terminal the current session name. Use <strong>Connect an Agent…</strong> for an agent briefing.</p>
 <p>For detailed procedures, see <a href="docs.html#capture">capture</a>, <a href="docs.html#scheduling">schedules</a>, <a href="docs.html#recording">recording</a> and <a href="docs.html#forwarding">forwarding</a>.</p>
 </article>
 <article class="doc-section" id="settings" data-doc-section data-doc-title="Change desktop preferences" data-doc-category="Desktop and browser" data-doc-tags="settings,appearance,light,dark,system,interface size,discovery,preferences"><h2>Change desktop preferences</h2>
-<p class="doc-summary">Open Settings from the toolbar or application menu. Preferences apply immediately, except API keys.</p>
+<p class="doc-summary">Open Settings from the camera picker, the macOS application menu, or with ⌘, or Ctrl+,. Preferences apply immediately, except API keys.</p>
 <div class="table-scroll"><table><caption>Settings and their effects</caption><thead><tr><th>Setting</th><th>Choices and behavior</th></tr></thead><tbody>
 <tr><td>AI assistant</td><td>Configure the provider, model, credentials and assistant defaults. <a href="docs.html#apple-intelligence">Apple Intelligence</a> uses the local system model and no API key.</td></tr>
 <tr><td>Appearance</td><td>System follows the computer's appearance. Light and Dark keep the selected appearance.</td></tr>
@@ -206,7 +206,7 @@
 <tr><td>Switch auto/manual</td><td>⇧⌘A</td><td>Ctrl+Shift+A</td></tr>
 <tr><td>Search features</td><td>⌘F</td><td>Ctrl+F</td></tr>
 <tr><td>Features / Capture / Video</td><td>⌘1 / ⌘2 / ⌘3</td><td>Ctrl+1 / Ctrl+2 / Ctrl+3</td></tr>
-<tr><td>Zoom in / out</td><td>⌘+ / ⌘−</td><td>Ctrl++ / Ctrl+−</td></tr>
+<tr><td>Zoom in / out</td><td>⌘+ / ⌘−</td><td>Ctrl+= / Ctrl+−</td></tr>
 <tr><td>Fit / Actual pixels</td><td>⌘0 / ⌥⌘0</td><td>Ctrl+0 / Ctrl+Alt+0</td></tr>
 <tr><td>Activity / Inspector</td><td>⌘J / ⌘I</td><td>Ctrl+J / Ctrl+I</td></tr>
 <tr><td>Show or hide sidebar</td><td>⌥⌘S</td><td>Ctrl+Alt+S</td></tr>
@@ -230,7 +230,7 @@
 <div class="code-wrap"><pre><code>capturefab serve --name remote --listen 127.0.0.1:8787</code></pre><button class="copy-button" type="button" aria-label="Copy local browser server command">Copy</button></div>
 <p>This example accepts connections from the same computer. Use the server's private network address for another computer.</p>
 <p>Anyone who can reach the listener can control the session. Configure host firewall and network access accordingly.</p>
-<p>For tailnet setup, HTTPS and service operation, use the <a href="https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md">remote control guide</a>.</p>
+<p>For tailnet setup, HTTPS and service operation, use the <a href="guides/remote-control.md">remote control guide</a>.</p>
 <div class="table-scroll"><table><caption>Browser controls</caption><thead><tr><th>Area</th><th>Actions and behavior</th></tr></thead><tbody>
 <tr><td>Cameras</td><td>Discover, include simulators, connect by address, select a connected camera and disconnect it.</td></tr>
 <tr><td>Camera settings</td><td>Search advertised features, edit supported values, run device commands, reload features and select auto or manual exposure.</td></tr>
@@ -276,6 +276,6 @@
 <p>Responses use <code>{version, ok, result}</code>, or an error when <code>ok</code> is false. Actor names identify participants; they do not authenticate them.</p>
 <p>Measurement routes expose history only. They do not configure provider credentials or start collection.</p>
 <p>An idle server with no cameras can be ready. A previous camera command error does not by itself fail readiness.</p>
-<p>See the <a href="https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md#http-automation">HTTP automation contract</a> for session commands, activity and preview headers.</p>
+<p>See the <a href="guides/remote-control.md#http-automation">HTTP automation contract</a> for session commands, activity and preview headers.</p>
 </article>
-</div></main><footer class="site-footer"><p>Capturefab · <a href="docs.html">Documentation</a> · <a href="reference.html">CLI reference</a></p><p><a href="https://github.com/capturefab/capturefab/issues">Report a documentation issue</a></p></footer></div></body></html>
+</div></main><footer class="site-footer"><p>Capturefab · <a href="docs.html">Documentation</a> · <a href="reference.html">CLI reference</a></p></footer></div></body></html>

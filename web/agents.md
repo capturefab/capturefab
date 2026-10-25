@@ -372,7 +372,7 @@ The maximum timeout is 25000 ms.
 
 `POST /api/command` accepts `actor:{id,name,kind}` beside `version`, `camera` and `command`.
 Actor metadata identifies participants; it does not authenticate them.
-See [remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md).
+See [remote control](https://capturefab.com/guides/remote-control.md).
 
 A schedule's `succeeded` state acknowledges creation.
 Its `entry.job` tracks identity, worker PID, state, count, captured frames, last file and errors until it ends.
@@ -398,7 +398,7 @@ Previews include an `ETag`.
 Send it in `If-None-Match`; unchanged frames return HTTP 304 without an image.
 Previews are display images.
 For measurement data, capture to a file.
-Follow the [line computer guide](https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md) to run a Linux service.
+Follow the [line computer guide](https://capturefab.com/guides/line-computer.md) to run a Linux service.
 
 Reversible GUI, CLI and RPC changes share each camera worker's bounded history.
 Use `capturefab --session NAME [--camera ID] history --json` to read the next undo and redo labels.
@@ -451,7 +451,7 @@ Apple Intelligence enabled, and its model ready. The build must include the nati
 Run `capturefab assistant test apple_foundation_models --json` to test availability and generation.
 The provider uses no API key, server or reasoning-effort setting. It has no remote fallback.
 It accepts text, numeric observations and permitted data results, but cannot inspect images.
-`--vision on` and `test --vision` are unsupported for this provider.
+`--vision on` and `test --vision` are refused for this provider.
 Tool validation, approval and scope rules still apply. Prompt measurements retain their separate API providers.
 See [Apple Intelligence setup and troubleshooting](https://capturefab.com/docs.html#apple-intelligence).
 
@@ -474,7 +474,7 @@ Environment keys precede saved keys for that provider.
 OpenAI, Gemini and Anthropic share saved keys with prompt measurements; other providers use separate accounts.
 Vertex uses Google Cloud credentials or a Gemini express key; Claude on Vertex must have Google Cloud credentials. ADC model requests renew cached access tokens when due, preserving the endpoint and conversation; an existing ADC session never switches to an express key.
 Bedrock uses a bearer token or the AWS SigV4 chain, with an explicit region.
-See the [assistant guide](https://github.com/capturefab/capturefab/blob/main/docs/assistant.md) for credential precedence and endpoint restrictions.
+See the [assistant guide](https://capturefab.com/guides/assistant.md) for credential precedence and endpoint restrictions.
 
 `use PROVIDER` accepts `--model`, `--base-url`, `--account-id`, `--gateway-id`, `--region`, `--profile`, `--project`, `--location`, `--endpoint`, `--effort low|medium|high` and `--vision auto|on|off`.
 Settings are private non-secret version-1 JSON in `<state_dir>/assistant.json`.
@@ -711,7 +711,7 @@ A client timeout does not cancel an accepted camera command.
 ## Apply repeatable JSON workflows
 
 Use workflow files for ordered camera setup and capture.
-The [workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md) links [examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows) for timelapse, scanner feeders and recordings.
+The [workflow guide](https://capturefab.com/guides/cli-workflows.md) links [examples](https://capturefab.com/guides/cli-workflows.md#start-from-an-example) for timelapse, scanner feeders and recordings.
 
 ```sh
 capturefab workflow validate workflow.json --json
@@ -766,7 +766,7 @@ The session stops that encoder when its deadline arrives.
 
 Dataset steps include `dataset_open`, `dataset_note`, `dataset_export` and `dataset_close` without an outer `camera`.
 Dataset paths resolve like capture outputs.
-[plant-line.json](https://github.com/capturefab/capturefab/blob/main/examples/workflows/plant-line.json) opens a dataset and saves a tagged `{seq}` capture.
+[plant-line.json](https://capturefab.com/guides/workflows/plant-line.json) opens a dataset and saves a tagged `{seq}` capture.
 
 PowerShell can use the same files directly. For stdin, use `Get-Content -Raw workflow.json | capturefab workflow validate - --json`; this changes the output base to the calling directory.
 
@@ -1179,7 +1179,7 @@ Live forwarding resends the last frame during stalls.
 
 `stop-forward` returns `{forwarding:null,stats:{accepted,written,dropped,late,stalled,encoder,error,recording?}}`.
 Timed fallback or interruption adds the conditional-stop result in `stopped`.
-Normal timed completion returns `{"forwarding":null,"by":"duration"}`.
+Normal timed completion returns `"stopped":{"forwarding":null,"by":"duration","stats":{...}}`.
 A resolution change or encoder failure stops recording and retains the video written so far.
 
 Outputs include RTSP, SRT, RTMP, UDP, HTTP and bounded local video files.

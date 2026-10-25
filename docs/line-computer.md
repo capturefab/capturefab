@@ -16,7 +16,7 @@ dpkg --print-architecture
 
 Take the Linux archive for your board. It is the same executable as the desktop app. With no `DISPLAY` or `WAYLAND_DISPLAY` it never opens a window, so you can run `capturefab serve` over SSH or as a service without a screen. From 0.2.2 on it includes the browser client for `serve --listen`; an older archive needs a [separately built client](remote-control.md#get-the-server-and-browser-client) passed with `--web-dir`.
 
-The install script does the choosing and checking for you. It reads `dpkg --print-architecture`, refuses `armhf`, downloads the matching archive from GitHub Releases, checks its SHA-256 before extracting, installs it in `~/.local/share/capturefab/VERSION` and links `~/.local/bin/capturefab`. It does not use `sudo`:
+The install script does the choosing and checking for you. It reads `dpkg --print-architecture`, refuses `armhf`, downloads the matching archive from capturefab.com, checks its SHA-256 before extracting, installs it in `~/.local/share/capturefab/VERSION` and links `~/.local/bin/capturefab`. It does not use `sudo`:
 
 ```sh
 curl -fsSL https://capturefab.com/install.sh | sh -s -- --dry-run   # show the file and checksum it would use
@@ -26,7 +26,7 @@ capturefab doctor
 
 The default `~/.profile` on Debian-based systems adds `~/.local/bin` to `PATH` at your next login once the folder exists; the script prints the line to add when it is missing. To read the script first: `curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh`.
 
-To install by hand instead, download the archive and `SHA256SUMS` from [GitHub Releases](https://github.com/capturefab/capturefab/releases), then check and install it (replace `VERSION` with the release number):
+To install by hand instead, download the archive and `SHA256SUMS` from the [downloads page](https://capturefab.com/downloads.html), then check and install it (replace `VERSION` with the release number):
 
 ```sh
 sha256sum --check --ignore-missing SHA256SUMS

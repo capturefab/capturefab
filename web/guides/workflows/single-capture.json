@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "steps": [
+    {"command": {"op": "connect", "camera": "sim:0", "timeout_ms": 2000}},
+    {"camera": "sim:0", "command": {"op": "set", "feature": "Width", "value": "640"}},
+    {"camera": "sim:0", "command": {"op": "set", "feature": "Height", "value": "480"}},
+    {"camera": "sim:0", "command": {
+      "op": "capture", "output": "captures/first.png",
+      "count": 1, "timeout_ms": 2000, "format": "png"
+    }}
+  ]
+}

@@ -935,6 +935,21 @@ def check_search_index(root, errors):
         errors.append("search-index.json is stale; run scripts/docs-search.py")
 
 
+def check_distribution(root, errors):
+    """The site distributes every download itself: GitHub only builds releases."""
+    for path in sorted(root.rglob("*")):
+        if path.is_file() and path.suffix in {".html", ".md", ".txt", ".json", ".xml", ".js", ".mjs", ".css", ".sh", ".ps1"}:
+            if "github.com/capturefab" in path.read_text(encoding="utf-8", errors="replace"):
+                errors.append(f"{path.relative_to(root)}: links to the source repository; link to a page on the site")
+    manifest = json.loads((root / "releases.json").read_text(encoding="utf-8"))
+    for release in manifest.get("releases", []):
+        urls = [release.get(k) for k in ("url", "checksums_url", "checksums_signature_url", "source_url", "sbom_url")]
+        urls += [item.get("url") for item in [*release.get("assets", []), release.get("source") or {}, *release.get("media_sources", [])]]
+        for url in filter(None, urls):
+            if not url.startswith("https://capturefab.com/"):
+                errors.append(f"releases.json {release.get('version')}: {url} is not served by capturefab.com")
+
+
 def check_theme_contrast(root, errors):
     """Check real theme tokens used by small text, buttons and control outlines."""
     css = (root / "style.css").read_text(encoding="utf-8")
@@ -997,6 +1012,7 @@ def validate(root=ROOT):
     check_signature_labels(root, errors)
     check_search_index(root, errors)
     check_theme_contrast(root, errors)
+    check_distribution(root, errors)
     return errors, versions
 
 
@@ -1005,6 +1021,9 @@ def main():
     check_installer_runs(errors)
     # Needs the web-try sources beside web/, so it is not part of validate(root).
     check_try_build(ROOT.parent, errors)
+    guides = subprocess.run([sys.executable, str(Path(__file__).with_name("site-guides.py")), "--check"], capture_output=True, text=True)
+    if guides.returncode:
+        errors.append(guides.stderr.strip() or "web/guides is stale; run scripts/site-guides.py")
     spec = importlib.util.spec_from_file_location("docs_coverage", Path(__file__).with_name("docs-coverage.py"))
     coverage = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(coverage)

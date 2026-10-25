@@ -14,8 +14,8 @@ param([string]$Prefix = '', [switch]$DryRun)
 $Version = '0.4.0'
 $Site = 'https://capturefab.com/'
 $Assets = @{
-  'x86_64' = @{ Name = 'capturefab-0.4.0-windows-x86_64.zip'; Url = 'https://github.com/capturefab/capturefab/releases/download/v0.4.0/capturefab-0.4.0-windows-x86_64.zip'; Sha256 = '62d1982a8d56265f91a158428b707a7991f47b964432500995211b9c7b4673b3' }
-  'aarch64' = @{ Name = 'capturefab-0.4.0-windows-aarch64.zip'; Url = 'https://github.com/capturefab/capturefab/releases/download/v0.4.0/capturefab-0.4.0-windows-aarch64.zip'; Sha256 = '22739afbd2d2c9427d38222cac1cc658403c5ad19986f551f2c8e46168963775' }
+  'x86_64' = @{ Name = 'capturefab-0.4.0-windows-x86_64.zip'; Url = 'https://capturefab.com/download/v0.4.0/capturefab-0.4.0-windows-x86_64.zip'; Sha256 = '62d1982a8d56265f91a158428b707a7991f47b964432500995211b9c7b4673b3' }
+  'aarch64' = @{ Name = 'capturefab-0.4.0-windows-aarch64.zip'; Url = 'https://capturefab.com/download/v0.4.0/capturefab-0.4.0-windows-aarch64.zip'; Sha256 = '22739afbd2d2c9427d38222cac1cc658403c5ad19986f551f2c8e46168963775' }
 }
 
 function Fail([string]$Message) { throw "capturefab install: $Message" }

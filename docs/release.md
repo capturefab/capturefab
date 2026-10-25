@@ -9,7 +9,8 @@ Failed or cancelled validation leaves the candidate in draft state and does not 
 | --- | --- | --- | --- |
 | `ci.yml` | push to `main`, pull requests, manual, reusable call from Release | `cargo fmt --check`, strict Clippy with all features, `cargo test` on Linux x64 and ARM64, macOS Apple silicon and Intel, Windows x64 and ARM64 (with a per-runner summary of the hardware accelerators `doctor` finds), the build without the GUI, `scripts/test-site.py`, `node --check web/app.js`, `node --check web/docs.js`, documentation search checks and the script unit tests | `contents: read` |
 | `prepare-release.yml` | manual, with a version | Raises the version in `Cargo.toml` and `Cargo.lock` (`release.py set-version`, which refuses a version that is not newer or is already tagged), pushes `release/vVERSION`, opens a pull request labeled `release` and starts CI on it | `contents`, `pull-requests`, `issues` and `actions: write` |
-| `release.yml` | a push to `main` that raises the version in `Cargo.toml`; a `vVERSION-rc.N` tag push; manual | Creates an explicitly tagged `-rc.N` draft before building, calls the full CI workflow, builds and smoke-tests every target, signs configured Windows artifacts, assembles and attests the artifacts, uploads to the draft and promotes it automatically only after all checks pass. Manual branch runs are dry runs. Published releases are never modified. | `contents: read`; `contents: write` for candidate, upload, promotion and site jobs; `id-token: write` for Azure signing and attestation; `attestations: write` for attestation; `pull-requests` and `actions: write` for the site job |
+| `release.yml` | a push to `main` that raises the version in `Cargo.toml`; a `vVERSION-rc.N` tag push; manual | Creates an explicitly tagged `-rc.N` draft before building, calls the full CI workflow, builds and smoke-tests every target, signs configured Windows artifacts, assembles and attests the artifacts, uploads to the draft, copies the files to the capturefab.com download bucket and promotes the draft automatically only after all checks pass. Manual branch runs are dry runs. Published releases are never modified. | `contents: read`; `contents: write` for candidate, upload, promotion and site jobs; `id-token: write` for Azure signing and attestation; `attestations: write` for attestation; `pull-requests` and `actions: write` for the site job |
+| `mirror-downloads.yml` | manual, with a published version | Copies a release published before the download bucket existed from its release assets to the bucket (`scripts/publish-downloads.py`) | `contents: read`; the `CLOUDFLARE_API_TOKEN` secret |
 | `pages.yml` | manual, and started by the release workflow after it updates `web/` | Validates `web/` and deploys it to capturefab.com as a Cloudflare Worker with static assets (`site/`, `cf deploy`), but only from the default branch and only when the repository variable `CAPTUREFAB_PUBLISH_SITE` is `true` | `contents: read`; the `CLOUDFLARE_API_TOKEN` secret |
 
 All actions are pinned to full commit SHAs. Checkouts do not persist credentials; the jobs that push pass the job token for that one command.
@@ -53,7 +54,8 @@ attach`. Releases up to 0.4.0 were ZIPs with the launcher beside the app.
 2. **Settings → Actions → General → Workflow permissions**: allow GitHub Actions to create pull requests, so `prepare-release.yml` and the site job can open them. Otherwise they push a branch and say so in the run summary.
 3. If tag rulesets restrict who may create `v*` tags, allow GitHub Actions to create both `vVERSION-rc.N` and `vVERSION`, or the release workflow cannot create candidates or promote them.
 4. To deploy the site, add a Cloudflare API token with Workers Scripts edit, Workers Routes edit and DNS edit on the capturefab.com zone as the repository secret `CLOUDFLARE_API_TOKEN`, and set `CAPTUREFAB_PUBLISH_SITE=true`. `site/cloudflare.config.ts` names the Worker and its custom domain; `site/wrangler.config.ts` points its assets at `web/`.
-5. If `main` is protected, the site job opens a pull request with the `web/` changes instead of pushing; run the Pages workflow after merging it.
+5. Set up [download hosting](#download-hosting) before the first deploy: the site's Worker needs the bucket.
+6. If `main` is protected, the site job opens a pull request with the `web/` changes instead of pushing; run the Pages workflow after merging it.
 
 ## Cutting a release
 
@@ -67,12 +69,30 @@ Directly pushing an RC tag is supported when its base version matches `Cargo.tom
 To update the site by hand after publication:
 
 ```sh
-gh release download v0.3.0 --pattern releases.json --dir /tmp/capturefab-v0.3.0
+gh release download v0.3.0 --dir /tmp/capturefab-v0.3.0
+python3 scripts/publish-downloads.py --version 0.3.0 --input /tmp/capturefab-v0.3.0
 python3 scripts/site-release.py --merge /tmp/capturefab-v0.3.0/releases.json
 python3 scripts/test-site.py
 ```
 
 A release contains, per target, `capturefab-VERSION-OS-ARCH` archives (`.tar.gz` on Linux, `.zip` on Windows, `.dmg` holding `Capturefab.app` on macOS) and `capturefab-VERSION-OS-ARCH-media-sources.tar.gz`, plus `capturefab-VERSION-source.tar.gz` (the exact committed tree, all `Cargo.lock` dependency sources in `vendor/`, and an offline Cargo configuration), `releases.json`, `capturefab-VERSION-sbom.cdx.json` (a CycloneDX bill of materials: the Rust crates linked into the executable with their `Cargo.lock` checksums, and the pinned FFmpeg, x264, SRT, OpenSSL and GPU header versions with their source checksums), and `SHA256SUMS` covering every file. Assembly refuses uncommitted changes and missing or modified corresponding-source archives. The FFmpeg source archives must match the build recipe's pinned checksums, including enabled GPU headers. Each Linux and Windows package holds `LICENSE`, `THIRD-PARTY-LICENSES.txt` (license texts of the Rust crates compiled into that executable), `media-licenses/` and the FFmpeg build manifest; on macOS these are in `Capturefab.app/Contents/Resources/licenses/`.
+
+## Download hosting
+
+GitHub builds, signs and attests releases; it is not a distribution channel. The site never links to the repository, its releases or its issues (`scripts/test-site.py` enforces this). Users download every file, including the source code, from `https://capturefab.com/download/vVERSION/FILE`:
+
+- `release.py assemble` writes those URLs into `releases.json` (`--download-base`) and points each release's `url` at `downloads.html#vVERSION`.
+- Before promotion, the `publish` job runs `scripts/publish-downloads.py`. It checks each file against `SHA256SUMS`, then uploads it with `wrangler r2 object put` to the R2 bucket `capturefab-downloads` (repository variable `CAPTUREFAB_DOWNLOAD_BUCKET` overrides the name). It keeps an object that already has the same bytes. Until promotion creates the final `vVERSION` tag, it replaces different bytes, which an earlier failed candidate left; after that it refuses. A failed read other than R2's missing-key answer stops the upload. `SHA256SUMS` goes last.
+- `site/src/worker.ts` serves `/download/*` from the bucket with range requests and immutable caching. `runWorkerFirst` keeps every other path on the static assets. For a release published before the bucket existed, a missing object is read from the release asset of the same name. Run **Actions → Mirror downloads** with that version to copy it into the bucket.
+- The installed app's update check accepts only `https://capturefab.com/` links (`src/updates.rs`), so downloads must stay on that host. A different hostname would hide the download link from installed versions.
+
+One-time setup:
+
+1. Create the bucket: `cd site && npx wrangler r2 bucket create capturefab-downloads`. Leave public access off; the Worker is the only reader.
+2. Give the `CLOUDFLARE_API_TOKEN` secret **Workers R2 Storage: Edit** as well as the Workers permissions above. Set the repository variable `CLOUDFLARE_ACCOUNT_ID` when the token can see more than one account.
+3. Deploy the site (Pages workflow), then run **Mirror downloads** for each release already listed in `web/releases.json`.
+
+Release runs fail early without `CLOUDFLARE_API_TOKEN`, because a published manifest would name files that were never uploaded.
 
 ### Release highlights and the update check
 

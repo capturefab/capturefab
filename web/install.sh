@@ -23,10 +23,10 @@ SITE='https://capturefab.com/'
 # Sets name, url and expected for an operating system and processor.
 asset() {
   case "$1/$2" in
-    macos/x86_64) name='capturefab-0.4.0-macos-x86_64.zip' url='https://github.com/capturefab/capturefab/releases/download/v0.4.0/capturefab-0.4.0-macos-x86_64.zip' expected='b28b02d1b56fbb493abd40d02f07189b8f35faabed28caf549d83d2896416f4c' ;;
-    macos/aarch64) name='capturefab-0.4.0-macos-aarch64.zip' url='https://github.com/capturefab/capturefab/releases/download/v0.4.0/capturefab-0.4.0-macos-aarch64.zip' expected='8105aa3078ca00920340ca0f4bd81aa7d87c8d51562df7d35c34a7651907ddde' ;;
-    linux/x86_64) name='capturefab-0.4.0-linux-x86_64.tar.gz' url='https://github.com/capturefab/capturefab/releases/download/v0.4.0/capturefab-0.4.0-linux-x86_64.tar.gz' expected='ddc4ef633cf113cba40cfcba507773b92be4b0055872c7f0f9a89145d2fc361d' ;;
-    linux/aarch64) name='capturefab-0.4.0-linux-aarch64.tar.gz' url='https://github.com/capturefab/capturefab/releases/download/v0.4.0/capturefab-0.4.0-linux-aarch64.tar.gz' expected='11ba70184921f291c347e850b5bcc39cc37fe4614f1f3e314d934c13591bc259' ;;
+    macos/x86_64) name='capturefab-0.4.0-macos-x86_64.zip' url='https://capturefab.com/download/v0.4.0/capturefab-0.4.0-macos-x86_64.zip' expected='b28b02d1b56fbb493abd40d02f07189b8f35faabed28caf549d83d2896416f4c' ;;
+    macos/aarch64) name='capturefab-0.4.0-macos-aarch64.zip' url='https://capturefab.com/download/v0.4.0/capturefab-0.4.0-macos-aarch64.zip' expected='8105aa3078ca00920340ca0f4bd81aa7d87c8d51562df7d35c34a7651907ddde' ;;
+    linux/x86_64) name='capturefab-0.4.0-linux-x86_64.tar.gz' url='https://capturefab.com/download/v0.4.0/capturefab-0.4.0-linux-x86_64.tar.gz' expected='ddc4ef633cf113cba40cfcba507773b92be4b0055872c7f0f9a89145d2fc361d' ;;
+    linux/aarch64) name='capturefab-0.4.0-linux-aarch64.tar.gz' url='https://capturefab.com/download/v0.4.0/capturefab-0.4.0-linux-aarch64.tar.gz' expected='11ba70184921f291c347e850b5bcc39cc37fe4614f1f3e314d934c13591bc259' ;;
     *) return 1 ;;
   esac
 }

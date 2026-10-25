@@ -82,6 +82,16 @@ jobs:
             echo "::error::Releases need the MACOS_CERTIFICATE_* and MACOS_NOTARY_* secrets (docs/release.md). Set the repository variable CAPTUREFAB_ALLOW_UNSIGNED_MACOS=true to release unsigned macOS builds anyway."
             exit 1
           fi
+      - name: Require the download bucket for releases
+        if: steps.version.outputs.release == 'true'
+        env:
+          CLOUDFLARE: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+        run: |
+          # Releases are distributed from capturefab.com/download, not from this build system.
+          if [ "$CLOUDFLARE" != true ]; then
+            echo "::error::Releases need the CLOUDFLARE_API_TOKEN secret with R2 write access to the download bucket (docs/release.md)."
+            exit 1
+          fi
       - name: Check Windows signing configuration
         if: steps.version.outputs.build == 'true'
         env:
@@ -469,7 +479,7 @@ jobs:
           RELEASE_GPG_PASSPHRASE: ${{ secrets.RELEASE_GPG_PASSPHRASE }}
           PROVENANCE: ${{ vars.CAPTUREFAB_ATTEST != 'false' && needs.version.outputs.release == 'true' }}
         run: |
-          set -- --version "$VERSION" --input dist/builds --output dist/release --repository "$GITHUB_REPOSITORY" --download-base "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/download/v$VERSION"
+          set -- --version "$VERSION" --input dist/builds --output dist/release --repository "$GITHUB_REPOSITORY" --download-base "https://capturefab.com/download/v$VERSION"
           if [ -n "$GPG_KEY" ]; then set -- "$@" --gpg-key "$GPG_KEY"; fi
           if [ "$PROVENANCE" = true ]; then set -- "$@" --provenance; fi
           # The in-app update check shows these lines.
@@ -587,6 +597,31 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release
+          path: dist/release
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - run: npm ci --ignore-scripts
+        working-directory: site
+      # Before promotion, so that the published manifest never names a missing file.
+      - name: Upload the downloads to capturefab.com
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CAPTUREFAB_DOWNLOAD_BUCKET: ${{ vars.CAPTUREFAB_DOWNLOAD_BUCKET }}
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -- --version "$VERSION" --input dist/release
+          # Until promotion creates the final tag, objects that differ are an earlier
+          # failed candidate's; after it, the version's files never change.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/v$VERSION" >/dev/null 2>&1; then set -- "$@" --unpublished; fi
+          python3 scripts/publish-downloads.py "$@"
       - id: publish
         env:
           GH_TOKEN: ${{ github.token }}

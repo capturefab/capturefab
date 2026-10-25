@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "steps": [
+    {"camera": "sim:recording", "command": {"op": "stop_forward"}},
+    {"camera": "sim:recording", "command": {"op": "stop"}}
+  ]
+}

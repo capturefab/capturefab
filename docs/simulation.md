@@ -16,13 +16,13 @@ The command prints its ready state and connection endpoints, then runs until Ctr
 | `rtsp` | RTSP / H.264 | 1920 × 1080, 30 fps, 4 Mbit/s | NVR recording and video stream ingestion |
 | `onvif` | ONVIF device/media + RTSP / H.264 | 1280 × 720, 15 fps, 2 Mbit/s | Camera discovery, media profiles and NVR onboarding |
 
-Override `--width`, `--height`, `--fps`, and `--bitrate` as needed. H.264 dimensions must be even. Frames fit within the selected camera dimensions with black padding to preserve their aspect ratio. Videos are resampled to the selected camera frame rate; a directory of still frames delivers one image per camera frame.
+Override `--width`, `--height`, `--fps`, and `--bitrate` as needed, within 64–1920 × 64–1080 and 1–120 fps. H.264 dimensions must be even. Frames fit within the selected camera dimensions with black padding to preserve their aspect ratio. Videos are resampled to the selected camera frame rate; a directory of still frames delivers one image per camera frame.
 
 ## Input selection and looping
 
 `--source` accepts a video or still image file, or a directory containing supported image/video files. A folder is listed once, **only at its top level**. Subdirectories, symlinks and unrelated files are ignored. Supported files are sorted lexicographically by filename, case sensitively, then replayed in that order. `10.png` sorts before `2.png`; use zero-padded filenames (`0001.png`, `0002.png`) for numeric sequences. The playlist repeats indefinitely, including a single selected file. Frame IDs and camera timestamps continue across file boundaries and loop restarts.
 
-The playlist remains fixed for the lifetime of the connection. Stop and restart to pick up added or renamed files. Empty folders, missing sources and corrupt selected media return errors. Media is decoded with the bundled FFmpeg, or `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg` for a development build. Local replay does not open stream URLs or playlist manifests.
+The playlist remains fixed for the lifetime of the connection. Stop and restart to pick up added or renamed files. Empty folders, missing sources and corrupt selected media return errors. Media is decoded with the bundled FFmpeg, or the one `CAPTUREFAB_FFMPEG=/absolute/path/to/ffmpeg` names. Local replay does not open stream URLs or playlist manifests.
 
 Supported images are PNG, JPEG, BMP, TIFF, WebP and PNM (PPM/PGM/PBM). Supported video extensions are MP4/M4V/MOV, MKV/WebM, AVI, MPG/MPEG/VOB, TS/MTS/M2TS, FLV, WMV and OGV. Decoder availability depends on the FFmpeg build. Reopening videos or image sequences at a playlist boundary can introduce a short decoding gap; camera timestamps remain monotonic.
 

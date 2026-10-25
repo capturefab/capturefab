@@ -137,8 +137,8 @@ capturefab --session bench --camera sim:0 stop-forward --json
 
 ## Start from an example
 
-The [example files](../examples/workflows) validate offline. Run from the repository
-root or use their absolute paths. Copy them to your own working directory and
+The [example files](../examples/workflows) validate offline. Download them, or run from the
+extracted source folder, and pass their paths. Copy them to your own working directory and
 edit camera selectors and output names before applying to hardware.
 
 | File | Workflow |

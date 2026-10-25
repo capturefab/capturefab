@@ -11,6 +11,9 @@ on:
       - scripts/test-docs-search.js
       - scripts/test-site-ui.js
       - scripts/site-release.py
+      - scripts/site-guides.py
+      - docs/*.md
+      - examples/workflows/**
       - scripts/install-template.*
       - scripts/build-try.py
       - scripts/try-tests/**
@@ -50,6 +53,8 @@ jobs:
           cache-dependency-path: site/package-lock.json
       - run: npm ci --ignore-scripts
         working-directory: site
+      # The /download/* Worker; Node 24 runs its TypeScript directly.
+      - run: node --test site/worker.test.mjs
       - run: npx cf deploy
         working-directory: site
         env:

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "steps": [
+    {"command": {"op": "connect", "camera": "scanner:sane:DEVICE", "timeout_ms": 60000}},
+    {"camera": "scanner:sane:DEVICE", "command": {"op": "set", "feature": "ScanResolution", "value": "300"}},
+    {"camera": "scanner:sane:DEVICE", "command": {"op": "set", "feature": "ScanMode", "value": "Gray"}},
+    {"camera": "scanner:sane:DEVICE", "command": {"op": "set", "feature": "ScanSource", "value": "Feeder"}},
+    {"camera": "scanner:sane:DEVICE", "command": {
+      "op": "capture", "output": "pages/page-{frame}.png",
+      "count": 5, "timeout_ms": 60000, "format": "png",
+      "storage": {"max_bytes": 1073741824, "max_files": 100, "on_full": "stop"}
+    }}
+  ]
+}

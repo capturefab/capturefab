@@ -15,7 +15,7 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129 --locked
 ```
 
-Then build from the repository root:
+Then build from the top folder of the source download:
 
 ```sh
 ./web-client/build.sh
@@ -85,7 +85,7 @@ The client uses same-origin HTTP endpoints without authentication headers. Reque
 | `GET /api/preview?camera=ID&format=png\|jpeg` | Latest camera preview, scaled to fit 1280×720: PNG by default, JPEG with `format=jpeg`; HTTP 204 while no frame is available, 304 for the frame named in `If-None-Match` |
 | `GET /api/destinations` | Saved folder destinations on the server; each row has `kind: "folder"` |
 | `GET /api/storage` | Server storage usage and policy |
-| `GET /api/resources` | Read-only CPU, camera-buffer and storage limits/headroom |
+| `GET`, `HEAD /api/resources` | Read-only CPU, camera-buffer and storage limits/headroom |
 | `GET`, `HEAD /health` | JSON readiness, uptime, camera counts and analytics health; HTTP 503 when stopping or analytics is unavailable |
 | `GET`, `HEAD /metrics` | Prometheus text metrics for session and camera acquisition |
 | `GET`, `HEAD /api/analytics` | Current session totals, camera summaries and bounded time series |
@@ -131,7 +131,7 @@ Widths are clamped to 180–2048 logical pixels; below 840 pixels the four panel
 stack vertically with readable labels. Omit `width` for the original 1200×700
 export. Invalid or duplicate query parameters return HTTP 400.
 
-Monitoring tools can fetch `/health` and `/metrics` directly without a browser origin. `/health` returns a plain JSON object with `status`, `ready`, `version`, `uptime_seconds`, `cameras` and `analytics`. An idle session with no connected cameras is ready. A previous camera command error stays in diagnostics without making readiness fail. `/metrics` uses Prometheus text format with session counters such as `capturefab_session_frames_total` and per-camera counters labeled by `camera_id` and `name`. `capturefab_session_lost_frames_total` and `capturefab_camera_lost_frames_total` count lost frames, `capturefab_session_preview_skipped_frames_total` and `capturefab_camera_preview_skipped_frames_total` skipped previews, and the `dropped_frames_total` counters keep the status `dropped` meaning. `capturefab_analytics_samples` counts retained one-second samples. `HEAD` returns the same status and headers as `GET` with no body; unsupported methods on these four routes return HTTP 405 with `Allow: GET, HEAD`.
+Monitoring tools can fetch `/health` and `/metrics` directly without a browser origin. `/health` returns a plain JSON object with `status`, `ready`, `version`, `uptime_seconds`, `cameras` and `analytics`. An idle session with no connected cameras is ready. A previous camera command error stays in diagnostics without making readiness fail. `/metrics` uses Prometheus text format with session counters such as `capturefab_session_frames_total` and per-camera counters labeled by `camera_id` and `name`. `capturefab_session_lost_frames_total` and `capturefab_camera_lost_frames_total` count lost frames, `capturefab_session_preview_skipped_frames_total` and `capturefab_camera_preview_skipped_frames_total` skipped previews, and the `dropped_frames_total` counters keep the status `dropped` meaning. `capturefab_analytics_samples` counts retained one-second samples. `HEAD` returns the same status and headers as `GET` with no body; unsupported methods on these four routes and `/api/resources` return HTTP 405 with `Allow: GET, HEAD`.
 
 ```sh
 curl http://100.101.102.103:8787/health

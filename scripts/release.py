@@ -22,6 +22,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 LINE_COMPUTER = re.search(r'^repository\s*=\s*"([^"]+)"', (ROOT / 'Cargo.toml').read_text(), re.M)[1] + '/blob/main/docs/line-computer.md'
+# The release notes page and download host; site/src/worker.ts serves SITE + 'download/'.
+SITE = 'https://capturefab.com/'
 # The udev rule for USB3 Vision cameras, shipped in Linux archives under share/udev/rules.d.
 UDEV_RULE = '70-capturefab-usb3vision.rules'
 SEMVER = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?')
@@ -799,7 +801,10 @@ def assemble(args):
     source = source_archive(output, ver)
     bill = sbom(output, ver, args.repository, any(item.get('browser_client') for item in successes.values()))
     signature = 'SHA256SUMS.asc' if args.gpg_key else None
-    release = dict(version=ver, date=dt.datetime.now(dt.timezone.utc).date().isoformat(), url=f'https://github.com/{args.repository}/releases/tag/v{ver}', checksums_url=link(args.download_base, 'SHA256SUMS'), source_url=link(args.download_base, source.name), sbom_url=link(args.download_base, bill.name), assets=assets)
+    download = lambda path: dict(name=path.name, sha256=digest(path), size=path.stat().st_size, url=link(args.download_base, path.name))
+    # The release notes and downloads live on the site; the build system is not a distribution channel.
+    release = dict(version=ver, date=dt.datetime.now(dt.timezone.utc).date().isoformat(), url=f'{SITE}downloads.html#v{ver}', checksums_url=link(args.download_base, 'SHA256SUMS'), source_url=link(args.download_base, source.name), sbom_url=link(args.download_base, bill.name), assets=assets,
+                   source=download(source), media_sources=[download(path) for path in sorted(output.glob(f'capturefab-{ver}-*-media-sources.tar.gz'))])
     if signature:
         release['checksums_signature_url'] = link(args.download_base, signature)
     if notable:

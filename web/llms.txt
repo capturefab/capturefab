@@ -18,19 +18,19 @@ Use the built-in simulators to try commands without camera hardware.
 - [Desktop reference](desktop.html): App settings, camera controls, performance, analytics and remote access.
 - [External agent setup](docs.html#agent-setup): CLI availability, shared session, bounded first task and manual takeover.
 - [Agent instructions](agents.md): Detailed automation contract, session behavior and recovery rules.
-- [Camera compatibility](https://github.com/capturefab/capturefab/blob/main/docs/camera-compatibility.md): Transport requirements, camera profiles and unsupported paths.
-- [Plant-floor guide](https://github.com/capturefab/capturefab/blob/main/docs/plant-floor.md): Templates, capture tags, camera datasets, exports and saved folders.
-- [Workflow guide](https://github.com/capturefab/capturefab/blob/main/docs/cli-workflows.md): JSON plans, path resolution and partial failures.
-- [Assistant guide](https://github.com/capturefab/capturefab/blob/main/docs/assistant.md): Providers, credentials, data sent, plans, approvals and bounded camera tasks.
-- [Workflow examples](https://github.com/capturefab/capturefab/tree/main/examples/workflows): Multi-camera timelapse, scanner feeder and local recording.
+- [Camera compatibility](https://capturefab.com/guides/camera-compatibility.md): Transport requirements, camera profiles and unsupported paths.
+- [Plant-floor guide](https://capturefab.com/guides/plant-floor.md): Templates, capture tags, camera datasets, exports and saved folders.
+- [Workflow guide](https://capturefab.com/guides/cli-workflows.md): JSON plans, path resolution and partial failures.
+- [Assistant guide](https://capturefab.com/guides/assistant.md): Providers, credentials, data sent, plans, approvals and bounded camera tasks.
+- [Workflow examples](https://capturefab.com/guides/cli-workflows.md#start-from-an-example): Multi-camera timelapse, scanner feeder and local recording.
 - [Release manifest](releases.json): Published files, architectures, SHA-256 checksums and available signatures.
 - [Update checks](docs.html#updates): The desktop app reads releases.json at most daily (Settings › Updates, `CAPTUREFAB_UPDATE_CHECK=off`); `capturefab version` is offline and `version --check` reads it once.
 - [Release feed](feed.xml): Atom release announcements.
-- [Source and build guide](https://github.com/capturefab/capturefab): Rust source, build instructions and MIT license.
-- [FFmpeg build notes](https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md): Media dependencies, corresponding source and build provenance.
-- [Remote control](https://github.com/capturefab/capturefab/blob/main/docs/remote-control.md): Local browser interface and HTTP activity observation.
+- [Source and build guide](https://capturefab.com/downloads.html#source): Rust source, build instructions and MIT license.
+- [FFmpeg build notes](https://capturefab.com/guides/ffmpeg-build.md): Media dependencies, corresponding source and build provenance.
+- [Remote control](https://capturefab.com/guides/remote-control.md): Local browser interface and HTTP activity observation.
 - [Try it in your browser](https://capturefab.com/#try): A webcam or the Pattern camera simulator with histogram, focus scores, features, capture and recording, run locally in a browser tab for people; it has no CLI, session or JSON interface.
-- [Line computer guide](https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md): Headless `serve` as a Linux service on a Raspberry Pi, Jetson or industrial PC: archive choice, camera permissions, systemd, storage budget and efficiency mode.
+- [Line computer guide](https://capturefab.com/guides/line-computer.md): Headless `serve` as a Linux service on a Raspberry Pi, Jetson or industrial PC: archive choice, camera permissions, systemd, storage budget and efficiency mode.
 
 ## Try it with the simulator
 
@@ -38,7 +38,7 @@ The built-in simulator needs no camera hardware or session.
 Each comment says what you should see.
 
 ```sh
-capturefab discover --simulate --json                                       # devices include sim:0, sim:1 ...
+capturefab discover --simulate --json                                       # devices include sim:0
 capturefab --camera sim:0 features --json                                   # Width, Height, PixelFormat ...
 capturefab --camera sim:0 capture -o 'shot-{seq}.png' --json                # shot-0001.png; rerun for shot-0002.png
 capturefab --camera sim:0 record -o 'clip-{seq}.mp4' --duration 2s --json   # clip-0001.mp4; `stopped` reports the deadline
@@ -78,10 +78,9 @@ Binary image stdout, raw XML, completions, help and version output use their com
 Plain `doctor` checks the host and prints a fix for each warning.
 `doctor --json` adds `host`, `efficiency`, `paths`, `limits`, `graphics` and `checks` (`{id,level,message,fix}`).
 Check ids include `private_dirs`, `camera_network` (wired adapters for GigE Vision, never a warning), `ffmpeg`, `receive_buffer`, `usb_access` and `storage_budget`.
-`doctor --json` reports `runtime_directory` for sessions; `session_directory` identifies the same directory.
+`doctor --json` reports `runtime_directory` for sessions.
 It reports `state_directory` for settings, hubs, destinations and the storage ledger.
 On Linux, state normally lives in `~/.local/state/capturefab` and survives reboots.
-State left by older versions moves there once, or appears in the `old_state` diagnostic.
 `cache_directory` holds extracted FFmpeg, encoder probes and Linux dataset staging; `CAPTUREFAB_CACHE_DIR` overrides it.
 Global `--efficiency auto|smooth|efficient` or `CAPTUREFAB_EFFICIENCY` sets the mode for a process and its camera workers.
 The command flag overrides the environment variable.
@@ -334,7 +333,7 @@ Apple Intelligence enabled, and its model ready. The build must include the nati
 Run `capturefab assistant test apple_foundation_models --json` to test availability and generation.
 The provider uses no API key, server or reasoning-effort setting. It has no remote fallback.
 It accepts text, numeric observations and permitted data results, but cannot inspect images.
-`--vision on` and `test --vision` are unsupported for this provider.
+`--vision on` and `test --vision` are refused for this provider.
 Tool validation, approval and scope rules still apply. Prompt measurements retain their separate API providers.
 See [Apple Intelligence setup and troubleshooting](https://capturefab.com/docs.html#apple-intelligence).
 
@@ -615,7 +614,7 @@ curl -fsSL https://capturefab.com/install.sh | sh    # macOS and Linux; add `-s 
 irm https://capturefab.com/install.ps1 | iex         # Windows PowerShell
 ```
 
-The scripts select the build for this computer from the latest release, download it from GitHub Releases and check its SHA-256 before extracting.
+The scripts select the build for this computer from the latest release, download it from capturefab.com and check its SHA-256 before extracting.
 They install to `~/Applications` (macOS) or `~/.local/share/capturefab` (Linux) with the command linked in `~/.local/bin`, or to `%LOCALAPPDATA%\Programs\Capturefab` on the user `PATH` (Windows).
 They never use sudo or administrator rights.
 To read a script first: `curl -fsSLO https://capturefab.com/install.sh; less install.sh; sh install.sh`.

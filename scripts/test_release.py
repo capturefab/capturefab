@@ -742,7 +742,10 @@ class ReleaseTests(unittest.TestCase):
             self.assertNotIn(('linux', 'armv7'), assets)
             self.assertEqual((entry['checksums_url'], entry['source_url']), ('https://example.invalid/v1.2.3/SHA256SUMS', 'https://example.invalid/v1.2.3/capturefab-1.2.3-source.tar.gz'))
             self.assertNotIn('checksums_signature_url', entry)
+            self.assertEqual(entry['url'], 'https://capturefab.com/downloads.html#v1.2.3')
             sums = {name: digest for digest, name in (line.split('  ') for line in (output / 'SHA256SUMS').read_text().splitlines())}
+            self.assertEqual(entry['source'], dict(name='capturefab-1.2.3-source.tar.gz', sha256=sums['capturefab-1.2.3-source.tar.gz'], size=(output / 'capturefab-1.2.3-source.tar.gz').stat().st_size, url='https://example.invalid/v1.2.3/capturefab-1.2.3-source.tar.gz'))
+            self.assertEqual([(m['name'], m['sha256']) for m in entry['media_sources']], [('capturefab-1.2.3-linux-x86_64-media-sources.tar.gz', sums['capturefab-1.2.3-linux-x86_64-media-sources.tar.gz'])])
             self.assertEqual(set(sums), {asset.name, 'capturefab-1.2.3-linux-x86_64-media-sources.tar.gz', 'capturefab-1.2.3-source.tar.gz', 'capturefab-1.2.3-sbom.cdx.json', 'releases.json'})
             self.assertEqual(entry['sbom_url'], 'https://example.invalid/v1.2.3/capturefab-1.2.3-sbom.cdx.json')
             bom = json.loads((output / 'capturefab-1.2.3-sbom.cdx.json').read_text())

@@ -204,3 +204,8 @@ jobs:
       # The committed web/try/capturefab.wasm against the golden results; this job has no Rust.
       - run: node --test scripts/try-tests/*.test.mjs
       - run: python3 -m unittest discover -s scripts -v
+      # The site's /download/* Worker is TypeScript, which Node 24 runs directly.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - run: node --test site/worker.test.mjs

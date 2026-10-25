@@ -50,7 +50,7 @@ PAGE = '''<!doctype html>
   <div class="shell">
     <header class="site-header">
       <a class="wordmark" href="index.html" aria-label="Capturefab home"><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</a>
-      <nav aria-label="Main navigation"><a href="index.html">Product</a><a href="docs.html">Documentation</a><a href="downloads.html" aria-current="page">Downloads</a><a href="https://github.com/capturefab/capturefab">Source <span aria-hidden="true">↗</span></a></nav>
+      <nav aria-label="Main navigation"><a href="index.html">Product</a><a href="docs.html">Documentation</a><a href="downloads.html" aria-current="page">Downloads</a><a href="downloads.html#source">Source</a></nav>
       <a class="search-trigger" href="docs.html#search" aria-label="Search documentation" aria-keyshortcuts="Control+K Meta+K"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><span>Search docs</span><kbd>Ctrl K</kbd></a>
     </header>
     <main id="main">
@@ -58,14 +58,14 @@ PAGE = '''<!doctype html>
         <h1 id="downloads-title">All downloads</h1>
         <p class="lead">Every app download includes the desktop app and the CLI. Latest release: {status}.</p>
         <p>Choose your operating system and processor. Apple silicon Macs and 64-bit ARM systems use ARM64. Intel and AMD computers use x64.</p>
-        <p>Check the file's SHA-256 with the command under each download. On macOS, open the .dmg and drag Capturefab to Applications, or extract the .zip of an earlier release. On Windows and Linux, extract the archive before you open the app. The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
+        <p>Check the file's SHA-256 with the command under each download. On macOS, open the .dmg and drag Capturefab to Applications. For a .zip download, extract it and move Capturefab.app to Applications. On Windows and Linux, extract the archive before you open the app. The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
         <p>Read the <a href="docs.html#installation">installation instructions</a> for system requirements, command-line setup and use without a display.</p>
       </section>
 {install}{body}    </main>
     <footer class="site-footer">
       <div class="brand"><p><img class="logo" src="favicon.svg" width="128" height="128" alt="" aria-hidden="true">Capturefab</p><small>Capturefab uses the MIT license. The included FFmpeg uses GPLv3. Releases include its source. This site sets no cookies and loads nothing from third parties.</small></div>
-      <div><h2 class="footer-heading">Project</h2><ul><li><a href="https://github.com/capturefab/capturefab">Source</a></li><li><a href="https://github.com/capturefab/capturefab/issues">Issues</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
-      <div><h2 class="footer-heading">Documentation</h2><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/ffmpeg-build.md">FFmpeg build and licensing</a></li><li><a href="https://github.com/capturefab/capturefab/blob/main/docs/release.md">Release process</a></li></ul></div>
+      <div><h2 class="footer-heading">Project</h2><ul><li><a href="downloads.html#source">Source code</a></li><li><a href="downloads.html">All downloads</a></li><li><a href="feed.xml">Releases feed</a></li></ul></div>
+      <div><h2 class="footer-heading">Documentation</h2><ul><li><a href="docs.html">Documentation hub</a></li><li><a href="docs.html#getting-started">Getting started</a></li><li><a href="docs.html#cli-reference">CLI reference</a></li><li><a href="guides/ffmpeg-build.md">FFmpeg build and licensing</a></li></ul></div>
       <div><h2 class="footer-heading">For agents</h2><ul><li><a href="agents.md">Agent instructions</a></li><li><a href="llms.txt">llms.txt</a></li><li><a href="releases.json">Release manifest</a></li></ul></div>
     </footer>
   </div>
@@ -78,18 +78,11 @@ INSTALL = '''      <section class="section install-cli" id="install-cli" aria-la
           <div><h3>macOS and Linux</h3><div class="code-wrap"><pre><code>curl -fsSL {site}install.sh | sh</code></pre><button class="copy-button" type="button" aria-label="Copy the macOS and Linux install command">Copy</button></div><p>Installs <code>Capturefab.app</code> in <code>~/Applications</code> on macOS, or the release folder in <code>~/.local/share/capturefab</code> on Linux, and links <code>capturefab</code> in <code>~/.local/bin</code>.</p></div>
           <div><h3>Windows PowerShell</h3><div class="code-wrap"><pre><code>irm {site}install.ps1 | iex</code></pre><button class="copy-button" type="button" aria-label="Copy the Windows install command">Copy</button></div><p>Installs in <code>%LOCALAPPDATA%\\Programs\\Capturefab</code>, adds it to your user <code>PATH</code> and adds a Start menu shortcut.</p></div>
         </div>
-        <p class="install-read-first">To read a script before it runs: <code>curl -fsSLO {site}install.sh; less install.sh; sh install.sh</code>. Add <code>--dry-run</code> to print the file, URL and checksum it would use. Read <a href="install.sh">install.sh</a> or <a href="install.ps1">install.ps1</a>.</p>
+        <p class="install-read-first">To read a script before it runs: <code>curl -fsSLO {site}install.sh; less install.sh; sh install.sh</code>. Add <code>--dry-run</code> (<code>-DryRun</code> for install.ps1) to print the file, URL and checksum it would use. Read <a href="install.sh">install.sh</a> or <a href="install.ps1">install.ps1</a>.</p>
       </section>
 '''
 EMPTY = '''      <section class="section" aria-labelledby="none-title">
-        <div class="section-heading"><h2 id="none-title">No published binaries yet.</h2><p>No release is available. The <a href="releases.json">release manifest</a> is empty. The <a href="feed.xml">Atom release feed</a> has no entries. Use the source build below.</p></div>
-        <div class="source-build">
-          <div><h3>Build it yourself</h3><p>Use a stable Rust toolchain, a C compiler and CMake. For x86 builds, NASM is necessary for libjpeg-turbo. GigE Vision and USB3 Vision capture work without FFmpeg. FFmpeg is necessary for webcams, streams and recording. A build can include FFmpeg or select it with <code>CAPTUREFAB_FFMPEG</code>. Read the <a href="https://github.com/capturefab/capturefab#build-test-and-release">build guide</a> for configuration.</p></div>
-          <div class="code-wrap"><pre><code>git clone https://github.com/capturefab/capturefab
-cd capturefab
-cargo build --release
-target/release/capturefab --camera sim:0 capture -o first.png</code></pre></div>
-        </div>
+        <div class="section-heading"><h2 id="none-title">No published binaries yet.</h2><p>No release is available. The <a href="releases.json">release manifest</a> is empty. The <a href="feed.xml">Atom release feed</a> has no entries. The source code is published with the first release.</p></div>
       </section>
 '''
 FEED = '''<?xml version="1.0" encoding="utf-8"?>
@@ -136,16 +129,49 @@ def row(asset):
 
 def section(release, latest):
     version = html.escape(release['version'])
-    links = [(release.get(k), label) for k, label in (('url', 'Release notes'), ('checksums_url', 'SHA256SUMS'), ('checksums_signature_url', 'Signature'), ('source_url', 'Corresponding source'), ('sbom_url', 'SBOM'))]
+    links = [(release.get(k), label) for k, label in (('checksums_url', 'SHA256SUMS'), ('checksums_signature_url', 'Signature'), ('source_url', 'Source code'), ('sbom_url', 'SBOM'))]
+    notes = ''.join(f'<li>{html.escape(line)}</li>' for line in release.get('highlights', []))
     rows = '\n'.join(f'          {row(asset)}' for asset in release['assets'])
     cards = download_cards(release)
     return f'''      <section class="section" id="v{version}" aria-labelledby="v{version}-title">
         <div class="section-heading"><p class="eyebrow">{html.escape(release['date'])}{' / latest' if latest else ''}</p><h2 id="v{version}-title">capturefab {version}</h2></div>
         <p class="section-intro">{' · '.join(f'<a href="{href(url)}">{label}</a>' for url, label in links if url)}</p>
-{cards}
+{f'        <ul class="release-highlights">{notes}</ul>' + chr(10) if notes else ''}{cards}
         <details class="all-builds"><summary>File details and SHA-256 checksums</summary><div class="table-scroll"><table class="release-assets"><caption>capturefab {version} release assets</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">File</th><th scope="col">SHA-256</th><th scope="col">Notes</th></tr></thead><tbody>
 {rows}
         </tbody></table></div></details>
+      </section>
+'''
+
+def source_section(release):
+    """The source download: the release's full Capturefab tree and Rust dependencies, built offline."""
+    source = release.get('source') or (release.get('source_url') and dict(name=release['source_url'].rsplit('/', 1)[-1], url=release['source_url']))
+    if not source:
+        return ''
+    version, name = html.escape(release['version']), source['name']
+    if not SAFE_NAME.fullmatch(name) or not name.endswith('.tar.gz'):
+        raise ValueError(f'unexpected source archive name: {name}')
+    folder = html.escape(name[:-len('-source.tar.gz')] if name.endswith('-source.tar.gz') else name[:-len('.tar.gz')])
+    facts = size(source['size']) if source.get('size') else ''
+    check = ''
+    if re.fullmatch(r'[0-9a-f]{64}', source.get('sha256', '')):
+        check = f'echo "{source["sha256"]}  {html.escape(name)}" | sha256sum -c\n'
+        facts = ' · '.join(filter(None, (facts, f'SHA-256 <code class="checksum">{source["sha256"]}</code>')))
+    media = release.get('media_sources') or []
+    rows = '\n'.join(f'          <tr><td>{html.escape(OS.get(m["name"].split("-")[2], ""))}</td><td>{html.escape(processor_label(m["name"].split("-")[2], m["name"].split("-")[3]))}</td><td><a href="{href(m["url"])}">{html.escape(m["name"])}</a><br>{size(m["size"])}</td><td><code class="checksum">{html.escape(m["sha256"])}</code></td></tr>' for m in media)
+    table = f'''
+        <details class="all-builds"><summary>Media sources for each download</summary><p>Each app download includes FFmpeg, which uses GPLv3. Its media sources archive holds the exact FFmpeg, x264, SRT, OpenSSL and zlib source archives, the enabled header archives and their build recipe.</p><div class="table-scroll"><table class="release-assets"><caption>capturefab {version} media sources</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">File</th><th scope="col">SHA-256</th></tr></thead><tbody>
+{rows}
+        </tbody></table></div></details>''' if media else ''
+    return f'''      <section class="section" id="source" aria-labelledby="source-title">
+        <div class="section-heading"><h2 id="source-title">Source code</h2><p>Capturefab uses the MIT license. Each release publishes its source as a download: the exact Capturefab files and every Rust dependency, ready for an offline build.</p></div>
+        <div class="source-build">
+          <div><h3>capturefab {version} source</h3><p><a class="button" href="{href(source['url'])}">Download {html.escape(name)} <span aria-hidden="true">↓</span></a></p><p><small>{facts}</small></p><p>Use a stable Rust toolchain, a C compiler and CMake. For x86 builds, NASM is necessary for libjpeg-turbo. A release build also builds FFmpeg from pinned upstream archives when it has no copy. Read the <a href="guides/ffmpeg-build.md">FFmpeg build guide</a> for that step. On macOS, use <code>shasum -a 256 -c</code> in place of <code>sha256sum -c</code>.</p></div>
+          <div class="code-wrap"><pre><code>{check}tar -xzf {html.escape(name)}
+cd {folder}
+cargo --config .cargo/vendor-config.toml build --release --offline --locked
+target/release/capturefab --camera sim:0 capture -o first.png</code></pre><button class="copy-button" type="button" aria-label="Copy the source build commands">Copy</button></div>
+        </div>{table}
       </section>
 '''
 
@@ -194,7 +220,7 @@ def download_cards(release):
 
 def downloads(manifest, site):
     releases = [r for r in ordered(manifest) if r['version'] == manifest.get('latest')] or ordered(manifest)[:1]
-    body = ''.join(section(r, True) for r in releases) or EMPTY
+    body = ''.join(section(r, True) + source_section(r) for r in releases) or EMPTY
     status = f'v{html.escape(manifest["latest"])}' if manifest.get('latest') else 'none published yet'
     install = INSTALL.format(site=html.escape(site)) if releases else ''
     return PAGE.format(site=html.escape(site), status=status, body=body, install=install)
