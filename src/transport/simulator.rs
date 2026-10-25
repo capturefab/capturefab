@@ -581,6 +581,7 @@ mod tests {
             // SFNC-mandatory acquisition features that clients set around
             // AcquisitionStart.
             assert_eq!(camera.get("AcquisitionMode").unwrap(), "Continuous");
+            assert!(camera.is_writable("TLParamsLocked"), "{selector}");
             camera.set("TLParamsLocked", "1").unwrap();
             assert_eq!(camera.get("TLParamsLocked").unwrap(), 1);
             assert!(camera.set("TLParamsLocked", "2").is_err(), "{selector}");
@@ -592,6 +593,7 @@ mod tests {
                 "{selector}"
             );
             camera.stop().unwrap();
+            camera.set("TLParamsLocked", "0").unwrap();
         }
     }
 
