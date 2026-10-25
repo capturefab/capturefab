@@ -129,6 +129,33 @@ impl GigEServer {
             threads: Vec::new(),
             shutdown: shutdown.clone(),
         };
+        if let Some((sockets, netmask)) = discovery_sockets(options.bind, port) {
+            let (replies, bootstrap, stopped) =
+                (control.try_clone()?, bootstrap.clone(), shutdown.clone());
+            let bind = u32::from(options.bind);
+            server.threads.push(
+                thread::Builder::new()
+                    .name("capturefab-virtual-gvcp-discovery".into())
+                    .spawn(move || {
+                        let mut buffer = [0u8; 576];
+                        while !stopped.load(Ordering::Relaxed) {
+                            for socket in &sockets {
+                                // Answer only the bound interface's subnet, as
+                                // a camera on that link would.
+                                if let Ok((length, SocketAddr::V4(peer))) =
+                                    socket.recv_from(&mut buffer)
+                                    && (u32::from(*peer.ip()) ^ bind) & netmask == 0
+                                    && let Some((0x0002, id, _)) = command(&buffer[..length])
+                                {
+                                    let _ = replies
+                                        .send_to(&ack(0, 0x0002, id, &bootstrap[..0xf8]), peer);
+                                }
+                            }
+                        }
+                    })
+                    .context("starting virtual GigE discovery")?,
+            );
+        }
         let (state_control, source, stopped, active, packets) = (
             state.clone(),
             camera,
@@ -157,15 +184,9 @@ impl GigEServer {
                         let Ok((length, peer)) = control.recv_from(&mut buffer) else {
                             continue;
                         };
-                        if length < 8
-                            || buffer[0] != 0x42
-                            || be16(&buffer, 4) as usize != length - 8
-                        {
+                        let Some((command, id, payload)) = command(&buffer[..length]) else {
                             continue;
-                        }
-                        let command = be16(&buffer, 2);
-                        let id = be16(&buffer, 6);
-                        let payload = &buffer[8..length];
+                        };
                         let mut state = state_control.lock().unwrap_or_else(|e| e.into_inner());
                         if state.controller == Some(peer) {
                             state.heartbeat = Instant::now();
@@ -363,12 +384,7 @@ impl GigEServer {
                                 (status, Vec::new())
                             }
                         };
-                        let mut reply = status.to_be_bytes().to_vec();
-                        reply.extend((command + 1).to_be_bytes());
-                        reply.extend((data.len() as u16).to_be_bytes());
-                        reply.extend(id.to_be_bytes());
-                        reply.extend(data);
-                        let _ = control.send_to(&reply, peer);
+                        let _ = control.send_to(&ack(status, command, id, &data), peer);
                     }
                 })
                 .context("starting virtual GigE control")?,
@@ -432,6 +448,65 @@ impl Drop for GigEServer {
             let _ = thread.join();
         }
     }
+}
+/// Linux and macOS deliver broadcasts only to sockets bound to a broadcast or
+/// wildcard address, so an interface-bound camera listens there for discovery
+/// too, as the Aravis fake camera does. Windows delivers them to the control
+/// socket. Returns the sockets and the interface netmask.
+fn discovery_sockets(bind: Ipv4Addr, port: u16) -> Option<(Vec<UdpSocket>, u32)> {
+    if cfg!(windows) || bind.is_loopback() || bind.is_unspecified() {
+        return None;
+    }
+    let interface =
+        if_addrs::get_if_addrs()
+            .ok()?
+            .into_iter()
+            .find_map(|interface| match interface.addr {
+                if_addrs::IfAddr::V4(v4) if v4.ip == bind => Some(v4),
+                _ => None,
+            })?;
+    let reusable = |address: Ipv4Addr| -> std::io::Result<UdpSocket> {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&SocketAddr::from((address, port)).into())?;
+        Ok(socket.into())
+    };
+    let mut sockets = Vec::new();
+    if let Ok(socket) = reusable(Ipv4Addr::BROADCAST) {
+        sockets.push(socket);
+        if let Some(subnet) = interface.broadcast.filter(|subnet| *subnet != bind)
+            && let Ok(socket) = UdpSocket::bind((subnet, port))
+        {
+            sockets.push(socket);
+        }
+    } else if let Ok(socket) = reusable(Ipv4Addr::UNSPECIFIED) {
+        // BSD kernels refuse to bind the limited broadcast address; a wildcard
+        // socket receives both broadcasts while unicast stays with the control socket.
+        sockets.push(socket);
+    }
+    for socket in &sockets {
+        socket
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .ok()?;
+    }
+    (!sockets.is_empty()).then_some((sockets, u32::from(interface.netmask)))
+}
+/// A GVCP command header: command, request ID and payload.
+fn command(packet: &[u8]) -> Option<(u16, u16, &[u8])> {
+    (packet.len() >= 8 && packet[0] == 0x42 && be16(packet, 4) as usize == packet.len() - 8)
+        .then(|| (be16(packet, 2), be16(packet, 6), &packet[8..]))
+}
+fn ack(status: u16, command: u16, id: u16, data: &[u8]) -> Vec<u8> {
+    let mut reply = status.to_be_bytes().to_vec();
+    reply.extend((command + 1).to_be_bytes());
+    reply.extend((data.len() as u16).to_be_bytes());
+    reply.extend(id.to_be_bytes());
+    reply.extend(data);
+    reply
 }
 fn be16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes(bytes[offset..offset + 2].try_into().unwrap())
@@ -680,6 +755,70 @@ mod tests {
         let camera = Camera::open(&id, &[info], Duration::from_secs(2)).unwrap();
         assert_eq!(camera.info.id, id);
         drop(camera);
+        drop(server);
+    }
+
+    #[test]
+    fn interface_bound_camera_answers_broadcast_discovery() {
+        // Needs a broadcast-capable LAN interface; hosts without one have
+        // nothing to test.
+        let Some((ip, subnet)) =
+            if_addrs::get_if_addrs()
+                .unwrap()
+                .into_iter()
+                .find_map(|interface| match interface.addr {
+                    if_addrs::IfAddr::V4(v4) if !v4.ip.is_loopback() && !v4.ip.is_link_local() => {
+                        v4.broadcast.map(|broadcast| (v4.ip, broadcast))
+                    }
+                    _ => None,
+                })
+        else {
+            return;
+        };
+        let source = Camera::open("sim:0", &[], Duration::from_millis(100)).unwrap();
+        let options = ServerOptions {
+            bind: ip,
+            advertise: ip,
+            gige_port: Some(0),
+            rtsp_port: None,
+            onvif_port: None,
+            name: "Broadcast test".into(),
+            fps: 30.0,
+            bitrate: "2M".into(),
+        };
+        let server = super::super::VirtualCameraServer::start(source, options).unwrap();
+        let port = server.endpoints()["gige"]["port"].as_u64().unwrap() as u16;
+        let client = UdpSocket::bind((ip, 0)).unwrap();
+        client.set_broadcast(true).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        for (id, destination) in [(0x1234u16, subnet), (0x1235, Ipv4Addr::BROADCAST)] {
+            // DISCOVERY_CMD with the acknowledge-required and broadcast-allowed
+            // flags, as Aravis sends it (arvgvcp.c).
+            let request = [
+                0x42,
+                0x11,
+                0x00,
+                0x02,
+                0x00,
+                0x00,
+                (id >> 8) as u8,
+                id as u8,
+            ];
+            if client.send_to(&request, (destination, port)).is_err() {
+                return;
+            }
+            let mut reply = [0u8; 1024];
+            let (length, from) = client.recv_from(&mut reply).unwrap();
+            assert_eq!(from, SocketAddr::from((ip, port)), "{destination}");
+            assert_eq!(length, 8 + 0xf8);
+            assert_eq!(
+                reply[..8],
+                [0, 0, 0x00, 0x03, 0x00, 0xf8, request[6], request[7]]
+            );
+            assert_eq!(reply[8 + 0x24..8 + 0x28], ip.octets());
+        }
         drop(server);
     }
 }
