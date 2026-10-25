@@ -819,23 +819,33 @@ impl<C: Channel> Control<C> {
             max_ack: 65548,
         }
     }
-    /// Send a command and wait for its acknowledgement. As GenCP describes,
-    /// a lost or corrupt acknowledgement or a failed transfer resends the
-    /// command after the response time with the same request ID and the
-    /// CommandResend flag, so a late acknowledgement still answers it. A
-    /// busy camera, or one that cannot take a resend, gets it again as a new
-    /// command.
+    /// Send a command and wait for its acknowledgement within the command
+    /// timeout. As GenCP describes, a lost or corrupt acknowledgement or a
+    /// failed transfer resends the command after the response time with the
+    /// same request ID and the CommandResend flag, so a late acknowledgement
+    /// still answers it. A busy camera, which did not run the command, gets
+    /// it again as a new command, as does one that cannot take a resend,
+    /// which may then run a write whose acknowledgement was lost twice.
     fn transact(&mut self, cmd: u16, payload: &[u8]) -> Result<Vec<u8>> {
         ensure!(
             12 + payload.len() <= self.max_command,
             "UVCP command exceeds camera transfer limit"
         );
+        let started = Instant::now();
+        let deadline = started + self.timeout;
+        let hard_deadline = started + self.timeout.max(Duration::from_secs(60));
         let window = self.response.max(self.timeout / ATTEMPTS);
-        let hard_deadline = Instant::now() + self.timeout.max(Duration::from_secs(60));
         self.id = self.id.wrapping_add(1).max(1);
         let mut resend = false;
+        let mut sent = 0;
         let mut failure = anyhow!("USB3 Vision command was not sent");
-        for _ in 0..ATTEMPTS {
+        while sent < ATTEMPTS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            sent += 1;
+            let window = window.min(remaining);
             let error = match self.attempt(cmd, payload, resend, window, hard_deadline) {
                 Ok(data) => return Ok(data),
                 Err(error) => error,
@@ -861,7 +871,10 @@ impl<C: Channel> Control<C> {
             }
             failure = error;
         }
-        Err(failure.context(format!("USB3 Vision command failed {ATTEMPTS} times")))
+        let plural = if sent == 1 { "" } else { "s" };
+        Err(failure.context(format!(
+            "USB3 Vision command failed after {sent} attempt{plural}"
+        )))
     }
     fn attempt(
         &mut self,
@@ -1432,17 +1445,22 @@ mod tests {
         sent: Vec<Vec<u8>>,
         replies: VecDeque<Result<Vec<u8>, TransferError>>,
         halts_cleared: usize,
+        /// Whether a read with nothing to receive waits out its timeout.
+        slow: bool,
     }
     impl Channel for Script {
         fn send(&mut self, packet: Vec<u8>, _timeout: Duration) -> Result<usize, TransferError> {
             self.sent.push(packet);
             Ok(self.sent.last().unwrap().len())
         }
-        fn receive(&mut self, _len: usize, _timeout: Duration) -> Result<Vec<u8>, TransferError> {
+        fn receive(&mut self, _len: usize, timeout: Duration) -> Result<Vec<u8>, TransferError> {
             // A read with nothing to receive times out.
-            self.replies
-                .pop_front()
-                .unwrap_or(Err(TransferError::Cancelled))
+            self.replies.pop_front().unwrap_or_else(|| {
+                if self.slow {
+                    std::thread::sleep(timeout);
+                }
+                Err(TransferError::Cancelled)
+            })
         }
         fn clear_halt(&mut self) {
             self.halts_cleared += 1;
@@ -1522,6 +1540,20 @@ mod tests {
         let error = silent.read_memory(0x1cc, 4).unwrap_err();
         assert!(format!("{error:#}").contains("timed out"));
         assert_eq!(silent.channel.sent.len(), ATTEMPTS as usize);
+    }
+    #[test]
+    fn resends_stay_within_the_command_timeout() {
+        let script = Script {
+            slow: true,
+            ..Script::default()
+        };
+        // A camera whose maximum response time is most of the timeout gets
+        // one resend in the time that remains.
+        let mut slow = Control::new(script, Duration::from_millis(300));
+        slow.response = Duration::from_millis(200);
+        assert!(slow.read_memory(0x1cc, 4).is_err());
+        assert!(slow.channel.sent.len() <= 2);
+        assert_eq!(sent(&slow)[0], (0x4000, 1));
     }
     #[test]
     fn usb_leader_and_trailer_validation() {
