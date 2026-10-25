@@ -880,6 +880,21 @@ pub(super) struct Acquisition {
     pub(super) settings: serde_json::Map<String, Value>,
 }
 
+impl Acquisition {
+    /// Whether the camera's own auto exposure, gain or white balance was on,
+    /// so its values may differ on the next frame.
+    fn firmware_auto(&self) -> bool {
+        ["ExposureAuto", "GainAuto", "BalanceWhiteAuto"]
+            .iter()
+            .any(|name| {
+                self.settings
+                    .get(*name)
+                    .and_then(Value::as_str)
+                    .is_some_and(|mode| !mode.eq_ignore_ascii_case("off"))
+            })
+    }
+}
+
 fn acquisition(c: &mut Camera) -> Acquisition {
     let mut settings = serde_json::Map::new();
     for &name in ACQUISITION_FEATURES {
@@ -1706,8 +1721,12 @@ fn process_plain(
                         }
                         let wall_ms = crate::scheduling::now_ms();
                         // Auto exposure changes the camera between frames until
-                        // it settles.
-                        if index > 0 && auto.as_ref().is_some_and(|a| !a.converged()) {
+                        // it settles, and the camera's own auto features may
+                        // change it on any frame.
+                        if index > 0
+                            && (auto.as_ref().is_some_and(|a| !a.converged())
+                                || settings.firmware_auto())
+                        {
                             settings = acquisition(c);
                         }
                         let mut metadata = serde_json::to_value(&frame)?;
@@ -2637,6 +2656,18 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn camera_auto_features_refresh_settings_every_frame() {
+        let mut settings = Acquisition::default();
+        settings
+            .settings
+            .insert("ExposureAuto".into(), json!("Off"));
+        assert!(!settings.firmware_auto());
+        settings
+            .settings
+            .insert("GainAuto".into(), json!("Continuous"));
+        assert!(settings.firmware_auto());
+    }
     #[test]
     fn forwarding_progress_is_sampled_four_times_a_second_without_payload_details() {
         use std::cell::Cell;

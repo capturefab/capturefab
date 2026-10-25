@@ -462,7 +462,13 @@ impl Plan {
         if output == "-" {
             Plan::Stdout
         } else if has_placeholder(output) {
-            Plan::Template(with_extension(output, format))
+            // A templated folder still names a folder: its frames are
+            // numbered inside it, like an untemplated one.
+            if names_directory(output) {
+                Plan::Template(with_extension(&format!("{output}frame-{{seq}}"), format))
+            } else {
+                Plan::Template(with_extension(output, format))
+            }
         } else if names_directory(output) || count > 1 || Path::new(output).is_dir() {
             Plan::Directory {
                 dir: output.into(),
@@ -785,6 +791,18 @@ pub fn save_named<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_templated_folder_numbers_frames_inside_it() {
+        assert_eq!(
+            Plan::new("dataset/{tag:label}/", 3, "png"),
+            Plan::Template("dataset/{tag:label}/frame-{seq}.png".into())
+        );
+        assert_eq!(
+            Plan::new("dataset/{tag:label}/", 1, "jpeg"),
+            Plan::Template("dataset/{tag:label}/frame-{seq}.jpg".into())
+        );
+    }
     use chrono::TimeZone;
 
     fn temp(name: &str) -> PathBuf {
