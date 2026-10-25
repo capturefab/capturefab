@@ -380,17 +380,17 @@ capturefab --session bench status --json</code></pre></div>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>NAME</code></td><td>Saved setup name.</td><td>Required unless <code>--file</code></td></tr>
 <tr><td><code>--file</code></td><td>Compare a setup document from a file instead.</td><td>None</td></tr>
-<tr><td><code>--allow-other-model</code></td><td>Compare with a camera of another model; only settings both share apply.</td><td>Off</td></tr>
+<tr><td><code>--allow-other-model</code></td><td>Leave out the note that <code>setup apply</code> needs <code>--allow-other-model</code>; a diff always compares the settings both cameras share.</td><td>Off</td></tr>
 </tbody></table></div>
 <h3 id="command-setup-apply"><code>capturefab setup apply</code></h3>
 <p>Restore a setup as one camera change. It previews first; changes to triggering, I/O lines and other settings beyond the image need <code>--yes</code>. A setup changed after its preview is refused.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>NAME</code></td><td>Saved setup name.</td><td>Required unless <code>--file</code></td></tr>
 <tr><td><code>--file</code></td><td>Restore a setup document from a file instead.</td><td>None</td></tr>
-<tr><td><code>--dry-run</code></td><td>Print what would change and change nothing.</td><td>Off</td></tr>
+<tr><td><code>--dry-run</code></td><td>Print what would change and change nothing. With <code>--strict</code>, fails as the strict restore would.</td><td>Off</td></tr>
 <tr><td><code>--strict</code></td><td>Fail, changing nothing, if any saved value cannot be applied to this camera.</td><td>Off</td></tr>
 <tr><td><code>--allow-other-model</code></td><td>Apply to a camera of another model; only settings both share change.</td><td>Off</td></tr>
-<tr><td><code>--yes</code></td><td>Confirm disruptive changes, such as trigger and I/O line settings.</td><td>Off</td></tr>
+<tr><td><code>--yes</code></td><td>Confirm changes beyond the image, such as trigger, I/O line and acquisition rate settings.</td><td>Off</td></tr>
 </tbody></table></div>
 <h3 id="command-setup-delete"><code>capturefab setup delete</code></h3>
 <p>Delete a saved setup. The camera is not changed.</p>

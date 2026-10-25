@@ -6779,6 +6779,287 @@ fn login_add_saves_in_the_real_credential_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The printed restore and undo hints name the camera they were for, so
+/// running them as printed in a session with several cameras changes that
+/// camera and not the session's default.
+#[test]
+fn setup_hints_name_the_camera_in_a_session_with_several() {
+    let root = temp_root("setup-hints");
+    let dir = root.join("sessions");
+    let cwd = root.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &cwd, "setup-two"),
+        dir: root.clone(),
+    };
+    let on = |camera: &str, args: &[&str]| {
+        json(
+            &dir,
+            &[
+                &["--json", "--session", "setup-two", "--camera", camera],
+                args,
+            ]
+            .concat(),
+        )
+    };
+    let gain = |camera: &str| {
+        on(camera, &["get", "Gain"])["features"][0]["value"]
+            .as_f64()
+            .unwrap()
+    };
+    // Runs a printed hint word for word; the ids need no quoting.
+    let run = |hint: &str| {
+        let args = hint.split_whitespace().skip(1).collect::<Vec<_>>();
+        let out = cmd(&dir, &args);
+        assert!(out.status.success(), "{hint}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let hint = |text: &str, prefix: &str| {
+        text.lines()
+            .find_map(|line| {
+                line.split_once(prefix)
+                    .map(|(_, hint)| hint.trim().to_owned())
+            })
+            .unwrap_or_else(|| panic!("no {prefix} in {text}"))
+    };
+    on("sim:0", &["connect", "sim:0"]);
+    on("sim:0", &["set", "Gain=3"]);
+    let out = cmd(
+        &dir,
+        &[
+            "--session",
+            "setup-two",
+            "--camera",
+            "sim:0",
+            "setup",
+            "save",
+            "bench",
+        ],
+    );
+    assert!(out.status.success());
+    let restore = hint(&String::from_utf8_lossy(&out.stdout), "Restore with:");
+    assert_eq!(
+        restore,
+        "capturefab --session setup-two --camera sim:0 setup apply bench"
+    );
+    on("sim:0", &["set", "Gain=9"]);
+    // sim:1 is now the session's active camera.
+    on("sim:1", &["connect", "sim:1"]);
+    on("sim:1", &["set", "Gain=4"]);
+    assert_eq!(
+        json(&dir, &["--json", "--session", "setup-two", "status"])["active_camera"],
+        "sim:1"
+    );
+    let applied = run(&restore);
+    assert_eq!((gain("sim:0"), gain("sim:1")), (3.0, 4.0), "{applied}");
+    let undo = hint(&applied, "Undo with:");
+    assert_eq!(undo, "capturefab --session setup-two --camera sim:0 undo");
+    on("sim:1", &["set", "Gain=5"]);
+    run(&undo);
+    assert_eq!((gain("sim:0"), gain("sim:1")), (9.0, 5.0));
+}
+
+/// Restoring a change beyond the image needs --yes, by name and from a
+/// file; the refusal changes nothing and names the commands that review
+/// and confirm the same setup on the same camera.
+#[test]
+fn saved_setups_require_yes_for_disruptive_changes() {
+    let root = temp_root("setup-yes");
+    let dir = root.join("sessions");
+    let cwd = root.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &cwd, "setup-yes"),
+        dir: root.clone(),
+    };
+    let base = ["--session", "setup-yes", "--camera", "sim:line:conveyor"];
+    let on = |args: &[&str]| json(&dir, &[&["--json"][..], &base, args].concat());
+    let refused = |args: &[&str]| {
+        let out = cmd(&dir, &[&["--json"][..], &base, args].concat());
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(error["error"]["code"], "usage", "{error}");
+        error["error"]["message"].as_str().unwrap().to_owned()
+    };
+    let rate = || {
+        on(&["get", "AcquisitionLineRate"])["features"][0]["value"]
+            .as_f64()
+            .unwrap()
+    };
+    on(&["connect", "sim:line:conveyor"]);
+    on(&["setup", "save", "line"]);
+    let saved = rate();
+    on(&["set", "AcquisitionLineRate=500"]);
+    assert_ne!(saved, 500.0);
+    let diff = on(&["setup", "diff", "line"]);
+    assert_eq!(
+        diff["changes"][0]["feature"], "AcquisitionLineRate",
+        "{diff}"
+    );
+    assert_eq!(diff["changes"][0]["risk"], "disruptive");
+
+    let message = refused(&["setup", "apply", "line"]);
+    assert!(
+        message
+            .contains("AcquisitionLineRate, which changes how the camera behaves beyond the image"),
+        "{message}"
+    );
+    assert!(!message.contains("triggers or signals"), "{message}");
+    assert!(
+        message
+            .contains("capturefab --session setup-yes --camera sim:line:conveyor setup diff line,")
+            && message.ends_with("setup apply line --yes"),
+        "{message}"
+    );
+    assert_eq!(rate(), 500.0);
+    // Human mode prints the diff before refusing.
+    let out = cmd(&dir, &[&base[..], &["setup", "apply", "line"]].concat());
+    assert_eq!(out.status.code(), Some(2));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("Would change 1 on sim:line:conveyor")
+            && text.contains("! AcquisitionLineRate: 500 → ")
+            && text.contains("restoring needs --yes"),
+        "{text}"
+    );
+
+    // The same gate for a file; the hint reviews that file, not the
+    // saved setup its document is named after.
+    let shown = cmd(&dir, &["--json", "setup", "show", "line"]);
+    let file = cwd.join("line copy.json");
+    std::fs::write(&file, &shown.stdout).unwrap();
+    let path = file.to_str().unwrap();
+    let message = refused(&["setup", "apply", "--file", path, "--strict"]);
+    let quoted = format!("'{path}'");
+    assert!(
+        message.contains(&format!("setup diff --file {quoted},"))
+            && message.ends_with(&format!("setup apply --file {quoted} --strict --yes")),
+        "{message}"
+    );
+    assert!(!message.contains("setup diff line"), "{message}");
+    assert_eq!(rate(), 500.0);
+    let history = on(&["history"]).to_string();
+    assert!(!history.contains("Restore setup line"), "{history}");
+
+    let applied = on(&["setup", "apply", "line", "--yes"]);
+    assert_eq!(applied["camera_change"]["label"], "Restore setup line");
+    assert_eq!(rate(), saved);
+    on(&["undo"]);
+    assert_eq!(rate(), 500.0);
+}
+
+/// Checks that need no running camera: a taken name is refused before the
+/// camera is read, a strict preview fails as the restore would, and the
+/// diff's --allow-other-model is described as what it does.
+#[test]
+fn setup_save_and_preview_refuse_early_and_strictly() {
+    let root = temp_root("setup-early");
+    let dir = root.join("sessions");
+    let cwd = root.join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    json(
+        &dir,
+        &["--json", "--camera", "sim:0", "setup", "save", "taken"],
+    );
+    // No GigE camera answers at this address; the name is checked first.
+    let start = std::time::Instant::now();
+    let out = cmd(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "gige:192.0.2.1",
+            "setup",
+            "save",
+            "TAKEN",
+        ],
+    );
+    let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(2), "{error}");
+    assert_eq!(error["error"]["code"], "usage");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pass --replace"),
+        "{error}"
+    );
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    // --replace goes on to the camera.
+    let out = cmd(
+        &dir,
+        &[
+            "--json",
+            "--camera",
+            "gige:192.0.2.1",
+            "setup",
+            "save",
+            "taken",
+            "--replace",
+        ],
+    );
+    assert_ne!(out.status.code(), Some(2));
+    assert_ne!(out.status.code(), Some(0));
+
+    // A value this camera lacks: a strict preview fails like the restore.
+    let shown = cmd(&dir, &["--json", "setup", "show", "taken"]);
+    let mut document: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    document["result"]["values"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"feature":"Scan3dOutputMode","value":"Range"}));
+    let file = cwd.join("extra.json");
+    std::fs::write(&file, serde_json::to_vec(&document).unwrap()).unwrap();
+    let path = file.to_str().unwrap();
+    let apply = |extra: &[&str]| {
+        cmd(
+            &dir,
+            &[
+                &[
+                    "--json", "--camera", "sim:0", "setup", "apply", "--file", path,
+                ][..],
+                extra,
+            ]
+            .concat(),
+        )
+    };
+    assert!(apply(&["--dry-run"]).status.success());
+    for flags in [&["--dry-run", "--strict"][..], &["--strict"]] {
+        let out = apply(flags);
+        let error: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(out.status.code(), Some(5), "{flags:?} {error}");
+        assert!(
+            error["error"]["message"].as_str().unwrap().contains(
+                "cannot be applied strictly; nothing changed. Not applicable: Scan3dOutputMode"
+            ),
+            "{error}"
+        );
+    }
+
+    let help = cmd(&dir, &["setup", "diff", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help.contains("a diff always compares the settings both cameras share"),
+        "{help}"
+    );
+    // read_setup takes no fields, as web/agents.md says.
+    let mut rpc = binary(&dir)
+        .args(["--json", "--camera", "sim:0", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write as _;
+    rpc.stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"op":"read_setup","name":"taken"}"#)
+        .unwrap();
+    let out = rpc.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Save a simulator's settings, change them, preview and restore the setup
 /// in a session, undo it, and move it between files and workflows.
 #[test]
@@ -6914,6 +7195,14 @@ fn saved_setups_restore_preview_and_undo_in_a_session() {
     assert!(out.status.success());
     let preview: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(preview["result"]["match"], "other_model");
+    // The note is in the JSON, not only on stderr.
+    let note = preview["result"]["warnings"][0]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        note.contains("Pattern camera") && note.contains("Pattern line scan camera"),
+        "{preview}"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("--allow-other-model"),
         "{}",

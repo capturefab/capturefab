@@ -1040,7 +1040,7 @@ impl Workbench {
         } else {
             if disruptive(diff) {
                 section = section.push(
-                    text("Settings marked “Changes camera behavior” control how the camera triggers or signals other equipment.")
+                    text("Settings marked “Changes camera behavior” affect more than the image, such as triggering, I/O lines or acquisition rate.")
                         .size(style::SMALL)
                         .color(p.secondary),
                 );

@@ -256,7 +256,7 @@ pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) 
         return if saved.id.is_some() && saved.id == live_saved.id {
             (Match::SameCamera, Vec::new())
         } else {
-            (Match::OtherModel, Vec::new())
+            (Match::OtherModel, vec![other_model_warning(saved, live)])
         };
     }
     if saved.transport == Transport::Media || live.transport == Transport::Media {
@@ -269,11 +269,11 @@ pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) 
                 )],
             )
         } else {
-            (Match::OtherModel, Vec::new())
+            (Match::OtherModel, vec![other_model_warning(saved, live)])
         };
     }
     if !(same(&saved.vendor, &live.vendor) && same(&saved.model, &live.model)) {
-        return (Match::OtherModel, Vec::new());
+        return (Match::OtherModel, vec![other_model_warning(saved, live)]);
     }
     match &saved.serial {
         Some(serial) if same(serial, &live.serial) => (Match::SameCamera, Vec::new()),
@@ -289,6 +289,17 @@ pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) 
             )],
         ),
     }
+}
+/// The note a preview or restore of another model carries. It names no
+/// flag: RPC callers read it too.
+fn other_model_warning(saved: &SavedCamera, live: &CameraInfo) -> String {
+    let saved = saved.id.clone().unwrap_or_else(|| saved.label());
+    let live = if live.id.starts_with("hub:") {
+        live.id.clone()
+    } else {
+        label(&live.vendor, &live.model)
+    };
+    format!("Saved from {saved}; this camera is {live}; only settings both share apply.")
 }
 fn article(model: &str) -> String {
     let model = model.trim();
@@ -798,17 +809,16 @@ impl Store {
         }
         read_file(&path)
     }
-    /// Save `setup`, refusing an existing name unless `replace`. Returns
-    /// the file written.
-    pub fn save(&self, setup: &Setup, replace: bool) -> Result<PathBuf> {
-        validate(setup)?;
-        let _lock = self.lock()?;
-        let path = self.path(&setup.name);
+    /// Whether `name` can be saved: refuses a taken name unless `replace`,
+    /// and a new name when the store is full. `save` checks again under
+    /// its lock; this lets a command refuse before reading a camera.
+    pub fn check_free(&self, name: &str, replace: bool) -> Result<()> {
+        let path = self.path(name);
         if path.exists() {
             if !replace {
                 let existing = read_file(&path)
                     .map(|existing| existing.name)
-                    .unwrap_or_else(|_| setup.name.clone());
+                    .unwrap_or_else(|_| name.to_owned());
                 return Err(NameTaken(existing).into());
             }
         } else {
@@ -817,6 +827,15 @@ impl Store {
                 "{MAX_SETUPS} setups are saved; delete one first (capturefab setup delete NAME)"
             );
         }
+        Ok(())
+    }
+    /// Save `setup`, refusing an existing name unless `replace`. Returns
+    /// the file written.
+    pub fn save(&self, setup: &Setup, replace: bool) -> Result<PathBuf> {
+        validate(setup)?;
+        let _lock = self.lock()?;
+        self.check_free(&setup.name, replace)?;
+        let path = self.path(&setup.name);
         self.write(&path, setup)?;
         Ok(path)
     }
@@ -1235,9 +1254,16 @@ mod tests {
             warnings,
             ["Saved from another acA1920-40gm (serial 23456789)."]
         );
+        // Another model carries one note naming both, and no CLI flag.
         assert_eq!(
-            matching(&saved, &info("FLIR", "BFS-U3-51S5M", "1")).0,
-            Match::OtherModel
+            matching(&saved, &info("FLIR", "BFS-U3-51S5M", "1")),
+            (
+                Match::OtherModel,
+                vec![
+                    "Saved from Basler acA1920-40gm; this camera is FLIR BFS-U3-51S5M; only settings both share apply."
+                        .to_owned()
+                ]
+            )
         );
         let rtsp = CameraInfo {
             id: "media:0123abcd".into(),
@@ -1259,7 +1285,14 @@ mod tests {
             ["Saved from an RTSP input; Capturefab cannot tell whether this is the same stream."]
         );
         assert_eq!(matching(&saved_rtsp, &same).0, Match::OtherModel);
-        assert_eq!(matching(&saved, &rtsp).0, Match::OtherModel);
+        let (other, warnings) = matching(&saved, &rtsp);
+        assert_eq!(other, Match::OtherModel);
+        assert_eq!(
+            warnings,
+            [
+                "Saved from Basler acA1920-40gm; this camera is FFmpeg RTSP input; only settings both share apply."
+            ]
+        );
         let hub = CameraInfo {
             id: "hub:home/camera.front".into(),
             ..rtsp.clone()
@@ -1271,7 +1304,14 @@ mod tests {
             id: "hub:home/camera.back".into(),
             ..rtsp
         };
-        assert_eq!(matching(&saved_hub, &other_hub).0, Match::OtherModel);
+        let (other, warnings) = matching(&saved_hub, &other_hub);
+        assert_eq!(other, Match::OtherModel);
+        assert_eq!(
+            warnings,
+            [
+                "Saved from hub:home/camera.front; this camera is hub:home/camera.back; only settings both share apply."
+            ]
+        );
     }
 
     #[test]
@@ -1332,6 +1372,12 @@ mod tests {
             taken.to_string(),
             "A setup named bench exists; pass --replace to overwrite it"
         );
+        // The same refusal, before any camera is read; replace passes.
+        let early = store.check_free("Bench", false).unwrap_err();
+        assert!(early.is::<NameTaken>());
+        assert_eq!(early.to_string(), taken.to_string());
+        store.check_free("bench", true).unwrap();
+        store.check_free("other", false).unwrap();
         store.save(&setup("BENCH"), true).unwrap();
         let list = store.list().unwrap();
         assert_eq!(list.len(), 1);
@@ -1354,6 +1400,20 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
         assert_eq!(names, ["setups.lock"]);
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn a_full_store_refuses_a_new_name_before_saving() {
+        let store = Store::at(temp("full"));
+        crate::ipc::ensure_private_dir(store.dir()).unwrap();
+        for index in 0..MAX_SETUPS {
+            fs::write(store.dir().join(format!("s{index}.json")), b"{}").unwrap();
+        }
+        let full = store.check_free("new", false).unwrap_err();
+        assert!(full.to_string().contains("setups are saved; delete one"));
+        // An existing name can still be replaced.
+        store.check_free("s1", true).unwrap();
         let _ = fs::remove_dir_all(store.dir());
     }
 

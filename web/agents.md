@@ -794,13 +794,14 @@ A restore verifies every saved value, including those in `matched[]`, and writes
 `restarts_stream` means a running stream stops and restarts once, for geometry, pixel format or a value the camera locks while acquiring; `blocked` explains a refusal while recording, forwarding or scheduled captures run.
 
 The CLI refuses changes with `risk: "disruptive"`, such as trigger and I/O line settings, without `--yes`; selecting another trigger or line bank is reversible.
-Pass `--yes` only after the person approved those exact changes.
-`setup apply` with a setup from another model needs `--allow-other-model`; `setup diff` previews it anyway and warns on stderr.
-`--strict` refuses, changing nothing, when any value cannot be applied.
+Pass `--yes` only after the person approved those exact changes. The refusal (exit 2, `usage`) names the review and confirm commands with the same session, camera and `--file`.
+Human hints after a save or restore (`Restore with:`, `Undo with:`) name the session and camera, so they run as printed.
+`setup apply` with a setup from another model needs `--allow-other-model`; `setup diff` previews it anyway, with the model note in `warnings` and a hint on stderr (its `--allow-other-model` only drops that hint).
+`--strict` refuses, changing nothing, when any value cannot be applied; `--dry-run --strict` fails the same way (exit 5).
 `apply_setup` with the `digest` from a reviewed diff refuses a setup edited since that review.
 The CLI also sends the reviewed disruptive changes as `confirmed_disruptive`, each `{feature, at}`; the restore is refused (exit 2), changing nothing, if the camera changed since and the restore would now make another disruptive change, at any bank. A bare feature name confirms only a value without banks.
 
-RPC `read_setup`, `setup_diff` and `apply_setup` take a setup `name` or an inline `setup` document.
+RPC `read_setup` takes no arguments (`{"op":"read_setup"}`) and returns the writable values a new setup would save; `setup_diff` and `apply_setup` take a setup `name` or an inline `setup` document.
 Workflows restore a setup with the step `{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}}`.
 RPC and workflow callers skip the `--yes` confirmation, as `set_many` does, but the model, node-kind and recording checks always apply.
 A failed restore puts every value back and says so ("Restoring setup NAME failed; every value was put back", and whether a stopped stream was restarted); exit 1.
