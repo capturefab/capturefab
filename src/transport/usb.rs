@@ -975,8 +975,13 @@ impl Backend for UsbBackend {
                 .chain()
                 .any(|cause| cause.downcast_ref() == Some(&TransferError::Stall))
         {
-            self.restart_stream()
-                .context("cannot recover the stalled USB stream endpoint")?;
+            // A control timeout during recovery must not read as a frame wait.
+            self.restart_stream().map_err(|restart| {
+                Categorized::error(
+                    ErrorKind::OperationFailed,
+                    format!("cannot recover the stalled USB stream endpoint: {restart:#}"),
+                )
+            })?;
         }
         frame
     }
