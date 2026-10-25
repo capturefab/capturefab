@@ -6985,6 +6985,38 @@ fn saved_setups_restore_preview_and_undo_in_a_session() {
     assert_eq!(applied["applied"], 1, "{applied}");
     assert_eq!(exposure(&session), 10000.0);
     json(&dir, &["--json", "setup", "delete", "backup"]);
+    // A restore that fails says every value was put back.
+    let mut bad: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    for value in bad["result"]["values"].as_array_mut().unwrap() {
+        if value["feature"] == "Gain" {
+            value["value"] = serde_json::json!(99999);
+        }
+    }
+    let bad_file = cwd.join("bad.json");
+    std::fs::write(&bad_file, serde_json::to_vec(&bad).unwrap()).unwrap();
+    let (code, error) = fail(&[
+        "--json",
+        "--session",
+        "setup-ci",
+        "--camera",
+        "sim:0",
+        "setup",
+        "apply",
+        "--file",
+        bad_file.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        (code, error["code"].as_str()),
+        (1, Some("operation_failed"))
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("Restoring setup bench failed; every value was put back"),
+        "{error}"
+    );
+    assert_eq!(exposure(&session), 10000.0);
     // The bare document works too.
     let document: Value = serde_json::from_slice(&shown.stdout).unwrap();
     let file = cwd.join("bench.json");

@@ -312,10 +312,14 @@ pub fn other_model_message(setup: &Setup, live: &CameraInfo) -> String {
     )
 }
 
-/// Apply order: geometry and format first, then enabling switches and
-/// modes, other values alphabetically, auto flags, and selectors last, so
-/// the inspector shows the saved bank afterwards.
-pub fn order_key(feature: &str) -> (u8, u8, String) {
+/// Apply order: geometry and format first; then switches that disarm or
+/// release (TriggerMode = Off, LineMode = Input, `*Enable` = false); other
+/// modes; other values alphabetically; then switches that arm or drive
+/// (TriggerMode = On, LineMode = Output, `*Enable` = true), so a trigger
+/// or output line never runs from a stale source; auto flags; and
+/// selectors last, so the inspector shows the saved bank afterwards.
+/// `target` is the value about to be written, as text.
+pub fn order_key(feature: &str, target: Option<&str>) -> (u8, u8, String) {
     const GEOMETRY: [&str; 6] = [
         "PixelFormat",
         "Binning",
@@ -335,14 +339,21 @@ pub fn order_key(feature: &str) -> (u8, u8, String) {
         };
         return (0, rank as u8, feature.into());
     }
+    let switch = matches!(feature, "TriggerMode" | "LineMode") || feature.ends_with("Enable");
     let group = if feature.ends_with("Selector") {
-        4
+        6
     } else if feature.ends_with("Auto") {
-        3
+        5
+    } else if let (true, Some(target)) = (switch, target) {
+        if matches!(target, "Off" | "Input" | "false" | "0") {
+            1
+        } else {
+            4
+        }
     } else if feature.ends_with("Enable") || feature.ends_with("Mode") {
-        1
-    } else {
         2
+    } else {
+        3
     };
     (group, 0, feature.into())
 }
@@ -350,10 +361,66 @@ pub fn order_key(feature: &str) -> (u8, u8, String) {
 /// Sort values into apply order.
 pub fn sort_values(values: &mut [SetupValue]) {
     values.sort_by(|a, b| {
-        order_key(&a.feature)
-            .cmp(&order_key(&b.feature))
+        order_key(&a.feature, Some(&a.value.text()))
+            .cmp(&order_key(&b.feature, Some(&b.value.text())))
             .then_with(|| a.at.cmp(&b.at))
     });
+}
+
+/// A disruptive change a person confirmed from a reviewed diff: a feature
+/// name, which confirms only a value without banks, or the feature and
+/// the banks it is written at.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Confirmed {
+    Name(String),
+    At(ConfirmedAt),
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmedAt {
+    pub feature: String,
+    #[serde(default)]
+    pub at: Vec<Bank>,
+}
+impl Confirmed {
+    /// The confirmation for one change of a diff (`{feature, at?}`).
+    pub fn of_change(change: &serde_json::Value) -> Option<Self> {
+        let feature = change["feature"].as_str()?.to_owned();
+        let at = if change["at"].is_null() {
+            Vec::new()
+        } else {
+            serde_json::from_value(change["at"].clone()).ok()?
+        };
+        Some(Self::At(ConfirmedAt { feature, at }))
+    }
+    pub fn feature(&self) -> &str {
+        match self {
+            Self::Name(feature) => feature,
+            Self::At(confirmed) => &confirmed.feature,
+        }
+    }
+    /// Whether this confirms writing `feature` at exactly `at`.
+    pub fn confirms(&self, feature: &str, at: &[Bank]) -> bool {
+        match self {
+            Self::Name(name) => name == feature && at.is_empty(),
+            Self::At(confirmed) => confirmed.feature == feature && confirmed.at == at,
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        crate::session::validate_feature(self.feature())?;
+        if let Self::At(confirmed) = self {
+            ensure!(
+                confirmed.at.len() <= MAX_BANKS,
+                "{} is addressed by more than {MAX_BANKS} selectors",
+                confirmed.feature
+            );
+            for bank in &confirmed.at {
+                validate_bank(&confirmed.feature, bank)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Setup names make their file names, so they avoid names some file
@@ -1037,7 +1104,7 @@ mod tests {
             digest: Some(digest(&big)),
             allow_other_model: true,
             strict: true,
-            confirmed_disruptive: Some(vec!["TriggerMode".into(); 8]),
+            confirmed_disruptive: Some(vec![Confirmed::Name("TriggerMode".into()); 8]),
         })
         .unwrap();
         assert!(line.len() < 1024 * 1024);
@@ -1104,13 +1171,55 @@ mod tests {
                 "BinningHorizontal",
                 "Width",
                 "OffsetX",
-                "AcquisitionFrameRateEnable",
-                "TriggerMode",
                 "BlackLevel",
                 "Gain",
+                "AcquisitionFrameRateEnable",
+                "TriggerMode",
                 "ExposureAuto",
                 "GainSelector"
             ]
+        );
+    }
+
+    #[test]
+    fn switches_disarm_first_and_arm_after_their_sources() {
+        let mut values = [
+            ("TriggerMode", "On"),
+            ("TriggerSource", "Software"),
+            ("TriggerActivation", "RisingEdge"),
+            ("LineMode", "Output"),
+            ("LineSource", "ExposureActive"),
+            ("UserOutputValue", "true"),
+            ("ExposureMode", "Timed"),
+            ("CounterEnable", "false"),
+            ("LineSelector", "Line1"),
+        ]
+        .map(|(f, v)| value(f, serde_json::json!(v)));
+        sort_values(&mut values);
+        assert_eq!(
+            values
+                .iter()
+                .map(|v| v.feature.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "CounterEnable",
+                "ExposureMode",
+                "LineSource",
+                "TriggerActivation",
+                "TriggerSource",
+                "UserOutputValue",
+                "LineMode",
+                "TriggerMode",
+                "LineSelector"
+            ]
+        );
+        // Disarming switches go before every value they gate.
+        assert!(order_key("TriggerMode", Some("Off")) < order_key("TriggerSource", Some("Line1")));
+        assert!(order_key("LineMode", Some("Input")) < order_key("LineSource", Some("Off")));
+        assert!(order_key("LineMode", Some("Output")) > order_key("LineSource", Some("Off")));
+        assert!(
+            order_key("AcquisitionFrameRateEnable", Some("true"))
+                > order_key("AcquisitionFrameRate", Some("30"))
         );
     }
 

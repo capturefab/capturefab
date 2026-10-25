@@ -785,22 +785,25 @@ capturefab setup show bench --json
 ```
 
 Always preview with `setup diff` or `setup apply --dry-run` first.
-`changes[]` lists `{feature, at?, saved, current, risk, stream_locked, warning?}`; `matched[]` lists `{feature, at?, value}` for settings that already match.
+`changes[]` lists `{feature, at?, saved, current, risk, stream_locked, deferred?, warning?}`; `matched[]` lists `{feature, at?, value}` for settings that already match.
+`deferred: true` marks a value unavailable now (`current` is null) that an earlier write in the same setup should make available, such as an output line's source; it is written after the others, and listed in the result's `not_applied` if it stays unavailable (`--strict` then fails and puts every value back).
+`auto_change` is `{current, saved, action, risk}`: `action` is `none`, `enter`, `balance` or `release` when restoring starts, retunes or stops Capturefab auto exposure; the result adds `auto_changed`.
+A restore verifies every saved value, including those in `matched[]`, and writes again one that an earlier write moved; `applied` counts the values it changed.
 `not_applied[]` lists values this camera lacks, cannot write or would not accept, each with `status` and `reason`.
 `match` is `same_camera`, `same_model`, `other_model` or `unknown_source`; read `warnings` before applying.
-`restarts_stream` means a running stream stops and restarts once; `blocked` explains a refusal while recording, forwarding or scheduled captures run.
+`restarts_stream` means a running stream stops and restarts once, for geometry, pixel format or a value the camera locks while acquiring; `blocked` explains a refusal while recording, forwarding or scheduled captures run.
 
-The CLI refuses changes with `risk: "disruptive"`, such as trigger and I/O line settings, without `--yes`.
+The CLI refuses changes with `risk: "disruptive"`, such as trigger and I/O line settings, without `--yes`; selecting another trigger or line bank is reversible.
 Pass `--yes` only after the person approved those exact changes.
 `setup apply` with a setup from another model needs `--allow-other-model`; `setup diff` previews it anyway and warns on stderr.
 `--strict` refuses, changing nothing, when any value cannot be applied.
 `apply_setup` with the `digest` from a reviewed diff refuses a setup edited since that review.
-The CLI also sends the reviewed disruptive features as `confirmed_disruptive`; the restore is refused (exit 2), changing nothing, if the camera changed since and the restore would now make another disruptive change.
+The CLI also sends the reviewed disruptive changes as `confirmed_disruptive`, each `{feature, at}`; the restore is refused (exit 2), changing nothing, if the camera changed since and the restore would now make another disruptive change, at any bank. A bare feature name confirms only a value without banks.
 
 RPC `read_setup`, `setup_diff` and `apply_setup` take a setup `name` or an inline `setup` document.
 Workflows restore a setup with the step `{"camera":"sim:0","command":{"op":"apply_setup","name":"bench"}}`.
 RPC and workflow callers skip the `--yes` confirmation, as `set_many` does, but the model, node-kind and recording checks always apply.
-A failed restore puts every value back; exit 1.
+A failed restore puts every value back and says so ("Restoring setup NAME failed; every value was put back", and whether a stopped stream was restarted); exit 1.
 A missing setup exits 3; another model through `setup apply` exits 2 and through RPC exits 5; a strict refusal exits 5; a blocked restore exits 3.
 
 Do not save, replace, import or delete setups unless the person asked; they are the person's saved state.

@@ -540,7 +540,7 @@ impl Workbench {
         // worker refuses any that appeared since.
         let confirmed = changes(&diff)
             .filter(|change| change["risk"] == "disruptive")
-            .filter_map(|change| change["feature"].as_str().map(str::to_owned))
+            .filter_map(crate::setup::Confirmed::of_change)
             .collect();
         if let Err(error) = self.try_submit(
             Some(&camera),

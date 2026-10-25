@@ -7,14 +7,17 @@
 //! changes; any other writable feature is Disruptive.
 
 /// Name prefixes of features Capturefab manages: GigE and transport-layer
-/// settings (writing GevSCDA would send the stream elsewhere), device
-/// resets and firmware, user sets and persistent settings that survive a
-/// reboot, camera file access, events and chunk data.
-const MANAGED_PREFIXES: [&str; 16] = [
+/// settings (writing GevSCDA would send the stream elsewhere), SFNC 2.x
+/// stream-channel settings such as DeviceStreamChannelPacketSize (the
+/// transport negotiates the packet size itself), device resets and
+/// firmware, user sets and persistent settings that survive a reboot,
+/// camera file access, events and chunk data.
+const MANAGED_PREFIXES: [&str; 17] = [
     "Gev",
     "TL",
     "DeviceLink",
     "DeviceTL",
+    "DeviceStreamChannel",
     "DeviceReset",
     "DeviceFactoryReset",
     "DeviceFirmware",
@@ -151,6 +154,9 @@ mod tests {
             "TransferStart",
             "ChunkModeActive",
             "EventNotification",
+            "DeviceStreamChannelPacketSize",
+            "DeviceStreamChannelSelector",
+            "DeviceStreamChannelEndianness",
         ] {
             assert!(managed(name, None, Some("Integer")), "{name}");
             assert!(!image_quality(name), "{name}");
