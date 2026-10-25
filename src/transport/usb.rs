@@ -62,7 +62,7 @@ fn device_names(d: &DeviceInfo) -> DeviceNames {
         .find_map(|c| {
             c.interface_alt_settings()
                 .filter(|i| is_u3v_interface(i.class(), i.subclass(), i.protocol()))
-                .find_map(|i| i.descriptors().find_map(|d| name_indexes(&d)))
+                .find_map(|i| i.descriptors().find_map(|desc| name_indexes(&desc)))
         })
         .unwrap_or_default();
     let descriptor = device.device_descriptor();
@@ -82,6 +82,17 @@ fn device_names(d: &DeviceInfo) -> DeviceNames {
         guid: read(NonZeroU8::new(guid)),
     }
 }
+/// A camera's ID. One without a serial number is told apart by its GUID,
+/// and by its USB address only when it has neither, or when reading them
+/// failed, as while another program holds the camera.
+fn camera_id(vendor: u16, product: u16, names: &DeviceNames, location: &str) -> String {
+    let unique = names
+        .serial
+        .as_deref()
+        .or(names.guid.as_deref())
+        .unwrap_or(location);
+    format!("usb:{vendor:04x}:{product:04x}:{unique}")
+}
 fn camera_info(d: &DeviceInfo) -> CameraInfo {
     let location = format!("{}:{}", d.bus_id(), d.device_address());
     let cached = |text: Option<&str>| text.filter(|text| !text.is_empty()).map(String::from);
@@ -98,15 +109,8 @@ fn camera_info(d: &DeviceInfo) -> CameraInfo {
         names.serial = names.serial.or(read.serial);
         names.guid = read.guid;
     }
-    // A camera without a serial number is told apart by its GUID, and by
-    // its USB address only when it has neither.
-    let unique = names
-        .serial
-        .as_ref()
-        .or(names.guid.as_ref())
-        .unwrap_or(&location);
     CameraInfo {
-        id: format!("usb:{:04x}:{:04x}:{unique}", d.vendor_id(), d.product_id()),
+        id: camera_id(d.vendor_id(), d.product_id(), &names, &location),
         transport: Transport::Usb3,
         vendor: names.vendor.unwrap_or_else(|| "Unknown".into()),
         model: names.model.unwrap_or_else(|| "USB3 Vision camera".into()),
@@ -473,7 +477,7 @@ fn layout(
 
 /// Whether Linux refused to submit a transfer for lack of usbfs memory. The
 /// transfer never reached the camera, so no data is missing.
-fn refused(status: &Result<(), TransferError>) -> bool {
+fn usbfs_refused(status: &Result<(), TransferError>) -> bool {
     (cfg!(any(target_os = "linux", target_os = "android")) || cfg!(test))
         && *status == Err(TransferError::Unknown(ENOMEM))
 }
@@ -594,7 +598,7 @@ impl Stream {
         let Completion {
             mut buffer, status, ..
         } = completion;
-        let received = if refused(&status) {
+        let received = if usbfs_refused(&status) {
             self.starved = true;
             Ok(None)
         } else if let Err(error) = status {
@@ -1382,6 +1386,20 @@ mod tests {
         assert_eq!(name_indexes(&descriptor), Some([4, 1, 2, 3]));
         assert_eq!(name_indexes(&descriptor[..17]), None);
         assert_eq!(name_indexes(&[7, 5, 0x81, 2, 0, 4, 0]), None);
+    }
+    #[test]
+    fn camera_id_prefers_the_serial_then_the_guid() {
+        let mut names = DeviceNames {
+            serial: Some("40012345".into()),
+            guid: Some("2676005E0A1B".into()),
+            ..DeviceNames::default()
+        };
+        let id = |names: &DeviceNames| camera_id(0x2676, 0xba02, names, "3:7");
+        assert_eq!(id(&names), "usb:2676:ba02:40012345");
+        names.serial = None;
+        assert_eq!(id(&names), "usb:2676:ba02:2676005E0A1B");
+        names.guid = None;
+        assert_eq!(id(&names), "usb:2676:ba02:3:7");
     }
     #[test]
     fn uvcp_little_endian_wire_packet() {
