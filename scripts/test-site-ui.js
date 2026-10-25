@@ -117,13 +117,27 @@ function openPage(options = {}) {
     oneclick.push(link); alts.push(alt);
   }
   const runHints = Array.from({ length: options.downloads === false ? 0 : 2 }, () => Object.assign(new Element('span'), { textContent: '# Run from the extracted folder' }));
+  // The in-browser launchers: the hero button asks for the camera at once and the
+  // quickstart one opens the welcome screen. Each names its status line.
+  const tryButtons = [];
+  const tryNotes = [];
+  if (options.tryLaunch) {
+    for (const [mode, status, label] of [['', 'try-status', 'Try with your webcam'], ['welcome', 'try-status-quickstart', 'Try it in your browser']]) {
+      const button = Object.assign(new Element('button'), { hidden: true, textContent: label });
+      button.dataset.tryLaunch = mode;
+      button.setAttribute('aria-describedby', status);
+      ids.set(status, new Element('p'));
+      tryButtons.push(button);
+      tryNotes.push(Object.assign(new Element('li'), { hidden: true }));
+    }
+  }
   const document = new Element();
   document.documentElement = new Element('html');
   document.baseURI = 'https://capturefab.example/';
   document.hidden = Boolean(options.hidden);
   document.getElementById = (id) => ids.get(id) || null;
   document.querySelector = (selector) => ({ '.download-result': result, '.platform-form': form })[selector] || null;
-  document.querySelectorAll = (selector) => ({ '.product-video': videos, '[data-oneclick]': oneclick, '[data-oneclick-alt]': alts, '[data-run-hint]': runHints })[selector] || [];
+  document.querySelectorAll = (selector) => ({ '.product-video': videos, '[data-oneclick]': oneclick, '[data-oneclick-alt]': alts, '[data-run-hint]': runHints, '[data-try-launch]': tryButtons, '[data-try-note]': tryNotes })[selector] || [];
   document.createElement = (tag) => new Element(tag);
   document.createTextNode = (text) => ({ textContent: text });
   const observers = [];
@@ -132,8 +146,29 @@ function openPage(options = {}) {
     observe() {}
   }
   // Timers run at once; the page uses them only to let a native download start first.
-  const window = { matchMedia: () => motion, setTimeout(callback) { callback(); } };
+  const windowListeners = new Map();
+  const logged = [];
+  const window = {
+    matchMedia: () => motion,
+    setTimeout(callback) { callback(); },
+    location: { protocol: options.protocol ?? 'https:', pathname: '/', search: '', hash: options.hash ?? '' },
+    // replaceState changes the address without a hashchange event.
+    history: {
+      replaced: [],
+      replaceState(state, title, url) {
+        this.replaced.push(url);
+        const at = String(url).indexOf('#');
+        window.location.hash = at < 0 ? '' : String(url).slice(at);
+      }
+    },
+    isSecureContext: options.secure ?? true,
+    console: { error: (error) => logged.push(error) },
+    addEventListener(type, listener) { windowListeners.set(type, [...(windowListeners.get(type) || []), listener]); }
+  };
   if (options.observer !== false) window.IntersectionObserver = Observer;
+  // A browser with ES modules has HTMLScriptElement.prototype.noModule.
+  function HTMLScriptElement() {}
+  HTMLScriptElement.prototype.noModule = false;
   const navigator = {
     platform: options.platform || '',
     userAgent: options.userAgent || '',
@@ -146,15 +181,37 @@ function openPage(options = {}) {
     if (options.fetchError) return Promise.reject(new Error('Offline'));
     return Promise.resolve({ ok: true, json: async () => options.manifest ?? published });
   };
-  vm.runInNewContext(source, { document, window, navigator, fetch, URL, IntersectionObserver: Observer }, { filename: 'web/app.js' });
+  // Node's vm has no module loader without a flag: there import() rejects, as a failed
+  // download does. A page given a loader gets it in place of the one import() of the
+  // workbench (test-site.py checks that ./try/try.mjs exists).
+  const imports = [];
+  let script = source;
+  if (options.loader) {
+    const call = "import('./try/try.mjs')";
+    assert.equal(source.split(call).length, 2, `web/app.js loads the workbench with exactly one ${call}`);
+    script = source.replace(call, "__tryImport('./try/try.mjs')");
+  }
+  const __tryImport = (specifier) => { imports.push(specifier); return options.loader(specifier); };
+  const globals = { document, window, navigator, fetch, URL, IntersectionObserver: Observer, __tryImport, ...(options.modules === false ? {} : { HTMLScriptElement }) };
+  vm.runInNewContext(script, globals, { filename: 'web/app.js' });
   return {
-    ids, result, motion, connection, videos, document, fetchCalls, oneclick, alts, runHints,
+    ids, result, motion, connection, videos, document, fetchCalls, oneclick, alts, runHints, tryButtons, tryNotes, imports, logged, windowListeners,
+    get hash() { return window.location.hash; },
+    replaced: window.history.replaced,
     async settle() {
       for (let pass = 0; pass < 6; pass += 1) {
         await Promise.resolve();
         while (events.length) events.shift()();
       }
     },
+    // Lets every pending promise, including a module load, finish.
+    async flush() {
+      for (let pass = 0; pass < 3; pass += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+        while (events.length) events.shift()();
+      }
+    },
+    navigate(hash) { window.location.hash = hash; for (const listener of windowListeners.get('hashchange') || []) listener({}); },
     change(id, value) { const element = ids.get(id); element.value = value; element.emit('change'); },
     intersect(index, ratio) {
       for (const observer of observers) observer.callback([{ target: videos[index], isIntersecting: ratio > 0, intersectionRatio: ratio }]);
@@ -510,10 +567,134 @@ async function missingObserverAndBlockedPlay() {
   assert.equal(blocked.videos[0].paused, false, 'A rejected automatic start must leave native playback available');
 }
 
+async function tryLauncher() {
+  const lead = 'Capturefab could not start in this browser.';
+  const status = (page, id = 'try-status') => page.ids.get(id).textContent;
+
+  // The buttons and their notes appear only where the workbench can load. A file:
+  // preview keeps them, so a click can explain why it does not start there.
+  for (const [options, shown, reason] of [
+    [{}, true, 'module support on a secure page'],
+    [{ modules: false }, false, 'no module support'],
+    [{ secure: false }, false, 'an insecure page'],
+    [{ protocol: 'file:', secure: false }, true, 'a file: preview']
+  ]) {
+    const page = openPage({ downloads: false, tryLaunch: true, ...options });
+    await page.flush();
+    assert.ok(page.tryButtons.every((button) => button.hidden === !shown), `Launchers ${shown ? 'appear' : 'stay hidden'} with ${reason}`);
+    assert.ok(page.tryNotes.every((note) => note.hidden === !shown), `Launcher notes ${shown ? 'appear' : 'stay hidden'} with ${reason}`);
+    assert.equal(status(page), '', 'Nothing is reported before a launch');
+    assert.equal(page.imports.length, 0, 'Nothing loads before a click');
+  }
+
+  // A real import() that fails, as an offline page or a missing file does.
+  const offline = openPage({ downloads: false, tryLaunch: true });
+  const [hero, quickstart] = offline.tryButtons;
+  hero.emit('click');
+  assert.equal(hero.textContent, 'Starting…', 'The label shows that the workbench is loading');
+  await offline.flush();
+  assert.equal(status(offline), `${lead} Its files did not load. Make sure that you are online, then try again.`);
+  assert.equal(offline.ids.get('try-status').children[0].tagName, 'STRONG');
+  assert.equal(hero.textContent, 'Try with your webcam', 'The label returns after a failed load');
+  assert.equal(status(offline, 'try-status-quickstart'), '', 'Only the clicked button reports');
+  assert.equal(offline.logged[0]?.code, 'ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING', 'The page called import() and kept the error for developers');
+  quickstart.emit('click');
+  await offline.flush();
+  assert.match(status(offline, 'try-status-quickstart'), /Its files did not load/);
+
+  // One load at a time, then launch with the clicked button as the opener.
+  const module = deferred();
+  const launches = [];
+  const page = openPage({ downloads: false, tryLaunch: true, loader: () => module.promise });
+  const [webcam, welcome] = page.tryButtons;
+  webcam.emit('click');
+  webcam.emit('click');
+  welcome.emit('click');
+  assert.deepEqual(page.imports, ['./try/try.mjs'], 'Repeated clicks while loading start one load');
+  assert.equal(webcam.textContent, 'Starting…');
+  module.resolve({ launch: (opener, settings) => { launches.push({ opener, settings }); return Promise.resolve(); } });
+  await page.flush();
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].opener, webcam, 'Focus returns to the clicked button');
+  assert.equal(launches[0].settings.autostart, true, 'The hero button asks for the webcam with the click');
+  assert.equal(webcam.textContent, 'Try with your webcam');
+  welcome.emit('click');
+  await page.flush();
+  assert.equal(launches[1].opener, welcome);
+  assert.equal(launches[1].settings.autostart, false, 'The quickstart button opens the welcome screen without a camera request');
+  assert.equal(status(page) + status(page, 'try-status-quickstart'), '');
+
+  // Errors the workbench writes for people are shown as written; a retry clears them.
+  let launch = async () => { throw new Error('This browser cannot run WebAssembly.'); };
+  const refused = openPage({ downloads: false, tryLaunch: true, loader: async () => ({ launch: (...args) => launch(...args) }) });
+  refused.tryButtons[0].emit('click');
+  await refused.flush();
+  assert.equal(status(refused), `${lead} This browser cannot run WebAssembly.`);
+  assert.equal(refused.logged.length, 0, 'A message for people is not a defect');
+  launch = async () => {};
+  refused.tryButtons[0].emit('click');
+  await refused.flush();
+  assert.equal(status(refused), '', 'A new launch clears the previous reason');
+
+  // Defects and old browsers get plain words; the defect stays in the console.
+  const broken = openPage({ downloads: false, tryLaunch: true, loader: async () => ({ launch: () => { throw new TypeError('reading properties of undefined'); } }) });
+  broken.tryButtons[0].emit('click');
+  await broken.flush();
+  assert.equal(status(broken), `${lead} An unexpected error stopped it. Reload the page, then try again.`);
+  assert.equal(broken.logged[0]?.name, 'TypeError');
+  const old = openPage({ downloads: false, tryLaunch: true, loader: () => Promise.reject(new SyntaxError('Unexpected token')) });
+  old.tryButtons[0].emit('click');
+  await old.flush();
+  assert.match(status(old), /cannot run its JavaScript\. Update the browser, or download Capturefab\.$/);
+
+  // A file: preview explains the limit and loads nothing.
+  const preview = openPage({ downloads: false, tryLaunch: true, protocol: 'file:', loader: async () => ({ launch: async () => {} }) });
+  preview.tryButtons[1].emit('click');
+  await preview.flush();
+  assert.equal(preview.imports.length, 0);
+  assert.match(status(preview, 'try-status-quickstart'), /^Capturefab could not start in this browser\. Browsers do not load its modules from a file\..*python3 -m http\.server -d web\.$/);
+
+  // #try opens the welcome screen from the hero button, now or after a hash change.
+  const linkLaunches = [];
+  const linked = openPage({ downloads: false, tryLaunch: true, hash: '#try', loader: async () => ({ launch: (opener, settings) => { linkLaunches.push({ opener, settings }); } }) });
+  await linked.flush();
+  assert.equal(linkLaunches.length, 1, 'A #try link opens the workbench on load');
+  assert.equal(linkLaunches[0].opener, linked.tryButtons[0]);
+  assert.equal(linkLaunches[0].settings.autostart, false, 'A link never asks for the camera without a click');
+  assert.equal(linked.hash, '', 'The #try fragment is used up, so Back or a reload after closing does not reopen the workbench');
+  assert.deepEqual(linked.replaced, ['/'], 'The address keeps its path and drops only the fragment');
+  linked.navigate('#download');
+  await linked.flush();
+  assert.equal(linkLaunches.length, 1);
+  linked.navigate('#try');
+  await linked.flush();
+  assert.equal(linkLaunches.length, 2, 'Following a #try link on the page opens it again');
+  assert.equal(linked.hash, '');
+
+  // Where it cannot run, the link explains why instead.
+  const insecure = openPage({ downloads: false, tryLaunch: true, secure: false, hash: '#try', loader: async () => ({ launch: async () => {} }) });
+  await insecure.flush();
+  assert.equal(insecure.imports.length, 0);
+  assert.equal(status(insecure), `${lead} This page is not secure. Open it with https, or from localhost.`);
+  const noModules = openPage({ downloads: false, tryLaunch: true, modules: false, hash: '#try' });
+  await noModules.flush();
+  assert.match(status(noModules), /cannot load JavaScript modules/);
+
+  // Pages without launchers ignore #try, and the download panel still works beside them.
+  const docs = openPage({ downloads: false, hash: '#try', loader: async () => ({ launch: async () => {} }) });
+  await docs.flush();
+  assert.equal(docs.imports.length, 0);
+  assert.equal(docs.windowListeners.size, 0, 'Pages without launchers add no hash listener');
+  const home = openPage({ tryLaunch: true, userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
+  await home.flush();
+  assert.equal(home.oneclick[0].dataset.oneclickState, 'ready', 'The download buttons still arm beside the launchers');
+  assert.ok(home.tryButtons.every((button) => !button.hidden));
+}
+
 (async () => {
-  for (const check of [downloads, signing, guessedProcessor, nextSteps, visiblePlayback, motionAndDataPreferences, missingObserverAndBlockedPlay]) {
+  for (const check of [downloads, signing, guessedProcessor, nextSteps, visiblePlayback, motionAndDataPreferences, missingObserverAndBlockedPlay, tryLauncher]) {
     try { await check(); }
     catch (error) { console.error(`${check.name}:`, error); process.exitCode = 1; }
   }
-  if (!process.exitCode) console.log('Download selection, fallback and visible-video controls respect viewer choices, motion, data and visibility.');
+  if (!process.exitCode) console.log('Download selection, fallback and visible-video controls respect viewer choices, motion, data and visibility; the in-browser launcher appears only where it can run and says why it cannot start.');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

@@ -1,0 +1,26 @@
+[package]
+name = "capturefab-try"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+description = "Capturefab's frame measurements, conversions, still encoders and Pattern camera, for Capturefab in the browser"
+license = "MIT"
+
+# Separate from the native crate, like web-client: no camera drivers, threads,
+# clocks, files or networking enter the WebAssembly build. Raw `cf_*` exports
+# (src/abi.rs), no wasm-bindgen; scripts/build-try.py builds web/try/capturefab.wasm.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dev-dependencies]
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]

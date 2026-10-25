@@ -507,6 +507,134 @@ def check_unused_css(root, errors):
                 errors.append(f"{sheet}: unused class selector .{name}")
 
 
+# References a browser resolves against the module that holds them. Each pattern
+# captures the quote and the literal specifier.
+MODULE_REFERENCES = (
+    # import … from './x.mjs' and export … from './x.mjs', also across lines.
+    re.compile(r"""(?m)^[ \t]*(?:import|export)\b[^;'"`]*?\bfrom\s*(['"])([^'"\n]*)\1"""),
+    # import './x.mjs'
+    re.compile(r"""(?m)^[ \t]*import\s*(['"])([^'"\n]*)\1"""),
+    # import('./x.mjs')
+    re.compile(r"""\bimport\s*\(\s*(['"])([^'"\n]*)\1\s*[,)]"""),
+)
+# new URL('./x', import.meta.url): workers, styles, WebAssembly and other assets.
+ASSET_REFERENCE = re.compile(r"""\bnew\s+URL\s*\(\s*(['"])([^'"\n]*)\1\s*,\s*import\.meta\.url\s*\)""")
+# A module's own file paths, also when a helper resolves them: fetchText('./x.css').
+ASSET_LITERAL = re.compile(r"""(['"])(\.\.?/[^'"\s]+\.(?:mjs|js|css|wasm|json))\1""")
+COMPUTED_IMPORT = re.compile(r"""\bimport\((?!\s*['")])""")
+# In a module, a literal fetch() or Worker URL resolves against the page, not the module.
+PAGE_RELATIVE = re.compile(r"""\b(fetch|new\s+(?:Shared)?Worker)\s*\(\s*(['"`])""")
+
+
+def module_reference_error(root, path, specifier, module):
+    """Why the browser cannot load this reference from the site, or None."""
+    url = urlsplit(specifier)
+    if url.scheme or url.netloc:
+        return f"remote module or asset: {specifier}"
+    if specifier.startswith("/"):
+        return f"root-relative path: {specifier}; use a path relative to the module"
+    if module and not specifier.startswith(("./", "../")):
+        return f"bare module specifier: {specifier}; browsers load only paths such as ./{specifier}"
+    target = (path.parent / unquote(url.path)).resolve()
+    if not target.is_relative_to(root.resolve()):
+        return f"path outside web/: {specifier}"
+    if target.is_file() or (target.is_dir() and (url.path in (".", "") or url.path.endswith("/"))):
+        return None
+    return f"missing module or asset: {specifier}"
+
+
+def check_modules(root, errors):
+    """Every module and asset the site's scripts load resolves to a file in web/.
+
+    Classic scripts load modules only with import(); modules also use static imports,
+    new URL(…, import.meta.url) and literal ./ paths to their own files. Nothing else
+    validates these paths, and a deployed page would only find a broken one when a
+    visitor clicks."""
+    sources = [(path, False) for path in sorted(root.glob("*.js"))] + [(path, True) for path in sorted(root.rglob("*.mjs"))]
+    for path, module in sources:
+        name = path.relative_to(root).as_posix()
+        text = path.read_text(encoding="utf-8")
+        references = [(match[2], True) for pattern in (MODULE_REFERENCES if module else MODULE_REFERENCES[2:]) for match in pattern.finditer(text)]
+        if module:
+            references += [(match[2], False) for pattern in (ASSET_REFERENCE, ASSET_LITERAL) for match in pattern.finditer(text)]
+        # A path that is also imported follows the stricter module rules, and is reported once.
+        imported = {}
+        for specifier, is_import in references:
+            imported[specifier] = imported.get(specifier, False) or is_import
+        for specifier, is_import in sorted(imported.items()):
+            error = module_reference_error(root, path, specifier, is_import)
+            if error:
+                errors.append(f"{name}: {error}")
+        if COMPUTED_IMPORT.search(text):
+            errors.append(f"{name}: import() with a computed specifier; use a string literal so this check can resolve it")
+        if module:
+            for match in PAGE_RELATIVE.finditer(text):
+                call = re.sub(r"\s+", " ", match[1])
+                errors.append(f"{name}: {call}() with a literal URL resolves against the page; pass new URL('./…', import.meta.url)")
+
+
+class TryLaunchers(HTMLParser):
+    """The markup app.js expects for "Try with your webcam"."""
+
+    def __init__(self):
+        super().__init__()
+        self.launchers = []
+        self.notes = []
+        self.statuses = set()
+        self.scripts = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if "data-try-launch" in attrs:
+            self.launchers.append((tag, attrs))
+        if "data-try-note" in attrs:
+            self.notes.append((tag, attrs))
+        if attrs.get("role") == "status" and attrs.get("id"):
+            self.statuses.add(attrs["id"])
+        if tag == "script":
+            self.scripts.append(attrs.get("src", ""))
+
+
+def check_try_launchers(root, errors):
+    """Launchers stay hidden until app.js finds that the workbench can load, and each
+    names the role="status" element where app.js reports why it could not start."""
+    for path in sorted(root.glob("*.html")):
+        page = TryLaunchers()
+        page.feed(path.read_text(encoding="utf-8"))
+        if (page.launchers or page.notes) and "app.js" not in page.scripts:
+            errors.append(f"{path.name}: in-browser launchers need app.js")
+        for tag, attrs in page.launchers:
+            if tag != "button" or attrs.get("type") != "button" or "hidden" not in attrs:
+                errors.append(f"{path.name}: a data-try-launch element must be <button type=\"button\" hidden>")
+            if attrs.get("data-try-launch") not in ("", None, "welcome"):
+                errors.append(f"{path.name}: data-try-launch is empty or \"welcome\", not {attrs.get('data-try-launch')!r}")
+            if attrs.get("aria-describedby") not in page.statuses:
+                errors.append(f"{path.name}: a launcher's aria-describedby must name a role=\"status\" element")
+        for tag, attrs in page.notes:
+            if "hidden" not in attrs:
+                errors.append(f"{path.name}: a data-try-note <{tag}> must start hidden")
+
+
+def check_try_build(repo, errors):
+    """The committed in-browser WebAssembly matches its manifest and the web-try sources."""
+    path = Path(__file__).with_name("build-try.py")
+    if not path.is_file():
+        errors.append("in-browser try: scripts/build-try.py is missing, so web/try/capturefab.wasm cannot be verified")
+        return
+    try:
+        spec = importlib.util.spec_from_file_location("build_try", path)
+        build = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build)
+        problems = build.check_manifest(repo)
+    except (Exception, SystemExit) as error:  # A broken checker fails the site check with its reason.
+        errors.append(f"in-browser try: scripts/build-try.py cannot verify web/try/capturefab.wasm: {type(error).__name__}: {error}")
+        return
+    if not isinstance(problems, list) or not all(isinstance(problem, str) for problem in problems):
+        errors.append(f"in-browser try: scripts/build-try.py check_manifest returned {type(problems).__name__}, not a list of messages")
+        return
+    errors.extend(f"in-browser try: {problem}" for problem in problems)
+
+
 def check_svgs(root, errors):
     for path in sorted(root.rglob("*.svg")):
         for element in ET.parse(path).iter():
@@ -851,6 +979,8 @@ def validate(root=ROOT):
     check_image_provenance(root, pages, errors)
     check_landing(root, errors)
     check_unused_css(root, errors)
+    check_modules(root, errors)
+    check_try_launchers(root, errors)
     check_svgs(root, errors)
     for path in sorted(root.rglob("*.css")):
         css = path.read_text(encoding="utf-8")
@@ -873,6 +1003,8 @@ def validate(root=ROOT):
 def main():
     errors, versions = validate()
     check_installer_runs(errors)
+    # Needs the web-try sources beside web/, so it is not part of validate(root).
+    check_try_build(ROOT.parent, errors)
     spec = importlib.util.spec_from_file_location("docs_coverage", Path(__file__).with_name("docs-coverage.py"))
     coverage = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(coverage)
@@ -883,7 +1015,7 @@ def main():
         errors.append(f"cannot validate documentation coverage: {error}")
     if errors:
         sys.exit("\n".join(errors))
-    print(f"Static site validated; installers checked and run against a local release, source-based documentation coverage, accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, no remote runtime dependencies.")
+    print(f"Static site validated; installers checked and run against a local release, source-based documentation coverage, accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, the in-browser WebAssembly build against its sources, resolvable module paths, no remote runtime dependencies.")
 
 
 if __name__ == "__main__":
