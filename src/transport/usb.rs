@@ -1176,6 +1176,9 @@ impl Backend for UsbBackend {
     }
     fn start(&mut self, _payload_size: usize) -> Result<()> {
         ensure!(self.stream.is_none(), "USB acquisition already started");
+        // Take back transfers that a stop whose cancellation timed out left
+        // pending, so the new stream counts only its own.
+        self.stop()?;
         let started = self.start_stream();
         if started.is_err() {
             if self.stream.is_none() {
