@@ -1226,7 +1226,7 @@ On macOS, link the app's executable into a `PATH` folder after moving the app to
 `mkdir -p ~/.local/bin && ln -sf /Applications/Capturefab.app/Contents/MacOS/capturefab ~/.local/bin/capturefab`.
 
 A release can carry `highlights`: at most six plain-text lines of at most 200 characters.
-On macOS the asset is a disk image (`.dmg`); each operating system and architecture has one asset.
+Each operating system and architecture has exactly one asset (a `.zip`, or a `.dmg` on macOS from releases that ship one).
 
 Capturefab source is MIT-licensed. The bundled FFmpeg executable is GPLv3; its source, build configuration, and licensing notices are part of the release provenance. See the repository's source and FFmpeg build guide when producing a new platform binary.
 

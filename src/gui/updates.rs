@@ -19,6 +19,8 @@ pub(super) enum Input {
     Close,
     /// From the guide's update row: close it, then open the sheet.
     FromHelp,
+    /// From Settings › Updates: close Settings, then open the sheet.
+    FromSettings,
     CheckNow,
     Download,
     ReleaseNotes,
@@ -54,6 +56,9 @@ pub(super) struct State {
     scene: bool,
     scene_sender: Option<mpsc::Sender<Fetched>>,
     scrolled: bool,
+    /// Why the last requested check of this session failed, until a check
+    /// succeeds. Shown even when the saved state keeps an earlier result.
+    requested_error: Option<UpdateError>,
     /// Fetches started, for tests.
     pub(super) started: usize,
 }
@@ -72,6 +77,7 @@ impl Default for State {
             scene: false,
             scene_sender: None,
             scrolled: false,
+            requested_error: None,
             started: 0,
         }
     }
@@ -99,6 +105,17 @@ impl State {
     /// The version the menu, guide and notice announce.
     pub(super) fn announce(&self) -> Option<String> {
         self.settings.announce()
+    }
+
+    /// What Settings and the sheet show: the saved status, unless the last
+    /// requested check failed. An available version stays shown, with the
+    /// failure as a second value.
+    fn shown(&self) -> (Status, Option<&UpdateError>) {
+        match (self.settings.status(), &self.requested_error) {
+            (status @ Status::Available(_), error) => (status, error.as_ref()),
+            (_, Some(error)) => (Status::Failed(error.clone()), None),
+            (status, None) => (status, None),
+        }
     }
 }
 
@@ -189,6 +206,10 @@ fn release_date(date: &str) -> Option<String> {
         .map(|date| date.format("%-d %b %Y").to_string())
 }
 
+fn again_text(error: &UpdateError) -> String {
+    format!("Couldn't check again just now: {error}.")
+}
+
 fn policy_text(source: &PolicySource) -> String {
     format!(
         "Update checks are turned off on this computer by {}.",
@@ -260,6 +281,10 @@ impl Workbench {
                 self.show_help(false);
                 return self.updates_input(Input::Open);
             }
+            Input::FromSettings => {
+                let closed = self.handle_message(Message::Settings(false));
+                return closed.chain(self.updates_input(Input::Open));
+            }
             Input::CheckNow => self.start_update_check(Run::Requested),
             Input::Download => {
                 let url = self
@@ -313,6 +338,16 @@ impl Workbench {
                 Ok(fetched) => {
                     self.updates.running = None;
                     self.updates.settings = fetched.settings;
+                    match &fetched.result {
+                        Some(Ok(_)) => self.updates.requested_error = None,
+                        Some(Err(error)) if job == Run::Requested => {
+                            if let UpdateError::PolicyOff(source) = error {
+                                self.updates.policy = Policy::Off(source.clone());
+                            }
+                            self.updates.requested_error = Some(error.clone());
+                        }
+                        _ => (),
+                    }
                     if fetched.result.is_some() {
                         self.updates.checked = Some(self.now);
                     }
@@ -374,7 +409,14 @@ impl Workbench {
             return;
         }
         self.set_notice(
-            format!("Capturefab {version} is available. Open Check for Updates for details."),
+            format!(
+                "Capturefab {version} is available. Choose {} › Check for Updates… for details.",
+                if cfg!(target_os = "macos") {
+                    "Capturefab"
+                } else {
+                    "Help"
+                }
+            ),
             None,
             Level::Done,
         );
@@ -437,35 +479,49 @@ impl Workbench {
                 .size(style::SMALL)
                 .color(p.accent_text)
                 .into(),
-            Policy::Allowed => match (state.settings.status(), when(&state.settings)) {
-                (Status::Available(version), _) => row![
-                    text(format!("{version} is available."))
-                        .size(style::SMALL)
-                        .font(style::MEDIUM),
-                    button(text("Release Notes").size(style::SMALL))
-                        .name("Open the release notes")
-                        .style(style::link)
-                        .padding(0)
-                        .on_press_maybe(
-                            state
-                                .settings
-                                .last_outcome
-                                .as_ref()
-                                .and_then(|outcome| outcome.url.as_ref())
-                                .map(|_| Message::Updates(Input::ReleaseNotes))
-                        ),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center)
-                .into(),
+            Policy::Allowed => match (state.shown(), when(&state.settings)) {
+                ((Status::Available(version), again), _) => {
+                    let line = row![
+                        text(format!("{version} is available."))
+                            .size(style::SMALL)
+                            .font(style::MEDIUM),
+                        button(text("Details…").size(style::SMALL))
+                            .name("Show the new version in Software Update")
+                            .style(style::link)
+                            .padding(0)
+                            .on_press(Message::Updates(Input::FromSettings)),
+                        button(text("Release Notes").size(style::SMALL))
+                            .name("Open the release notes")
+                            .style(style::link)
+                            .padding(0)
+                            .on_press_maybe(
+                                state
+                                    .settings
+                                    .last_outcome
+                                    .as_ref()
+                                    .and_then(|outcome| outcome.url.as_ref())
+                                    .map(|_| Message::Updates(Input::ReleaseNotes))
+                            ),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center);
+                    match again {
+                        Some(error) => column![line, small(again_text(error))]
+                            .spacing(4)
+                            .into(),
+                        None => line.into(),
+                    }
+                }
+                ((Status::Failed(error), _), _) => {
+                    small(format!("Last check failed: {error}.")).into()
+                }
                 (_, None) => small("Never checked.".into()).into(),
-                (Status::Failed(error), _) => small(format!("Last check failed: {error}.")).into(),
-                (Status::Newer(latest), Some(at)) => small(format!(
+                ((Status::Newer(latest), _), Some(at)) => small(format!(
                     "Last checked {at}. This build ({}) is newer than the latest release, {latest}.",
                     check::current()
                 ))
                 .into(),
-                (Status::None, Some(at)) => {
+                ((Status::None, _), Some(at)) => {
                     small(format!("Last checked {at}. No releases are published yet.")).into()
                 }
                 (_, Some(at)) => small(format!(
@@ -530,15 +586,29 @@ impl Workbench {
         let mut body = column![].spacing(14);
         let mut footer: Option<Element<'_, Message>> = None;
         let outcome = state.settings.last_outcome.clone().unwrap_or_default();
-        match (&state.policy, state.checking(), state.settings.status()) {
+        let (shown, again) = state.shown();
+        let close_footer = |label: &'static str| -> Element<'_, Message> {
+            row![
+                space().width(Fill),
+                action(label.into(), "Close", Input::Close, false)
+            ]
+            .into()
+        };
+        match (&state.policy, state.checking(), shown) {
             (Policy::Off(source), _, _) => {
                 body = body
                     .push(title("Update checks are off".into()))
                     .push(body_text(format!(
                         "{} You're using {current}.",
-                        policy_text(source)
+                        match source {
+                            PolicySource::File(_) =>
+                                "Your administrator turned them off with this file.",
+                            PolicySource::Env => "This environment variable turns them off.",
+                        }
                     )))
+                    .push(self.copyable(source.describe(), p))
                     .push(downloads());
+                footer = Some(close_footer("Close"));
             }
             (_, true, _) => {
                 body = body.push(
@@ -585,6 +655,9 @@ impl Workbench {
                         }))
                         .spacing(6),
                     );
+                }
+                if let Some(error) = again {
+                    body = body.push(body_text(again_text(error)));
                 }
                 if state.settings.skipped.as_deref() == Some(&version) {
                     body = body.push(body_text("You chose to skip this version.".into()));
@@ -668,6 +741,7 @@ impl Workbench {
                         ]
                         .spacing(10),
                     );
+                footer = Some(close_footer("Close"));
             }
             (_, false, Status::Unknown) => {
                 body = body
@@ -932,6 +1006,66 @@ mod tests {
         // A version this build already has is never announced.
         found(&mut app, check::current());
         assert_eq!(app.updates.announce(), None);
+    }
+
+    /// Deliver `result` as the end of a requested check.
+    fn finish(app: &mut Workbench, result: Result<Outcome, UpdateError>) {
+        let (send, receive) = mpsc::channel();
+        app.updates.running = Some((Run::Requested, receive));
+        let settings = app.updates.settings.clone();
+        send.send(Fetched {
+            result: Some(result),
+            settings,
+        })
+        .unwrap();
+        app.tick_updates();
+        assert!(!app.updates.checking());
+    }
+
+    #[test]
+    fn a_requested_check_that_fails_before_saving_still_shows_why() {
+        let mut app = bench();
+        app.updates.open = true;
+        finish(&mut app, Err(UpdateError::BadUrl));
+        assert_eq!(
+            app.updates.shown(),
+            (Status::Failed(UpdateError::BadUrl), None)
+        );
+        let _ = app.updates_sheet(&style::LIGHT, 600.0);
+        let _ = app.updates_settings_section(&style::LIGHT);
+        // A later success clears it.
+        finish(&mut app, Ok(Outcome::default()));
+        assert_eq!(app.updates.shown(), (Status::Unknown, None));
+        // A policy added after launch shows the policy view.
+        finish(&mut app, Err(UpdateError::PolicyOff(PolicySource::Env)));
+        assert_eq!(app.updates.policy, Policy::Off(PolicySource::Env));
+    }
+
+    #[test]
+    fn a_failed_check_after_finding_a_version_keeps_it_and_says_so() {
+        let mut app = bench();
+        found(&mut app, "9.9.0");
+        finish(&mut app, Err(UpdateError::Timeout));
+        assert_eq!(
+            app.updates.shown(),
+            (
+                Status::Available("9.9.0".into()),
+                Some(&UpdateError::Timeout)
+            )
+        );
+        let _ = app.updates_sheet(&style::LIGHT, 600.0);
+        let _ = app.updates_settings_section(&style::LIGHT);
+    }
+
+    #[test]
+    fn details_in_settings_closes_settings_and_opens_the_sheet() {
+        let mut app = bench();
+        found(&mut app, "9.9.0");
+        app.settings_open = true;
+        assert!(app.sheet_open());
+        let _ = app.updates_input(Input::FromSettings);
+        assert!(!app.settings_open);
+        assert!(app.updates.open);
     }
 
     #[test]

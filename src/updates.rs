@@ -78,9 +78,9 @@ impl fmt::Display for UpdateError {
                 "CAPTUREFAB_UPDATE_URL must be an https:// URL, or http:// to this computer (127.0.0.1, [::1] or localhost), without a query",
             ),
             Self::Offline => f.write_str("No network connection"),
-            Self::Unreachable => f.write_str("capturefab.com could not be reached"),
-            Self::Timeout => f.write_str("capturefab.com didn't respond within 10 seconds"),
-            Self::Status(code) => write!(f, "capturefab.com returned an error (HTTP {code})"),
+            Self::Unreachable => f.write_str("The release list server could not be reached"),
+            Self::Timeout => f.write_str("The release list server didn't respond within 10 seconds"),
+            Self::Status(code) => write!(f, "The release list server returned an error (HTTP {code})"),
             Self::TooLarge => f.write_str("The release list is larger than 256 KiB"),
             Self::Malformed => {
                 f.write_str("The release list was not in a format this version understands")
@@ -1196,6 +1196,17 @@ pub fn human(value: &Value) -> String {
             if let Some(url) = release["url"].as_str() {
                 out.push_str(&format!("Release notes: {url}\n"));
             }
+        } else if let Status::Newer(latest) = status(
+            Some(&Outcome {
+                latest: latest.as_str().map(str::to_owned),
+                ..Outcome::default()
+            }),
+            &text(&value["version"]),
+        ) {
+            out.push_str(&format!(
+                "This build ({}) is newer than the latest release, {latest}.\n",
+                text(&value["version"])
+            ));
         } else {
             out.push_str(&format!(
                 "This is the latest version (latest release: {}).\n",
@@ -1716,7 +1727,10 @@ mod tests {
             Policy::Off(PolicySource::File(file.clone()))
         );
         fs::write(&file, br#"{"update_check":"on"}"#).unwrap();
-        assert_eq!(policy_from(None, std::slice::from_ref(&file)), Policy::Allowed);
+        assert_eq!(
+            policy_from(None, std::slice::from_ref(&file)),
+            Policy::Allowed
+        );
         fs::write(
             &file,
             format!(r#"{{"update_check":"off","pad":"{}"}}"#, "x".repeat(5000)),
@@ -1758,6 +1772,33 @@ mod tests {
                 expected,
                 "{error:?}"
             );
+        }
+    }
+
+    #[test]
+    fn version_check_text_tells_a_newer_build_from_the_latest() {
+        let checked = |version: &str, latest: &str| {
+            human(&json!({
+                "version": version, "os": "macos", "arch": "aarch64",
+                "checked_at": "2026-10-25T09:14:00Z", "latest": latest,
+                "update_available": false, "release": {},
+            }))
+        };
+        assert!(
+            checked("0.5.0", "0.4.0")
+                .contains("This build (0.5.0) is newer than the latest release, 0.4.0.")
+        );
+        assert!(checked("0.4.0", "0.4.0").contains("This is the latest version"));
+    }
+
+    #[test]
+    fn network_errors_never_name_one_server() {
+        for error in [
+            UpdateError::Unreachable,
+            UpdateError::Timeout,
+            UpdateError::Status(502),
+        ] {
+            assert!(!error.to_string().contains("capturefab.com"), "{error}");
         }
     }
 
