@@ -588,6 +588,7 @@ impl Camera {
         if self.streaming {
             return Ok(());
         }
+        self.acquire_continuously()?;
         if self.has("TLParamsLocked") && self.is_writable("TLParamsLocked") {
             self.nodes
                 .set(self.backend.as_mut(), "TLParamsLocked", "1")?;
@@ -598,6 +599,26 @@ impl Camera {
             return Err(error);
         }
         self.streaming = true;
+        Ok(())
+    }
+    /// A camera left in SingleFrame or MultiFrame ends each acquisition by
+    /// itself after a frame or a few, which would freeze live view and fail
+    /// later captures: switch it to Continuous, before TLParamsLocked can
+    /// lock the mode. The camera keeps the new mode after stop.
+    fn acquire_continuously(&mut self) -> Result<()> {
+        let limited = self.has("AcquisitionMode")
+            && self
+                .get("AcquisitionMode")
+                .is_ok_and(|mode| mode == "SingleFrame" || mode == "MultiFrame");
+        if limited
+            && self.is_writable("AcquisitionMode")
+            && self
+                .choices("AcquisitionMode")
+                .is_ok_and(|modes| modes.iter().any(|mode| mode == "Continuous"))
+        {
+            self.nodes
+                .set(self.backend.as_mut(), "AcquisitionMode", "Continuous")?;
+        }
         Ok(())
     }
     fn begin(&mut self) -> Result<()> {
@@ -746,7 +767,10 @@ pub(crate) mod tests {
             Ok(self.word(address).to_le_bytes().to_vec())
         }
         fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
-            ensure!(data.len() == 4 && address.is_multiple_of(4), "unaligned write");
+            ensure!(
+                data.len() == 4 && address.is_multiple_of(4),
+                "unaligned write"
+            );
             ensure!(address != PAYLOAD && address != LOCKS, "read-only register");
             let value = u32::from_le_bytes(data.try_into()?);
             self.memory[(address / 4) as usize] = value;
@@ -848,6 +872,10 @@ pub(crate) mod tests {
     /// locked by the camera's own lock bit or an unlocked transport layer.
     const FLIR_ACQUISITION: &str = r#"<Command Name="AcquisitionStart" NameSpace="Standard"><ToolTip>Starts the acquisition of images</ToolTip><Visibility>Beginner</Visibility><pIsLocked>Acquisition_Locked</pIsLocked><pValue>AcquisitionStart_Val</pValue><CommandValue>1</CommandValue></Command><IntSwissKnife Name="Acquisition_Locked"><Visibility>Invisible</Visibility><pVariable Name="TLPL">TLParamsLocked</pVariable><pVariable Name="LCK">AcquisitionStart_Lck</pVariable><Formula>LCK || ((TLPL = 0) ? 1 : 0)</Formula></IntSwissKnife><MaskedIntReg Name="AcquisitionStart_Lck"><Address>0x60</Address><Length>4</Length><AccessMode>RO</AccessMode><Bit>3</Bit><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></MaskedIntReg><IntReg Name="AcquisitionStart_Val"><Address>0x04</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Command Name="AcquisitionStop" NameSpace="Standard"><Visibility>Beginner</Visibility><pValue>AcquisitionStop_Val</pValue><CommandValue>1</CommandValue></Command><IntReg Name="AcquisitionStop_Val"><Address>0x08</Address><Length>4</Length><AccessMode>WO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
 
+    /// AcquisitionMode and AcquisitionFrameCount, locked by the transport
+    /// layer as on FLIR Blackfly S, with Basler ace entry values.
+    const ACQUISITION_MODE_NODES: &str = r#"<Enumeration Name="AcquisitionMode" NameSpace="Standard"><pIsLocked>TLParamsLocked</pIsLocked><EnumEntry Name="SingleFrame" NameSpace="Standard"><Value>0</Value></EnumEntry><EnumEntry Name="MultiFrame" NameSpace="Standard"><Value>1</Value></EnumEntry><EnumEntry Name="Continuous" NameSpace="Standard"><Value>2</Value></EnumEntry><pValue>AcquisitionModeReg</pValue></Enumeration><IntReg Name="AcquisitionModeReg"><Address>0x0c</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Integer Name="AcquisitionFrameCount" NameSpace="Standard"><pIsLocked>TLParamsLocked</pIsLocked><pValue>FrameCountReg</pValue><Min>1</Min><Max>255</Max><Inc>1</Inc></Integer><IntReg Name="FrameCountReg"><Address>0x10</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
+
     pub(crate) fn device_camera(device: Device) -> Camera {
         Camera::from_backend(crate::transport::simulator::info(), Box::new(device)).unwrap()
     }
@@ -910,6 +938,36 @@ pub(crate) mod tests {
         assert!(error.to_string().contains("is locked"), "{error:#}");
         camera.stop().unwrap();
         camera.set("GevSCPSPacketSize", "9000").unwrap();
+    }
+
+    #[test]
+    fn single_and_multi_frame_cameras_stream_continuously() {
+        for (mode, frames) in [(0, 1), (1, 2)] {
+            let device = Device::new(&format!(
+                "{TL_PARAMS_LOCKED}{FLIR_ACQUISITION}{ACQUISITION_MODE_NODES}"
+            ))
+            .with(ACQUISITION_MODE, mode)
+            .with(FRAME_COUNT, frames);
+            let mut camera = device_camera(device);
+            camera.start().unwrap();
+            assert_eq!(camera.get("AcquisitionMode").unwrap(), "Continuous");
+            for _ in 0..4 {
+                camera.next_frame(Duration::from_millis(10)).unwrap();
+            }
+            camera.stop().unwrap();
+            assert_eq!(camera.get("AcquisitionMode").unwrap(), "Continuous");
+        }
+        // Without a Continuous mode the camera keeps its own.
+        let single = ACQUISITION_MODE_NODES.replace(
+            r#"<EnumEntry Name="Continuous" NameSpace="Standard"><Value>2</Value></EnumEntry>"#,
+            "",
+        );
+        let device = Device::new(&format!("{OPEN_ACQUISITION}{single}")).with(ACQUISITION_MODE, 0);
+        let mut camera = device_camera(device);
+        camera.start().unwrap();
+        assert_eq!(camera.get("AcquisitionMode").unwrap(), "SingleFrame");
+        camera.next_frame(Duration::from_millis(10)).unwrap();
+        assert!(camera.next_frame(Duration::from_millis(10)).is_err());
     }
 
     #[test]
