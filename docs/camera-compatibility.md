@@ -114,8 +114,10 @@ capturefab --camera 'dshow:video=Camera Name' capture -o webcam.png
 
 The GUI's direct locator field accepts these same inputs. On macOS, grant camera
 access to the executable or terminal when the operating system requests it. On
-Linux, grant your user access to the selected video node. A virtual camera or
-capture device must be visible to the host API used by that build.
+Linux, grant your user access to the selected video node; its `/dev/v4l/by-id/`
+or `/dev/v4l/by-path/` link also works and stays bound to the same camera when
+node numbers change. A virtual camera or capture device must be visible to the
+host API used by that build.
 
 Native locators accept optional `size` and `fps`, for example
 `avfoundation:Camera Name?size=1920x1080&fps=30`. Run `features` to inspect the

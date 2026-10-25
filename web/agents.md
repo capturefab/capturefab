@@ -1033,7 +1033,7 @@ A camera that asks for a user name and password fails with `auth_required`; one 
 
 Session RPC `connect` accepts `login:{user,password}` beside a credential-free `camera`, and `saved_login` (default true; false skips saved sign-ins). This is for local session IPC only: the `serve --listen` remote API refuses `login`, and opens cameras with sign-ins saved on that computer only when started with `--allow-saved-sign-ins`. The built-in assistant and assistant-origin tool calls connect with `saved_login:false`, so they never use saved passwords; they can use a camera the user already connected.
 
-Native camera locators are `avfoundation:0` on macOS, `v4l2:/dev/video0` on Linux, and `dshow:video=Camera Name` on Windows. CSI cameras require an operating system driver exposing a suitable V4L2 device. Native enumeration and capture may require operating system camera permissions.
+Native camera locators are `avfoundation:0` on macOS, `v4l2:/dev/video0` on Linux (or its `/dev/v4l/by-id/` or `/dev/v4l/by-path/` link), and `dshow:video=Camera Name` on Windows. CSI cameras require an operating system driver exposing a suitable V4L2 device. Native enumeration and capture may require operating system camera permissions.
 
 Native locators accept `?size=WIDTHxHEIGHT&fps=RATE`.
 Examine `features` for advertised `VideoMode` choices.

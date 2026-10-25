@@ -1770,8 +1770,8 @@ fn native_input(source: &str) -> Result<Option<(&'static str, String)>> {
                 "V4L2 capture is available on Linux"
             );
             ensure!(
-                path.starts_with("/dev/video"),
-                "V4L2 URI must point to /dev/videoN"
+                v4l2_path(path),
+                "V4L2 URI must point to /dev/videoN or a /dev/v4l/by-id or /dev/v4l/by-path link"
             );
             ("v4l2", path.into())
         } else if let Some(name) = source.strip_prefix("dshow:") {
@@ -1788,6 +1788,18 @@ fn native_input(source: &str) -> Result<Option<(&'static str, String)>> {
             return Ok(None);
         },
     ))
+}
+/// A V4L2 device node, or a persistent link udev makes to one, which stays
+/// bound to the same camera when node numbers change across reboots and
+/// replugs.
+fn v4l2_path(path: &str) -> bool {
+    path.starts_with("/dev/video")
+        || ["/dev/v4l/by-id/", "/dev/v4l/by-path/"]
+            .iter()
+            .any(|links| {
+                path.strip_prefix(links)
+                    .is_some_and(|name| !matches!(name, "" | "." | "..") && !name.contains('/'))
+            })
 }
 fn device_name(source: &str) -> &str {
     let name = source.split_once(':').map_or(source, |(_, name)| name);
@@ -7700,6 +7712,45 @@ Error opening input files: Input/output error
             ]
         );
         fs::remove_dir_all(class).unwrap();
+    }
+    #[test]
+    fn v4l2_locators_accept_persistent_udev_links() {
+        let by_path = "/dev/v4l/by-path/pci-0000:00:14.0-usb-0:1:1.0-video-index0";
+        for path in [
+            "/dev/video0",
+            "/dev/v4l/by-id/usb-046d_HD_Pro_Webcam_C920_8A4F3D5F-video-index0",
+            by_path,
+            "/dev/v4l/by-path/platform-fe801000.csi-video-index0",
+        ] {
+            assert!(v4l2_path(path), "{path}");
+        }
+        for path in [
+            "/dev/v4l/by-id/",
+            "/dev/v4l/by-id/..",
+            "/dev/v4l/by-path/../../sda",
+            "/dev/v4l-subdev0",
+            "/dev/sda",
+        ] {
+            assert!(!v4l2_path(path), "{path}");
+        }
+        let source = format!("v4l2:{by_path}?size=1280x720");
+        validate_source_shape(&source).unwrap();
+        let (base, options) = native_source(&source).unwrap();
+        assert_eq!(base, format!("v4l2:{by_path}"));
+        assert_eq!(options.unwrap().size, Some((1280, 720)));
+        let missing = native_failure(
+            &format!("[video4linux2,v4l2 @ 0x55d0c8a0c0] Cannot open video device {by_path}: No such file or directory\n"),
+            false,
+            &base,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            missing,
+            format!(
+                "camera device not found: {by_path}; reconnect the device and run capturefab native to obtain its current locator"
+            )
+        );
     }
     #[test]
     fn native_devices_prefer_names_and_failures_are_concise() {
