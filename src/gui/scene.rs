@@ -5,6 +5,9 @@ use super::*;
 use notice::{Level, Saved, command_notice};
 use serde_json::json;
 
+mod video;
+use video::VideoSink;
+
 /// An explicit zero renders a camera-free workbench; it never invents a
 /// simulator just to satisfy the screenshot's startup condition.
 pub(super) fn screenshot_camera_count(words: &[&str], existing: u32, requested: u32) -> u32 {
@@ -28,6 +31,35 @@ pub(super) struct ScreenshotRequest {
     pub(super) save: Option<Receiver<Result<()>>>,
     pub(super) outcome: Arc<Mutex<Option<String>>>,
     pub(super) sequence: ScreenshotSequence,
+    /// A video sequence's writers and timing sidecar; single shots use `save`.
+    pub(super) video: Option<VideoSink>,
+}
+
+impl ScreenshotRequest {
+    pub(super) fn new(
+        path: PathBuf,
+        cameras: u32,
+        outcome: Arc<Mutex<Option<String>>>,
+        sequence: ScreenshotSequence,
+    ) -> Result<Self> {
+        let video = sequence
+            .is_video()
+            .then(|| VideoSink::open(&path))
+            .transpose()
+            .map_err(|error| anyhow::anyhow!("Open renderer frame timing: {error:#}"))?;
+        Ok(Self {
+            path,
+            cameras,
+            started: Instant::now(),
+            streams_started: None,
+            staged: false,
+            requested: false,
+            save: None,
+            outcome,
+            sequence,
+            video,
+        })
+    }
 }
 
 /// Optional bounded renderer frame sequence for documentation videos. Each
@@ -52,18 +84,18 @@ impl ScreenshotSequence {
 
     pub(super) fn parse(frames: Option<&str>, fps: Option<&str>) -> Result<Self> {
         let frames = frames.unwrap_or("1").parse::<u32>().map_err(|_| {
-            anyhow::anyhow!("CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 240")
+            anyhow::anyhow!("CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 900")
         })?;
         let fps = fps.unwrap_or("8").parse::<u32>().map_err(|_| {
-            anyhow::anyhow!("CAPTUREFAB_SCREENSHOT_FPS must be an integer from 1 to 15")
+            anyhow::anyhow!("CAPTUREFAB_SCREENSHOT_FPS must be an integer from 1 to 60")
         })?;
         anyhow::ensure!(
-            (1..=240).contains(&frames),
-            "CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 240"
+            (1..=900).contains(&frames),
+            "CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 900"
         );
         anyhow::ensure!(
-            (1..=15).contains(&fps),
-            "CAPTUREFAB_SCREENSHOT_FPS must be an integer from 1 to 15"
+            (1..=60).contains(&fps),
+            "CAPTUREFAB_SCREENSHOT_FPS must be an integer from 1 to 60"
         );
         Ok(Self {
             frames,
@@ -71,6 +103,11 @@ impl ScreenshotSequence {
             interval: Duration::from_secs_f64(1.0 / f64::from(fps)),
             next: None,
         })
+    }
+
+    /// More than one frame: written by `VideoSink`, with a timing sidecar.
+    pub(super) fn is_video(&self) -> bool {
+        self.frames > 1
     }
 
     pub(super) fn path(&self, base: &std::path::Path) -> PathBuf {
@@ -86,19 +123,26 @@ impl ScreenshotSequence {
         self.index < self.frames
     }
 
-    fn ready(&self) -> bool {
-        self.ready_at(Instant::now())
-    }
-
     fn ready_at(&self, now: Instant) -> bool {
         self.next.is_none_or(|next| now >= next)
     }
 
+    /// Schedule the next frame on a fixed grid, so frames do not drift; a
+    /// late frame restarts the grid rather than bursting to catch up.
     fn requested(&mut self) {
-        self.next = Some(Instant::now() + self.interval);
+        self.requested_at(Instant::now());
     }
 
-    fn timeout(&self) -> Duration {
+    fn requested_at(&mut self, now: Instant) {
+        self.next = Some(match self.next {
+            Some(next) if next + self.interval > now => next + self.interval,
+            _ => now,
+        });
+    }
+
+    /// 30 s, plus max(interval, 250 ms) per frame for a sequence; the
+    /// website media script mirrors this for its own deadline.
+    pub(super) fn timeout(&self) -> Duration {
         // Allow startup and painting time, while keeping even a one-frame/s
         // documentation sequence finite. This does not affect a single shot.
         Duration::from_secs(30)
@@ -694,18 +738,59 @@ impl Workbench {
             .is_some_and(|request| request.staged)
     }
 
+    /// A video frame after the first may be staged as soon as a new camera
+    /// frame arrives (`FrameArrived`).
+    pub(super) fn video_awaits_camera(&self) -> bool {
+        self.screenshot.as_ref().is_some_and(|request| {
+            request.video.as_ref().is_some_and(|video| {
+                !video.draining && video.first_staged.is_some() && video.backlog.is_none()
+            }) && !request.staged
+                && !request.requested
+        })
+    }
+
+    /// A video frame is staged and waits for a draw of it.
+    pub(super) fn video_awaits_draw(&self) -> bool {
+        self.screenshot
+            .as_ref()
+            .is_some_and(|request| request.video.is_some() && request.staged && !request.requested)
+    }
+
     pub(super) fn screenshot_tick(&mut self) -> Task<Message> {
         let Some(mut request) = self.screenshot.take() else {
             return Task::none();
         };
         let mut task = Task::none();
-        let finish = |request: &ScreenshotRequest, error: Option<String>| {
-            *request
-                .outcome
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = error;
-            iced::exit()
-        };
+        if let Some(video) = &mut request.video {
+            // A video frame is released on readback (`video_frame_read`);
+            // here the writers report, and a refused frame is retried.
+            let frames = request.sequence.frames;
+            let retried = video.poll().and_then(|_| match video.backlog {
+                Some(_) => video.retry(),
+                None => Ok(false),
+            });
+            match retried {
+                Err(error) => {
+                    return finish(&request, Some(format!("Save renderer screenshot: {error}")));
+                }
+                // The frame the full queue refused is now queued.
+                Ok(true) => release_video(&mut request),
+                Ok(false) => {}
+            }
+            if video_drained(&request) {
+                let video = request.video.take().expect("video sequence");
+                return finish(
+                    &request,
+                    match video.close() {
+                        Ok(written) if written == frames => None,
+                        Ok(written) => Some(format!(
+                            "Save renderer screenshot: wrote {written} of {frames} frames"
+                        )),
+                        Err(error) => Some(format!("Save renderer screenshot: {error}")),
+                    },
+                );
+            }
+        }
         if let Some(receiver) = &request.save {
             match receiver.try_recv() {
                 Ok(Ok(())) if request.sequence.more() => {
@@ -747,16 +832,40 @@ impl Workbench {
             self.scene.scroll_down = false;
             task = operation::scroll_by(SHEET_BODY, operation::AbsoluteOffset { x: 0.0, y: 150.0 });
         } else if request.staged && !request.requested {
-            // One tick after staging, so the staged state is what gets drawn.
-            task = window::latest()
-                .and_then(window::screenshot)
-                .map(Message::Screenshot);
-            request.requested = true;
-            request.sequence.requested();
+            // A single shot is taken one tick after staging, so the staged
+            // state is what gets drawn. A video frame waits for an observed
+            // draw instead: the screenshot renders the layers last drawn, so
+            // a draw since staging proves they hold the staged state.
+            match &request.video {
+                None => {
+                    task = window::latest()
+                        .and_then(window::screenshot)
+                        .map(Message::Screenshot);
+                    request.requested = true;
+                    request.sequence.requested();
+                }
+                Some(video) if self.draws.last().1 > video.staged_draws => {
+                    // Addressed directly, the screenshot runs as this
+                    // update ends, before the next draw, rather than after
+                    // a round trip to look the window up.
+                    task = window::screenshot(self.main_window).map(Message::Screenshot);
+                    request.requested = true;
+                    request.sequence.requested();
+                }
+                Some(_) => {}
+            }
         } else if !request.requested
-            && request.sequence.ready()
+            && !request.staged
+            && !request.video.as_ref().is_some_and(|video| video.draining)
+            && stage_due(&request, self.frame_id, Instant::now())
             && self.snapshot.cameras.len() == request.cameras as usize
-            && self.pending.len() == self.scene.held.len()
+            // Pending commands hold back a single shot and a video's first
+            // frame; later video frames record their spinners as they are.
+            && (self.pending.len() == self.scene.held.len()
+                || request
+                    .video
+                    .as_ref()
+                    .is_some_and(|video| video.first_staged.is_some()))
         {
             if request.streams_started.is_none() {
                 for id in self
@@ -790,6 +899,42 @@ impl Workbench {
             {
                 self.stage_scene();
                 request.staged = true;
+                if let Some(video) = &mut request.video {
+                    let held = self.pending.len() != self.scene.held.len();
+                    let cameras = self
+                        .snapshot
+                        .cameras
+                        .iter()
+                        .map(|camera| (camera.info.id.clone(), camera.frames))
+                        .collect();
+                    video.stage(
+                        Instant::now(),
+                        self.draws.last().1,
+                        self.frame_id,
+                        cameras,
+                        held,
+                    );
+                }
+            }
+        }
+        if let Some(video) = &mut request.video
+            && !request.staged
+            && !request.requested
+        {
+            // Stage the next frame when it is due, without ticking for it;
+            // a new camera frame arriving stages it too (`FrameArrived`).
+            let now = Instant::now();
+            let due = match video.staged_at.filter(|_| video.first_staged.is_some()) {
+                Some(at) => camera_wait(request.sequence.interval, at)
+                    .into_iter()
+                    .find(|due| *due > now),
+                None => request.sequence.next.filter(|next| *next > now),
+            };
+            if let Some(due) = due
+                && video.wake != Some(due)
+            {
+                video.wake = Some(due);
+                task = Task::batch([task, wake_at(due)]);
             }
         }
         if request.started.elapsed() > request.sequence.timeout() {
@@ -804,9 +949,128 @@ impl Workbench {
         self.screenshot = Some(request);
         task
     }
+
+    /// A video frame's pixels arrived: note its timing, queue its write and
+    /// release the scene for the next frame, which a full queue holds back.
+    pub(super) fn video_frame_read(&mut self, shot: window::Screenshot) -> Task<Message> {
+        let Some(request) = &mut self.screenshot else {
+            return Task::none();
+        };
+        let Some(video) = &mut request.video else {
+            return Task::none();
+        };
+        let path = request.sequence.path(&request.path);
+        if let Err(error) = video.record(request.sequence.index, &path) {
+            let request = self.screenshot.take().expect("screenshot request");
+            return finish(
+                &request,
+                Some(format!("Write renderer frame timing: {error}")),
+            );
+        }
+        match video.send((request.sequence.index, shot, path)) {
+            Ok(true) => {
+                release_video(request);
+                if !request.staged {
+                    // Tick now rather than up to a tick later: the frames
+                    // held back meanwhile are taken, freeing the frame
+                    // watcher, the snapshot catches up and the next frame is
+                    // staged when due, in time for the coming draw.
+                    self.tick_frames();
+                    return self.tick();
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                let request = self.screenshot.take().expect("screenshot request");
+                return finish(&request, Some(format!("Save renderer screenshot: {error}")));
+            }
+        }
+        Task::none()
+    }
+}
+
+/// Whether the next frame may be staged. A single shot and a video's first
+/// frame follow the sequence's schedule. Later video frames follow the
+/// camera instead: each is staged once the preview shows a camera frame the
+/// last did not, at least 0.9 of an interval after it, or 1.5 intervals
+/// after it without one. A camera sampled on an unrelated clock at its own
+/// rate would otherwise show some frames twice and skip others.
+fn stage_due(request: &ScreenshotRequest, frame_id: Option<u64>, now: Instant) -> bool {
+    match &request.video {
+        Some(video) if video.first_staged.is_some() => {
+            let Some(at) = video.staged_at else {
+                return true;
+            };
+            let [spaced, ends] = camera_wait(request.sequence.interval, at);
+            now >= ends || now >= spaced && frame_id != video.preview_frame
+        }
+        _ => request.sequence.ready_at(now),
+    }
+}
+
+/// When a video frame staged at `at` may be followed by one showing a new
+/// camera frame, and when by one regardless.
+fn camera_wait(interval: Duration, at: Instant) -> [Instant; 2] {
+    [at + interval * 9 / 10, at + interval * 3 / 2]
+}
+
+/// A tick at `at`.
+fn wake_at(at: Instant) -> Task<Message> {
+    Task::perform(
+        async move {
+            let (send, receive) = iced::futures::channel::oneshot::channel();
+            let started = std::thread::Builder::new()
+                .name("capturefab-screenshot-wake".into())
+                .spawn(move || {
+                    std::thread::sleep(at.saturating_duration_since(Instant::now()));
+                    let _ = send.send(());
+                });
+            if started.is_ok() {
+                let _ = receive.await;
+            }
+        },
+        |()| Message::Tick,
+    )
+}
+
+/// Record the screenshot's outcome and close the app.
+fn finish(request: &ScreenshotRequest, error: Option<String>) -> Task<Message> {
+    *request
+        .outcome
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = error;
+    iced::exit()
+}
+
+/// The writers took the frame just read: stage the next, or drain after the
+/// last.
+fn release_video(request: &mut ScreenshotRequest) {
+    if request.sequence.more() {
+        // Release the snapshot freeze between frames. Acquisition, real CLI
+        // commands and normal UI updates keep running.
+        request.staged = false;
+        request.requested = false;
+    } else if let Some(video) = &mut request.video {
+        video.draining = true;
+    }
+}
+
+/// Every frame of a drained video sequence is written.
+fn video_drained(request: &ScreenshotRequest) -> bool {
+    request.video.as_ref().is_some_and(|video| {
+        video.draining && video.backlog.is_none() && video.written() == request.sequence.frames
+    })
 }
 
 pub(super) fn save_screenshot(shot: &window::Screenshot, path: &std::path::Path) -> Result<()> {
+    save_screenshot_with(shot, path, png::Compression::Default)
+}
+
+pub(super) fn save_screenshot_with(
+    shot: &window::Screenshot,
+    path: &std::path::Path,
+    compression: png::Compression,
+) -> Result<()> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -817,8 +1081,24 @@ pub(super) fn save_screenshot(shot: &window::Screenshot, path: &std::path::Path)
     let mut encoder = png::Encoder::new(file, shot.size.width, shot.size.height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(compression);
     encoder.write_header()?.write_image_data(&shot.rgba)?;
     Ok(())
+}
+
+/// A fresh directory for a test's frames.
+#[cfg(test)]
+pub(super) fn test_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "capturefab-{name}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[cfg(test)]
@@ -971,31 +1251,43 @@ mod tests {
         assert_eq!(single.path(base), base);
         assert_eq!(single.timeout(), Duration::from_secs(30));
         assert!(!single.more());
-        for value in ["0", "241", "-1", "2.5", "invalid"] {
-            assert!(ScreenshotSequence::parse(Some(value), None).is_err());
+        assert!(!single.is_video());
+        for value in ["0", "901", "-1", "2.5", "invalid"] {
+            let error = ScreenshotSequence::parse(Some(value), None).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "CAPTUREFAB_SCREENSHOT_FRAMES must be an integer from 1 to 900"
+            );
         }
-        for value in ["0", "16", "-1", "2.5", "invalid"] {
-            assert!(ScreenshotSequence::parse(None, Some(value)).is_err());
+        for value in ["0", "61", "-1", "2.5", "invalid"] {
+            let error = ScreenshotSequence::parse(None, Some(value)).err().unwrap();
+            assert_eq!(
+                error.to_string(),
+                "CAPTUREFAB_SCREENSHOT_FPS must be an integer from 1 to 60"
+            );
         }
+        let most = ScreenshotSequence::parse(Some("900"), Some("60")).unwrap();
+        assert!(most.is_video());
+        assert_eq!(
+            most.timeout(),
+            Duration::from_secs(30) + Duration::from_millis(250) * 900
+        );
     }
 
     #[test]
     fn screenshot_sequence_names_every_frame_and_finishes() {
         let base = std::path::Path::new("/tmp/workbench.png");
-        let mut sequence = ScreenshotSequence::parse(Some("3"), Some("5")).unwrap();
+        let mut sequence = ScreenshotSequence::parse(Some("3"), Some("30")).unwrap();
         assert_eq!(
             sequence.path(base),
             std::path::Path::new("/tmp/workbench-0000.png")
         );
-        assert!(sequence.ready());
-        let before_request = Instant::now();
-        sequence.requested();
-        assert!(
-            sequence
-                .next
-                .is_some_and(|next| next >= before_request + sequence.interval)
-        );
+        assert!(sequence.ready_at(Instant::now()));
+        let start = Instant::now();
+        sequence.requested_at(start);
+        sequence.requested_at(start + Duration::from_millis(5));
         let next = sequence.next.unwrap();
+        assert_eq!(next, start + sequence.interval);
         assert!(!sequence.ready_at(next - Duration::from_nanos(1)));
         assert!(sequence.ready_at(next));
         assert!(sequence.more());
@@ -1010,6 +1302,355 @@ mod tests {
         );
         assert!(!sequence.more());
         assert!(sequence.timeout() < Duration::from_secs(31));
+    }
+
+    #[test]
+    fn requested_schedules_on_a_fixed_grid() {
+        let mut sequence = ScreenshotSequence::parse(Some("10"), Some("30")).unwrap();
+        let interval = sequence.interval;
+        let start = Instant::now();
+        sequence.requested_at(start);
+        assert_eq!(sequence.next, Some(start));
+        // On time, however late within the frame: the grid holds.
+        sequence.requested_at(start + Duration::from_millis(3));
+        assert_eq!(sequence.next, Some(start + interval));
+        sequence.requested_at(start + interval + Duration::from_millis(20));
+        assert_eq!(sequence.next, Some(start + interval * 2));
+        // A frame later than a whole interval restarts the grid, no burst.
+        let late = start + interval * 5;
+        sequence.requested_at(late);
+        assert_eq!(sequence.next, Some(late));
+        sequence.requested_at(late + Duration::from_millis(1));
+        assert_eq!(sequence.next, Some(late + interval));
+    }
+
+    fn shot_bench(frames: &str, dir: &std::path::Path) -> Workbench {
+        let mut bench = bench();
+        let request = ScreenshotRequest::new(
+            dir.join("frame.png"),
+            1,
+            Arc::new(Mutex::new(Some("unfinished".into()))),
+            ScreenshotSequence::parse(Some(frames), Some("30")).unwrap(),
+        )
+        .unwrap();
+        bench.screenshot = Some(request);
+        bench
+    }
+
+    fn stage_for_video(bench: &mut Workbench) {
+        let draws = bench.draws.last().1;
+        let request = bench.screenshot.as_mut().unwrap();
+        request.staged = true;
+        let video = request.video.as_mut().unwrap();
+        video.stage(
+            Instant::now(),
+            draws,
+            Some(7),
+            vec![("sim:0".into(), 10)],
+            false,
+        );
+    }
+
+    fn shot() -> window::Screenshot {
+        window::Screenshot::new(vec![128; 64], Size::new(4, 4), 1.0)
+    }
+
+    fn outcome(bench: &Workbench) -> Arc<Mutex<Option<String>>> {
+        bench.screenshot.as_ref().unwrap().outcome.clone()
+    }
+
+    fn wait_for(mut done: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < until, "timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn video_sequence_ticks_slowly_and_single_shot_keeps_60ms() {
+        let dir = test_dir("tick-interval");
+        let mut bench = shot_bench("30", &dir);
+        // Draws, readbacks and wakes move a video on, not ticks.
+        assert_eq!(bench.tick_interval(), Duration::from_millis(60));
+        stage_for_video(&mut bench);
+        assert!(bench.video_awaits_draw());
+        assert_eq!(bench.tick_interval(), Duration::from_millis(60));
+        let (index, path) = (
+            bench.screenshot.as_ref().unwrap().sequence.index,
+            dir.join("x.png"),
+        );
+        let video = bench.screenshot.as_mut().unwrap().video.as_mut().unwrap();
+        video.backlog = Some((index, shot(), path));
+        assert_eq!(
+            bench.tick_interval(),
+            Duration::from_millis(5),
+            "a held frame retries fast"
+        );
+        let bench = shot_bench("1", &dir);
+        assert!(bench.screenshot.as_ref().unwrap().video.is_none());
+        assert_eq!(bench.tick_interval(), Duration::from_millis(60));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn next_video_frame_wakes_when_due() {
+        let dir = test_dir("video-wake");
+        let mut bench = shot_bench("3", &dir);
+        let now = Instant::now();
+        let sequence = &mut bench.screenshot.as_mut().unwrap().sequence;
+        sequence.requested_at(now);
+        sequence.requested_at(now);
+        let next = sequence.next.unwrap();
+        assert!(next > Instant::now());
+        let _ = bench.screenshot_tick();
+        let request = bench.screenshot.as_ref().unwrap();
+        assert!(!request.staged, "not due yet");
+        assert_eq!(request.video.as_ref().unwrap().wake, Some(next));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn video_request_waits_for_a_draw_after_staging() {
+        let dir = test_dir("video-draw");
+        let mut bench = shot_bench("3", &dir);
+        stage_for_video(&mut bench);
+        let _ = bench.screenshot_tick();
+        assert!(
+            !bench.screenshot.as_ref().unwrap().requested,
+            "not drawn yet"
+        );
+        assert!(bench.shot_staged(), "still staged, not staged again");
+        bench.draws.drawn();
+        let _ = bench.screenshot_tick();
+        assert!(bench.screenshot.as_ref().unwrap().requested);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn single_shot_still_requests_one_tick_after_staging() {
+        let dir = test_dir("single-shot");
+        let mut bench = shot_bench("1", &dir);
+        bench.screenshot.as_mut().unwrap().staged = true;
+        let _ = bench.screenshot_tick();
+        assert!(
+            bench.screenshot.as_ref().unwrap().requested,
+            "no draw needed"
+        );
+        assert!(!dir.join("frame-timing.jsonl").exists(), "no sidecar");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sequence_unstages_on_readback_and_queues_the_write() {
+        let dir = test_dir("video-readback");
+        let mut bench = shot_bench("3", &dir);
+        stage_for_video(&mut bench);
+        bench.screenshot.as_mut().unwrap().requested = true;
+        let _ = bench.update(Message::Screenshot(shot()));
+        assert!(!bench.shot_staged());
+        let request = bench.screenshot.as_ref().unwrap();
+        assert!(!request.requested);
+        assert_eq!(request.sequence.index, 1);
+        wait_for(|| {
+            let _ = bench.screenshot_tick();
+            bench
+                .screenshot
+                .as_ref()
+                .unwrap()
+                .video
+                .as_ref()
+                .unwrap()
+                .written()
+                == 1
+        });
+        let png = std::fs::read(dir.join("frame-0000.png")).unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let timing = std::fs::read_to_string(dir.join("frame-timing.jsonl")).unwrap();
+        assert_eq!(timing.lines().count(), 1);
+        let line: serde_json::Value = serde_json::from_str(timing.lines().next().unwrap()).unwrap();
+        assert_eq!(line["index"], 0);
+        assert_eq!(line["file"], "frame-0000.png");
+        assert_eq!(line["preview_frame"], 7);
+        assert_eq!(line["camera_frames"]["sim:0"], 10);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn last_video_frame_drains_then_finishes_cleanly() {
+        let dir = test_dir("video-drain");
+        let mut bench = shot_bench("2", &dir);
+        let outcome = outcome(&bench);
+        for _ in 0..2 {
+            stage_for_video(&mut bench);
+            bench.screenshot.as_mut().unwrap().requested = true;
+            let _ = bench.update(Message::Screenshot(shot()));
+        }
+        assert!(
+            bench
+                .screenshot
+                .as_ref()
+                .unwrap()
+                .video
+                .as_ref()
+                .unwrap()
+                .draining
+        );
+        wait_for(|| {
+            let _ = bench.screenshot_tick();
+            bench.screenshot.is_none()
+        });
+        assert_eq!(*outcome.lock().unwrap(), None);
+        assert!(dir.join("frame-0001.png").is_file());
+        let timing = std::fs::read_to_string(dir.join("frame-timing.jsonl")).unwrap();
+        assert_eq!(timing.lines().count(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_writer_queue_holds_the_next_request() {
+        let dir = test_dir("video-backlog");
+        let mut bench = shot_bench("10", &dir);
+        // No writers: the queue fills and stays full.
+        std::fs::remove_file(dir.join("frame-timing.jsonl")).unwrap();
+        bench.screenshot.as_mut().unwrap().video =
+            Some(VideoSink::with_writers(&dir.join("frame.png"), 0).unwrap());
+        for index in 0..4 {
+            stage_for_video(&mut bench);
+            bench.screenshot.as_mut().unwrap().requested = true;
+            let _ = bench.update(Message::Screenshot(shot()));
+            let request = bench.screenshot.as_ref().unwrap();
+            if index < 3 {
+                assert!(!request.staged, "frame {index} queued");
+            }
+        }
+        let held = |bench: &Workbench| {
+            let request = bench.screenshot.as_ref().unwrap();
+            request.staged
+                && request.requested
+                && request.video.as_ref().unwrap().backlog.is_some()
+                && request.sequence.index == 3
+        };
+        assert!(held(&bench), "the fourth frame waits as the backlog");
+        // Each tick retries it; the full queue keeps it waiting.
+        let _ = bench.tick();
+        assert!(held(&bench));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn timing_line_has_relative_file_and_staged_ms() {
+        let text = video::line(
+            4,
+            "frame-0004.png",
+            133.3336,
+            150.0,
+            None,
+            &[("sim:0".into(), 12)],
+            true,
+        );
+        let line: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for key in [
+            "index",
+            "file",
+            "staged_ms",
+            "read_ms",
+            "preview_frame",
+            "camera_frames",
+            "held_by_pending",
+        ] {
+            assert!(line.get(key).is_some(), "{key}");
+        }
+        let file = line["file"].as_str().unwrap();
+        assert!(!file.contains('/') && !file.contains('\\'));
+        assert_eq!(line["staged_ms"], 133.334);
+        assert_eq!(line["held_by_pending"], 1);
+        assert!(line["preview_frame"].is_null());
+    }
+
+    #[test]
+    fn writer_error_finishes_with_save_message() {
+        let dir = test_dir("video-error");
+        let mut bench = shot_bench("3", &dir);
+        let outcome = outcome(&bench);
+        // A frame under a regular file cannot be written.
+        std::fs::write(dir.join("blocker"), b"").unwrap();
+        bench.screenshot.as_mut().unwrap().path = dir.join("blocker/frame.png");
+        stage_for_video(&mut bench);
+        bench.screenshot.as_mut().unwrap().requested = true;
+        let _ = bench.update(Message::Screenshot(shot()));
+        wait_for(|| {
+            let _ = bench.screenshot_tick();
+            bench.screenshot.is_none()
+        });
+        let error = outcome.lock().unwrap().clone().unwrap();
+        assert!(error.starts_with("Save renderer screenshot:"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn video_staging_ignores_pending_jobs_after_the_first_frame() {
+        let dir = test_dir("video-pending");
+        let mut bench = shot_bench("3", &dir);
+        bench.screenshot.as_mut().unwrap().streams_started =
+            Some(Instant::now() - Duration::from_secs(2));
+        // A pending command of the workbench's own, not the scene's.
+        bench.hold(Job::Discover, None);
+        drop(bench.scene.held.pop());
+        let _ = bench.screenshot_tick();
+        assert!(!bench.shot_staged(), "the first frame waits for it");
+        bench
+            .screenshot
+            .as_mut()
+            .unwrap()
+            .video
+            .as_mut()
+            .unwrap()
+            .first_staged = Some(Instant::now());
+        let _ = bench.screenshot_tick();
+        assert!(bench.shot_staged(), "later frames do not");
+        let video = bench.screenshot.as_ref().unwrap().video.as_ref().unwrap();
+        assert!(video.held_by_pending);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn later_video_frames_follow_the_camera() {
+        let dir = test_dir("video-camera");
+        let mut bench = shot_bench("5", &dir);
+        let interval = bench.screenshot.as_ref().unwrap().sequence.interval;
+        let staged = |bench: &mut Workbench, ago: Duration, preview: u64| {
+            let request = bench.screenshot.as_mut().unwrap();
+            request.staged = false;
+            request.streams_started = Some(Instant::now() - Duration::from_secs(2));
+            let video = request.video.as_mut().unwrap();
+            video.first_staged = Some(Instant::now() - Duration::from_secs(1));
+            video.staged_at = Some(Instant::now() - ago);
+            video.preview_frame = Some(preview);
+        };
+        bench.frame_id = Some(7);
+        staged(&mut bench, interval, 7);
+        assert!(bench.video_awaits_camera());
+        let _ = bench.screenshot_tick();
+        assert!(!bench.shot_staged(), "waits for a new camera frame");
+        let video = bench.screenshot.as_ref().unwrap().video.as_ref().unwrap();
+        let ends = video.staged_at.unwrap() + interval * 3 / 2;
+        assert_eq!(video.wake, Some(ends), "wakes when the wait ends");
+        bench.frame_id = Some(8);
+        let _ = bench.screenshot_tick();
+        assert!(bench.shot_staged(), "a new camera frame stages it");
+        // Too soon after the last frame, even a new camera frame waits.
+        staged(&mut bench, interval / 2, 7);
+        let _ = bench.screenshot_tick();
+        assert!(!bench.shot_staged(), "at most about one frame an interval");
+        // Without a new camera frame, the end of the wait stages it.
+        staged(&mut bench, interval * 2, 8);
+        let _ = bench.screenshot_tick();
+        assert!(
+            bench.shot_staged(),
+            "stops waiting 1.5 intervals after the last"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn bench() -> Workbench {
