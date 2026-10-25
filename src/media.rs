@@ -1,6 +1,9 @@
 //! FFmpeg-backed media inputs and bounded frame forwarding. The optional FFmpeg
 //! executable is embedded at build time and extracted into a private directory.
 //! No shell is involved in launching decoders or encoders.
+#[cfg(any(test, target_os = "linux"))]
+mod v4l2;
+
 use crate::types::{
     Backend, CameraInfo, Categorized, ErrorKind, Frame, RGB8, RegisterIo, Transport,
 };
@@ -1108,18 +1111,10 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
     let _ = timeout;
     #[cfg(target_os = "linux")]
     {
-        let mut devices = Vec::new();
-        if let Ok(entries) = fs::read_dir("/sys/class/video4linux") {
-            for entry in entries.flatten() {
-                let node = entry.file_name().to_string_lossy().to_string();
-                let name = fs::read_to_string(entry.path().join("name"))
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                devices
-                    .push(json!({"id":format!("v4l2:/dev/{node}"),"name":name,"backend":"v4l2"}));
-            }
-        }
+        let devices = v4l2_devices(
+            std::path::Path::new("/sys/class/video4linux"),
+            v4l2::captures_video,
+        );
         return Ok(json!({"platform":"linux","devices":devices}));
     }
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1173,6 +1168,30 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
     Err(anyhow!(
         "native camera enumeration is supported on macOS, Linux and Windows"
     ))
+}
+/// The video capture nodes in the `video4linux` sysfs class, in node order.
+/// The class also holds UVC metadata, codec, ISP, subdevice, VBI and radio
+/// nodes, which share the camera's name but cannot capture its video.
+#[cfg(any(test, target_os = "linux"))]
+fn v4l2_devices(
+    class: &std::path::Path,
+    captures: impl Fn(&std::path::Path) -> bool,
+) -> Vec<Value> {
+    let mut nodes = fs::read_dir(class)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|node| node.starts_with("video") && captures(&PathBuf::from("/dev").join(node)))
+        .collect::<Vec<_>>();
+    nodes.sort_by_key(|node| (node.len(), node.clone()));
+    nodes
+        .into_iter()
+        .map(|node| {
+            let name = fs::read_to_string(class.join(&node).join("name")).unwrap_or_default();
+            json!({"id":format!("v4l2:/dev/{node}"),"name":name.trim(),"backend":"v4l2"})
+        })
+        .collect()
 }
 #[cfg(any(test, target_os = "macos", target_os = "windows"))]
 fn avfoundation_devices(listing: &str) -> Vec<Value> {
@@ -1995,6 +2014,13 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
             .any(|text| lower.contains(text))
     {
         Some("camera is in use by another application".into())
+    } else if log.contains("Not a video capture device.")
+        || log.contains("ioctl(VIDIOC_G_INPUT): Inappropriate ioctl for device")
+    {
+        Some(format!(
+            "video capture is not supported by {}, which may be a metadata, codec or ISP node; run capturefab native to list capture nodes",
+            device_name(source)
+        ))
     } else if [
         "video device not found",
         "could not find video device",
@@ -7617,6 +7643,63 @@ Error opening input files: Input/output error
             )
             .is_none()
         );
+        for (node, log) in [
+            (
+                "/dev/video1",
+                concat!(
+                    "[video4linux2,v4l2 @ 0x55d0c8a0c0] ioctl(VIDIOC_G_INPUT): Inappropriate ioctl for device\n",
+                    "[in#0 @ 0x55d0c8a000] Error opening input: Inappropriate ioctl for device\n",
+                    "Error opening input file /dev/video1.\n",
+                ),
+            ),
+            (
+                "/dev/video10",
+                concat!(
+                    "[video4linux2,v4l2 @ 0x55d0c8a0c0] Not a video capture device.\n",
+                    "[in#0 @ 0x55d0c8a000] Error opening input: No such device\n",
+                    "Error opening input file /dev/video10.\n",
+                ),
+            ),
+        ] {
+            let source = format!("v4l2:{node}");
+            let message = native_failure(log, false, &source, Duration::from_secs(2)).unwrap();
+            assert_eq!(
+                message,
+                format!(
+                    "video capture is not supported by {node}, which may be a metadata, codec or ISP node; run capturefab native to list capture nodes"
+                )
+            );
+            assert_eq!(crate::cli::error_code(&anyhow!(message)).1, 5);
+        }
+    }
+    #[test]
+    fn v4l2_discovery_lists_capture_nodes_only() {
+        // A Raspberry Pi with a USB webcam: uvcvideo's metadata node shares
+        // the camera's name, and the codec, subdevice and VBI nodes sit in
+        // the same class.
+        let class = temp_dir("video4linux");
+        for (node, name) in [
+            ("video0", "HD Pro Webcam C920"),
+            ("video1", "HD Pro Webcam C920"),
+            ("video10", "bcm2835-codec-decode"),
+            ("video2", "unicam-image"),
+            ("v4l-subdev0", "imx219 10-0010"),
+            ("vbi0", "saa7134"),
+        ] {
+            fs::create_dir(class.join(node)).unwrap();
+            fs::write(class.join(node).join("name"), format!("{name}\n")).unwrap();
+        }
+        let devices = v4l2_devices(&class, |path| {
+            !matches!(path.to_str(), Some("/dev/video1" | "/dev/video10"))
+        });
+        assert_eq!(
+            devices,
+            [
+                json!({"id":"v4l2:/dev/video0","name":"HD Pro Webcam C920","backend":"v4l2"}),
+                json!({"id":"v4l2:/dev/video2","name":"unicam-image","backend":"v4l2"}),
+            ]
+        );
+        fs::remove_dir_all(class).unwrap();
     }
     #[test]
     fn native_devices_prefer_names_and_failures_are_concise() {
