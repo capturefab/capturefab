@@ -11,6 +11,7 @@ on:
       - scripts/test-docs-search.js
       - scripts/test-site-ui.js
       - scripts/site-release.py
+      - scripts/publish-downloads.py
       - scripts/site-guides.py
       - docs/*.md
       - examples/workflows/**
@@ -31,7 +32,7 @@ jobs:
     name: Deploy to Cloudflare Workers
     if: vars.CAPTUREFAB_PUBLISH_SITE == 'true' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 30
     permissions:
       contents: read
     steps:
@@ -55,6 +56,25 @@ jobs:
         working-directory: site
       # The /download/* Worker; Node 24 runs its TypeScript directly.
       - run: node --test site/worker.test.mjs
+      # Upload before deploying the manifest that advertises this release. A failed
+      # upload leaves the deployed site unchanged; rerunning Pages retries it.
+      - name: Download the latest advertised release
+        id: downloads
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(python3 -c 'import json; print(json.load(open("web/releases.json")).get("latest") or "")')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -z "$version" ]; then exit 0; fi
+          gh release download "v$version" --repo "$GITHUB_REPOSITORY" --dir dist/release
+      - name: Verify and upload the downloads
+        if: steps.downloads.outputs.version != ''
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+          CAPTUREFAB_DOWNLOAD_BUCKET: ${{ vars.CAPTUREFAB_DOWNLOAD_BUCKET }}
+          VERSION: ${{ steps.downloads.outputs.version }}
+        run: python3 scripts/publish-downloads.py --version "$VERSION" --input dist/release
       - run: npx cf deploy
         working-directory: site
         env:
