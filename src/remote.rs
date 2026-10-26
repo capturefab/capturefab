@@ -255,8 +255,10 @@ impl Server {
     }
 }
 
-impl Drop for Server {
-    fn drop(&mut self) {
+impl Server {
+    // Report whether the listener thread exited; the port can immediately be
+    // reused by another listener, so probing its address cannot prove this.
+    fn stop(&mut self) -> bool {
         self.quitting.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             // Unblock accept(). Another socket on the loopback port can take
@@ -267,9 +269,17 @@ impl Drop for Server {
                 .is_ok()
                 && self.stopped.recv_timeout(WAKE_TIMEOUT).is_ok();
             if woke {
-                let _ = thread.join();
+                return thread.join().is_ok();
             }
+            return false;
         }
+        true
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1737,17 +1747,16 @@ mod tests {
     fn dropping_the_server_wakes_its_blocked_accept() {
         let root = TempWebRoot::new();
         let handle = SessionHandle::new();
-        let server = Server::start(
+        let mut server = Server::start(
             handle.clone(),
             "127.0.0.1:0".parse().unwrap(),
             WebRoot::Folder(root.0.clone()),
         )
         .unwrap();
-        let address = server.local_addr();
         let started = Instant::now();
+        assert!(server.stop(), "listener thread did not exit");
         drop(server);
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err());
         assert_eq!(
             wake_address("0.0.0.0:8787".parse().unwrap()),
             "127.0.0.1:8787".parse().unwrap()
