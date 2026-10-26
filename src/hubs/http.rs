@@ -370,18 +370,21 @@ impl Socket {
 impl Read for Socket {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let wait = self.wait()?;
-        let Some(cancel) = &self.cancel else {
-            self.stream.set_read_timeout(Some(wait))?;
-            return self.stream.read(buf);
-        };
-        // Windows does not wake a blocked read when another thread shuts the
-        // socket down, so wait in short slices and look at the flag between.
+        // Socket timeouts can return early on Windows. Keep waiting until
+        // the requested deadline so a total timeout is not reported as idle.
+        // Cancellable reads also use short slices: Windows does not wake a
+        // blocked read when another thread shuts the socket down.
         let started = Instant::now();
         loop {
-            if cancel.is_cancelled() {
+            if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
                 return Err(io::ErrorKind::ConnectionAborted.into());
             }
-            let slice = wait.saturating_sub(started.elapsed()).min(CANCEL_POLL);
+            let remaining = wait.saturating_sub(started.elapsed());
+            let slice = if self.cancel.is_some() {
+                remaining.min(CANCEL_POLL)
+            } else {
+                remaining
+            };
             if slice.is_zero() {
                 return Err(io::ErrorKind::TimedOut.into());
             }

@@ -178,8 +178,11 @@ fn stalled_servers_time_out_by_phase() {
         "*/*",
         short(2000, 2000, Some(500)),
     );
+    let start = Instant::now();
     let response = send(&endpoint(&fake), &request, &Auth::None, None).unwrap();
     let error = response.body.read_all(1 << 20).unwrap_err();
+    assert!(start.elapsed() >= Duration::from_millis(500));
+    assert!(start.elapsed() < Duration::from_secs(2));
     assert!(error.message().contains("within 500 ms"), "{error}");
     assert_eq!(crate::cli::error_code(&error.into_error()), ("timeout", 4));
 }
