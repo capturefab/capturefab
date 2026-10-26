@@ -4144,8 +4144,16 @@ mod tests {
         let timeout = |gige: &GigE| gige.stream.as_ref().unwrap().timeout;
         // Waiting for a trigger: one receive for the whole timeout.
         let started = Instant::now();
-        assert!(gige.next_frame(Duration::from_millis(100)).is_err());
-        assert!(started.elapsed() >= Duration::from_millis(100));
+        let error = gige.next_frame(Duration::from_millis(100)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            error.to_string().starts_with("frame receive timed out;"),
+            "idle receive failed after {elapsed:?}: {error:#}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "idle receive timed out early after {elapsed:?}: {error:#}"
+        );
         // A Windows receive can return a little early, leaving a short final
         // wait that says nothing about how long the first one was.
         if !cfg!(windows) {
