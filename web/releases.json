@@ -1,137 +1,144 @@
 {
   "schema_version": 1,
-  "latest": "0.4.0",
+  "latest": "0.5.0",
   "releases": [
     {
-      "version": "0.4.0",
-      "date": "2026-10-23",
-      "url": "https://capturefab.com/downloads.html#v0.4.0",
-      "checksums_url": "https://capturefab.com/download/v0.4.0/SHA256SUMS",
-      "source_url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-source.tar.gz",
-      "sbom_url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-sbom.cdx.json",
+      "version": "0.5.0",
+      "date": "2026-10-26",
+      "url": "https://capturefab.com/downloads.html#v0.5.0",
+      "checksums_url": "https://capturefab.com/download/v0.5.0/SHA256SUMS",
+      "source_url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-source.tar.gz",
+      "sbom_url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-sbom.cdx.json",
       "assets": [
         {
-          "name": "capturefab-0.4.0-linux-x86_64.tar.gz",
+          "name": "capturefab-0.5.0-linux-x86_64.tar.gz",
           "os": "linux",
           "arch": "x86_64",
           "available": true,
-          "sha256": "ddc4ef633cf113cba40cfcba507773b92be4b0055872c7f0f9a89145d2fc361d",
-          "size": 47469993,
+          "sha256": "fbb7088edaada8de5e107c8a5d5081f716e43e4b49798dcf5982cd571d255511",
+          "size": 48420052,
+          "platform_signature": "unsigned",
           "target": "x86_64-unknown-linux-gnu",
-          "platform_signature": "unsigned",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-linux-x86_64.tar.gz"
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-linux-x86_64.tar.gz"
         },
         {
-          "name": "capturefab-0.4.0-linux-aarch64.tar.gz",
+          "name": "capturefab-0.5.0-linux-aarch64.tar.gz",
           "os": "linux",
           "arch": "aarch64",
           "available": true,
-          "sha256": "11ba70184921f291c347e850b5bcc39cc37fe4614f1f3e314d934c13591bc259",
-          "size": 44692626,
+          "sha256": "24bda40e610bb39de7dc294fe95cdd5678df75f8975231536d67e720016654fc",
+          "size": 45571720,
+          "platform_signature": "unsigned",
           "target": "aarch64-unknown-linux-gnu",
-          "platform_signature": "unsigned",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-linux-aarch64.tar.gz"
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-linux-aarch64.tar.gz"
         },
         {
-          "name": "capturefab-0.4.0-macos-x86_64.zip",
+          "name": "capturefab-0.5.0-macos-x86_64.dmg",
           "os": "macos",
           "arch": "x86_64",
           "available": true,
-          "sha256": "b28b02d1b56fbb493abd40d02f07189b8f35faabed28caf549d83d2896416f4c",
-          "size": 41358421,
+          "sha256": "5894e9ef68245dede3e7dcc2732f26610c272e6ea308623f399d9d9ccb095243",
+          "size": 42465851,
+          "platform_signature": "apple-notarized",
           "target": "x86_64-apple-darwin",
-          "platform_signature": "apple-notarized",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-macos-x86_64.zip"
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-macos-x86_64.dmg"
         },
         {
-          "name": "capturefab-0.4.0-macos-aarch64.zip",
+          "name": "capturefab-0.5.0-macos-aarch64.dmg",
           "os": "macos",
           "arch": "aarch64",
           "available": true,
-          "sha256": "8105aa3078ca00920340ca0f4bd81aa7d87c8d51562df7d35c34a7651907ddde",
-          "size": 37698431,
-          "target": "aarch64-apple-darwin",
+          "sha256": "85ab45bad3e5b4ebea73f47b93c917d65a7a84ea8adc8875c3916ea2a3a1861e",
+          "size": 38939244,
           "platform_signature": "apple-notarized",
+          "target": "aarch64-apple-darwin",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-macos-aarch64.zip"
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-macos-aarch64.dmg"
         },
         {
-          "name": "capturefab-0.4.0-windows-x86_64.zip",
+          "name": "capturefab-0.5.0-windows-x86_64.zip",
           "os": "windows",
           "arch": "x86_64",
           "available": true,
-          "sha256": "62d1982a8d56265f91a158428b707a7991f47b964432500995211b9c7b4673b3",
-          "size": 41835760,
-          "target": "x86_64-pc-windows-msvc",
+          "sha256": "14108e419bccad235db0c9adf0f8e79fdf0ea89acc3962f00a425748f4729f1f",
+          "size": 42860605,
           "platform_signature": "unsigned",
+          "target": "x86_64-pc-windows-msvc",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-windows-x86_64.zip"
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-windows-x86_64.zip"
         },
         {
-          "name": "capturefab-0.4.0-windows-aarch64.zip",
+          "name": "capturefab-0.5.0-windows-aarch64.zip",
           "os": "windows",
           "arch": "aarch64",
           "available": true,
-          "sha256": "22739afbd2d2c9427d38222cac1cc658403c5ad19986f551f2c8e46168963775",
-          "size": 38214762,
-          "target": "aarch64-pc-windows-msvc",
+          "sha256": "594c4f79081c9b5c04672f273e4c0cbe7112e9490c7bdc37d463fb9e015799f9",
+          "size": 39158084,
           "platform_signature": "unsigned",
+          "target": "aarch64-pc-windows-msvc",
           "validation": "native-smoke-passed",
           "browser_client": true,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-windows-aarch64.zip"
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-windows-aarch64.zip"
         }
       ],
       "source": {
-        "name": "capturefab-0.4.0-source.tar.gz",
-        "sha256": "6b5c1e1042510c99b6ed7c73b039ab0f866e97eac48f93c06de389b53e3d6901",
-        "size": 127953203,
-        "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-source.tar.gz"
+        "name": "capturefab-0.5.0-source.tar.gz",
+        "sha256": "9a73b26574baf03fc76d853ee40d0c7e537b89473cc55ce686ad5940632a8a7c",
+        "size": 129814512,
+        "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-source.tar.gz"
       },
       "media_sources": [
         {
-          "name": "capturefab-0.4.0-linux-aarch64-media-sources.tar.gz",
-          "sha256": "0cca19023a0b662d4254da66f9f3ed2c28cf4d7d162dfd8a68630d7193028a19",
-          "size": 71456514,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-linux-aarch64-media-sources.tar.gz"
+          "name": "capturefab-0.5.0-linux-aarch64-media-sources.tar.gz",
+          "sha256": "e5e2a7785d822a9d82c73a4997cfe15f7d4b6305151f524c39dd9e81bbc8f55f",
+          "size": 71456516,
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-linux-aarch64-media-sources.tar.gz"
         },
         {
-          "name": "capturefab-0.4.0-linux-x86_64-media-sources.tar.gz",
-          "sha256": "9b02da3ef9ece68035533eeba17030ee84f0a9dabf9230ab999c774adcb26c90",
-          "size": 71535541,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-linux-x86_64-media-sources.tar.gz"
+          "name": "capturefab-0.5.0-linux-x86_64-media-sources.tar.gz",
+          "sha256": "244878fedcf6cab19efc0c9af5705dd5670d4c57dbb6e53383a7e100242809b8",
+          "size": 71535544,
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-linux-x86_64-media-sources.tar.gz"
         },
         {
-          "name": "capturefab-0.4.0-macos-aarch64-media-sources.tar.gz",
-          "sha256": "9a338d4a25cec707b51c0a210fa5306051cc1c0de6d7bed3e4b6362a63233d16",
-          "size": 71378135,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-macos-aarch64-media-sources.tar.gz"
+          "name": "capturefab-0.5.0-macos-aarch64-media-sources.tar.gz",
+          "sha256": "bb1886f9a1d484154e7efdf4a2e337c207b76a57fdc3965c748d041811db1f19",
+          "size": 71378128,
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-macos-aarch64-media-sources.tar.gz"
         },
         {
-          "name": "capturefab-0.4.0-macos-x86_64-media-sources.tar.gz",
-          "sha256": "2d484d588af859f890b7454d475bca21d93f0d1fe73b7c6f1e4719398047dc34",
-          "size": 71378132,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-macos-x86_64-media-sources.tar.gz"
+          "name": "capturefab-0.5.0-macos-x86_64-media-sources.tar.gz",
+          "sha256": "5b3d0d22ef60c1b94d1a9099221759ecf5db58d4d0c632e3b5a55a26cf53e081",
+          "size": 71378131,
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-macos-x86_64-media-sources.tar.gz"
         },
         {
-          "name": "capturefab-0.4.0-windows-aarch64-media-sources.tar.gz",
-          "sha256": "d6ab7d13c580c5b68597ab03ff436fc84237e8f0964f434157777ad2f44221d4",
-          "size": 71456370,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-windows-aarch64-media-sources.tar.gz"
+          "name": "capturefab-0.5.0-windows-aarch64-media-sources.tar.gz",
+          "sha256": "2adbe3c64b7854ab704df6b7fa8b6a50f8cf0d29c5120c9507bf373cac7928c9",
+          "size": 71456364,
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-windows-aarch64-media-sources.tar.gz"
         },
         {
-          "name": "capturefab-0.4.0-windows-x86_64-media-sources.tar.gz",
-          "sha256": "e3857bd533d608f41b33d23d4faaf18e4e0829e23591da7edbdcd2c28d990d1c",
-          "size": 71535471,
-          "url": "https://capturefab.com/download/v0.4.0/capturefab-0.4.0-windows-x86_64-media-sources.tar.gz"
+          "name": "capturefab-0.5.0-windows-x86_64-media-sources.tar.gz",
+          "sha256": "ff2b5defc3d444427ef8f246db857b294812c637135e5ba4cda5fbb95080e608",
+          "size": 71535510,
+          "url": "https://capturefab.com/download/v0.5.0/capturefab-0.5.0-windows-x86_64-media-sources.tar.gz"
         }
+      ],
+      "highlights": [
+        "macOS downloads are now a disk image: drag Capturefab to Applications.",
+        "Password-protected RTSP and ONVIF cameras ask you to sign in, and the password can be kept in the system credential store.",
+        "Save a tuned camera setup and restore it later, with a preview of every change and one-step undo.",
+        "Capturefab tells you when a new version is available; turn it off in Settings \u203a Updates.",
+        "Clearer first-run guidance, camera connection help and doctor checks for networks, permissions and installs."
       ]
     }
   ]
