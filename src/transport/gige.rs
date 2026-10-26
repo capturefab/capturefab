@@ -2439,7 +2439,13 @@ mod tests {
             }
         }
     }
+    // Each fixture runs a UDP server and heartbeat alongside the test. Keep
+    // these real-time exchanges from competing with other fake cameras on
+    // small runners, without changing protocol deadlines or skipping tests.
+    static FAKE_CAMERA: Mutex<()> = Mutex::new(());
+
     struct Fake {
+        _fixture: std::sync::MutexGuard<'static, ()>,
         address: SocketAddrV4,
         gvcp: UdpSocket,
         stream: UdpSocket,
@@ -2449,6 +2455,9 @@ mod tests {
     }
     impl Fake {
         fn new(setup: impl FnOnce(&mut FakeCamera)) -> Self {
+            let fixture = FAKE_CAMERA
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             let mut camera = FakeCamera::default();
             setup(&mut camera);
             let camera = Arc::new(Mutex::new(camera));
@@ -2558,6 +2567,7 @@ mod tests {
                 }
             });
             Self {
+                _fixture: fixture,
                 address,
                 gvcp,
                 stream,
