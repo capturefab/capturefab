@@ -2258,7 +2258,9 @@ mod tests {
         let skew = unix_seconds(2001, 2, 3, 4, 5, 6) - now_seconds().unwrap();
         let credentials = Credentials {
             username: "admin".into(),
-            password: "pw".into(),
+            // ':' cannot occur in the random base64 nonce or digest, so the
+            // plaintext-leak assertion cannot mistake a collision for a leak.
+            password: "test-password:never-send-in-clear".into(),
         };
         let password = credentials.password.clone();
         let mut nonces = Vec::new();
