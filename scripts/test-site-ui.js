@@ -223,6 +223,16 @@ function openPage(options = {}) {
 }
 
 async function downloads() {
+  // Exercise both archive formats independently of the latest release's format.
+  const macManifest = (extension) => {
+    const manifest = structuredClone(published);
+    manifest.releases.find((release) => release.version === manifest.latest).assets
+      .filter((asset) => asset.os === 'macos').forEach((asset) => {
+        asset.name = asset.name.replace(/\.(zip|dmg)$/, `.${extension}`);
+        asset.url = asset.url.replace(/\.(zip|dmg)$/, `.${extension}`);
+      });
+    return manifest;
+  };
   const latest = published.releases.find((release) => release.version === published.latest);
   // One build of the latest release left unpublished, to check unavailable selections.
   const partial = structuredClone(published);
@@ -241,7 +251,10 @@ async function downloads() {
   assert.match(page.ids.get('primary-download').getAttribute('aria-label'), /macOS ARM64/);
   assert.equal(page.ids.get('verify-command').textContent, `cd ~/Downloads && echo "${desktop.sha256.toLowerCase()}  ${desktop.name}" | shasum -a 256 -c`, 'The Mac check prints OK or FAILED by itself');
   assert.match(page.ids.get('checksum-text').textContent, new RegExp(desktop.sha256));
-  assert.match(page.ids.get('install-hint').textContent, /Extract.*Move Capturefab\.app to Applications.*Local Network.*CLI/, 'One macOS story: move the app, allow Local Network, then set up the CLI');
+  const macSteps = desktop.name.endsWith('.dmg')
+    ? /Open.*\.dmg.*Drag Capturefab to the Applications folder.*Local Network.*CLI/
+    : /Extract.*Move Capturefab\.app to Applications.*Local Network.*CLI/;
+  assert.match(page.ids.get('install-hint').textContent, macSteps, 'One macOS story: move the app, allow Local Network, then set up the CLI');
   const firstLaunch = (hint) => hint.children.find((child) => child.tagName === 'A' && child.href === 'https://capturefab.example/docs.html#first-launch');
   assert.ok(firstLaunch(page.ids.get('install-hint')), 'The install hint links to the first-launch steps');
   page.change('os-select', 'windows');
@@ -255,10 +268,13 @@ async function downloads() {
   assert.equal(page.ids.get('verify-box').hidden, true);
   assert.equal(page.ids.get('install-hint').hidden, true);
 
+  const zip = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X', manifest: macManifest('zip') });
+  await zip.settle();
+  assert.match(zip.ids.get('install-hint').textContent, /Extract.*Move Capturefab\.app to Applications.*Local Network.*CLI/);
+  assert.doesNotMatch(zip.ids.get('install-hint').textContent, /disk image/);
+
   // A disk image release (after 0.4.0) gets drag-to-Applications steps.
-  const imaged = structuredClone(published);
-  imaged.releases.find((release) => release.version === imaged.latest).assets
-    .filter((asset) => asset.os === 'macos').forEach((asset) => { asset.name = asset.name.replace(/\.zip$/, '.dmg'); });
+  const imaged = macManifest('dmg');
   const dmg = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X', manifest: imaged });
   await dmg.settle();
   assert.match(dmg.ids.get('install-hint').textContent, /Drag Capturefab to the Applications folder/);
