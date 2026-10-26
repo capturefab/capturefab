@@ -262,16 +262,19 @@ pub(super) fn run_camera(cli: &Cli, client: &Client, command: &SetupCommand) -> 
             // A preview changes nothing: another model is compared too, with
             // its note in warnings, so the person sees what
             // --allow-other-model applies.
-            if other_model(client, &setup, *allow_other_model)?.is_some() {
+            let diff = client.call(SessionCommand::SetupDiff {
+                setup: inline(&name, &setup),
+                name,
+                allow_other_model: true,
+            })?;
+            // A preliminary Status can still be connecting. Use the worker's
+            // completed comparison so the hint agrees with its warnings.
+            if !allow_other_model && diff["match"] == "other_model" {
                 eprintln!(
                     "capturefab: setup apply needs --allow-other-model for a setup from another model"
                 );
             }
-            client.call(SessionCommand::SetupDiff {
-                setup: inline(&name, &setup),
-                name,
-                allow_other_model: true,
-            })
+            Ok(diff)
         }
         SetupCommand::Apply {
             name,
