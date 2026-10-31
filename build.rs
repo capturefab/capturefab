@@ -1,4 +1,4 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{env, fs, io::Write, path::PathBuf, process::Command};
 
 /// The OS model is accessed through a bundled helper, so running the desktop
 /// app never needs Xcode or a Swift compiler. Older SDKs keep building the app
@@ -249,16 +249,19 @@ fn main() {
             path.display()
         )
     });
-    fs::write(out.join("capturefab-ffmpeg.bin"), &bytes).expect("write bundled FFmpeg");
-    // Names the extracted copy, so processes running one build share a file.
-    let digest: String = {
-        use sha2::Digest;
-        sha2::Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
-    };
-    println!("cargo:rustc-env=CAPTUREFAB_FFMPEG_SHA256={digest}");
+    // A versioned envelope lets release packaging verify the original executable,
+    // independently of the compressor's implementation. Its digest also names the
+    // extracted copy, so existing builds continue sharing the same cache file.
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(&bytes);
+    let mut packed = Vec::new();
+    packed.extend_from_slice(b"CAPTUREFAB-FFMPEG-ZLIB\0");
+    packed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    packed.extend_from_slice(&digest);
+    let mut encoder = flate2::write::ZlibEncoder::new(packed, flate2::Compression::best());
+    encoder.write_all(&bytes).expect("compress bundled FFmpeg");
+    let packed = encoder.finish().expect("finish bundled FFmpeg compression");
+    fs::write(out.join("capturefab-ffmpeg.bin"), packed).expect("write bundled FFmpeg");
     let license = if let Some(path) = env::var_os("CAPTUREFAB_FFMPEG_LICENSE") {
         let path = PathBuf::from(path);
         println!("cargo:rerun-if-changed={}", path.display());

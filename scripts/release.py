@@ -19,6 +19,7 @@ import tempfile
 import time
 import uuid
 import zipfile
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 LINE_COMPUTER = re.search(r'^repository\s*=\s*"([^"]+)"', (ROOT / 'Cargo.toml').read_text(), re.M)[1] + '/blob/main/docs/line-computer.md'
@@ -203,11 +204,39 @@ def check_headers(data, name, os_, arch):
             raise ValueError(f'{name} needs the Visual C++ runtime ({", ".join(runtime)}); link it statically')
 
 def embeds(binary, payload):
+    """Prove that the complete original payload is embedded, raw or compressed."""
     data, needle = Path(binary).read_bytes(), Path(payload).read_bytes()
     start = data.find(needle[:65536])
     while start >= 0 and data[start:start + len(needle)] != needle:
         start = data.find(needle[:65536], start + 1)
-    return start >= 0
+    if start >= 0:
+        return True
+    # Keep this versioned envelope in sync with build.rs and src/media.rs.
+    # Compare the decoded bytes too: a copied length/digest header alone is not
+    # evidence of an embedded executable. Compressor output can differ by host.
+    header = (b'CAPTUREFAB-FFMPEG-ZLIB\0' + struct.pack('<Q', len(needle))
+              + hashlib.sha256(needle).digest())
+    start = data.find(header)
+    while start >= 0:
+        decoder = zlib.decompressobj()
+        offset, position = 0, start + len(header)
+        try:
+            while position < len(data) and not decoder.eof:
+                chunk = data[position:position + 65536]
+                position += len(chunk)
+                decoded = decoder.decompress(chunk, len(needle) - offset + 1)
+                if decoded != needle[offset:offset + len(decoded)]:
+                    break
+                offset += len(decoded)
+                if offset > len(needle) or decoder.unconsumed_tail:
+                    break
+            else:
+                if decoder.eof and offset == len(needle):
+                    return True
+        except zlib.error:
+            pass
+        start = data.find(header, start + 1)
+    return False
 
 def archive_tree(source, output, prefix=None):
     if output.suffix == '.zip':

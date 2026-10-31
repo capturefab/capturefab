@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for the release, site, and terminal-screenshot scripts."""
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -268,6 +269,30 @@ class ReleaseTests(unittest.TestCase):
             truncated.write_bytes(b'head' + payload[:-1] + b'tail')
             self.assertTrue(release.embeds(binary, ffmpeg))
             self.assertFalse(release.embeds(truncated, ffmpeg))
+
+    def test_embeds_validates_compressed_payload_and_envelope(self):
+        import zlib
+        payload = b'camera payload' * 20000
+        header = (b'CAPTUREFAB-FFMPEG-ZLIB\0' + struct.pack('<Q', len(payload))
+                  + hashlib.sha256(payload).digest())
+        packed = header + zlib.compress(payload, 9)
+        with tempfile.TemporaryDirectory() as temp:
+            original, binary = (Path(temp) / name for name in ('ffmpeg', 'capturefab'))
+            original.write_bytes(payload)
+            # A damaged early envelope must not hide a valid later one.
+            binary.write_bytes(b'head' + packed[:-1] + b'gap' + packed + b'tail')
+            self.assertTrue(release.embeds(binary, original))
+            for bad in (packed[:-1], packed[:-4],
+                        header + zlib.compress(b'x' * len(payload)),
+                        header + zlib.compress(payload + b'x'),
+                        header + zlib.compress(payload[:-1]),
+                        packed[:25] + b'wrong' + packed[30:]):
+                binary.write_bytes(b'head' + bad)
+                self.assertFalse(release.embeds(binary, original))
+            corrupt = bytearray(packed)
+            corrupt[-1] ^= 1  # zlib checksum
+            binary.write_bytes(corrupt)
+            self.assertFalse(release.embeds(binary, original))
 
     def test_srt_protocols_needs_input_and_output(self):
         self.assertTrue(release.srt_protocols('Input:\n  file\n  srt\nOutput:\n  file\n  srt\n'))

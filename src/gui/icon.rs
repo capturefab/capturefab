@@ -1,6 +1,7 @@
 //! Phosphor icons (MIT, assets/fonts) drawn as font glyphs, so they stay crisp
 //! at any size and take their color from the palette. The app mark uses the
-//! shared brand artwork.
+//! shared brand artwork. The checked-in fonts contain only these glyphs;
+//! scripts/subset-icons.py regenerates them from the pinned upstream fonts.
 use crate::types::Transport;
 use iced::widget::canvas::{self, Geometry, LineCap, Path, Stroke};
 use iced::widget::{container, image, text, text_input};
@@ -328,12 +329,15 @@ mod tests {
             Network,
             Usb,
             Video,
+            Webcam,
+            Monitor,
             Cube,
             Check,
             Warning,
             WarningTriangle,
             Keyboard,
             Sliders,
+            Sidebar,
             CornersOut,
             CornersIn,
             Scan,
@@ -344,6 +348,31 @@ mod tests {
             HardDrives,
             Mark,
         ];
+        // Adding an enum variant must extend this coverage check as well as
+        // the subset fonts. Count simple variant declarations in the source;
+        // uniqueness plus the count makes omission of any variant fail here.
+        let variants = include_str!("icon.rs")
+            .split_once("pub enum Icon {")
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//") && line.ends_with(','))
+            .count();
+        assert_eq!(
+            all.len(),
+            variants,
+            "every Icon variant needs glyph coverage"
+        );
+        for (index, icon) in all.iter().enumerate() {
+            assert!(
+                !all[..index].contains(icon),
+                "duplicate glyph test {icon:?}"
+            );
+        }
         for icon in all {
             let (font, code) = icon.glyph();
             let bytes = if font == FILL {

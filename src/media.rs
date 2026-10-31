@@ -1,5 +1,5 @@
 //! FFmpeg-backed media inputs and bounded frame forwarding. The optional FFmpeg
-//! executable is embedded at build time and extracted into a private directory.
+//! executable is compressed at build time and extracted into a private directory.
 //! No shell is involved in launching decoders or encoders.
 #[cfg(any(test, target_os = "linux"))]
 mod v4l2;
@@ -430,7 +430,95 @@ impl Drop for Executable {
         }
     }
 }
-const EMBEDDED_SHA256: &str = env!("CAPTUREFAB_FFMPEG_SHA256");
+// Keep this envelope in sync with build.rs and scripts/release.py. The raw
+// length and SHA-256 are checked while decoding, before publishing a cache file.
+const PAYLOAD_MAGIC: &[u8] = b"CAPTUREFAB-FFMPEG-ZLIB\0";
+struct Payload<'a> {
+    bytes: &'a [u8],
+    length: usize,
+    digest: String,
+    #[cfg(test)]
+    raw: bool,
+}
+impl<'a> Payload<'a> {
+    fn compressed(bytes: &'a [u8]) -> Result<Self> {
+        let header = PAYLOAD_MAGIC.len() + 8 + 32;
+        ensure!(
+            bytes.len() > header && bytes.starts_with(PAYLOAD_MAGIC),
+            "bundled FFmpeg has an invalid compressed header"
+        );
+        let length = u64::from_le_bytes(
+            bytes[PAYLOAD_MAGIC.len()..PAYLOAD_MAGIC.len() + 8]
+                .try_into()
+                .expect("eight length bytes"),
+        );
+        let length =
+            usize::try_from(length).context("bundled FFmpeg is too large for this host")?;
+        ensure!(length > 0, "bundled FFmpeg is empty");
+        let digest = bytes[PAYLOAD_MAGIC.len() + 8..header]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(Self {
+            bytes: &bytes[header..],
+            length,
+            digest,
+            #[cfg(test)]
+            raw: false,
+        })
+    }
+    #[cfg(test)]
+    fn raw(bytes: &'a [u8], digest: &str) -> Self {
+        Self {
+            bytes,
+            length: bytes.len(),
+            digest: digest.to_owned(),
+            raw: true,
+        }
+    }
+    /// Decode directly to the file with fixed working memory. No decompressed
+    /// executable is retained in Capturefab's address space.
+    fn write_to(&self, output: &mut impl Write) -> Result<()> {
+        #[cfg(test)]
+        if self.raw {
+            output.write_all(self.bytes)?;
+            return Ok(());
+        }
+        use sha2::Digest;
+        let mut decoder = flate2::bufread::ZlibDecoder::new(self.bytes);
+        let mut hash = sha2::Sha256::new();
+        let mut length = 0usize;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = decoder
+                .read(&mut buffer)
+                .context("cannot decompress bundled FFmpeg")?;
+            if count == 0 {
+                break;
+            }
+            ensure!(
+                count <= self.length.saturating_sub(length),
+                "bundled FFmpeg exceeds its expected length"
+            );
+            length += count;
+            hash.update(&buffer[..count]);
+            output.write_all(&buffer[..count])?;
+        }
+        ensure!(
+            length == self.length,
+            "bundled FFmpeg has an incomplete payload"
+        );
+        ensure!(
+            decoder.total_in() == self.bytes.len() as u64,
+            "bundled FFmpeg has trailing compressed data"
+        );
+        ensure!(
+            format!("{:x}", hash.finalize()) == self.digest,
+            "bundled FFmpeg checksum mismatch"
+        );
+        Ok(())
+    }
+}
 const FFMPEG_NAME: &str = if cfg!(windows) {
     "ffmpeg.exe"
 } else {
@@ -470,6 +558,7 @@ pub(crate) fn executable() -> Result<Arc<Executable>> {
         );
         return Ok(Arc::new(Executable::external(PathBuf::from(path))));
     }
+    let payload = Payload::compressed(EMBEDDED)?;
     let mut extracted = EXECUTABLE
         .get_or_init(Default::default)
         .lock()
@@ -477,7 +566,7 @@ pub(crate) fn executable() -> Result<Arc<Executable>> {
     // Another process can remove or replace the shared copy, so its owner,
     // mode and length are checked again before each use.
     if let Some(shared) = &extracted.shared
-        && trusted(&shared.path, EMBEDDED.len()).is_ok()
+        && trusted(&shared.path, payload.length).is_ok()
     {
         return Ok(shared.clone());
     }
@@ -487,7 +576,7 @@ pub(crate) fn executable() -> Result<Arc<Executable>> {
     if !extracted.uncached {
         let shared = crate::ipc::cache_dir()
             .context("no user cache directory")
-            .and_then(|root| cached_copy(&root, EMBEDDED, EMBEDDED_SHA256))
+            .and_then(|root| cached_payload(&root, &payload))
             .and_then(|copy| {
                 ensure!(
                     runs(&copy),
@@ -502,7 +591,7 @@ pub(crate) fn executable() -> Result<Arc<Executable>> {
             Err(_) => extracted.uncached = true,
         }
     }
-    let copy = Arc::new(private_copy(EMBEDDED)?);
+    let copy = Arc::new(private_copy(&payload)?);
     extracted.private = Arc::downgrade(&copy);
     Ok(copy)
 }
@@ -529,14 +618,20 @@ fn runs(exe: &Executable) -> bool {
 /// written once, under a lock, to a new file that is renamed into place;
 /// an existing copy is checked against the digest before this process
 /// first runs it.
+#[cfg(test)]
 fn cached_copy(root: &std::path::Path, bytes: &[u8], digest: &str) -> Result<Executable> {
+    cached_payload(root, &Payload::raw(bytes, digest))
+}
+fn cached_payload(root: &std::path::Path, payload: &Payload<'_>) -> Result<Executable> {
+    let digest = &payload.digest;
     ensure!(digest.len() == 64, "bundled FFmpeg has no digest");
     private_dir(root)?;
     let dir = root.join(format!("ffmpeg-{}", &digest[..16]));
     let in_use = hold(&dir)?;
     let path = dir.join(FFMPEG_NAME);
     let intact = || {
-        trusted(&path, bytes.len()).is_ok() && sha256_file(&path).ok().as_deref() == Some(digest)
+        trusted(&path, payload.length).is_ok()
+            && sha256_file(&path).ok().as_deref() == Some(digest.as_str())
     };
     if !intact() {
         let extracting = lock_file(&dir.join("extract.lock"))?;
@@ -544,7 +639,7 @@ fn cached_copy(root: &std::path::Path, bytes: &[u8], digest: &str) -> Result<Exe
         // Another process may have finished the copy while this one waited.
         if !intact() {
             let temporary = dir.join(format!("{FFMPEG_NAME}.{}.tmp", nonce()?));
-            let written = write_new(&temporary, bytes, true).and_then(|()| {
+            let written = write_payload(&temporary, payload).and_then(|()| {
                 // Windows cannot rename over an existing file.
                 #[cfg(windows)]
                 let _ = fs::remove_file(&path);
@@ -555,7 +650,7 @@ fn cached_copy(root: &std::path::Path, bytes: &[u8], digest: &str) -> Result<Exe
                 return Err(error.context("cannot extract bundled FFmpeg"));
             }
             // A file system that ignores modes would fail every later check.
-            trusted(&path, bytes.len())?;
+            trusted(&path, payload.length)?;
         }
     }
     prune(root, &dir);
@@ -642,7 +737,7 @@ fn discard(_: &std::path::Path, dir: &std::path::Path, lock: fs::File) {
     let _ = fs::remove_dir_all(dir);
 }
 /// A fallback copy private to this process, in a new temporary directory.
-fn private_copy(bytes: &[u8]) -> Result<Executable> {
+fn private_copy(payload: &Payload<'_>) -> Result<Executable> {
     let directory = std::env::temp_dir().join(format!("capturefab-ffmpeg-{}", nonce()?));
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -654,7 +749,7 @@ fn private_copy(bytes: &[u8]) -> Result<Executable> {
         .create(&directory)
         .context("cannot create private FFmpeg directory")?;
     let path = directory.join(FFMPEG_NAME);
-    if let Err(error) = write_new(&path, bytes, true) {
+    if let Err(error) = write_payload(&path, payload) {
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&directory);
         return Err(error.context("cannot extract bundled FFmpeg"));
@@ -666,9 +761,19 @@ fn private_copy(bytes: &[u8]) -> Result<Executable> {
         _in_use: None,
     })
 }
+/// Create with the same private permissions as other extracted files, then
+/// validate the entire compressed stream before callers can run or rename it.
+fn write_payload(path: &std::path::Path, payload: &Payload<'_>) -> Result<()> {
+    let mut file = new_private_file(path, true)?;
+    payload.write_to(&mut file)
+}
 /// A private file that did not exist before. It is not synced: a copy cut
 /// short by a crash fails validation and is written again.
 fn write_new(path: &std::path::Path, bytes: &[u8], executable: bool) -> Result<()> {
+    new_private_file(path, executable)?.write_all(bytes)?;
+    Ok(())
+}
+fn new_private_file(path: &std::path::Path, executable: bool) -> Result<fs::File> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
     #[cfg(unix)]
@@ -678,8 +783,7 @@ fn write_new(path: &std::path::Path, bytes: &[u8], executable: bool) -> Result<(
     }
     #[cfg(not(unix))]
     let _ = executable;
-    options.open(path)?.write_all(bytes)?;
-    Ok(())
+    Ok(options.open(path)?)
 }
 fn nonce() -> Result<String> {
     let mut nonce = [0u8; 16];
@@ -1019,7 +1123,7 @@ pub fn ffmpeg_info() -> Result<Value> {
         Duration::from_secs(5),
     )?;
     Ok(
-        json!({"embedded":!EMBEDDED.is_empty(),"embedded_bytes":EMBEDDED.len(),"version":version,"protocols":protocols,"encoders":encoders,"license_notice":LICENSE}),
+        json!({"embedded":!EMBEDDED.is_empty(),"embedded_bytes":Payload::compressed(EMBEDDED)?.length,"embedded_compressed_bytes":EMBEDDED.len(),"version":version,"protocols":protocols,"encoders":encoders,"license_notice":LICENSE}),
     )
 }
 /// How long a failed encoder listing is remembered before FFmpeg runs again.
@@ -5262,7 +5366,9 @@ mod tests {
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
     fn ffmpeg_encoder_names_list_the_build_once() {
         let names = encoder_names().unwrap();
-        assert!(names.iter().any(|name| name == "png"), "{names:?}");
+        // The camera-focused payload keeps raw video; PNG stills use our
+        // native encoder and are not part of the bundled FFmpeg recipe.
+        assert!(names.iter().any(|name| name == "rawvideo"), "{names:?}");
         assert!(Arc::ptr_eq(&names, &encoder_names().unwrap()));
     }
 
@@ -5345,6 +5451,86 @@ mod tests {
     fn digest(bytes: &[u8]) -> String {
         use sha2::Digest;
         format!("{:x}", sha2::Sha256::digest(bytes))
+    }
+    fn compressed_payload(bytes: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        let mut packed = PAYLOAD_MAGIC.to_vec();
+        packed.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        packed.extend_from_slice(&sha2::Sha256::digest(bytes));
+        let mut encoder = flate2::write::ZlibEncoder::new(packed, flate2::Compression::best());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+    #[test]
+    fn compressed_ffmpeg_extraction_preserves_bytes_and_reuses_the_cache() {
+        let base = temp_dir("compressed-cache");
+        let root = base.join("capturefab");
+        let bytes = PAYLOAD.repeat(10000);
+        let packed = compressed_payload(&bytes);
+        assert!(packed.len() < bytes.len());
+        let payload = Payload::compressed(&packed).unwrap();
+        let copy = cached_payload(&root, &payload).unwrap();
+        assert_eq!(fs::read(&copy.path).unwrap(), bytes);
+        // Existing copies need no valid compressed stream: no decoding occurs
+        // when the length and digest already match the file in the cache.
+        let corrupt = Payload {
+            bytes: b"invalid",
+            ..payload
+        };
+        assert_eq!(cached_payload(&root, &corrupt).unwrap().path, copy.path);
+        let private = private_copy(&Payload::compressed(&packed).unwrap()).unwrap();
+        assert_eq!(fs::read(&private.path).unwrap(), bytes);
+        let path = private.path.clone();
+        drop(private);
+        assert!(!path.exists());
+        drop(copy);
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn compressed_ffmpeg_rejects_corruption_and_length_mismatches_without_publishing() {
+        let base = temp_dir("compressed-invalid");
+        let good = compressed_payload(PAYLOAD);
+        let header = PAYLOAD_MAGIC.len() + 8 + 32;
+        let mut checksum = good.clone();
+        *checksum.last_mut().unwrap() ^= 1;
+        let mut digest = good.clone();
+        digest[header - 1] ^= 1;
+        let mut shorter = good.clone();
+        shorter[PAYLOAD_MAGIC.len()..PAYLOAD_MAGIC.len() + 8]
+            .copy_from_slice(&((PAYLOAD.len() - 1) as u64).to_le_bytes());
+        let mut longer = good.clone();
+        longer[PAYLOAD_MAGIC.len()..PAYLOAD_MAGIC.len() + 8]
+            .copy_from_slice(&((PAYLOAD.len() + 1) as u64).to_le_bytes());
+        let mut trailing = good.clone();
+        trailing.push(0);
+        for (index, bad) in [
+            checksum,
+            digest,
+            shorter,
+            longer,
+            trailing,
+            good[..good.len() - 1].to_vec(),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let root = base.join(index.to_string());
+            let payload = Payload::compressed(bad).unwrap();
+            assert!(cached_payload(&root, &payload).is_err());
+            assert!(private_copy(&payload).is_err());
+            let dir = root.join(format!("ffmpeg-{}", &payload.digest[..16]));
+            assert!(!dir.join(FFMPEG_NAME).exists());
+            assert!(fs::read_dir(dir).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            }));
+        }
+        assert!(Payload::compressed(&good[..header]).is_err());
+        assert!(Payload::compressed(b"invalid").is_err());
+        fs::remove_dir_all(base).unwrap();
     }
     #[test]
     #[cfg(unix)]

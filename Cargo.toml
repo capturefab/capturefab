@@ -71,6 +71,8 @@ sha1 = "0.10"
 md-5 = "0.10"
 sha2 = "0.10"
 fs2 = "0.4"
+# Lossless storage of the bundled executable; PNG/ZIP already use this backend.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # In-memory session analytics and on-disk dataset catalogs; bundling keeps releases portable.
 duckdb = { version = "~1.10506.1", default-features = false, features = ["bundled", "appender-arrow"] }
@@ -130,6 +132,7 @@ libc = "0.2"
 sha2 = { version = "0.10", features = ["asm"] }
 
 [build-dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 cc = "1"
 # Digest of the embedded FFmpeg, which names its extracted copy.
 sha2 = "0.10"
