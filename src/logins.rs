@@ -298,7 +298,7 @@ pub fn split_userinfo(url: &str) -> Result<(String, Option<CameraLogin>)> {
 }
 
 /// Best-effort removal of credentials from text that may be a half-typed
-/// address, for undo history. A complete `user[:password]@` prefix is
+/// address. A complete `user[:password]@` prefix is
 /// removed; so is a `:password` still being typed before its `@` (a
 /// non-numeric port), keeping the user name.
 pub fn strip_userinfo(text: &str) -> String {

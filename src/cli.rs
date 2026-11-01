@@ -7,7 +7,7 @@ pub use setup::SetupCommand;
 
 use crate::{
     ipc,
-    session::{ActivityOrigin, ActorKind, SessionActor, SessionCommand, SessionHandle},
+    session::{SessionCommand, SessionHandle},
 };
 use anyhow::{Context, Result, ensure};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
@@ -48,19 +48,6 @@ pub struct Cli {
     /// Choose a serve session (default: CAPTUREFAB_SESSION, then the only running session)
     #[arg(long, global = true, help_heading = "Target")]
     pub session: Option<String>,
-    /// Name shown to other people and agents in the shared activity timeline
-    #[arg(long, global = true, env = "CAPTUREFAB_ACTOR", help_heading = "Target")]
-    pub actor: Option<String>,
-    /// Identify the caller as a human or AI agent (attribution, not authentication)
-    #[arg(
-        long,
-        global = true,
-        value_enum,
-        default_value = "human",
-        env = "CAPTUREFAB_ACTOR_KIND",
-        help_heading = "Target"
-    )]
-    pub actor_kind: CallerKind,
     /// Open a temporary worker instead of automatically using a running session
     #[arg(
         long,
@@ -80,35 +67,6 @@ pub struct Cli {
     pub simulate: bool,
     #[command(subcommand)]
     pub command: Option<Command>,
-}
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CallerKind {
-    Human,
-    Agent,
-}
-impl Cli {
-    fn session_actor(&self) -> Result<SessionActor> {
-        let kind = match self.actor_kind {
-            CallerKind::Human => ActorKind::Human,
-            CallerKind::Agent => ActorKind::Agent,
-        };
-        if let Some(name) = &self.actor {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(name.as_bytes());
-            let id = format!(
-                "cli-{}-{hash:x}",
-                match self.actor_kind {
-                    CallerKind::Human => "human",
-                    CallerKind::Agent => "agent",
-                }
-            );
-            SessionActor::new(id, name.clone(), kind)
-        } else {
-            let mut actor = SessionActor::process(ActivityOrigin::Client);
-            actor.kind = kind;
-            Ok(actor)
-        }
-    }
 }
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum ImageFormat {
@@ -287,12 +245,6 @@ pub enum Command {
         #[arg(required = true)]
         assignments: Vec<String>,
     },
-    /// Undo the latest reversible camera change in an existing session
-    Undo,
-    /// Redo the latest undone camera change in an existing session
-    Redo,
-    /// Show the next undo and redo labels for the selected or addressed camera
-    History,
     /// Execute a GenICam command such as TriggerSoftware
     Execute { feature: String },
     /// Save a tuned camera's settings by name and restore them later, with a preview of what changes
@@ -309,21 +261,6 @@ pub enum Command {
         /// Camera ID, serial, IP, media URI or sim:0 (default: --camera / CAPTUREFAB_CAMERA)
         #[arg(value_name = "CAMERA")]
         target: Option<String>,
-    },
-    /// Set the session's default camera for CLI calls without --camera
-    Select {
-        /// Connected camera to make the default (default: --camera / CAPTUREFAB_CAMERA)
-        #[arg(value_name = "CAMERA")]
-        target: Option<String>,
-    },
-    /// Observe all participants' actions, optionally waiting for a revision change
-    Activity {
-        /// Revision from a previous activity result; omit for immediate history
-        #[arg(long)]
-        after: Option<u64>,
-        /// Wait up to this duration for changes (maximum 25s; default: no wait)
-        #[arg(long, requires = "after", value_parser = parse_duration_text)]
-        wait: Option<String>,
     },
     /// Disconnect the camera in a persistent session
     Disconnect,
@@ -427,7 +364,7 @@ pub enum Command {
     },
     /// List capture schedules in a persistent session
     Jobs,
-    /// Cancel a scheduled capture job on the selected camera
+    /// Cancel a scheduled capture job on the camera
     Cancel {
         #[arg(value_parser = clap::value_parser!(u64).range(1..))]
         id: u64,
@@ -582,7 +519,6 @@ struct Client<'a> {
     cli: &'a Cli,
     local: Option<SessionHandle>,
     target: Option<String>,
-    actor: SessionActor,
 }
 impl<'a> Client<'a> {
     fn new(cli: &'a Cli) -> Result<Self> {
@@ -595,7 +531,6 @@ impl<'a> Client<'a> {
             cli,
             local,
             target: cli.camera.clone(),
-            actor: cli.session_actor()?,
         };
         if let Some(name) = &cli.session
             && camera_command(cli.command.as_ref())
@@ -610,18 +545,17 @@ impl<'a> Client<'a> {
                 if let Some(connected) = connected {
                     c.target = connected["info"]["id"].as_str().map(str::to_owned);
                 } else if one_shot_camera_command(cli.command.as_ref()) {
-                    let result = ipc::call_to_as(
+                    let result = ipc::call_to(
                         name,
                         None,
                         SessionCommand::connect(selector.clone(), cli.timeout_ms),
                         request_timeout(cli, &SessionCommand::Status)?,
-                        Some(&c.actor),
                     )?;
                     note_loose_match(cli, selector, &result);
                     c.target = result["connected"]["id"].as_str().map(str::to_owned);
                 }
             } else {
-                c.target = state["active_camera"].as_str().map(str::to_owned);
+                c.target = Some(only_camera(name, &state)?);
             }
             ensure!(
                 c.target.is_some(),
@@ -641,7 +575,6 @@ impl<'a> Client<'a> {
         if let Some(name) = &self.cli.session {
             let target = match &command {
                 SessionCommand::Connect { .. }
-                | SessionCommand::Select { .. }
                 | SessionCommand::Discover { .. }
                 | SessionCommand::NetworkScan { .. } => None,
                 SessionCommand::Status
@@ -649,22 +582,16 @@ impl<'a> Client<'a> {
                 {
                     None
                 }
-                SessionCommand::Activity { .. } => None,
                 _ => self.target.as_deref(),
             };
-            ipc::call_to_as(
+            ipc::call_to(
                 name,
                 target,
                 command.clone(),
                 request_timeout(self.cli, &command)?,
-                Some(&self.actor),
             )
         } else {
-            self.local.as_ref().unwrap().request_as(
-                command,
-                ActivityOrigin::Client,
-                self.actor.clone(),
-            )
+            self.local.as_ref().unwrap().request(command)
         }
     }
     fn set(&self, feature: String, value: String) -> Result<Value> {
@@ -710,6 +637,34 @@ fn request_timeout(cli: &Cli, command: &SessionCommand) -> Result<Duration> {
         None => crate::session::default_request_timeout(command),
     })
 }
+/// The camera a session command without --camera is for: the session's only
+/// one.
+fn only_camera(session: &str, state: &Value) -> Result<String> {
+    let ids = state["cameras"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|camera| camera["info"]["id"].as_str())
+        .collect::<Vec<_>>();
+    match ids.as_slice() {
+        [id] => Ok((*id).to_owned()),
+        [] => anyhow::bail!("no camera connected; use --camera ID or connect ID"),
+        _ => Err(crate::types::Usage(format!(
+            "session '{session}' has {} cameras connected ({}); choose one with --camera ID",
+            ids.len(),
+            ids.iter()
+                .map(|id| crate::media::redact_url(id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .into()),
+    }
+}
+/// A status reply's one camera: a direct worker's, or the one a session
+/// status was addressed to.
+fn status_camera(state: &Value) -> &Value {
+    &state["cameras"][0]
+}
 fn addressed_camera<'a>(state: &'a Value, selector: &str) -> Option<&'a Value> {
     let cameras = state["cameras"].as_array()?;
     cameras
@@ -751,9 +706,6 @@ fn camera_command(command: Option<&Command>) -> bool {
                     | Command::Stop
                     | Command::Auto { .. }
                     | Command::Manual { .. }
-                    | Command::Undo
-                    | Command::Redo
-                    | Command::History
                     | Command::StopForward
                     | Command::Jobs
                     | Command::Cancel { .. }
@@ -767,9 +719,7 @@ fn uses_session(command: Option<&Command>) -> bool {
             command,
             Some(
                 Command::Connect { .. }
-                    | Command::Select { .. }
                     | Command::Status
-                    | Command::Activity { .. }
                     | Command::Rpc
                     | Command::Discover
                     | Command::NetworkScan
@@ -851,7 +801,7 @@ fn binary_stdout_allowed(output: &str, stdout_is_terminal: bool) -> Result<()> {
     Ok(())
 }
 
-/// The camera `connect`/`select` name: their argument, else --camera or
+/// The camera `connect` names: its argument, else --camera or
 /// CAPTUREFAB_CAMERA. Two different cameras are a usage error.
 fn connect_target(cli: &Cli, target: &Option<String>) -> Result<String> {
     match (target, &cli.camera) {
@@ -866,19 +816,13 @@ fn connect_target(cli: &Cli, target: &Option<String>) -> Result<String> {
         }
         (Some(camera), None) | (None, Some(camera)) => Ok(camera.clone()),
         (None, None) => anyhow::bail!(
-            "{} needs a camera: capturefab {0} ID (find IDs with capturefab discover)",
-            if matches!(cli.command, Some(Command::Select { .. })) {
-                "select"
-            } else {
-                "connect"
-            }
+            "connect needs a camera: capturefab connect ID (find IDs with capturefab discover)"
         ),
     }
 }
 
 /// Prepare all command arguments before connecting or applying --set/--auto.
 fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
-    cli.session_actor()?.validate()?;
     if let Some(camera) = &cli.camera {
         crate::session::validate_selector(camera)?;
         if cli.session.is_none() {
@@ -890,14 +834,6 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
     }
     crate::session::validate_timeout(cli.timeout_ms)?;
     let command = match &cli.command {
-        Some(Command::Activity { after, wait }) => Some(SessionCommand::Activity {
-            after: *after,
-            timeout_ms: wait
-                .as_deref()
-                .map(crate::scheduling::parse_duration)
-                .transpose()?
-                .unwrap_or(0),
-        }),
         Some(Command::Login { command }) => {
             login::prepare(command)?;
             None
@@ -962,9 +898,6 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
             connect_target(cli, target)?,
             cli.timeout_ms,
         )),
-        Some(Command::Select { target }) => Some(SessionCommand::Select {
-            camera: connect_target(cli, target)?,
-        }),
         Some(Command::Capture {
             output,
             count,
@@ -1192,7 +1125,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
     if let Some(camera) = &mut cli.camera {
         input(paths::resolve_selector(camera, &base))?;
     }
-    if let Some(Command::Connect { target } | Command::Select { target }) = &mut cli.command
+    if let Some(Command::Connect { target }) = &mut cli.command
         && let Some(camera) = target
     {
         input(paths::resolve_selector(camera, &base))?;
@@ -1318,18 +1251,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
         &cli.command,
         Some(
             Command::Connect { .. }
-                | Command::Select { .. }
                 | Command::Disconnect
                 | Command::Start
                 | Command::Stop
                 | Command::Auto { .. }
                 | Command::Manual { .. }
-                | Command::Undo
-                | Command::Redo
-                | Command::History
                 | Command::StopForward
                 | Command::Status
-                | Command::Activity { .. }
                 | Command::Rpc
                 | Command::Jobs
                 | Command::Cancel { .. }
@@ -1381,7 +1309,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Command::Info => {
             let state = client.call(SessionCommand::Status)?;
             let features = client.call(SessionCommand::Features)?;
-            json!({"camera":state["connected"],"features":features["features"]})
+            json!({"camera":status_camera(&state)["info"],"features":features["features"]})
         }
         Command::Features { filter } => {
             let mut v = client.call(SessionCommand::Features)?;
@@ -1431,7 +1359,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             }
             result
         }
-        Command::Select { .. } => client.call(prepared.clone().unwrap())?,
         Command::Forward {
             output: destination,
             duration,
@@ -1445,12 +1372,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
             auto.apply(&client)?;
             // The camera's newest error before the recording: one after it
             // means the recording failed, even before a status shows it.
-            let errors = match (duration_ms, &client.local) {
-                (None, _) => ErrorMark::default(),
-                (Some(_), Some(h)) => ErrorMark::of(&ForwardStatus::of_snapshot(&h.snapshot())),
-                (Some(_), None) => ErrorMark::of(&ForwardStatus::of_status(
+            let errors = match duration_ms {
+                None => ErrorMark::default(),
+                Some(_) => ErrorMark::of(&ForwardStatus::of(status_camera(
                     &client.call(SessionCommand::Status)?,
-                )),
+                ))),
             };
             let mut result = client.call(prepared.clone().unwrap())?;
             // The session ends a timed recording at its end time; the CLI
@@ -1480,15 +1406,16 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     if h.is_shutting_down() {
                         return Ok(());
                     }
-                    let state = h.stored();
+                    let state = serde_json::to_value(h.snapshot())?;
+                    let camera = status_camera(&state);
                     let next = match &mut timed {
                         Some(timed) => timed.next(
-                            ForwardStatus::of_snapshot(&state),
+                            ForwardStatus::of(camera),
                             crate::scheduling::now_ms(),
                             epoch.elapsed(),
                             false,
                         ),
-                        None if state.forwarding.is_some() => RecordingWait::Wait,
+                        None if camera["forwarding"].is_string() => RecordingWait::Wait,
                         None => RecordingWait::Failed,
                     };
                     match next {
@@ -1497,7 +1424,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                             result["stopped"] = timed
                                 .as_ref()
                                 .unwrap()
-                                .finished(&serde_json::to_value(&state.forwarding_progress)?);
+                                .finished(&camera["forwarding_progress"]);
                             break;
                         }
                         RecordingWait::Stop => {
@@ -1507,9 +1434,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         }
                         RecordingWait::Failed => anyhow::bail!(
                             "{}",
-                            state
-                                .last_error
-                                .unwrap_or_else(|| "forwarding stopped".into())
+                            camera["last_error"]
+                                .as_str()
+                                .unwrap_or("forwarding stopped")
                         ),
                     }
                 }
@@ -1533,17 +1460,18 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         timed.duration.saturating_sub(epoch.elapsed()),
                     )));
                     let state = client.call(SessionCommand::Status)?;
+                    let camera = status_camera(&state);
                     match timed.next(
-                        ForwardStatus::of_status(&state),
+                        ForwardStatus::of(camera),
                         crate::scheduling::now_ms(),
                         epoch.elapsed(),
                         stopped.load(Ordering::Relaxed),
                     ) {
                         RecordingWait::Wait => {}
-                        // Never stop-forward here: another participant may
+                        // Never stop-forward here: another client may
                         // already record on this camera.
                         RecordingWait::Finished => {
-                            result["stopped"] = timed.finished(&state["forwarding_progress"]);
+                            result["stopped"] = timed.finished(&camera["forwarding_progress"]);
                             break;
                         }
                         RecordingWait::Stop => {
@@ -1552,7 +1480,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
                         }
                         RecordingWait::Failed => anyhow::bail!(
                             "{}",
-                            state["last_error"]
+                            camera["last_error"]
                                 .as_str()
                                 .unwrap_or("forwarding stopped before its duration elapsed")
                         ),
@@ -1571,18 +1499,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Command::Auto { balance } => client.call(SessionCommand::Auto { balance: *balance })?,
         Command::Manual { revert } => client.call(SessionCommand::Manual { revert: *revert })?,
         Command::Setup { command } => setup::run_camera(&cli, &client, command)?,
-        Command::Undo => client.call(SessionCommand::Undo)?,
-        Command::Redo => client.call(SessionCommand::Redo)?,
-        Command::History => {
-            let status = client.call(SessionCommand::Status)?;
-            ensure!(
-                status["connected"].is_object(),
-                "no camera connected; use connect"
-            );
-            json!({"camera":status["connected"]["id"],"history":status["history"]})
-        }
         Command::Status => client.call(SessionCommand::Status)?,
-        Command::Activity { .. } => client.call(prepared.clone().unwrap())?,
         Command::Capture {
             output: destination,
             format,
@@ -1621,9 +1538,13 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     if h.is_shutting_down() {
                         return Ok(());
                     }
-                    // The status poller keeps the stored jobs current.
-                    let state = h.stored();
-                    let Some(job) = state.jobs.iter().find(|job| job.id == id) else {
+                    let state = h.snapshot();
+                    let Some(job) = state
+                        .cameras
+                        .iter()
+                        .flat_map(|camera| &camera.jobs)
+                        .find(|job| job.id == id)
+                    else {
                         let since = *missing.get_or_insert_with(std::time::Instant::now);
                         anyhow::ensure!(
                             since.elapsed() < Duration::from_secs(5),
@@ -1634,8 +1555,9 @@ pub fn run(mut cli: Cli) -> Result<()> {
                     };
                     missing = None;
                     if !cli.json && job.captured > shown {
-                        // The poller can miss a frame when the interval is
-                        // shorter than its period; still count each one.
+                        // A look can miss a frame when the interval is
+                        // shorter than the wait between looks; still count
+                        // each one.
                         for missed in shown + 1..job.captured {
                             eprintln!("{missed}/{} saved", job.count);
                         }
@@ -1714,9 +1636,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             if matches!(&command, SessionCommand::Capture { output, .. } if output == "-") {
                 return Err(InvalidInput("remote captures require an output file".into()).into());
             }
-            if let SessionCommand::Connect { camera, .. } | SessionCommand::Select { camera } =
-                &mut command
-            {
+            if let SessionCommand::Connect { camera, .. } = &mut command {
                 input(paths::resolve_selector(camera, &std::env::current_dir()?))?;
             }
             input(caller_output(&mut command))?;
@@ -1847,115 +1767,45 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         writeln!(out, "Ctrl-C stops the session.")?;
     } else if let Some(Command::Login { command }) = &cli.command {
         write!(out, "{}", login::human(command, &value))?;
-    } else if matches!(&cli.command, Some(Command::Undo | Command::Redo)) {
-        let (verb, key) = if matches!(&cli.command, Some(Command::Undo)) {
-            ("Undid", "undone")
-        } else {
-            ("Redid", "redone")
-        };
-        writeln!(out, "{verb} {}", value[key].as_str().unwrap_or("change"))?;
-    } else if matches!(&cli.command, Some(Command::History)) {
-        writeln!(out, "Camera {}", value["camera"].as_str().unwrap_or(""))?;
-        writeln!(
-            out,
-            "Undo: {}",
-            value["history"]["undo"]
-                .as_str()
-                .unwrap_or("Nothing to undo")
-        )?;
-        writeln!(
-            out,
-            "Redo: {}",
-            value["history"]["redo"]
-                .as_str()
-                .unwrap_or("Nothing to redo")
-        )?;
-    } else if matches!(&cli.command, Some(Command::Activity { .. })) {
-        writeln!(out, "Session activity · revision {}", value["revision"])?;
-        for entry in value["activity"].as_array().into_iter().flatten() {
-            let actor = entry["actor"]["name"].as_str().unwrap_or("Participant");
-            let state = entry["job"]["status"]
-                .as_str()
-                .or_else(|| entry["state"].as_str())
-                .unwrap_or("updated");
-            writeln!(
-                out,
-                "#{} · {} · {} · {} · {}",
-                entry["id"],
-                actor,
-                entry["camera"].as_str().unwrap_or("session"),
-                state,
-                entry["label"].as_str().unwrap_or("")
-            )?;
-            if let Some(detail) = entry["detail"].as_str() {
-                for line in detail.lines() {
-                    writeln!(out, "  {line}")?;
-                }
-            }
-        }
     } else if matches!(&cli.command, Some(Command::Status)) {
         writeln!(
             out,
             "Session {}",
             cli.session.as_deref().unwrap_or("temporary")
         )?;
-        let cameras = value["cameras"].as_array();
-        if let Some(cameras) = cameras {
+        let cameras = value["cameras"].as_array().cloned().unwrap_or_default();
+        writeln!(
+            out,
+            "{:<28} {:<10} {:>8} {:>10} OUTPUT",
+            "CAMERA", "STATE", "FPS", "FRAMES"
+        )?;
+        for camera in &cameras {
             writeln!(
                 out,
-                "{:<28} {:<10} {:>8} {:>10} OUTPUT",
-                "CAMERA", "STATE", "FPS", "FRAMES"
-            )?;
-            for camera in cameras {
-                if let Some(target) = value["target_camera"].as_str()
-                    && camera["info"]["id"].as_str() != Some(target)
-                {
-                    continue;
-                }
-                writeln!(
-                    out,
-                    "{:<28} {:<10} {:>8.1} {:>10} {}{}",
-                    camera["info"]["id"].as_str().unwrap_or(""),
-                    if camera["streaming"] == true {
-                        "streaming"
-                    } else {
-                        "idle"
-                    },
-                    camera["fps"].as_f64().unwrap_or(0.0),
-                    camera["frames"].as_u64().unwrap_or(0),
-                    camera["forwarding"].as_str().unwrap_or(""),
-                    if camera["info"]["id"] == value["active_camera"] {
-                        " (session default)"
-                    } else {
-                        ""
-                    }
-                )?;
-                if let Some(error) = camera["last_error"].as_str() {
-                    writeln!(out, "  Error: {error}")?;
-                }
-            }
-            if cameras.is_empty() {
-                writeln!(
-                    out,
-                    "No cameras connected. Use capturefab connect ID, or add --camera ID to capture/record commands."
-                )?;
-            }
-        } else if let Some(camera) = value["connected"]["id"].as_str() {
-            writeln!(
-                out,
-                "Camera {camera}: {}, {:.1} fps, {} frames",
-                if value["streaming"] == true {
+                "{:<28} {:<10} {:>8.1} {:>10} {}",
+                camera["info"]["id"].as_str().unwrap_or(""),
+                if camera["streaming"] == true {
                     "streaming"
                 } else {
                     "idle"
                 },
-                value["fps"].as_f64().unwrap_or(0.0),
-                value["frames"].as_u64().unwrap_or(0)
+                camera["fps"].as_f64().unwrap_or(0.0),
+                camera["frames"].as_u64().unwrap_or(0),
+                camera["forwarding"].as_str().unwrap_or("")
+            )?;
+            if let Some(error) = camera["last_error"].as_str() {
+                writeln!(out, "  Error: {error}")?;
+            }
+        }
+        if cameras.is_empty() {
+            writeln!(
+                out,
+                "No cameras connected. Use capturefab connect ID, or add --camera ID to capture/record commands."
             )?;
         }
         writeln!(
             out,
-            "Use status --json for full state, jobs for captures, and history for undo/redo."
+            "Use status --json for full state and jobs for captures."
         )?;
     } else if value["files"].is_array() {
         write!(out, "{}", summary::capture_summary(&value))?;
@@ -2065,12 +1915,6 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             out,
             "Next: capturefab {target} capture -o 'shot-{{seq}}.png'   (or start live acquisition: capturefab {target} start)"
         )?;
-    } else if matches!(&cli.command, Some(Command::Select { .. })) {
-        writeln!(
-            out,
-            "CLI calls without --camera now use {}.",
-            crate::media::redact_url(value["active_camera"].as_str().unwrap_or("no camera"))
-        )?;
     } else if matches!(&cli.command, Some(Command::Disconnect)) {
         writeln!(out, "Disconnected.")?;
     } else if let Some(features) = value["features"].as_array() {
@@ -2154,9 +1998,7 @@ fn schema() -> Value {
         "CAPTUREFAB_SESSION",
         "CAPTUREFAB_SESSION_DIR",
         "CAPTUREFAB_CACHE_DIR",
-        "CAPTUREFAB_THREADS",
-        "CAPTUREFAB_ACTOR",
-        "CAPTUREFAB_ACTOR_KIND"
+        "CAPTUREFAB_THREADS"
     ]);
     contract["selection"]["direct_mode"] = json!(
         "--direct --camera ID bypasses automatic session attachment; --direct conflicts with explicit --session and overrides CAPTUREFAB_SESSION"
@@ -2204,38 +2046,32 @@ fn schema() -> Value {
     contract["capture"]["result"] = json!({
         "capture":"{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,file_bytes?,wall_ms,settings?,file?}],count,context?}; bytes is the raw acquired frame size, file_bytes the saved file size (absent for stdout); settings maps the camera's allowlisted acquisition features to their values. A burst that fails part way keeps its saved frames and its error category; the message starts with saved N of M frames to FOLDER (names)",
         "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\",stats?:{accepted,written,dropped,late,stalled,recording?:{path,bytes,started_ms,ended_ms,encoder}}} when the session ended it on time (stats is absent from a worker that does not report them), else the conditional-stop result",
-        "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, forwarding_until_ms while a timed recording or forward runs, and recording_path (the resolved absolute file; forwarding keeps the requested output) while a local recording runs",
+        "status":"cameras[].forwarding_id and forwarding_since_ms while forwarding, forwarding_until_ms while a timed recording or forward runs, and recording_path (the resolved absolute file; forwarding keeps the requested output) while a local recording runs",
         "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback uses this form; explicit stop-forward stops the current instance."},
         "stop_forward":"{forwarding:null,stats:{accepted,written,dropped,late,stalled,encoder,error,recording?}|null}; stop_forward_if returns the same shape. Timed CLI fallback or interruption adds the conditional-stop result as stopped; normal timed completion returns {forwarding:null,by:duration,stats?}. late counts frames lost while the encoder was still busy (dropped includes them); stalled means no new camera frame for 2 s",
     });
     contract["status"] = json!({
+        "shape":"{devices,cameras:[{info,streaming,frames,fps,dropped,lost,preview_skipped,last_error,error_logged_ms?,worker_pid,forwarding,forwarding_id?,forwarding_progress?,recording_path?,forwarding_since_ms?,forwarding_until_ms?,jobs,auto,transport}],logs}",
         "frames":"frames the worker acquired",
         "lost":"frames lost on the camera link (incomplete or missing) or in the worker",
-        "preview_skipped":"preview frames the shared ring replaced while a viewer read it; captures and recordings still receive them",
+        "preview_skipped":"preview frames the shared ring replaced while a reader read it; captures and recordings still receive them",
         "dropped":"worker receive errors plus preview_skipped",
-        "scope":"top level for the selected camera, and per camera in cameras[]"
+        "error_logged_ms":"when the camera last logged an error, UTC Unix milliseconds; it changes when the same error is logged again",
+        "features":"not in status; use features or info"
     });
     contract["selection"]["source_base"] = json!(
         "Relative file: and sim:replay: inputs, and existing bare media paths, resolve in the calling terminal for CLI/RPC; network/device locators keep their meaning"
     );
-    contract["selection"]["addressed_status"] = json!(
-        "status --camera retains session context and actual active_camera selection; target_camera identifies the camera whose top-level connected/features/streaming/forwarding/jobs/history fields are returned"
+    contract["selection"]["addressed_status"] =
+        json!("status --camera ID lists only that camera in cameras[]");
+    contract["selection"]["default_camera"] = json!(
+        "A session command without --camera addresses the session's only camera; with several connected it is a usage error (exit 2) naming them"
     );
-    contract["activity"] = json!({
-        "snapshot":"status.activity; status.activity_revision",
-        "actor":{"fields":{"id":"stable participant identifier","name":"display name","kind":"human or agent"},"cli":"--actor NAME --actor-kind human|agent; CAPTUREFAB_ACTOR and CAPTUREFAB_ACTOR_KIND", "identity":"Self-reported attribution; not authentication. Unnamed CLI calls use a process identity."},
-        "origins":["client"],"states":["queued","running","succeeded","failed"],
-        "job":"Schedule acknowledgment is succeeded; entry.job tracks id, worker_pid, status, count, captured, last_file and error through completion/cancellation/failure.",
-        "history":"Entries show actor, target, command lifecycle, progress, errors and saved outputs across cameras, and remain after selection/disconnect. History retains 200 completed entries plus active work.",
-        "local_updates":"activity --json returns {revision,activity}; activity --after REV --wait 20s --json waits for shared changes through private local IPC, without an HTTP listener. RPC command: {op:activity,after:REV,timeout_ms:20000}.",
-        "polling":"Status, activity, get, jobs, features, xml, read_memory and authenticated discovery probes do not create activity entries; targeted status includes all participants without waiting behind captures.",
-        "waiting_observers":{"private_ipc":8,"capacity":"Waiting observers reserve capacity for commands; extra waits fail explicitly and can be retried."}
-    });
     contract["writes"] = json!(
-        "Camera operations are ordered per camera across IPC participants; different cameras run independently. Concurrent scheduled jobs on the same camera share acquisition. Multiple set assignments apply sequentially; failures may leave earlier assignments applied. RPC set_many writes 1..32 {feature, value} pairs in order as one camera change: a failure restores every value it wrote, and success returns one camera_change token that undoes them together."
+        "Camera operations are ordered per camera across IPC clients; different cameras run independently. Concurrent scheduled jobs on the same camera share acquisition. Multiple set assignments apply sequentially; failures may leave earlier assignments applied. RPC set_many writes 1..32 {feature, value} pairs in order as one camera change: a failure restores every value it wrote."
     );
     contract["jobs"] = json!({
-        "in":"schedule result.job; jobs result.jobs; status jobs and cameras[].jobs",
+        "in":"schedule result.job; jobs result.jobs; status cameras[].jobs",
         "fields":["id","status","output","count","captured","skipped","retries","first_at_ms","interval_ms","next_at_ms","last_file","error","context?"],
         "status":"One of scheduling.states",
         "next_at_ms":"Follows scheduling.interval",
@@ -2245,9 +2081,9 @@ fn schema() -> Value {
         "failures":"Storage full and other save errors fail the job."
     });
     contract["logs"] = json!({
-        "snapshot":"status.logs",
-        "fields":["timestamp","level","message"],
-        "timestamp":{"unix_ms":"signed Unix milliseconds (absolute UTC instant)","utc_offset_seconds":"producer offset, seconds east of UTC (-86399..86399)"}
+        "snapshot":"status.logs: the session's newest 200 lines in arrival order; a camera's lines start with [CAMERA]",
+        "fields":["unix_ms","level","message"],
+        "unix_ms":"when the line was logged, UTC Unix milliseconds"
     });
     contract["forwarding"] = json!({"cli":"record|forward -o OUTPUT [--duration 30s] [--on-exists fail|number] [--context KEY=VALUE]...; a local file output accepts the capture placeholders","duration":"Works with direct workers and persistent sessions. The CLI sends duration_ms: the camera worker stops the encoder at since_ms + duration_ms (wall clock), commits the file, and the CLI stays alive until then. Ctrl-C stops it early. A recording that stops early or with a new camera error fails the command with that error. Without duration, persistent session forwarding returns immediately; direct forwarding runs until Ctrl-C.","duration_ms":"RPC forward commands accept duration_ms (1 ms to 10 years); the session ends the recording or stream itself, even after the client that started it exits. Size max_file_bytes for the whole duration: a recording that reaches it stops with storage_full and keeps the video written until then.","request_timeout":"--request-timeout controls a session request deadline, not recording duration; a timed-out request may still complete in the session. Inspect status before retrying writes."});
     contract["forwarding"]["timeline"] = json!(
@@ -2263,7 +2099,7 @@ fn schema() -> Value {
         "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:NAME_OR_INDEX[?size=WxH&fps=F]|v4l2:/dev/videoN[?size=WxH&fps=F]|dshow:video=NAME[?size=WxH&fps=F]|onvif:http://HOST[:PORT]/PATH|onvif://[USER:PASS@]HOST[:PORT][/PATH]"
     );
     contract["selection"]["matching"] = json!(
-        "An exact ID, serial or address wins; otherwise a bare name opens the one local camera whose model or name (the ID after its kind) equals it, or whose model contains it as whole words, ignoring case (never part of a serial or ID), and stderr names the camera chosen; several matches fail with exit 3. connect and select take the camera as an argument or from --camera / CAPTUREFAB_CAMERA. Scripts should use IDs from discover."
+        "An exact ID, serial or address wins; otherwise a bare name opens the one local camera whose model or name (the ID after its kind) equals it, or whose model contains it as whole words, ignoring case (never part of a serial or ID), and stderr names the camera chosen; several matches fail with exit 3. connect takes the camera as an argument or from --camera / CAPTUREFAB_CAMERA. Scripts should use IDs from discover."
     );
     contract["selection"]["existing_session"] =
         json!("--session NAME [--camera ID] targets an existing serve session");
@@ -2271,7 +2107,7 @@ fn schema() -> Value {
     contract["limits"]["camera_workers_default"] = json!(16);
     contract["limits"]["shared_memory_slots_per_camera"] = json!(3);
     contract["camera_profiles"] = json!({
-        "location":"CameraInfo.profile: discover.devices[], info.camera, status.connected and status.cameras[].info",
+        "location":"CameraInfo.profile: discover.devices[], info.camera and status.cameras[].info",
         "kinds":["unknown","area_scan","line_scan","depth","microscope","thermal"],
         "sources":["unknown","identity","features","device_metadata"],
         "capabilities":["exposure","gain","roi","binning","frame_rate","line_rate","trigger","encoder","depth_components","depth_range","spatial_calibration","focus","magnification","illumination","temperature"],
@@ -2294,16 +2130,7 @@ fn schema() -> Value {
     });
     contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories, recorded in this user's state directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"recording_cut":"A recording that reaches its maximum file size (storage_full) or fails to write stops, and keeps the video written until then, recorded in the ledger","on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6","free_space_floor":crate::storage::FREE_SPACE_FLOOR,"free_bytes":"storage --json reports free space on the disk of the default capture folder (~/Capturefab), or null. Every save must leave free_space_floor bytes free on its own disk, counting what active recordings may still write; delete-oldest removes the oldest owned files on that disk to keep it, except on Windows, and not again on a disk where that freed no space until a save there fits."});
     contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus interval times the shots so far: captured, being saved, skipped and retried, so a skipped or retried shot moves the schedule one interval later; zero interval captures consecutive frames. All frames must fall within 10 years. A past first timestamp starts immediately. Durations must resolve to whole milliseconds. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
-    contract["auto"] = json!({"cli":"--session NAME auto [--balance B] | manual [--revert]; capture|forward|serve --auto [--balance B]","default":"manual; connecting never enables auto mode and it ends on disconnect","balance":"0 favors image quality, 1 favors frame rate; quality, balanced and frame-rate mean 0, 0.5 and 1; omitted keeps the current value, initially 0.5","status":"status.auto and cameras[].auto; null in manual mode","strategies":["firmware","software","video-mode","none"],"states":["waiting","converging","stable","limited"],"settled":["stable","limited"],"manual":"Setting a feature in auto.managed switches that camera to manual first and the set result adds \"auto\":null; manual turns ExposureAuto, GainAuto and BalanceWhiteAuto off so values hold","persistence":"Camera settings written by auto mode remain after manual, like set; manual --revert, disconnect and session exit restore their previous values (best effort)","capture":"--set applies before --auto; capture saves once exposure settles or after min(timeout_ms/2, 3 s) and result.auto reports the state; with --session auto mode stays on afterwards"});
-    contract["history"] = json!({
-        "cli":"--session NAME [--camera ID] history | undo | redo",
-        "scope":"Reversible camera changes are recorded by the camera worker, including changes made through the CLI and RPC; each connected camera has its own history.",
-        "status":"status.history and cameras[].history contain undo and redo labels, or null when unavailable, and entries with setting_changes (the semantic assignment count). history returns the selected or addressed camera's labels.",
-        "lifetime":"History is bounded and lasts while the camera remains connected; a new change clears its redo history.",
-        "checkpoints":"Successful reversible commands also return camera_change:{token,camera,label,last_changed_at_us}. replay_camera_change targets that token with undo:true or undo:false; expired tokens and conflicting camera state fail.",
-        "conflicts":"Replay checks current camera state before changing it. A conflicting or failed replay reports an error and retains the history entry.",
-        "effects":"Captures, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by camera history. Stopping a stream with schedules or forwarding is also excluded."
-    });
+    contract["auto"] = json!({"cli":"--session NAME auto [--balance B] | manual [--revert]; capture|forward|serve --auto [--balance B]","default":"manual; connecting never enables auto mode and it ends on disconnect","balance":"0 favors image quality, 1 favors frame rate; quality, balanced and frame-rate mean 0, 0.5 and 1; omitted keeps the current value, initially 0.5","status":"status cameras[].auto; null in manual mode","strategies":["firmware","software","video-mode","none"],"states":["waiting","converging","stable","limited"],"settled":["stable","limited"],"manual":"Setting a feature in auto.managed switches that camera to manual first and the set result adds \"auto\":null; manual turns ExposureAuto, GainAuto and BalanceWhiteAuto off so values hold","persistence":"Camera settings written by auto mode remain after manual, like set; manual --revert, disconnect and session exit restore their previous values (best effort)","capture":"--set applies before --auto; capture saves once exposure settles or after min(timeout_ms/2, 3 s) and result.auto reports the state; with --session auto mode stays on afterwards"});
     contract["frame"] = json!({
         "rpc":"{\"op\":\"frame\"} through rpc or IPC on a running session; --camera or the request's camera picks the camera",
         "behavior":"Read-only: the newest frame of one camera as measurements and a bounded preview. It never saves files, uses storage or changes settings, and runs after commands sent to that camera before it. A stopped camera acquires one frame and stays stopped.",
@@ -2317,17 +2144,11 @@ fn schema() -> Value {
         json!({"op":"frame","fresh":2,"timeout_ms":5000,"max_dimension":512,"format":"png","region":[0.25,0.25,0.5,0.5]}),
         json!({"op":"set_many","values":[{"feature":"ExposureTime","value":"8000"},{"feature":"Gain","value":"6"}]}),
     ]);
-    commands.push(json!({"op":"activity","after":12,"timeout_ms":20000}));
     commands.extend([
         json!({"op":"network_scan","timeout_ms":1000}),
         json!({"op":"optimize_network","bytes_per_second":100000000}),
     ]);
-    commands.extend([json!({"op":"select","camera":"sim:0"}),json!({"op":"jobs"}),json!({"op":"cancel_job","id":1}),json!({"op":"schedule","output":"timelapse","count":10,"timeout_ms":2000,"format":"png","first_at_ms":crate::scheduling::now_ms()+60000,"interval_ms":10000,"storage":crate::storage::StoragePolicy::default()}),json!({"op":"forward","output":"rtsp://localhost:8554/camera","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::default_recording_cap()}),json!({"op":"forward","output":"video/run-{seq}.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::recording_reservation("4M",3_600_000).expect("a valid bitrate"),"on_exists":"number","duration_ms":3_600_000}),json!({"op":"stop_forward"}),json!({"op":"stop_forward_if","forwarding_id":"0123456789abcdef0123456789abcdef"}),json!({"op":"auto","balance":0.5}),json!({"op":"manual"})]);
-    commands.extend([
-        json!({"op":"undo"}),
-        json!({"op":"redo"}),
-        json!({"op":"replay_camera_change","token":"TOKEN_FROM_CAMERA_CHANGE","undo":true}),
-    ]);
+    commands.extend([json!({"op":"jobs"}),json!({"op":"cancel_job","id":1}),json!({"op":"schedule","output":"timelapse","count":10,"timeout_ms":2000,"format":"png","first_at_ms":crate::scheduling::now_ms()+60000,"interval_ms":10000,"storage":crate::storage::StoragePolicy::default()}),json!({"op":"forward","output":"rtsp://localhost:8554/camera","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::default_recording_cap()}),json!({"op":"forward","output":"video/run-{seq}.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M","storage":crate::storage::StoragePolicy::default(),"max_file_bytes":crate::media::recording_reservation("4M",3_600_000).expect("a valid bitrate"),"on_exists":"number","duration_ms":3_600_000}),json!({"op":"stop_forward"}),json!({"op":"stop_forward_if","forwarding_id":"0123456789abcdef0123456789abcdef"}),json!({"op":"auto","balance":0.5}),json!({"op":"manual"})]);
     commands.push(json!({"op":"capture","output":"line1/{date}/{camera}-{datetime}-{seq}.png","count":1,"timeout_ms":2000,"format":"png","on_exists":"number","context":{"line":"L1","part":"A-100"}}));
     contract["doctor"] = json!({
         "host":"{cpu_cores}",
@@ -2371,30 +2192,13 @@ struct ForwardStatus<'a> {
     error_logged_ms: Option<u64>,
 }
 impl<'a> ForwardStatus<'a> {
-    /// The selected camera in this process's own session.
-    fn of_snapshot(state: &'a crate::session::SessionSnapshot) -> Self {
+    /// The camera's entry in a `status` reply.
+    fn of(camera: &'a Value) -> Self {
         Self {
-            forwarding: state.forwarding.is_some(),
-            forwarding_id: state.forwarding_id.as_deref(),
-            last_error: state.last_error.as_deref(),
-            error_logged_ms: state
-                .connected
-                .as_ref()
-                .and_then(|camera| crate::session::camera_error_logged_ms(&state.logs, &camera.id)),
-        }
-    }
-    /// The addressed camera in a session's `status` reply.
-    fn of_status(state: &'a Value) -> Self {
-        let logs =
-            <Vec<crate::session::LogEntry> as serde::Deserialize>::deserialize(&state["logs"])
-                .unwrap_or_default();
-        Self {
-            forwarding: !state["forwarding"].is_null(),
-            forwarding_id: state["forwarding_id"].as_str(),
-            last_error: state["last_error"].as_str(),
-            error_logged_ms: state["connected"]["id"]
-                .as_str()
-                .and_then(|camera| crate::session::camera_error_logged_ms(&logs, camera)),
+            forwarding: !camera["forwarding"].is_null(),
+            forwarding_id: camera["forwarding_id"].as_str(),
+            last_error: camera["last_error"].as_str(),
+            error_logged_ms: camera["error_logged_ms"].as_u64(),
         }
     }
 }
@@ -2413,8 +2217,7 @@ impl ErrorMark {
         }
     }
     /// Whether `status` shows an error logged after this one: another
-    /// error, or the same one again. A line that has left the bounded log
-    /// is not a new error.
+    /// error, or the same one again.
     fn newer_in(&self, status: &ForwardStatus) -> bool {
         status.last_error != self.text.as_deref() || status.error_logged_ms > self.logged_ms
     }
@@ -2627,16 +2430,14 @@ mod tests {
     fn connect_takes_its_argument_or_the_global_camera() {
         let parse = |args: &[&str]| Cli::try_parse_from(args).unwrap();
         let target = |cli: &Cli| match &cli.command {
-            Some(Command::Connect { target } | Command::Select { target }) => {
-                connect_target(cli, target)
-            }
+            Some(Command::Connect { target }) => connect_target(cli, target),
             _ => unreachable!(),
         };
         let cli = parse(&["capturefab", "connect", "sim:0"]);
         assert_eq!(target(&cli).unwrap(), "sim:0");
         let cli = parse(&["capturefab", "connect", "--camera", "sim:1"]);
         assert_eq!(target(&cli).unwrap(), "sim:1");
-        let cli = parse(&["capturefab", "--camera", "sim:1", "select", "sim:1"]);
+        let cli = parse(&["capturefab", "--camera", "sim:1", "connect", "sim:1"]);
         assert_eq!(target(&cli).unwrap(), "sim:1");
         let cli = parse(&["capturefab", "connect", "sim:0", "--camera", "sim:1"]);
         assert!(
@@ -2645,12 +2446,12 @@ mod tests {
                 .to_string()
                 .contains("two cameras")
         );
-        let cli = parse(&["capturefab", "select"]);
+        let cli = parse(&["capturefab", "connect"]);
         assert!(
             target(&cli)
                 .unwrap_err()
                 .to_string()
-                .starts_with("select needs a camera")
+                .starts_with("connect needs a camera")
         );
     }
     #[test]
@@ -2782,21 +2583,6 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(["capturefab"].iter().chain(args)).is_err());
         }
-        for action in ["undo", "redo", "history"] {
-            assert!(Cli::try_parse_from(["capturefab", "--session", "bench", action]).is_ok());
-            assert!(
-                Cli::try_parse_from([
-                    "capturefab",
-                    "--session",
-                    "bench",
-                    "--camera",
-                    "sim:1",
-                    action,
-                    "--json"
-                ])
-                .is_ok()
-            );
-        }
     }
     #[test]
     fn balance_values() {
@@ -2831,18 +2617,9 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{command}: {e:#}"));
         }
         assert!(
-            [
-                "auto",
-                "manual",
-                "undo",
-                "redo",
-                "replay_camera_change",
-                "activity",
-                "frame",
-                "set_many"
-            ]
-            .iter()
-            .all(|op| commands.iter().any(|c| c["op"] == *op))
+            ["auto", "manual", "frame", "set_many"]
+                .iter()
+                .all(|op| commands.iter().any(|c| c["op"] == *op))
         );
         // Grab belongs to camera workers; sessions refuse it.
         assert!(!commands.iter().any(|c| c["op"] == "grab"));
@@ -2900,7 +2677,7 @@ mod tests {
         // The worker's monotonic timer can finish while UTC is still behind
         // its nominal deadline after a system-clock rollback.
         assert_eq!(timed.next(stopped, since - 60_000, s(30), false), Finished);
-        // Another participant's newer recording is not this one to stop.
+        // Another client's newer recording is not this one to stop.
         let newer = status(true, Some(replacement), earlier, logged);
         assert_eq!(timed.next(newer, since + 31_000, s(33), false), Finished);
         // Stopped early, or with a new error, is a failure even if video was kept.
@@ -3039,57 +2816,50 @@ mod tests {
         assert!(interval.contains("skipped and retried"), "{interval}");
     }
     #[test]
-    fn multiplayer_identity_and_observer_contract_validate_before_execution() {
-        let actor = |kind| {
-            Cli::try_parse_from([
-                "capturefab",
-                "--actor",
-                "Focus agent",
-                "--actor-kind",
-                kind,
-                "schema",
-            ])
-            .unwrap()
-            .session_actor()
-            .unwrap()
-        };
-        let agent = actor("agent");
-        assert_eq!(agent.kind, ActorKind::Agent);
-        assert_eq!(agent, actor("agent"));
-        assert_ne!(agent.id, actor("human").id);
-        let invalid = Cli::try_parse_from(["capturefab", "--actor", "", "schema"]).unwrap();
-        assert!(invalid.session_actor().is_err());
-        assert!(Cli::try_parse_from(["capturefab", "activity", "--wait", "20s"]).is_err());
-        let observer = Cli::try_parse_from([
-            "capturefab",
-            "--session",
-            "bench",
-            "activity",
-            "--after",
-            "12",
-            "--wait",
-            "25s",
-        ])
-        .unwrap();
-        assert!(matches!(
-            prepare(&observer).unwrap(),
-            Some(SessionCommand::Activity {
-                after: Some(12),
-                timeout_ms: 25_000
-            })
-        ));
-        let excessive = Cli::try_parse_from([
-            "capturefab",
-            "--session",
-            "bench",
-            "activity",
-            "--after",
-            "12",
-            "--wait",
-            "26s",
-        ])
-        .unwrap();
-        assert!(prepare(&excessive).is_err());
+    fn a_session_command_without_a_camera_is_for_its_only_one() {
+        let state = |ids: &[&str]| json!({"cameras": ids.iter().map(|id| json!({"info": {"id": id}})).collect::<Vec<_>>()});
+        assert_eq!(only_camera("bench", &state(&["sim:0"])).unwrap(), "sim:0");
+        let none = only_camera("bench", &state(&[])).unwrap_err();
+        assert_eq!(error_code(&none), ("unavailable", 3), "{none}");
+        let several =
+            only_camera("bench", &state(&["sim:0", "rtsp://user:secret@cam/live"])).unwrap_err();
+        assert_eq!(error_code(&several), ("usage", 2), "{several}");
+        let message = several.to_string();
+        assert!(
+            message.starts_with("session 'bench' has 2 cameras connected (sim:0, rtsp://"),
+            "{message}"
+        );
+        assert!(!message.contains("secret"), "{message}");
+        // A timed recording reads its camera's entry in the status.
+        let camera = json!({"forwarding": "clip.mkv", "forwarding_id": "a", "last_error": "x", "error_logged_ms": 5});
+        let status = ForwardStatus::of(&camera);
+        assert!(status.forwarding);
+        assert_eq!(
+            (
+                status.forwarding_id,
+                status.last_error,
+                status.error_logged_ms
+            ),
+            (Some("a"), Some("x"), Some(5))
+        );
+        assert!(!ForwardStatus::of(&json!({"forwarding": null})).forwarding);
+    }
+    #[test]
+    fn session_collaboration_commands_and_flags_are_gone() {
+        for args in [
+            &["--actor", "Focus agent", "schema"][..],
+            &["--actor-kind", "agent", "schema"],
+            &["--session", "bench", "activity"],
+            &["--session", "bench", "select", "sim:0"],
+            &["--session", "bench", "undo"],
+            &["--session", "bench", "redo"],
+            &["--session", "bench", "history"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["capturefab"].iter().chain(args)).is_err(),
+                "{args:?}"
+            );
+        }
     }
     #[test]
     fn frame_inspection_errors_keep_their_exit_codes() {

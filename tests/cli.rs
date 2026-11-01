@@ -158,7 +158,7 @@ fn automatic_session_targeting_and_caller_relative_paths() {
         ],
     );
     let status = json(&dir, &["--json", "status"]);
-    assert_eq!(status["active_camera"], "sim:other");
+    assert_eq!(status["cameras"].as_array().unwrap().len(), 2);
     assert!(
         status["cameras"]
             .as_array()
@@ -166,12 +166,14 @@ fn automatic_session_targeting_and_caller_relative_paths() {
             .iter()
             .any(|camera| camera["worker_pid"] == worker_pid)
     );
+    // With two cameras connected, a camera command must name one.
+    let unnamed = cmd(&dir, &["--json", "get", "Width"]);
+    assert_eq!(unnamed.status.code(), Some(2));
+    let error: Value = serde_json::from_slice(&unnamed.stdout).unwrap();
+    let message = error["error"]["message"].as_str().unwrap();
     assert!(
-        status["activity"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|activity| activity["operation"] == "capture" && activity["state"] == "succeeded")
+        message.contains("2 cameras connected (sim:other, sim:visible)"),
+        "{message}"
     );
 
     // A relative output given with an explicit session also lands beside
@@ -316,7 +318,7 @@ fn ambiguous_sessions_require_target_and_direct_bypasses_them() {
 
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
-fn session_recording_duration_stops_original_camera_after_selection_changes() {
+fn session_recording_duration_stops_its_camera_while_others_connect() {
     let dir = std::env::temp_dir().join(format!(
         "capturefab-duration-cli-{}-{}",
         std::process::id(),
@@ -370,7 +372,7 @@ fn session_recording_duration_stops_original_camera_after_selection_changes() {
             );
         }
         let state = json(&dir, &["--json", "--camera", "sim:recording", "status"]);
-        if state["forwarding"].is_string() {
+        if state["cameras"][0]["forwarding"].is_string() {
             break;
         }
         assert!(
@@ -379,7 +381,7 @@ fn session_recording_duration_stops_original_camera_after_selection_changes() {
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
-    json(&dir, &["--json", "select", "sim:other"]);
+    json(&dir, &["--json", "connect", "sim:third"]);
     let finished = recording.wait_with_output().unwrap();
     assert!(
         finished.status.success(),
@@ -390,7 +392,7 @@ fn session_recording_duration_stops_original_camera_after_selection_changes() {
     assert!(start.elapsed() >= std::time::Duration::from_secs(2));
     assert!(std::fs::metadata(output).unwrap().len() > 0);
     let state = json(&dir, &["--json", "status"]);
-    assert_eq!(state["active_camera"], "sim:other");
+    assert_eq!(state["cameras"].as_array().unwrap().len(), 3);
     assert!(
         state["cameras"]
             .as_array()
@@ -469,7 +471,7 @@ fn a_short_timed_recording_that_cannot_start_fails() {
 }
 
 #[test]
-fn network_scan_preserves_active_non_gige_streams_and_retains_report() {
+fn network_scan_preserves_active_non_gige_streams() {
     let dir = std::env::temp_dir().join(format!(
         "capturefab-network-ci-{}-{}",
         std::process::id(),
@@ -530,12 +532,9 @@ fn network_scan_preserves_active_non_gige_streams_and_retains_report() {
             && camera["tuning"].is_null()
     ));
     let after = json(&dir, &["--json", "--session", "network-ci", "status"]);
-    assert_eq!(after["network_scan"], *report);
-    assert_eq!(after["connected"]["id"], before["connected"]["id"]);
-    assert_eq!(
-        after["cameras"][0]["worker_pid"],
-        before["cameras"][0]["worker_pid"]
-    );
+    let (after, before) = (&after["cameras"][0], &before["cameras"][0]);
+    assert_eq!(after["info"]["id"], before["info"]["id"]);
+    assert_eq!(after["worker_pid"], before["worker_pid"]);
     assert_eq!(after["streaming"], true);
     assert!(after["frames"].as_u64().unwrap() >= before["frames"].as_u64().unwrap());
 }
@@ -585,8 +584,6 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
         vec!["--camera", "FiLe:", "capture", "-o", "unused.png"],
         vec!["connect", "sim:replay:"],
         vec!["connect", "file:"],
-        vec!["select", "sim:replay:"],
-        vec!["select", "file:"],
     ] {
         let result = cmd(&dir, &[&["--json"][..], args.as_slice()].concat());
         assert_eq!(
@@ -724,198 +721,6 @@ fn live_source_unavailability_keeps_its_operation_category() {
         let message = response["error"]["message"].as_str().unwrap();
         assert!(message.contains(hint), "{message}");
         assert!(!dir.exists());
-    }
-}
-
-#[test]
-fn undo_redo_camera_session_contract() {
-    let dir = std::env::temp_dir().join(format!(
-        "capturefab-history-test-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-        .env("CAPTUREFAB_SESSION_DIR", &dir)
-        .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .args(["--json", "serve", "--name", "history-ci"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut line)
-        .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&line).unwrap()["result"]["ready"],
-        true
-    );
-    let _fixture = Fixture {
-        child,
-        dir: dir.clone(),
-    };
-    let session = |args: &[&str]| {
-        json(
-            &dir,
-            &[&["--json", "--session", "history-ci"], args].concat(),
-        )
-    };
-    let camera = |id: &str, args: &[&str]| session(&[&["--camera", id], args].concat());
-    let rpc = |id: &str, request: Value| {
-        let mut process = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-            .env("CAPTUREFAB_SESSION_DIR", &dir)
-            .env("CAPTUREFAB_CACHE_DIR", test_cache())
-            .args(["--json", "--session", "history-ci", "--camera", id, "rpc"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        serde_json::to_writer(process.stdin.take().unwrap(), &request).unwrap();
-        let out = process.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-        serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone()
-    };
-    session(&["connect", "sim:0"]);
-    session(&["connect", "sim:1"]);
-    let original = camera("sim:0", &["get", "Width"])["features"][0]["value"].clone();
-    assert!(camera("sim:0", &["history"])["history"]["undo"].is_null());
-    let write = camera("sim:0", &["set", "Width=128"]);
-    assert_eq!(write["features"][0]["camera_change"]["camera"], "sim:0");
-    assert!(
-        write["features"][0]["camera_change"]["last_changed_at_us"]
-            .as_u64()
-            .unwrap()
-            > 0
-    );
-    camera("sim:1", &["set", "Width=256"]);
-    let status = session(&["status"]);
-    assert_eq!(status["active_camera"], "sim:1");
-    for id in ["sim:0", "sim:1"] {
-        assert_eq!(camera(id, &["history"])["history"]["undo"], "Set Width");
-        let reported = status["cameras"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|camera| camera["info"]["id"] == id)
-            .unwrap();
-        assert_eq!(reported["history"]["undo"], "Set Width");
-        if id == "sim:0" {
-            assert_eq!(
-                reported["history"]["entries"][0]["last_changed_at_us"],
-                write["features"][0]["camera_change"]["last_changed_at_us"]
-            );
-        }
-    }
-    let plain = cmd(
-        &dir,
-        &["--session", "history-ci", "--camera", "sim:0", "history"],
-    );
-    assert!(plain.status.success());
-    assert!(String::from_utf8_lossy(&plain.stdout).contains("Undo: Set Width"));
-    assert_eq!(camera("sim:0", &["undo"])["undone"], "Set Width");
-    assert_eq!(
-        camera("sim:0", &["get", "Width"])["features"][0]["value"],
-        original
-    );
-    assert_eq!(
-        camera("sim:1", &["get", "Width"])["features"][0]["value"],
-        256
-    );
-    assert_eq!(session(&["status"])["active_camera"], "sim:1");
-    let invalid = cmd(
-        &dir,
-        &[
-            "--json",
-            "--session",
-            "history-ci",
-            "--camera",
-            "sim:0",
-            "set",
-            "Width=0",
-        ],
-    );
-    assert!(!invalid.status.success());
-    assert_eq!(
-        camera("sim:0", &["history"])["history"]["redo"],
-        "Set Width"
-    );
-    assert_eq!(
-        rpc("sim:0", serde_json::json!({"op":"redo"}))["redone"],
-        "Set Width"
-    );
-    // Raw writes bypass history; replay must detect and retain the conflicting entry.
-    camera("sim:0", &["memory", "write", "0x100", "c0000000"]);
-    let conflict = cmd(
-        &dir,
-        &[
-            "--json",
-            "--session",
-            "history-ci",
-            "--camera",
-            "sim:0",
-            "undo",
-        ],
-    );
-    assert!(!conflict.status.success());
-    assert!(
-        serde_json::from_slice::<Value>(&conflict.stdout).unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("changed outside this history")
-    );
-    assert_eq!(
-        camera("sim:0", &["history"])["history"]["undo"],
-        "Set Width"
-    );
-    assert_eq!(
-        camera("sim:0", &["get", "Width"])["features"][0]["value"],
-        192
-    );
-    camera("sim:0", &["memory", "write", "0x100", "80000000"]);
-    rpc("sim:0", serde_json::json!({"op":"undo"}));
-    camera("sim:0", &["set", "Width=160"]);
-    assert!(camera("sim:0", &["history"])["history"]["redo"].is_null());
-    let no_redo = cmd(
-        &dir,
-        &[
-            "--json",
-            "--session",
-            "history-ci",
-            "--camera",
-            "sim:0",
-            "redo",
-        ],
-    );
-    assert!(!no_redo.status.success());
-    camera("sim:0", &["start"]);
-    assert_eq!(camera("sim:0", &["undo"])["undone"], "Start stream");
-    assert_eq!(camera("sim:0", &["status"])["streaming"], false);
-    camera("sim:0", &["redo"]);
-    assert_eq!(camera("sim:0", &["status"])["streaming"], true);
-    camera("sim:0", &["disconnect"]);
-    session(&["connect", "sim:0"]);
-    assert!(camera("sim:0", &["history"])["history"]["undo"].is_null());
-    assert_eq!(
-        camera("sim:1", &["history"])["history"]["undo"],
-        "Set Width"
-    );
-    for action in ["undo", "redo", "history"] {
-        let direct = cmd(&dir, &["--json", "--direct", "--camera", "sim:0", action]);
-        assert_eq!(direct.status.code(), Some(2));
-        assert!(
-            serde_json::from_slice::<Value>(&direct.stdout).unwrap()["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("--session")
-        );
     }
 }
 
@@ -1072,7 +877,8 @@ fn parallel_camera_workers_and_public_cli() {
         &dir,
         &["--json", "--session", "ci", "--camera", "sim:0", "status"],
     );
-    assert_eq!(targeted["connected"]["id"], "sim:0");
+    assert_eq!(targeted["cameras"].as_array().unwrap().len(), 1);
+    assert_eq!(targeted["cameras"][0]["info"]["id"], "sim:0");
     let sequence = dir.join("scheduled");
     let result = json(
         &dir,
@@ -1261,8 +1067,7 @@ fn auto_mode_session_contract() {
     };
     let session = |args: &[&str]| json(&dir, &[&["--json", "--session", "auto-ci"], args].concat());
     let status = session(&["status"]);
-    assert_eq!(status["auto"]["balance"], 0.5);
-    assert!(status["cameras"][0]["auto"].is_object());
+    assert_eq!(status["cameras"][0]["auto"]["balance"], 0.5);
     assert_eq!(
         session(&["auto", "--balance", "0.25"])["auto"]["balance"],
         0.25
@@ -1311,7 +1116,7 @@ fn auto_mode_session_contract() {
         );
         assert!(!invalid.status.success(), "{args:?}");
         assert_eq!(
-            session(&["status"])["auto"]["balance"],
+            session(&["status"])["cameras"][0]["auto"]["balance"],
             0.25,
             "invalid input changed auto mode: {args:?}"
         );
@@ -1322,7 +1127,7 @@ fn auto_mode_session_contract() {
         );
     }
     assert!(session(&["manual"])["auto"].is_null());
-    assert!(session(&["status"])["auto"].is_null());
+    assert!(session(&["status"])["cameras"][0]["auto"].is_null());
     let saved = dir.join("session.png");
     session(&[
         "capture",
@@ -1333,7 +1138,7 @@ fn auto_mode_session_contract() {
         saved.to_str().unwrap(),
     ]);
     assert!(saved.exists());
-    assert_eq!(session(&["status"])["auto"]["balance"], 0.0);
+    assert_eq!(session(&["status"])["cameras"][0]["auto"]["balance"], 0.0);
     let usage = cmd(
         &dir,
         &["--json", "--session", "auto-ci", "auto", "--balance", "2"],
@@ -1572,7 +1377,7 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
             ],
         );
         assert_eq!(
-            status["connected"]["profile"]["kind"], kind,
+            status["cameras"][0]["info"]["profile"]["kind"], kind,
             "profile lost after capture"
         );
     }
@@ -1722,7 +1527,7 @@ fn ring_files(dir: &PathBuf) -> Vec<PathBuf> {
 }
 
 #[test]
-fn viewerless_streams_report_no_losses_and_keep_frames_off_disk() {
+fn unread_streams_report_no_losses_and_keep_frames_off_disk() {
     let root = temp_root("ring-viewerless");
     let dir = root.join("sessions");
     std::fs::create_dir_all(&root).unwrap();
@@ -1741,7 +1546,7 @@ fn viewerless_streams_report_no_losses_and_keep_frames_off_disk() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "viewerless stream never produced enough frames: {status}"
+            "the stream never produced enough frames: {status}"
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
     };
@@ -1749,13 +1554,12 @@ fn viewerless_streams_report_no_losses_and_keep_frames_off_disk() {
     let frames = camera["frames"].as_u64().unwrap();
     let dropped = camera["dropped"].as_u64().unwrap();
     assert!(frames > 30, "{camera}");
-    // Frames nobody previewed were neither lost nor skipped.
+    // Frames nobody read were neither lost nor skipped.
     assert_eq!(
         (camera["lost"].as_u64(), camera["preview_skipped"].as_u64()),
         (Some(0), Some(0))
     );
     assert!(dropped * 10 < frames, "{dropped} dropped of {frames}");
-    assert_eq!(status["lost"], 0);
     let backing = json(&dir, &["--json", "doctor"])["ring_backing"].clone();
     if cfg!(target_os = "linux") {
         assert_eq!(backing, "memfd");
@@ -2042,7 +1846,7 @@ fn serve_finishes_a_recording_when_its_terminal_signals_the_process_group() {
         let start = std::time::Instant::now();
         loop {
             let status = json(&dir, &["--json", "--session", name, "status"]);
-            if status["forwarding"].is_string() && start.elapsed().as_secs() >= 1 {
+            if status["cameras"][0]["forwarding"].is_string() && start.elapsed().as_secs() >= 1 {
                 break;
             }
             assert!(start.elapsed().as_secs() < 10, "recording failed to start");
@@ -2120,7 +1924,7 @@ fn serve_finishes_a_recording_on_sigterm() {
     let start = std::time::Instant::now();
     loop {
         let status = json(&dir, &["--json", "--session", "rec", "status"]);
-        if status["forwarding"].is_string() && start.elapsed().as_secs() >= 1 {
+        if status["cameras"][0]["forwarding"].is_string() && start.elapsed().as_secs() >= 1 {
             break;
         }
         assert!(start.elapsed().as_secs() < 10, "recording failed to start");
@@ -2857,15 +2661,7 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
     assert_eq!(bytes.len() as u64, image["bytes"].as_u64().unwrap());
     assert!(capturefab::testing::jpeg::well_formed(&bytes, 256, 192));
     let status = session(&["status"]);
-    assert_eq!(status["streaming"], false);
-    assert!(
-        status["activity"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|entry| entry["operation"] != "frame"),
-        "inspections are observations"
-    );
+    assert_eq!(status["cameras"][0]["streaming"], false);
 
     session(&["start"]);
     let live = ok(r#"{"op":"frame","fresh":2,"max_dimension":0}"#);
@@ -2889,12 +2685,14 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
     assert_eq!(region["image"]["height"], 240);
     assert!(region["focus"]["tenengrad"].as_f64().unwrap() > 0.0);
 
-    // One undoable change; the next fresh frame shows it, and undo restores it.
+    // One grouped change; the next fresh frame shows it, and putting the
+    // values back restores the exposure.
+    let before = session(&["get", "ExposureTime", "Gain"]);
+    let value = |index: usize| before["features"][index]["value"].to_string();
     let changed = ok(
         r#"{"op":"set_many","values":[{"feature":"ExposureTime","value":"40000"},{"feature":"Gain","value":"0"}]}"#,
     );
     assert_eq!(changed["values"][0]["name"], "ExposureTime");
-    let token = changed["camera_change"]["token"].as_str().unwrap();
     let bright = ok(r#"{"op":"frame","max_dimension":0}"#);
     assert!(
         bright["exposure"]["highlights"].as_f64().unwrap() > 0.2,
@@ -2908,9 +2706,11 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
             .any(|note| note.as_str().unwrap().starts_with("highlights clipped")),
         "{bright}"
     );
-    ok(&format!(
-        r#"{{"op":"replay_camera_change","token":"{token}","undo":true}}"#
-    ));
+    session(&[
+        "set",
+        &format!("ExposureTime={}", value(0)),
+        &format!("Gain={}", value(1)),
+    ]);
     let restored = ok(r#"{"op":"frame","max_dimension":0}"#);
     assert!(
         (restored["exposure"]["mean"].as_f64().unwrap() - mean).abs() < 0.1,
@@ -2940,7 +2740,7 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
             .starts_with("no new frame from sim:0 within 200 ms (timed out)"),
         "{slow}"
     );
-    assert_eq!(session(&["status"])["streaming"], true);
+    assert_eq!(session(&["status"])["cameras"][0]["streaming"], true);
 }
 
 fn failure(out: &std::process::Output) -> Value {
@@ -3124,15 +2924,13 @@ fn connect_takes_a_camera_argument_or_flag_and_reads_like_prose() {
         ),
         "{text}"
     );
-    let selected = json(
-        &root,
-        &["--json", "--session", "conn", "select", "--camera", "sim:0"],
-    );
-    assert_eq!(selected["active_camera"], "sim:0");
-    let human = cmd(&root, &["--session", "conn", "select", "sim:1"]);
-    assert_eq!(
-        String::from_utf8_lossy(&human.stdout),
-        "CLI calls without --camera now use sim:1.\n"
+    // Several cameras: a camera command must name one.
+    let unnamed = cmd(&root, &["--session", "conn", "get", "Width"]);
+    assert_eq!(unnamed.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&unnamed.stderr).contains("choose one with --camera ID"),
+        "{}",
+        String::from_utf8_lossy(&unnamed.stderr)
     );
     // A session name typo points at the running session.
     let typo = cmd(&root, &["--json", "--session", "conx", "status"]);
@@ -3824,9 +3622,8 @@ fn login_add_saves_in_the_real_credential_store() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The printed restore and undo hints name the camera they were for, so
-/// running them as printed in a session with several cameras changes that
-/// camera and not the session's default.
+/// The printed restore hint names the camera it was for, so running it as
+/// printed in a session with several cameras changes that camera alone.
 #[test]
 fn setup_hints_name_the_camera_in_a_session_with_several() {
     let root = temp_root("setup-hints");
@@ -3888,20 +3685,10 @@ fn setup_hints_name_the_camera_in_a_session_with_several() {
         "capturefab --session setup-two --camera sim:0 setup apply bench"
     );
     on("sim:0", &["set", "Gain=9"]);
-    // sim:1 is now the session's active camera.
     on("sim:1", &["connect", "sim:1"]);
     on("sim:1", &["set", "Gain=4"]);
-    assert_eq!(
-        json(&dir, &["--json", "--session", "setup-two", "status"])["active_camera"],
-        "sim:1"
-    );
     let applied = run(&restore);
     assert_eq!((gain("sim:0"), gain("sim:1")), (3.0, 4.0), "{applied}");
-    let undo = hint(&applied, "Undo with:");
-    assert_eq!(undo, "capturefab --session setup-two --camera sim:0 undo");
-    on("sim:1", &["set", "Gain=5"]);
-    run(&undo);
-    assert_eq!((gain("sim:0"), gain("sim:1")), (9.0, 5.0));
 }
 
 /// Restoring a change outside the known image settings needs --yes, by name and from a
@@ -3986,14 +3773,10 @@ fn saved_setups_require_yes_for_disruptive_changes() {
     );
     assert!(!message.contains("setup diff line"), "{message}");
     assert_eq!(rate(), 500.0);
-    let history = on(&["history"]).to_string();
-    assert!(!history.contains("Restore setup line"), "{history}");
 
     let applied = on(&["setup", "apply", "line", "--yes"]);
-    assert_eq!(applied["camera_change"]["label"], "Restore setup line");
+    assert!(applied["applied"].as_u64().unwrap() > 0, "{applied}");
     assert_eq!(rate(), saved);
-    on(&["undo"]);
-    assert_eq!(rate(), 500.0);
 }
 
 /// Checks that need no running camera: a taken name is refused before the
@@ -4269,9 +4052,9 @@ fn unreadable_setups_list_and_delete_and_inline_setups_take_the_envelope() {
 }
 
 /// Save a simulator's settings, change them, preview and restore the setup
-/// in a session, undo it, and move it between files and RPC requests.
+/// in a session, and move it between files and RPC requests.
 #[test]
-fn saved_setups_restore_preview_and_undo_in_a_session() {
+fn saved_setups_restore_and_preview_in_a_session() {
     let root = temp_root("setups");
     let dir = root.join("sessions");
     let cwd = root.join("work");
@@ -4353,7 +4136,6 @@ fn saved_setups_restore_preview_and_undo_in_a_session() {
     assert_eq!(exposure(&session), 5000.0);
     let applied = session(&["setup", "apply", "bench"]);
     assert_eq!(applied["applied"], 1, "{applied}");
-    assert_eq!(applied["camera_change"]["label"], "Restore setup bench");
     assert_eq!(exposure(&session), 10000.0);
     // Nothing differs: the human output says so plainly.
     let human = |args: &[&str]| {
@@ -4375,7 +4157,7 @@ fn saved_setups_restore_preview_and_undo_in_a_session() {
         text.starts_with("sim:0 already matches bench; nothing was changed."),
         "{text}"
     );
-    session(&["undo"]);
+    session(&["set", "ExposureTime=5000"]);
     assert_eq!(exposure(&session), 5000.0);
     let text = human(&["setup", "diff", "bench"]);
     assert!(text.contains("ExposureTime: 5000 → 10000"), "{text}");

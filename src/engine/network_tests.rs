@@ -132,14 +132,13 @@ impl Harness {
         let (sender, _) = mpsc::sync_channel(32);
         let handle = WorkerHandle {
             sender,
-            state: Arc::new(RwLock::new(SessionSnapshot::default())),
+            state: Arc::new(RwLock::new(WorkerSnapshot::default())),
             counters: Arc::default(),
             frame: Arc::new(RwLock::new(None)),
             quitting: Arc::new(AtomicBool::new(false)),
             thread: Arc::new(Mutex::new(None)),
             ring: None,
             ring_note: Arc::default(),
-            history: Arc::default(),
             saved: Arc::default(),
             recording: Arc::default(),
             forward_clock: Arc::default(),

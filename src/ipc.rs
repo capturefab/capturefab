@@ -1,5 +1,5 @@
 //! Versioned newline-delimited JSON over loopback, with a private per-session bearer token.
-use crate::session::{ActivityOrigin, SessionActor, SessionCommand, SessionHandle};
+use crate::session::{SessionCommand, SessionHandle};
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -45,8 +45,6 @@ struct Request {
     token: String,
     #[serde(default)]
     camera: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    actor: Option<SessionActor>,
     #[serde(
         default,
         deserialize_with = "deserialize_optional_command",
@@ -66,14 +64,11 @@ fn deserialize_optional_command<'de, D: serde::Deserializer<'de>>(
 struct ClientSlot(Arc<AtomicUsize>);
 impl ClientSlot {
     fn acquire(clients: &Arc<AtomicUsize>) -> Option<Self> {
-        Self::acquire_limit(clients, MAX_CLIENTS)
-    }
-    fn acquire_limit(clients: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
         // Count first; the guard undoes the increment if over the limit. Unlike
         // a CAS loop this works on every supported toolchain.
         let previous = clients.fetch_add(1, Ordering::AcqRel);
         let slot = Self(clients.clone());
-        (previous < limit).then_some(slot)
+        (previous < MAX_CLIENTS).then_some(slot)
     }
 }
 impl Drop for ClientSlot {
@@ -82,8 +77,6 @@ impl Drop for ClientSlot {
     }
 }
 const MAX_CLIENTS: usize = 16;
-// Long polls must leave capacity for the actions they are waiting to observe.
-const MAX_OBSERVERS: usize = MAX_CLIENTS / 2;
 pub struct Server {
     pub name: String,
     path: PathBuf,
@@ -94,7 +87,6 @@ pub struct Server {
     // Keep the lock inode in place: unlinking it lets competing processes lock
     // different files and both claim the same name.
     _name_lock: fs::File,
-    _observers: Arc<AtomicUsize>,
 }
 
 /// Session descriptors and their locks, and files that matter only while
@@ -611,12 +603,7 @@ fn constant_eq(a: &str, b: &str) -> bool {
     }
     a.bytes().zip(b.bytes()).fold(0, |v, (x, y)| v | (x ^ y)) == 0
 }
-fn serve_client(
-    mut stream: TcpStream,
-    h: SessionHandle,
-    token: String,
-    observers: Arc<AtomicUsize>,
-) -> Result<()> {
+fn serve_client(mut stream: TcpStream, h: SessionHandle, token: String) -> Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -637,40 +624,21 @@ fn serve_client(
         );
         if request.probe {
             ensure!(
-                request.command.is_none() && request.camera.is_none() && request.actor.is_none(),
-                "session probes cannot include a command, camera or actor"
+                request.command.is_none() && request.camera.is_none(),
+                "session probes cannot include a command or camera"
             );
             return Ok(json!({"probe":true}));
         }
         let command = request.command.context("RPC request requires a command")?;
         command.validate()?;
-        let _observer = if matches!(&command, SessionCommand::Activity { after: Some(after), timeout_ms }
-            if *timeout_ms > 0 && *after == h.activity_revision())
-        {
-            Some(ClientSlot::acquire_limit(&observers, MAX_OBSERVERS)
-                .context("session activity observer queue is full (8 waiting clients); retry after an observer returns")?)
-        } else {
-            None
-        };
         ensure!(
             !matches!(&command,SessionCommand::Capture{output,..} if output=="-"),
             "remote captures require an output file"
         );
-        let actor = request.actor.unwrap_or_else(|| {
-            SessionActor::new(
-                format!(
-                    "ipc:{}",
-                    stream.peer_addr().map_or(0, |address| address.port())
-                ),
-                "CLI / API",
-                crate::session::ActorKind::Human,
-            )
-            .expect("valid anonymous RPC actor")
-        });
         if let Some(camera) = request.camera {
-            h.request_to_as(&camera, command, ActivityOrigin::Client, actor)
+            h.request_to(&camera, command)
         } else {
-            h.request_as(command, ActivityOrigin::Client, actor)
+            h.request(command)
         }
     })();
     let response = match result {
@@ -775,8 +743,6 @@ impl Server {
         let thread_stop = stop.clone();
         let server_token = token.clone();
         let clients = Arc::new(AtomicUsize::new(0));
-        let observers = Arc::new(AtomicUsize::new(0));
-        let thread_observers = observers.clone();
         // Accept blocks instead of polling; Drop wakes it with a loopback connect.
         let thread = std::thread::Builder::new()
             .name("capturefab-rpc".into())
@@ -805,12 +771,11 @@ impl Server {
                     };
                     let h = h.clone();
                     let token = server_token.clone();
-                    let observers = thread_observers.clone();
                     let spawned = std::thread::Builder::new()
                         .name("capturefab-rpc-client".into())
                         .spawn(move || {
                             let _slot = slot;
-                            let _ = serve_client(stream, h, token, observers);
+                            let _ = serve_client(stream, h, token);
                         });
                     if let Err(e) = spawned {
                         eprintln!("capturefab: rejected RPC client: {e}");
@@ -832,7 +797,6 @@ impl Server {
             stop,
             thread: Some(thread),
             _name_lock: name_lock,
-            _observers: observers,
         })
     }
 }
@@ -865,25 +829,7 @@ pub fn call_to(
     command: SessionCommand,
     timeout: Duration,
 ) -> Result<Value> {
-    call_to_as(
-        name,
-        camera,
-        command,
-        timeout,
-        Some(&SessionActor::process(ActivityOrigin::Client)),
-    )
-}
-pub fn call_to_as(
-    name: &str,
-    camera: Option<&str>,
-    command: SessionCommand,
-    timeout: Duration,
-    actor: Option<&SessionActor>,
-) -> Result<Value> {
     command.validate()?;
-    if let Some(actor) = actor {
-        actor.validate()?;
-    }
     ensure!(
         !matches!(&command, SessionCommand::Capture { output, .. } if output == "-"),
         "remote captures require an output file"
@@ -893,7 +839,7 @@ pub fn call_to_as(
     }
     ensure!(!timeout.is_zero(), "RPC timeout must be positive");
     let descriptor = read_descriptor(name)?;
-    send_request_as(&descriptor, camera, Some(command), false, timeout, actor)
+    send_request(&descriptor, camera, Some(command), false, timeout)
 }
 fn rpc_network_error(name: &str, phase: &str, error: std::io::Error) -> anyhow::Error {
     match error.kind() {
@@ -911,22 +857,11 @@ fn send_request(
     probe: bool,
     timeout: Duration,
 ) -> Result<Value> {
-    send_request_as(descriptor, camera, command, probe, timeout, None)
-}
-fn send_request_as(
-    descriptor: &Descriptor,
-    camera: Option<&str>,
-    command: Option<SessionCommand>,
-    probe: bool,
-    timeout: Duration,
-    actor: Option<&SessionActor>,
-) -> Result<Value> {
     let deadline = rpc_deadline(timeout)?;
     let request = serde_json::to_vec(&Request {
         version: VERSION,
         token: descriptor.token.clone(),
         camera: camera.map(str::to_owned),
-        actor: actor.cloned(),
         command,
         probe,
     })?;
@@ -1004,7 +939,7 @@ fn descriptors_in(dir: &Path) -> Result<Vec<Descriptor>> {
     Ok(descriptors)
 }
 /// Discover authenticated, responsive sessions without touching camera state
-/// or adding entries to their activity logs.
+/// or their logs.
 pub fn active_sessions() -> Result<Vec<Descriptor>> {
     Ok(descriptors_in(&runtime_dir())?
         .into_iter()
@@ -1291,7 +1226,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_probes_do_not_change_camera_state_or_activity() {
+    fn authenticated_probes_do_not_change_camera_state_or_logs() {
         let dir = TestDir::new();
         let handle = SessionHandle::new();
         let server =
@@ -1314,252 +1249,8 @@ mod tests {
         let snapshot = handle.snapshot();
         assert!(snapshot.logs.is_empty());
         assert!(snapshot.cameras.is_empty());
-        assert!(snapshot.last_error.is_none());
         drop(server);
         assert!(!descriptor_path_in(&dir.0, "desktop").unwrap().exists());
-        handle.shutdown();
-    }
-    #[test]
-    fn rpc_attributes_independent_participants_and_rejects_invalid_identity_before_queueing() {
-        let dir = TestDir::new();
-        let handle = SessionHandle::new();
-        let server =
-            Server::start_in(handle.clone(), "shared", SessionKind::Serve, &dir.0).unwrap();
-        let descriptor = read_descriptor_in(&dir.0, "shared").unwrap();
-        let actors = [
-            SessionActor::new("human:alice", "Alice", crate::session::ActorKind::Human).unwrap(),
-            SessionActor::new("agent:planner", "Planner", crate::session::ActorKind::Agent)
-                .unwrap(),
-        ];
-        let clients: Vec<_> = actors
-            .iter()
-            .map(|actor| {
-                let descriptor = descriptor.clone();
-                let actor = actor.clone();
-                std::thread::spawn(move || {
-                    send_request_as(
-                        &descriptor,
-                        Some("sim:0"),
-                        Some(SessionCommand::Start),
-                        false,
-                        Duration::from_secs(2),
-                        Some(&actor),
-                    )
-                })
-            })
-            .collect();
-        for client in clients {
-            assert!(client.join().unwrap().is_err());
-        }
-        let view = handle.activity();
-        assert_eq!(view.activity.len(), 2);
-        for actor in actors {
-            assert!(view.activity.iter().any(|entry| entry.actor == actor));
-        }
-        let revision = view.revision;
-        let invalid = SessionActor {
-            id: "invalid id".into(),
-            name: "Invalid".into(),
-            kind: crate::session::ActorKind::Agent,
-        };
-        let error = send_request_as(
-            &descriptor,
-            Some("sim:0"),
-            Some(SessionCommand::Start),
-            false,
-            Duration::from_secs(2),
-            Some(&invalid),
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("actor id must use"));
-        let status = send_request(
-            &descriptor,
-            None,
-            Some(SessionCommand::Status),
-            false,
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        assert_eq!(status["activity_revision"], revision);
-        assert_eq!(handle.activity().activity.len(), 2);
-        drop(server);
-        handle.shutdown();
-    }
-    #[test]
-    fn local_rpc_activity_observers_wait_for_changes_without_remote_http_or_camera() {
-        let dir = TestDir::new();
-        let handle = SessionHandle::new();
-        let server =
-            Server::start_in(handle.clone(), "shared", SessionKind::Serve, &dir.0).unwrap();
-        let descriptor = read_descriptor_in(&dir.0, "shared").unwrap();
-        let initial = send_request(
-            &descriptor,
-            None,
-            Some(SessionCommand::Activity {
-                after: None,
-                timeout_ms: 25_000,
-            }),
-            false,
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        assert_eq!(initial, json!({"revision":0,"activity":[]}));
-        let (started, ready) = std::sync::mpsc::channel();
-        let observers: Vec<_> = (0..2)
-            .map(|_| {
-                let descriptor = descriptor.clone();
-                let started = started.clone();
-                std::thread::spawn(move || {
-                    started.send(()).unwrap();
-                    send_request(
-                        &descriptor,
-                        Some("unconnected-camera"),
-                        Some(SessionCommand::Activity {
-                            after: Some(0),
-                            timeout_ms: 25_000,
-                        }),
-                        false,
-                        Duration::from_secs(2),
-                    )
-                    .unwrap()
-                })
-            })
-            .collect();
-        for _ in 0..2 {
-            ready.recv_timeout(Duration::from_secs(1)).unwrap();
-        }
-        let actor = SessionActor::new(
-            "agent:controller",
-            "Controller",
-            crate::session::ActorKind::Agent,
-        )
-        .unwrap();
-        assert!(
-            send_request_as(
-                &descriptor,
-                Some("sim:0"),
-                Some(SessionCommand::Start),
-                false,
-                Duration::from_secs(2),
-                Some(&actor)
-            )
-            .is_err()
-        );
-        for observer in observers {
-            let view = observer.join().unwrap();
-            assert!(view["revision"].as_u64().unwrap() > 0);
-            assert_eq!(view["activity"][0]["actor"]["id"], actor.id);
-        }
-        let revision = handle.activity_revision();
-        let started = Instant::now();
-        let unchanged = send_request(
-            &descriptor,
-            None,
-            Some(SessionCommand::Activity {
-                after: Some(revision),
-                timeout_ms: 20,
-            }),
-            false,
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        assert!(started.elapsed() >= Duration::from_millis(10));
-        assert_eq!(unchanged["revision"], revision);
-        assert_eq!(unchanged["activity"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            handle.activity().activity.len(),
-            1,
-            "long polling is read only"
-        );
-        drop(server);
-        handle.shutdown();
-    }
-    #[test]
-    fn waiting_observers_leave_room_for_actions_and_immediate_status() {
-        let dir = TestDir::new();
-        let handle = SessionHandle::new();
-        let server =
-            Server::start_in(handle.clone(), "shared", SessionKind::Serve, &dir.0).unwrap();
-        let descriptor = read_descriptor_in(&dir.0, "shared").unwrap();
-        let observers: Vec<_> = (0..MAX_OBSERVERS)
-            .map(|_| {
-                let descriptor = descriptor.clone();
-                std::thread::spawn(move || {
-                    send_request(
-                        &descriptor,
-                        None,
-                        Some(SessionCommand::Activity {
-                            after: Some(0),
-                            timeout_ms: 25_000,
-                        }),
-                        false,
-                        Duration::from_secs(3),
-                    )
-                })
-            })
-            .collect();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while server._observers.load(Ordering::Acquire) != MAX_OBSERVERS
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert_eq!(
-            server._observers.load(Ordering::Acquire),
-            MAX_OBSERVERS,
-            "all observer requests are now live"
-        );
-        let rejected = send_request(
-            &descriptor,
-            None,
-            Some(SessionCommand::Activity {
-                after: Some(0),
-                timeout_ms: 25_000,
-            }),
-            false,
-            Duration::from_secs(1),
-        )
-        .unwrap_err();
-        assert!(format!("{rejected:#}").contains("observer queue is full"));
-        let immediate = send_request(
-            &descriptor,
-            None,
-            Some(SessionCommand::Activity {
-                after: None,
-                timeout_ms: 0,
-            }),
-            false,
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert_eq!(immediate["revision"], 0);
-        let status = send_request(
-            &descriptor,
-            None,
-            Some(SessionCommand::Status),
-            false,
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert_eq!(status["activity_revision"], 0);
-        let action = send_request(
-            &descriptor,
-            Some("sim:0"),
-            Some(SessionCommand::Start),
-            false,
-            Duration::from_secs(1),
-        )
-        .unwrap_err();
-        assert!(
-            format!("{action:#}").contains("not connected"),
-            "the action reached the camera coordinator"
-        );
-        for observer in observers {
-            let view = observer.join().unwrap().unwrap();
-            assert!(view["revision"].as_u64().unwrap() > 0);
-            assert_eq!(view["activity"].as_array().unwrap().len(), 1);
-        }
-        drop(server);
         handle.shutdown();
     }
     #[test]
@@ -1724,7 +1415,7 @@ mod tests {
             let handle = SessionHandle::new();
             let server = std::thread::spawn({
                 let handle = handle.clone();
-                move || serve_client(stream, handle, "t".into(), Arc::new(AtomicUsize::new(0)))
+                move || serve_client(stream, handle, "t".into())
             });
             client.write_all(request.as_bytes()).unwrap();
             let response: Value =
@@ -1741,7 +1432,6 @@ mod tests {
             let snapshot = handle.snapshot();
             assert!(snapshot.logs.is_empty());
             assert!(snapshot.cameras.is_empty());
-            assert!(snapshot.last_error.is_none());
             handle.shutdown();
         }
     }
@@ -1771,7 +1461,7 @@ mod tests {
         let h = SessionHandle::new();
         let server = std::thread::spawn({
             let h = h.clone();
-            move || serve_client(stream, h, "t".into(), Arc::new(AtomicUsize::new(0)))
+            move || serve_client(stream, h, "t".into())
         });
         std::thread::sleep(Duration::from_millis(200));
         serde_json::to_writer(
@@ -1780,7 +1470,6 @@ mod tests {
                 version: VERSION,
                 token: "t".into(),
                 camera: None,
-                actor: None,
                 command: Some(SessionCommand::Jobs),
                 probe: false,
             },

@@ -200,8 +200,8 @@ pub(super) fn job_scheduled(job: &Value, camera: Option<&str>, session: &str) ->
 }
 
 /// The stderr line a local schedule prints as each frame is saved: `2/3
-/// saved · next in 1s`. Names wait for the final line, because frames the
-/// poller missed have none to show.
+/// saved · next in 1s`. Names wait for the final line, because frames a
+/// look at the job missed have none to show.
 pub(super) fn job_progress(job: &Value, now_ms: u64) -> String {
     let captured = job["captured"].as_u64().unwrap_or(0);
     let mut line = format!("{captured}/{} saved", job["count"].as_u64().unwrap_or(0));

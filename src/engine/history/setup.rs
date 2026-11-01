@@ -1,7 +1,7 @@
 //! Saved setups in the camera worker: reading one, comparing it with the
-//! camera, and restoring it inside one history checkpoint. The coordinator
-//! loads named setups; the worker checks the camera's identity and node
-//! kinds itself, so remote, workflow and RPC callers get the same checks.
+//! camera, and restoring it as one change that a failure rolls back. The
+//! coordinator loads named setups; the worker checks the camera's identity
+//! and node kinds itself, so CLI and RPC callers get the same checks.
 use super::*;
 use crate::genicam::Availability;
 use crate::setup::{
@@ -920,7 +920,7 @@ pub(super) fn extend_at(
     if let std::collections::btree_map::Entry::Vacant(entry) = before.values.entry(address.clone())
     {
         let value = read_at(camera, address)
-            .with_context(|| format!("read {} for undo", address.feature))?;
+            .with_context(|| format!("read {} for rollback", address.feature))?;
         entry.insert(value);
     }
     Ok(())
@@ -1238,7 +1238,7 @@ mod tests {
     }
 
     #[test]
-    fn a_simulator_setup_restores_as_one_undoable_change() {
+    fn a_simulator_setup_restores_and_previews_without_writing() {
         let h = connected("sim:0");
         let setup = saved(&h, "bench");
         let names = setup
@@ -1260,44 +1260,27 @@ mod tests {
         set(&h, "ExposureTime", "5000");
         set(&h, "Gain", "3");
         set(&h, "Width", "320");
-        let changed = [get(&h, "ExposureTime"), get(&h, "Gain"), get(&h, "Width")];
-        let entries = h.snapshot().history.entries.len();
         let preview = diff(&h, &setup).unwrap();
         assert_eq!(preview["changes"].as_array().unwrap().len(), 3, "{preview}");
         assert_eq!(preview["match"], "same_camera");
         assert_eq!(preview["risk"], "reversible");
         assert_eq!(preview["restarts_stream"], false);
-        // Previewing changes nothing and records nothing.
+        // Previewing changes nothing.
         assert_eq!(get(&h, "Width"), 320);
-        assert_eq!(h.snapshot().history.entries.len(), entries);
         let applied = apply(&h, &setup).unwrap();
         assert_eq!(applied["applied"], 3, "{applied}");
-        assert_eq!(applied["camera_change"]["label"], "Restore setup bench");
         assert_eq!(
             [get(&h, "ExposureTime"), get(&h, "Gain"), get(&h, "Width")],
             original
         );
-        let history = h.snapshot().history;
-        assert_eq!(history.entries.len(), entries + 1);
-        let entry = history.entries.last().unwrap();
-        assert_eq!(entry.kind, "apply_setup");
-        assert_eq!(entry.setting_changes, 3);
-        // Already matching: a second restore changes nothing and records nothing.
+        // Already matching: a second restore changes nothing.
         let again = apply(&h, &setup).unwrap();
         assert_eq!(again["applied"], 0);
-        assert!(again.get("camera_change").is_none());
-        h.request(SessionCommand::Undo).unwrap();
-        assert_eq!(
-            [get(&h, "ExposureTime"), get(&h, "Gain"), get(&h, "Width")],
-            changed
-        );
-        h.request(SessionCommand::Redo).unwrap();
-        assert_eq!(get(&h, "Width"), original[2]);
         h.shutdown();
     }
 
     #[test]
-    fn a_streaming_geometry_change_restarts_once_and_replays() {
+    fn a_streaming_geometry_change_restarts_the_stream_once() {
         let h = connected("sim:0");
         let setup = saved(&h, "bench");
         set(&h, "Width", "320");
@@ -1309,13 +1292,8 @@ mod tests {
         assert_eq!(applied["restarted_stream"], true, "{applied}");
         assert!(h.snapshot().streaming);
         assert_eq!(get(&h, "Width"), 640);
-        h.request(SessionCommand::Undo).unwrap();
-        assert!(h.snapshot().streaming);
-        assert_eq!(get(&h, "Width"), 320);
-        h.request(SessionCommand::Redo).unwrap();
-        assert_eq!(get(&h, "Width"), 640);
-        // A scheduled capture keeps the stream: no restart, nothing changes,
-        // and undoing the geometry is refused.
+        // A scheduled capture keeps the stream: no restart, and nothing
+        // changes.
         h.request(SessionCommand::Schedule {
             output: "setup-never-written.png".into(),
             count: 1,
@@ -1328,11 +1306,6 @@ mod tests {
             context: Default::default(),
         })
         .unwrap();
-        let undo = h.request(SessionCommand::Undo).unwrap_err();
-        assert!(
-            format!("{undo:#}").contains("cannot restore Width while recording"),
-            "{undo:#}"
-        );
         let mut narrow = setup.clone();
         for value in &mut narrow.values {
             if value.feature == "Width" {
@@ -1475,7 +1448,6 @@ mod tests {
                 .contains("restoring fails and puts every value back"),
             "{width}"
         );
-        let entries = h.snapshot().history.entries.len();
         let error = apply(&h, &setup).unwrap_err();
         assert!(
             format!("{error:#}").contains("could not restore setup values"),
@@ -1489,7 +1461,6 @@ mod tests {
         assert_eq!(get(&h, "Gain").as_f64(), Some(5.0));
         assert_eq!(get(&h, "ExposureTime").as_f64(), Some(7000.0));
         assert_eq!(get(&h, "Width"), 640);
-        assert_eq!(h.snapshot().history.entries.len(), entries);
         // A restore that stopped the stream says it started it again.
         set(&h, "Width", "320");
         h.request(SessionCommand::Start).unwrap();
@@ -1809,9 +1780,6 @@ mod tests {
         assert_eq!(applied["applied"], 3, "{applied}");
         assert_eq!(rig.gains(), (json!("Red"), json!(10), json!(11)));
         assert_eq!(rig.c().get("TriggerMode").unwrap(), "Off");
-        rig.run(SessionCommand::Undo).unwrap();
-        assert_eq!(rig.gains(), (json!("Red"), json!(40), json!(50)));
-        assert_eq!(rig.c().get("TriggerMode").unwrap(), "On");
         rig.h.shutdown();
     }
 
@@ -2134,9 +2102,6 @@ mod tests {
                 self.at("LineSelector", line, "LineSource"),
             )
         }
-        fn entries(&self) -> usize {
-            self.h.snapshot().history.entries.len()
-        }
     }
     fn saved_at<'a>(setup: &'a Setup, feature: &str, bank: &str) -> Option<&'a Scalar> {
         setup
@@ -2209,8 +2174,6 @@ mod tests {
             ("Output".into(), "ExposureActive".into())
         );
         assert_eq!(rig.c().get("LineSelector").unwrap(), "Line0");
-        rig.run(SessionCommand::Undo).unwrap();
-        assert_eq!(rig.line("Line1"), ("Output".into(), "Off".into()));
         rig.h.shutdown();
     }
 
@@ -2242,7 +2205,6 @@ mod tests {
             (&format["current"], &format["deferred"]),
             (&json!("Mono8"), &json!(true))
         );
-        let entries = rig.entries();
         // Strict too: nothing is missing once the earlier writes land.
         let applied = rig.apply_with(&setup, true, None).unwrap();
         assert_eq!(applied["not_applied"], json!([]), "{applied}");
@@ -2251,17 +2213,6 @@ mod tests {
             ("Output".into(), "ExposureActive".into())
         );
         assert_eq!(rig.c().get("ADCBitDepth").unwrap(), "Bit12");
-        assert_eq!(rig.c().get("PixelFormat").unwrap(), "Mono12");
-        assert_eq!(rig.entries(), entries + 1);
-        rig.run(SessionCommand::Undo).unwrap();
-        assert_eq!(rig.line("Line1"), ("Input".into(), "unavailable".into()));
-        assert_eq!(rig.c().get("ADCBitDepth").unwrap(), "Bit8");
-        assert_eq!(rig.c().get("PixelFormat").unwrap(), "Mono8");
-        rig.run(SessionCommand::Redo).unwrap();
-        assert_eq!(
-            rig.line("Line1"),
-            ("Output".into(), "ExposureActive".into())
-        );
         assert_eq!(rig.c().get("PixelFormat").unwrap(), "Mono12");
         rig.h.shutdown();
     }
@@ -2354,9 +2305,6 @@ mod tests {
         assert_eq!(rig.c().get("BinningHorizontal").unwrap(), 1);
         assert_eq!(rig.c().get("Width").unwrap(), 640);
         assert_eq!(applied["applied"], 2, "{applied}");
-        rig.run(SessionCommand::Undo).unwrap();
-        assert_eq!(rig.c().get("BinningHorizontal").unwrap(), 2);
-        assert_eq!(rig.c().get("Width").unwrap(), 640);
         rig.h.shutdown();
     }
 
@@ -2376,11 +2324,6 @@ mod tests {
         let applied = rig.apply_with(&setup, false, None).unwrap();
         assert_eq!(applied["restarted_stream"], true, "{applied}");
         assert!(rig.c().is_streaming());
-        assert_eq!(rig.c().get("DigitalShift").unwrap(), 0);
-        rig.run(SessionCommand::Undo).unwrap();
-        assert!(rig.c().is_streaming());
-        assert_eq!(rig.c().get("DigitalShift").unwrap(), 2);
-        rig.run(SessionCommand::Redo).unwrap();
         assert_eq!(rig.c().get("DigitalShift").unwrap(), 0);
         // A lock the setup itself releases needs no restart.
         rig.run(SessionCommand::Stop).unwrap();
@@ -2504,11 +2447,10 @@ mod tests {
         rig.c().set("BlackLevel", "7").unwrap();
         rig.c().set("BinningHorizontal", "2").unwrap();
         // The comparison reads BlackLevel this many times; the next read,
-        // for the undo checkpoint, fails.
+        // for the rollback checkpoint, fails.
         let before = wires.black_reads.load(std::sync::atomic::Ordering::SeqCst);
         rig.diff(&setup);
         let plan_reads = wires.black_reads.load(std::sync::atomic::Ordering::SeqCst) - before;
-        let entries = rig.entries();
         *wires.fail_black_after.lock().unwrap() =
             Some(wires.black_reads.load(std::sync::atomic::Ordering::SeqCst) + plan_reads);
         let error = rig.apply_with(&setup, false, None).unwrap_err();
@@ -2519,7 +2461,6 @@ mod tests {
         *wires.fail_black_after.lock().unwrap() = None;
         assert_eq!(rig.c().get("BlackLevel").unwrap(), 7);
         assert_eq!(rig.c().get("BinningHorizontal").unwrap(), 2);
-        assert_eq!(rig.entries(), entries);
         rig.h.shutdown();
     }
 
@@ -2618,7 +2559,7 @@ mod tests {
     }
 
     #[test]
-    fn undo_redo_and_rollback_arm_after_their_sources() {
+    fn a_rollback_arms_after_its_source() {
         let (mut rig, wires) = Rig::rich();
         // The last writes of the trigger source and mode.
         let order = |wires: &Wires| {
@@ -2632,16 +2573,6 @@ mod tests {
         let on = rig.save("on");
         rig.apply_with(&off, false, None).unwrap();
         rig.apply_with(&on, false, None).unwrap();
-        // Undo disarms: the mode turns off before the source changes.
-        wires.writes.lock().unwrap().clear();
-        rig.run(SessionCommand::Undo).unwrap();
-        let (source, mode) = order(&wires);
-        assert!(mode < source, "{:?}", wires.writes.lock().unwrap());
-        // Redo arms: the source is written before the mode turns on.
-        wires.writes.lock().unwrap().clear();
-        rig.run(SessionCommand::Redo).unwrap();
-        let (source, mode) = order(&wires);
-        assert!(source < mode, "{:?}", wires.writes.lock().unwrap());
         // A failed restore that disarmed re-arms after the source is back.
         let mut bad = off.clone();
         for value in &mut bad.values {

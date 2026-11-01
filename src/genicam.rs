@@ -333,8 +333,8 @@ impl NodeMap {
         self.nodes.get(name)?.prop("Unit")
     }
     /// Selectors that address a feature's value, including selectors hidden
-    /// behind register address expressions. Undo must read and write the
-    /// same selected bank even when the inspector has since selected another.
+    /// behind register address expressions. A rollback must read and write
+    /// the same selected bank even when another has since been selected.
     pub fn selectors(&self, name: &str) -> Vec<String> {
         let mut dependencies = BTreeSet::new();
         let mut pending = vec![name.to_owned()];

@@ -1,6 +1,6 @@
 //! Saved camera setups: a named, host-side snapshot of one camera's writable
 //! configuration values, kept in the state directory and restored later as
-//! one undoable camera change.
+//! one camera change that a failure rolls back.
 //!
 //! A setup never touches the camera's own user sets, and holds no address,
 //! credential or capture setting. Media sources keep only their transport
@@ -83,7 +83,8 @@ const MANAGED_CATEGORIES: [&str; 3] = [
 ];
 
 /// Features that change only how the image looks, frames or is sized:
-/// undo restores them, so writing them is a reversible change.
+/// restoring the earlier setup puts them back, so writing them is a
+/// reversible change.
 const IMAGE_QUALITY: [&str; 36] = [
     "ExposureTime",
     "ExposureTimeAbs",

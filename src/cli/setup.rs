@@ -31,7 +31,7 @@ pub enum SetupCommand {
         #[arg(long)]
         allow_other_model: bool,
     },
-    /// Restore a saved setup as one camera change that undo reverts
+    /// Restore a saved setup as one camera change; a failure puts every value back
     Apply {
         #[arg(required_unless_present = "file")]
         name: Option<String>,
@@ -207,17 +207,17 @@ fn other_model(client: &Client, setup: &Setup, allow_other_model: bool) -> Resul
         return Ok(None);
     }
     let status = client.call(SessionCommand::Status)?;
-    Ok(
-        serde_json::from_value::<crate::types::CameraInfo>(status["connected"].clone())
-            .ok()
-            .filter(|info| setups::matching(&setup.camera, info).0 == setups::Match::OtherModel)
-            .map(|info| {
-                setups::other_model_message(setup, &info).replace(
-                    "Pass allow_other_model (CLI: --allow-other-model)",
-                    "Pass --allow-other-model",
-                )
-            }),
+    Ok(serde_json::from_value::<crate::types::CameraInfo>(
+        super::status_camera(&status)["info"].clone(),
     )
+    .ok()
+    .filter(|info| setups::matching(&setup.camera, info).0 == setups::Match::OtherModel)
+    .map(|info| {
+        setups::other_model_message(setup, &info).replace(
+            "Pass allow_other_model (CLI: --allow-other-model)",
+            "Pass --allow-other-model",
+        )
+    }))
 }
 
 /// Refuse a setup from another model before asking the camera, as a usage
@@ -248,7 +248,7 @@ pub(super) fn run_camera(cli: &Cli, client: &Client, command: &SetupCommand) -> 
             let mut result = summary(&setup, &path);
             // The camera the restore hint names; the document holds no id.
             let status = client.call(SessionCommand::Status)?;
-            if let Some(id) = status["connected"]["id"].as_str() {
+            if let Some(id) = super::status_camera(&status)["info"]["id"].as_str() {
                 result["camera"] = json!({"id": crate::media::redact_url(id)});
             }
             Ok(result)
@@ -631,8 +631,8 @@ fn camera_label(camera: &Value) -> String {
     }
 }
 
-/// A restore's result: what changed, what did not apply, and the undo.
-fn write_applied(out: &mut impl Write, cli: &Cli, value: &Value) -> Result<()> {
+/// A restore's result: what changed and what did not apply.
+fn write_applied(out: &mut impl Write, value: &Value) -> Result<()> {
     let setup = value["setup"].as_str().unwrap_or_default();
     let camera = value["camera"]["id"].as_str().unwrap_or("the camera");
     let auto = (value["auto_changed"] == true)
@@ -699,15 +699,6 @@ fn write_applied(out: &mut impl Write, cli: &Cli, value: &Value) -> Result<()> {
     }
     if value["restarted_stream"] == true {
         writeln!(out, "  The stream was stopped and restarted.")?;
-    }
-    // Undo lives in the session; a direct worker exits with this command.
-    // It names the camera: the session's default camera may be another.
-    if value.get("camera_change").is_some() && cli.session.is_some() {
-        writeln!(
-            out,
-            "Undo with: capturefab {}undo",
-            target(cli, value["camera"]["id"].as_str())
-        )?;
     }
     Ok(())
 }
@@ -840,7 +831,7 @@ pub(super) fn print_human(cli: &Cli, command: &SetupCommand, value: &Value) -> R
         }
         SetupCommand::Diff { .. } => write_diff(&mut out, value, "Would change")?,
         SetupCommand::Apply { dry_run: true, .. } => write_diff(&mut out, value, "Would change")?,
-        SetupCommand::Apply { .. } => write_applied(&mut out, cli, value)?,
+        SetupCommand::Apply { .. } => write_applied(&mut out, value)?,
         SetupCommand::Delete { .. } => {
             writeln!(
                 out,
@@ -857,14 +848,14 @@ pub(super) fn print_human(cli: &Cli, command: &SetupCommand, value: &Value) -> R
 pub(super) fn extend_schema(contract: &mut Value) {
     contract["setup"] = json!({
         "cli":"setup save NAME [--note TEXT] [--replace] | list | show NAME | diff NAME [--file PATH] [--allow-other-model] | apply NAME [--file PATH] [--dry-run] [--strict] [--allow-other-model] [--yes] | delete NAME | import FILE [--name NAME] [--replace]; save, diff and apply need --camera or --session",
-        "purpose":"A setup is a named, host-side snapshot of one camera's writable configuration values. It is previewed as a diff against a connected camera and restored as one camera change with one undo token. Camera user sets are never read or written.",
+        "purpose":"A setup is a named, host-side snapshot of one camera's writable configuration values. It is previewed as a diff against a connected camera and restored as one camera change that a failure rolls back. Camera user sets are never read or written.",
         "store":{"dir":"setups/ in the state directory (setup list --json reports dir); one <lowercase name>.json per setup, private (0700 directory, 0600 files)","backup":"setup show NAME --json > FILE writes the document inside the --json envelope; setup import FILE and setup diff|apply --file FILE accept that file or the bare document (the envelope's result). An inline setup field (RPC) takes either form","unreadable":"setup list lists a file it cannot read, or one holding a setup named differently from its file, under its file name with status unreadable or newer_version and a reason, and no camera, date or values. A newer_version file needs a newer Capturefab: using or importing one exits 5 (unsupported). Using an unreadable one exits 3 (unavailable); setup delete NAME removes it without reading it","names":"1-64 ASCII letters, digits, '.', '-' and '_'; not starting or ending with '.'; not a reserved Windows device name such as con or nul; unique ignoring case"},
         "limits":{"bytes":crate::setup::MAX_SETUP_BYTES,"values":crate::setup::MAX_SETUP_VALUES,"setups":crate::setup::MAX_SETUPS,"note_chars":crate::setup::MAX_NOTE,"string_bytes":crate::setup::MAX_STRING,"selectors_per_value":crate::setup::MAX_BANKS},
         "document":{"version":1,"name":"bench","saved_at":"2026-10-25T14:03:11Z","note":"Ring light at 60%","camera":{"transport":"simulator","vendor":"Capturefab","model":"Pattern camera","serial":"SIM0","kind":"area_scan"},"auto":null,"values":[{"feature":"PixelFormat","value":"Mono8"},{"feature":"Width","value":640},{"feature":"Gain","value":2.5,"at":[{"selector":"GainSelector","value":"All"}]},{"feature":"ExposureTime","value":10000.0}],"skipped":[{"feature":"BalanceRatio","reason":"set by BalanceWhiteAuto = Continuous"}]},
         "captured":"Every writable configuration value at the selected bank, and every bank of GainSelector, BlackLevelSelector, BalanceRatioSelector, TriggerSelector, LineSelector, UserOutputSelector, CounterSelector and TimerSelector, including values unavailable at the selected bank (an output line's source while an input line is selected). Never: transport, network, stream-channel (DeviceStreamChannel*), user-set, file, chunk and event settings, commands, registers, DeviceUserID, values a firmware auto drives, values Capturefab auto exposure manages (auto records its balance instead), stream state, capture settings, credentials or addresses. Banks that cannot be read are listed in skipped; banks that are read-only or not available are listed only when another bank of the value was saved. Media sources store only transport and model.",
         "match":{"same_camera":"same vendor, model and serial; transport is ignored","same_model":"same vendor and model, another serial; applies with a warning","other_model":"apply is refused unless allow_other_model (CLI --allow-other-model); then only settings both cameras share change, and warnings names both models. CLI setup diff previews it anyway, with that note in warnings and a hint on stderr that its --allow-other-model leaves out","unknown_source":"a webcam, stream or file of the same kind; Capturefab cannot tell whether it is the same source; applies with a warning"},
         "diff":{"fields":["setup","digest","camera","match","warnings","changes[{feature,at?,saved,current,risk,stream_locked,deferred?,warning?}]","unchanged","matched[{feature,at?,value}]","not_applied[{feature,at?,status,saved,reason}]","risk","restarts_stream","blocked","auto_change{current,saved,action,risk}"],"warning":"a value outside the camera's current limits: unless an earlier change in this setup widens them, the restore fails and puts every value back, strict or not","deferred":"true for a value unavailable now (current null) that an earlier write in this setup should make available; it is written after the others, and moves to not_applied in the result if it stays unavailable","auto_change":"Capturefab auto exposure balance now and in the setup; action none, enter, balance or release; always reversible","stream_locked":"geometry and pixel format, or a value the camera locks (pIsLocked) while acquiring that no other change in this setup unlocks","status":["missing","read_only","invalid","skipped","refused"],"risk":"reversible when every change only affects the image (exposure, gain, white balance, ...) or selects another bank of a selector setups read bank by bank; disruptive otherwise, such as trigger and I/O line settings"},
-        "apply":{"result":"the diff fields plus applied (values changed, including matched values written again after an earlier write moved them), auto_changed, restarted_stream, auto and camera_change","order":"geometry and pixel format first; then switches that disarm (TriggerMode Off, LineMode Input, *Enable false); other modes; other values; switches that arm or drive (TriggerMode On, LineMode Output, *Enable true) after their sources; auto flags; selectors last. Up to 4 passes retry values an earlier write unlocked, made available or moved, then every saved value, changed or matched, is verified","failure":"any value that does not take within 4 passes or 90 s restores every captured value and fails with \"Restoring setup NAME failed; every value was put back\", adding whether a stopped stream was restarted; nothing is recorded in history","stream":"a running stream is stopped once and started again when the setup changes Width, Height, PixelFormat, binning, decimation, offsets, a video mode, or a value the camera locks while acquiring; refused while recording, forwarding or scheduled captures run","strict":"refuses, changing nothing, when any value is missing, read-only, invalid or refused, or when a deferred value stays unavailable; CLI --dry-run --strict fails the same way (exit 5) for values the diff already lists","digest":"apply_setup with digest refuses a setup changed since that digest was reviewed","confirmation":"The CLI refuses disruptive changes without --yes (exit 2, naming the setup diff and setup apply --yes commands for the same session, camera and --file), and sends the reviewed disruptive changes as confirmed_disruptive [{feature, at}]; the worker compares again and refuses (exit 2), changing nothing, a disruptive change at a feature and bank outside that list. A bare feature name confirms only a value without banks. RPC callers that omit confirmed_disruptive have no confirmation gate (as with set_many), but the model, kind and busy checks always apply."},
+        "apply":{"result":"the diff fields plus applied (values changed, including matched values written again after an earlier write moved them), auto_changed, restarted_stream and auto","order":"geometry and pixel format first; then switches that disarm (TriggerMode Off, LineMode Input, *Enable false); other modes; other values; switches that arm or drive (TriggerMode On, LineMode Output, *Enable true) after their sources; auto flags; selectors last. Up to 4 passes retry values an earlier write unlocked, made available or moved, then every saved value, changed or matched, is verified","failure":"any value that does not take within 4 passes or 90 s restores every captured value and fails with \"Restoring setup NAME failed; every value was put back\", adding whether a stopped stream was restarted","stream":"a running stream is stopped once and started again when the setup changes Width, Height, PixelFormat, binning, decimation, offsets, a video mode, or a value the camera locks while acquiring; refused while recording, forwarding or scheduled captures run","strict":"refuses, changing nothing, when any value is missing, read-only, invalid or refused, or when a deferred value stays unavailable; CLI --dry-run --strict fails the same way (exit 5) for values the diff already lists","digest":"apply_setup with digest refuses a setup changed since that digest was reviewed","confirmation":"The CLI refuses disruptive changes without --yes (exit 2, naming the setup diff and setup apply --yes commands for the same session, camera and --file), and sends the reviewed disruptive changes as confirmed_disruptive [{feature, at}]; the worker compares again and refuses (exit 2), changing nothing, a disruptive change at a feature and bank outside that list. A bare feature name confirms only a value without banks. RPC callers that omit confirmed_disruptive have no confirmation gate (as with set_many), but the model, kind and busy checks always apply."},
         "rpc":{"read_setup":"read-only, no arguments: the values a new setup would save","setup_diff":"read-only: {name} or {setup: DOCUMENT}, optional allow_other_model","apply_setup":"{name} or {setup: DOCUMENT}, optional digest, allow_other_model, strict, confirmed_disruptive: [FEATURE | {feature, at: [{selector, value}]}]"},
         "exit_codes":{"missing setup":3,"strict refusal (CLI --dry-run --strict)":5,"other model (CLI apply)":2,"other model (CLI diff)":0,"other model (RPC)":5,"disruptive without --yes":2,"disruptive change not in confirmed_disruptive":2,"name taken, invalid name or document":2,"blocked by recording, forwarding or schedules":3,"strict refusal":5,"setup changed since review":1,"restore failed (rolled back)":1}
     });
@@ -877,7 +868,7 @@ pub(super) fn extend_schema(contract: &mut Value) {
     }
     if let Some(writes) = contract["writes"].as_str() {
         contract["writes"] = json!(format!(
-            "{writes} apply_setup restores up to {} values as one camera change with one undo token; a failure restores every value, and stream-locked changes restart the stream once and are refused while recording, forwarding or scheduled captures run.",
+            "{writes} apply_setup restores up to {} values as one camera change: a failure restores every value, and stream-locked changes restart the stream once and are refused while recording, forwarding or scheduled captures run.",
             crate::setup::MAX_SETUP_VALUES
         ));
     }
@@ -930,14 +921,13 @@ mod tests {
         let mut out = Vec::new();
         write_applied(
             &mut out,
-            &session,
-            &json!({"setup":"bench","camera":{"id":"sim:0"},"applied":1,"unchanged":2,"camera_change":{"label":"Restore setup bench"}}),
+            &json!({"setup":"bench","camera":{"id":"sim:0"},"applied":1,"unchanged":2}),
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(
-            text.contains("Undo with: capturefab --session t --camera sim:0 undo"),
-            "{text}"
+        assert_eq!(
+            text,
+            "Restored bench on sim:0: 1 changed, 2 already matched.\n"
         );
     }
 
@@ -955,7 +945,7 @@ mod tests {
             "{text}"
         );
         let mut out = Vec::new();
-        write_applied(&mut out, &cli(&["setup", "apply", "line"]), &value).unwrap();
+        write_applied(&mut out, &value).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains("  Confirmed (not known image settings): AcquisitionLineRate 700 → 480"),
@@ -1045,7 +1035,7 @@ mod tests {
             "setup":"bench","camera":{"id":"sim:0"},"applied":0,"unchanged":3,"auto_changed":true,
             "auto_change":{"current":0.5,"saved":null,"action":"release","risk":"reversible"},
         });
-        write_applied(&mut out, &cli(&["setup", "apply", "bench"]), &applied).unwrap();
+        write_applied(&mut out, &applied).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.starts_with(

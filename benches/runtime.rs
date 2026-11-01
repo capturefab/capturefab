@@ -386,7 +386,7 @@ fn main() {
             println!("{large:<40} ledger {per_save:>7} bytes per save");
         }
     }
-    // Session snapshots, as views take them, with eight idle simulated
+    // Session snapshots, as status takes them, with eight idle simulated
     // cameras on real workers and a full session log.
     if b.selected("session/snapshot") {
         unsafe { std::env::set_var("CAPTUREFAB_EXECUTABLE", env!("CARGO_BIN_EXE_capturefab")) };
@@ -403,15 +403,9 @@ fn main() {
         }
         let snapshot = h.snapshot();
         println!(
-            "session/snapshot: {} cameras, {} features, {} log lines, {} activity entries",
+            "session/snapshot: {} cameras, {} log lines",
             snapshot.cameras.len(),
-            snapshot
-                .cameras
-                .iter()
-                .map(|c| c.features.len())
-                .sum::<usize>(),
-            snapshot.logs.len(),
-            snapshot.activity.len()
+            snapshot.logs.len()
         );
         b.run("session/snapshot/8-sim-cameras", 0, || h.snapshot());
         h.shutdown();

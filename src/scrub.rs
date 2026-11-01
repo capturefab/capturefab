@@ -5,7 +5,8 @@
 //! replies, CLI errors) has each registered literal replaced. Errors are
 //! worded without secrets in the first place; this only catches what a
 //! dependency might echo. URL credentials in errors and structured results
-//! are redacted by [`redact_error`] and [`redact_value`].
+//! are redacted by [`redact_error`] and [`redact_value`], and in free text
+//! such as log lines by [`redact_urls`].
 use serde_json::Value;
 use std::{
     borrow::Cow,
@@ -130,6 +131,40 @@ pub fn redact_error(message: &str, known: &Value) -> String {
     message
 }
 
+/// `text` with the credentials of every URL in it redacted, including in
+/// diagnostics that name several sources.
+pub fn redact_urls(text: &str) -> String {
+    text.split_inclusive(char::is_whitespace)
+        .map(|part| {
+            let body = part.trim_end_matches(char::is_whitespace);
+            let starts: Vec<_> = body
+                .match_indices("://")
+                .map(|(at, _)| {
+                    body[..at]
+                        .char_indices()
+                        .rev()
+                        .take_while(|(_, character)| {
+                            character.is_ascii_alphanumeric()
+                                || matches!(character, '+' | '-' | '.')
+                        })
+                        .last()
+                        .map_or(at, |(start, _)| start)
+                })
+                .collect();
+            if starts.is_empty() {
+                return part.to_owned();
+            }
+            let mut redacted = body[..starts[0]].to_owned();
+            for (index, start) in starts.iter().enumerate() {
+                let end = starts.get(index + 1).copied().unwrap_or(body.len());
+                redacted.push_str(&crate::media::redact_url(&body[*start..end]));
+            }
+            redacted.push_str(&part[body.len()..]);
+            redacted
+        })
+        .collect()
+}
+
 fn collect_strings(value: &Value, strings: &mut Vec<String>) {
     match value {
         Value::String(value) => strings.push(value.clone()),
@@ -200,6 +235,24 @@ mod tests {
         let mut scrubber = Scrubber::new();
         scrubber.register("éééé");
         assert_eq!(scrubber.scrub("ééééé"), "<redacted>");
+    }
+
+    #[test]
+    fn every_url_in_a_sentence_is_redacted_and_its_spacing_kept() {
+        let text = redact_urls(
+            "failed rtsp://user:password@one/live,rtsp://user:secret@two/live then srt://three?passphrase=secret next",
+        );
+        assert!(
+            !text.contains("password") && !text.contains("secret"),
+            "{text}"
+        );
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(text.starts_with("failed rtsp://"), "{text}");
+        assert!(
+            text.ends_with(" then srt://three?passphrase=<redacted> next"),
+            "{text}"
+        );
+        assert_eq!(redact_urls("no address here\n"), "no address here\n");
     }
 
     #[test]

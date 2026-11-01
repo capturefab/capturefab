@@ -1,4 +1,5 @@
-//! A single camera owner shared by the UI and authenticated local RPC clients.
+//! A single camera owner in a camera worker: one thread runs the camera's
+//! commands, captures, recordings and scheduled jobs.
 use crate::{
     auto::AutoController,
     camera::Camera,
@@ -18,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::session::{FeatureValue, ForwardingProgress, LogEntry, SessionCommand, SessionSnapshot};
+use crate::session::{FeatureValue, ForwardingProgress, LogEntry, SessionCommand, WorkerSnapshot};
 mod history;
 mod network_defaults;
 #[cfg(test)]
@@ -93,7 +94,7 @@ impl std::error::Error for ForwardChanged {}
 pub struct WorkerHandle {
     /// Commands for the camera thread; `None` only wakes it.
     sender: SyncSender<Option<Envelope>>,
-    state: Arc<RwLock<SessionSnapshot>>,
+    state: Arc<RwLock<WorkerSnapshot>>,
     counters: Arc<Counters>,
     frame: Arc<RwLock<Option<Frame>>>,
     quitting: Arc<AtomicBool>,
@@ -102,7 +103,6 @@ pub struct WorkerHandle {
     /// The shared-ring problem last logged, so one that every frame of a
     /// stream hits is logged once.
     ring_note: Arc<Mutex<Option<String>>>,
-    history: Arc<Mutex<history::Journal>>,
     /// Files saved since the coordinator last collected them.
     saved: Arc<Mutex<crate::engine::saved::SavedLog>>,
     /// The local recording in progress, reported when it stops.
@@ -137,14 +137,13 @@ impl WorkerHandle {
         let (sender, receiver) = mpsc::sync_channel(32);
         let handle = Self {
             sender,
-            state: Arc::new(RwLock::new(SessionSnapshot::default())),
+            state: Arc::new(RwLock::new(WorkerSnapshot::default())),
             counters: Arc::default(),
             frame: Arc::new(RwLock::new(None)),
             quitting: Arc::new(AtomicBool::new(false)),
             thread: Arc::new(Mutex::new(None)),
             ring,
             ring_note: Arc::default(),
-            history: Arc::default(),
             saved: Arc::default(),
             recording: Arc::default(),
             forward_clock: Arc::default(),
@@ -159,7 +158,7 @@ impl WorkerHandle {
         *handle.thread.lock().unwrap_or_else(|e| e.into_inner()) = Some(thread);
         handle
     }
-    pub fn snapshot(&self) -> SessionSnapshot {
+    pub fn snapshot(&self) -> WorkerSnapshot {
         let mut s = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
         s.frames = self.counters.frames.load(Ordering::Relaxed);
         s.received_bytes = self.counters.received_bytes.load(Ordering::Relaxed);
@@ -532,7 +531,7 @@ fn settle_auto(
 /// Write `values` in order, each as Set would: later values may depend on
 /// earlier ones (a selector, then the value it selects). `checkpoint` runs
 /// just before each write, with the bank that write changes selected, so
-/// camera history can record the value it replaces.
+/// the rollback checkpoint can record the value it replaces.
 fn set_many(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
@@ -583,11 +582,14 @@ fn set_many(
 }
 
 /// Add a line to the worker's log; an error also becomes its `last_error`.
-fn push_log(s: &mut SessionSnapshot, level: &str, message: String) {
+fn push_log(s: &mut WorkerSnapshot, level: &str, message: String) {
+    let entry = LogEntry::now(level, message);
     if level == "error" {
-        s.last_error = Some(message.clone());
+        s.last_error = Some(entry.message.clone());
+        s.error_logged_ms = Some(entry.unix_ms);
     }
-    s.logs.push(LogEntry::now_utc(level, message));
+    s.logs.push(entry);
+    s.logged += 1;
     if s.logs.len() > 200 {
         s.logs.remove(0);
     }
@@ -747,7 +749,7 @@ fn end_forward(
 }
 /// The requested length of a timed recording or forward whose end time has
 /// come at `now_ms` (UTC Unix milliseconds), or `None` while it should run on.
-fn forward_due(state: &SessionSnapshot, now_ms: u64) -> Option<u64> {
+fn forward_due(state: &WorkerSnapshot, now_ms: u64) -> Option<u64> {
     let until = state.forwarding_until_ms.filter(|until| now_ms >= *until)?;
     Some(until.saturating_sub(state.forwarding_since_ms.unwrap_or(until)))
 }
@@ -1103,13 +1105,9 @@ fn process_plain(
         SessionCommand::ReadSetup
         | SessionCommand::SetupDiff { .. }
         | SessionCommand::ApplySetup { .. } => {
-            anyhow::bail!("saved setups are handled by camera history")
+            anyhow::bail!("saved setups are read and restored before plain commands")
         }
-        SessionCommand::Undo | SessionCommand::Redo | SessionCommand::ReplayCameraChange { .. } => {
-            anyhow::bail!("history commands must be handled by the camera journal")
-        }
-        SessionCommand::Select { .. } => anyhow::bail!("selection belongs to the coordinator"),
-        SessionCommand::Activity { .. } => anyhow::bail!("activity belongs to the coordinator"),
+        SessionCommand::Discover { .. } => anyhow::bail!("discovery belongs to the coordinator"),
         SessionCommand::NetworkScan { .. } => {
             anyhow::bail!("network scan belongs to the coordinator")
         }
@@ -1256,18 +1254,6 @@ fn process_plain(
             let stats = stop_forward(h, forwarder, auto)?;
             Ok(json!({"forwarding":null,"stats":stats}))
         }
-        SessionCommand::Discover {
-            timeout_ms,
-            simulated,
-        } => {
-            let (devices, warnings) = crate::camera::discover(timeout(timeout_ms)?, simulated)?;
-            h.state.write().unwrap_or_else(|e| e.into_inner()).devices = devices.clone();
-            for w in &warnings {
-                h.log("warn", w.clone());
-            }
-            h.log("info", format!("Discovered {} camera(s)", devices.len()));
-            Ok(json!({"devices":devices,"warnings":warnings}))
-        }
         SessionCommand::Connect {
             camera: selector,
             timeout_ms,
@@ -1279,11 +1265,9 @@ fn process_plain(
                 "a camera is already connected; disconnect first"
             );
             let duration = timeout(timeout_ms)?;
-            let mut known = h.snapshot().devices;
-            if !known
-                .iter()
-                .any(|d| d.id == selector || d.serial == selector)
-                && !selector.starts_with("sim:")
+            // Each worker opens one camera, so it has discovered nothing yet.
+            let mut known = Vec::new();
+            if !selector.starts_with("sim:")
                 && !crate::media::is_source(&selector)
                 && !crate::onvif::is_source(&selector)
                 && !crate::camera::needs_no_discovery(&selector)
@@ -1297,7 +1281,6 @@ fn process_plain(
                 for w in warnings {
                     h.log("warn", w);
                 }
-                h.state.write().unwrap_or_else(|e| e.into_inner()).devices = known.clone();
             }
             if !crate::camera::is_explicit_selector(&selector)
                 && let crate::camera::Resolution::Loose { info, matched_on } =
@@ -1437,7 +1420,7 @@ fn process_plain(
             }
             Ok(reply)
         }
-        // Camera history checkpoints each write; see `set_many`.
+        // The rollback checkpoint records each write; see `set_many`.
         SessionCommand::SetMany { values } => set_many(h, camera, auto, &values, |_, _| Ok(())),
         SessionCommand::Execute { feature } => {
             if auto.is_some() && matches!(feature.as_str(), "UserSetLoad" | "UserSetDefault") {
@@ -3013,7 +2996,7 @@ mod tests {
     #[test]
     fn timed_forwards_keep_their_end_time_until_stopped() {
         // The deadline falls due at its end time, never before.
-        let state = |since, until| SessionSnapshot {
+        let state = |since, until| WorkerSnapshot {
             forwarding: Some("clip.mkv".into()),
             forwarding_since_ms: since,
             forwarding_until_ms: until,
@@ -3893,52 +3876,6 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn undo_restarts_a_stream_whose_transport_layer_lock_holds_the_feature() {
-        use crate::camera::tests::{BASLER_ACQUISITION, Device, TL_PARAMS_LOCKED, device_camera};
-        // TLParamsLocked is listed with the transport layer features, as on
-        // Basler and FLIR cameras; ReverseX is locked by it, Width is also
-        // geometry.
-        let device = Device::new(&format!(
-            r#"{TL_PARAMS_LOCKED}{BASLER_ACQUISITION}<Category Name="Fixture"><pFeature>TLParamsLocked</pFeature><pFeature>Width</pFeature><pFeature>ReverseX</pFeature></Category><Integer Name="Width"><pIsLocked>TLParamsLocked</pIsLocked><Value>640</Value><Min>16</Min><Max>1024</Max><Inc>16</Inc></Integer><Boolean Name="ReverseX"><pIsLocked>ReverseXLocked</pIsLocked><Value>0</Value><OnValue>1</OnValue><OffValue>0</OffValue></Boolean><IntSwissKnife Name="ReverseXLocked"><pVariable Name="TLP">TLParamsLocked</pVariable><Formula>TLP</Formula></IntSwissKnife>"#
-        ));
-        let mut camera = Some(device_camera(device));
-        let h = WorkerHandle::new();
-        let set = |feature: &str, value: &str| SessionCommand::Set {
-            feature: feature.into(),
-            value: value.into(),
-        };
-        let get =
-            |camera: &mut Option<Camera>, name: &str| camera.as_mut().unwrap().get(name).unwrap();
-        // A grouped write records every configuration value.
-        run_command(
-            &h,
-            &mut camera,
-            SessionCommand::SetMany {
-                values: vec![crate::session::FeatureValue {
-                    feature: "Width".into(),
-                    value: "320".into(),
-                }],
-            },
-        )
-        .unwrap();
-        run_command(&h, &mut camera, set("ReverseX", "true")).unwrap();
-        // Started outside the history, as a capture or schedule may leave it.
-        camera.as_mut().unwrap().start().unwrap();
-        assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
-        // The lock is acquisition state, never a value to set or restore.
-        //TMP
-        assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
-        run_command(&h, &mut camera, SessionCommand::Undo).unwrap();
-        assert_eq!(get(&mut camera, "ReverseX"), false);
-        run_command(&h, &mut camera, SessionCommand::Undo).unwrap();
-        assert_eq!(get(&mut camera, "Width"), 640);
-        assert!(camera.as_ref().unwrap().is_streaming());
-        assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
-        run_command(&h, &mut camera, SessionCommand::Stop).unwrap();
-        assert_eq!(get(&mut camera, "TLParamsLocked"), 0);
-        h.shutdown();
-    }
-    #[test]
     fn a_busy_ledger_retries_the_shot_and_other_failures_stop_the_job() {
         let h = WorkerHandle::new();
         let dir = temp_dir("retry");
@@ -4114,22 +4051,16 @@ mod tests {
         let backing_files = std::fs::read_dir(&dir).unwrap().count();
         let h = WorkerHandle::with_ring(Arc::new(Mutex::new(ring)));
         connect(&h, "1000");
-        let history = h.snapshot().history.entries.len();
+        let logged = h.snapshot().logged;
         assert!(!h.snapshot().streaming);
         let grabbed = grab(&h);
         assert_eq!(grabbed["frame"]["width"], 128);
         assert!(grabbed.get("auto_settled").is_none(), "{grabbed}");
-        assert!(grabbed.get("files").is_none() && grabbed.get("camera_change").is_none());
+        assert!(grabbed.get("files").is_none());
         let snapshot = h.snapshot();
         assert!(!snapshot.streaming);
         assert_eq!(snapshot.frames, 1);
-        assert_eq!(snapshot.history.entries.len(), history);
-        assert!(
-            !snapshot
-                .logs
-                .iter()
-                .any(|entry| entry.message.starts_with("Captured"))
-        );
+        assert_eq!(snapshot.logged, logged, "a grab logs nothing");
         // Exactly one frame reached the ring, and nothing else was written.
         assert_eq!(reader.sequence(), 1);
         let frame = reader.take_latest().unwrap().unwrap();
@@ -4173,17 +4104,26 @@ mod tests {
         assert!(h.request(SessionCommand::Grab { timeout_ms: 10 }).is_err());
         let snapshot = h.snapshot();
         assert_eq!(snapshot.logs.len(), logs);
-        assert!(snapshot.last_error.is_none());
-        // Other failures are still the worker's to log.
-        assert!(
+        assert!(snapshot.last_error.is_none() && snapshot.error_logged_ms.is_none());
+        // Other failures are still the worker's to log, each with its time.
+        let get = || {
             h.request(SessionCommand::Get {
-                feature: "Width".into()
+                feature: "Width".into(),
             })
-            .is_err()
+        };
+        assert!(get().is_err());
+        let first = h.snapshot();
+        assert_eq!(
+            (first.logs.len(), first.logged),
+            (logs + 1, logs as u64 + 1)
         );
-        let snapshot = h.snapshot();
-        assert_eq!(snapshot.logs.len(), logs + 1);
-        assert!(snapshot.last_error.unwrap().contains("no camera connected"));
+        assert!(first.last_error.unwrap().contains("no camera connected"));
+        let logged_ms = first.error_logged_ms.unwrap();
+        assert_eq!(logged_ms, first.logs.last().unwrap().unix_ms);
+        // The same error again is told apart by its time.
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(get().is_err());
+        assert!(h.snapshot().error_logged_ms.unwrap() > logged_ms);
         h.shutdown();
     }
     #[test]
