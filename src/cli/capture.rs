@@ -242,7 +242,9 @@ impl Plan {
         };
         if plan.output != "-" {
             crate::engine::check_capture_name(&plan.output, count, format)?;
-            plan.request(args, None).validate().map_err(super::input)?;
+            plan.request(args, None, None)
+                .validate()
+                .map_err(super::input)?;
             crate::engine::preflight_capture_output(&plan.output, count, format, args.on_exists)
                 .map_err(exists_hint)?;
         }
@@ -250,13 +252,20 @@ impl Plan {
     }
     /// The job request for one camera; a capture this command waits for
     /// holds a lease, so the session stops it if this command goes away.
-    fn request(&self, args: &CaptureArgs, quality: Option<u8>) -> SessionCommand {
+    fn request(
+        &self,
+        args: &CaptureArgs,
+        quality: Option<u8>,
+        first_at_ms: Option<u64>,
+    ) -> SessionCommand {
         SessionCommand::Schedule {
             output: self.output.clone(),
             count: self.count,
             timeout_ms: self.timeout_ms,
             format: self.format.into(),
-            first_at_ms: self.first_at_ms.unwrap_or_else(crate::scheduling::now_ms),
+            first_at_ms: first_at_ms
+                .or(self.first_at_ms)
+                .unwrap_or_else(crate::scheduling::now_ms),
             interval_ms: self.interval_ms,
             on_exists: args.on_exists,
             manifest: self.manifest.clone(),
@@ -368,6 +377,28 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
     };
     let results = if cameras.len() == 1 {
         vec![each(cameras[0])]
+    } else if !args.dry_run && !args.background {
+        let ready = std::sync::Barrier::new(cameras.len());
+        let start = std::sync::OnceLock::new();
+        std::thread::scope(|scope| {
+            let threads = cameras
+                .iter()
+                .map(|camera| {
+                    let (args, plan, ready, start) = (&args, &plan, &ready, &start);
+                    scope.spawn(move || {
+                        shoot_together(*camera, global, route, args, plan, ready, start)
+                    })
+                })
+                .collect::<Vec<_>>();
+            threads
+                .into_iter()
+                .map(|thread| {
+                    thread
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("capture thread failed")))
+                })
+                .collect()
+        })
     } else {
         std::thread::scope(|scope| {
             let threads = cameras
@@ -445,8 +476,30 @@ fn combine(results: Vec<Result<Value>>, cameras: &[Option<&str>]) -> Result<Valu
         None if shown.iter().all(|value| value.get("job").is_some()) => Ok(json!({
             "jobs": shown.into_iter().map(|value| value["job"].clone()).collect::<Vec<_>>()
         })),
-        None => Ok(json!({ "cameras": shown })),
+        None => {
+            let mut value = json!({ "cameras": shown });
+            if let Some(skew) = skew_ms(&value["cameras"]) {
+                value["skew_ms"] = json!(skew);
+            }
+            Ok(value)
+        }
     }
+}
+
+/// How far apart the cameras' first frames arrived, in milliseconds, by
+/// the host's clock.
+fn skew_ms(cameras: &Value) -> Option<u64> {
+    let times = cameras
+        .as_array()?
+        .iter()
+        .map(|camera| {
+            chrono::DateTime::parse_from_rfc3339(camera["time"].as_str()?)
+                .ok()
+                .map(|time| time.timestamp_millis())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (first, last) = (times.iter().min()?, times.iter().max()?);
+    u64::try_from(last - first).ok()
 }
 
 /// Change settings and settle exposure, as asked, before frames are taken.
@@ -477,7 +530,63 @@ const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 /// Run the capture job on one camera and wait for it, or leave it running.
 fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
     prepare(client, args, plan)?;
-    let reply = client.call(plan.request(args, args.quality))?;
+    run_job(client, args, plan, None)
+}
+
+/// How long after every camera of a capture is armed their first frames
+/// are due: time to send each its job.
+const SYNC_LEAD_MS: u64 = 300;
+
+/// Capture from one of several cameras together: connected, set and
+/// streaming (warmed up) like the others before any takes a frame, then
+/// each takes its first frame at or after the same moment. Every camera's
+/// thread reaches `ready` whatever happens to it, so none waits for ever.
+fn shoot_together(
+    camera: Option<&str>,
+    global: &Global,
+    route: Route,
+    args: &CaptureArgs,
+    plan: &Plan,
+    ready: &std::sync::Barrier,
+    start: &std::sync::OnceLock<u64>,
+) -> Result<Value> {
+    let armed = Client::open_with(global, camera, route).and_then(|client| {
+        prepare(&client, args, plan)?;
+        let arm = client.call(SessionCommand::Arm {
+            warmup_ms: Some(plan.warmup_ms),
+        })?;
+        Ok((client, arm))
+    });
+    ready.wait();
+    let (client, arm) = armed?;
+    let first_at = plan
+        .first_at_ms
+        .unwrap_or_else(|| *start.get_or_init(|| crate::scheduling::now_ms() + SYNC_LEAD_MS));
+    let mut result = run_job(&client, args, plan, Some(first_at));
+    // A camera armed for this streams no longer, unless it has work.
+    if arm["started"] == true {
+        let camera = client.status()?;
+        let busy = camera["forwarding"].is_string()
+            || jobs::of_camera(&camera).iter().any(|job| !jobs::ended(job));
+        if !busy {
+            client.call(SessionCommand::Stop)?;
+        }
+    }
+    if let Ok(value) = &mut result {
+        freshness(value, &arm);
+    }
+    result
+}
+
+/// Run the capture job on one camera, its first frame at `first_at_ms` or
+/// as planned, and wait for it, or leave it running.
+fn run_job(
+    client: &Client,
+    args: &CaptureArgs,
+    plan: &Plan,
+    first_at_ms: Option<u64>,
+) -> Result<Value> {
+    let reply = client.call(plan.request(args, args.quality, first_at_ms))?;
     let id = reply["job"]["id"]
         .as_str()
         .context("capture job without ID")?
@@ -1063,6 +1172,10 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("duration_s", "float — first to last frame, for several"),
     ("output", "\"-\" — with -o -: the image went to stdout"),
     ("bytes", "int — with -o -: the image's size"),
+    (
+        "skew_ms",
+        "int — with -c repeated: how far apart the cameras' first frames arrived; all were armed first and asked for a frame at the same moment",
+    ),
     (
         "cameras",
         "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,warnings?,inspect?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",

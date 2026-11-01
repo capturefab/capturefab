@@ -80,6 +80,14 @@ pub enum SessionCommand {
     },
     Start,
     Stop,
+    /// Start acquisition, as before a capture of several cameras together,
+    /// warming up a camera that sets its own exposure; the stream runs on
+    /// until stopped.
+    Arm {
+        /// The longest warm-up, in milliseconds; 2 s when unset.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warmup_ms: Option<u64>,
+    },
     /// Read the camera's writable configuration values for a new saved
     /// setup. Read-only: selectors are switched only to read and restored.
     ReadSetup,
@@ -625,6 +633,7 @@ impl SessionCommand {
                     ensure!(*job != Some(0), "capture job ID must be positive");
                 }
             }
+            Self::Arm { warmup_ms } => validate_warmup(*warmup_ms)?,
             Self::Wait {
                 job, timeout_ms, ..
             } => {

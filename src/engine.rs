@@ -2127,6 +2127,23 @@ fn process_plain(
             h.log("info", "Acquisition started".into());
             Ok(json!({"streaming":true}))
         }
+        SessionCommand::Arm { warmup_ms } => {
+            let c = camera_mut(camera)?;
+            let was_streaming = c.is_streaming();
+            c.start()?;
+            let warmup = if was_streaming {
+                None
+            } else {
+                warm_up(h, c, auto, warmup_ms)?
+            };
+            refresh(h, camera, false);
+            let mut value = json!({"streaming": true, "started": !was_streaming});
+            if let Some(warmup) = warmup {
+                value["warmup_ms"] = json!(warmup.ms);
+                value["settled"] = json!(warmup.settled);
+            }
+            Ok(value)
+        }
         SessionCommand::Stop => {
             cancel_jobs(jobs, "cancelled");
             sync_jobs(h, jobs);

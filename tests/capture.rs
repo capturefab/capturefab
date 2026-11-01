@@ -230,6 +230,12 @@ fn several_cameras_capture_at_once() {
     assert_eq!(cameras.len(), 2);
     assert_eq!(cameras[0]["camera"], "sim:0");
     assert_eq!(cameras[1]["camera"], "sim:1");
+    // Both were streaming before either was asked for a frame, at the same
+    // moment: their first frames are less than a frame period apart.
+    assert!(both["skew_ms"].as_u64().unwrap() < 40, "{both}");
+    for camera in cameras {
+        assert!(camera["device_ts_ns"].is_u64(), "{camera}");
+    }
     let one_file = home.fails(
         2,
         &["capture", "-c", "sim:0", "-c", "sim:1", "-o", "same.png"],

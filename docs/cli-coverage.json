@@ -57,6 +57,7 @@
     "exec": "reference.html#rpc-exec",
     "start": "reference.html#rpc-start",
     "stop": "reference.html#rpc-stop",
+    "arm": "reference.html#rpc-arm",
     "read_setup": "reference.html#rpc-read-setup",
     "setup_diff": "reference.html#rpc-setup-diff",
     "apply_setup": "reference.html#rpc-apply-setup",

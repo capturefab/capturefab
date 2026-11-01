@@ -305,7 +305,10 @@ fn auto_meters_a_region_and_keeps_exposure_short_when_asked() {
         "10s",
     ]);
     assert_eq!(capped["by"], "capturefab", "{capped}");
-    assert!(capped["exposure_us"].as_f64().unwrap() <= 3000.0, "{capped}");
+    assert!(
+        capped["exposure_us"].as_f64().unwrap() <= 3000.0,
+        "{capped}"
+    );
     assert!(capped["gain_db"].as_f64().unwrap() > 0.0, "{capped}");
     assert_eq!(capped["settled"], true, "{capped}");
     // Without limits the camera's own auto exposure runs once.
