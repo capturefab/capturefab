@@ -22,11 +22,29 @@ fn a_session_starts_answers_and_stops() {
     assert_eq!(again["started"], false);
     assert_eq!(again["pid"], pid);
     assert_eq!(again["cameras"], json!(["sim:0", "sim:1"]));
+    // --live on a running session starts the cameras it names streaming.
+    home.ok(&[
+        "session", "start", "--name", "bench", "-c", "sim:2", "--live",
+    ]);
+    let states = home.ok(&["session", "status", "bench"])["cameras"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|camera| (camera["id"].clone(), camera["state"].clone()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        states,
+        [
+            (json!("sim:0"), json!("idle")),
+            (json!("sim:1"), json!("idle")),
+            (json!("sim:2"), json!("streaming"))
+        ]
+    );
     let list = home.ok(&["session", "list"]);
     assert_eq!(list["sessions"][0]["session"], "bench");
     let status = home.ok(&["session", "status", "bench"]);
     assert_eq!(status["pid"], pid);
-    assert_eq!(status["cameras"].as_array().unwrap().len(), 2);
+    assert_eq!(status["cameras"].as_array().unwrap().len(), 3);
     // Commands find it by the camera it holds; its settings persist.
     home.ok(&["set", "-c", "sim:1", "Width=320"]);
     assert_eq!(
@@ -203,7 +221,8 @@ fn background_jobs_run_on_and_can_be_waited_for_or_stopped() {
     for id in &ids {
         assert_eq!(home.ok(&["jobs", "wait", id])["job"]["saved"], 1);
     }
-    // A failed job reports its own reason.
+    // A job that cannot take its first frame fails the command that
+    // started it, with its own reason; it stays listed as failed.
     home.ok(&[
         "set",
         "-c",
@@ -211,20 +230,31 @@ fn background_jobs_run_on_and_can_be_waited_for_or_stopped() {
         "TriggerMode=On",
         "TriggerSource=Line1",
     ]);
-    let triggered = home.ok(&[
-        "capture",
-        "-c",
-        "sim:0",
-        "--timeout",
-        "200ms",
-        "-o",
-        "never.png",
-        "--background",
-    ]);
-    let id = triggered["job"]["id"].as_str().unwrap().to_owned();
+    let triggered = home.fails(
+        4,
+        &[
+            "capture",
+            "-c",
+            "sim:0",
+            "--timeout",
+            "200ms",
+            "-o",
+            "never.png",
+            "--background",
+        ],
+    );
+    assert_eq!(triggered["code"], "trigger_timeout");
+    let id = triggered["details"]["job"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(triggered["details"]["job"]["state"], "failed");
     let failed = home.fails(4, &["jobs", "wait", &id, "--timeout", "10s"]);
     assert_eq!(failed["code"], "trigger_timeout");
     assert_eq!(failed["details"]["job"]["error"]["code"], "trigger_timeout");
+    // Stopping it shows it as it ended, with its error.
+    let stopped = home.ok(&["jobs", "stop", &id]);
+    assert_eq!(stopped["stopped"][0]["error"]["code"], "trigger_timeout");
 }
 
 #[cfg(unix)]
@@ -363,4 +393,108 @@ fn a_dead_worker_fails_its_jobs() {
     let failed = home.fails(3, &["jobs", "wait", &id, "--timeout", "10s"]);
     assert_eq!(failed["code"], "worker_crashed");
     assert_eq!(failed["details"]["job"]["state"], "failed");
+    // The camera is in error until the session stops.
+    let camera = &home.ok(&["session", "status", "dead"])["cameras"][0];
+    assert_eq!(camera["state"], "error", "{camera}");
+    assert!(
+        camera["error"].as_str().unwrap().contains("exited"),
+        "{camera}"
+    );
+}
+
+/// A session killed without cleaning up leaves its descriptor, and its pid
+/// may name another process by then: the name is free all the same.
+#[cfg(unix)]
+#[test]
+fn a_killed_sessions_descriptor_does_not_hold_its_name() {
+    let home = Home::new("stale");
+    let started = home.ok(&["session", "start", "--name", "stale", "-c", "sim:0"]);
+    let pid = started["pid"].as_i64().unwrap() as i32;
+    // SAFETY: kill only sends a signal to the session this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    assert!(!support::cli::process_lives(pid));
+    // Process 1 always runs.
+    let descriptor = home.sessions.join("stale.json");
+    let mut stale: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&descriptor).unwrap()).unwrap();
+    stale["pid"] = json!(1);
+    let leave = || {
+        use std::{io::Write, os::unix::fs::OpenOptionsExt};
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&descriptor)
+            .unwrap()
+            .write_all(stale.to_string().as_bytes())
+            .unwrap();
+    };
+    leave();
+    assert_eq!(home.ok(&["session", "list"])["sessions"], json!([]));
+    // Routing passes it by, and --keep starts a session of its own.
+    assert_eq!(
+        home.ok(&["get", "-c", "sim:0", "Width"])["values"]["Width"],
+        640
+    );
+    home.ok(&["get", "-c", "sim:0", "Width", "--keep", "1m"]);
+    assert_eq!(
+        home.ok(&["session", "list"])["sessions"][0]["session"],
+        "auto"
+    );
+    let gone = home.fails(3, &["session", "status", "stale"]);
+    assert_eq!(gone["code"], "session_not_found");
+    assert!(!descriptor.exists(), "what it left is removed");
+    leave();
+    let again = home.ok(&["session", "start", "--name", "stale", "-c", "sim:0"]);
+    assert_eq!(again["started"], true);
+    assert_ne!(again["pid"], json!(1));
+    home.ok(&["session", "stop", "stale"]);
+}
+
+/// Commands that start the same session at once share it: the cameras of
+/// one capture, or several agents' calls.
+#[test]
+fn commands_that_start_a_session_at_once_share_it() {
+    for round in 0..3 {
+        let home = Home::new(&format!("keep-race-{round}"));
+        let both = home.ok(&[
+            "capture",
+            "-c",
+            "sim:0",
+            "-c",
+            "sim:1",
+            "-o",
+            "x/{camera}.png",
+            "--keep",
+            "1m",
+        ]);
+        assert_eq!(both["cameras"].as_array().unwrap().len(), 2, "{both}");
+        let sessions = home.ok(&["session", "list"])["sessions"].clone();
+        assert_eq!(sessions.as_array().unwrap().len(), 1, "{sessions}");
+        assert_eq!(sessions[0]["cameras"].as_array().unwrap().len(), 2);
+    }
+}
+
+/// A command without -c in a session uses its only camera; with none or
+/// several it says which, never with credentials.
+#[test]
+fn a_session_names_its_only_camera_or_its_candidates() {
+    let home = Home::new("only-camera");
+    let _empty = home.serve("empty", &[]);
+    let none = home.fails(3, &["--session", "empty", "get", "Width"]);
+    assert_eq!(none["code"], "camera_not_found");
+    assert_eq!(none["details"]["candidates"], json!([]));
+    home.ok(&["--session", "empty", "get", "-c", "sim:one", "Width"]);
+    assert_eq!(
+        home.ok(&["--session", "empty", "get", "Width"])["camera"],
+        "sim:one"
+    );
+    home.ok(&["--session", "empty", "get", "-c", "sim:two", "Width"]);
+    let several = home.fails(2, &["--session", "empty", "get", "Width"]);
+    assert_eq!(several["code"], "camera_ambiguous");
+    assert_eq!(
+        several["details"]["candidates"],
+        json!([{"id": "sim:one"}, {"id": "sim:two"}])
+    );
 }

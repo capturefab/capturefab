@@ -87,16 +87,41 @@ fn direct_and_session_results_are_the_same_apart_from_timing() {
 #[test]
 fn bursts_time_lapses_and_names_that_never_overwrite() {
     let home = Home::new("names");
-    // A burst into a folder numbers its files.
+    // A burst into a folder names its files by camera, time and number.
     let burst = home.ok(&["capture", "-c", "sim:0", "-n", "3", "-o", "burst/"]);
     assert_eq!(burst["count"], 3);
     let files = burst["files"].as_array().unwrap();
     assert_eq!(files.len(), 3);
-    for file in files {
+    for (index, file) in files.iter().enumerate() {
         let file = Path::new(file.as_str().unwrap());
         assert!(file.starts_with(home.real("burst")), "{file:?}");
+        let name = file.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("Pattern-camera-SIM0-"), "{name}");
+        assert!(name.ends_with(&format!("-{:04}.png", index + 1)), "{name}");
         assert!(std::fs::read(file).unwrap().starts_with(b"\x89PNG"));
     }
+    // A templated folder holds several frames too; {serial}, {seq:N} and
+    // {ext} fill in.
+    let folders = home.ok(&["capture", "-c", "sim:0", "-n", "2", "-o", "by/{camera}/"]);
+    assert_eq!(folders["count"], 2);
+    assert!(
+        Path::new(folders["files"][1].as_str().unwrap())
+            .starts_with(home.real("by/Pattern-camera-SIM0"))
+    );
+    let named = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "-o",
+        "{serial}-{seq:6}.{ext}",
+        "-f",
+        "jpg",
+    ]);
+    assert_eq!(named["files"][0], json!(home.real("SIM0-000001.jpg")));
+    // {time} names differ by the millisecond, and a name taken in one is
+    // numbered, never a failure.
+    let timed = home.ok(&["capture", "-c", "sim:0", "-n", "2", "-o", "t/{time}.png"]);
+    assert_eq!(timed["count"], 2);
     assert!(burst["duration_s"].as_f64().unwrap() >= 0.0);
     // A time lapse: frames apart, its count from -n.
     let lapse = home.ok(&[
@@ -232,6 +257,10 @@ fn dry_runs_resolve_without_capturing() {
     assert_eq!(plan["settings"].as_array().unwrap().len(), 1);
     assert!(Path::new(plan["output"].as_str().unwrap()).starts_with(home.real("")));
     assert!(!home.path("plan").exists());
+    // A dry run never starts a session, whatever else it is asked.
+    home.ok(&["capture", "-c", "sim:0", "--background", "--dry-run"]);
+    home.ok(&["capture", "-c", "sim:0", "--keep", "1m", "--dry-run"]);
+    assert_eq!(home.ok(&["session", "list"])["sessions"], json!([]));
 }
 
 #[test]
@@ -251,8 +280,30 @@ fn stdout_takes_one_valid_image() {
     let result: Value = serde_json::from_str(run.stderr.trim()).unwrap();
     assert_eq!(result["output"], "-");
     assert_eq!(result["bytes"], 640 * 480);
-    let many = home.fails(2, &["capture", "-c", "sim:0", "-o", "-", "-n", "2"]);
-    assert_eq!(many["code"], "usage");
+    // So does an error: stdout holds nothing but an image.
+    let many = home.run(&["--json", "capture", "-c", "sim:0", "-o", "-", "-n", "2"]);
+    assert_eq!(many.code, Some(2));
+    assert!(many.raw.is_empty());
+    let error: Value = serde_json::from_str(many.stderr.trim()).unwrap();
+    assert_eq!(error["error"]["code"], "usage");
+    let triggered = home.run(&[
+        "--json",
+        "capture",
+        "-c",
+        "sim:0",
+        "-o",
+        "-",
+        "--set",
+        "TriggerMode=On",
+        "--set",
+        "TriggerSource=Line0",
+        "--timeout",
+        "300ms",
+    ]);
+    assert_eq!(triggered.code, Some(4));
+    assert!(triggered.raw.is_empty());
+    let error: Value = serde_json::from_str(triggered.stderr.trim()).unwrap();
+    assert_eq!(error["error"]["code"], "trigger_timeout");
 }
 
 #[test]
@@ -300,9 +351,15 @@ fn a_hardware_triggered_camera_times_out_with_its_trigger() {
     );
     assert!(timeout["hint"].as_str().unwrap().contains("--timeout"));
     assert_eq!(timeout["details"]["files"], json!([]));
-    // An inspection says the same.
+    // An inspection says the same, with what it can do: it has no
+    // --timeout.
     let inspected = home.fails(4, &["inspect", "-c", "sim:0"]);
     assert_eq!(inspected["code"], "trigger_timeout");
+    let hint = inspected["hint"].as_str().unwrap();
+    assert!(
+        !hint.contains("--timeout") && hint.contains("trigger=off"),
+        "{hint}"
+    );
     // Auto exposure has nothing to meter.
     assert_eq!(
         home.fails(5, &["auto", "-c", "sim:0"])["code"],
@@ -346,5 +403,53 @@ fn a_signal_during_a_burst_exits_with_the_files_saved() {
         for file in files {
             assert!(Path::new(file.as_str().unwrap()).is_file());
         }
+    }
+}
+
+/// Every camera's saved files are in an interrupted capture's details.
+#[cfg(unix)]
+#[test]
+fn a_signal_during_a_capture_from_several_cameras_lists_all_their_files() {
+    use std::process::Stdio;
+    let home = Home::new("interrupted-several");
+    let mut child = home
+        .command()
+        .args([
+            "--json",
+            "capture",
+            "-c",
+            "sim:0",
+            "-c",
+            "sim:1",
+            "-n",
+            "1000",
+            "-o",
+            "{camera}-{seq}.png",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let saved = || {
+        std::fs::read_dir(&home.work)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.path().extension().is_some_and(|e| e == "png"))
+            .count()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while saved() < 4 {
+        assert!(std::time::Instant::now() < deadline, "no frames saved");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    support::cli::signal_and_wait(&mut child, libc::SIGINT);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let error: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let details = &error["error"]["details"];
+    let files = details["files"].as_array().unwrap();
+    assert_eq!(files.len(), saved(), "{error}");
+    for camera in details["cameras"].as_array().unwrap() {
+        assert_eq!(camera["error"]["code"], "interrupted", "{camera}");
+        assert!(!camera["files"].as_array().unwrap().is_empty(), "{camera}");
     }
 }

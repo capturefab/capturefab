@@ -130,21 +130,6 @@ fn output(args: &RecordArgs) -> Result<String> {
     Ok(output)
 }
 
-/// The most a recording without `--max-size` may write: what the storage
-/// budget has left.
-fn budget() -> u64 {
-    let policy = crate::storage::configured_policy().unwrap_or_default();
-    let used = crate::storage::usage()
-        .ok()
-        .flatten()
-        .map_or(0, |usage| usage.allocated_bytes);
-    policy
-        .max_bytes
-        .saturating_sub(used)
-        .max(64 * 1024 * 1024)
-        .min(policy.max_bytes)
-}
-
 /// The camera's frame rate, as `info` reports it, for `--fps` unset.
 fn camera_fps(info: &Value) -> f64 {
     let number = |value: &Value| {
@@ -176,7 +161,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
     {
         return Err(Usage("--fps must be 0.1..240".into()).into());
     }
-    let max_file_bytes = args.max_size.unwrap_or_else(budget);
+    let max_file_bytes = args.max_size.unwrap_or(crate::media::NO_SIZE_CAP);
     let request = |fps: f64| SessionCommand::Forward {
         output: output.clone(),
         codec: args.codec.name().into(),
@@ -258,6 +243,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         client: &client,
         session: client.session().unwrap_or("direct").to_owned(),
         id,
+        job: reply["job"].as_u64().context("recording without a job")?,
         args: &args,
         info: &info,
         output: reply["path"]
@@ -281,6 +267,8 @@ struct Recording<'a> {
     client: &'a Client,
     session: String,
     id: String,
+    /// Its job number in the session, whose record says how it ended.
+    job: u64,
     args: &'a RecordArgs,
     info: &'a Value,
     output: String,
@@ -294,8 +282,8 @@ enum Ended {
     Duration,
     Signal,
     MaxSize,
-    /// It stopped on its own without reaching its end: a failure.
-    Failed,
+    /// Another command stopped it (jobs stop, session stop).
+    Stopped,
 }
 impl Ended {
     fn name(self) -> &'static str {
@@ -303,15 +291,19 @@ impl Ended {
             Self::Duration => "duration",
             Self::Signal => "signal",
             Self::MaxSize => "max_size",
-            Self::Failed => "failed",
+            Self::Stopped => "stopped",
         }
     }
 }
 
 impl Recording<'_> {
-    /// Whether `camera` (a status entry) still records this recording.
-    fn running(&self, camera: &Value) -> bool {
-        camera["forwarding_id"].as_str() == Some(self.id.as_str())
+    /// The camera's status entry and the session's record of this recording.
+    fn look(&self) -> Result<(Value, Value)> {
+        let camera = self.client.status()?;
+        let entry = jobs::recording_entry(&camera, self.job)
+            .cloned()
+            .context("the session no longer lists this recording")?;
+        Ok((camera, entry))
     }
     /// The first frame's wait.
     fn first_frame_wait(&self) -> Option<Duration> {
@@ -326,20 +318,18 @@ impl Recording<'_> {
         })
     }
     /// Wait for the first frame to be encoded, then leave the recording
-    /// running: its job. A recording that could not start leaves none.
+    /// running: its job. A recording that could not start fails.
     fn armed(&self) -> Result<Value> {
         loop {
-            let camera = self.client.status()?;
-            if !self.running(&camera) {
-                return Err(self.failure(&camera));
+            let (camera, entry) = self.look()?;
+            let job = jobs::recording(&self.session, &camera, &entry);
+            if entry["running"] != true {
+                if entry["ended"] == "failed" {
+                    return Err(self.failure(&camera, &entry));
+                }
+                return Ok(json!({ "job": job }));
             }
-            if camera["forwarding_progress"]["written"]
-                .as_u64()
-                .unwrap_or(0)
-                > 0
-            {
-                let job =
-                    jobs::recording(&self.session, &camera).context("the recording has no job")?;
+            if entry["progress"]["written"].as_u64().unwrap_or(0) > 0 {
                 return Ok(json!({ "job": job }));
             }
             if let Some(wait) = self.first_frame_wait()
@@ -364,39 +354,46 @@ impl Recording<'_> {
             super::args::duration_text(self.first_frame_wait().unwrap_or_default())
         ))
     }
-    /// The recording's error, from the camera's last one.
-    fn failure(&self, camera: &Value) -> anyhow::Error {
-        let message = camera["last_error"]
+    /// The recording's error, as the session recorded it, with its reason.
+    fn failure(&self, camera: &Value, entry: &Value) -> anyhow::Error {
+        let message = entry["error"]
             .as_str()
             .map(crate::scrub::redact_urls)
             .unwrap_or_else(|| "the recording stopped".into());
-        let mut error = Categorized::new(ErrorKind::OperationFailed, message);
-        if let Some(job) = jobs::recording(&self.session, camera) {
-            error = error.details(json!({ "job": job }));
-        }
-        error.into()
+        let tag = serde_json::from_value::<crate::types::ErrorTag>(entry["error_tag"].clone()).ok();
+        crate::types::with_details(
+            crate::types::error_from_tag(tag, message),
+            json!({ "job": jobs::recording(&self.session, camera, entry) }),
+        )
     }
     /// Wait until the recording ends: its result.
     fn wait(&self) -> Result<Value> {
         let duration = self.args.duration;
         loop {
-            let camera = self.client.status()?;
-            if !self.running(&camera) {
-                let ended = match duration {
-                    Some(duration) if self.started.elapsed() + GRACE >= duration => Ended::Duration,
-                    _ if self.args.max_size.is_some() && reached_max_size(&camera) => {
-                        Ended::MaxSize
-                    }
-                    _ => Ended::Failed,
+            let (camera, entry) = self.look()?;
+            if entry["running"] != true {
+                let ended = match entry["ended"].as_str() {
+                    Some("duration") => Ended::Duration,
+                    Some("max_size") if self.args.max_size.is_some() => Ended::MaxSize,
+                    Some("stopped") => Ended::Stopped,
+                    _ => return Err(self.failure(&camera, &entry)),
                 };
-                if ended == Ended::Failed {
-                    return Err(self.failure(&camera));
+                let value = self.result(&entry, ended, None);
+                if ended == Ended::Stopped && duration.is_some() {
+                    return Err(Categorized::new(
+                        ErrorKind::Incomplete,
+                        format!(
+                            "the recording was stopped after {} of {}",
+                            crate::scheduling::format_duration(millis(self.started.elapsed())),
+                            super::args::duration_text(duration.unwrap_or_default())
+                        ),
+                    )
+                    .details(value)
+                    .into());
                 }
-                return Ok(self.result(&camera, ended, None));
+                return Ok(value);
             }
-            let written = camera["forwarding_progress"]["written"]
-                .as_u64()
-                .unwrap_or(0);
+            let written = entry["progress"]["written"].as_u64().unwrap_or(0);
             if written == 0
                 && let Some(wait) = self.first_frame_wait()
                 && self.started.elapsed() > wait
@@ -407,9 +404,12 @@ impl Recording<'_> {
             let late = duration.is_some_and(|duration| self.started.elapsed() > duration + GRACE);
             if signals::interrupted() || late {
                 let stopped = self.stop();
-                let camera = self.client.status()?;
+                let (camera, entry) = self.look()?;
+                if entry["ended"] == "failed" {
+                    return Err(self.failure(&camera, &entry));
+                }
                 let ended = if late { Ended::Duration } else { Ended::Signal };
-                let value = self.result(&camera, ended, Some(&stopped));
+                let value = self.result(&entry, ended, Some(&stopped));
                 // A recording asked to run for a time and cut short is
                 // interrupted; an open-ended one ends like this.
                 if ended == Ended::Signal && duration.is_some() {
@@ -428,45 +428,41 @@ impl Recording<'_> {
             std::thread::sleep(POLL);
         }
     }
-    /// The finished recording's result, from the camera's final counters
+    /// The finished recording's result, from the session's record of it
     /// and the stop reply when this command stopped it.
-    fn result(&self, camera: &Value, ended: Ended, stopped: Option<&Result<Value>>) -> Value {
-        let progress = &camera["forwarding_progress"];
-        let ours = progress["id"].as_str() == Some(self.id.as_str());
-        let finished = if ours {
-            &progress["recording"]
-        } else {
-            &Value::Null
-        };
+    fn result(&self, entry: &Value, ended: Ended, stopped: Option<&Result<Value>>) -> Value {
+        let progress = &entry["progress"];
+        let file = &progress["recording"];
         let stats = stopped
             .and_then(|stopped| stopped.as_ref().ok())
             .map(|stopped| &stopped["stats"]);
-        let duration_s = match (
-            finished["started_ms"].as_u64(),
-            finished["ended_ms"].as_u64(),
-        ) {
-            (Some(start), Some(end)) => end.saturating_sub(start) as f64 / 1000.0,
-            _ => self.started.elapsed().as_secs_f64(),
+        let duration_ms = match (file["started_ms"].as_u64(), file["ended_ms"].as_u64()) {
+            (Some(start), Some(end)) => Some(end.saturating_sub(start)),
+            _ => entry["ended_ms"]
+                .as_u64()
+                .zip(entry["since_ms"].as_u64())
+                .map(|(end, start)| end.saturating_sub(start)),
         };
+        let duration_s = duration_ms.map_or_else(
+            || self.started.elapsed().as_secs_f64(),
+            |ms| ms as f64 / 1000.0,
+        );
         let frames = stats
             .and_then(|stats| stats["written"].as_u64())
-            .or(ours.then(|| progress["written"].as_u64()).flatten());
+            .or(progress["written"].as_u64());
         let dropped = stats
             .and_then(|stats| stats["dropped"].as_u64())
-            .or(ours.then(|| progress["dropped"].as_u64()).flatten());
-        let encoder = finished["encoder"]
+            .or(progress["dropped"].as_u64());
+        let encoder = file["encoder"]
             .as_str()
             .or(stats.and_then(|stats| stats["encoder"].as_str()))
             .unwrap_or_default();
         let local = crate::media::is_recording(&self.args.output);
-        let finalized = match stopped {
-            Some(stopped) => stopped.is_ok() && (!local || finished.is_object()),
-            None => !local || finished.is_object(),
-        };
+        let finalized = stopped.is_none_or(Result::is_ok) && (!local || file.is_object());
         let mut value = json!({
             "camera": self.info["camera"],
-            "output": finished["path"].as_str().map_or_else(|| self.output.clone(), str::to_owned),
-            "bytes": finished["bytes"],
+            "output": file["path"].as_str().map_or_else(|| self.output.clone(), str::to_owned),
+            "bytes": file["bytes"],
             "duration_s": (duration_s * 1000.0).round() / 1000.0,
             "frames": frames,
             "dropped": dropped,
@@ -483,14 +479,6 @@ impl Recording<'_> {
         value["fps"] = json!(self.fps);
         crate::types::without_nulls(value)
     }
-}
-
-/// Whether a recording that stopped on its own did so at its maximum file
-/// size: the session reports that only in words for now.
-fn reached_max_size(camera: &Value) -> bool {
-    camera["last_error"]
-        .as_str()
-        .is_some_and(|error| error.contains("maximum file size"))
 }
 
 fn text(value: &Value) -> String {
@@ -531,12 +519,15 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("encoder", "string — the FFmpeg encoder used"),
     (
         "ended",
-        "duration|signal|max_size — signal is a normal end without --for",
+        "duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it",
     ),
     ("finalized", "bool — the file was closed and is complete"),
     (
         "job",
-        "{...} — with --background: the job, as jobs lists it",
+        concat!(
+            jobs::job_row!(),
+            " — with --background: the job, as jobs lists it, once its first frame is encoded"
+        ),
     ),
 ];
 

@@ -592,6 +592,7 @@ fn push_log(s: &mut WorkerSnapshot, level: &str, message: String) {
     if level == "error" {
         s.last_error = Some(entry.message.clone());
         s.error_logged_ms = Some(entry.unix_ms);
+        s.last_error_tag = None;
     }
     s.logs.push(entry);
     s.logged += 1;
@@ -674,6 +675,9 @@ fn stop_forward(
 ) -> Result<Option<crate::media::ForwardStats>> {
     end_forward(h, forwarder, auto, |_| None)
 }
+/// How a forward ended, for its log line: a level, a message and, for an
+/// error, its reason.
+type ForwardEnd = (&'static str, String, Option<crate::types::ErrorTag>);
 /// Stop the forward, and log the line `report` makes of how it ended (a
 /// level and message) in the same step that clears the forwarding state: a
 /// status never shows the forward gone without the error it ended with, nor
@@ -682,7 +686,7 @@ fn end_forward(
     h: &WorkerHandle,
     forwarder: &mut Option<(Forwarder, f64)>,
     auto: &mut Option<AutoController>,
-    report: impl FnOnce(&Result<Option<crate::media::ForwardStats>>) -> Option<(&'static str, String)>,
+    report: impl FnOnce(&Result<Option<crate::media::ForwardStats>>) -> Option<ForwardEnd>,
 ) -> Result<Option<crate::media::ForwardStats>> {
     if let Some(a) = auto.as_mut() {
         a.set_forward_fps(None)?;
@@ -739,8 +743,11 @@ fn end_forward(
     // Last: whoever sees the forward gone (a client waiting out a timed
     // recording, say) finds its file finished and reported.
     let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
-    if let Some((level, message)) = report(&stopped) {
+    if let Some((level, message, tag)) = report(&stopped) {
         push_log(&mut s, level, message);
+        if level == "error" {
+            s.last_error_tag = tag;
+        }
     }
     if let Some(progress) = final_progress {
         s.forwarding_progress = Some(progress);
@@ -796,8 +803,12 @@ fn finish_timed_forward_at(
     let length = crate::scheduling::format_duration(duration_ms);
     let _ = end_forward(h, forwarder, auto, |stopped| {
         Some(match stopped {
-            Ok(_) => ("info", format!("{what} finished after {length}")),
-            Err(e) => ("error", format!("{what} stopped after {length}: {e:#}")),
+            Ok(_) => ("info", format!("{what} finished after {length}"), None),
+            Err(e) => (
+                "error",
+                format!("{what} stopped after {length}: {e:#}"),
+                crate::types::error_tag(e),
+            ),
         })
     });
 }
@@ -806,7 +817,7 @@ fn finish_timed_forward_at(
 fn name_recording(
     h: &WorkerHandle,
     config: &ForwardConfig,
-    camera: &str,
+    camera: &crate::naming::CameraName,
     on_exists: crate::naming::OnExists,
     context: &crate::context::Context,
     utc_offset_s: Option<i32>,
@@ -836,7 +847,7 @@ fn name_recording(
     let (path, writer) =
         crate::naming::save_named(&h.names, &plan, &input, on_exists, first, |path| {
             check_parents(path)?;
-            crate::storage::create_writer(path, &config.storage, config.max_file_bytes)
+            config.writer(path)
         })?;
     Ok((path, writer))
 }
@@ -1239,7 +1250,7 @@ fn process_plain(
                 && (crate::naming::has_placeholder(&output) || !on_exists.is_fail());
             let f = if named {
                 config.validate()?;
-                let label = crate::naming::camera_label(&camera_mut(camera)?.info);
+                let label = crate::naming::camera_name(&camera_mut(camera)?.info);
                 let (path, reserved) =
                     name_recording(h, &config, &label, on_exists, &context, utc_offset_s)?;
                 config.output = path.to_string_lossy().into_owned();
@@ -1654,7 +1665,7 @@ fn process_plain(
                 "capture schedule queue is full (32 active jobs)"
             );
             crate::scheduling::validate_schedule(first_at_ms, interval_ms, count)?;
-            let label = crate::naming::camera_label(&camera_mut(camera)?.info);
+            let label = crate::naming::camera_name(&camera_mut(camera)?.info);
             let now_ms = crate::scheduling::now_ms();
             let first_at_ms = first_at_ms.max(now_ms);
             // The coordinator numbers jobs across a session's cameras.
@@ -1790,7 +1801,7 @@ fn process_plain(
                         "Auto exposure had not settled; capturing anyway".into(),
                     );
                 }
-                let label = crate::naming::camera_label(&c.info);
+                let label = crate::naming::camera_name(&c.info);
                 let plan = crate::naming::Plan::new(&output, count, &format);
                 let mut settings = acquisition(c);
                 for index in 0..count {
@@ -1907,8 +1918,8 @@ struct Scheduled {
     storage: crate::storage::StoragePolicy,
     deadline: Option<Instant>,
     warm: Option<Instant>,
-    /// The camera label for {camera}, taken when the job was scheduled.
-    camera: String,
+    /// What {camera} and {serial} name, taken when the job was scheduled.
+    camera: crate::naming::CameraName,
     on_exists: crate::naming::OnExists,
     /// The name picked for the frame being requested, with its clock time.
     next: Option<(PathBuf, chrono::DateTime<chrono::FixedOffset>)>,
@@ -2521,14 +2532,14 @@ pub fn saved_before(files: &[String], count: u32) -> String {
     )
 }
 /// Frame `index`'s name under an output whose names are known in advance.
+/// A folder's names depend on the camera and the time, so they never are:
+/// its frames are in the folder.
 fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBuf {
     match crate::naming::Plan::new(output, count, format) {
         crate::naming::Plan::Template(template) => {
             PathBuf::from(template.replace("{frame}", &format!("{:06}", index + 1)))
         }
-        crate::naming::Plan::Directory { dir, ext } => {
-            dir.join(format!("frame-{:06}.{ext}", index + 1))
-        }
+        crate::naming::Plan::Directory { dir, .. } => dir,
         crate::naming::Plan::File(path) => path,
         crate::naming::Plan::Stdout => PathBuf::from("-"),
     }
@@ -2689,8 +2700,9 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
                         && let Err(e) = f.push(frame)
                     {
                         let message = format!("Forwarding stopped: {e:#}");
+                        let tag = crate::types::error_tag(&e);
                         let _ = end_forward(&h, &mut forwarder, &mut auto, |_| {
-                            Some(("error", message))
+                            Some(("error", message, tag))
                         });
                     }
                     if let Some(shot) = shot {
@@ -3681,16 +3693,18 @@ mod tests {
         // The CLI refuses these names as typed (check_capture_name); the
         // worker keeps serving RPC clients as before: a sequence fills a
         // folder, and the format wins.
+        let label = crate::naming::camera_label(&h.snapshot().connected.unwrap());
+        let in_folder = |file: &Value, folder: &Path, seq: u32| {
+            let file = Path::new(file.as_str().unwrap());
+            let name = file.file_name().unwrap().to_str().unwrap();
+            file.parent() == Some(folder)
+                && name.starts_with(&format!("{label}-"))
+                && name.ends_with(&format!("-{seq:04}.raw"))
+        };
         let v = h
             .request(capture_to(&dir.join("shot.raw"), 3, OnExists::Fail))
             .unwrap();
-        assert_eq!(
-            v["files"][2].as_str().unwrap(),
-            dir.join("shot.raw")
-                .join("frame-000003.raw")
-                .to_str()
-                .unwrap()
-        );
+        assert!(in_folder(&v["files"][2], &dir.join("shot.raw"), 3), "{v}");
         let mut mismatched = capture_to(&dir.join("y.jpg"), 1, OnExists::Fail);
         if let SessionCommand::Capture { format, .. } = &mut mismatched {
             *format = "png".into();
@@ -3710,13 +3724,7 @@ mod tests {
         let v = h
             .request(capture_to(Path::new(&folder), 1, OnExists::Fail))
             .unwrap();
-        assert_eq!(
-            v["files"][0].as_str().unwrap(),
-            dir.join("newdir")
-                .join("frame-000001.raw")
-                .to_str()
-                .unwrap()
-        );
+        assert!(in_folder(&v["files"][0], &dir.join("newdir"), 1), "{v}");
         let v = h
             .request(capture_to(&dir.join("noext"), 1, OnExists::Fail))
             .unwrap();
@@ -3807,19 +3815,23 @@ mod tests {
         );
         let v = h.request(capture_to(&file, 1, OnExists::Number)).unwrap();
         assert_eq!(files(v), ["shot-0001.raw"]);
-        // A directory continues its numbering on every run.
+        // A directory names frames by camera and time, and continues its
+        // numbering on every run.
         let frames = dir.join("frames");
         for run in 0..2 {
             let v = h.request(capture_to(&frames, 2, OnExists::Fail)).unwrap();
-            assert_eq!(
-                files(v),
-                [1, 2].map(|i| {
-                    Path::new("frames")
-                        .join(format!("frame-{:06}.raw", run * 2 + i))
-                        .to_string_lossy()
-                        .into_owned()
-                })
-            );
+            for (i, name) in files(v).iter().enumerate() {
+                let name = name
+                    .strip_prefix(&format!("frames{}{label}-", std::path::MAIN_SEPARATOR))
+                    .unwrap_or_else(|| panic!("{name}"));
+                let (time, seq) = name.split_at("20261031-142233.123".len());
+                assert!(
+                    time.bytes()
+                        .all(|b| b.is_ascii_digit() || b == b'-' || b == b'.'),
+                    "{name}"
+                );
+                assert_eq!(seq, format!("-{:04}.raw", run * 2 + i + 1));
+            }
         }
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
@@ -3897,7 +3909,10 @@ mod tests {
             storage: Default::default(),
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             warm: None,
-            camera: "camera".into(),
+            camera: crate::naming::CameraName {
+                label: "camera".into(),
+                serial: "unknown".into(),
+            },
             on_exists: Default::default(),
             next: None,
             saving: false,
@@ -4291,17 +4306,14 @@ mod tests {
     }
     #[test]
     fn capture_paths() {
-        assert_eq!(
-            output_path("frames", 2, 0, "png"),
-            PathBuf::from("frames/frame-000001.png")
-        );
+        assert_eq!(output_path("frames", 2, 0, "png"), PathBuf::from("frames"));
         assert_eq!(
             output_path("shot-{frame}.png", 5, 3, "png"),
             PathBuf::from("shot-000004.png")
         );
         assert_eq!(
             output_path("newdir/", 1, 0, "png"),
-            PathBuf::from("newdir/frame-000001.png")
+            PathBuf::from("newdir/")
         );
         assert_eq!(
             output_path("noext", 1, 0, "jpeg"),

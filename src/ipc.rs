@@ -1278,16 +1278,58 @@ pub fn active_sessions() -> Result<Vec<Descriptor>> {
         .filter(descriptor_active)
         .collect())
 }
-/// The sessions whose descriptors say they run, read locally without
-/// asking any of them: a client matches its camera against these and sends
-/// one request. A session that was killed leaves its descriptor until the
-/// next one by that name; its process is gone.
+/// The running sessions' descriptors, read locally without asking any of
+/// them: a client matches its camera against these and sends one request.
 pub fn sessions() -> Vec<Descriptor> {
-    descriptors_in(&runtime_dir())
+    let dir = runtime_dir();
+    descriptors_in(&dir)
         .unwrap_or_default()
         .into_iter()
-        .filter(|descriptor| process_alive(descriptor.pid))
+        .filter(|descriptor| running_in(&dir, descriptor))
         .collect()
+}
+/// Whether `descriptor` is a running session's: a process holds its name
+/// lock, as every session does while it runs. A session that was killed
+/// leaves its descriptor until the next one by that name, and its pid may
+/// name another process by then.
+fn running_in(dir: &Path, descriptor: &Descriptor) -> bool {
+    let held = fs::File::open(dir.join(format!("{}.session.lock", descriptor.name)))
+        .is_ok_and(|lock| FileExt::try_lock_shared(&lock).is_err());
+    held && process_alive(descriptor.pid)
+}
+/// Session `name`'s descriptor, when that session runs.
+pub fn running_session(name: &str) -> Option<Descriptor> {
+    let dir = runtime_dir();
+    read_descriptor_in(&dir, name)
+        .ok()
+        .filter(|descriptor| running_in(&dir, descriptor))
+}
+/// Remove the descriptor a session that no longer runs left under `name`.
+/// False when there was none, or a session holds the name.
+pub fn remove_stale(name: &str) -> Result<bool> {
+    validate_name(name)?;
+    let dir = runtime_dir();
+    let lock = lock_file(&dir.join(format!("{name}.session.lock")))?;
+    if lock.try_lock_exclusive().is_err() {
+        return Ok(false);
+    }
+    match fs::remove_file(descriptor_path_in(&dir, name)?) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+/// Wait for the turn to start session `name`: commands that would start it
+/// at once take turns, so the first starts it and the others find it
+/// running. The turn lasts while the returned file is open.
+pub fn start_turn(name: &str) -> Result<fs::File> {
+    validate_name(name)?;
+    let dir = runtime_dir();
+    ensure_private_dir(&dir)?;
+    let lock = lock_file(&dir.join(format!("{name}.start.lock")))?;
+    lock.lock_exclusive()
+        .with_context(|| format!("waiting to start session {name}"))?;
+    Ok(lock)
 }
 /// Whether process `pid` exists.
 pub(crate) fn process_alive(pid: u32) -> bool {

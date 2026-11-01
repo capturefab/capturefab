@@ -106,6 +106,19 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
             return Err(error);
         }
     };
+    // A session that `session start` detached writes to its log for as
+    // long as it runs.
+    if args.ready_fd.is_some() {
+        let name = args.name.clone();
+        let _ = std::thread::Builder::new()
+            .name("capturefab-log".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(10));
+                    super::session::rotate_log(&name);
+                }
+            });
+    }
     let quitter = server.quitter();
     signals::on_signal(move || quitter.quit(ipc::Quit::Signal));
     if signals::interrupted() {

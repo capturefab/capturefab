@@ -787,6 +787,102 @@ pub struct FinishedRecording {
     pub ended_ms: u64,
     pub encoder: String,
 }
+/// A recording as a session job: its number, and what became of it, which
+/// the session works out as it sees the camera's state change, so a client
+/// that comes later still learns how it ended.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordJob {
+    pub job: u64,
+    pub forwarding_id: String,
+    pub running: bool,
+    /// The file it writes, or the stream URL with credentials redacted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_ms: Option<u64>,
+    /// When the worker ends a timed recording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until_ms: Option<u64>,
+    /// Its counters, final once it has ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<ForwardingProgress>,
+    /// How it ended: `duration` (its timer), `max_size`, `stopped` (asked to
+    /// stop, or the session ended) or `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_tag: Option<crate::types::ErrorTag>,
+    /// The camera it records.
+    #[serde(skip)]
+    camera: String,
+    /// When the camera last logged an error while this ran: one logged
+    /// after that, as it stopped, is how it failed.
+    #[serde(skip)]
+    errors_ms: Option<u64>,
+}
+impl RecordJob {
+    /// Follow `camera`, the snapshot of the camera it records, at `now_ms`.
+    fn observe(&mut self, camera: &CameraSnapshot, now_ms: u64) {
+        // A busy worker's entry may predate this recording.
+        if !self.running || camera.stale {
+            return;
+        }
+        // Until a snapshot shows this recording's counters, it is older
+        // than the recording: it cannot say the recording ended.
+        let Some(progress) = camera
+            .forwarding_progress
+            .as_ref()
+            .filter(|progress| progress.id == self.forwarding_id)
+        else {
+            return;
+        };
+        self.progress = Some(progress.clone());
+        if camera.forwarding_id.as_deref() == Some(self.forwarding_id.as_str()) {
+            // An error while it still runs did not end it: the worker logs
+            // the error that ends a recording in the step that clears it.
+            self.errors_ms = camera.error_logged_ms;
+            if let Some(path) = &camera.recording_path {
+                self.output = Some(path.clone());
+            }
+            return;
+        }
+        self.running = false;
+        self.ended_ms = Some(now_ms);
+        if let Some(file) = &progress.recording {
+            self.output = Some(file.path.clone());
+        }
+        let failed = camera.error_logged_ms > self.errors_ms;
+        let ended = if failed {
+            self.error = camera.last_error.clone();
+            self.error_tag = camera.last_error_tag.clone();
+            if camera
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("maximum file size"))
+            {
+                "max_size"
+            } else {
+                "failed"
+            }
+        } else if self
+            .until_ms
+            .is_some_and(|until| now_ms.saturating_add(RECORDING_GRACE_MS) >= until)
+        {
+            "duration"
+        } else {
+            "stopped"
+        };
+        self.ended = Some(ended.into());
+    }
+}
+/// How long before its end time a timed recording that ended without an
+/// error still counts as ended by its timer.
+const RECORDING_GRACE_MS: u64 = 2000;
+
 /// A camera worker's state, which it sends with every reply: its camera,
 /// stream, recording and jobs. Its features stay in the worker, and a reply
 /// carries only the log lines added since the one before.
@@ -808,6 +904,13 @@ pub struct WorkerSnapshot {
     /// same error logged again can be told from the one before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_logged_ms: Option<u64>,
+    /// The reason of `last_error`, when it had a typed one, so a client
+    /// reports a recording that failed for lack of space as storage_full.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_tag: Option<crate::types::ErrorTag>,
+    /// The worker process exited; set by the coordinator, never sent.
+    #[serde(skip)]
+    pub exited: bool,
     pub logs: Vec<LogEntry>,
     /// Lines logged in all, which tells a reply's new lines from the rest.
     #[serde(skip)]
@@ -852,6 +955,12 @@ pub struct CameraSnapshot {
     /// same error logged again can be told from the one before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_logged_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_tag: Option<crate::types::ErrorTag>,
+    /// The camera's worker exited: the camera is unusable until the session
+    /// is stopped.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exited: bool,
     pub worker_pid: u32,
     #[serde(default)]
     pub forwarding: Option<String>,
@@ -886,9 +995,10 @@ pub struct CameraSnapshot {
     /// recordings still receive those frames.
     #[serde(default)]
     pub preview_skipped: u64,
-    /// The session job number of the current or last recording.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub record_job: Option<u64>,
+    /// The camera's recordings as session jobs, newest last: the one
+    /// running and those that ended lately.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recordings: Vec<RecordJob>,
     /// The worker was busy, so this entry repeats its last report. Kept for
     /// this process's own use; not serialized.
     #[serde(skip)]
@@ -1123,6 +1233,11 @@ impl Process {
             job.end("failed", Some(&error));
         }
         report.last_error = Some(format!("{error:#}"));
+        report.error_logged_ms = Some(
+            crate::scheduling::now_ms().max(report.error_logged_ms.unwrap_or(0).saturating_add(1)),
+        );
+        report.last_error_tag = crate::types::error_tag(&error);
+        report.exited = true;
         error
     }
     /// Send one command and keep the reply's snapshot.
@@ -1214,6 +1329,8 @@ fn camera_of(s: &WorkerSnapshot, worker_pid: u32, preview_skipped: u64) -> Optio
         fps: s.fps,
         last_error: s.last_error.clone(),
         error_logged_ms: s.error_logged_ms,
+        last_error_tag: s.last_error_tag.clone(),
+        exited: s.exited,
         worker_pid,
         forwarding: s.forwarding.clone(),
         forwarding_id: s.forwarding_id.clone(),
@@ -1226,7 +1343,7 @@ fn camera_of(s: &WorkerSnapshot, worker_pid: u32, preview_skipped: u64) -> Optio
         transport: s.transport.clone(),
         lost: frames_lost(s),
         preview_skipped,
-        record_job: None,
+        recordings: Vec::new(),
         stale: false,
     })
 }
@@ -1267,24 +1384,65 @@ struct Coordinator {
     aliases: Mutex<BTreeMap<String, String>>,
 }
 /// Job numbers across a session's cameras. A capture job carries its own; a
-/// recording's is kept beside its forward's identity.
+/// recording's is kept here with what became of it.
 #[derive(Default)]
 struct JobBook {
     last: u64,
-    recordings: VecDeque<(u64, String)>,
+    recordings: VecDeque<RecordJob>,
 }
-/// Recordings whose job numbers are remembered.
+/// Recordings remembered in all.
 const RECORDING_JOBS: usize = 256;
+/// Recordings a camera's status lists, besides the one running.
+const RECORDING_JOBS_SHOWN: usize = 32;
+/// How long an ended recording stays listed.
+const RECORDING_JOBS_KEPT_MS: u64 = 3_600_000;
 impl JobBook {
     fn next(&mut self) -> u64 {
         self.last += 1;
         self.last
     }
-    fn recording(&self, forwarding_id: &str) -> Option<u64> {
-        self.recordings
-            .iter()
-            .find(|(_, id)| id == forwarding_id)
-            .map(|(job, _)| *job)
+    /// Number the recording `reply` (a Forward reply) started on `camera`,
+    /// whose last error before it was logged at `errors_ms`.
+    fn start_recording(&mut self, camera: &str, reply: &Value, errors_ms: Option<u64>) -> u64 {
+        let job = self.next();
+        self.recordings.push_back(RecordJob {
+            job,
+            forwarding_id: reply["forwarding_id"].as_str().unwrap_or_default().into(),
+            running: true,
+            output: reply["path"]
+                .as_str()
+                .or(reply["forwarding"].as_str())
+                .map(str::to_owned),
+            since_ms: reply["since_ms"].as_u64(),
+            until_ms: reply["until_ms"].as_u64(),
+            camera: camera.into(),
+            errors_ms,
+            ..RecordJob::default()
+        });
+        if self.recordings.len() > RECORDING_JOBS {
+            self.recordings.pop_front();
+        }
+        job
+    }
+    /// Follow the recordings of `camera` and list them for its status.
+    fn recordings_of(&mut self, camera: &CameraSnapshot, now_ms: u64) -> Vec<RecordJob> {
+        let id = &camera.info.id;
+        let mut shown = Vec::new();
+        for recording in self.recordings.iter_mut().rev() {
+            if recording.camera != *id {
+                continue;
+            }
+            recording.observe(camera, now_ms);
+            let recent = recording.running
+                || recording
+                    .ended_ms
+                    .is_some_and(|ended| now_ms.saturating_sub(ended) < RECORDING_JOBS_KEPT_MS);
+            if recent && shown.len() < RECORDING_JOBS_SHOWN {
+                shown.push(recording.clone());
+            }
+        }
+        shown.reverse();
+        shown
     }
 }
 /// Holds one of the bounded command slots; released even if the command panics.
@@ -2241,6 +2399,18 @@ impl SessionHandle {
                 }
                 let (result, fresh) = {
                     let mut worker = w.lock().unwrap_or_else(|e| e.into_inner());
+                    // The recording before this one may have ended since the
+                    // worker last reported: see how, before this replaces it.
+                    let errors_ms = if forward {
+                        let _ = worker.refresh();
+                        if let Some(camera) = worker.camera() {
+                            locked(&self.inner.jobs)
+                                .recordings_of(&camera, crate::scheduling::now_ms());
+                        }
+                        worker.report.error_logged_ms
+                    } else {
+                        None
+                    };
                     let mut result = worker.call(command);
                     if schedule
                         && let Ok(value) = &mut result
@@ -2251,14 +2421,11 @@ impl SessionHandle {
                     // A recording is a job too, numbered with the captures.
                     if forward
                         && let Ok(value) = &mut result
-                        && let Some(id) = value["forwarding_id"].as_str().map(str::to_owned)
+                        && value["forwarding_id"].is_string()
+                        && let Some(camera) = worker.report.connected.as_ref()
                     {
-                        let mut book = locked(&self.inner.jobs);
-                        let job = book.next();
-                        book.recordings.push_back((job, id));
-                        if book.recordings.len() > RECORDING_JOBS {
-                            book.recordings.pop_front();
-                        }
+                        let job =
+                            locked(&self.inner.jobs).start_recording(&camera.id, value, errors_ms);
                         value["job"] = json!(job);
                     }
                     (result, worker.camera())
@@ -2291,28 +2458,33 @@ impl SessionHandle {
             (info, p.report.streaming, p.feed.clone())
         };
         let start = feed.counters.acquired_sequence();
-        // A stopped camera acquires one frame, which is new by definition.
+        // A stopped camera acquires a frame, which is new by definition; to
+        // let `fresh` frames pass, as many, measuring the last.
         let (source, fresh, notes) = if streaming {
             ("live", fresh, Vec::new())
         } else {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Err(crate::types::frame_timeout(no_new_frame(&info.id, timeout)));
+            let grabs = fresh.max(1);
+            let mut notes = Vec::new();
+            for _ in 0..grabs {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(crate::types::frame_timeout(no_new_frame(&info.id, timeout)));
+                }
+                let grab = SessionCommand::Grab {
+                    timeout_ms: u64::try_from(remaining.as_millis())
+                        .unwrap_or(u64::MAX)
+                        .clamp(1, 60_000),
+                };
+                let grabbed = locked(&w).call(grab);
+                self.store_snapshot();
+                let grabbed = grabbed.map_err(|error| grab_failed(error, &info.id, timeout))?;
+                notes = if grabbed["auto_settled"] == false {
+                    vec!["auto exposure had not settled when this frame was taken".to_owned()]
+                } else {
+                    Vec::new()
+                };
             }
-            let grab = SessionCommand::Grab {
-                timeout_ms: u64::try_from(remaining.as_millis())
-                    .unwrap_or(u64::MAX)
-                    .clamp(1, 60_000),
-            };
-            let grabbed = locked(&w).call(grab);
-            self.store_snapshot();
-            let grabbed = grabbed.map_err(|error| grab_failed(error, &info.id, timeout))?;
-            let notes = if grabbed["auto_settled"] == false {
-                vec!["auto exposure had not settled when this frame was taken".to_owned()]
-            } else {
-                Vec::new()
-            };
-            ("grab", 1, notes)
+            ("grab", grabs, notes)
         };
         let (frame, meta) = self
             .await_frame(&info.id, start, fresh, deadline)?
@@ -2365,13 +2537,10 @@ impl SessionHandle {
     /// Store a snapshot with the session log as it is now.
     fn commit(&self, mut snapshot: SessionSnapshot) {
         {
-            let book = locked(&self.inner.jobs);
+            let mut book = locked(&self.inner.jobs);
+            let now_ms = crate::scheduling::now_ms();
             for camera in &mut snapshot.cameras {
-                camera.record_job = camera
-                    .forwarding_id
-                    .as_deref()
-                    .or(camera.forwarding_progress.as_ref().map(|p| p.id.as_str()))
-                    .and_then(|id| book.recording(id));
+                camera.recordings = book.recordings_of(camera, now_ms);
             }
         }
         let mut state = self.inner.state.write().unwrap_or_else(|e| e.into_inner());
@@ -2924,7 +3093,9 @@ mod tests {
             transport: None,
             lost: 0,
             preview_skipped: 0,
-            record_job: None,
+            recordings: Vec::new(),
+            last_error_tag: None,
+            exited: false,
             stale: true,
             forwarding_id: Some(format!("{frames:032x}")),
             forwarding_progress: None,
@@ -2933,6 +3104,54 @@ mod tests {
             forwarding_until_ms: Some(frames * 1000 + 60_000),
         }
     }
+    #[test]
+    fn recordings_end_as_the_session_sees_them_end() {
+        let mut book = JobBook::default();
+        let reply = json!({"forwarding_id": "a", "since_ms": 1000, "until_ms": 5000});
+        let job = book.start_recording("sim:0", &reply, Some(1));
+        let running = |forwarding: Option<&str>, error_ms: Option<u64>| CameraSnapshot {
+            stale: false,
+            forwarding_id: forwarding.map(str::to_owned),
+            forwarding_progress: Some(ForwardingProgress {
+                id: "a".into(),
+                written: 3,
+                ..ForwardingProgress::default()
+            }),
+            error_logged_ms: error_ms,
+            last_error: error_ms.map(|_| "Forwarding stopped: refused".into()),
+            ..cached_camera("sim:0", 1)
+        };
+        // A snapshot from before the recording cannot end it.
+        let older = CameraSnapshot {
+            forwarding_progress: None,
+            ..running(None, Some(1))
+        };
+        assert!(book.recordings_of(&older, 2000)[0].running);
+        // An error while it runs does not end it; one as it stops does.
+        assert!(book.recordings_of(&running(Some("a"), Some(1500)), 2000)[0].running);
+        let failed = &book.recordings_of(&running(None, Some(2500)), 2500)[0];
+        assert_eq!((failed.job, failed.running), (job, false));
+        assert_eq!(failed.ended.as_deref(), Some("failed"));
+        assert_eq!(failed.error.as_deref(), Some("Forwarding stopped: refused"));
+        // Ended without an error near its end time: its timer ended it.
+        let mut book = JobBook::default();
+        book.start_recording("sim:0", &reply, None);
+        let timed = &book.recordings_of(&running(None, None), 4500)[0];
+        assert_eq!(timed.ended.as_deref(), Some("duration"));
+        let mut book = JobBook::default();
+        book.start_recording("sim:0", &reply, None);
+        let stopped = &book.recordings_of(&running(None, None), 2000)[0];
+        assert_eq!(stopped.ended.as_deref(), Some("stopped"));
+        // Every recording stays listed once it ends.
+        let next = json!({"forwarding_id": "b", "since_ms": 6000});
+        book.start_recording("sim:0", &next, None);
+        assert_eq!(book.recordings_of(&running(None, None), 6000).len(), 2);
+        assert!(
+            book.recordings_of(&cached_camera("sim:1", 1), 6000)
+                .is_empty()
+        );
+    }
+
     #[test]
     fn snapshot_commits_preserve_discovery_completed_during_a_poll() {
         let mut in_flight = SessionSnapshot {

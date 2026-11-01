@@ -533,7 +533,7 @@ impl Manager {
             file: Some(file),
             lease: Some(lease),
             lease_path,
-            reserve,
+            limit: reserve,
             written: 0,
             hash: Sha256::new(),
             reread: true,
@@ -1519,7 +1519,9 @@ pub struct StorageWriter {
     file: Option<File>,
     lease: Option<File>,
     lease_path: PathBuf,
-    reserve: u64,
+    /// The most it writes: its reservation, or more for a recording that
+    /// reserves a little and grows until stopped.
+    limit: u64,
     written: u64,
     hash: Sha256,
     /// Read the file back to confirm the streamed hash when finishing.
@@ -1540,7 +1542,7 @@ impl Write for StorageWriter {
         if self
             .written
             .checked_add(bytes.len() as u64)
-            .is_none_or(|size| size > self.reserve)
+            .is_none_or(|size| size > self.limit)
         {
             self.failed = true;
             self.cut = true;
@@ -1549,7 +1551,7 @@ impl Write for StorageWriter {
                 format!(
                     "Storage full: {} reached its maximum file size of {}; raise --max-size or record shorter segments",
                     self.path.display(),
-                    human_bytes(self.reserve)
+                    human_bytes(self.limit)
                 ),
             ));
         }
@@ -1782,6 +1784,23 @@ pub fn create_writer(
     reserve_bytes: u64,
 ) -> Result<StorageWriter> {
     Manager::global().writer(path, policy, reserve_bytes)
+}
+/// A writer that reserves `reserve_bytes` in the budget but may write up to
+/// `limit` bytes: a recording without a size cap, which must not hold the
+/// whole budget from other captures while it runs. Its real size is
+/// recorded when it finishes.
+pub fn create_growing_writer(
+    path: &Path,
+    policy: &StoragePolicy,
+    reserve_bytes: u64,
+    limit: u64,
+) -> Result<StorageWriter> {
+    let budget = policy
+        .constrained_by(&configured_policy().unwrap_or_default())
+        .max_bytes;
+    let mut writer = Manager::global().writer(path, policy, reserve_bytes.min(budget))?;
+    writer.limit = limit.max(writer.limit);
+    Ok(writer)
 }
 
 /// A finished output's size and SHA-256, as recorded in the ledger.
@@ -2019,6 +2038,31 @@ mod tests {
             "{error:#}"
         );
         assert!(!is_busy(&anyhow!("lock storage manager")));
+    }
+    #[test]
+    fn a_growing_writer_holds_only_its_reservation_while_it_writes() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let budget = policy(48, 10, "stop");
+        let mut growing = manager.writer(&temp.path("clip.mkv"), &budget, 4).unwrap();
+        growing.limit = u64::MAX;
+        growing
+            .write_all(b"a recording past its reservation")
+            .unwrap();
+        // Another save fits beside the bytes written, where reserving the
+        // whole budget up front would have refused it.
+        let mut shot = manager.writer(&temp.path("shot.raw"), &budget, 8).unwrap();
+        shot.write_all(b"shot").unwrap();
+        shot.finish().unwrap();
+        growing.finish().unwrap();
+        assert_eq!(fs::read(temp.path("clip.mkv")).unwrap().len(), 32);
+        assert_eq!(manager.lock().unwrap().allocated().unwrap(), 36);
+        // A capped writer still ends at its reservation.
+        let mut capped = manager
+            .writer(&temp.path("capped.mkv"), &policy(1024, 10, "stop"), 4)
+            .unwrap();
+        let error = capped.write_all(b"too long").unwrap_err();
+        assert!(error.to_string().contains("maximum file size"), "{error}");
     }
     /// A saved file whose ledger record waits behind another process's lock.
     fn saved_shot(temp: &Temp) -> (StorageWriter, PathBuf, File) {

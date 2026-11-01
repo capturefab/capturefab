@@ -20,6 +20,13 @@ const MAX_WARNINGS: usize = 10;
 
 /// Whether this process has printed, or is printing, its one document.
 static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Stdout carries something else (`capture -o -`'s image): the document,
+/// result or error, goes to stderr.
+static TO_STDERR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Send this invocation's document to stderr from now on.
+pub fn document_to_stderr() {
+    TO_STDERR.store(true, std::sync::atomic::Ordering::Release);
+}
 /// Take the right to print this invocation's document; false when a result
 /// or error already took it, as when a signal arrives as a command ends.
 pub fn claim() -> bool {
@@ -159,9 +166,15 @@ pub fn without_nulls(value: Value) -> Value {
 }
 
 pub fn write_json(value: &Value) -> io::Result<()> {
+    // One write, so the line is never split by other output.
+    let mut line = serde_json::to_vec(value)?;
+    line.push(b'\n');
+    if TO_STDERR.load(std::sync::atomic::Ordering::Acquire) {
+        let mut out = io::stderr().lock();
+        return out.write_all(&line).and_then(|()| out.flush());
+    }
     let mut out = io::stdout().lock();
-    serde_json::to_writer(&mut out, value)?;
-    out.write_all(b"\n")?;
+    out.write_all(&line)?;
     out.flush()
 }
 

@@ -6,31 +6,50 @@ use crate::session::{SessionCommand, validate_selector};
 use anyhow::{Context, Result};
 use std::path::Path;
 
-/// Local sources follow the same caller/file base as outputs. Network/device
-/// locators and discovered camera IDs are never rewritten.
+/// Local sources follow the same caller/file base as outputs, and an
+/// existing file or folder is named by its canonical path, so `a.png`,
+/// `./a.png` and `../here/a.png` are one camera. Network/device locators and
+/// discovered camera IDs are never rewritten.
 pub(crate) fn resolve_selector(selector: &mut String, base: &Path) -> Result<()> {
     // Preserve malformed-input errors: an empty local path must never become
     // the caller's valid current directory during absolute path resolution.
     validate_selector(selector)?;
     if let Some(path) = selector.strip_prefix("sim:replay:") {
         let mut path = path.to_owned();
-        resolve_path(&mut path, base)?;
+        resolve_source(&mut path, base)?;
         *selector = format!("sim:replay:{path}");
     } else if selector
         .get(..5)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
     {
         let path = &selector[5..];
-        if !path.starts_with("//") && Path::new(path).is_relative() {
+        if !path.starts_with("//") {
             let mut path = path.to_owned();
-            resolve_path(&mut path, base)?;
+            resolve_source(&mut path, base)?;
             *selector = format!("file:{path}");
         }
     } else if selector.parse::<std::net::Ipv4Addr>().is_err()
         && crate::media::is_recording(selector)
         && base.join(&*selector).is_file()
     {
-        resolve_path(selector, base)?;
+        resolve_source(selector, base)?;
+    }
+    Ok(())
+}
+
+/// A local source made absolute, and canonical when it exists.
+fn resolve_source(path: &mut String, base: &Path) -> Result<()> {
+    resolve_path(path, base)?;
+    if let Ok(canonical) = std::fs::canonicalize(&*path)
+        && let Some(canonical) = canonical.to_str()
+    {
+        // Windows canonical paths are verbatim (\\?\C:\...); keep the
+        // plain form a person would type.
+        *path = canonical
+            .strip_prefix(r"\\?\")
+            .filter(|plain| Path::new(plain).is_absolute())
+            .unwrap_or(canonical)
+            .to_owned();
     }
     Ok(())
 }
@@ -73,14 +92,42 @@ pub(crate) fn resolve_path(output: &mut String, base: &Path) -> Result<()> {
             && !path.is_absolute()),
         "drive-relative paths are ambiguous; use an absolute path or a relative path without a drive prefix"
     );
-    if path.is_relative() {
-        *output = base
-            .join(path)
-            .to_str()
-            .context("output path must be valid UTF-8")?
-            .to_owned();
+    let joined = if path.is_relative() {
+        base.join(path)
+    } else {
+        path.to_path_buf()
+    };
+    let mut normal = normalize(&joined)
+        .to_str()
+        .context("output path must be valid UTF-8")?
+        .to_owned();
+    // A trailing separator names a folder to fill.
+    if output.ends_with(std::path::is_separator) && !normal.ends_with(std::path::is_separator) {
+        normal.push(std::path::MAIN_SEPARATOR);
     }
+    *output = normal;
     Ok(())
+}
+
+/// `path` without `.` components, each `..` taking away the name before it:
+/// what the caller's words name, before any symbolic link is followed.
+fn normalize(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut normal = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir
+                if matches!(normal.components().next_back(), Some(Component::Normal(_))) =>
+            {
+                normal.pop();
+            }
+            // Above the root is the root.
+            Component::ParentDir if normal.has_root() => {}
+            component => normal.push(component),
+        }
+    }
+    normal
 }
 
 #[cfg(test)]
@@ -111,6 +158,44 @@ mod tests {
             let mut resolved = source.to_owned();
             resolve_selector(&mut resolved, &base).unwrap();
             assert_eq!(resolved, source);
+        }
+    }
+
+    #[test]
+    fn one_file_has_one_name_however_it_is_reached() {
+        let base = std::env::temp_dir().join(format!("capturefab-paths-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        std::fs::write(base.join("a.png"), b"x").unwrap();
+        let named = |selector: &str, base: &Path| {
+            let mut selector = selector.to_owned();
+            resolve_selector(&mut selector, base).unwrap();
+            selector
+        };
+        let canonical = std::fs::canonicalize(base.join("a.png")).unwrap();
+        for (selector, from) in [
+            ("a.png", base.clone()),
+            ("./a.png", base.clone()),
+            ("../a.png", base.join("sub")),
+        ] {
+            assert_eq!(
+                named(selector, &from),
+                canonical.to_str().unwrap(),
+                "{selector}"
+            );
+        }
+        assert_eq!(
+            named("sim:replay:./sub/../a.png", &base),
+            format!("sim:replay:{}", canonical.display())
+        );
+        std::fs::remove_dir_all(base).unwrap();
+        #[cfg(unix)]
+        {
+            let mut output = "./out/../shots/".to_owned();
+            resolve_path(&mut output, Path::new("/data/run")).unwrap();
+            assert_eq!(output, "/data/run/shots/");
+            let mut output = "/data/./x/../../../y.png".to_owned();
+            resolve_path(&mut output, Path::new("/elsewhere")).unwrap();
+            assert_eq!(output, "/y.png");
         }
     }
 

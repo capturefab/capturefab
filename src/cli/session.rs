@@ -96,9 +96,10 @@ fn start(global: &Global, args: StartArgs) -> Result<Report> {
             ipc::runtime_dir().display()
         ));
     }
+    let _turn = ipc::start_turn(&args.name)?;
     // A running session of that name is kept: it takes the cameras asked
     // for and stays at least the idle time asked for.
-    let (mut value, started) = match running(&args.name) {
+    let (mut value, started) = match ipc::running_session(&args.name) {
         Some(descriptor) => {
             ipc::keep(&args.name, args.idle)?;
             for selector in &cameras {
@@ -109,6 +110,26 @@ fn start(global: &Global, args: StartArgs) -> Result<Report> {
                 )?;
             }
             let descriptor = ipc::read_descriptor(&args.name).unwrap_or(descriptor);
+            if args.live {
+                // The cameras asked for, or without -c every one it holds.
+                let live = if cameras.is_empty() {
+                    descriptor
+                        .cameras
+                        .iter()
+                        .map(|camera| camera.id.clone())
+                        .collect()
+                } else {
+                    cameras.clone()
+                };
+                for camera in &live {
+                    ipc::call_to(
+                        &args.name,
+                        Some(camera),
+                        Request::Start,
+                        crate::session::default_request_timeout(&Request::Start),
+                    )?;
+                }
+            }
             (
                 json!({
                     "session": descriptor.name,
@@ -149,7 +170,10 @@ pub(super) fn ensure(
     idle: Duration,
     global: &Global,
 ) -> Result<()> {
-    if running(name).is_some() {
+    // Commands that need the session at once (the cameras of one capture,
+    // or several agents' calls) take turns: one starts it, the rest use it.
+    let _turn = ipc::start_turn(name)?;
+    if ipc::running_session(name).is_some() {
         return ipc::keep(name, idle);
     }
     let cameras = selector.map(str::to_owned).into_iter().collect::<Vec<_>>();
@@ -161,24 +185,30 @@ pub(super) fn ensure(
             }
             Ok(())
         }
-        // Another command started it first.
-        Err(error) if running(name).is_some() => {
-            let _ = error;
-            ipc::keep(name, idle)
-        }
+        // A session started another way, such as serve, took the name.
+        Err(_) if ipc::running_session(name).is_some() => ipc::keep(name, idle),
         Err(error) => Err(error),
     }
 }
 
-/// Session `name`'s descriptor, when its process runs.
-fn running(name: &str) -> Option<ipc::Descriptor> {
-    ipc::read_descriptor(name)
-        .ok()
-        .filter(|descriptor| ipc::process_alive(descriptor.pid))
+/// Session `name`'s descriptor when it runs, or `session_not_found`; what a
+/// session that was killed left under that name is removed.
+fn running(name: &str) -> Result<ipc::Descriptor> {
+    let descriptor = ipc::read_descriptor(name)?;
+    if ipc::running_session(name).is_some() {
+        return Ok(descriptor);
+    }
+    let _ = ipc::remove_stale(name);
+    Err(Categorized::new(
+        ErrorKind::SessionNotFound,
+        format!("session {name} is not running; it ended without cleaning up, and what it left is removed"),
+    )
+    .hint(format!("start it again with capturefab session start --name {name}"))
+    .into())
 }
 
 /// Where a detached session's output goes.
-fn log_path(name: &str) -> PathBuf {
+pub(super) fn log_path(name: &str) -> PathBuf {
     ipc::state_dir()
         .join("sessions")
         .join(format!("{name}.log"))
@@ -203,6 +233,22 @@ fn open_log(name: &str) -> Result<std::fs::File> {
     options
         .open(&path)
         .with_context(|| format!("cannot open the session log {}", path.display()))
+}
+
+/// Keep a running session's log near `MAX_LOG`: once it is larger, copy it
+/// over the older one and empty it. The session and its camera workers
+/// append to it, so they go on writing at its new end; what they write
+/// between the copy and the emptying is lost.
+pub(super) fn rotate_log(name: &str) {
+    rotate(&log_path(name), MAX_LOG);
+}
+fn rotate(path: &std::path::Path, most: u64) {
+    if std::fs::metadata(path).is_ok_and(|meta| meta.len() > most)
+        && std::fs::copy(path, path.with_extension("log.1")).is_ok()
+        && let Ok(file) = std::fs::OpenOptions::new().write(true).open(path)
+    {
+        let _ = file.set_len(0);
+    }
 }
 
 /// Start `serve` as a session of its own, detached from this terminal, and
@@ -418,7 +464,7 @@ fn named(global: &Global, name: Option<String>) -> Result<String> {
 
 fn stop(global: &Global, name: Option<String>) -> Result<Report> {
     let name = named(global, name)?;
-    let descriptor = ipc::read_descriptor(&name)?;
+    let descriptor = running(&name)?;
     let pid = descriptor.pid;
     let asked = ipc::stop(&descriptor);
     if let Err(error) = &asked {
@@ -432,7 +478,7 @@ fn stop(global: &Global, name: Option<String>) -> Result<Report> {
         }
     }
     let deadline = Instant::now() + STOP_WAIT;
-    while ipc::process_alive(pid) && running(&name).is_some() {
+    while ipc::process_alive(pid) && ipc::running_session(&name).is_some() {
         if Instant::now() >= deadline {
             return Err(Categorized::new(
                 ErrorKind::Timeout,
@@ -509,7 +555,7 @@ fn uptime(descriptor: &ipc::Descriptor) -> u64 {
 
 fn status(global: &Global, name: Option<String>) -> Result<Report> {
     let name = named(global, name)?;
-    let descriptor = ipc::read_descriptor(&name)?;
+    let descriptor = running(&name)?;
     let state = ipc::call(&name, Request::Status, Duration::from_secs(10))?;
     let cameras = state["cameras"]
         .as_array()
@@ -551,7 +597,9 @@ fn status(global: &Global, name: Option<String>) -> Result<Report> {
 
 /// A camera as `session status` shows it.
 fn camera_state(session: &str, camera: &Value) -> Value {
-    let state = if camera["forwarding"].is_string() {
+    let state = if camera["exited"] == true {
+        "error"
+    } else if camera["forwarding"].is_string() {
         "recording"
     } else if camera["streaming"] == true {
         "streaming"
@@ -629,7 +677,7 @@ pub const STATUS_FIELDS: &[(&str, &str)] = &[
     ("uptime_s", "int"),
     (
         "cameras",
-        "[{id,state:idle|streaming|recording,error?,frames?,dropped?,jobs:[job]}] — job as jobs lists it",
+        "[{id,state:idle|streaming|recording|error,error?,frames?,dropped?,jobs:[job]}] — job as jobs lists it; error: the camera's worker exited and the camera is unusable until the session is stopped",
     ),
 ];
 pub const LIST_FIELDS: &[(&str, &str)] =
@@ -640,3 +688,38 @@ pub const SERVE_FIELDS: &[(&str, &str)] = &[
     ("cameras", "[string] — camera IDs it holds"),
     ("ready", "bool — printed once the session takes requests"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn a_running_sessions_log_is_rotated_under_its_writers() {
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-session-log-{}-{}",
+            std::process::id(),
+            crate::scheduling::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bench.log");
+        // The session and its workers hold the log open to append.
+        let mut writer = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"small").unwrap();
+        rotate(&path, 16);
+        assert_eq!(std::fs::read(&path).unwrap(), b"small");
+        writer.write_all(b" and then much more").unwrap();
+        rotate(&path, 16);
+        assert_eq!(
+            std::fs::read(path.with_extension("log.1")).unwrap(),
+            b"small and then much more"
+        );
+        writer.write_all(b"next").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"next");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}

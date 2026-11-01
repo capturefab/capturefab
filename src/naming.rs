@@ -1,6 +1,7 @@
-//! Output file naming: templates with {camera}, {date}, {time}, {datetime},
-//! {seq}, {frame} and {tag:KEY}, and what to do when a name is taken. Names
-//! are picked only in the camera worker; the CLI validates and previews.
+//! Output file naming: templates with {camera}, {serial}, {date}, {time},
+//! {datetime}, {seq} (or {seq:N}), {frame}, {ext} and {tag:KEY}, and what to
+//! do when a name is taken. Names are picked only in the camera worker; the
+//! CLI validates and previews.
 //! {tag:KEY} is the capture context value for KEY made into one safe path
 //! component, so a label such as `defect` can choose a folder.
 use crate::{context::Context, storage::OutputExists, types::CameraInfo};
@@ -29,14 +30,18 @@ impl OnExists {
     }
 }
 
-pub const PLACEHOLDERS: [&str; 6] = ["camera", "date", "time", "datetime", "seq", "frame"];
+pub const PLACEHOLDERS: [&str; 8] = [
+    "camera", "serial", "date", "time", "datetime", "seq", "frame", "ext",
+];
 /// Names tried for one file before giving up on races with other writers.
 pub const MAX_ATTEMPTS: u32 = 64;
 /// Directory entries read to find the highest {seq} already used.
 pub const MAX_SCAN_ENTRIES: usize = 200_000;
 pub const MAX_SEQ: u32 = 99_999_999;
 const CACHE_KEYS: usize = 256;
-const PLACEHOLDER_ERROR: &str = "capture output supports only the {camera}, {date}, {time}, {datetime}, {seq}, {frame} and {tag:KEY} placeholders";
+const PLACEHOLDER_ERROR: &str = "capture output supports only the {camera}, {serial}, {date}, {time}, {datetime}, {seq}, {seq:N}, {frame}, {ext} and {tag:KEY} placeholders";
+/// The digits {seq} is padded to unless {seq:N} says otherwise.
+const SEQ_WIDTH: usize = 4;
 /// The longest expanded {tag:KEY} value, in bytes.
 pub const MAX_TAG_COMPONENT: usize = 128;
 
@@ -44,11 +49,15 @@ pub const MAX_TAG_COMPONENT: usize = 128;
 enum Token {
     Lit(String),
     Camera,
+    Serial,
     Date,
     Time,
     DateTime,
-    Seq,
+    /// The next free number, padded to this many digits.
+    Seq(usize),
     Frame,
+    /// The format's extension; [`Plan::new`] fills it in.
+    Ext,
     /// A capture context value, by key.
     Tag(String),
 }
@@ -64,11 +73,20 @@ fn tokens(template: &str) -> Result<Vec<Token>> {
         let close = rest[open..].find('}').context(PLACEHOLDER_ERROR)? + open;
         out.push(match &rest[open + 1..close] {
             "camera" => Token::Camera,
+            "serial" => Token::Serial,
             "date" => Token::Date,
             "time" => Token::Time,
             "datetime" => Token::DateTime,
-            "seq" => Token::Seq,
+            "seq" => Token::Seq(SEQ_WIDTH),
             "frame" => Token::Frame,
+            "ext" => Token::Ext,
+            seq if seq.starts_with("seq:") => {
+                let width = seq[4..]
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|width| (1..=9).contains(width));
+                Token::Seq(width.context("{seq:N} pads to N digits, 1 to 9, such as {seq:6}")?)
+            }
             tag if tag.starts_with("tag:") => {
                 let key = &tag[4..];
                 ensure!(
@@ -101,11 +119,11 @@ pub fn validate_output(output: &str) -> Result<()> {
 /// Check placeholder names and where {seq} may appear.
 pub fn validate_template(output: &str) -> Result<()> {
     let tokens = tokens(output)?;
-    let Some(seq) = tokens.iter().position(|t| *t == Token::Seq) else {
+    let Some(seq) = tokens.iter().position(|t| matches!(t, Token::Seq(_))) else {
         return Ok(());
     };
     ensure!(
-        tokens.iter().filter(|t| **t == Token::Seq).count() == 1,
+        tokens.iter().filter(|t| matches!(t, Token::Seq(_))).count() == 1,
         "capture output may use {{seq}} only once"
     );
     ensure!(
@@ -129,6 +147,7 @@ pub fn validate_template(output: &str) -> Result<()> {
 
 pub fn has_placeholder(output: &str) -> bool {
     output.contains("{tag:")
+        || output.contains("{seq:")
         || PLACEHOLDERS
             .iter()
             .any(|p| output.contains(&format!("{{{p}}}")))
@@ -285,15 +304,18 @@ pub fn format_mismatch(output: &str, format: &str) -> Option<String> {
     ))
 }
 
-/// A template written once per frame needs a name that changes per frame.
+/// A template written once per frame needs a name that changes per frame:
+/// {seq}, {frame} or {time}, or a folder, whose frames are numbered.
 pub fn validate_for_count(output: &str, count: u32, on_exists: OnExists) -> Result<()> {
     ensure!(
         count <= 1
             || !has_placeholder(output)
-            || output.contains("{frame}")
-            || output.contains("{seq}")
+            || names_directory(output)
+            || ["{frame}", "{seq}", "{seq:", "{time}"]
+                .iter()
+                .any(|placeholder| output.contains(placeholder))
             || on_exists == OnExists::Number,
-        "a multi-frame template needs {{frame}} or {{seq}}, or on_exists number"
+        "a multi-frame template needs {{seq}}, {{frame}} or {{time}}, or --on-exists number"
     );
     Ok(())
 }
@@ -317,10 +339,41 @@ pub fn validate_request(
     Ok(())
 }
 
+/// What {camera} and {serial} name a camera's files with.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CameraName {
+    /// `model-serial`, from [`camera_label`].
+    pub label: String,
+    /// The serial number made file-name-safe the same way, or `unknown`.
+    pub serial: String,
+}
+/// The names {camera} and {serial} give `info`'s files.
+pub fn camera_name(info: &CameraInfo) -> CameraName {
+    let serial = safe_label(&info.serial);
+    CameraName {
+        label: camera_label(info),
+        serial: if serial.is_empty() {
+            "unknown".into()
+        } else {
+            serial
+        },
+    }
+}
+
 /// A file-name-safe camera label, `model-serial`. It never uses the camera's
 /// ID or address, so URL credentials cannot reach a file name.
 pub fn camera_label(info: &CameraInfo) -> String {
-    let raw = format!("{}-{}", info.model, info.serial);
+    let label = safe_label(&format!("{}-{}", info.model, info.serial));
+    if label.is_empty() {
+        "camera".into()
+    } else {
+        label
+    }
+}
+/// `raw` limited to `A-Z a-z 0-9 . _ -` (other characters become one `-`)
+/// and 64 bytes, without leading or trailing `-` and `.`; empty for a
+/// Windows device name.
+fn safe_label(raw: &str) -> String {
     let mut label = String::new();
     for c in raw.chars() {
         let c = if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
@@ -343,23 +396,25 @@ pub fn camera_label(info: &CameraInfo) -> String {
             && stem.len() == 4
             && stem.as_bytes()[3].is_ascii_digit()
             && stem.as_bytes()[3] != b'0');
-    if label.is_empty() || reserved {
-        "camera".into()
-    } else {
-        label
-    }
+    if reserved { String::new() } else { label }
 }
+
+/// {time}: the date and the time to the millisecond, so names made in the
+/// same second differ.
+const TIME_FORMAT: &str = "%Y%m%d-%H%M%S%.3f";
 
 fn expand(token: &Token, input: &NameInput) -> Result<String> {
     Ok(match token {
         Token::Lit(s) => s.clone(),
-        Token::Camera => input.camera.into(),
+        Token::Camera => input.camera.label.clone(),
+        Token::Serial => input.camera.serial.clone(),
         Token::Date => input.now.format("%Y-%m-%d").to_string(),
-        Token::Time => input.now.format("%H%M%S").to_string(),
+        Token::Time => input.now.format(TIME_FORMAT).to_string(),
         Token::DateTime => input.now.format("%Y%m%d-%H%M%S").to_string(),
         Token::Frame => format!("{:06}", input.index.saturating_add(1)),
         Token::Tag(key) => tag_value(key, input.context)?,
-        Token::Seq => unreachable!("{{seq}} is chosen by the namer"),
+        Token::Ext => bail!("{{ext}} names an image format; a recording's name gives its own"),
+        Token::Seq(_) => unreachable!("{{seq}} is chosen by the namer"),
     })
 }
 
@@ -383,29 +438,35 @@ pub fn check_free(path: &Path) -> Result<()> {
 pub enum Plan {
     Stdout,
     File(PathBuf),
-    /// `frame-NNNNNN.ext`, continuing after the highest existing number.
+    /// `{camera}-{time}-{seq}.ext`, continuing after the highest number
+    /// the camera's files there have.
     Directory {
         dir: PathBuf,
         ext: String,
     },
     Template(String),
 }
+/// The names a folder's frames get.
+const FOLDER_NAMES: &str = "{camera}-{time}-{seq}.{ext}";
 impl Plan {
     /// A name ending in a separator, a sequence without a placeholder and
-    /// an existing folder number `frame-NNNNNN.ext` files in that folder. A
-    /// file name or template whose last component has no extension gets the
-    /// format's, so the name says what the file holds.
+    /// an existing folder name `{camera}-{time}-{seq}.ext` files in that
+    /// folder. A file name or template whose last component has no
+    /// extension gets the format's, so the name says what the file holds;
+    /// {ext} is the format's.
     pub fn new(output: &str, count: u32, format: &str) -> Plan {
         if output == "-" {
             Plan::Stdout
         } else if has_placeholder(output) {
             // A templated folder still names a folder: its frames are
-            // numbered inside it, like an untemplated one.
-            if names_directory(output) {
-                Plan::Template(with_extension(&format!("{output}frame-{{seq}}"), format))
+            // named inside it, like an untemplated one's.
+            let template = if names_directory(output) {
+                format!("{output}{FOLDER_NAMES}")
             } else {
-                Plan::Template(with_extension(output, format))
-            }
+                output.to_owned()
+            };
+            let template = template.replace("{ext}", format_extension(format));
+            Plan::Template(with_extension(&template, format))
         } else if names_directory(output) || count > 1 || Path::new(output).is_dir() {
             Plan::Directory {
                 dir: output.into(),
@@ -437,12 +498,14 @@ impl Plan {
     }
 }
 
-/// Whether a taken name is replaced by the next free one rather than failing.
+/// Whether a taken name is replaced by the next free one rather than
+/// failing: names with {seq}, or with {time}, which a name taken in the
+/// same millisecond must not fail on.
 pub fn renumbers(plan: &Plan, on_exists: OnExists) -> bool {
     match plan {
         Plan::Stdout => false,
         Plan::Directory { .. } => true,
-        Plan::Template(t) if t.contains("{seq}") => true,
+        Plan::Template(t) if t.contains("{seq") || t.contains("{time}") => true,
         _ => on_exists == OnExists::Number,
     }
 }
@@ -472,7 +535,7 @@ pub fn validate_offset(utc_offset_s: Option<i32>) -> Result<()> {
 
 /// What a name is built from, taken once per frame before it is requested.
 pub struct NameInput<'a> {
-    pub camera: &'a str,
+    pub camera: &'a CameraName,
     pub now: DateTime<FixedOffset>,
     pub index: u32,
     /// The capture context that fills {tag:KEY}.
@@ -480,7 +543,8 @@ pub struct NameInput<'a> {
 }
 
 /// One part of a numbered file name. A stamp matches any text of its length
-/// made of digits and dashes, so numbering continues across seconds and days.
+/// made of digits, dashes and dots, so numbering continues across seconds
+/// and days.
 enum Part {
     Lit(String),
     Stamp(String),
@@ -507,22 +571,34 @@ impl Namer {
             Plan::Directory { dir, ext } => self.numbered(
                 dir,
                 vec![
-                    Part::Lit("frame-".into()),
+                    Part::Lit(format!("{}-", input.camera.label)),
+                    Part::Stamp(input.now.format(TIME_FORMAT).to_string()),
+                    Part::Lit("-".into()),
                     Part::Seq,
-                    Part::Lit(format!(".{ext}")),
+                    Part::Lit(format!(".{}", format_extension(ext))),
                 ],
-                6,
+                SEQ_WIDTH,
                 plan,
             ),
             Plan::File(path) => self.fixed(path.clone(), on_exists, plan),
             Plan::Template(template) => {
                 let tokens = tokens(template)?;
-                let Some(seq) = tokens.iter().position(|t| *t == Token::Seq) else {
+                let Some(seq) = tokens.iter().position(|t| matches!(t, Token::Seq(_))) else {
                     let name = tokens
                         .iter()
                         .map(|t| expand(t, input))
                         .collect::<Result<String>>()?;
+                    // A {time} name taken in the same millisecond is
+                    // numbered rather than failing.
+                    let on_exists = if tokens.contains(&Token::Time) {
+                        OnExists::Number
+                    } else {
+                        on_exists
+                    };
                     return self.fixed(name.into(), on_exists, plan);
+                };
+                let Token::Seq(width) = tokens[seq] else {
+                    unreachable!("found as {{seq}}")
                 };
                 // {seq} is in the final component: split the text before it
                 // at the last separator into the folder and the name prefix.
@@ -570,7 +646,7 @@ impl Namer {
                         _ => parts.push(Part::Lit(text)),
                     }
                 }
-                self.numbered(&dir, parts, 4, plan)
+                self.numbered(&dir, parts, width, plan)
             }
         }
     }
@@ -692,7 +768,10 @@ fn matches(mut name: &str, parts: &[Part]) -> Option<u32> {
             Part::Lit(s) => name = name.strip_prefix(s.as_str())?,
             Part::Stamp(s) => {
                 let head = name.get(..s.len())?;
-                if !head.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                if !head
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b == b'-' || b == b'.')
+                {
                     return None;
                 }
                 name = &name[s.len()..];
@@ -753,15 +832,74 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_templated_folder_numbers_frames_inside_it() {
+    fn a_templated_folder_names_frames_inside_it() {
         assert_eq!(
             Plan::new("dataset/{tag:label}/", 3, "png"),
-            Plan::Template("dataset/{tag:label}/frame-{seq}.png".into())
+            Plan::Template("dataset/{tag:label}/{camera}-{time}-{seq}.png".into())
         );
         assert_eq!(
             Plan::new("dataset/{tag:label}/", 1, "jpeg"),
-            Plan::Template("dataset/{tag:label}/frame-{seq}.jpg".into())
+            Plan::Template("dataset/{tag:label}/{camera}-{time}-{seq}.jpg".into())
         );
+        validate_for_count("out/{camera}/", 2, OnExists::Fail).unwrap();
+    }
+
+    #[test]
+    fn serials_seq_widths_and_extensions() {
+        let dir = temp("placeholders");
+        let mut namer = Namer::default();
+        let plan = Plan::new(
+            &format!("{}/{{serial}}-{{seq:6}}.{{ext}}", dir.display()),
+            1,
+            "jpeg",
+        );
+        assert_eq!(
+            plan,
+            Plan::Template(format!("{}/{{serial}}-{{seq:6}}.jpg", dir.display()))
+        );
+        assert_eq!(
+            namer
+                .candidate(&plan, &input(fixed_time()), OnExists::Fail)
+                .unwrap(),
+            dir.join("SN1-000001.jpg")
+        );
+        for bad in [
+            "{seq:0}.png",
+            "{seq:10}.png",
+            "{seq:x}.png",
+            "{seq:4}-{seq}.png",
+        ] {
+            assert!(validate_template(bad).is_err(), "{bad}");
+        }
+        // {time} reads to the millisecond, and a name taken in that
+        // millisecond is numbered rather than failing.
+        let plan = Plan::new(&format!("{}/{{time}}.png", dir.display()), 1, "png");
+        let first = namer
+            .candidate(&plan, &input(fixed_time()), OnExists::Fail)
+            .unwrap();
+        assert_eq!(first, dir.join("20261017-101500.000.png"));
+        std::fs::write(&first, b"x").unwrap();
+        assert_eq!(
+            namer
+                .candidate(&plan, &input(fixed_time()), OnExists::Fail)
+                .unwrap(),
+            dir.join("20261017-101500.000-0001.png")
+        );
+        assert!(renumbers(&plan, OnExists::Fail));
+        validate_for_count("{time}.png", 5, OnExists::Fail).unwrap();
+        let mut unnamed = CameraInfo {
+            id: "sim:0".into(),
+            transport: crate::types::Transport::Simulator,
+            vendor: String::new(),
+            model: "M".into(),
+            serial: "A/B 7".into(),
+            address: None,
+            profile: Default::default(),
+        };
+        assert_eq!(camera_name(&unnamed).serial, "A-B-7");
+        unnamed.serial.clear();
+        assert_eq!(camera_name(&unnamed).serial, "unknown");
+        std::fs::remove_dir_all(dir).unwrap();
     }
     use chrono::TimeZone;
 
@@ -775,9 +913,15 @@ mod tests {
         dir
     }
     static NO_TAGS: Context = Context::new();
+    fn camera(label: &str) -> &'static CameraName {
+        Box::leak(Box::new(CameraName {
+            label: label.into(),
+            serial: "SN1".into(),
+        }))
+    }
     fn input(now: DateTime<FixedOffset>) -> NameInput<'static> {
         NameInput {
-            camera: "Model-SN1",
+            camera: camera("Model-SN1"),
             now,
             index: 0,
             context: &NO_TAGS,
@@ -826,7 +970,7 @@ mod tests {
             validate_template("{x}")
                 .unwrap_err()
                 .to_string()
-                .contains("supports only the {camera}")
+                .contains("supports only the {camera}, {serial}")
         );
         validate_for_count("d/{camera}.png", 1, OnExists::Fail).unwrap();
         validate_for_count("d/{camera}.png", 2, OnExists::Number).unwrap();
@@ -893,7 +1037,7 @@ mod tests {
         ));
         let mut namer = Namer::default();
         let mut input = input(fixed_time());
-        input.camera = "A";
+        input.camera = camera("A");
         let first = namer.candidate(&plan, &input, OnExists::Fail).unwrap();
         assert_eq!(first, dir.join("A-20261017-101500-0013.png"));
         // A name handed out is not handed out again before it exists.
@@ -938,7 +1082,11 @@ mod tests {
             );
         }
         for i in 1..=3 {
-            std::fs::write(dir.join(format!("frame-{i:06}.raw")), b"x").unwrap();
+            std::fs::write(
+                dir.join(format!("Model-SN1-20261016-090000.000-{i:04}.raw")),
+                b"x",
+            )
+            .unwrap();
         }
         let plan = Plan::new(dir.to_str().unwrap(), 1, "raw");
         assert!(matches!(plan, Plan::Directory { .. }) && !plan.is_static());
@@ -946,7 +1094,7 @@ mod tests {
             namer
                 .candidate(&plan, &input(fixed_time()), OnExists::Fail)
                 .unwrap(),
-            dir.join("frame-000004.raw")
+            dir.join("Model-SN1-20261017-101500.000-0004.raw")
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

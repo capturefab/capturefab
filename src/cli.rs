@@ -92,6 +92,10 @@ pub struct Global {
     /// that --no-session and binary stdout override.
     #[arg(skip)]
     pub session_from_env: bool,
+    /// The command's --keep came from CAPTUREFAB_KEEP: a default that
+    /// --no-session and binary stdout override.
+    #[arg(skip)]
+    pub keep_from_env: bool,
 }
 impl Global {
     /// Let `--no-session` override a CAPTUREFAB_SESSION default; both typed
@@ -262,6 +266,7 @@ pub fn main() -> i32 {
     if let Err(error) = cli.global.settle_session(typed) {
         return out.error(&error);
     }
+    cli.global.keep_from_env = keep_from_env(&matches);
     if let Err(error) = signals::install(out) {
         return out.error(&error);
     }
@@ -270,6 +275,16 @@ pub fn main() -> i32 {
         Ok(None) => 0,
         Err(error) => out.error(&error),
     }
+}
+
+/// Whether the command's `--keep` came from CAPTUREFAB_KEEP.
+fn keep_from_env(matches: &clap::ArgMatches) -> bool {
+    let mut matches = matches;
+    while let Some((_, sub)) = matches.subcommand() {
+        matches = sub;
+    }
+    matches.ids().any(|id| id == "keep")
+        && matches.value_source("keep") == Some(clap::parser::ValueSource::EnvVariable)
 }
 
 fn clap_failure(error: &clap::Error, json: bool) -> i32 {
@@ -474,6 +489,15 @@ impl Client {
     pub fn open_with(global: &Global, selector: Option<&str>, route: Route) -> Result<Self> {
         let selector = selector.map(caller_selector).transpose()?;
         let out = global.output();
+        // CAPTUREFAB_KEEP is a default, which --no-session overrides.
+        let route = if global.no_session && global.keep_from_env {
+            Route {
+                keep: None,
+                ..route
+            }
+        } else {
+            route
+        };
         if route.needs_session() && global.no_session {
             return Err(Usage(
                 "--keep and --background run through a session; drop --no-session".into(),
@@ -566,38 +590,7 @@ impl Client {
         // camera connected later does not change what this command uses.
         if selector.is_none() {
             let cameras = reply["cameras"].as_array().cloned().unwrap_or_default();
-            client.target = match cameras.as_slice() {
-                [camera] => camera["info"]["id"].as_str().map(str::to_owned),
-                [] => {
-                    return Err(Unusable::Failed(
-                        Categorized::new(
-                            ErrorKind::CameraNotFound,
-                            format!("session '{name}' has no camera connected"),
-                        )
-                        .hint("name one with -c CAMERA")
-                        .details(json!({"candidates": []}))
-                        .into(),
-                    ));
-                }
-                cameras => {
-                    let ids = cameras
-                        .iter()
-                        .filter_map(|camera| camera["info"]["id"].as_str())
-                        .map(|id| json!({"id": crate::media::redact_url(id)}))
-                        .collect::<Vec<_>>();
-                    return Err(Unusable::Failed(
-                        Categorized::new(
-                            ErrorKind::CameraAmbiguous,
-                            format!(
-                                "session '{name}' has {} cameras connected; choose one with -c",
-                                ids.len()
-                            ),
-                        )
-                        .details(json!({ "candidates": ids }))
-                        .into(),
-                    ));
-                }
-            };
+            client.target = Some(only_camera(name, &cameras).map_err(Unusable::Failed)?);
         }
         Ok(client)
     }
@@ -641,6 +634,40 @@ impl Client {
     /// The worker of this command, without a session.
     pub fn local(&self) -> Option<&SessionHandle> {
         self.local.as_ref()
+    }
+}
+
+/// The only camera of session `name`, whose status lists `cameras`; with
+/// none or several, which to name, with credentials redacted.
+fn only_camera(name: &str, cameras: &[Value]) -> Result<String> {
+    match cameras {
+        [camera] => camera["info"]["id"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("session '{name}' lists a camera without an ID")),
+        [] => Err(Categorized::new(
+            ErrorKind::CameraNotFound,
+            format!("session '{name}' has no camera connected"),
+        )
+        .hint("name one with -c CAMERA")
+        .details(json!({"candidates": []}))
+        .into()),
+        cameras => {
+            let ids = cameras
+                .iter()
+                .filter_map(|camera| camera["info"]["id"].as_str())
+                .map(|id| json!({"id": crate::media::redact_url(id)}))
+                .collect::<Vec<_>>();
+            Err(Categorized::new(
+                ErrorKind::CameraAmbiguous,
+                format!(
+                    "session '{name}' has {} cameras connected; choose one with -c",
+                    ids.len()
+                ),
+            )
+            .details(json!({ "candidates": ids }))
+            .into())
+        }
     }
 }
 
@@ -813,6 +840,27 @@ mod tests {
         let mut flag = global(Some("bench"), false);
         flag.settle_session(true).unwrap();
         assert!(!flag.session_from_env);
+    }
+
+    #[test]
+    fn a_session_command_without_a_camera_is_for_its_only_one() {
+        let camera = |id: &str| json!({"info": {"id": id}});
+        assert_eq!(
+            only_camera("bench", &[camera("rtsp://user:secret@cam/live")]).unwrap(),
+            "rtsp://user:secret@cam/live"
+        );
+        let none = only_camera("bench", &[]).unwrap_err();
+        assert_eq!(error_code(&none), ("camera_not_found", 3));
+        let several = only_camera(
+            "bench",
+            &[camera("rtsp://user:secret@cam/live"), camera("sim:0")],
+        )
+        .unwrap_err();
+        assert_eq!(error_code(&several), ("camera_ambiguous", 2));
+        let details = crate::types::classify(&several).details.unwrap();
+        assert_eq!(details["candidates"].as_array().unwrap().len(), 2);
+        assert!(!details.to_string().contains("secret"), "{details}");
+        assert!(!format!("{several:#}").contains("secret"));
     }
 
     #[test]

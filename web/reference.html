@@ -152,7 +152,7 @@
 <p>Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites. Effect: file_write.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-<tr><td><code>-o</code>, <code>--output</code></td><td>File, folder (existing, or ending in /) or template with {camera} {seq} {frame} {date} {time} {datetime} {tag:KEY}; - writes one image to stdout (default: this folder)</td><td>—</td></tr>
+<tr><td><code>-o</code>, <code>--output</code></td><td>File, folder (existing, or ending in /) or template with {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; - writes one image to stdout (default: this folder, as {camera}-{time}-{seq}.png)</td><td>—</td></tr>
 <tr><td><code>-n</code>, <code>--count</code></td><td>Frames to save, 1..100000</td><td>—</td></tr>
 <tr><td><code>--every</code></td><td>Time between frames of a time lapse, with -n or --for</td><td>—</td></tr>
 <tr><td><code>--for</code></td><td>How long a time lapse runs, with --every</td><td>—</td></tr>

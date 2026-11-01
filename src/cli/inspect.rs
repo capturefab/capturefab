@@ -3,7 +3,12 @@
 //! thread; this turns the measurements into a short document with a
 //! verdict, a suggested exposure and a preview image in a private folder.
 use super::{Client, Global, args::CamerasArg, args::KeepArg, output::Report};
-use crate::{controls::Assignment, inspect::PreviewFormat, session::SessionCommand, types::Usage};
+use crate::{
+    controls::Assignment,
+    inspect::PreviewFormat,
+    session::SessionCommand,
+    types::{Categorized, ErrorKind, Usage},
+};
 use anyhow::{Context, Result, anyhow};
 use clap::Args;
 use serde_json::{Value, json};
@@ -60,6 +65,9 @@ static NEXT_IMAGE: AtomicU64 = AtomicU64::new(1);
 const WAIT: Duration = Duration::from_secs(5);
 /// Brightness auto exposure aims for, as `auto` does.
 const TARGET: f64 = 0.45;
+/// The clipped share past which a frame says too little to suggest an
+/// exact exposure.
+const SATURATED: f64 = 0.25;
 
 /// Where previews go unless --preview says otherwise: private, bounded,
 /// and shown by doctor, so a person can allow reading it once.
@@ -179,17 +187,19 @@ fn inspect(
         },
         _ => PreviewFormat::Auto,
     };
-    let reply = client.call(SessionCommand::Frame {
-        fresh: args.fresh,
-        timeout_ms: super::millis(WAIT),
-        max_dimension: if matches!(preview, Preview::None) {
-            0
-        } else {
-            args.size
-        },
-        format,
-        region: args.region,
-    })?;
+    let reply = client
+        .call(SessionCommand::Frame {
+            fresh: args.fresh,
+            timeout_ms: super::millis(WAIT),
+            max_dimension: if matches!(preview, Preview::None) {
+                0
+            } else {
+                args.size
+            },
+            format,
+            region: args.region,
+        })
+        .map_err(trigger_hint)?;
     let mut value = document(&info, &reply, verbose);
     if let Some(image) = reply.get("image").filter(|image| image.is_object()) {
         let path = deliver(image, preview, &info)?;
@@ -198,6 +208,27 @@ fn inspect(
         }
     }
     Ok(value)
+}
+
+/// A trigger timeout says what inspect can do about it: it has no
+/// --timeout of its own.
+fn trigger_hint(error: anyhow::Error) -> anyhow::Error {
+    let classified = crate::types::classify(&error);
+    if classified.kind != ErrorKind::TriggerTimeout {
+        return error;
+    }
+    let source = classified
+        .details
+        .as_ref()
+        .and_then(|details| details["trigger"]["source"].as_str())
+        .unwrap_or("its line")
+        .to_owned();
+    let mut error = Categorized::new(classified.kind, format!("{error:#}")).hint(format!(
+        "send a trigger on {source} within {}, or inspect with --set trigger=off",
+        super::args::duration_text(WAIT)
+    ));
+    error.details = classified.details;
+    error.into()
 }
 
 /// The compact document: what an agent needs to judge the frame and what to
@@ -296,9 +327,17 @@ fn suggest(info: &Value, reply: &Value) -> Option<Value> {
         p99: p99.max(1.0 / 255.0),
     });
     // Clipped highlights are lost detail whatever the mean says: go at
-    // least a third of a stop darker.
-    if exposure["highlights"].as_f64().unwrap_or(0.0) > crate::inspect::CLIP_WARN {
+    // least a third of a stop darker. Past saturation nothing shows how
+    // much darker, so a mostly clipped frame steps further the more of it
+    // is clipped (4 stops when all of it is), and the suggestion is a
+    // bound to measure again.
+    let clipped = exposure["highlights"].as_f64().unwrap_or(0.0);
+    if clipped > crate::inspect::CLIP_WARN {
         ev = ev.min(-1.0 / 3.0);
+    }
+    let saturated = clipped > SATURATED;
+    if saturated {
+        ev = ev.min(-(1.0 + 3.0 * clipped.min(1.0)));
     }
     if !ev.is_finite() || ev.abs() < 0.1 || (mean - TARGET).abs() < 0.03 && ev.abs() < 0.25 {
         return None;
@@ -327,6 +366,9 @@ fn suggest(info: &Value, reply: &Value) -> Option<Value> {
         } else if wanted <= min {
             value["limited_by"] = json!("exposure_min");
         }
+    }
+    if saturated && value.get("limited_by").is_none() {
+        value["limited_by"] = json!("clipped");
     }
     Some(value)
 }
@@ -526,7 +568,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ),
     (
         "suggest",
-        "{ev,exposure_us?,limited_by?} — how far to move exposure, in stops, toward mid-grey without clipping highlights; absent when close enough",
+        "{ev,exposure_us?,limited_by?:exposure_max|exposure_min|clipped} — how far to move exposure, in stops, toward mid-grey without clipping highlights; absent when close enough. clipped: most of the frame is clipped, so this is a first step; inspect again",
     ),
     (
         "focus",
@@ -635,6 +677,13 @@ mod tests {
         assert!(suggest(&info, &bright).unwrap()["ev"].as_f64().unwrap() <= -0.33);
         let fine = json!({"exposure": {"mean": 0.45, "p99": 0.8}});
         assert!(suggest(&info, &fine).is_none());
+        // A saturated frame cannot say how far to go: a big first step.
+        let info = json!({"exposure_us": 1e6, "controls": {"exposure": {"unit": "us", "min": 10.0, "max": 2e6}}});
+        let white = json!({"exposure": {"mean": 1.0, "p99": 1.0, "highlights": 1.0}});
+        let suggested = suggest(&info, &white).unwrap();
+        assert_eq!(suggested["ev"], -4.0);
+        assert_eq!(suggested["exposure_us"], 62500.0);
+        assert_eq!(suggested["limited_by"], "clipped");
     }
 
     #[test]

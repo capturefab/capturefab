@@ -495,7 +495,7 @@ fn overview() -> Value {
             "selector": "list id (gige:…, u3v:…, avfoundation:…, v4l2:…, dshow:…), serial, IPv4, rtsp(s)://, srt://, http(s)://, onvif://host[/path], file path, sim:N, sim:replay:PATH",
             "name": "Feature | Feature[Selector=Value,…] | Feature[Value] (when one selector addresses it) | control: exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb",
             "duration": "number+unit, repeatable: 500us, 250ms, 2s, 1.5s, 5m, 1h30m; 0; none where a wait may be unlimited. A bare number is invalid_duration",
-            "template": "-o: {camera} {seq} {frame} {date} {time} {datetime} {tag:KEY}; a folder (existing or ending in /) holds numbered files"
+            "template": "-o: {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; a folder holds {camera}-{time}-{seq}.{ext}; a taken name fails without {seq}, {time} or --on-exists number"
         },
         "exit_codes": exit_codes,
         "errors": errors,

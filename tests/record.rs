@@ -187,5 +187,205 @@ fn serve_finishes_a_recording_on_a_signal() {
         assert!(exit.success(), "{name}: {exit:?}");
         assert!(std::fs::metadata(&clip).unwrap().len() > 0);
         assert!(decodes(Path::new(&clip)), "{name}");
+        // Complete in the storage ledger too, with nothing left reserved.
+        let storage = home.ok(&["storage", "status"]);
+        assert_eq!(storage["files"], 1, "{name}: {storage}");
+        assert_eq!(storage["active_reservations"], 0, "{name}: {storage}");
+        assert_eq!(storage["reserved_bytes"], 0, "{name}: {storage}");
     }
+}
+
+/// A timed recording in a session ends on time, by the session, while other
+/// cameras connect to that session.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_session_recording_ends_on_time_while_other_cameras_connect() {
+    let home = Home::new("record-session-timed");
+    let _serve = home.serve("rec", &["sim:recording"]);
+    home.ok(&["set", "-c", "sim:recording", "Width=64", "Height=64"]);
+    let started = Instant::now();
+    let recording = home
+        .command()
+        .args([
+            "--json",
+            "record",
+            "-c",
+            "sim:recording",
+            "-o",
+            "clip.mkv",
+            "--for",
+            "2s",
+            "--fps",
+            "10",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !home.ok(&["jobs"])["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|job| job["kind"] == "record" && job["state"] == "running")
+    {
+        assert!(Instant::now() < deadline, "the recording did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    home.ok(&["--session", "rec", "get", "-c", "sim:other", "Width"]);
+    home.ok(&["--session", "rec", "get", "-c", "sim:third", "Width"]);
+    let finished = recording.wait_with_output().unwrap();
+    assert_eq!(
+        finished.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&finished.stderr)
+    );
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    let result: Value = serde_json::from_slice(&finished.stdout).unwrap();
+    assert_eq!(result["ended"], "duration", "{result}");
+    assert!(decodes(&home.path("clip.mkv")));
+    let status = home.ok(&["session", "status", "rec"]);
+    let cameras = status["cameras"].as_array().unwrap();
+    assert_eq!(cameras.len(), 3, "{status}");
+    assert!(
+        cameras.iter().all(|camera| camera["state"] != "recording"),
+        "{status}"
+    );
+}
+
+/// A short timed recording that fails as it starts fails the command, however
+/// close to its end it fails.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_short_timed_recording_that_cannot_start_fails() {
+    let home = Home::new("record-cannot-start");
+    for duration in ["1s", "2s", "10s"] {
+        let refused = home.fails(
+            1,
+            &[
+                "record",
+                "-c",
+                "sim:0",
+                "-o",
+                "rtsp://127.0.0.1:9/refused",
+                "--for",
+                duration,
+            ],
+        );
+        assert_eq!(refused["code"], "failed", "{duration}: {refused}");
+        assert!(
+            refused["message"].as_str().unwrap().contains("refused"),
+            "{duration}: {refused}"
+        );
+        assert_eq!(refused["details"]["job"]["state"], "failed");
+    }
+}
+
+/// A recording without --max-size holds little of the storage budget, so
+/// captures and other recordings run beside it; and every recording stays a
+/// job once it ends, however many follow on its camera.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn recordings_leave_room_and_stay_listed() {
+    let home = Home::new("record-room");
+    let first = home.ok(&["record", "-c", "sim:0", "-o", "open.mkv", "--background"]);
+    let open = first["job"]["id"].as_str().unwrap().to_owned();
+    let storage = home.ok(&["storage", "status"]);
+    assert!(
+        storage["reserved_bytes"].as_u64().unwrap() <= 64 * 1024 * 1024,
+        "{storage}"
+    );
+    home.ok(&["capture", "-c", "sim:0", "-o", "beside.png"]);
+    home.ok(&["capture", "-c", "sim:1", "-o", "other.png"]);
+    home.ok(&["record", "-c", "sim:1", "-o", "second.mkv", "--for", "1s"]);
+    home.ok(&["jobs", "stop", &open]);
+    let short = home.ok(&[
+        "record",
+        "-c",
+        "sim:0",
+        "-o",
+        "r1.mkv",
+        "--for",
+        "500ms",
+        "--background",
+    ]);
+    let r1 = short["job"]["id"].as_str().unwrap().to_owned();
+    home.ok(&["jobs", "wait", &r1]);
+    let again = home.ok(&[
+        "record",
+        "-c",
+        "sim:0",
+        "-o",
+        "r2.mkv",
+        "--for",
+        "500ms",
+        "--background",
+    ]);
+    let r2 = again["job"]["id"].as_str().unwrap().to_owned();
+    assert_ne!(r1, r2);
+    for id in [&open, &r1, &r2] {
+        let done = home.ok(&["jobs", "wait", id, "--timeout", "10s"]);
+        assert_eq!(done["job"]["state"], "done", "{id}: {done}");
+    }
+    assert_eq!(
+        home.ok(&["jobs", "wait", &r1])["job"]["last_file"],
+        serde_json::json!(home.real("r1.mkv"))
+    );
+}
+
+/// A recording that fails for lack of room says so with its own reason,
+/// as a capture would.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_recording_without_room_fails_as_storage_full() {
+    let home = Home::new("record-full");
+    home.ok(&["storage", "configure", "--max-space", "1MiB"]);
+    let full = home.fails(
+        6,
+        &[
+            "record",
+            "-c",
+            "sim:0",
+            "-o",
+            "big.mkv",
+            "--max-size",
+            "2MiB",
+            "--for",
+            "2s",
+        ],
+    );
+    assert_eq!(full["code"], "storage_full", "{full}");
+    assert_eq!(full["details"]["job"]["error"]["code"], "storage_full");
+}
+
+/// A second signal ends the command at once, still with one document.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_second_signal_ends_at_once_with_a_document() {
+    let home = Home::new("record-twice");
+    let child = home
+        .command()
+        .args(["--json", "record", "-c", "sim:0", "-o", "clip.mp4"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::metadata(home.path("clip.mp4")).map_or(0, |meta| meta.len()) == 0 {
+        assert!(Instant::now() < deadline, "the recording did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // SAFETY: kill only sends signals to the child this test spawned.
+    unsafe {
+        assert_eq!(libc::kill(child.id() as i32, libc::SIGINT), 0);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(libc::kill(child.id() as i32, libc::SIGINT), 0);
+    }
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    let document: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(document["error"]["code"], "interrupted", "{document}");
 }

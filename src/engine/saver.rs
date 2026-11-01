@@ -22,7 +22,7 @@ pub(super) struct Save {
     pub(super) path: PathBuf,
     pub(super) now: chrono::DateTime<chrono::FixedOffset>,
     pub(super) index: u32,
-    pub(super) camera: String,
+    pub(super) camera: crate::naming::CameraName,
     pub(super) plan: crate::naming::Plan,
     pub(super) on_exists: crate::naming::OnExists,
     pub(super) format: String,

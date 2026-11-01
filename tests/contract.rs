@@ -568,6 +568,27 @@ fn an_environment_session_yields_to_no_session_and_binary_stdout() {
     assert_eq!(run.raw.len(), 4096);
     let run = home.run_env(&env, &["--json", "session", "status"]);
     assert!(run.success()["cameras"].as_array().unwrap().is_empty());
+    // CAPTUREFAB_KEEP is a default too: --no-session and binary stdout
+    // leave it out, where a typed --keep is a mistake.
+    let keep = [("CAPTUREFAB_KEEP", "5m")];
+    let run = home.run_env(
+        &keep,
+        &["--json", "--no-session", "get", "-c", "sim:env", "Width"],
+    );
+    assert_eq!(run.success()["values"]["Width"], 640);
+    let run = home.run_env(&keep, &["capture", "-c", "sim:env", "-o", "-", "-f", "raw"]);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.raw.len(), 640 * 480);
+    let sessions = home.ok(&["session", "list"])["sessions"].clone();
+    assert_eq!(sessions.as_array().unwrap().len(), 1, "{sessions}");
+    // With -o -, stdout is the image's: the document goes to stderr.
+    let typed = home.run(&[
+        "--json", "capture", "-c", "sim:env", "-o", "-", "--keep", "5m",
+    ]);
+    assert_eq!(typed.code, Some(2));
+    assert!(typed.raw.is_empty());
+    let error: Value = serde_json::from_str(&typed.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "usage");
 }
 
 #[test]
@@ -756,32 +777,112 @@ fn results_carry_only_documented_keys() {
         ("auto", &["auto", "-c", "sim:0", "--off"]),
         ("jobs", &["jobs"]),
         ("jobs list", &["jobs", "list"]),
+        (
+            "capture",
+            &[
+                "capture",
+                "-c",
+                "sim:0",
+                "--every",
+                "100ms",
+                "-n",
+                "2",
+                "-o",
+                "bg/",
+                "--background",
+            ],
+        ),
+        (
+            "capture",
+            &[
+                "capture",
+                "-c",
+                "sim:0",
+                "-c",
+                "sim:1",
+                "-o",
+                "bg2/",
+                "--background",
+            ],
+        ),
+        ("jobs wait", &["jobs", "wait", "auto-1"]),
+        ("jobs", &["jobs"]),
+        ("jobs stop", &["jobs", "stop", "all"]),
+        (
+            "session start",
+            &["session", "start", "--name", "documented", "-c", "sim:2"],
+        ),
         ("session list", &["session", "list"]),
+        ("session status", &["session", "status", "documented"]),
+        ("session stop", &["session", "stop", "documented"]),
     ];
     for (command, args) in runs {
-        let result = home.ok(args);
-        let words = command.split(' ').collect::<Vec<_>>();
-        let documented = home.ok(&[&["schema"][..], &words].concat())["result"].clone();
-        for (key, value) in result.as_object().unwrap() {
-            let Some(meaning) = documented.get(key) else {
-                panic!("{command}: {key} is not in schema {command}");
-            };
-            // Rows: every key of every row is named in `[{a,b?,c:…}]`.
-            let meaning = meaning.as_str().unwrap();
-            let (Some(row), Some(rows)) = (meaning.strip_prefix("[{"), value.as_array()) else {
-                continue;
-            };
-            let names = row_keys(row);
-            for row in rows.iter().filter_map(Value::as_object) {
-                for field in row.keys() {
-                    assert!(
-                        names.contains(field.as_str()),
-                        "{command}: {key}[].{field} is not in {meaning}"
-                    );
-                }
+        assert_documented(&home, command, &home.ok(args));
+    }
+    // A failed job carries its error wherever it is shown.
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "TriggerMode=On",
+        "TriggerSource=Line1",
+    ]);
+    let failed = home.fails(
+        4,
+        &[
+            "capture",
+            "-c",
+            "sim:0",
+            "--timeout",
+            "100ms",
+            "-o",
+            "never.png",
+            "--background",
+        ],
+    );
+    let id = failed["details"]["job"]["id"].as_str().unwrap();
+    let stopped = home.ok(&["jobs", "stop", id]);
+    assert!(stopped["stopped"][0]["error"].is_object(), "{stopped}");
+    assert_documented(&home, "jobs stop", &stopped);
+    assert_documented(&home, "jobs", &home.ok(&["jobs"]));
+}
+
+/// Every key of `result` is in `schema COMMAND`, and so is every key of the
+/// rows of its documented `[{a,b?,c:…}]` lists.
+fn assert_documented(home: &Home, command: &str, result: &Value) {
+    let words = command.split(' ').collect::<Vec<_>>();
+    let documented = home.ok(&[&["schema"][..], &words].concat())["result"].clone();
+    for (key, value) in result.as_object().unwrap() {
+        let Some(meaning) = documented.get(key) else {
+            panic!("{command}: {key} is not in schema {command}");
+        };
+        let meaning = meaning.as_str().unwrap();
+        let (Some(row), Some(rows)) = (meaning.strip_prefix("[{"), value.as_array()) else {
+            continue;
+        };
+        let names = row_keys(row);
+        for row in rows.iter().filter_map(Value::as_object) {
+            for field in row.keys() {
+                assert!(
+                    names.contains(field.as_str()),
+                    "{command}: {key}[].{field} is not in {meaning}"
+                );
             }
         }
     }
+}
+
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn record_results_carry_only_documented_keys() {
+    let home = Home::new("documented-record");
+    let result = home.ok(&["record", "-c", "sim:0", "-o", "clip.mkv", "--for", "1s"]);
+    assert_documented(&home, "record", &result);
+    let started = home.ok(&["record", "-c", "sim:0", "-o", "bg.mkv", "--background"]);
+    assert_documented(&home, "record", &started);
+    assert_documented(&home, "jobs", &home.ok(&["jobs"]));
+    let stopped = home.ok(&["jobs", "stop", "all"]);
+    assert_documented(&home, "jobs stop", &stopped);
 }
 
 /// The field names of a documented row, `a,b?,c:{x,y},d:x|y}]`, leaving

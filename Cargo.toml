@@ -27,8 +27,6 @@ zip = { version = "2.4", default-features = false, features = ["deflate"] }
 png = "0.17"
 if-addrs = "0.13"
 socket2 = { version = "0.6", features = ["all"] }
-# SIGINT, plus SIGTERM (systemctl stop) and SIGHUP (a closed terminal).
-ctrlc = { version = "3.4", features = ["termination"] }
 getrandom = "0.3"
 nusb = { version = "0.2.7", optional = true }
 memmap2 = "0.9"
@@ -48,6 +46,11 @@ zeroize = "1"
 # a detached session reports ready on.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+# Ctrl-C, Ctrl-Break and a closed console where there are no Unix signals,
+# which go through libc.
+[target.'cfg(not(unix))'.dependencies]
+ctrlc = { version = "3.4", features = ["termination"] }
 
 # Host facts for doctor (sysctl, statfs, access), and anonymous shared memory
 # for frame rings (memfd_create, shm_open) with descriptor inheritance by

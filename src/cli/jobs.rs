@@ -113,42 +113,52 @@ fn error_object(job: &Value) -> Value {
     })
 }
 
-/// The current or last recording of `camera` as a job document.
-pub(super) fn recording(session: &str, camera: &Value) -> Option<Value> {
-    let job = camera["record_job"].as_u64()?;
-    let progress = &camera["forwarding_progress"];
-    let finished = &progress["recording"];
-    let running = camera["forwarding"].is_string();
+/// Recording `entry` of `camera` (a session status entry and one of its
+/// `recordings`) as a job document.
+pub(super) fn recording(session: &str, camera: &Value, entry: &Value) -> Value {
+    let progress = &entry["progress"];
+    let file = &progress["recording"];
+    let running = entry["running"] == true;
+    let ended = entry["ended"].as_str().unwrap_or_default();
     let state = if running {
         if progress["written"].as_u64().unwrap_or(0) == 0 {
             "armed"
         } else {
             "running"
         }
-    } else if finished.is_object() || camera["last_error"].is_null() {
-        "done"
-    } else {
+    } else if ended == "failed" {
         "failed"
+    } else {
+        "done"
     };
     let mut value = json!({
-        "id": format!("{session}-{job}"),
+        "id": format!("{session}-{}", entry["job"]),
         "camera": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
         "kind": "record",
         "state": state,
-        "saved": u64::from(finished.is_object()),
-        "bytes": finished["bytes"],
-        "last_file": if running { camera["recording_path"].clone() } else { finished["path"].clone() },
-        "started": camera["forwarding_since_ms"].as_u64().or(finished["started_ms"].as_u64()).map(rfc3339),
-        "ends_at": camera["forwarding_until_ms"].as_u64().filter(|_| running).map(rfc3339),
-        "ended": finished["ended_ms"].as_u64().filter(|_| !running).map(rfc3339),
+        "saved": u64::from(file.is_object()),
+        "bytes": file["bytes"],
+        "last_file": entry["output"].as_str().map(crate::media::redact_url),
+        "started": entry["since_ms"].as_u64().or(file["started_ms"].as_u64()).map(rfc3339),
+        "ends_at": entry["until_ms"].as_u64().filter(|_| running).map(rfc3339),
+        "ended": entry["ended_ms"].as_u64().filter(|_| !running).map(rfc3339),
     });
     if state == "failed" {
         value["error"] = json!({
-            "code": "failed",
-            "message": crate::scrub::redact_urls(camera["last_error"].as_str().unwrap_or_default()),
+            "code": entry["error_tag"]["code"].as_str().unwrap_or("failed"),
+            "message": crate::scrub::redact_urls(entry["error"].as_str().unwrap_or("the recording failed")),
         });
     }
-    Some(crate::types::without_nulls(value))
+    crate::types::without_nulls(value)
+}
+
+/// Recording job `job` of `camera`, a session status entry: the session's
+/// record of it.
+pub(super) fn recording_entry(camera: &Value, job: u64) -> Option<&Value> {
+    camera["recordings"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["job"] == job)
 }
 
 /// Every job of `camera`, a session status entry.
@@ -159,7 +169,13 @@ pub(super) fn of_camera(session: &str, camera: &Value) -> Vec<Value> {
         .flatten()
         .map(|job| capture(session, camera, job))
         .collect::<Vec<_>>();
-    jobs.extend(recording(session, camera));
+    jobs.extend(
+        camera["recordings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|entry| recording(session, camera, entry)),
+    );
     jobs
 }
 
@@ -272,16 +288,16 @@ fn find(id: &str) -> Result<(Value, Value)> {
 /// Stop job `job` of `camera` in `session`.
 pub(super) fn stop_job(session: &str, camera: &Value, job: &Value) -> Result<()> {
     let target = camera["info"]["id"].as_str().context("camera without ID")?;
+    let number = parse(job["id"].as_str().unwrap_or_default())?.1;
     let command = if job["kind"] == "record" {
         Request::StopForwardIf {
-            forwarding_id: camera["forwarding_id"]
-                .as_str()
+            forwarding_id: recording_entry(camera, number)
+                .and_then(|entry| entry["forwarding_id"].as_str())
                 .context("recording without an identity")?
                 .to_owned(),
         }
     } else {
-        let id = job["id"].as_str().unwrap_or_default();
-        Request::CancelJob { id: parse(id)?.1 }
+        Request::CancelJob { id: number }
     };
     ipc::call_to(
         session,
@@ -408,19 +424,28 @@ fn finished(job: Value) -> Result<Report> {
     }
 }
 
-/// The job document, for `schema`.
-pub const JOB: &str = "{id,camera,kind:capture|record,state:armed|running|done|failed|cancelled,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}";
+/// The job document, for `schema`: every command that shows a job shows
+/// this.
+macro_rules! job_row {
+    () => {
+        "{id,camera,kind:capture|record,state:armed|running|done|failed|cancelled,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}"
+    };
+}
+pub(super) use job_row;
 pub const LIST_FIELDS: &[(&str, &str)] = &[(
     "jobs",
-    "[{id,camera,kind:capture|record,state:armed|running|done|failed|cancelled,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session's",
+    concat!("[", job_row!(), "] — every running session's"),
 )];
 pub const STOP_FIELDS: &[(&str, &str)] = &[(
     "stopped",
-    "[{id,camera,kind,state,saved,planned?,bytes?,last_file?,started,ended?}] — the jobs as they are after stopping",
+    concat!("[", job_row!(), "] — the jobs as they are after stopping"),
 )];
 pub const WAIT_FIELDS: &[(&str, &str)] = &[(
     "job",
-    "{id,camera,kind,state:done,saved,planned?,bytes?,last_file?,started,ended} — a failed job exits with its own error code and details.job",
+    concat!(
+        job_row!(),
+        " — done; a failed job exits with its own error code and details.job"
+    ),
 )];
 
 #[cfg(test)]

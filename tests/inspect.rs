@@ -62,6 +62,28 @@ fn inspect_measures_a_fresh_frame_and_leaves_a_private_preview() {
     assert!(verbose["focus"]["tenengrad"].is_number());
 }
 
+/// --fresh lets frames pass on a stopped camera too: each direct
+/// inspection starts the simulator from its first frame.
+#[test]
+fn fresh_frames_pass_before_the_one_measured() {
+    let home = Home::new("inspect-fresh");
+    let measure = |fresh: &str| {
+        let measured = home.ok(&[
+            "inspect",
+            "-c",
+            "sim:0",
+            "--fresh",
+            fresh,
+            "--preview",
+            "none",
+        ]);
+        (measured["exposure"].clone(), measured["focus"].clone())
+    };
+    assert_eq!(measure("1"), measure("1"));
+    assert_eq!(measure("3"), measure("3"));
+    assert_ne!(measure("1"), measure("3"));
+}
+
 #[test]
 fn inspect_applies_settings_first_and_suggests_an_exposure() {
     let home = Home::new("inspect-set");

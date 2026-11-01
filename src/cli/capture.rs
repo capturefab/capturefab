@@ -44,7 +44,7 @@ impl Format {
 pub struct CaptureArgs {
     #[command(flatten)]
     pub cameras: CamerasArg,
-    /// File, folder (existing, or ending in /) or template with {camera} {seq} {frame} {date} {time} {datetime} {tag:KEY}; - writes one image to stdout (default: this folder)
+    /// File, folder (existing, or ending in /) or template with {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; - writes one image to stdout (default: this folder, as {camera}-{time}-{seq}.png)
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: Option<String>,
     /// Frames to save, 1..100000
@@ -274,6 +274,10 @@ fn exists_hint(error: anyhow::Error) -> anyhow::Error {
 }
 
 pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
+    if args.output.as_deref() == Some("-") {
+        // Stdout is for the image alone.
+        super::output::document_to_stderr();
+    }
     let plan = Plan::new(&args)?;
     if args.quality.is_some() && plan.format != "jpeg" {
         return Err(Usage("--quality is for JPEG; use a .jpg name or -f jpg".into()).into());
@@ -297,10 +301,16 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
         .into());
     }
     signals::take_over();
-    let route = Route {
-        keep: args.keep.route().keep,
-        background: args.background,
-        connect: None,
+    // A dry run uses a session that already holds the camera, but never
+    // starts one.
+    let route = if args.dry_run {
+        Route::default()
+    } else {
+        Route {
+            keep: args.keep.route().keep,
+            background: args.background,
+            connect: None,
+        }
     }
     .waiting(args.timeout);
     let each = |camera: Option<&str>| -> Result<Value> {
@@ -335,31 +345,58 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
 }
 
 /// One camera's result as the document, or several as `{cameras}` (or
-/// `{jobs}` in the background); a failure carries the others in details.
+/// `{jobs}` in the background). A failure carries every camera's result or
+/// error in details, each with what it saved, and every file saved in
+/// `files`.
 fn combine(results: Vec<Result<Value>>, cameras: &[Option<&str>]) -> Result<Value> {
     if results.len() == 1 {
         return results.into_iter().next().unwrap_or_else(|| unreachable!());
     }
     let mut first = None;
     let mut shown = Vec::new();
+    let mut files = Vec::new();
+    let mut truncated = 0;
+    let saved = |value: &Value, files: &mut Vec<Value>, truncated: &mut u64| {
+        files.extend(value["files"].as_array().cloned().unwrap_or_default());
+        *truncated += value["truncated"].as_u64().unwrap_or(0);
+    };
     for (result, camera) in results.into_iter().zip(cameras) {
         match result {
-            Ok(value) => shown.push(value),
+            Ok(value) => {
+                saved(&value, &mut files, &mut truncated);
+                shown.push(value);
+            }
             Err(error) => {
                 let classified = crate::types::classify(&error);
-                shown.push(json!({
+                let mut entry = json!({
                     "camera": camera.map(crate::media::redact_url),
                     "error": {"code": classified.kind.code().0, "message": crate::scrub::scrub(&format!("{error:#}"))},
-                }));
+                });
+                if let Some(details) = &classified.details {
+                    saved(details, &mut files, &mut truncated);
+                    for key in ["files", "truncated", "job"] {
+                        if let Some(value) = details.get(key) {
+                            entry[key] = value.clone();
+                        }
+                    }
+                }
+                shown.push(entry);
                 first.get_or_insert(error);
             }
         }
     }
     match first {
-        Some(error) => Err(crate::types::with_details(
-            error,
-            json!({ "cameras": shown }),
-        )),
+        Some(error) => {
+            let classified = crate::types::classify(&error);
+            let mut details = json!({ "cameras": shown, "files": files });
+            if truncated > 0 {
+                details["truncated"] = json!(truncated);
+            }
+            let mut combined =
+                Categorized::new(classified.kind, format!("{error:#}")).details(details);
+            combined.hint = classified.hint;
+            Err(combined.into())
+        }
         None if shown.iter().all(|value| value.get("job").is_some()) => Ok(json!({
             "jobs": shown.into_iter().map(|value| value["job"].clone()).collect::<Vec<_>>()
         })),
@@ -396,9 +433,7 @@ fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
         .context("capture job without ID")?;
     let session = client.session().unwrap_or("direct").to_owned();
     if args.background {
-        let camera = client.status()?;
-        let job = find(&camera, id).unwrap_or_else(|| reply["job"].clone());
-        return Ok(json!({ "job": jobs::capture(&session, &camera, &job) }));
+        return started(client, &session, id, plan);
     }
     let mut pause = Duration::from_millis(10);
     let mut stopping: Option<Instant> = None;
@@ -425,6 +460,38 @@ fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
         // Look again soon for a quick shot, less often for a long job.
         std::thread::sleep(pause);
         pause = (pause * 3 / 2).min(Duration::from_millis(250));
+    }
+}
+
+/// A background job once it has started: armed for a later first frame,
+/// or with its first frame saved; or its failure. A job that cannot take
+/// its first frame fails within the frame timeout; one that may wait for a
+/// trigger without a limit is returned as it is after a moment.
+fn started(client: &Client, session: &str, id: u64, plan: &Plan) -> Result<Value> {
+    let begun = Instant::now();
+    let wait = if plan.timeout_ms >= crate::scheduling::MAX_DURATION_MS {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(plan.timeout_ms) + Duration::from_secs(1)
+    };
+    let mut pause = Duration::from_millis(10);
+    loop {
+        let camera = client.status()?;
+        let job = find(&camera, id).context("the capture job is gone")?;
+        let saved = job["captured"].as_u64().unwrap_or(0);
+        let armed = job["first_at_ms"].as_u64().unwrap_or(0) > crate::scheduling::now_ms();
+        match job["status"].as_str() {
+            Some("pending" | "running")
+                if saved == 0 && !armed && begun.elapsed() < wait && !signals::interrupted() =>
+            {
+                std::thread::sleep(pause);
+                pause = (pause * 3 / 2).min(Duration::from_millis(250));
+            }
+            Some("pending" | "running" | "complete") => {
+                return Ok(json!({ "job": jobs::capture(session, &camera, &job) }));
+            }
+            _ => return finished(session, &camera, &job, false),
+        }
     }
 }
 
@@ -489,7 +556,7 @@ fn finished(session: &str, camera: &Value, job: &Value, stopped: bool) -> Result
             let mut details = saved(job);
             details["job"] = jobs::capture(session, camera, job);
             Err(crate::types::with_details(
-                crate::types::error_from_tag(tag, message),
+                exists_hint(crate::types::error_from_tag(tag, message)),
                 details,
             ))
         }
@@ -509,7 +576,7 @@ fn result(camera: &Value, job: &Value) -> Value {
         "width": frame["width"],
         "height": frame["height"],
         "pixel_format": frame["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
-        "settings": job["settings"],
+        "settings": settings(&job["settings"]),
         "time": first.map(jobs_time),
     });
     if count > 1
@@ -520,10 +587,45 @@ fn result(camera: &Value, job: &Value) -> Value {
     if count > files.len() as u64 {
         value["truncated"] = json!(count - files.len() as u64);
     }
-    if value["settings"].is_null() {
-        value["settings"] = json!({});
-    }
     crate::types::without_nulls(value)
+}
+
+/// The camera's settings when the first frame was taken (`features`, the
+/// GenICam values the worker read) under the names `inspect` and `info`
+/// use, with units in the names: SFNC gives ExposureTime in microseconds
+/// and Gain in dB.
+fn settings(features: &Value) -> Value {
+    let number = |names: &[&str]| names.iter().find_map(|name| features[*name].as_f64());
+    let mode = |name: &str| features[name].as_str().map(str::to_ascii_lowercase);
+    let trigger = match features["TriggerMode"].as_str() {
+        Some(mode) if mode.eq_ignore_ascii_case("off") => Some("off".to_owned()),
+        Some(_) => Some(
+            features["TriggerSource"]
+                .as_str()
+                .map_or_else(|| "on".to_owned(), str::to_ascii_lowercase),
+        ),
+        None => None,
+    };
+    let binning = number(&["BinningHorizontal"])
+        .zip(number(&["BinningVertical"]))
+        .map(|(x, y)| format!("{x}x{y}"));
+    crate::types::without_nulls(json!({
+        "exposure_us": number(&["ExposureTime", "ExposureTimeAbs"]),
+        "auto_exposure": mode("ExposureAuto"),
+        "gain_db": number(&["Gain"]),
+        "gain": features["Gain"].is_null().then(|| number(&["GainRaw"])).flatten(),
+        "auto_gain": mode("GainAuto"),
+        "auto_wb": mode("BalanceWhiteAuto"),
+        "fps": number(&["AcquisitionFrameRate", "AcquisitionFrameRateAbs"]),
+        "trigger": trigger,
+        "black_level": number(&["BlackLevel"]),
+        "gamma": number(&["Gamma"]),
+        "binning": binning,
+        "offset_x": number(&["OffsetX"]),
+        "offset_y": number(&["OffsetY"]),
+        "reverse_x": features["ReverseX"].as_bool(),
+        "reverse_y": features["ReverseY"].as_bool(),
+    }))
 }
 
 fn dry_run(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
@@ -572,7 +674,7 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         || plan.interval_ms > 0
         || plan.first_at_ms.is_some()
         || args.background
-        || args.keep.keep.is_some()
+        || (args.keep.keep.is_some() && !global.keep_from_env)
         || args.dry_run
     {
         return Err(Usage(
@@ -640,14 +742,12 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         "width": frame.width,
         "height": frame.height,
         "pixel_format": crate::inspect::pixel_format_label(frame.pixel_format),
-        "settings": meta["settings"].clone(),
+        "settings": settings(&meta["settings"]),
         "time": meta["wall_ms"].as_u64().map(jobs_time),
     }));
     // The image owns stdout; the result goes to stderr in one write.
     if global.json && super::output::claim() {
-        let mut line = serde_json::to_vec(&super::output::document(value))?;
-        line.push(b'\n');
-        let _ = std::io::stderr().lock().write_all(&line);
+        let _ = super::output::write_json(&super::output::document(value));
     }
     Ok(())
 }
@@ -718,7 +818,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("pixel_format", "string — the camera's PFNC format"),
     (
         "settings",
-        "{feature: value} — exposure, gain, trigger and other acquisition features when the first frame was taken",
+        "{exposure_us?,auto_exposure?,gain_db?,gain?,auto_gain?,auto_wb?,fps?,trigger?,black_level?,gamma?,binning?,offset_x?,offset_y?,reverse_x?,reverse_y?} — the camera's settings when the first frame was taken, as the camera has them; trigger: off, or its source (software, line0)",
     ),
     ("time", "string — RFC 3339 time of the first frame"),
     ("duration_s", "float — first to last frame, for several"),
@@ -726,15 +826,22 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("bytes", "int — with -o -: the image's size"),
     (
         "cameras",
-        "[{camera,files,count,truncated?,width,height,pixel_format,settings,time,duration_s?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera",
+        "[{camera,files,count,truncated?,width,height,pixel_format,settings,time,duration_s?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
     ),
     (
         "job",
-        "{id,camera,kind,state,saved,planned,last_file?,next_at?,ends_at?,started} — with --background, as jobs lists it",
+        concat!(
+            jobs::job_row!(),
+            " — with --background, as jobs lists it, once armed or its first frame is saved"
+        ),
     ),
     (
         "jobs",
-        "[{id,camera,kind,state,saved,planned,last_file?,next_at?,ends_at?,started}] — with --background and -c repeated",
+        concat!(
+            "[",
+            jobs::job_row!(),
+            "] — with --background and -c repeated"
+        ),
     ),
     ("dry_run", "true — with --dry-run; nothing was captured"),
     ("format", "png|jpg|raw — with --dry-run"),
@@ -747,6 +854,25 @@ pub const FIELDS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_take_the_names_inspect_uses() {
+        let shown = settings(&json!({
+            "ExposureTime": 10000.0, "ExposureAuto": "Off", "Gain": 0.0,
+            "AcquisitionFrameRate": 30.0, "TriggerMode": "On", "TriggerSource": "Line0",
+            "BinningHorizontal": 2, "BinningVertical": 2,
+        }));
+        assert_eq!(
+            shown,
+            json!({"exposure_us": 10000.0, "auto_exposure": "off", "gain_db": 0.0,
+                "fps": 30.0, "trigger": "line0", "binning": "2x2"})
+        );
+        assert_eq!(
+            settings(&json!({"TriggerMode": "Off", "GainRaw": 4})),
+            json!({"trigger": "off", "gain": 4.0})
+        );
+        assert_eq!(settings(&Value::Null), json!({}));
+    }
 
     #[test]
     fn formats_come_from_the_name_and_flags_only_fill_in() {

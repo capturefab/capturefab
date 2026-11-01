@@ -3252,6 +3252,28 @@ impl ForwardConfig {
 pub fn default_recording_cap() -> u64 {
     512 * 1024 * 1024
 }
+/// `max_file_bytes` for a recording without a size cap: it runs until it is
+/// stopped, or the disk is full.
+pub const NO_SIZE_CAP: u64 = u64::MAX;
+/// What a recording without a size cap holds of the storage budget while it
+/// runs, so captures and other recordings keep working beside it.
+const UNCAPPED_RESERVATION: u64 = 64 * 1024 * 1024;
+impl ForwardConfig {
+    /// The file writer of a local recording at `path`: bounded by
+    /// `max_file_bytes`, or without a cap reserving a little and growing.
+    pub fn writer(&self, path: &std::path::Path) -> Result<crate::storage::StorageWriter> {
+        if self.max_file_bytes == NO_SIZE_CAP {
+            crate::storage::create_growing_writer(
+                path,
+                &self.storage,
+                UNCAPPED_RESERVATION,
+                NO_SIZE_CAP,
+            )
+        } else {
+            crate::storage::create_writer(path, &self.storage, self.max_file_bytes)
+        }
+    }
+}
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ForwardStats {
     pub accepted: u64,
@@ -4532,13 +4554,7 @@ impl Forwarder {
         let storage = match self.reserved.take() {
             Some(reserved) => Some(reserved),
             None => recording
-                .map(|(path, _)| {
-                    crate::storage::create_writer(
-                        &path,
-                        &self.config.storage,
-                        self.config.max_file_bytes,
-                    )
-                })
+                .map(|(path, _)| self.config.writer(&path))
                 .transpose()?,
         };
         let started_ms = crate::scheduling::now_ms();
