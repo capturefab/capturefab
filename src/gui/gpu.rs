@@ -284,8 +284,12 @@ impl Layout {
             0x0110_000c..=0x0110_000f => wide(2).map(mosaic),
             0x0110_0010..=0x0110_0013 => wide(4).map(mosaic),
             0x0110_002e..=0x0110_0031 => wide(8).map(mosaic),
+            0x0110_0109..=0x0110_010c => wide(6).map(mosaic),
             _ => {
                 let (_, bits, packing) = crate::frame::packing(pixel_format)?;
+                if bits < 8 {
+                    return None;
+                }
                 let layout = Self {
                     shift: bits as i32 - 8,
                     packing: match packing {
@@ -944,32 +948,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layouts_cover_every_cpu_format() {
-        // Every PFNC code of 8 to 32 bits a pixel the CPU decodes, and no other.
+    fn layouts_only_decode_cpu_formats_and_preserve_sensor_layout_support() {
+        // The GPU is a subset of the CPU decoder; other formats use the
+        // preview's bounded CPU conversion path.
         let sizes = [
-            0x0108, 0x010a, 0x010c, 0x0110, 0x0120, 0x0210, 0x0218, 0x0220,
+            0x0108, 0x010a, 0x010c, 0x010e, 0x0110, 0x0120, 0x0210, 0x0218, 0x0220,
         ];
         for format in sizes
             .into_iter()
-            .flat_map(|size| (0..=0xff).map(move |id| size << 16 | id))
+            .flat_map(|size| (0..=0x10c).map(move |id| size << 16 | id))
         {
-            if cfg!(target_endian = "little") {
-                assert_eq!(
-                    Layout::of(format).is_some(),
-                    crate::frame::convertible(format),
-                    "{format:#x}"
-                );
+            if Layout::of(format).is_some() {
+                assert!(crate::frame::convertible(format), "{format:#x}");
             }
         }
-        for format in [
+        // Keep every previously supported layout explicit so additions to
+        // the CPU converter cannot hide a regression in GPU compatibility.
+        let required = [
             MONO8,
             RGB8,
+            0x0218_0015,
+            0x0220_0016,
+            0x0220_0017,
+            0x0110_0003,
+            0x0110_0005,
             0x0110_0025,
-            0x0110_0011,
+            0x0110_0007,
+            0x010a_0046,
             0x010c_0047,
+            0x010c_0004,
+            0x010c_0006,
+            0x0108_00b1,
+            0x0110_00b8,
+            0x0108_00c6,
+            0x0110_00c7,
+            0x010a_0052,
+            0x010a_0054,
+            0x010a_0056,
+            0x010a_0058,
+            0x010c_0053,
+            0x010c_0055,
+            0x010c_0057,
+            0x010c_0059,
+            0x0210_001f,
             0x0210_0032,
-        ] {
+            0x0210_003b,
+            0x0210_0043,
+            0x010e_0104,
+        ]
+        .into_iter()
+        .chain(0x0108_0008..=0x0108_000b)
+        .chain(0x0110_000c..=0x0110_0013)
+        .chain(0x0110_002e..=0x0110_0031)
+        .chain(0x010c_0026..=0x010c_002d)
+        .chain(0x010e_0105..=0x010e_0108)
+        .chain(0x0110_0109..=0x0110_010c);
+        for format in required {
             assert!(crate::frame::convertible(format), "{format:#x}");
+            let wide = matches!((format >> 16) & 0xff, 16);
+            if !wide || cfg!(target_endian = "little") {
+                assert!(Layout::of(format).is_some(), "{format:#x}");
+            }
         }
         // Packed bytes fold four to a texel into rows as wide as allowed, so
         // 1080p fits a 2048-texel limit and 4K an 8192 one.
@@ -1090,6 +1129,15 @@ mod tests {
             (0x010c_0053, 0, 0xff),
             (0x010c_0026, 0, 0xff),
             (0x010c_002d, 0, 0xff),
+            (0x010e_0104, 0, 0xff),
+            (0x010e_0105, 0, 0xff),
+            (0x010e_0106, 0, 0xff),
+            (0x010e_0107, 0, 0xff),
+            (0x010e_0108, 0, 0xff),
+            (0x0110_0109, 2, 0x3fff),
+            (0x0110_010a, 2, 0x3fff),
+            (0x0110_010b, 2, 0x3fff),
+            (0x0110_010c, 2, 0x3fff),
         ];
         // Odd and even sizes exercise the edges of the Bayer neighborhood, row
         // padding, packed pixels split across texels, and half-filled groups

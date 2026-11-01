@@ -24,6 +24,26 @@ camera availability depends on operating system permissions and drivers. This
 does not require Aravis, libusb, a separately installed FFmpeg, or a camera vendor
 SDK in a release containing the matching embedded FFmpeg.
 
+## Pixel formats
+
+Native captures and the browser Try engine use the same PFNC layouts:
+
+| Family | Converted layouts |
+| --- | --- |
+| Monochrome | Mono1p/2p/4p, Mono8/8s/10/12/14/16, Mono10p/12p/14p, Mono10/12Packed |
+| Bayer | GR/RG/GB/BG at 8/10/12/14/16 bits, 10p/12p/14p and 10/12Packed |
+| Interleaved color | RGB/BGR at 8/10/12/14/16 bits, RGB/BGR10p/12p, RGB10p32, RGB/BGR565p |
+| Planar color | RGB8/10/12/16_Planar |
+| Alpha/alignment color | RGBa/BGRa at 8/10/12/14/16 bits, RGBa/BGRa10p/12p, RGB8a32/BGR8a32; alpha/alignment is omitted from opaque previews |
+| YUV/YCbCr | Generic 8-bit 4:4:4, 4:2:2 and 4:1:1; YCbCr601/709 at those subsamplings, in the PFNC default and explicit Cb-first orders |
+| Scalar measurements | Coord3D_C8/C16, Confidence8/16 as grayscale; floating-point depth through the specialized GUI preview |
+
+Names and component orders follow the [EMVA pixel format values](https://www.emva.org/wp-content/uploads/GenICamPixelFormatValues.pdf) and [PFNC 2.4](https://www.emva.org/wp-content/uploads/GenICam_PFNC_2_4.pdf). Generic YUV/YCbCr uses full-range BT.601; explicitly named YCbCr601/709 uses video-range luma/chroma and its named matrix. 4:1:1 requires widths divisible by four. A lone last 4:2:2 pixel uses neutral Cr. Packed rows start on byte boundaries in the acquired frame; GigE also normalizes continuous LSB packing when the shorter payload identifies it unambiguously. If payload padding or chunks hide that distinction, rows retain the byte-aligned interpretation. Unpacked words are little-endian.
+
+Image exports are opaque 8-bit visualizations. Monochrome samples below eight bits span black to white; higher-depth samples use their high eight significant bits. Exposure and auto metering use bounded, stratified samples to avoid locking onto one phase of stripes or checkerboards. Auto metering retains native precision for packed mono/Bayer and wide RGB, including cropped regions. Raw capture preserves the acquired frame buffer, including its native component precision. Unsupported layouts fail explicitly and can still be saved as raw.
+
+The GPU reads mono/Bayer, RGB/BGR8, RGBa/BGRa8 and generic 4:2:2 directly; other supported formats use CPU conversion. Video forwarding uses sensor layouts FFmpeg accepts and converts the remaining supported formats to gray/RGB24. These checks establish conversion behavior with synthetic payloads; they do not establish compatibility with a physical camera model.
+
 ## Camera types and stream limits
 
 Camera purpose and transport are separate. Area scan, line scan, depth, microscope, thermal and document scanner profiles adapt the interface using controls the source advertises:

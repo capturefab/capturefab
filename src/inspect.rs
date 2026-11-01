@@ -131,14 +131,49 @@ pub fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
     let (even_width, even_height) = (fw & !1, fh & !1);
     let x0 = (x & !1).min(even_width - 2);
     let y0 = (y & !1).min(even_height - 2);
-    let x1 = (x + width).next_multiple_of(2).clamp(x0 + 2, even_width);
-    let y1 = (y + height).next_multiple_of(2).clamp(y0 + 2, even_height);
+    let x1 = ((x + width).saturating_add(1) & !1).clamp(x0 + 2, even_width);
+    let y1 = ((y + height).saturating_add(1) & !1).clamp(y0 + 2, even_height);
     [x0, y0, x1 - x0, y1 - y0]
 }
 
 /// The `crop_rect` of `px` as a frame of its own, with the original's
-/// identity and timestamp and its pixel format as `frame::unpacked` leaves it.
+/// identity and timestamp. Wide color components retain their native depth
+/// as interleaved RGB; other formats use `frame::unpacked`'s representation.
 pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
+    frame::validate_source(frame)?;
+    if let Some((_, bits)) = frame::native_color(frame, 0, 0) {
+        let [x, y, width, height] = crop_rect(frame, px);
+        let pixel_format = match bits {
+            8 => crate::types::RGB8,
+            10 => 0x0230_0018,
+            12 => 0x0230_001a,
+            14 => 0x0230_005e,
+            16 => 0x0230_0033,
+            _ => bail!("unsupported RGB component depth {bits}"),
+        };
+        let bytes = if bits == 8 { 3 } else { 6 };
+        let mut data = Vec::with_capacity(width as usize * height as usize * bytes);
+        for yy in y..y + height {
+            for xx in x..x + width {
+                let (rgb, _) = frame::native_color(frame, xx as usize, yy as usize)
+                    .expect("a validated native color layout stays constant across the frame");
+                for sample in rgb {
+                    if bits == 8 {
+                        data.push(sample as u8);
+                    } else {
+                        data.extend_from_slice(&sample.to_le_bytes());
+                    }
+                }
+            }
+        }
+        return Ok(Frame {
+            width,
+            height,
+            pixel_format,
+            data,
+            ..*frame
+        });
+    }
     let frame = &*frame::unpacked(frame)?;
     let bytes = frame::validated_bytes_per_pixel(frame)?;
     let [x, y, width, height] = crop_rect(frame, px);
@@ -789,6 +824,15 @@ mod tests {
     }
 
     #[test]
+    fn bayer_crop_rect_clamps_maximum_dimensions_without_overflow() {
+        let source = frame(BAYER_RG8, u32::MAX, u32::MAX, Vec::new());
+        assert_eq!(
+            crop_rect(&source, [u32::MAX - 2, u32::MAX - 2, 2, 2]),
+            [u32::MAX - 3, u32::MAX - 3, 2, 2]
+        );
+    }
+
+    #[test]
     fn packed_frames_crop_unpacked_and_measure_at_native_depth() {
         // BayerRG12p: each pair of 12-bit samples lsb packed into three bytes.
         let (width, height) = (8u32, 6u32);
@@ -823,6 +867,102 @@ mod tests {
         }
         let image = render(&mono12p, 64, PreviewFormat::Png).unwrap().unwrap();
         assert_eq!((image.width, image.height), (4, 4));
+    }
+
+    #[test]
+    fn color_crops_keep_native_samples_for_metering() {
+        let (width, height) = (4u32, 3u32);
+        for (format, bits, bgr, planar, packed, alpha, canonical) in [
+            (0x0230_0018, 10, false, false, false, false, 0x0230_0018),
+            (0x0224_0049, 12, true, false, true, false, 0x0230_001a),
+            (0x0240_0063, 14, false, false, false, true, 0x0230_005e),
+            (0x0230_0024, 16, false, true, false, false, 0x0230_0033),
+            (0x0220_012e, 8, true, false, false, true, RGB8),
+        ] {
+            let max = (1u32 << bits) - 1;
+            let pixels: Vec<[u16; 3]> = (0..width * height)
+                .map(|i| {
+                    [
+                        max / 4 + 3 * i + 1,
+                        max / 2 + 2 * i + 2,
+                        3 * max / 4 + i + 3,
+                    ]
+                    .map(|v| v as u16)
+                })
+                .collect();
+            let components: Vec<u16> = if planar {
+                (0..3)
+                    .flat_map(|channel| pixels.iter().map(move |rgb| rgb[channel]))
+                    .collect()
+            } else {
+                pixels
+                    .iter()
+                    .flat_map(|rgb| {
+                        let mut channels = if bgr {
+                            vec![rgb[2], rgb[1], rgb[0]]
+                        } else {
+                            rgb.to_vec()
+                        };
+                        if alpha {
+                            channels.push(max as u16);
+                        }
+                        channels
+                    })
+                    .collect()
+            };
+            let data = if packed {
+                components
+                    .chunks_exact(width as usize * 3)
+                    .flat_map(|row| {
+                        let mut packed = vec![0u8; (row.len() * bits).div_ceil(8)];
+                        for (i, &value) in row.iter().enumerate() {
+                            for bit in 0..bits {
+                                packed[(i * bits + bit) / 8] |=
+                                    ((value >> bit) as u8 & 1) << ((i * bits + bit) % 8);
+                            }
+                        }
+                        packed
+                    })
+                    .collect()
+            } else if bits == 8 {
+                components.iter().map(|&v| v as u8).collect()
+            } else {
+                components.iter().flat_map(|v| v.to_le_bytes()).collect()
+            };
+            let mut source = frame(format, width, height, data);
+            let cropped = crop(&source, [1, 1, 2, 2]).unwrap();
+            let selected = [pixels[5], pixels[6], pixels[9], pixels[10]];
+            let expected = frame(
+                canonical,
+                2,
+                2,
+                if bits == 8 {
+                    selected.into_iter().flatten().map(|v| v as u8).collect()
+                } else {
+                    selected
+                        .into_iter()
+                        .flatten()
+                        .flat_map(u16::to_le_bytes)
+                        .collect()
+                },
+            );
+            assert_eq!(cropped.pixel_format, canonical, "{format:08x}");
+            assert_eq!(cropped.data, expected.data, "{format:08x}");
+            assert_eq!(
+                (cropped.id, cropped.timestamp_ns),
+                (source.id, source.timestamp_ns)
+            );
+            let meter = crate::auto::meter(&expected).unwrap();
+            assert_eq!(crate::auto::meter(&cropped), Some(meter), "{format:08x}");
+            let measured = measure(&source, CameraKind::AreaScan, [1, 1, 2, 2]);
+            assert_eq!(
+                measured.auto_meter.unwrap().mean,
+                round4(meter.mean),
+                "{format:08x}"
+            );
+            source.data.pop();
+            assert!(crop(&source, [1, 1, 2, 2]).is_err(), "{format:08x}");
+        }
     }
 
     #[test]

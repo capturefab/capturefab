@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FORMATS: [(&str, u32); 7] = [
+const FORMATS: [(&str, u32); 19] = [
     ("Mono8", MONO8),
     ("RGB8", RGB8),
     ("BGR8", 0x0218_0015),
@@ -27,6 +27,18 @@ const FORMATS: [(&str, u32); 7] = [
     ("Mono12", 0x0110_0005),
     ("Mono16", 0x0110_0007),
     ("BayerRG8", 0x0108_0009),
+    ("Mono10p", 0x010a_0046),
+    ("Mono12Packed", 0x010c_0006),
+    ("Mono14p", 0x010e_0104),
+    ("BayerRG12p", 0x010c_0059),
+    ("BayerRG14p", 0x010e_0106),
+    ("RGBa8", 0x0220_0016),
+    ("RGB12", 0x0230_001a),
+    ("RGB12p", 0x0224_005d),
+    ("RGB8_Planar", 0x0218_0021),
+    ("RGB16_Planar", 0x0230_0024),
+    ("YUV8_UYV", 0x0218_0020),
+    ("YCbCr709_422_8", 0x0210_0041),
 ];
 
 struct Rng(u64);
@@ -59,6 +71,39 @@ fn scene(width: u32, height: u32) -> Vec<u8> {
     rgb
 }
 
+/// Fixture packing, outside the timed operations. Every row starts on a byte.
+fn packed_rows(samples: &[u16], width: usize, bits: usize, gige: bool) -> Vec<u8> {
+    let mut output = Vec::new();
+    for row in samples.chunks_exact(width) {
+        if gige {
+            let shift = bits - 8;
+            let mask = (1 << shift) - 1;
+            for pair in row.chunks(2) {
+                output.extend_from_slice(&[(pair[0] >> shift) as u8, (pair[0] & mask) as u8]);
+                if let Some(&second) = pair.get(1) {
+                    *output.last_mut().unwrap() |= ((second & mask) << 4) as u8;
+                    output.push((second >> shift) as u8);
+                }
+            }
+        } else {
+            let (mut word, mut present) = (0u32, 0);
+            for &sample in row {
+                word |= u32::from(sample) << present;
+                present += bits;
+                while present >= 8 {
+                    output.push(word as u8);
+                    word >>= 8;
+                    present -= 8;
+                }
+            }
+            if present > 0 {
+                output.push(word as u8);
+            }
+        }
+    }
+    output
+}
+
 fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
     let rgb = scene(width, height);
     let pixels = rgb.as_chunks::<3>().0;
@@ -68,6 +113,95 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
         MONO8 => pixels.iter().map(|p| luma(p) as u8).collect(),
         RGB8 => rgb.clone(),
         0x0218_0015 => pixels.iter().flat_map(|p| [p[2], p[1], p[0]]).collect(),
+        0x0220_0016 => pixels
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        0x0218_0021 => (0..3)
+            .flat_map(|c| pixels.iter().map(move |p| p[c]))
+            .collect(),
+        0x0230_001a => rgb
+            .iter()
+            .enumerate()
+            .flat_map(|(i, &v)| ((u16::from(v) << 4) | (i as u16 & 15)).to_le_bytes())
+            .collect(),
+        0x0230_0024 => (0..3)
+            .flat_map(|c| {
+                pixels.iter().enumerate().flat_map(move |(i, p)| {
+                    ((u16::from(p[c]) << 8) | (i as u16 & 255)).to_le_bytes()
+                })
+            })
+            .collect(),
+        0x0224_005d => {
+            let samples: Vec<u16> = rgb
+                .iter()
+                .enumerate()
+                .map(|(i, &v)| (u16::from(v) << 4) | (i as u16 & 15))
+                .collect();
+            packed_rows(&samples, width as usize * 3, 12, false)
+        }
+        0x010a_0046 | 0x010c_0006 | 0x010e_0104 | 0x010c_0059 | 0x010e_0106 => {
+            let bits = match pixel_format {
+                0x010a_0046 => 10,
+                0x010c_0006 | 0x010c_0059 => 12,
+                _ => 14,
+            };
+            let bayer = matches!(pixel_format, 0x010c_0059 | 0x010e_0106);
+            let samples: Vec<u16> = pixels
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let (x, y) = (i % width as usize, i / width as usize);
+                    let value = if bayer {
+                        u16::from(p[[0, 1, 1, 2][(y & 1) * 2 + (x & 1)]])
+                    } else {
+                        luma(p)
+                    };
+                    (value << (bits - 8)) | (i as u16 & ((1 << (bits - 8)) - 1))
+                })
+                .collect();
+            packed_rows(&samples, width as usize, bits, pixel_format == 0x010c_0006)
+        }
+        0x0218_0020 | 0x0210_0041 => {
+            let limited = pixel_format == 0x0210_0041;
+            let yuv = |p: &[u8; 3]| {
+                let [r, g, b] = p.map(f64::from);
+                let values = if limited {
+                    [
+                        16.0 + 0.18259 * r + 0.61423 * g + 0.06201 * b,
+                        128.0 - 0.10064 * r - 0.33857 * g + 0.43922 * b,
+                        128.0 + 0.43922 * r - 0.39894 * g - 0.04027 * b,
+                    ]
+                } else {
+                    [
+                        0.299 * r + 0.587 * g + 0.114 * b,
+                        128.0 - 0.16874 * r - 0.33126 * g + 0.5 * b,
+                        128.0 + 0.5 * r - 0.41869 * g - 0.08131 * b,
+                    ]
+                };
+                values.map(|v| v.round().clamp(0.0, 255.0) as u8)
+            };
+            if limited {
+                pixels
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|p| {
+                        let (a, b) = (yuv(&p[0]), yuv(&p[1]));
+                        let mean = |c: usize| (u16::from(a[c]) + u16::from(b[c])).div_ceil(2) as u8;
+                        [a[0], mean(1), b[0], mean(2)]
+                    })
+                    .collect()
+            } else {
+                pixels
+                    .iter()
+                    .flat_map(|p| {
+                        let [y, cb, cr] = yuv(p);
+                        [cb, y, cr]
+                    })
+                    .collect()
+            }
+        }
         0x0110_0003 | 0x0110_0005 | 0x0110_0007 => {
             let shift = match pixel_format {
                 0x0110_0003 => 2,
@@ -82,7 +216,7 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                 })
                 .collect()
         }
-        _ => (0..height as usize)
+        0x0108_0009 => (0..height as usize)
             .flat_map(|y| {
                 let pixels = &pixels;
                 (0..width as usize).map(move |x| {
@@ -90,6 +224,7 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                 })
             })
             .collect(),
+        _ => panic!("missing benchmark fixture for {pixel_format:#010x}"),
     };
     Frame {
         id: 1,
@@ -207,13 +342,84 @@ fn main() {
     efficiency::set(Mode::Smooth);
     for (width, height) in [(1920, 1200), (640, 480)] {
         for (name, format) in FORMATS {
+            let label = format!("rgb/{name}/{width}x{height}");
+            if !b.selected(&label) {
+                continue;
+            }
             let f = frame(width, height, format);
-            b.run(
-                &format!("rgb/{name}/{width}x{height}"),
-                f.data.len(),
-                || frame::rgb(&f).unwrap(),
-            );
+            b.run(&label, f.data.len(), || frame::rgb(&f).unwrap());
         }
+    }
+    // Sparse consumers decode the samples they use from the sensor layout.
+    // The expanded comparison includes constructing a whole unpacked image,
+    // which is avoidable even when only a scope or a small preview is needed.
+    // For wide RGB, expansion is an 8-bit visualization; native metering also
+    // retains the original component precision.
+    for (name, format) in FORMATS {
+        let suffix = format!("/{name}/2448x2048");
+        let prefixes = [
+            "pixels/exposure/native",
+            "pixels/exposure/expanded",
+            "pixels/meter/native",
+            "pixels/meter/expanded",
+            "pixels/preview/native",
+            "pixels/preview/expanded",
+            "pixels/preview/efficient",
+            "pixels/rgba/reused",
+        ];
+        if !prefixes
+            .iter()
+            .any(|prefix| b.selected(&format!("{prefix}{suffix}")))
+        {
+            continue;
+        }
+        let f = frame(2448, 2048, format);
+        assert_eq!(
+            f.data.len(),
+            frame::row_bytes(f.width, format) * f.height as usize
+        );
+        b.run(
+            &format!("pixels/exposure/native{suffix}"),
+            f.data.len(),
+            || frame::exposure(&f).unwrap(),
+        );
+        b.run(
+            &format!("pixels/exposure/expanded{suffix}"),
+            f.data.len(),
+            || frame::exposure(&frame::unpacked(&f).unwrap()).unwrap(),
+        );
+        b.run(
+            &format!("pixels/meter/native{suffix}"),
+            f.data.len(),
+            || capturefab::auto::meter(&f).unwrap(),
+        );
+        b.run(
+            &format!("pixels/meter/expanded{suffix}"),
+            f.data.len(),
+            || capturefab::auto::meter(&frame::unpacked(&f).unwrap()).unwrap(),
+        );
+        b.run(
+            &format!("pixels/preview/native{suffix}"),
+            f.data.len(),
+            || frame::preview_rgba(&f, 320, 240).unwrap(),
+        );
+        b.run(
+            &format!("pixels/preview/expanded{suffix}"),
+            f.data.len(),
+            || frame::preview_rgba(&frame::unpacked(&f).unwrap(), 320, 240).unwrap(),
+        );
+        efficient(|| {
+            b.run(
+                &format!("pixels/preview/efficient{suffix}"),
+                f.data.len(),
+                || frame::preview_rgba(&f, 320, 240).unwrap(),
+            )
+        });
+        let mut rgba = Vec::new();
+        b.run(&format!("pixels/rgba/reused{suffix}"), f.data.len(), || {
+            frame::convert_into(&f, &mut rgba, |[r, g, b]| [r, g, b, 255]).unwrap();
+            black_box(&rgba);
+        });
     }
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);

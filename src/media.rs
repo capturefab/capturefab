@@ -4578,6 +4578,8 @@ struct RawInput {
     color: bool,
     /// Packed samples, unpacked before the pipe.
     unpack: bool,
+    /// Formats FFmpeg cannot consume directly are converted to gray or RGB.
+    convert: bool,
     /// Bits each 16-bit sample is shifted up to span the full range.
     widen: u32,
     /// Full-range BT.601 Y'CbCr, as PFNC defines its YUV and YCbCr formats.
@@ -4586,12 +4588,13 @@ struct RawInput {
 impl RawInput {
     fn for_format(pixel_format: u32) -> Result<Self> {
         let unpacked = crate::frame::packing(pixel_format).map_or(pixel_format, |(v, ..)| v);
+        let mut convert = false;
         let (ffmpeg, bytes_per_pixel, color) = match unpacked {
-            crate::types::MONO8 => ("gray", 1, false),
+            crate::types::MONO8 | 0x0108_00b1 | 0x0108_00c6 => ("gray", 1, false),
             0x0110_0003 => ("gray10le", 2, false),
             0x0110_0005 => ("gray12le", 2, false),
             0x0110_0025 => ("gray14le", 2, false),
-            0x0110_0007 => ("gray16le", 2, false),
+            0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => ("gray16le", 2, false),
             crate::types::RGB8 => ("rgb24", 3, true),
             0x0218_0015 => ("bgr24", 3, true),
             0x0220_0016 => ("rgba", 4, true),
@@ -4606,6 +4609,18 @@ impl RawInput {
             0x0110_000d | 0x0110_0011 | 0x0110_002f => ("bayer_rggb16le", 2, true),
             0x0110_000e | 0x0110_0012 | 0x0110_0030 => ("bayer_gbrg16le", 2, true),
             0x0110_000f | 0x0110_0013 | 0x0110_0031 => ("bayer_bggr16le", 2, true),
+            0x0110_0109 => ("bayer_grbg16le", 2, true),
+            0x0110_010a => ("bayer_rggb16le", 2, true),
+            0x0110_010b => ("bayer_gbrg16le", 2, true),
+            0x0110_010c => ("bayer_bggr16le", 2, true),
+            _ if crate::frame::convertible(pixel_format) => {
+                convert = true;
+                if crate::frame::monochrome(pixel_format) {
+                    ("gray", 1, false)
+                } else {
+                    ("rgb24", 3, true)
+                }
+            }
             _ => bail!(
                 "unsupported PFNC format 0x{pixel_format:08x}; capture with --format raw to preserve bytes"
             ),
@@ -4613,6 +4628,7 @@ impl RawInput {
         let widen = match unpacked {
             0x0110_000c..=0x0110_000f => 6,
             0x0110_0010..=0x0110_0013 => 4,
+            0x0110_0109..=0x0110_010c => 2,
             _ => 0,
         };
         Ok(Self {
@@ -4620,7 +4636,8 @@ impl RawInput {
             ffmpeg,
             bytes_per_pixel,
             color,
-            unpack: unpacked != pixel_format,
+            unpack: !convert && unpacked != pixel_format,
+            convert,
             widen,
             full_range: matches!(ffmpeg, "uyvy422" | "yuyv422"),
         })
@@ -4637,14 +4654,36 @@ impl RawInput {
             &[]
         }
     }
+    /// Size of the normalized image, checked before unpacking or allocating.
+    fn frame_len(&self, width: u32, height: u32) -> Result<usize> {
+        let pixels = (width as usize).checked_mul(height as usize);
+        ensure!(
+            width > 0 && height > 0 && pixels.is_some_and(|n| n <= MAX_FRAME / 3),
+            "invalid forwarding dimensions"
+        );
+        pixels
+            .and_then(|n| n.checked_mul(self.bytes_per_pixel))
+            .filter(|&n| n <= MAX_FRAME)
+            .context("forwarding frame exceeds size limit")
+    }
     /// The bytes FFmpeg reads for `frame`; the sensor buffer itself unless
     /// its samples are packed or widened, or its 4:2:2 rows end in half a
     /// pixel pair.
     fn bytes(&self, frame: Frame) -> Result<Vec<u8>> {
         let (width, height) = (frame.width as usize, frame.height as usize);
-        let length = width * height * self.bytes_per_pixel;
+        let length = self.frame_len(frame.width, frame.height)?;
+        ensure!(
+            frame.pixel_format == self.pixel_format,
+            "the camera's pixel format changed; start a new recording to continue"
+        );
         let name = crate::frame::pixel_format_name(frame.pixel_format);
-        let mut data = if self.unpack {
+        let mut data = if self.convert {
+            if self.color {
+                crate::frame::rgb(&frame)?
+            } else {
+                crate::frame::gray8(&frame)?.context("monochrome frame has no gray conversion")?
+            }
+        } else if self.unpack {
             crate::frame::unpacked(&frame)?.into_owned().data
         } else {
             frame.data
@@ -4663,7 +4702,11 @@ impl RawInput {
             // bytes. Each row gets the missing luma, which lies outside the
             // image, and a neutral Cr, as `frame::unpacked` decodes that pixel.
             let row = width * 2;
-            let mut padded = Vec::with_capacity((row + 2) * height);
+            let padded_length = (row + 2)
+                .checked_mul(height)
+                .filter(|&n| n <= MAX_FRAME)
+                .context("forwarding frame exceeds size limit")?;
+            let mut padded = Vec::with_capacity(padded_length);
             for line in data.chunks_exact(row) {
                 padded.extend_from_slice(line);
                 padded.extend_from_slice(&[128, 128]);
@@ -4730,10 +4773,7 @@ impl Forwarder {
             .map(|(path, _)| path)
     }
     fn spawn(&mut self, width: u32, height: u32, raw: RawInput) -> Result<()> {
-        ensure!(
-            width > 0 && height > 0 && width as usize * height as usize <= MAX_FRAME / 3,
-            "invalid forwarding dimensions"
-        );
+        raw.frame_len(width, height)?;
         let recording = recording_output(&self.config.output)?;
         let local = recording.is_some();
         let exe = executable()?;
@@ -7003,6 +7043,191 @@ esac"#
         }
         let error = RawInput::for_format(0x0110_0099).unwrap_err().to_string();
         assert!(error.contains("0x01100099") && error.contains("--format raw"));
+    }
+    #[test]
+    fn raw_inputs_keep_fourteen_bit_precision() {
+        let frame = |pixel_format, data| Frame {
+            width: 2,
+            height: 1,
+            pixel_format,
+            data,
+            ..Frame::default()
+        };
+        let samples = [0x1234u16, 0x3abc];
+        let unpacked = samples
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let packed = [0x34, 0x12, 0xaf, 0x0e].to_vec();
+        let mono = RawInput::for_format(0x010e_0104).unwrap();
+        assert_eq!(mono.ffmpeg, "gray14le");
+        assert_eq!(
+            mono.bytes(frame(0x010e_0104, packed.clone())).unwrap(),
+            unpacked
+        );
+        for (plain, packed_format, ffmpeg) in [
+            (0x0110_0109, 0x010e_0105, "bayer_grbg16le"),
+            (0x0110_010a, 0x010e_0106, "bayer_rggb16le"),
+            (0x0110_010b, 0x010e_0107, "bayer_gbrg16le"),
+            (0x0110_010c, 0x010e_0108, "bayer_bggr16le"),
+        ] {
+            for (format, data) in [(plain, unpacked.clone()), (packed_format, packed.clone())] {
+                let raw = RawInput::for_format(format).unwrap();
+                assert_eq!(raw.ffmpeg, ffmpeg);
+                assert_eq!(
+                    raw.bytes(frame(format, data)).unwrap(),
+                    [0x48d0u16, 0xeaf0]
+                        .into_iter()
+                        .flat_map(u16::to_le_bytes)
+                        .collect::<Vec<_>>(),
+                    "{format:#x}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn scalar_raw_inputs_preserve_samples_without_expanding_to_rgb() {
+        for (format, ffmpeg, bytes_per_pixel) in [
+            (0x0108_00b1, "gray", 1),
+            (0x0108_00c6, "gray", 1),
+            (0x0110_00b8, "gray16le", 2),
+            (0x0110_00c7, "gray16le", 2),
+        ] {
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!(
+                (raw.ffmpeg, raw.bytes_per_pixel, raw.color),
+                (ffmpeg, bytes_per_pixel, false)
+            );
+            let data = (1..=3 * bytes_per_pixel as u8).collect::<Vec<_>>();
+            let expected = data.clone();
+            let buffer = data.as_ptr();
+            let frame = Frame {
+                width: 3,
+                height: 1,
+                pixel_format: format,
+                data,
+                ..Frame::default()
+            };
+            let bytes = raw.bytes(frame).unwrap();
+            assert_eq!(bytes, expected, "{format:#x}");
+            assert_eq!(bytes.as_ptr(), buffer, "sensor buffer moves without a copy");
+        }
+    }
+    #[test]
+    fn raw_inputs_reject_invalid_dimensions_before_reading_samples() {
+        for format in [crate::types::MONO8, 0x0210_0032, 0x010c_0047] {
+            let raw = RawInput::for_format(format).unwrap();
+            for (width, height) in [(0, 1), (1, 0), (u32::MAX, u32::MAX), (100_000, 100_000)] {
+                let frame = Frame {
+                    width,
+                    height,
+                    pixel_format: format,
+                    data: vec![],
+                    ..Frame::default()
+                };
+                assert!(
+                    raw.bytes(frame)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("invalid forwarding dimensions"),
+                    "{format:#x} {width}x{height}"
+                );
+            }
+        }
+        let rgba = RawInput::for_format(0x0220_0016).unwrap();
+        assert!(rgba.frame_len(8192, 8192).is_ok());
+        assert!(rgba.frame_len(8193, 8192).is_err());
+        let gray = RawInput::for_format(crate::types::MONO8).unwrap();
+        let frame = Frame {
+            width: 1,
+            height: 1,
+            pixel_format: crate::types::RGB8,
+            data: vec![1, 2, 3],
+            ..Frame::default()
+        };
+        assert!(
+            gray.bytes(frame)
+                .unwrap_err()
+                .to_string()
+                .contains("pixel format changed")
+        );
+    }
+    #[test]
+    fn raw_inputs_normalize_formats_ffmpeg_cannot_consume_directly() {
+        for (format, width, height, data, ffmpeg, expected) in [
+            (
+                0x0101_0037,
+                5,
+                2,
+                vec![0b10101, 0b01010],
+                "gray",
+                vec![255, 0, 255, 0, 255, 0, 255, 0, 255, 0],
+            ),
+            (
+                0x0108_0002,
+                4,
+                1,
+                vec![128, 255, 0, 127],
+                "gray",
+                vec![0, 127, 128, 255],
+            ),
+            (
+                0x0218_0021,
+                2,
+                1,
+                vec![10, 40, 20, 50, 30, 60],
+                "rgb24",
+                vec![10, 20, 30, 40, 50, 60],
+            ),
+            (
+                0x0230_0033,
+                2,
+                1,
+                vec![0, 10, 0, 20, 0, 30, 0, 40, 0, 50, 0, 60],
+                "rgb24",
+                vec![10, 20, 30, 40, 50, 60],
+            ),
+            (
+                0x0224_0049,
+                1,
+                1,
+                vec![0x00, 0x0f, 0x80, 0x00, 0x01],
+                "rgb24",
+                vec![16, 128, 240],
+            ),
+            (
+                0x0210_003e,
+                2,
+                1,
+                vec![16, 128, 235, 128],
+                "rgb24",
+                vec![0, 0, 0, 255, 255, 255],
+            ),
+            (
+                0x0218_0040,
+                1,
+                1,
+                vec![102, 63, 240],
+                "rgb24",
+                vec![255, 1, 0],
+            ),
+        ] {
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!(raw.ffmpeg, ffmpeg, "{format:#x}");
+            assert!(raw.convert, "{format:#x}");
+            assert!(
+                raw.color_options().is_empty(),
+                "converted RGB has no YUV matrix tag"
+            );
+            let frame = Frame {
+                width,
+                height,
+                pixel_format: format,
+                data,
+                ..Frame::default()
+            };
+            assert_eq!(raw.bytes(frame).unwrap(), expected, "{format:#x}");
+        }
     }
     #[test]
     fn odd_width_yuv_422_rows_fill_whole_pixel_pairs() {

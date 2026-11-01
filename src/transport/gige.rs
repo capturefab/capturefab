@@ -2225,7 +2225,43 @@ impl Assembler {
                 );
             }
         }
-        data.truncate((leader.row_bytes * height as usize).min(frame.end));
+        // A short image-packed PFNC stream can end before the size of its
+        // byte-aligned rows. Normalize that unambiguous layout for Frame's
+        // row-based consumers. A full-sized payload remains line-padded:
+        // its length cannot establish whether extra bytes are transport
+        // padding, and chunk payloads do not expose the image boundary here.
+        let line_bytes = leader.row_bytes * height as usize;
+        if leader.x_padding == 0
+            && !leader.chunks
+            && line_bytes <= MAX_PAYLOAD
+            && frame.end == leader.image_bytes(height) + leader.y_padding
+            && leader.image_bytes(height) < line_bytes
+            && crate::frame::lsb_packed(leader.pixel_format)
+        {
+            let row_bits = leader.width as usize * ((leader.pixel_format >> 16) & 0xff) as usize;
+            data.resize(line_bytes, 0);
+            // Move backwards so expanding rows can reuse the receive buffer.
+            for row in (0..height as usize).rev() {
+                let first_bit = row * row_bits;
+                let shift = first_bit % 8;
+                for byte in (0..leader.row_bytes).rev() {
+                    let source = first_bit / 8 + byte;
+                    let low = u16::from(data[source]);
+                    let high = if shift == 0 {
+                        0
+                    } else {
+                        u16::from(data.get(source + 1).copied().unwrap_or(0)) << 8
+                    };
+                    data[row * leader.row_bytes + byte] = ((low | high) >> shift) as u8;
+                }
+                if !row_bits.is_multiple_of(8) {
+                    data[(row + 1) * leader.row_bytes - 1] &= (1 << (row_bits % 8)) - 1;
+                }
+            }
+            data.truncate(line_bytes);
+        } else {
+            data.truncate(line_bytes.min(frame.end));
+        }
         let swapped = if self.big_endian_mono16 && leader.pixel_format == MONO16 {
             Some(2)
         } else if self.big_endian {
@@ -3645,24 +3681,78 @@ mod tests {
     fn packed_rows_may_be_padded_per_line_or_per_image() {
         // 5 Mono12p or 6 Mono10p pixels are 60 bits: 8 bytes per line when
         // each line is padded, 60 bytes for 8 lines when lines run on.
-        let send = |pixel, width, payload, bytes: usize| {
+        let send = |pixel, width, payload, wire: &[u8], x_padding: u16, y_padding: u16| {
             let mut assembler = Assembler::new(payload, 48, 0);
-            let wire: Vec<u8> = (1..=bytes as u8).collect();
-            let mut packets = vec![gvsp(1, 0, 1, false, &leader(width, 8, pixel))];
+            let mut metadata = leader(width, 8, pixel);
+            metadata[32..34].copy_from_slice(&x_padding.to_be_bytes());
+            metadata[34..36].copy_from_slice(&y_padding.to_be_bytes());
+            let mut packets = vec![gvsp(1, 0, 1, false, &metadata)];
             for chunk in wire.chunks(12) {
                 packets.push(gvsp(1, packets.len() as u32, 3, false, chunk));
             }
             packets.push(gvsp(1, packets.len() as u32, 2, false, &trailer(8)));
-            let frame = packets
+            packets
                 .iter()
-                .find_map(|packet| assembler.push(packet).unwrap())
-                .unwrap();
-            assert_eq!(frame.data, wire, "{pixel:08x} {payload} {bytes}");
+                .find_map(|packet| assembler.push(packet).transpose())
+                .expect("the image or its error is delivered")
         };
-        for (pixel, width) in [(0x010c_0047, 5), (0x010a_0046, 6)] {
-            send(pixel, width, 60, 60);
-            send(pixel, width, 64, 60);
-            send(pixel, width, 64, 64);
+        let pack = |samples: &[u16], bits: usize| {
+            let mut data = vec![0u8; (samples.len() * bits).div_ceil(8)];
+            for (i, &sample) in samples.iter().enumerate() {
+                for bit in 0..bits {
+                    data[(i * bits + bit) / 8] |=
+                        ((sample >> bit) as u8 & 1) << ((i * bits + bit) % 8);
+                }
+            }
+            data
+        };
+        for (pixel, width, bits) in [(0x010c_0047, 5, 12), (0x010a_0046, 6, 10)] {
+            let samples: Vec<u16> = (0..width * 8)
+                .map(|i| ((i * 317 + 179) & ((1 << bits) - 1)) as u16)
+                .collect();
+            let continuous = pack(&samples, bits);
+            let rows: Vec<u8> = samples
+                .chunks_exact(width as usize)
+                .flat_map(|row| pack(row, bits))
+                .collect();
+            assert_eq!((continuous.len(), rows.len()), (60, 64));
+            for payload in [60, 64] {
+                let frame = send(pixel, width, payload, &continuous, 0, 0).unwrap();
+                assert_eq!(frame.data, rows, "{pixel:08x} {payload}");
+                let actual = crate::frame::unpacked(&frame).unwrap();
+                let expected: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+                assert_eq!(actual.data, expected, "{pixel:08x} {payload}");
+            }
+            let frame = send(pixel, width, 64, &rows, 0, 0).unwrap();
+            assert_eq!(frame.data, rows);
+            let mut y_padded = continuous.clone();
+            y_padded.extend([0xa5; 3]);
+            assert_eq!(send(pixel, width, 63, &y_padded, 0, 3).unwrap().data, rows);
+            let x_padded: Vec<u8> = rows
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .flat_map(|row| row.iter().copied().chain([0xa5]))
+                .collect();
+            assert_eq!(send(pixel, width, 72, &x_padded, 1, 0).unwrap().data, rows);
+            assert!(send(pixel, width, 64, &continuous[..59], 0, 0).is_err());
+        }
+        for (pixel, width, channels, bits) in [
+            (0x0104_0039, 3, 1, 4),
+            (0x021e_005c, 3, 3, 10),
+            (0x0224_0049, 3, 3, 12),
+        ] {
+            let samples: Vec<u16> = (0..width * channels * 8)
+                .map(|i| ((i * 317 + 179) & ((1 << bits) - 1)) as u16)
+                .collect();
+            let continuous = pack(&samples, bits);
+            let rows: Vec<u8> = samples
+                .chunks_exact((width * channels) as usize)
+                .flat_map(|row| pack(row, bits))
+                .collect();
+            let frame = send(pixel, width, rows.len(), &continuous, 0, 0).unwrap();
+            assert_eq!(frame.data, rows, "{pixel:08x}");
+            assert!(crate::frame::rgb(&frame).is_ok());
         }
         assert!(ImageLeader::parse(&leader(5, 8, 0x010c_0047), 59).is_err());
     }

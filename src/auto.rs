@@ -80,57 +80,75 @@ pub struct Meter {
 }
 
 pub fn meter(frame: &Frame) -> Option<Meter> {
-    let frame = &*crate::frame::unpacked(frame).ok()?;
+    // A meter only reads its sampling grid. Packed mono and Bayer samples
+    // can be decoded there directly, without a full-sized temporary image.
+    crate::frame::validate_source(frame).ok()?;
+    let packed = crate::frame::packing(frame.pixel_format);
+    let color_bits = crate::frame::native_color(frame, 0, 0).map(|(_, bits)| bits);
+    let normalized;
+    let frame = if packed.is_some() || color_bits.is_some() {
+        frame
+    } else {
+        normalized = crate::frame::unpacked(frame).ok()?;
+        &*normalized
+    };
     let (w, h) = (frame.width as usize, frame.height as usize);
-    let (bytes, bits, quad) = match frame.pixel_format {
-        crate::types::MONO8 => (1, 8, false),
-        crate::types::RGB8 | 0x0218_0015 => (3, 8, false),
-        0x0110_0003 => (2, 10, false),
-        0x0110_0005 => (2, 12, false),
-        0x0110_0025 => (2, 14, false),
-        0x0110_0007 => (2, 16, false),
-        0x0108_0008..=0x0108_000b => (1, 8, true),
-        0x0110_000c..=0x0110_000f => (2, 10, true),
-        0x0110_0010..=0x0110_0013 => (2, 12, true),
-        0x0110_002e..=0x0110_0031 => (2, 16, true),
-        _ => return None,
+    let format = packed.map_or(frame.pixel_format, |(format, ..)| format);
+    let (bytes, bits, quad) = if let Some(bits) = color_bits {
+        (3, bits, false)
+    } else {
+        match format {
+            crate::types::MONO8 => (1, 8, false),
+            crate::types::RGB8 | 0x0218_0015 => (3, 8, false),
+            0x0110_0003 => (2, 10, false),
+            0x0110_0005 => (2, 12, false),
+            0x0110_0025 => (2, 14, false),
+            0x0110_0007 => (2, 16, false),
+            0x0108_0008..=0x0108_000b => (1, 8, true),
+            0x0110_000c..=0x0110_000f => (2, 10, true),
+            0x0110_0010..=0x0110_0013 => (2, 12, true),
+            0x0110_002e..=0x0110_0031 => (2, 16, true),
+            0x0110_0109..=0x0110_010c => (2, 14, true),
+            _ => return None,
+        }
     };
     let (gw, gh) = if quad { (w / 2, h / 2) } else { (w, h) };
-    if gw == 0 || gh == 0 || frame.data.len() < w.checked_mul(h)?.checked_mul(bytes)? {
+    if gw == 0 || gh == 0 {
         return None;
-    }
-    let mut stride = 1;
-    while gw.div_ceil(stride) * gh.div_ceil(stride) > 16_384 {
-        stride += 1;
     }
     let scale = ((1u32 << bits) - 1) as f64;
     let d = &frame.data;
-    let px = |i: usize| match bytes {
-        2 => u16::from_le_bytes([d[2 * i], d[2 * i + 1]]) as f64,
-        _ => d[i] as f64,
-    };
+    let sample = |x, y| f64::from(crate::frame::native_sample(frame, x, y));
     let (mut sum, mut count, mut histogram) = (0.0, 0u32, [0u32; 256]);
-    for y in (0..gh).step_by(stride) {
-        for x in (0..gw).step_by(stride) {
-            let (luma, peak) = if quad {
-                let i = 2 * (y * w + x);
-                let q = [px(i), px(i + 1), px(i + w), px(i + w + 1)];
-                (
-                    q.iter().sum::<f64>() / 4.0,
-                    q.into_iter().fold(0.0, f64::max),
-                )
-            } else if bytes == 3 {
-                let i = 3 * (y * w + x);
-                let (r, g, b) = (px(i), px(i + 1), px(i + 2));
-                ((r + 2.0 * g + b) / 4.0, r.max(g).max(b))
+    for i in crate::frame::sample_indices(gw * gh, 16_384) {
+        let (x, y) = (i % gw, i / gw);
+        let (luma, peak) = if quad {
+            let (x, y) = (2 * x, 2 * y);
+            let q = [
+                sample(x, y),
+                sample(x + 1, y),
+                sample(x, y + 1),
+                sample(x + 1, y + 1),
+            ];
+            (
+                q.iter().sum::<f64>() / 4.0,
+                q.into_iter().fold(0.0, f64::max),
+            )
+        } else if bytes == 3 {
+            let [r, g, b] = if color_bits.is_some() {
+                crate::frame::native_color(frame, x, y)?.0.map(f64::from)
             } else {
-                let v = px(y * w + x);
-                (v, v)
+                let i = 3 * (y * w + x);
+                [d[i], d[i + 1], d[i + 2]].map(f64::from)
             };
-            sum += (luma / scale).min(1.0);
-            count += 1;
-            histogram[((peak / scale).min(1.0) * 255.0).round() as usize] += 1;
-        }
+            ((r + 2.0 * g + b) / 4.0, r.max(g).max(b))
+        } else {
+            let v = sample(x, y);
+            (v, v)
+        };
+        sum += (luma / scale).min(1.0);
+        count += 1;
+        histogram[((peak / scale).min(1.0) * 255.0).round() as usize] += 1;
     }
     let mut seen = 0;
     let p99 = histogram
@@ -2152,6 +2170,119 @@ mod tests {
         );
         assert!(meter(&frame(MONO8, 4, 4, vec![0; 15])).is_none());
         assert!(meter(&frame(0x010c_0047, 4, 4, vec![0; 23])).is_none());
+    }
+
+    #[test]
+    fn meter_samples_packed_rows_at_native_precision() {
+        let pack = |samples: &[u16], width: usize, bits: usize| {
+            samples
+                .chunks_exact(width)
+                .flat_map(|row| {
+                    let mut packed = vec![0u8; (width * bits).div_ceil(8)];
+                    for (x, &sample) in row.iter().enumerate() {
+                        for bit in 0..bits {
+                            packed[(x * bits + bit) / 8] |=
+                                ((sample >> bit) as u8 & 1) << ((x * bits + bit) % 8);
+                        }
+                    }
+                    packed
+                })
+                .collect()
+        };
+        for (packed, unpacked, bits) in [
+            (0x010a_0046, 0x0110_0003, 10),
+            (0x010c_0047, 0x0110_0005, 12),
+            (0x010e_0104, 0x0110_0025, 14),
+            (0x010a_0058, 0x0110_000d, 10),
+            (0x010c_0059, 0x0110_0011, 12),
+            (0x010e_0106, 0x0110_010a, 14),
+        ] {
+            // Odd-width rows end inside a byte, and every sample retains
+            // low bits that an 8-bit display conversion would discard.
+            let samples: Vec<u16> = (0..20)
+                .map(|i| ((i * 317 + 179) & ((1 << bits) - 1)) as u16)
+                .collect();
+            let mut source = frame(packed, 5, 4, pack(&samples, 5, bits));
+            let whole = frame(
+                unpacked,
+                5,
+                4,
+                samples.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            );
+            assert_eq!(meter(&source), meter(&whole), "{packed:08x}");
+            assert!(meter(&source).is_some());
+            source.data.pop();
+            assert!(meter(&source).is_none(), "{packed:08x}");
+        }
+        for (width, height) in [(0, 4), (4, 0), (u32::MAX, u32::MAX)] {
+            assert!(meter(&frame(MONO8, width, height, vec![0; 16])).is_none());
+        }
+    }
+
+    #[test]
+    fn meter_does_not_alias_checkerboards_or_single_pixel_stripes() {
+        let (width, height) = (1024usize, 1024usize);
+        for (format, channels, unit) in [(MONO8, 1, 1), (RGB8, 3, 1), (0x0108_0009, 1, 2)] {
+            // Bayer detail is one color quad per cell, so its metering grid
+            // sees the same alternating cells as the scalar/color grids.
+            for pattern in 0..3 {
+                for phase in 0..2 {
+                    let data = (0..width * height)
+                        .flat_map(|i| {
+                            let (x, y) = (i % width / unit, i / width / unit);
+                            let cell = match pattern {
+                                0 => x + y,
+                                1 => x,
+                                _ => y,
+                            };
+                            let value = if (cell + phase).is_multiple_of(2) {
+                                0
+                            } else {
+                                255
+                            };
+                            std::iter::repeat_n(value, channels)
+                        })
+                        .collect();
+                    let measured =
+                        meter(&frame(format, width as u32, height as u32, data)).unwrap();
+                    assert!(
+                        (measured.mean - 0.5).abs() < 0.02,
+                        "{format:08x}, pattern {pattern}, phase {phase}: {measured:?}"
+                    );
+                    assert_eq!(measured.p99, 1.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn meter_keeps_native_precision_for_wide_color_and_ignores_alpha() {
+        for (format, bits, bgr, planar, alpha) in [
+            (0x0230_0018, 10, false, false, false),
+            (0x0230_001b, 12, true, false, false),
+            (0x0240_0063, 14, false, false, true),
+            (0x0230_0024, 16, false, true, false),
+        ] {
+            let max = (1u32 << bits) - 1;
+            let rgb = [max / 4 + 1, max / 2 + 2, 3 * max / 4 + 3];
+            let channels = if bgr { [rgb[2], rgb[1], rgb[0]] } else { rgb };
+            let samples = if planar {
+                channels.into_iter().flat_map(|v| [v, v]).collect()
+            } else {
+                let mut pixel = channels.to_vec();
+                if alpha {
+                    pixel.push(max);
+                }
+                pixel.repeat(2)
+            };
+            let data = samples
+                .iter()
+                .flat_map(|&v| (v as u16).to_le_bytes())
+                .collect();
+            let actual = meter(&frame(format, 2, 1, data)).unwrap();
+            let mean = f64::from(rgb[0] + 2 * rgb[1] + rgb[2]) / 4.0 / f64::from(max);
+            assert!(near(actual.mean, mean), "{format:08x}: {actual:?}");
+        }
     }
 
     #[test]

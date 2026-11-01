@@ -380,6 +380,37 @@ fn frames() -> Vec<Value> {
             CameraKind::Microscope,
         ],
     ));
+    // Exercise every supported PFNC layout through native Rust, browser Rust
+    // and the shipped Wasm ABI using identical bytes. A byte generator avoids
+    // assuming RGB component counts or whole-byte samples in the consumers.
+    for format in [
+        0x0101, 0x0102, 0x0104, 0x0108, 0x010a, 0x010c, 0x010e, 0x0110, 0x020c, 0x0210, 0x0218,
+        0x021e, 0x0220, 0x0224, 0x0228, 0x0230, 0x0240,
+    ]
+    .into_iter()
+    .flat_map(|prefix| (0..=0x12e).map(move |id| prefix << 16 | id))
+    {
+        if !frame::convertible(format) {
+            continue;
+        }
+        let mut seed = format ^ 0x2545_f491;
+        let bytes: Vec<u8> = (0..frame::row_bytes(12, format) * 8)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        cases.push(frame_case(
+            &format!("{}-layout-12x8", format_label(format)),
+            format,
+            (12, 8),
+            json!({"kind": "bytes", "hex": hex}),
+            &area,
+        ));
+    }
     cases
 }
 
