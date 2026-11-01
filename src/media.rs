@@ -26,6 +26,7 @@ use std::{
 };
 
 const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/capturefab-ffmpeg.bin"));
+const LICENSE: &str = include_str!(concat!(env!("OUT_DIR"), "/capturefab-ffmpeg-license.txt"));
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const MAX_LOG: usize = 16 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -909,6 +910,11 @@ fn timed_output(
         String::from_utf8_lossy(&bytes).to_string(),
         timed_out,
     ))
+}
+/// The bundled FFmpeg's license notice, with the license texts it is
+/// distributed under.
+pub(crate) fn license_notice() -> &'static str {
+    LICENSE
 }
 /// Which FFmpeg this process would run, and whether it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -2270,6 +2270,18 @@ fn doctor_reports_build_features_paths_and_checks() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Installers copy only the executable, so it carries the GPL notice of the
+/// FFmpeg it embeds.
+#[test]
+fn version_carries_the_bundled_ffmpeg_license_notice() {
+    let dir = temp_root("version");
+    let version = json(&dir, &["--json", "version"]);
+    assert_eq!(version["version"], env!("CARGO_PKG_VERSION"));
+    let notice = version["ffmpeg_license_notice"].as_str().unwrap();
+    assert!(notice.contains("GPL"), "{notice}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn doctor_warns_when_ffmpeg_does_not_run_and_when_sessions_are_shared() {
     let dir = temp_root("doctor-ffmpeg");

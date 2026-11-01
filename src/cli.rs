@@ -473,7 +473,7 @@ pub enum Command {
     },
     /// Check this computer (session and state folders, FFmpeg, GigE and USB limits, storage budget) and print a fix under each warning; --json adds interfaces and compiled capabilities
     Doctor,
-    /// Print this build's version
+    /// Print this build's version and the bundled FFmpeg's license notice
     Version,
     /// Emit the versioned CLI and session automation contract as JSON
     Schema,
@@ -1223,7 +1223,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Some(Command::Version) => {
             return output(
                 &cli,
-                json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH}),
+                json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"ffmpeg_license_notice":crate::media::license_notice()}),
             );
         }
         Some(Command::Storage { command }) => {
@@ -1833,6 +1833,10 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             value["version"].as_str().unwrap_or_default(),
             value["os"].as_str().unwrap_or_default(),
             value["arch"].as_str().unwrap_or_default()
+        )?;
+        writeln!(
+            out,
+            "Bundled FFmpeg is GPL; `capturefab --json version` includes its license notice."
         )?;
     } else if let Some(Command::Serve { name, .. }) = &cli.command {
         writeln!(
