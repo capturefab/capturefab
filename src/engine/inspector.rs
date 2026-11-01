@@ -305,7 +305,7 @@ pub(super) fn acquire(
     } else {
         Ok(())
     };
-    refresh(h, camera, false);
+    refresh(h, camera);
     let acquired = result?;
     stopped?;
     Ok(acquired)

@@ -165,6 +165,90 @@ fn a_camera_the_session_holds_names_it_to_another_command() {
     run(&["--json", "get", "--keep", "0", "-c", camera, "Width"]).success();
 }
 
+#[test]
+fn a_change_after_a_capture_finds_a_lingering_camera_stopped() {
+    let home = Home::new("warm-linger-set");
+    let hooks = [("CAPTUREFAB_TEST_HOOKS", "1")];
+    // A simulator that, like a webcam, goes on streaming a moment after a
+    // capture for the next one.
+    let camera = "sim:0?linger=1";
+    let run = |args: &[&str]| {
+        support::cli::Run::of_output(
+            home.warm_command().envs(hooks).args(args).output().unwrap(),
+            args,
+        )
+    };
+    let state = || home.ok(&["session", "status", "auto"])["cameras"][0]["state"].clone();
+    run(&["--json", "capture", "-c", camera, "-o", "a.png"]).success();
+    assert_eq!(state(), "streaming");
+    // The width is locked while the camera streams; a change stops a
+    // stream that only lingers, as it finds the camera alone.
+    let checked = run(&["--json", "set", "-c", camera, "--dry-run", "Width=320"]).success();
+    assert_eq!(checked["plan"][0]["name"], "Width", "{checked}");
+    run(&["--json", "capture", "-c", camera, "-o", "b.png"]).success();
+    let changed = run(&["--json", "set", "-c", camera, "Width=320", "Height=240"]).success();
+    assert_eq!(changed["changed"][0]["to"], 320, "{changed}");
+    assert_eq!(state(), "idle");
+    let shot = run(&["--json", "capture", "-c", camera, "-o", "c.png"]).success();
+    assert_eq!(shot["width"], 320, "{shot}");
+}
+
+#[test]
+fn a_command_without_a_camera_finds_it_as_it_would_alone() {
+    let home = Home::new("warm-default-camera");
+    // No camera this test can find: FFmpeg lists no host camera, and no
+    // network is searched.
+    let quiet = [("CAPTUREFAB_FFMPEG", "/usr/bin/false")];
+    let run = |args: &[&str]| {
+        support::cli::Run::of_output(
+            home.warm_command().envs(quiet).args(args).output().unwrap(),
+            args,
+        )
+    };
+    run(&["--json", "get", "-c", "sim:0", "Width"]).success();
+    assert_eq!(sessions(&home).len(), 1);
+    // The auto session holds sim:0, which no command takes for its default
+    // camera: without -c, the result is the one a command alone gets.
+    let alone = run(&["--json", "--no-session", "get", "Width"]);
+    let warm = run(&["--json", "get", "Width"]);
+    assert_eq!(warm.code, alone.code, "{}", warm.stdout);
+    assert_eq!(warm.stdout, alone.stdout);
+}
+
+#[test]
+fn a_session_command_without_a_name_leaves_the_auto_session_aside() {
+    let home = Home::new("warm-unnamed");
+    home.ok(&["session", "start", "-c", "sim:0"]);
+    home.warm(&["--json", "get", "-c", "sim:1", "Width"])
+        .success();
+    assert_eq!(sessions(&home).len(), 2);
+    assert_eq!(home.ok(&["session", "status"])["session"], "default");
+    assert_eq!(home.ok(&["session", "stop"])["session"], "default");
+    // Alone, the auto session is the one.
+    assert_eq!(home.ok(&["session", "status"])["session"], "auto");
+}
+
+#[test]
+fn verbose_shows_what_the_session_logged_for_the_command() {
+    let home = Home::new("warm-verbose");
+    let first = home.warm(&["-v", "get", "-c", "sim:0", "Width"]);
+    assert_eq!(first.code, Some(0), "{}", first.stderr);
+    assert!(
+        first.stderr.contains("[info] Connected to sim:0"),
+        "{}",
+        first.stderr
+    );
+    // The next command connects nothing, and says what it did.
+    let next = home.warm(&["-v", "set", "-c", "sim:0", "Width=320"]);
+    assert_eq!(next.code, Some(0), "{}", next.stderr);
+    assert!(!next.stderr.contains("Connected"), "{}", next.stderr);
+    assert!(
+        next.stderr.contains("[info] Set Width = 320"),
+        "{}",
+        next.stderr
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn without_a_writable_runtime_folder_a_command_opens_its_camera_alone() {
@@ -256,5 +340,29 @@ fn a_live_stream_decodes_only_while_frames_are_needed_and_a_moment_after() {
     while state() != "idle" {
         assert!(Instant::now() < deadline, "the stream kept decoding");
         std::thread::sleep(Duration::from_millis(250));
+    }
+    // A command that takes no frame opens the stream to connect, and lets
+    // it go a few seconds later.
+    #[cfg(unix)]
+    {
+        home.ok(&["session", "stop", "auto"]);
+        let decoding = || {
+            std::process::Command::new("pgrep")
+                .args(["-f", &format!("[-]i {stream}")])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(!decoding());
+        home.warm(&["--json", "get", "-c", &stream, "Width"])
+            .success();
+        assert!(decoding());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while decoding() {
+            assert!(Instant::now() < deadline, "FFmpeg kept decoding");
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert_eq!(state(), "idle");
     }
 }

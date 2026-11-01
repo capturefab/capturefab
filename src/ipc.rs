@@ -1460,25 +1460,29 @@ pub fn idle_left(name: &str) -> Option<Duration> {
     probe["idle_ms"].as_u64().map(Duration::from_millis)
 }
 /// Wait up to `wait` for session `name`, which is ending, to be gone, so
-/// another may start under its name.
-pub fn wait_ended(name: &str, wait: Duration) -> Result<()> {
-    let deadline = Instant::now() + wait;
-    let mut pause = Duration::from_millis(1);
-    while running_session(name).is_some() {
-        if Instant::now() >= deadline {
-            return Err(crate::types::Categorized::new(
-                crate::types::ErrorKind::Timeout,
-                format!("session {name} is still ending"),
-            )
-            .hint(format!(
-                "try again, or stop it with capturefab session stop {name}"
-            ))
-            .into());
-        }
-        std::thread::sleep(pause);
-        pause = (pause * 2).min(Duration::from_millis(50));
+/// another may start under its name: whether it is. The wait is for its
+/// name lock, which it holds until it exits, so it ends as the session does.
+pub fn wait_ended(name: &str, wait: Duration) -> bool {
+    let Ok(lock) = fs::File::open(runtime_dir().join(format!("{name}.session.lock"))) else {
+        return running_session(name).is_none();
+    };
+    let (ended, gone) = std::sync::mpsc::channel();
+    // A wait that outlasts `wait` goes on alone until the session ends;
+    // nothing waits for it then.
+    let waiting = std::thread::Builder::new()
+        .name("capturefab-session-end".into())
+        .spawn(move || {
+            // Let go at once: a session started next under the name takes
+            // the lock for itself.
+            if FileExt::lock_shared(&lock).is_ok() {
+                let _ = FileExt::unlock(&lock);
+            }
+            let _ = ended.send(());
+        });
+    if waiting.is_ok() {
+        let _ = gone.recv_timeout(wait);
     }
-    Ok(())
+    running_session(name).is_none()
 }
 /// Session `name`'s descriptor, when that session runs.
 pub fn running_session(name: &str) -> Option<Descriptor> {

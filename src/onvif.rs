@@ -206,11 +206,9 @@ fn repeat_offsets(first_delay_ms: u64) -> [Duration; 3] {
         Duration::from_millis(at)
     })
 }
-pub fn discover(timeout: Duration) -> Result<Vec<OnvifDevice>> {
-    discover_until(timeout, &mut |_| false)
-}
-/// `discover`, telling `found` of each device as it answers; it returns at
-/// once, with what answered so far, when `found` says that was the one.
+/// Search the network for ONVIF devices for up to `timeout`, telling
+/// `found` of each device as it answers; it returns at once, with what
+/// answered so far, when `found` says that was the one.
 fn discover_until(
     timeout: Duration,
     found: &mut dyn FnMut(&OnvifDevice) -> bool,
@@ -1716,11 +1714,9 @@ pub fn connect_with(
     };
     Ok((info, backend))
 }
-pub fn camera_infos(timeout: Duration) -> Result<Vec<crate::types::CameraInfo>> {
-    camera_infos_until(timeout, &mut |_| false)
-}
-/// `camera_infos`, telling `found` of each camera as it answers; it returns
-/// at once when `found` says that was the one.
+/// The ONVIF cameras that answer within `timeout`, as `list` shows them,
+/// telling `found` of each camera as it answers; it returns at once when
+/// `found` says that was the one.
 pub fn camera_infos_until(
     timeout: Duration,
     found: &mut dyn FnMut(&crate::types::CameraInfo) -> bool,
@@ -1928,12 +1924,12 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("profile token"));
         assert!(
-            discover(Duration::ZERO)
+            discover_until(Duration::ZERO, &mut |_| false)
                 .unwrap_err()
                 .to_string()
                 .contains("positive")
         );
-        assert!(discover(Duration::MAX).is_err());
+        assert!(discover_until(Duration::MAX, &mut |_| false).is_err());
     }
     #[test]
     fn endpoint_schemes_ignore_case_and_fragments_have_specific_errors() {

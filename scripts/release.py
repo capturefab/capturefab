@@ -390,6 +390,9 @@ def smoke(binary):
         # the builder's own folders.
         env['CAPTUREFAB_SESSION_DIR'] = str(Path(temp) / 'sessions')
         env['CAPTUREFAB_CACHE_DIR'] = str(Path(temp) / 'cache')
+        # The camera is opened for each command alone: no session outlives
+        # the folder it keeps its log and lock in.
+        env['CAPTUREFAB_KEEP'] = '0'
         run([binary, '--version'], stdout=subprocess.PIPE, text=True, env=env)
         result = run([binary, '--json', 'doctor'], stdout=subprocess.PIPE, text=True, env=env)
         media = json.loads(result.stdout).get('ffmpeg') or {}

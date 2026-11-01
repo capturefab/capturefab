@@ -482,6 +482,9 @@ pub(crate) struct Client {
     keep: Option<Duration>,
     /// The pipe this command's worker writes an image captured to stdout to.
     stdout: Option<std::io::PipeReader>,
+    /// When this command began, in Unix milliseconds: `-v` shows what a
+    /// session logged for it since.
+    since_ms: u64,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -492,6 +495,10 @@ impl Drop for Client {
                 }
             }
             local.shutdown();
+        } else if self.out.verbose
+            && let Some(session) = &self.session
+        {
+            self.print_session_log(session);
         }
     }
 }
@@ -518,6 +525,7 @@ impl Client {
     /// session that holds the camera, or for `--keep`/`--background` one
     /// started for it; else a worker of this command.
     pub fn open_with(global: &Global, selector: Option<&str>, route: Route) -> Result<Self> {
+        let since_ms = crate::scheduling::now_ms();
         let selector = selector.map(caller_selector).transpose()?;
         let out = global.output();
         // CAPTUREFAB_KEEP and the warm default are defaults, which
@@ -539,15 +547,15 @@ impl Client {
             if route.warm {
                 route = route.cold();
             }
-            if route.needs_session() {
-                session::ensure(name, selector.as_deref(), route.idle(), global)?;
-            }
-            return Self::in_session(out, name, selector, route).map_err(Unusable::error);
+            let started = route.needs_session()
+                && session::ensure(name, selector.as_deref(), route.idle(), global)?;
+            return Self::in_session(out, name, selector, route, since_ms, started)
+                .map_err(Unusable::error);
         }
         if !global.no_session
             && let Some(name) = route_to(&ipc::sessions(), selector.as_deref())
         {
-            match Self::in_session(out, &name, selector.clone(), route) {
+            match Self::in_session(out, &name, selector.clone(), route, since_ms, false) {
                 Ok(client) => return Ok(client),
                 // A session that is stopping, or gone, leaves the camera to
                 // this command; one that holds it and failed says why.
@@ -571,8 +579,8 @@ impl Client {
                 Some(selector) => selector,
                 None => default_camera()?,
             };
-            session::ensure(AUTO_SESSION, Some(&selector), route.idle(), global)?;
-            return Self::in_session(out, AUTO_SESSION, Some(selector), route)
+            let started = session::ensure(AUTO_SESSION, Some(&selector), route.idle(), global)?;
+            return Self::in_session(out, AUTO_SESSION, Some(selector), route, since_ms, started)
                 .map_err(Unusable::error);
         }
         let selector = match selector {
@@ -590,18 +598,22 @@ impl Client {
             local: Some(local.clone()),
             keep: None,
             stdout,
+            since_ms,
         };
         client.call(SessionCommand::connect(selector, route.connect()))?;
         Ok(client)
     }
     /// Use session `name` for `selector`, connecting the camera there when
-    /// it does not hold it yet; otherwise a status request checks that the
-    /// session still runs and holds it.
+    /// it does not hold it yet; otherwise a short request checks that the
+    /// session still runs and holds it, unless this command just `started`
+    /// it for the camera.
     fn in_session(
         out: Output,
         name: &str,
         selector: Option<String>,
         route: Route,
+        since_ms: u64,
+        started: bool,
     ) -> std::result::Result<Self, Unusable> {
         let keep = route.keep_for(name);
         let unusable = |error: anyhow::Error| {
@@ -625,6 +637,7 @@ impl Client {
             local: None,
             keep,
             stdout: None,
+            since_ms,
         };
         match (&selector, held) {
             (Some(selector), false) => {
@@ -632,6 +645,8 @@ impl Client {
                 ipc::call_keeping(name, None, connect.clone(), default_timeout(&connect), keep)
                     .map_err(unusable)?;
             }
+            // Started for it just now, with this command's keep.
+            (Some(_), true) if started => {}
             // The session runs and holds it: one short request says it still
             // answers, and keeps it.
             (Some(_), true) => ipc::touch(&descriptor, keep).map_err(unusable)?,
@@ -670,6 +685,36 @@ impl Client {
             }
             (None, Some(local)) => local.request(command),
             (None, None) => unreachable!("a client has a session or a worker"),
+        }
+    }
+    /// What session `session` logged for this command's camera since the
+    /// command began, as a worker of the command's own shows under `-v`:
+    /// its own lines and the session's, not other cameras'.
+    fn print_session_log(&self, session: &str) {
+        let Ok(state) = ipc::call_keeping(
+            session,
+            self.target.as_deref(),
+            SessionCommand::Status,
+            default_timeout(&SessionCommand::Status),
+            None,
+        ) else {
+            return;
+        };
+        let camera = state["cameras"][0]["info"]["id"]
+            .as_str()
+            .map(|id| format!("[{}] ", crate::media::redact_url(id)));
+        let lines = serde_json::from_value::<Vec<crate::session::LogEntry>>(state["logs"].clone())
+            .unwrap_or_default();
+        for line in lines.iter().filter(|line| line.unix_ms >= self.since_ms) {
+            let message = match camera
+                .as_deref()
+                .and_then(|camera| line.message.strip_prefix(camera))
+            {
+                Some(message) => message,
+                None if line.message.starts_with('[') => continue,
+                None => &line.message,
+            };
+            eprintln!("capturefab: [{}] {message}", line.level);
         }
     }
     /// The camera's entry in a session status, as `Status` reports it.
@@ -847,7 +892,11 @@ pub(crate) fn input(error: anyhow::Error) -> anyhow::Error {
 
 /// The running session a camera command uses without `--session`: the one
 /// whose descriptor lists the camera, or, without `-c`, the only session
-/// that holds exactly one camera. Matched locally, without asking any.
+/// that holds exactly one camera. The auto session, which camera commands
+/// start for themselves, holds whatever camera they used last: it answers
+/// only for the cameras it is asked for by name, and a command without
+/// `-c` finds its camera as it would alone. Matched locally, without asking
+/// any.
 fn route_to(sessions: &[ipc::Descriptor], selector: Option<&str>) -> Option<String> {
     // A camera's own ID outranks another camera's serial or alias.
     let rank = |session: &ipc::Descriptor| match selector {
@@ -856,7 +905,7 @@ fn route_to(sessions: &[ipc::Descriptor], selector: Option<&str>) -> Option<Stri
             .iter()
             .filter_map(|camera| camera.named_by(selector))
             .min(),
-        None => (session.cameras.len() == 1).then_some(0),
+        None => (session.cameras.len() == 1 && session.name != AUTO_SESSION).then_some(0),
     };
     let ranked = sessions
         .iter()
@@ -1056,5 +1105,22 @@ mod tests {
         assert!(route_to(&all, None).is_none());
         assert_eq!(route_to(&all[1..2], None), None);
         assert_eq!(route_to(&all[..2], None).unwrap(), "one");
+        // The auto session answers only for a camera named: beside one
+        // other, that one is the only session without -c, and alone it
+        // leaves the camera to be found.
+        let auto = session(
+            AUTO_SESSION,
+            vec![ipc::HeldCamera::new(
+                &info("sim:0", "SIM0"),
+                std::iter::empty(),
+            )],
+        );
+        assert_eq!(
+            route_to(std::slice::from_ref(&auto), Some("sim:0")).unwrap(),
+            "auto"
+        );
+        assert!(route_to(std::slice::from_ref(&auto), None).is_none());
+        let both = [auto, all[0].clone()];
+        assert_eq!(route_to(&both, None).unwrap(), "one");
     }
 }

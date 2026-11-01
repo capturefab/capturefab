@@ -116,15 +116,7 @@ pub(super) fn read(
     camera: &mut Camera,
     auto: &Option<AutoController>,
 ) -> Result<Value> {
-    let mut walked = h
-        .state
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .features
-        .clone();
-    if !walked.iter().any(|feature| feature.value.is_some()) {
-        walked = camera.features();
-    }
+    let walked = camera.features();
     // A value read at every bank is listed even when it has no value at the
     // selected bank: an output line's source is unavailable while an input
     // line is selected.
@@ -1158,7 +1150,7 @@ pub(super) fn apply(
             result["auto"] = entered["auto"].clone();
         }
         None => {
-            refresh(h, camera, true);
+            refresh(h, camera);
             result["auto"] = Value::Null;
         }
     }
@@ -1659,9 +1651,8 @@ mod tests {
         }
         fn with(backend: Box<dyn crate::types::Backend>) -> Self {
             let h = WorkerHandle::new();
-            let mut camera =
+            let camera =
                 Some(Camera::from_backend(crate::transport::simulator::info(), backend).unwrap());
-            refresh(&h, &mut camera, true);
             Self {
                 h,
                 camera,
@@ -2030,7 +2021,6 @@ mod tests {
             (Self::with(Box::new(Rich(wires.clone()))), wires)
         }
         fn save(&mut self, name: &str) -> Setup {
-            refresh(&self.h, &mut self.camera, true);
             let reading =
                 serde_json::from_value(self.run(SessionCommand::ReadSetup).unwrap()).unwrap();
             crate::setup::from_read(name, None, reading).unwrap()
@@ -2044,14 +2034,12 @@ mod tests {
             .unwrap()
         }
         fn apply_with(&mut self, setup: &Setup, strict: bool) -> Result<Value> {
-            let result = self.run(SessionCommand::ApplySetup {
+            self.run(SessionCommand::ApplySetup {
                 name: None,
                 setup: Some(setup.clone()),
                 allow_other_model: false,
                 strict,
-            });
-            refresh(&self.h, &mut self.camera, true);
-            result
+            })
         }
         /// Read `feature` at `selector` = `bank`, keeping the selection.
         fn at(&mut self, selector: &str, bank: &str, feature: &str) -> String {

@@ -839,6 +839,11 @@ fn frame_packets(block: u16, frame: &Frame, chunk: usize) -> Vec<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The first link of `xml` to a node it does not have.
+    fn camera_nodes_unresolved(xml: &str) -> Option<(String, String)> {
+        crate::genicam::NodeMap::parse(xml).unwrap().unresolved()
+    }
+
     #[test]
     fn remapped_xml_and_gvsp_stream_open_through_native_camera() {
         let ip = Ipv4Addr::LOCALHOST;
@@ -911,9 +916,11 @@ mod tests {
         let camera =
             Camera::open(&id, std::slice::from_ref(&info), Duration::from_secs(2)).unwrap();
         assert_eq!(camera.info.id, id);
-        // Its XML was kept on disk, and a kept copy that does not parse is
-        // forgotten and read from the camera again.
+        // Its XML was kept on disk, and a kept copy that does not parse, or
+        // links to a node it does not have, is forgotten and read from the
+        // camera again.
         let served = camera.xml().to_owned();
+        assert_eq!(camera_nodes_unresolved(&served), None);
         drop(camera);
         let kept = std::fs::read_dir(crate::ipc::cache_dir().unwrap().join("xml"))
             .unwrap()
@@ -922,13 +929,17 @@ mod tests {
             .filter(|path| std::fs::read_to_string(path).is_ok_and(|xml| xml == served))
             .collect::<Vec<_>>();
         assert!(!kept.is_empty());
-        for path in &kept {
-            std::fs::write(path, "<RegisterDescription").unwrap();
+        let dangling = served.replacen("<pValue>", "<pValue>Missing", 1);
+        assert!(camera_nodes_unresolved(&dangling).is_some());
+        for broken in ["<RegisterDescription", dangling.as_str()] {
+            for path in &kept {
+                std::fs::write(path, broken).unwrap();
+            }
+            let camera =
+                Camera::open(&id, std::slice::from_ref(&info), Duration::from_secs(2)).unwrap();
+            assert_eq!(camera.xml(), served);
+            drop(camera);
         }
-        let camera =
-            Camera::open(&id, std::slice::from_ref(&info), Duration::from_secs(2)).unwrap();
-        assert_eq!(camera.xml(), served);
-        drop(camera);
         // A camera a recent discovery found is opened at its address only
         // while the same camera answers there.
         assert!(crate::camera::still_there(&info));

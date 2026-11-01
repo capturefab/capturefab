@@ -505,51 +505,14 @@ fn timeout(ms: u64) -> Result<Duration> {
     );
     Ok(Duration::from_millis(ms))
 }
-fn refresh(h: &WorkerHandle, camera: &mut Option<Camera>, features: bool) {
-    let list = if features {
-        camera.as_mut().map(|c| c.features())
-    } else {
-        None
-    };
+/// Publish what the camera is: connected, streaming, its transport counts.
+/// Never a walk of every feature, which on GigE is hundreds of round trips:
+/// commands read what they need.
+fn refresh(h: &WorkerHandle, camera: &Option<Camera>) {
     let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
     s.connected = camera.as_ref().map(|c| c.info.clone());
     s.streaming = camera.as_ref().is_some_and(Camera::is_streaming);
     s.transport = camera.as_ref().and_then(Camera::stats);
-    if let Some(list) = list {
-        s.features = list;
-    } else if camera.is_none() {
-        s.features.clear();
-    }
-}
-/// Stopping unlocks what the camera locked while it streamed, the image
-/// geometry and often more: read again whether each feature last seen
-/// read-only is writable, without walking every feature.
-fn unlock_features(h: &WorkerHandle, camera: &mut Option<Camera>) {
-    let Some(c) = camera.as_mut() else {
-        return;
-    };
-    let names = h
-        .state
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .features
-        .iter()
-        .filter(|feature| !feature.writable)
-        .map(|feature| feature.name.clone())
-        .collect::<Vec<_>>();
-    let writable = names
-        .into_iter()
-        .map(|name| {
-            let writable = c.is_writable(&name);
-            (name, writable)
-        })
-        .collect::<Vec<_>>();
-    let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
-    for (name, writable) in writable {
-        if let Some(feature) = s.features.iter_mut().find(|f| f.name == name) {
-            feature.writable = writable;
-        }
-    }
 }
 fn release_auto(
     h: &WorkerHandle,
@@ -569,17 +532,7 @@ fn release_auto(
     result
 }
 fn publish_auto(h: &WorkerHandle, controller: &AutoController) {
-    let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
-    s.auto = Some(controller.status().clone());
-    for f in s
-        .features
-        .iter_mut()
-        .filter(|f| controller.manages(&f.name))
-    {
-        if let Some(v) = controller.values().get(&f.name) {
-            f.value = Some(v.clone());
-        }
-    }
+    h.state.write().unwrap_or_else(|e| e.into_inner()).auto = Some(controller.status().clone());
 }
 fn camera_mut(camera: &mut Option<Camera>) -> Result<&mut Camera> {
     camera
@@ -783,7 +736,7 @@ fn set_many(
         }
         Ok(written)
     })();
-    refresh(h, camera, true);
+    refresh(h, camera);
     let written = written?;
     h.log(
         "info",
@@ -837,8 +790,13 @@ fn compact_forwarding(id: String, stats: &crate::media::ForwardStats) -> Forward
 struct ForwardProgressSampler {
     id: Option<String>,
     at: Option<Instant>,
+    /// The last progress told had a frame written.
+    written: bool,
 }
 impl ForwardProgressSampler {
+    /// Progress to tell, four times a second, and at once when the first
+    /// frame is written: a recording leaves armed as its first frame is
+    /// encoded, which `record --background` waits for.
     fn sample(
         &mut self,
         id: Option<&str>,
@@ -850,16 +808,21 @@ impl ForwardProgressSampler {
             self.at = None;
             return None;
         };
-        if self.id.as_deref() == Some(id)
-            && self
+        let due = self.id.as_deref() != Some(id)
+            || self
                 .at
-                .is_some_and(|at| now.saturating_duration_since(at) < FORWARD_PROGRESS_INTERVAL)
-        {
+                .is_none_or(|at| now.saturating_duration_since(at) >= FORWARD_PROGRESS_INTERVAL);
+        if !due && self.written {
+            return None;
+        }
+        let progress = compact_forwarding(id.into(), &stats());
+        if !due && progress.written == 0 {
             return None;
         }
         self.id = Some(id.into());
         self.at = Some(now);
-        Some(compact_forwarding(id.into(), &stats()))
+        self.written = progress.written > 0;
+        Some(progress)
     }
 }
 fn sync_forwarding_progress(
@@ -1486,7 +1449,7 @@ fn enter_auto(
     }
     controller.tick(c, Instant::now());
     let status = controller.status().clone();
-    refresh(h, camera, true);
+    refresh(h, camera);
     publish_auto(h, controller);
     h.log("info", format!("Auto mode, balance {:.2}", status.balance));
     if let Some(job) = job {
@@ -1536,7 +1499,7 @@ fn optimize_network(
     // Resume even when a probe or camera setting failed. Never leave a
     // previously running preview stopped as a side effect of scanning.
     let resumed = if streaming { c.start() } else { Ok(()) };
-    refresh(h, camera, true);
+    refresh(h, camera);
     let tuning = match (tuned, resumed) {
         (Ok(tuning), Ok(())) => tuning,
         (Err(error), Ok(())) => return Err(error),
@@ -1584,7 +1547,7 @@ fn process_plain(
             }
             camera_mut(camera)?.set(&feature, &value)?;
             let result = camera_mut(camera)?.get(&feature)?;
-            refresh(h, camera, true);
+            refresh(h, camera);
             h.log("info", format!("Set {feature} = {value}"));
             let mut reply = json!({"name":feature,"value":result});
             if switched {
@@ -1609,13 +1572,12 @@ fn process_plain(
                 a.invalidate();
             }
             camera_mut(camera)?.execute(&feature)?;
-            refresh(h, camera, true);
+            refresh(h, camera);
             return Ok(json!({"executed":feature}));
         }
         #[cfg(test)]
         WorkerCommand::Features => {
-            refresh(h, camera, true);
-            return Ok(json!({"features":h.snapshot().features}));
+            return Ok(json!({"features":camera_mut(camera)?.features()}));
         }
         #[cfg(test)]
         WorkerCommand::StopForward => {
@@ -1629,7 +1591,7 @@ fn process_plain(
             anyhow::bail!("frame requests are taken up by the camera thread's loop")
         }
         SessionCommand::Status => {
-            refresh(h, camera, false);
+            refresh(h, camera);
             Ok(serde_json::to_value(h.snapshot())?)
         }
         SessionCommand::ReadSetup
@@ -1715,7 +1677,7 @@ fn process_plain(
             if let Some(a) = auto.as_mut() {
                 a.set_forward_fps(Some(fps))?;
             }
-            refresh(h, camera, false);
+            refresh(h, camera);
             let since_ms = crate::scheduling::now_ms();
             // The worker loop stops a timed forward at this wall-clock time.
             let until_ms = duration_ms.map(|duration| since_ms.saturating_add(duration));
@@ -1904,9 +1866,9 @@ fn process_plain(
                     .unwrap_or_else(|e| e.into_inner())
                     .forwarding_progress = None;
             }
-            // No walk of every feature: on GigE that is hundreds of round
-            // trips, and commands read what they need.
-            refresh(h, camera, false);
+            // A capture soon after takes the frame it opened with.
+            scheduled_stream.rest_at = Some(Instant::now() + MEDIA_LINGER);
+            refresh(h, camera);
             h.log(
                 "info",
                 format!("Connected to {}", crate::media::redact_url(&selector)),
@@ -1926,7 +1888,7 @@ fn process_plain(
             };
             *camera = None;
             h.lock.lock().unwrap_or_else(|e| e.into_inner()).take();
-            refresh(h, camera, false);
+            refresh(h, camera);
             auto_result?;
             forward_result?;
             camera_result?;
@@ -1975,18 +1937,11 @@ fn process_plain(
             }
             let c = camera_mut(camera)?;
             let result = crate::controls::set(c, &values, dry_run);
-            refresh(h, camera, false);
+            refresh(h, camera);
             let result = result?;
             if let Some(changed) = &result.changed
                 && !changed.is_empty()
             {
-                let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
-                for change in changed {
-                    if let Some(feature) = s.features.iter_mut().find(|f| f.name == change.name) {
-                        feature.value = Some(change.to.clone());
-                    }
-                }
-                drop(s);
                 h.log(
                     "info",
                     format!(
@@ -2018,7 +1973,7 @@ fn process_plain(
             let c = camera_mut(camera)?;
             let executed = crate::controls::exec(c, &name);
             let id = crate::media::redact_url(&c.info.id);
-            refresh(h, camera, false);
+            refresh(h, camera);
             Ok(json!({"camera": id, "executed": executed?}))
         }
         SessionCommand::Info => {
@@ -2193,7 +2148,7 @@ fn process_plain(
             h.state.write().unwrap_or_else(|e| e.into_inner()).auto = None;
             // Continuous auto exposure ended with auto mode.
             end_auto_job(h, JobStatus::Done);
-            refresh(h, camera, true);
+            refresh(h, camera);
             released?;
             h.log("info", "Manual mode".into());
             Ok(json!({"auto":null}))
@@ -2201,7 +2156,7 @@ fn process_plain(
         SessionCommand::Start => {
             *scheduled_stream = JobStream::default();
             camera_mut(camera)?.start()?;
-            refresh(h, camera, false);
+            refresh(h, camera);
             h.log("info", "Acquisition started".into());
             Ok(json!({"streaming":true}))
         }
@@ -2228,7 +2183,7 @@ fn process_plain(
             } else {
                 warm_up(h, c, auto, warmup_ms)?
             };
-            refresh(h, camera, false);
+            refresh(h, camera);
             let mut value = json!({"streaming": true, "started": !was_streaming});
             if let Some(warmup) = warmup {
                 value["warmup_ms"] = json!(warmup.ms);
@@ -2247,8 +2202,7 @@ fn process_plain(
             *scheduled_stream = JobStream::default();
             let forward_result = stop_forward(h, forwarder, auto, Ended::Stopped);
             let camera_result = camera_mut(camera)?.stop();
-            refresh(h, camera, false);
-            unlock_features(h, camera);
+            refresh(h, camera);
             forward_result?;
             camera_result?;
             h.log("info", "Acquisition stopped".into());
@@ -2412,7 +2366,7 @@ fn process_plain(
             } else {
                 Ok(())
             };
-            refresh(h, camera, false);
+            refresh(h, camera);
             // The file's name reaches the disk before the reply.
             if sync.is_file()
                 && let Err(error) = folders.sync()
@@ -2959,6 +2913,10 @@ pub(super) struct JobStream {
     pub(super) armed_until: Option<Instant>,
     /// Until when it goes on streaming with nothing to do; see `linger`.
     pub(super) linger_until: Option<Instant>,
+    /// When a camera that does not stream lets go of what it opened to
+    /// connect: FFmpeg, which read a source's first frame, kept that long
+    /// for a capture to take.
+    pub(super) rest_at: Option<Instant>,
 }
 /// How long an armed camera streams for jobs that never come.
 const ARM_HOLD: Duration = Duration::from_secs(30);
@@ -3077,10 +3035,7 @@ fn tick_jobs(
     // once, so its end is seen as the encoders finish rather than at the
     // next frame.
     let now = Instant::now();
-    let needed = jobs
-        .iter()
-        .any(|j| j.info.active() && (j.deadline.is_some() || (j.saving > 0 && j.wants())));
-    if needed {
+    if needs_stream(jobs) {
         stream.linger_until = None;
     } else if stream.started
         && !forwarding
@@ -3098,9 +3053,47 @@ fn tick_jobs(
             }
         }
     }
+    // Nothing took a frame from what the camera opened to connect: no
+    // FFmpeg goes on decoding, and a webcam's light goes off.
+    if stream.rest_at.is_some_and(|at| now >= at) {
+        stream.rest_at = None;
+        if let Some(c) = camera.as_mut() {
+            c.rest();
+        }
+    }
     if changed {
         jobs_changed(h, camera, jobs);
     }
+}
+/// Whether a job needs the camera to stream: it waits for a frame, or
+/// still wants frames while one is saved.
+fn needs_stream(jobs: &[Scheduled]) -> bool {
+    jobs.iter()
+        .any(|j| j.info.active() && (j.deadline.is_some() || (j.saving > 0 && j.wants())))
+}
+/// Stop a camera that streams only because it lingers, before a command
+/// that writes its settings or checks what writing them would do: the
+/// command finds it stopped, as a command of its own would, rather than its
+/// geometry and frame rate locked by the stream.
+fn end_linger(
+    camera: &mut Option<Camera>,
+    stream: &mut JobStream,
+    jobs: &[Scheduled],
+    forwarding: bool,
+) {
+    if stream.linger_until.is_none()
+        || forwarding
+        || stream
+            .armed_until
+            .is_some_and(|until| Instant::now() < until)
+        || needs_stream(jobs)
+    {
+        return;
+    }
+    if let Some(c) = camera.as_mut() {
+        let _ = c.stop();
+    }
+    *stream = JobStream::default();
 }
 /// How long a camera started for a capture or an inspection goes on
 /// streaming once nothing needs its frames, for the next command of a
@@ -3125,7 +3118,7 @@ pub(super) fn used(stream: &mut JobStream, c: &Camera) {
 fn jobs_changed(h: &WorkerHandle, camera: &mut Option<Camera>, jobs: &mut Vec<Scheduled>) {
     trim_jobs(jobs);
     sync_jobs(h, jobs);
-    refresh(h, camera, false);
+    refresh(h, camera);
 }
 /// The files to save of the frame that came, for every job due now; the
 /// saver encodes and writes them from its own copy. Without `room` the
@@ -3742,6 +3735,14 @@ fn worker(h: WorkerHandle) {
                 keep_settings(&h, &mut camera, &mut kept);
             }
             let changes = e.command.changes_settings();
+            if changes || matches!(e.command.session(), Some(SessionCommand::SetValues { .. })) {
+                end_linger(
+                    &mut camera,
+                    &mut scheduled_stream,
+                    &jobs,
+                    forwarder.is_some(),
+                );
+            }
             // Whether the frames in flight before the change were sent
             // without a software trigger.
             let was_software = changes
@@ -3897,7 +3898,7 @@ fn worker(h: WorkerHandle) {
                         } else {
                             h.log("error", format!("Acquisition stopped: {e:#}"));
                         }
-                        refresh(&h, &mut camera, false);
+                        refresh(&h, &camera);
                     }
                     None if timed_out(&e) => {
                         // A source that fails fast must not turn this loop
@@ -3918,7 +3919,7 @@ fn worker(h: WorkerHandle) {
                                 "error",
                                 "Acquisition stopped after repeated transport errors".into(),
                             );
-                            refresh(&h, &mut camera, false);
+                            refresh(&h, &camera);
                         }
                     }
                 },
@@ -3973,6 +3974,35 @@ mod tests {
             .settings
             .insert("GainAuto".into(), json!("Continuous"));
         assert!(settings.firmware_auto());
+    }
+    #[test]
+    fn a_recordings_first_written_frame_is_told_at_once() {
+        let written = |written| crate::media::ForwardStats {
+            accepted: 1,
+            written,
+            ..Default::default()
+        };
+        let mut sampler = ForwardProgressSampler::default();
+        let now = Instant::now();
+        assert_eq!(
+            sampler
+                .sample(Some("first"), now, || written(0))
+                .unwrap()
+                .written,
+            0
+        );
+        let soon = now + Duration::from_millis(10);
+        assert!(sampler.sample(Some("first"), soon, || written(0)).is_none());
+        // Its first frame reached the file: told now, not at the next
+        // quarter second.
+        let told = sampler.sample(Some("first"), soon, || written(1)).unwrap();
+        assert_eq!(told.written, 1);
+        let later = soon + Duration::from_millis(10);
+        assert!(
+            sampler
+                .sample(Some("first"), later, || written(2))
+                .is_none()
+        );
     }
     #[test]
     fn forwarding_progress_is_sampled_four_times_a_second_without_payload_details() {
@@ -6004,6 +6034,123 @@ mod tests {
         }
     }
 
+    /// The simulator as a live source: it goes on streaming a moment after
+    /// a capture, and counts the times it let go of what it connected with.
+    struct Lingering {
+        simulator: crate::transport::simulator::Simulator,
+        rests: Arc<AtomicU64>,
+    }
+    impl crate::types::RegisterIo for Lingering {
+        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+            self.simulator.read_memory(address, length)
+        }
+        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+            self.simulator.write_memory(address, data)
+        }
+    }
+    impl crate::types::Backend for Lingering {
+        fn xml(&mut self) -> Result<String> {
+            self.simulator.xml()
+        }
+        fn start(&mut self, payload: usize) -> Result<()> {
+            self.simulator.start(payload)
+        }
+        fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
+            self.simulator.next_frame(timeout)
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.simulator.stop()
+        }
+        fn lingers(&self) -> bool {
+            true
+        }
+        fn rest(&mut self) {
+            self.rests.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    fn lingering(rests: &Arc<AtomicU64>) -> Option<Camera> {
+        let backend = Lingering {
+            simulator: Default::default(),
+            rests: rests.clone(),
+        };
+        Some(Camera::from_backend(crate::transport::simulator::info(), Box::new(backend)).unwrap())
+    }
+
+    #[test]
+    fn a_change_finds_a_lingering_camera_stopped() {
+        let h = WorkerHandle::new();
+        let mut camera = lingering(&Arc::default());
+        let mut stream = JobStream::default();
+        let wait = Duration::from_secs(1);
+        inspector::acquire(
+            &h,
+            &mut camera,
+            &mut None,
+            1,
+            Instant::now() + wait,
+            wait,
+            None,
+            Some(&mut stream),
+        )
+        .unwrap();
+        assert!(camera.as_ref().unwrap().is_streaming() && stream.linger_until.is_some());
+        // A recording holds the stream.
+        end_linger(&mut camera, &mut stream, &[], true);
+        assert!(camera.as_ref().unwrap().is_streaming());
+        end_linger(&mut camera, &mut stream, &[], false);
+        assert!(!camera.as_ref().unwrap().is_streaming() && stream.linger_until.is_none());
+        // Width, locked while the camera streams, changes as it would for
+        // a command of its own.
+        let values = vec![crate::controls::Assignment::parse("Width=320").unwrap()];
+        let set = process(
+            &h,
+            &mut camera,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+            &mut 1,
+            &mut stream,
+            SessionCommand::SetValues {
+                values,
+                dry_run: false,
+            }
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(set["changed"][0]["to"], 320, "{set}");
+        h.shutdown();
+    }
+    #[test]
+    fn a_camera_lets_go_of_what_it_connected_with_once_unused() {
+        let h = WorkerHandle::new();
+        let mut stream = JobStream::default();
+        process(
+            &h,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut Vec::new(),
+            &mut 1,
+            &mut stream,
+            SessionCommand::connect("sim:0".into(), 1000).into(),
+        )
+        .unwrap();
+        assert!(stream.rest_at.is_some_and(|at| at > Instant::now()));
+        let rests = Arc::new(AtomicU64::new(0));
+        let mut camera = lingering(&rests);
+        tick_jobs(&h, &mut camera, &mut Vec::new(), &mut stream, false, false);
+        assert_eq!(rests.load(Ordering::Relaxed), 0);
+        stream.rest_at = Some(Instant::now());
+        tick_jobs(&h, &mut camera, &mut Vec::new(), &mut stream, false, false);
+        assert_eq!(rests.load(Ordering::Relaxed), 1);
+        assert!(stream.rest_at.is_none());
+        // A streaming camera keeps what it streams with.
+        camera.as_mut().unwrap().start().unwrap();
+        stream.rest_at = Some(Instant::now());
+        tick_jobs(&h, &mut camera, &mut Vec::new(), &mut stream, false, false);
+        assert_eq!(rests.load(Ordering::Relaxed), 1);
+        h.shutdown();
+    }
     #[test]
     fn inspection_uses_one_deadline_including_startup_and_rejects_late_frames() {
         for (start_delay, frame_delay, expected_reads) in [(40, 0, 0), (0, 40, 1)] {

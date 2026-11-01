@@ -2,10 +2,7 @@
 //! it starts, follows through its replies and events, reconnects after a
 //! crash and ends with everything it started; the session's jobs; and the
 //! public command set IPC clients send.
-use crate::{
-    genicam::FeatureInfo,
-    types::{CameraInfo, Categorized, ErrorKind},
-};
+use crate::types::{CameraInfo, Categorized, ErrorKind};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -988,14 +985,11 @@ pub struct FinishedRecording {
 }
 
 /// A camera worker's state, which its status request returns: its camera,
-/// stream and recording. Its features, log and jobs stay in the worker;
-/// jobs and log lines reach the coordinator as events.
+/// stream and recording. Its log and jobs stay in the worker; jobs and log
+/// lines reach the coordinator as events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerSnapshot {
     pub connected: Option<CameraInfo>,
-    /// The features as last walked; `features` returns them.
-    #[serde(skip)]
-    pub features: Vec<FeatureInfo>,
     pub streaming: bool,
     pub frames: u64,
     /// Payload bytes acquired by this worker, before preview downsampling or encoding.
@@ -1386,11 +1380,13 @@ impl SessionHandle {
         Self::create(DIRECT, verbose, false, JobBook::new(DIRECT))
     }
     /// Session `name`, which keeps its jobs in the state folder: the jobs
-    /// an earlier session of that name left are listed as lost.
+    /// an earlier session of that name left are listed as lost. Its workers
+    /// send info log lines too, for the log a client shows under `-v`; its
+    /// own output has only warnings and errors.
     pub fn named(name: &str) -> Result<Self> {
         crate::ipc::validate_name(name)?;
         sweep_stdout_files(&stdout_dir());
-        Ok(Self::create(name, false, true, JobBook::saved(name)))
+        Ok(Self::create(name, true, true, JobBook::saved(name)))
     }
     fn create(name: &str, verbose: bool, print_logs: bool, jobs: JobBook) -> Self {
         let handle = Self {

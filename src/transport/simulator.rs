@@ -111,7 +111,7 @@ impl Options {
                     options.line0 = Some(every);
                 }
                 // Fault-test hooks, honored only with CAPTUREFAB_TEST_HOOKS=1.
-                "panic" | "connect" | "exclusive" => {}
+                "panic" | "connect" | "exclusive" | "linger" => {}
                 _ => bail!("unknown simulator option {key}; use drop=0.02 or line0=every:500ms"),
             }
         }
@@ -365,6 +365,9 @@ pub struct Simulator {
     /// Panic after this many frames: `?panic=after:N`, a fault-test hook
     /// honored only with CAPTUREFAB_TEST_HOOKS=1.
     panic_after: Option<u64>,
+    /// Go on streaming after a capture as a live FFmpeg source does:
+    /// `?linger=1`, a test hook honored only with CAPTUREFAB_TEST_HOOKS=1.
+    lingers: bool,
     /// When each software frame trigger that no frame answered yet fired.
     triggers: VecDeque<Instant>,
     /// The last Line0 edge taken: only later edges start frames.
@@ -419,6 +422,7 @@ impl Simulator {
             frame_id: 0,
             scene: (0, 0, Vec::new()),
             panic_after: panic_after(selector),
+            lingers: test_hook(selector, "linger=") == Some(1),
             triggers: VecDeque::new(),
             line_edge: now,
             armed: false,
@@ -879,6 +883,9 @@ impl Backend for Simulator {
     fn xml(&mut self) -> Result<String> {
         Ok(self.genicam_xml())
     }
+    fn lingers(&self) -> bool {
+        self.lingers
+    }
     fn start(&mut self, _: usize) -> Result<()> {
         let now = Instant::now();
         self.running = true;
@@ -1152,6 +1159,21 @@ impl Simulator {
 mod tests {
     use super::*;
     use crate::{camera::Camera, camera_profile::CameraKind};
+
+    #[test]
+    fn every_link_of_the_simulators_xml_names_a_node() {
+        for selector in [
+            "sim:0",
+            "sim:line:a",
+            "sim:depth:a",
+            "sim:microscope:a",
+            "sim:thermal:a",
+        ] {
+            let xml = Simulator::for_selector(selector).xml().unwrap();
+            let nodes = crate::genicam::NodeMap::parse(&xml).unwrap();
+            assert_eq!(nodes.unresolved(), None, "{selector}");
+        }
+    }
 
     #[test]
     fn typed_selectors_open_with_specialized_profiles_and_real_features() {

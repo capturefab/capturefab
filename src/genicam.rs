@@ -315,6 +315,22 @@ impl NodeMap {
     pub fn has(&self, name: &str) -> bool {
         self.nodes.contains_key(name)
     }
+    /// The first link to a node the map does not have, as `(node, link)`:
+    /// a `pValue`, `pIsLocked` or other `p` element naming no node. A
+    /// device's own XML has none; a copy kept on disk that has one is not
+    /// the XML the device serves.
+    pub(crate) fn unresolved(&self) -> Option<(String, String)> {
+        self.nodes.iter().find_map(|(name, node)| {
+            node.props
+                .iter()
+                .filter(|p| {
+                    let mut tag = p.tag.chars();
+                    tag.next() == Some('p') && tag.next().is_some_and(|c| c.is_ascii_uppercase())
+                })
+                .find(|p| !p.text.is_empty() && !self.nodes.contains_key(&p.text))
+                .map(|p| (name.clone(), p.text.clone()))
+        })
+    }
 
     /// Whether the `pIsLocked` link of `name` reads `target`, directly or
     /// through the nodes its formula references.

@@ -82,6 +82,8 @@ fn search(
     }
     type Message = (&'static str, Result<Found>);
     type Search = Box<dyn FnOnce(&std::sync::mpsc::Sender<Message>) -> Result<Found> + Send>;
+    // Whether it looks everywhere a camera can be.
+    let everywhere = kinds.gige && kinds.u3v && kinds.host && kinds.onvif;
     // Without a network no broadcast can be answered: nothing to wait for.
     if (kinds.gige || kinds.onvif) && !networked() {
         kinds.gige = false;
@@ -150,30 +152,28 @@ fn search(
     }
     drop(sender);
     let deadline = std::time::Instant::now() + timeout + DISCOVERY_GRACE;
-    let mut devices = Vec::new();
+    let mut heard = Heard::default();
     let mut warnings = Vec::new();
     let mut answered = Vec::new();
-    let wanted = |devices: &[CameraInfo]| {
-        want.as_ref()
-            .is_some_and(|want| devices.iter().any(|info| want(info)))
-    };
-    while answered.len() < asked.len() && !wanted(&devices) {
+    let wanted = |heard: &Heard| want.as_ref().is_some_and(|want| heard.any(want.as_ref()));
+    while answered.len() < asked.len() && !wanted(&heard) {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         let Ok((label, result)) = found.recv_timeout(left) else {
             break;
         };
         match result {
             Ok(Found::One(info)) => {
-                devices.push(info);
+                heard.told(label, info);
                 continue;
             }
-            Ok(Found::Cameras(found)) => devices.extend(found),
-            Ok(Found::Native(native)) => devices.extend(native_cameras(&native)),
+            Ok(Found::Cameras(found)) => heard.listed(label, found),
+            Ok(Found::Native(native)) => heard.listed(label, native_cameras(&native)),
             Err(error) => warnings.push(format!("{label} discovery: {error:#}")),
         }
         answered.push(label);
     }
-    let complete = !wanted(&devices);
+    let complete = !wanted(&heard);
+    let mut devices = heard.cameras();
     if complete {
         for label in asked.iter().filter(|label| !answered.contains(label)) {
             warnings.push(format!(
@@ -207,8 +207,38 @@ fn search(
     crate::discovery::store(
         &devices,
         complete.then_some(&searched as &dyn Fn(&CameraInfo) -> bool),
+        everywhere && complete && answered.len() == asked.len(),
     );
     (devices, warnings)
+}
+
+/// The cameras a search heard of so far: each answer a broadcast told of
+/// as it came, until the broadcast's own list replaces them, in which a
+/// device that answered from two addresses is one camera.
+#[derive(Default)]
+struct Heard {
+    listed: Vec<CameraInfo>,
+    told: Vec<(&'static str, CameraInfo)>,
+}
+impl Heard {
+    fn told(&mut self, from: &'static str, info: CameraInfo) {
+        self.told.push((from, info));
+    }
+    fn listed(&mut self, from: &'static str, cameras: Vec<CameraInfo>) {
+        self.told.retain(|(told, _)| *told != from);
+        self.listed.extend(cameras);
+    }
+    fn any(&self, want: &(dyn Fn(&CameraInfo) -> bool + Send + Sync)) -> bool {
+        self.listed
+            .iter()
+            .chain(self.told.iter().map(|(_, info)| info))
+            .any(want)
+    }
+    fn cameras(self) -> Vec<CameraInfo> {
+        let mut cameras = self.listed;
+        cameras.extend(self.told.into_iter().map(|(_, info)| info));
+        cameras
+    }
 }
 
 /// The host cameras FFmpeg listed.
@@ -235,11 +265,12 @@ fn native_cameras(native: &serde_json::Value) -> Vec<CameraInfo> {
 /// The cameras to resolve `selector` among, a serial, name, model or
 /// discovered ID: those discovery found within the last minute when one of
 /// them is still the camera it names, else those a search finds, which ends
-/// as soon as the camera that has this ID, serial or address answers.
+/// as soon as the camera that has this ID, serial or address answers. A
+/// name or model names one camera only among every camera there is, so it
+/// is looked up there only after a search of every transport to its end.
 pub fn lookup(selector: &str, timeout: Duration) -> (Vec<CameraInfo>, Vec<String>) {
-    let cached = crate::discovery::fresh();
-    if let Resolution::Exact(info) | Resolution::Loose { info, .. } =
-        resolve_selector(selector, &cached)
+    let (cached, everywhere) = crate::discovery::fresh();
+    if let Some(info) = cached_match(selector, &cached, everywhere)
         && still_there(&info)
     {
         return (cached, Vec::new());
@@ -247,6 +278,18 @@ pub fn lookup(selector: &str, timeout: Duration) -> (Vec<CameraInfo>, Vec<String
     let wanted = selector.to_owned();
     let want: Want = std::sync::Arc::new(move |info: &CameraInfo| names_exactly(&wanted, info));
     search(timeout, kinds_for(selector), Some(want))
+}
+
+/// The camera `selector` names among those a discovery found lately: by
+/// its ID, serial or address, or by a name or model only when they are
+/// `everywhere` a search found, since a search that ended early may have
+/// missed another camera of that model.
+fn cached_match(selector: &str, cached: &[CameraInfo], everywhere: bool) -> Option<CameraInfo> {
+    match resolve_selector(selector, cached) {
+        Resolution::Exact(info) => Some(info),
+        Resolution::Loose { info, .. } if everywhere => Some(info),
+        _ => None,
+    }
 }
 
 /// The transports a camera named `selector` may be on.
@@ -823,9 +866,14 @@ impl Camera {
     pub fn from_backend(mut info: CameraInfo, mut backend: Box<dyn Backend>) -> Result<Self> {
         let mut xml = backend.xml().context("load camera GenICam XML")?;
         let nodes = match NodeMap::parse(&xml) {
-            // A copy from the disk cache that does not parse is read again
-            // from the device.
-            Err(_) if backend.forget_xml() => {
+            // A copy from the disk cache that does not parse, or links to a
+            // node it does not have, is read again from the device.
+            parsed
+                if !parsed
+                    .as_ref()
+                    .is_ok_and(|nodes| nodes.unresolved().is_none())
+                    && backend.forget_xml() =>
+            {
                 xml = backend.xml().context("load camera GenICam XML")?;
                 NodeMap::parse(&xml)
             }
@@ -1350,6 +1398,12 @@ impl Camera {
     pub(crate) fn lingers(&self) -> bool {
         self.backend.lingers()
     }
+    /// See `Backend::rest`; a streaming camera keeps what it streams with.
+    pub(crate) fn rest(&mut self) {
+        if !self.streaming {
+            self.backend.rest();
+        }
+    }
     pub fn is_streaming(&self) -> bool {
         self.streaming
     }
@@ -1390,7 +1444,7 @@ pub(crate) mod tests {
         assert!(!names_exactly("00c0df12345", &gige));
         assert_eq!(
             resolve_selector("00:c0:df:12:34:56", std::slice::from_ref(&gige)),
-            Resolution::Exact(gige)
+            Resolution::Exact(gige.clone())
         );
         let only = |gige, u3v| Kinds {
             gige,
@@ -1412,6 +1466,53 @@ pub(crate) mod tests {
         );
         // A 12-digit serial is not a MAC address.
         assert!(mac_id("123456789012").is_none());
+        // A model names one camera only among every camera there is.
+        let cached = std::slice::from_ref(&gige);
+        assert_eq!(cached_match("SN42", cached, false), Some(gige.clone()));
+        assert_eq!(cached_match("Line Scan 4K", cached, false), None);
+        assert_eq!(
+            cached_match("Line Scan 4K", cached, true),
+            Some(gige.clone())
+        );
+    }
+
+    #[test]
+    fn a_broadcasts_list_replaces_the_answers_it_told_of() {
+        let onvif = |endpoint: &str| CameraInfo {
+            id: format!("onvif://{endpoint}"),
+            transport: Transport::Media,
+            vendor: "Acme".into(),
+            model: "Dome".into(),
+            serial: "D1".into(),
+            address: Some(endpoint.into()),
+            profile: Default::default(),
+        };
+        let gige = CameraInfo {
+            id: "gige:00c0df123456".into(),
+            transport: Transport::GigE,
+            vendor: "Acme".into(),
+            model: "Line Scan 4K".into(),
+            serial: "SN42".into(),
+            address: Some("192.168.1.20".into()),
+            profile: Default::default(),
+        };
+        // One device answered from two addresses; ONVIF's own list merges
+        // them into one camera.
+        let mut heard = Heard::default();
+        heard.told("ONVIF", onvif("10.0.0.5"));
+        heard.told("ONVIF", onvif("192.168.1.5"));
+        heard.told("GigE", gige.clone());
+        assert!(heard.any(&|info: &CameraInfo| info.serial == "D1"));
+        heard.listed("ONVIF", vec![onvif("10.0.0.5")]);
+        let ids = |heard: Heard| {
+            heard
+                .cameras()
+                .into_iter()
+                .map(|info| info.id)
+                .collect::<Vec<_>>()
+        };
+        // A broadcast that ended before its list keeps what it told of.
+        assert_eq!(ids(heard), ["onvif://10.0.0.5", "gige:00c0df123456"]);
     }
 
     #[test]

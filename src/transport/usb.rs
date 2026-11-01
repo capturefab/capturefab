@@ -1202,7 +1202,9 @@ impl Backend for UsbBackend {
             }
             let key = crate::xml_cache::key(&[&entry, &identity]);
             if let Some(xml) = crate::xml_cache::load(&key) {
-                if crate::genicam::NodeMap::parse(&xml).is_ok() {
+                if crate::genicam::NodeMap::parse(&xml)
+                    .is_ok_and(|nodes| nodes.unresolved().is_none())
+                {
                     return Ok(xml);
                 }
                 crate::xml_cache::forget(&key);

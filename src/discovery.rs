@@ -1,8 +1,9 @@
-//! The cameras discovery found lately, kept in `<runtime>/discovery.json`
-//! for a minute: a camera named by its serial, name or model is looked up
-//! there before anything is broadcast. An address may since belong to
-//! another camera, so what the cache names is checked before it is opened.
-//! Best effort: a cache that cannot be read or written is no cache.
+//! The cameras discovery found lately, kept in `<runtime>/.discovery.json`
+//! (a name no session's `NAME.json` can have) for a minute: a camera named
+//! by its serial, name or model is looked up there before anything is
+//! broadcast. An address may since belong to another camera, so what the
+//! cache names is checked before it is opened. Best effort: a cache that
+//! cannot be read or written is no cache.
 use crate::types::{CameraInfo, Transport};
 use serde::{Deserialize, Serialize};
 use std::{io::Read, path::PathBuf, time::Duration};
@@ -15,6 +16,10 @@ const MAX_FILE: u64 = 1024 * 1024;
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Cache {
     cameras: Vec<Entry>,
+    /// When a search of every transport last ran to its end, in
+    /// milliseconds since the epoch: the cameras are then all there were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    everywhere_ms: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Entry {
@@ -24,7 +29,7 @@ struct Entry {
 }
 
 fn path() -> PathBuf {
-    crate::ipc::runtime_dir().join("discovery.json")
+    crate::ipc::runtime_dir().join(".discovery.json")
 }
 
 fn read() -> Cache {
@@ -38,36 +43,54 @@ fn read() -> Cache {
     serde_json::from_slice(&text).unwrap_or_default()
 }
 
-/// The cameras a discovery found within `TTL`.
-pub(crate) fn fresh() -> Vec<CameraInfo> {
+/// The cameras a discovery found within `TTL`, and whether a search of
+/// every transport ran to its end within it: then they are every camera
+/// there was, and any found since.
+pub(crate) fn fresh() -> (Vec<CameraInfo>, bool) {
     fresh_at(read(), crate::scheduling::now_ms())
 }
-fn fresh_at(cache: Cache, now_ms: u64) -> Vec<CameraInfo> {
+fn fresh_at(cache: Cache, now_ms: u64) -> (Vec<CameraInfo>, bool) {
     let ttl = u64::try_from(TTL.as_millis()).unwrap_or(u64::MAX);
-    cache
+    let recent = |seen_ms: u64| seen_ms <= now_ms && now_ms - seen_ms < ttl;
+    let cameras = cache
         .cameras
         .into_iter()
-        .filter(|entry| entry.seen_ms <= now_ms && now_ms - entry.seen_ms < ttl)
+        .filter(|entry| recent(entry.seen_ms))
         .map(|entry| entry.info)
-        .collect()
+        .collect();
+    (cameras, cache.everywhere_ms.is_some_and(recent))
 }
 
 /// Note the cameras a discovery `found`. When it searched to the end,
 /// `searched` says which cameras it looked for: those it no longer found
-/// are forgotten. Simulators are never kept: their selectors say what they
-/// open.
-pub(crate) fn store(found: &[CameraInfo], searched: Option<&dyn Fn(&CameraInfo) -> bool>) {
-    let cache = merge(read(), found, searched, crate::scheduling::now_ms());
+/// are forgotten; `everywhere`, that it searched every transport. Simulators
+/// are never kept: their selectors say what they open.
+pub(crate) fn store(
+    found: &[CameraInfo],
+    searched: Option<&dyn Fn(&CameraInfo) -> bool>,
+    everywhere: bool,
+) {
+    let cache = merge(
+        read(),
+        found,
+        searched,
+        everywhere,
+        crate::scheduling::now_ms(),
+    );
     let _ = write(&cache);
 }
 fn merge(
     mut cache: Cache,
     found: &[CameraInfo],
     searched: Option<&dyn Fn(&CameraInfo) -> bool>,
+    everywhere: bool,
     now_ms: u64,
 ) -> Cache {
     if let Some(searched) = searched {
         cache.cameras.retain(|entry| !searched(&entry.info));
+    }
+    if everywhere {
+        cache.everywhere_ms = Some(now_ms);
     }
     for info in found
         .iter()
@@ -141,17 +164,47 @@ mod tests {
             Cache::default(),
             &[gige("gige:a"), gige("gige:b"), webcam.clone()],
             None,
+            false,
             1_000,
         );
-        assert_eq!(fresh_at(merge(Cache::default(), &[], None, 0), 0).len(), 0);
+        assert_eq!(
+            fresh_at(merge(Cache::default(), &[], None, false, 0), 0)
+                .0
+                .len(),
+            0
+        );
         // A GigE search found only one of them; the webcam was not looked for.
         let is_gige = |info: &CameraInfo| info.transport == Transport::GigE;
-        let cache = merge(cache, &[gige("gige:b")], Some(&is_gige), 2_000);
-        let ids = fresh_at(cache, 2_000)
-            .into_iter()
-            .map(|info| info.id)
-            .collect::<Vec<_>>();
+        let cache = merge(cache, &[gige("gige:b")], Some(&is_gige), false, 2_000);
+        let (cameras, everywhere) = fresh_at(cache, 2_000);
+        let ids = cameras.into_iter().map(|info| info.id).collect::<Vec<_>>();
         assert_eq!(ids, ["avfoundation:FaceTime HD Camera", "gige:b"]);
+        assert!(!everywhere);
+    }
+
+    #[test]
+    fn only_a_search_of_every_transport_lists_every_camera() {
+        let found = [camera("gige:a", Transport::GigE)];
+        let ttl = u64::try_from(TTL.as_millis()).unwrap();
+        // A search that ended once its camera answered adds what it found.
+        let early = merge(Cache::default(), &found, None, false, 1_000);
+        assert!(!fresh_at(early, 1_000).1);
+        let whole = merge(Cache::default(), &found, Some(&|_| true), true, 1_000);
+        let text = serde_json::to_string(&whole).unwrap();
+        let parsed = || serde_json::from_str::<Cache>(&text).unwrap();
+        assert!(fresh_at(parsed(), 1_000 + ttl - 1).1);
+        assert!(!fresh_at(parsed(), 1_000 + ttl).1);
+        // A later search that ended early keeps the list whole.
+        let added = merge(
+            parsed(),
+            &[camera("gige:b", Transport::GigE)],
+            None,
+            false,
+            2_000,
+        );
+        let (cameras, everywhere) = fresh_at(added, 2_000);
+        assert_eq!(cameras.len(), 2);
+        assert!(everywhere);
     }
 
     #[test]
@@ -163,14 +216,21 @@ mod tests {
                 camera("sim:0", Transport::Simulator),
             ],
             None,
+            false,
             1_000,
         );
         let ttl = u64::try_from(TTL.as_millis()).unwrap();
         let text = serde_json::to_string(&cache).unwrap();
         let parsed = || serde_json::from_str::<Cache>(&text).unwrap();
-        assert_eq!(fresh_at(parsed(), 1_000 + ttl - 1).len(), 1);
-        assert!(fresh_at(parsed(), 1_000 + ttl).is_empty());
+        assert_eq!(fresh_at(parsed(), 1_000 + ttl - 1).0.len(), 1);
+        assert!(fresh_at(parsed(), 1_000 + ttl).0.is_empty());
         // A clock that went back trusts nothing.
-        assert!(fresh_at(parsed(), 500).is_empty());
+        assert!(fresh_at(parsed(), 500).0.is_empty());
+    }
+
+    #[test]
+    fn no_session_name_is_the_cache() {
+        let name = path().file_stem().unwrap().to_string_lossy().into_owned();
+        assert!(crate::ipc::validate_name(&name).is_err(), "{name}");
     }
 }

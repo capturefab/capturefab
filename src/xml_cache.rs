@@ -4,8 +4,9 @@
 //! serves: its URL or manifest entry (address and length, a SHA-1 where the
 //! device gives one), its model and firmware version, and the bytes at the
 //! end of the file, which for a ZIP hold the checksum of the XML inside. A
-//! cached file that does not parse is forgotten. Best effort: a cache that
-//! cannot be read or written is no cache.
+//! cached file that does not parse, or links to a node it does not have, is
+//! forgotten. Best effort: a cache that cannot be read or written is no
+//! cache.
 use sha2::{Digest, Sha256};
 use std::{io::Read, path::PathBuf};
 

@@ -26,6 +26,9 @@ def transcript(binary):
         env = {k: v for k, v in os.environ.items() if not k.startswith('CAPTUREFAB_')}
         env['CAPTUREFAB_SESSION_DIR'] = str(Path(temp) / 'sessions')
         env['CAPTUREFAB_CACHE_DIR'] = str(Path(temp) / 'cache')
+        # Each command opens the camera for itself: no session outlives the
+        # folder it keeps its log and lock in. The output is the same.
+        env['CAPTUREFAB_KEEP'] = '0'
         lines = []
         for args in COMMANDS:
             result = subprocess.run([str(binary), *args], cwd=temp, env=env, capture_output=True, text=True, timeout=120)

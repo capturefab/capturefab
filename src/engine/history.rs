@@ -366,10 +366,10 @@ fn restore(
     Ok(())
 }
 
-/// Publish the camera after a rollback: its features and auto mode. A
+/// Publish the camera after a rollback: its state and auto mode. A
 /// rollback to manual mode ends continuous auto exposure.
-fn publish(h: &WorkerHandle, camera: &mut Option<Camera>, auto: &Option<AutoController>) {
-    refresh(h, camera, true);
+fn publish(h: &WorkerHandle, camera: &Option<Camera>, auto: &Option<AutoController>) {
+    refresh(h, camera);
     if let Some(controller) = auto {
         publish_auto(h, controller);
     } else {
@@ -456,10 +456,10 @@ pub(super) fn process(
         }
         _ => None,
     };
-    // The written features are checkpointed even when the walk did not list
-    // them. A banked setup row is checkpointed at its own bank before it is
-    // written, so its feature need not be readable at the bank selected now
-    // (an input line hides an output's source).
+    // The features a change writes are checkpointed with their coupled
+    // groups. A banked setup row is checkpointed at its own bank before it
+    // is written, so its feature need not be readable at the bank selected
+    // now (an input line hides an output's source).
     let written = match &command {
         WorkerCommand::Session(SessionCommand::ApplySetup { .. }) => setup_plan
             .iter()
@@ -550,7 +550,7 @@ pub(super) fn process(
                 .and_then(|mut result| {
                     if restart {
                         camera_mut(camera)?.start()?;
-                        refresh(h, camera, false);
+                        refresh(h, camera);
                         result["restarted_stream"] = json!(true);
                     }
                     Ok(result)
@@ -868,7 +868,6 @@ mod tests {
             )
             .unwrap(),
         );
-        refresh(&h, &mut camera, true);
         let many = |values: &[(&str, &str)]| WorkerCommand::SetMany {
             values: values
                 .iter()
@@ -989,12 +988,10 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_walks_the_features_once_and_starting_walks_none() {
+    fn edits_starting_and_stopping_walk_no_features() {
         let walks = Arc::new(AtomicU64::new(0));
         let h = WorkerHandle::new();
         let mut camera = walked(&walks, &Arc::default());
-        // Connecting walks the features once.
-        refresh(&h, &mut camera, true);
         let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
         let (mut next, mut scheduled) = (1, JobStream::default());
         let mut walked = |camera: &mut Option<Camera>, command| {
@@ -1017,10 +1014,10 @@ mod tests {
             value: value.into(),
         };
         let (count, result) = walked(&mut camera, set("Width", "128"));
-        assert_eq!(count, 1);
+        assert_eq!(count, 0);
         assert_eq!(result, json!({"name":"Width","value":128}));
-        // A grouped edit reads its checkpoint from the cached names: all
-        // writes together still end with only one full feature walk.
+        // A grouped edit checkpoints what it writes and the features coupled
+        // with it, not every feature.
         let (count, result) = walked(
             &mut camera,
             WorkerCommand::SetMany {
@@ -1033,39 +1030,31 @@ mod tests {
                     .collect(),
             },
         );
-        assert_eq!(count, 1);
+        assert_eq!(count, 0);
         assert_eq!(result["values"][1], json!({"name":"Height","value":192}));
+        let values = vec![crate::controls::Assignment::parse("ExposureTime=4000").unwrap()];
+        let (count, result) = walked(
+            &mut camera,
+            SessionCommand::SetValues {
+                values,
+                dry_run: false,
+            }
+            .into(),
+        );
+        assert_eq!(count, 0);
+        assert_eq!(result["changed"][0]["name"], "ExposureTime", "{result}");
         assert_eq!(walked(&mut camera, SessionCommand::Start.into()).0, 0);
-        let writable = |h: &WorkerHandle, name: &str| {
-            h.snapshot()
-                .features
-                .iter()
-                .find(|feature| feature.name == name)
-                .unwrap()
-                .writable
-        };
-        // A walk while streaming sees the geometry and the frame rate locked;
-        // stopping unlocks both without another walk.
-        assert_eq!(walked(&mut camera, set("ExposureTime", "5000")).0, 1);
-        assert!(!writable(&h, "Width") && !writable(&h, "AcquisitionFrameRate"));
+        assert_eq!(walked(&mut camera, set("ExposureTime", "5000")).0, 0);
         assert_eq!(walked(&mut camera, SessionCommand::Stop.into()).0, 0);
-        assert!(writable(&h, "Width") && writable(&h, "AcquisitionFrameRate"));
-        assert!(!writable(&h, "DeviceScanType"));
         h.shutdown();
     }
 
     #[test]
-    fn a_feature_that_became_unreadable_since_the_last_walk_is_left_out() {
+    fn a_coupled_feature_that_is_unavailable_is_left_out_of_the_checkpoint() {
         let hidden = Arc::new(AtomicBool::new(false));
         let h = WorkerHandle::new();
         let mut camera = walked(&Arc::default(), &hidden);
-        refresh(&h, &mut camera, true);
-        assert!(
-            h.snapshot()
-                .features
-                .iter()
-                .any(|f| f.name == "Height" && f.value.is_some())
-        );
+        assert!(camera.as_mut().unwrap().get("Height").is_ok());
         hidden.store(true, Ordering::Relaxed);
         let result = process(
             &h,
@@ -1083,8 +1072,8 @@ mod tests {
             },
         )
         .unwrap();
-        // As a fresh walk would, the checkpoint skips Height instead of
-        // refusing the change.
+        // Height, coupled with Width, cannot be read now: the checkpoint
+        // skips it instead of refusing the change.
         assert_eq!(result["values"][0], json!({"name":"Width","value":128}));
         h.shutdown();
     }

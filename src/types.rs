@@ -80,8 +80,9 @@ pub trait RegisterIo: Send {
 /// Owns transport resources; called exclusively by the camera worker thread.
 pub trait Backend: RegisterIo {
     fn xml(&mut self) -> Result<String>;
-    /// Forget the XML `xml` read from the disk cache, which did not parse,
-    /// so the next call reads it from the device. Whether there was one.
+    /// Forget the XML `xml` read from the disk cache, which did not parse
+    /// or resolve, so the next call reads it from the device. Whether there
+    /// was one.
     fn forget_xml(&mut self) -> bool {
         false
     }
@@ -119,6 +120,10 @@ pub trait Backend: RegisterIo {
     fn lingers(&self) -> bool {
         false
     }
+    /// Let go of what it opened to connect and still holds while it does
+    /// not stream: FFmpeg, which read a source's first frame and went on
+    /// decoding. The next start opens it again.
+    fn rest(&mut self) {}
     /// The settings this process keeps for a camera that has nowhere else
     /// to keep them, as a simulator's registers or a webcam's video mode:
     /// a real camera keeps its settings until it is powered off. None for a

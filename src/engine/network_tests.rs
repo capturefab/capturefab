@@ -130,7 +130,7 @@ impl Harness {
         // The commands under test run synchronously, without a second camera
         // owner or a background acquisition changing their state.
         let handle = WorkerHandle::idle();
-        let mut harness = Self {
+        let harness = Self {
             handle,
             camera: Some(camera),
             backend,
@@ -140,7 +140,7 @@ impl Harness {
             next_job: 1,
             scheduled_stream: JobStream::default(),
         };
-        refresh(&harness.handle, &mut harness.camera, false);
+        refresh(&harness.handle, &harness.camera);
         harness.backend.lock().unwrap().calls.clear();
         harness
     }

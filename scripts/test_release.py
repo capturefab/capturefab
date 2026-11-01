@@ -919,7 +919,7 @@ class TerminalSvgTests(unittest.TestCase):
             fake = Path(temp) / 'capturefab'
             row = Path(temp) / 'row'
             row.write_text('sim:0  sim  Pattern camera  SIM0')
-            fake.write_text(f'#!{sys.executable}\nimport os, sys\nif "CAPTUREFAB_SESSION" in os.environ or not os.environ.get("CAPTUREFAB_SESSION_DIR"):\n    sys.exit(3)\nprint("ID  KIND  MODEL  SERIAL\\n" + open({str(row)!r}).read() if "list" in sys.argv else " ".join(sys.argv[1:]))\n')
+            fake.write_text(f'#!{sys.executable}\nimport os, sys\nif "CAPTUREFAB_SESSION" in os.environ or not os.environ.get("CAPTUREFAB_SESSION_DIR") or os.environ.get("CAPTUREFAB_KEEP") != "0":\n    sys.exit(3)\nprint("ID  KIND  MODEL  SERIAL\\n" + open({str(row)!r}).read() if "list" in sys.argv else " ".join(sys.argv[1:]))\n')
             fake.chmod(0o755)
             with mock.patch.dict(os.environ, {'CAPTUREFAB_SESSION': 'gui'}):
                 lines = svg.transcript(fake)

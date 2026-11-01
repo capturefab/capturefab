@@ -3220,6 +3220,13 @@ impl Backend for MediaBackend {
     fn lingers(&self) -> bool {
         !self.file() && !self.clip()
     }
+    fn rest(&mut self) {
+        if !self.running {
+            self.decoder = None;
+            self.first = None;
+            self.unpace = false;
+        }
+    }
     fn xml(&mut self) -> Result<String> {
         Ok(backend_xml(self.native, &self.modes, self.file()))
     }
@@ -7543,6 +7550,50 @@ Error opening input files: Input/output error
             on_demand: None,
             unpace: false,
         }
+    }
+    #[test]
+    fn every_link_of_a_sources_xml_names_a_node() {
+        let mode = Mode {
+            width: 640,
+            height: 480,
+            fps: Some((15.0, 30.0)),
+            input_format: None,
+            intervals: None,
+            min_size: None,
+        };
+        for (native, modes, playback) in [
+            (true, vec![mode], false),
+            (true, Vec::new(), false),
+            (false, Vec::new(), true),
+            (false, Vec::new(), false),
+        ] {
+            let nodes = NodeMap::parse(&backend_xml(native, &modes, playback)).unwrap();
+            assert_eq!(nodes.unresolved(), None, "{native} {playback}");
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_live_source_resting_lets_go_of_the_ffmpeg_it_connected_with() {
+        let fake = Fake::new(
+            "rest",
+            r#"case "$*" in *udp://127.0.0.1:5999*) echo "$*" >> "$dir/argv" ;; *) exit 0 ;; esac
+while :; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; sleep 0.05; done"#,
+        );
+        let source = "udp://127.0.0.1:5999";
+        let mut camera = open_url(source, Duration::from_secs(5)).unwrap();
+        assert!(camera.lingers());
+        let opened = fake.launches(&[source]);
+        assert!(opened >= 1);
+        camera.rest();
+        // Started again, it opens the source again.
+        camera.start(12).unwrap();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        assert_eq!(fake.launches(&[source]), opened + 1);
+        // While it streams, it keeps the FFmpeg it streams with.
+        camera.rest();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        assert_eq!(fake.launches(&[source]), opened + 1);
+        camera.stop().unwrap();
     }
     #[test]
     fn a_live_source_gives_its_newest_frame_and_drops_the_older_ones() {

@@ -13,7 +13,7 @@ use std::{
     fmt::Write as _,
     path::PathBuf,
     process::{Command, Stdio},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[derive(Debug, Subcommand)]
@@ -164,20 +164,32 @@ fn start(global: &Global, args: StartArgs) -> Result<Report> {
 
 /// Make sure session `name` runs, holding `selector` if one is given, and
 /// stays at least `idle` after its last use: `--keep` and `--background`.
+/// Whether this started it.
 pub(super) fn ensure(
     name: &str,
     selector: Option<&str>,
     idle: Duration,
     global: &Global,
-) -> Result<()> {
+) -> Result<bool> {
     // Commands that need the session at once (the cameras of one capture,
     // or several agents' calls) take turns: one starts it, the rest use it.
     let _turn = ipc::start_turn(name)?;
     if ipc::running_session(name).is_some() {
         match ipc::keep(name, idle) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(false),
             // It ended unused just now: start another once it is gone.
-            Err(error) if super::session_gone(&error) => ipc::wait_ended(name, ENDING)?,
+            Err(error) if super::session_gone(&error) => {
+                if !ipc::wait_ended(name, ENDING) {
+                    return Err(Categorized::new(
+                        ErrorKind::Timeout,
+                        format!("session {name} is still ending"),
+                    )
+                    .hint(format!(
+                        "try again, or stop it with capturefab session stop {name}"
+                    ))
+                    .into());
+                }
+            }
             Err(error) => return Err(error),
         }
     }
@@ -188,10 +200,10 @@ pub(super) fn ensure(
             for warning in warnings {
                 global.output().note(format_args!("capturefab: {warning}"));
             }
-            Ok(())
+            Ok(true)
         }
         // A session started another way, such as serve, took the name.
-        Err(_) if ipc::running_session(name).is_some() => ipc::keep(name, idle),
+        Err(_) if ipc::running_session(name).is_some() => ipc::keep(name, idle).map(|()| false),
         Err(error) => Err(error),
     }
 }
@@ -460,16 +472,22 @@ mod platform {
 }
 
 /// The session a command without a name is for: `--session`, else the only
-/// one running.
+/// one running, else the only one besides the auto session, which camera
+/// commands start for themselves.
 fn named(global: &Global, name: Option<String>) -> Result<String> {
     if let Some(name) = name.or_else(|| global.session.clone()) {
         ipc::validate_name(&name).map_err(super::input)?;
         return Ok(name);
     }
     let sessions = ipc::sessions();
-    match sessions.as_slice() {
-        [session] => Ok(session.name.clone()),
-        [] => Err(
+    let started = sessions
+        .iter()
+        .filter(|session| session.name != super::AUTO_SESSION)
+        .collect::<Vec<_>>();
+    match (sessions.as_slice(), started.as_slice()) {
+        ([session], _) => Ok(session.name.clone()),
+        (_, [session]) => Ok(session.name.clone()),
+        ([], _) => Err(
             Categorized::new(ErrorKind::SessionNotFound, "no session is running")
                 .hint("start one with capturefab session start -c CAMERA")
                 .into(),
@@ -506,24 +524,16 @@ fn stop(global: &Global, name: Option<String>) -> Result<Report> {
             ));
         }
     }
-    let deadline = Instant::now() + STOP_WAIT;
-    // Most sessions are gone within milliseconds; one finishing recordings
-    // takes longer, and is looked at less often.
-    let mut pause = Duration::from_millis(1);
-    while ipc::process_alive(pid) && ipc::running_session(&name).is_some() {
-        if Instant::now() >= deadline {
-            return Err(Categorized::new(
-                ErrorKind::Timeout,
-                format!(
-                    "session {name} is still finishing after {}",
-                    super::args::duration_text(STOP_WAIT)
-                ),
-            )
-            .hint(format!("see {}", log_path(&name).display()))
-            .into());
-        }
-        std::thread::sleep(pause);
-        pause = (pause * 2).min(Duration::from_millis(50));
+    if ipc::process_alive(pid) && !ipc::wait_ended(&name, STOP_WAIT) {
+        return Err(Categorized::new(
+            ErrorKind::Timeout,
+            format!(
+                "session {name} is still finishing after {}",
+                super::args::duration_text(STOP_WAIT)
+            ),
+        )
+        .hint(format!("see {}", log_path(&name).display()))
+        .into());
     }
     let text = format!("Stopped session {name}.\n");
     Ok(Report::json(json!({"session": name, "pid": pid, "stopped": true})).text(text))
