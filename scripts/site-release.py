@@ -56,10 +56,10 @@ PAGE = '''<!doctype html>
     <main id="main">
       <section class="page-head" aria-labelledby="downloads-title">
         <h1 id="downloads-title">All downloads</h1>
-        <p class="lead">Every app download includes the desktop app and the CLI. Latest release: {status}.</p>
+        <p class="lead">Each download is the <code>capturefab</code> command-line tool for one system, with FFmpeg built in. Latest release: {status}.</p>
         <p>Choose your operating system and processor. Apple silicon Macs and 64-bit ARM systems use ARM64. Intel and AMD computers use x64.</p>
-        <p>Check the file's SHA-256 with the command under each download. On macOS, open the .dmg and drag Capturefab to Applications. For a .zip download, extract it and move Capturefab.app to Applications. On Windows and Linux, extract the archive before you open the app. The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
-        <p>Read the <a href="docs.html#installation">installation instructions</a> for system requirements, command-line setup and use without a display.</p>
+        <p>Check the file's SHA-256 with the command under each download, then extract the archive and put <code>capturefab</code> on your <code>PATH</code>{install_note}.{legacy} The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
+        <p>Read the <a href="docs.html#installation">installation instructions</a> for system requirements and setup on computers without a display.</p>
       </section>
 {install}{body}    </main>
     <footer class="site-footer">
@@ -75,8 +75,8 @@ PAGE = '''<!doctype html>
 INSTALL = '''      <section class="section install-cli" id="install-cli" aria-labelledby="install-cli-title">
         <div class="section-heading"><h2 id="install-cli-title">Install from a terminal</h2><p>One command downloads the build for this computer, checks its SHA-256 and installs it for your account, without sudo or administrator rights.</p></div>
         <div class="install-commands">
-          <div><h3>macOS and Linux</h3><div class="code-wrap"><pre><code>curl -fsSL {site}install.sh | sh</code></pre><button class="copy-button" type="button" aria-label="Copy the macOS and Linux install command">Copy</button></div><p>Installs <code>Capturefab.app</code> in <code>~/Applications</code> on macOS, or the release folder in <code>~/.local/share/capturefab</code> on Linux, and links <code>capturefab</code> in <code>~/.local/bin</code>.</p></div>
-          <div><h3>Windows PowerShell</h3><div class="code-wrap"><pre><code>irm {site}install.ps1 | iex</code></pre><button class="copy-button" type="button" aria-label="Copy the Windows install command">Copy</button></div><p>Installs in <code>%LOCALAPPDATA%\\Programs\\Capturefab</code>, adds it to your user <code>PATH</code> and adds a Start menu shortcut.</p></div>
+          <div><h3>macOS and Linux</h3><div class="code-wrap"><pre><code>curl -fsSL {site}install.sh | sh</code></pre><button class="copy-button" type="button" aria-label="Copy the macOS and Linux install command">Copy</button></div><p>Installs the release folder in <code>~/.local/share/capturefab</code> and links <code>capturefab</code> in <code>~/.local/bin</code>.</p></div>
+          <div><h3>Windows PowerShell</h3><div class="code-wrap"><pre><code>irm {site}install.ps1 | iex</code></pre><button class="copy-button" type="button" aria-label="Copy the Windows install command">Copy</button></div><p>Installs in <code>%LOCALAPPDATA%\\Programs\\Capturefab</code> and adds it to your user <code>PATH</code>.</p></div>
         </div>
         <p class="install-read-first">To read a script before it runs: <code>curl -fsSLO {site}install.sh; less install.sh; sh install.sh</code>. Add <code>--dry-run</code> (<code>-DryRun</code> for install.ps1) to print the file, URL and checksum it would use. Read <a href="install.sh">install.sh</a> or <a href="install.ps1">install.ps1</a>.</p>
       </section>
@@ -160,7 +160,7 @@ def source_section(release):
     media = release.get('media_sources') or []
     rows = '\n'.join(f'          <tr><td>{html.escape(OS.get(m["name"].split("-")[2], ""))}</td><td>{html.escape(processor_label(m["name"].split("-")[2], m["name"].split("-")[3]))}</td><td><a href="{href(m["url"])}">{html.escape(m["name"])}</a><br>{size(m["size"])}</td><td><code class="checksum">{html.escape(m["sha256"])}</code></td></tr>' for m in media)
     table = f'''
-        <details class="all-builds"><summary>Media sources for each download</summary><p>Each app download includes FFmpeg, which uses GPLv3. Its media sources archive holds the exact FFmpeg, x264, SRT, OpenSSL and zlib source archives, the enabled header archives and their build recipe.</p><div class="table-scroll"><table class="release-assets"><caption>capturefab {version} media sources</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">File</th><th scope="col">SHA-256</th></tr></thead><tbody>
+        <details class="all-builds"><summary>Media sources for each download</summary><p>Each download includes FFmpeg, which uses GPLv3. Its media sources archive holds the exact FFmpeg, x264, SRT, OpenSSL and zlib source archives, the enabled header archives and their build recipe.</p><div class="table-scroll"><table class="release-assets"><caption>capturefab {version} media sources</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">File</th><th scope="col">SHA-256</th></tr></thead><tbody>
 {rows}
         </tbody></table></div></details>''' if media else ''
     return f'''      <section class="section" id="source" aria-labelledby="source-title">
@@ -170,7 +170,7 @@ def source_section(release):
           <div class="code-wrap"><pre><code>{check}tar -xzf {html.escape(name)}
 cd {folder}
 cargo --config .cargo/vendor-config.toml build --release --offline --locked
-target/release/capturefab --camera sim:0 capture -o first.png</code></pre><button class="copy-button" type="button" aria-label="Copy the source build commands">Copy</button></div>
+target/release/capturefab capture -c sim:0 -o first.png</code></pre><button class="copy-button" type="button" aria-label="Copy the source build commands">Copy</button></div>
         </div>{table}
       </section>
 '''
@@ -190,6 +190,23 @@ def check_command(asset):
         return f"cd $HOME\\Downloads; if ((Get-FileHash .\\{name} -Algorithm SHA256).Hash -eq '{digest}') {{ 'OK: checksum matches' }} else {{ 'MISMATCH: do not open this file' }}"
     tool = 'shasum -a 256' if asset['os'] == 'macos' else 'sha256sum'
     return f'cd ~/Downloads && echo "{digest}  {name}" | {tool} -c'
+
+def is_disk_image(asset):
+    """Releases up to 0.5.0 shipped the macOS desktop app as a disk image."""
+    return asset['os'] == 'macos' and asset['name'].endswith('.dmg')
+
+# The last release, with its candidates, that was the desktop app.
+LAST_DESKTOP = (0, 5, 0)
+
+def is_desktop_release(release):
+    """Releases up to 0.5.0 were the desktop app, with another command set. The
+    installers install only the command-line releases after them; until one is
+    published they install nothing, rather than a desktop release whose launcher
+    entries the migration would remove."""
+    core = SEMVER.fullmatch(release['version'])
+    if not core:
+        raise ValueError(f'invalid release version: {release["version"]}')
+    return tuple(int(part) for part in core.groups()[:3]) <= LAST_DESKTOP or any(is_disk_image(a) for a in release['assets'])
 
 def download_cards(release):
     """Keep direct downloads readable on narrow screens without JavaScript."""
@@ -215,15 +232,19 @@ def download_cards(release):
             items.append(f'<li data-os="{system}" data-arch="{html.escape(asset["arch"])}"><div><strong>{html.escape(processor)}</strong><small>{detail}</small></div><a class="button primary" href="{href(asset["url"])}" aria-label="Download Capturefab {html.escape(release["version"])} for {label} {html.escape(processor)}">Download for {html.escape(processor.split(" (")[0])} <span aria-hidden="true">↓</span></a>{check or ''}</li>')
         # The prompt follows the manifest, so signed Windows builds lose the note.
         note = SMARTSCREEN if system == 'windows' and any(asset.get('platform_signature') == 'unsigned' for asset in builds) else ''
-        cards.append(f'<article class="platform-download-card" data-os="{system}"><h3>{label}</h3><p>Desktop app and CLI</p><ul class="static-build-list">{"".join(items)}</ul>{note}</article>')
+        kind = 'Desktop app and CLI (disk image)' if any(is_disk_image(asset) for asset in builds) else 'Command-line tool'
+        cards.append(f'<article class="platform-download-card" data-os="{system}"><h3>{label}</h3><p>{kind}</p><ul class="static-build-list">{"".join(items)}</ul>{note}</article>')
     return '<div class="platform-download-grid">' + ''.join(cards) + '</div>' if cards else ''
 
 def downloads(manifest, site):
     releases = [r for r in ordered(manifest) if r['version'] == manifest.get('latest')] or ordered(manifest)[:1]
     body = ''.join(section(r, True) + source_section(r) for r in releases) or EMPTY
     status = f'v{html.escape(manifest["latest"])}' if manifest.get('latest') else 'none published yet'
-    install = INSTALL.format(site=html.escape(site)) if releases else ''
-    return PAGE.format(site=html.escape(site), status=status, body=body, install=install)
+    installable = any(not is_desktop_release(r) for r in releases)
+    install = INSTALL.format(site=html.escape(site)) if installable else ''
+    install_note = ', or use the install command below, which does both' if installable else ''
+    legacy = ' The macOS download of this release is a disk image with the desktop app: open it and drag Capturefab to Applications.' if any(is_disk_image(a) for r in releases for a in r['assets'] if a.get('available')) else ''
+    return PAGE.format(site=html.escape(site), status=status, body=body, install=install, install_note=install_note, legacy=legacy)
 
 def entry(release, site):
     page = f'{site}downloads.html#v{release["version"]}'
@@ -252,6 +273,8 @@ def installer_assets(manifest, site, system):
     release = releases[0]
     if not SEMVER.fullmatch(release['version']):
         raise ValueError(f'invalid release version: {release["version"]}')
+    if is_desktop_release(release):
+        return '', []
     builds = []
     for asset in release['assets']:
         if asset['os'] != system or not asset.get('available'):
@@ -272,7 +295,7 @@ def installers(manifest, site):
     sh = ''.join(f"    {system}/{arch}) name='{name}' url='{url}' expected='{digest}' ;;\n" for system, builds in (('macos', unix), ('linux', linux)) for arch, name, url, digest in builds)
     _, windows = installer_assets(manifest, site, 'windows')
     ps1 = ''.join(f"  '{arch}' = @{{ Name = '{name}'; Url = '{url}'; Sha256 = '{digest}' }}\n" for arch, name, url, digest in windows)
-    label = version or '(no published release)'
+    label = version or '(no command-line release published yet)'
     fill = lambda template, assets: (SCRIPTS / template).read_text(encoding='utf-8').replace('@VERSION_LABEL@', label).replace('@VERSION@', version).replace('@SITE@', site).replace('@ASSETS@', assets)
     return fill('install-template.sh', sh), fill('install-template.ps1', ps1)
 

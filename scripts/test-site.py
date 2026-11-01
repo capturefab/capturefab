@@ -14,7 +14,6 @@ import sys
 import tarfile
 import tempfile
 import threading
-import zipfile
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import xml.etree.ElementTree as ET
@@ -35,10 +34,6 @@ class Page(HTMLParser):
         self.links = []
         self.scripts = []
         self.images = []
-        # (srcset, width, height, fetchpriority, src) for responsive images.
-        self.srcsets = []
-        self.videos = []
-        self.current_video = None
         self.errors = []
         self.lang = False
         self.main = False
@@ -57,17 +52,10 @@ class Page(HTMLParser):
             if "alt" not in attrs or (not attrs["alt"] and attrs.get("aria-hidden") != "true"):
                 self.errors.append("image without descriptive alternative text")
             self.images.append((attrs.get("src", ""), attrs.get("width"), attrs.get("height")))
-            if attrs.get("srcset") or attrs.get("fetchpriority"):
-                self.srcsets.append((attrs.get("srcset") or "", attrs.get("width"), attrs.get("height"), attrs.get("fetchpriority"), attrs.get("src", "")))
         if tag == "script":
             self.scripts.append(attrs.get("src", ""))
-        if tag == "video":
-            self.current_video = {"attrs": attrs, "sources": []}
-            self.videos.append(self.current_video)
-            if attrs.get("src"):
-                self.current_video["sources"].append(attrs["src"])
-        if tag == "source" and self.current_video is not None and attrs.get("src"):
-            self.current_video["sources"].append(attrs["src"])
+        if tag in {"video", "audio"}:
+            self.errors.append(f"<{tag}> element: the site publishes no recorded media")
         runtime_url = None
         if tag in {"img", "script", "iframe", "audio", "video", "source"}:
             runtime_url = attrs.get("src")
@@ -75,11 +63,7 @@ class Page(HTMLParser):
             runtime_url = attrs.get("href")
         if runtime_url and (urlsplit(runtime_url).scheme or urlsplit(runtime_url).netloc):
             self.errors.append(f"remote runtime dependency: {runtime_url}")
-        if tag == "video" and attrs.get("poster"):
-            poster_url = urlsplit(attrs["poster"])
-            if poster_url.scheme or poster_url.netloc:
-                self.errors.append(f"remote video poster: {attrs['poster']}")
-        for name in ("href", "src", "poster"):
+        for name in ("href", "src"):
             if attrs.get(name):
                 self.links.append(attrs[name])
         for candidate in (attrs.get("srcset") or "").split(","):
@@ -87,10 +71,6 @@ class Page(HTMLParser):
                 self.links.append(candidate.split()[0])
         if any(key.startswith("on") for key in attrs):
             self.errors.append("inline event handler")
-
-    def handle_endtag(self, tag):
-        if tag == "video":
-            self.current_video = None
 
 
 def image_size(path):
@@ -113,7 +93,7 @@ def check_pages(root, errors):
         if not (page.lang and page.main):
             errors.append(f"{name}: semantic page language/main missing")
     scripts = {"index.html": ["app.js", "docs.js"], "docs.html": ["app.js", "docs.js"], "downloads.html": ["docs.js"],
-               "reference.html": ["app.js", "docs.js"], "desktop.html": ["app.js", "docs.js"]}
+               "reference.html": ["app.js", "docs.js"]}
     for name, page in pages.items():
         if page.scripts != scripts.get(name, []):
             errors.append(f"{name}: unexpected or missing script dependency: {page.scripts}")
@@ -137,323 +117,11 @@ def check_pages(root, errors):
                     errors.append(f"{name}: {src} is {size[0]}x{size[1]}, not {width}x{height}")
             except (ValueError, ET.ParseError, struct.error) as error:
                 errors.append(f"{name}: cannot validate {src}: {error}")
-        for video in page.videos:
-            attrs = video["attrs"]
-            label = attrs.get("id") or attrs.get("poster") or "video"
-            prefix = f"{name}: {label}"
-            for attribute in ("muted", "loop", "playsinline", "controls"):
-                if attribute not in attrs:
-                    errors.append(f"{prefix}: video needs {attribute}")
-            if "autoplay" in attrs:
-                errors.append(f"{prefix}: HTML autoplay bypasses motion and data preferences")
-            dimensions = tuple(attrs.get(key) or "" for key in ("width", "height"))
-            if any(not re.fullmatch(r"[1-9][0-9]*", value) for value in dimensions):
-                errors.append(f"{prefix}: video needs positive width and height")
-            if not attrs.get("poster"):
-                errors.append(f"{prefix}: video needs a local poster")
-            if not video["sources"]:
-                errors.append(f"{prefix}: video has no media source")
-            labelled_by = (attrs.get("aria-labelledby") or "").split()
-            if not (attrs.get("aria-label") or "").strip() and not labelled_by:
-                errors.append(f"{prefix}: video needs an accessible name")
-            described_by = (attrs.get("aria-describedby") or "").split()
-            if not described_by:
-                errors.append(f"{prefix}: video needs an accessible description")
-            for reference in labelled_by + described_by:
-                if reference not in page.ids:
-                    errors.append(f"{prefix}: missing accessible text: #{reference}")
     return pages
-
-
-def boxes(data, start=0, end=None):
-    """ISO BMFF boxes in data[start:end] as (kind, body start, box end)."""
-    end = len(data) if end is None else end
-    found = []
-    offset = start
-    while offset < end:
-        if end - offset < 8:
-            raise ValueError("incomplete MP4 box header")
-        size, kind = struct.unpack_from(">I4s", data, offset)
-        header = 8
-        if size == 1:
-            if end - offset < 16:
-                raise ValueError("incomplete extended MP4 box header")
-            size = struct.unpack_from(">Q", data, offset + 8)[0]
-            header = 16
-        elif size == 0:
-            size = end - offset
-        if size < header or offset + size > end:
-            raise ValueError("invalid MP4 box size")
-        found.append((kind, offset + header, offset + size))
-        offset += size
-    return found
-
-
-def mp4_boxes(path):
-    """Read top-level ISO BMFF boxes without a platform media dependency."""
-    return [kind for kind, _, _ in boxes(path.read_bytes())]
-
-
-def mp4_child(data, start, end, *path):
-    for kind, body, box_end in boxes(data, start, end):
-        if kind == path[0]:
-            return (body, box_end) if len(path) == 1 else mp4_child(data, body, box_end, *path[1:])
-    raise ValueError(f"missing MP4 {b'/'.join(path).decode()} box")
-
-
-def mp4_video_timing(path):
-    """The first video track's size, codec, timescale, duration, stts entries
-    and sample sizes, read from moov without a media dependency."""
-    data = Path(path).read_bytes()
-    moov = mp4_child(data, 0, len(data), b"moov")
-    for kind, start, end in boxes(data, *moov):
-        if kind != b"trak":
-            continue
-        hdlr, _ = mp4_child(data, start, end, b"mdia", b"hdlr")
-        if data[hdlr + 8:hdlr + 12] != b"vide":
-            continue
-        tkhd, _ = mp4_child(data, start, end, b"tkhd")
-        # Width and height are the last two 16.16 fields of tkhd.
-        width, height = struct.unpack_from(">II", data, tkhd + (88 if data[tkhd] == 1 else 76))
-        mdhd, _ = mp4_child(data, start, end, b"mdia", b"mdhd")
-        if data[mdhd] == 1:
-            timescale, duration = struct.unpack_from(">IQ", data, mdhd + 20)
-        else:
-            timescale, duration = struct.unpack_from(">II", data, mdhd + 12)
-        stbl = mp4_child(data, start, end, b"mdia", b"minf", b"stbl")
-        stsd, _ = mp4_child(data, *stbl, b"stsd")
-        codec = data[stsd + 12:stsd + 16].decode("latin-1")
-        stts, _ = mp4_child(data, *stbl, b"stts")
-        count = struct.unpack_from(">I", data, stts + 4)[0]
-        entries = [struct.unpack_from(">II", data, stts + 8 + 8 * index) for index in range(count)]
-        stsz, _ = mp4_child(data, *stbl, b"stsz")
-        fixed, samples = struct.unpack_from(">II", data, stsz + 4)
-        sizes = ([fixed] * samples if fixed else
-                 [struct.unpack_from(">I", data, stsz + 12 + 4 * index)[0] for index in range(samples)])
-        return {"width": width >> 16, "height": height >> 16, "codec": codec, "timescale": timescale,
-                "duration": duration, "stts": entries, "samples": samples, "sizes": sizes}
-    raise ValueError("no video track")
-
-
-MIN_CLIP_FPS = 24
-CODED_CHANGE_BYTES = 400
-CODED_CHANGE_FRACTION = 0.8
-CLIP_BYTE_BUDGET = 1_500_000
-TOTAL_BYTE_BUDGET = 3_500_000
-
-
-def check_clip_timing(prefix, path, clip, errors):
-    """A clip must play at its manifest rate, constantly, and show new images.
-
-    Samples under CODED_CHANGE_BYTES are x264 skip frames that repeat the last
-    image. This assumes these scenes always move the camera preview and the
-    pinned encoder settings: no B-frames, which code new images in a few
-    hundred bytes, and a fixed GOP that keeps I-frames from skewing the
-    count: a clip whose frames mostly repeat was not captured at its rate."""
-    timing = mp4_video_timing(path)
-    fps = clip.get("fps")
-    duration = clip.get("duration_seconds")
-    seconds = timing["duration"] / timing["timescale"] if timing["timescale"] else 0
-    if len(timing["stts"]) != 1:
-        errors.append(f"{prefix}: expected constant-frame-rate video")
-    played = timing["samples"] / seconds if seconds else 0
-    if type(fps) in (int, float) and abs(played - fps) > 0.05:
-        errors.append(f"{prefix}: video plays at {played:.1f} fps; manifest says {fps}")
-    if type(fps) not in (int, float) or fps < MIN_CLIP_FPS:
-        errors.append(f"{prefix}: demonstration must play at {MIN_CLIP_FPS} fps or more")
-    if timing["samples"] != clip.get("frame_count"):
-        errors.append(f"{prefix}: video has {timing['samples']} frames; manifest says {clip.get('frame_count')}")
-    if type(duration) in (int, float) and abs(seconds - duration) > 0.05:
-        errors.append(f"{prefix}: video lasts {seconds:.2f} s; manifest says {duration}")
-    if (timing["width"], timing["height"]) != (clip.get("width"), clip.get("height")):
-        errors.append(f"{prefix}: video is {timing['width']}x{timing['height']}; manifest says {clip.get('width')}x{clip.get('height')}")
-    if seconds and type(fps) in (int, float):
-        changes = sum(1 for size in timing["sizes"] if size >= CODED_CHANGE_BYTES) / seconds
-        if changes < CODED_CHANGE_FRACTION * fps:
-            errors.append(f"{prefix}: only {changes:.1f} fps of the {fps} fps clip show new images (repeated frames)")
-    source = clip.get("source") if isinstance(clip.get("source"), dict) else {}
-    for value, label in ((source.get("observed_fps"), "renderer capture rate"),
-                         (clip.get("preview_motion_fps"), "camera preview change rate")):
-        if type(value) not in (int, float) or value < MIN_CLIP_FPS:
-            errors.append(f"{prefix}: {label} must be {MIN_CLIP_FPS} fps or more")
-    size = path.stat().st_size
-    if size != clip.get("size_bytes"):
-        errors.append(f"{prefix}: file is {size:,} bytes; manifest says {clip.get('size_bytes')}")
-    if size > CLIP_BYTE_BUDGET:
-        errors.append(f"{prefix}: {size:,} bytes exceeds the {CLIP_BYTE_BUDGET:,}-byte clip budget")
-
-
-def check_media(root, pages, errors):
-    """Anchor recorded-media metadata to checked-in files and accessible embeds."""
-    directory = root / "media"
-    total = sum(path.stat().st_size for path in directory.glob("*.mp4"))
-    if total > TOTAL_BYTE_BUDGET:
-        errors.append(f"media: clips total {total:,} bytes, over the {TOTAL_BYTE_BUDGET:,}-byte budget")
-    manifest_path = directory / "manifest.json"
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as error:
-        errors.append(f"media/manifest.json: cannot read recording provenance: {error}")
-        return
-    if not isinstance(manifest, dict):
-        errors.append("media/manifest.json: expected a recording manifest object")
-        return
-    for key in ("method", "source_note", "demo"):
-        if not isinstance(manifest.get(key), str) or not manifest[key].strip():
-            errors.append(f"media/manifest.json: missing recording provenance: {key}")
-    binary_digest = manifest.get("binary_sha256")
-    if not isinstance(binary_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", binary_digest):
-        errors.append("media/manifest.json: missing recording binary SHA-256")
-    clips = manifest.get("clips")
-    if not isinstance(clips, list) or len(clips) < 2:
-        errors.append("media/manifest.json: expected at least two software demonstration clips")
-        return
-
-    recorded = {}
-    for clip in clips:
-        if not isinstance(clip, dict):
-            errors.append("media/manifest.json: invalid clip entry")
-            continue
-        filename = clip.get("file", "")
-        prefix = f"media/{filename or 'manifest.json'}"
-        if not isinstance(filename, str) or Path(filename).name != filename or Path(filename).suffix != ".mp4":
-            errors.append(f"{prefix}: expected a local MP4 filename")
-            continue
-        if filename in recorded:
-            errors.append(f"{prefix}: duplicate recorded clip")
-        recorded[filename] = clip
-        for key, hash_key, suffix in (("file", "sha256", ".mp4"), ("poster", "poster_sha256", ".png")):
-            value = clip.get(key, "")
-            if not isinstance(value, str) or Path(value).name != value or Path(value).suffix != suffix:
-                errors.append(f"{prefix}: {key} must name a local {suffix} file")
-                continue
-            path = directory / value
-            digest = clip.get(hash_key, "")
-            if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
-                errors.append(f"{prefix}: invalid {hash_key}")
-            elif not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
-                errors.append(f"{prefix}: missing or modified {key}: {value}")
-        dimensions = (clip.get("width"), clip.get("height"))
-        if any(type(value) is not int or value <= 0 for value in dimensions):
-            errors.append(f"{prefix}: invalid video dimensions")
-        poster = directory / str(clip.get("poster") or "")
-        if poster.is_file():
-            try:
-                if image_size(poster) != dimensions:
-                    errors.append(f"{prefix}: poster dimensions differ from recorded video")
-            except (ValueError, struct.error) as error:
-                errors.append(f"{prefix}: cannot validate poster: {error}")
-        duration = clip.get("duration_seconds")
-        if type(duration) not in (int, float) or not 3 <= duration <= 12:
-            errors.append(f"{prefix}: demonstration must be 3–12 seconds long")
-        if type(clip.get("fps")) not in (int, float) or not 1 <= clip["fps"] <= 60:
-            errors.append(f"{prefix}: invalid recorded frame rate")
-        if clip.get("codec") != "h264" or clip.get("pixel_format") != "yuv420p" or clip.get("audio") is not False:
-            errors.append(f"{prefix}: expected silent H.264 video with yuv420p pixels")
-        if not isinstance(clip.get("description"), str) or not clip["description"].strip():
-            errors.append(f"{prefix}: missing clip description")
-        source = clip.get("source", {})
-        if not isinstance(source, dict) or any(not source.get(key) for key in ("method", "scene")):
-            errors.append(f"{prefix}: missing native recording source details")
-        path = directory / filename
-        if path.is_file():
-            try:
-                top = mp4_boxes(path)
-                if not top or top[0] != b"ftyp" or b"moov" not in top or b"mdat" not in top:
-                    errors.append(f"{prefix}: invalid MP4 container")
-                elif top.index(b"moov") > top.index(b"mdat"):
-                    errors.append(f"{prefix}: MP4 metadata must precede media for progressive playback")
-                else:
-                    check_clip_timing(prefix, path, clip, errors)
-            except (ValueError, struct.error) as error:
-                errors.append(f"{prefix}: cannot validate MP4 container: {error}")
-
-    embedded = set()
-    for name, page in pages.items():
-        for video in page.videos:
-            attrs = video["attrs"]
-            for src in video["sources"]:
-                url = urlsplit(src)
-                path = (root / Path(name).parent / unquote(url.path)).resolve()
-                filename = path.name
-                if url.scheme or url.netloc or path.parent != directory.resolve() or filename not in recorded:
-                    errors.append(f"{name}: video source lacks local recording provenance: {src}")
-                    continue
-                clip = recorded[filename]
-                embedded.add(filename)
-                if (attrs.get("width"), attrs.get("height")) != (str(clip.get("width")), str(clip.get("height"))):
-                    errors.append(f"{name}: {src}: HTML dimensions differ from recording")
-                poster = (root / Path(name).parent / unquote(urlsplit(attrs.get("poster") or "").path)).resolve()
-                if poster != (directory / str(clip.get("poster") or "")).resolve():
-                    errors.append(f"{name}: {src}: poster differs from recording manifest")
-    for filename in recorded.keys() - embedded:
-        errors.append(f"media/{filename}: recorded demonstration is not embedded in a page")
-    check_clip_copy(root, pages, recorded, errors)
-
-
-NUMBERS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8}
 
 
 def plain_text(markup):
     return re.sub(r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", markup))).strip()
-
-
-def check_clip_copy(root, pages, recorded, errors):
-    """The copy beside a clip must count the cameras the recording actually shows."""
-    for name in pages:
-        markup = (root / name).read_text(encoding="utf-8")
-        for block in re.findall(r"<article\b.*?</article>", markup, re.S):
-            for filename, clip in recorded.items():
-                if f"media/{filename}" not in block:
-                    continue
-                cameras = (clip.get("source") or {}).get("cameras")
-                caption = plain_text(" ".join(re.findall(r"<figcaption\b.*?</figcaption>", block, re.S)))
-                body = plain_text(re.sub(r"<figure\b.*?</figure>", " ", block, flags=re.S))
-                stated = re.findall(r"\b(\w+) simulator cameras?\b", caption, re.I)
-                if "simulator camera" in caption.lower() and not stated:
-                    errors.append(f"media/{filename}: caption mentions simulator cameras without a count")
-                stated += re.findall(r"\b(\w+) (?:simulator )?cameras\b", body, re.I)
-                for word in stated:
-                    count = int(word) if word.isdigit() else NUMBERS.get(word.lower())
-                    if count is None:
-                        errors.append(f"media/{filename}: cannot read the camera count in '{word} ... cameras'")
-                    elif count != cameras:
-                        errors.append(f"media/{filename}: {name} says {word} simulator camera(s) but manifest source.cameras is {cameras}")
-
-
-def check_image_provenance(root, pages, errors):
-    """Responsive candidates exist at their stated widths and derived images match their manifest."""
-    manifest_path = root / "images" / "docs" / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
-    for entry in manifest.get("derived", []):
-        path = manifest_path.parent / str(entry.get("file", ""))
-        source = manifest_path.parent / str(entry.get("derived_from", ""))
-        if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("sha256"):
-            errors.append(f"images/docs/{entry.get('file')}: missing or modified derived image; it no longer matches images/docs/manifest.json")
-        elif not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != entry.get("derived_from_sha256"):
-            errors.append(f"images/docs/{entry.get('file')}: its source {entry.get('derived_from')} changed since images/docs/manifest.json recorded it")
-    for name, page in pages.items():
-        for srcset, width, height, priority, src in page.srcsets:
-            for candidate in filter(None, (part.strip() for part in srcset.split(","))):
-                parts = candidate.split()
-                path = root / Path(name).parent / unquote(urlsplit(parts[0]).path)
-                if len(parts) != 2 or not re.fullmatch(r"[1-9][0-9]*w", parts[1]):
-                    errors.append(f"{name}: srcset candidate needs a width descriptor: {candidate}")
-                    continue
-                if not path.is_file():
-                    continue  # Reported as a missing local resource.
-                try:
-                    size = image_size(path)
-                except (ValueError, ET.ParseError, struct.error) as error:
-                    errors.append(f"{name}: cannot validate {parts[0]}: {error}")
-                    continue
-                if size[0] != int(parts[1][:-1]):
-                    errors.append(f"{name}: {parts[0]} is {size[0]} pixels wide, not {parts[1]}")
-                if width and height and abs(size[0] * int(height) - size[1] * int(width)) > size[0]:
-                    errors.append(f"{name}: {parts[0]} does not match the {width}x{height} aspect ratio")
-            path = root / Path(name).parent / unquote(urlsplit(src).path)
-            if priority == "high" and path.is_file() and path.stat().st_size > 300_000:
-                print(f"warning: {name}: high-priority image {src} is {path.stat().st_size // 1000} KB", file=sys.stderr)
 
 
 def code_lines(markup):
@@ -473,9 +141,9 @@ def check_landing(root, errors):
     if title and "<br" in title[1]:
         errors.append("index.html: the hero heading must wrap on its own; remove <br>")
     quickstart = re.search(r'<section id="quickstart".*?</section>', index, re.S)
-    for line in code_lines(quickstart[0] if quickstart else ""):
-        if re.match(r"capturefab\b.*\bdiscover\b", line) and "--simulate" not in line:
-            errors.append(f"index.html: the simulator quickstart must discover with --simulate: {line}")
+    commands = [line for line in code_lines(quickstart[0] if quickstart else "") if line.startswith("capturefab ")]
+    if not commands or any("-c " in line and "-c sim:" not in line for line in commands):
+        errors.append("index.html: the quickstart must run on the simulator camera (-c sim:0) so it works without hardware")
     # Landing examples are copied from documented ones, so docs coverage keeps them current.
     documented = set(code_lines(docs))
     for line in code_lines(index):
@@ -484,13 +152,6 @@ def check_landing(root, errors):
     faq = re.search(r'<div class="faq">\s*<details><summary>(.*?)</summary>', index, re.S)
     if faq and re.search(r"\b(version|upgrad\w*|changed)\b|\d+\.\d+", faq[1], re.I):
         errors.append(f"index.html: the FAQ should open with a newcomer question, not release news: {faq[1]}")
-    if index.count("development build") > 1:
-        errors.append("index.html: say 'development build' once at most; captions already link their provenance")
-    for manifest in (root / "media" / "manifest.json", root / "images" / "docs" / "manifest.json"):
-        version = json.loads(manifest.read_text(encoding="utf-8")).get("app_version") if manifest.is_file() else None
-        note = re.search(r'<p class="media-note">(.*?)</p>', index, re.S)
-        if version and (not note or version not in note[1]):
-            errors.append(f"index.html: the media note must name version {version}, recorded in {manifest.relative_to(root)}")
 
 
 def check_unused_css(root, errors):
@@ -672,11 +333,12 @@ def site_release():
 
 
 def check_installers(root, errors):
-    """The generated installers offer exactly the manifest's published builds, with their checksums."""
+    """The generated installers offer exactly the manifest's published builds, with their checksums,
+    and nothing while the latest release is the desktop app (0.5.0 and earlier)."""
     manifest = json.loads((root / "releases.json").read_text(encoding="utf-8"))
     canonical = re.search(r'<link rel="canonical" href="([^"]+)"', (root / "index.html").read_text(encoding="utf-8"))
     site = canonical[1].rstrip("/") + "/" if canonical else ""
-    latest = [r for r in manifest["releases"] if r["version"] == manifest.get("latest")]
+    latest = [r for r in manifest["releases"] if r["version"] == manifest.get("latest") and not site_release().is_desktop_release(r)]
     available = [a for r in latest for a in r["assets"] if a.get("available")]
     for name, systems, pattern in (("install.sh", {"macos", "linux"}, r"url='([^']+)' expected='([0-9a-f]{64})'"),
                                    ("install.ps1", {"windows"}, r"Url = '([^']+)'; Sha256 = '([0-9a-f]{64})'")):
@@ -704,89 +366,66 @@ def check_installers(root, errors):
 def fixture_archive(directory, system, arch, kind=None):
     """A release archive whose capturefab prints a version, laid out like scripts/release.py's.
 
-    macOS takes kind "zip" (releases up to 0.4.0) or "dmg" (later releases, built with hdiutil)."""
+    kind "dmg" is a macOS disk image as releases up to 0.5.0 shipped; the
+    installer must refuse it before downloading anything."""
     stem = f"capturefab-9.9.9-{system}-{arch}"
-    stub = b"#!/bin/sh\necho 'capturefab 9.9.9'\n"
-    if system == "macos" and kind == "dmg":
-        stage = directory / f"{stem}-stage"
-        executable = stage / "Capturefab.app/Contents/MacOS/capturefab"
-        executable.parent.mkdir(parents=True)
-        executable.write_bytes(stub)
-        executable.chmod(0o755)
-        os.symlink("/Applications", stage / "Applications")
+    if kind == "dmg":
         path = directory / f"{stem}.dmg"
-        subprocess.run(["hdiutil", "create", "-quiet", "-volname", "Capturefab 9.9.9", "-srcfolder", str(stage), "-format", "UDZO", "-ov", str(path)],
-                       check=True, capture_output=True, timeout=120)
-        shutil.rmtree(stage)
-    elif system == "macos":
-        path = directory / f"{stem}.zip"
-        with zipfile.ZipFile(path, "w") as archive:
-            info = zipfile.ZipInfo(f"{stem}/Capturefab.app/Contents/MacOS/capturefab")
-            info.external_attr = 0o100755 << 16
-            archive.writestr(info, stub)
-    else:
-        path = directory / f"{stem}.tar.gz"
-        with tarfile.open(path, "w:gz") as archive:
-            for name, data, mode in ((f"{stem}/capturefab", stub, 0o755),
-                                     (f"{stem}/share/applications/capturefab.desktop", b"[Desktop Entry]\nExec=capturefab\n", 0o644)):
-                info = tarfile.TarInfo(name)
-                info.size, info.mode = len(data), mode
-                archive.addfile(info, io.BytesIO(data))
+        path.write_bytes(b"not a disk image")
+        return path
+    stub = b"#!/bin/sh\necho 'capturefab 9.9.9'\n"
+    path = directory / f"{stem}.tar.gz"
+    with tarfile.open(path, "w:gz") as archive:
+        for name, data, mode in ((f"{stem}/capturefab", stub, 0o755), (f"{stem}/README.txt", b"Capturefab 9.9.9\n", 0o644)):
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), mode
+            archive.addfile(info, io.BytesIO(data))
     return path
 
 
 def check_installer_runs(errors):
-    """Install from a local server, then refuse a corrupted download and an empty release."""
+    """Install from a local server, migrate an earlier desktop install, then refuse a
+    corrupted download, a disk image, a desktop release (0.5.0 and earlier) and an empty release."""
     system = {"Darwin": "macos", "Linux": "linux"}.get(platform.system())
-    if not system or not shutil.which("sh") or (system == "macos" and not shutil.which("ditto")):
+    if not system or not shutil.which("sh"):
         return
-    kinds = [None]
-    if system == "macos":
-        # A disk image needs hdiutil to build and mount; elsewhere only the .zip case runs.
-        kinds = ["zip"] + (["dmg"] if shutil.which("hdiutil") else [])
-    for kind in kinds:
-        check_installer_run(errors, system, kind)
+    check_installer_run(errors, system)
 
 
-def check_installer_run(errors, system, kind):
+def installer(site, temp, system, kind=None, version="9.9.9"):
+    served = temp / "served"
+    served.mkdir(exist_ok=True)
+    assets = []
+    for arch in ("x86_64", "aarch64"):
+        path = fixture_archive(served, system, arch, kind)
+        assets.append(dict(name=path.name, os=system, arch=arch, available=True, size=path.stat().st_size,
+                           sha256=hashlib.sha256(path.read_bytes()).hexdigest(), url=f"https://example.invalid/{path.name}"))
+    manifest = dict(schema_version=1, latest=version, releases=[dict(version=version, date="2026-01-01", assets=assets)])
+    script = temp / f"install-{kind or 'tar'}-{version}.sh"
+    script.write_text(site.installers(manifest, "https://capturefab.example/")[0], encoding="utf-8")
+    return served, script
+
+
+def check_installer_run(errors, system):
     site = site_release()
-    label = f"install.sh ({kind})" if kind else "install.sh"
+    label = "install.sh"
     with tempfile.TemporaryDirectory() as temp:
         temp = Path(temp)
-        served = temp / "served"
-        served.mkdir()
-        assets = []
-        for arch in ("x86_64", "aarch64"):
-            try:
-                path = fixture_archive(served, system, arch, kind)
-            except (OSError, subprocess.SubprocessError) as error:
-                # hdiutil can be present but unusable, as in some sandboxes.
-                print(f"skipping the {label} fixture: {error}", file=sys.stderr)
-                return
-            assets.append(dict(name=path.name, os=system, arch=arch, available=True, size=path.stat().st_size,
-                               sha256=hashlib.sha256(path.read_bytes()).hexdigest(), url=f"https://example.invalid/{path.name}"))
-        manifest = dict(schema_version=1, latest="9.9.9", releases=[dict(version="9.9.9", date="2026-01-01", assets=assets)])
-        script = temp / "install.sh"
-        script.write_text(site.installers(manifest, "https://capturefab.example/")[0], encoding="utf-8")
+        served, script = installer(site, temp, system)
         server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(served)))
         threading.Thread(target=server.serve_forever, daemon=True).start()
         try:
-            def install(name, prefix=None):
+            def install(name, prefix=None, setup=None, script=script):
                 home = temp / name
                 home.mkdir()
-                # The script's own temporary folder, which must be gone (and any image detached) afterwards.
+                # The script's own temporary folder, which must be gone afterwards.
                 (home / "tmp").mkdir()
+                if setup:
+                    setup(home)
                 env = dict(os.environ, HOME=str(home), TMPDIR=str(home / "tmp"), XDG_DATA_HOME=str(home / "share"),
                            CAPTUREFAB_INSTALL_BASE_URL=f"http://127.0.0.1:{server.server_port}")
-                result = subprocess.run(["sh", str(script), "--prefix", prefix or str(home / "apps"), "--bin-dir", str(home / "bin")],
-                                        capture_output=True, text=True, env=env, timeout=120, cwd=home)
-                if kind == "dmg":
-                    # A disk image still mounted in the temporary folder would also stop its removal.
-                    root = str((home / "tmp").resolve())
-                    mounts = re.findall(r" on (.+?) \(", subprocess.run(["mount"], capture_output=True, text=True).stdout)
-                    for mount in [m for m in mounts if m.startswith(root + "/")]:
-                        errors.append(f"{label}: left the disk image mounted at {mount}")
-                        subprocess.run(["hdiutil", "detach", "-force", mount], capture_output=True)
+                arguments = ["sh", str(script), "--bin-dir", str(home / "bin")] + (["--prefix", prefix] if prefix else [])
+                result = subprocess.run(arguments, capture_output=True, text=True, env=env, timeout=120, cwd=home)
                 if any((home / "tmp").iterdir()):
                     errors.append(f"{label}: left {sorted(p.name for p in (home / 'tmp').iterdir())} in its temporary folder")
                 return home, result
@@ -797,27 +436,62 @@ def check_installer_run(errors, system, kind):
                 errors.append(f"{label}: fixture install failed: {result.stderr.strip() or result.stdout.strip()}")
             elif "capturefab 9.9.9" not in result.stdout:
                 errors.append(f"{label}: did not run the installed capturefab --version")
-            elif system == "macos" and command.resolve() != (home / "apps/Capturefab.app/Contents/MacOS/capturefab").resolve():
-                errors.append(f"{label}: the command must link to the app's executable, not {os.readlink(command)}")
-            elif system == "linux" and 'Exec="' not in (home / "share/applications/capturefab.desktop").read_text():
-                errors.append(f"{label}: the launcher entry must name the installed command")
+            elif command.resolve() != (home / "apps/9.9.9/capturefab").resolve():
+                errors.append(f"{label}: the command must link to the release's executable, not {os.readlink(command)}")
+
+            def desktop_install(home):
+                # What 0.5 and earlier left: a command link into the app and a Linux launcher entry.
+                app = home / "Applications/Capturefab.app/Contents/MacOS"
+                app.mkdir(parents=True)
+                (app / "capturefab").write_text("#!/bin/sh\necho 'capturefab 0.5.0'\n")
+                (home / "bin").mkdir()
+                (home / "bin/capturefab").symlink_to(app / "capturefab")
+                launcher = home / "share/applications"
+                launcher.mkdir(parents=True)
+                (launcher / "capturefab.desktop").write_text("[Desktop Entry]\nExec=\"/home/user/.local/bin/capturefab\"\n")
+                icons = home / "share/icons/hicolor/256x256/apps"
+                icons.mkdir(parents=True)
+                (icons / "capturefab.png").write_bytes(b"png")
+            home, result = install("upgrade", setup=desktop_install)
+            command = home / "bin" / "capturefab"
+            if result.returncode or command.resolve() != (home / "share/capturefab/9.9.9/capturefab").resolve():
+                errors.append(f"{label}: an earlier desktop install must not stop the upgrade: {result.stderr.strip() or result.stdout.strip()}")
+            elif "no longer runs the desktop app" not in result.stdout:
+                errors.append(f"{label}: replacing a command link into Capturefab.app must say what happened to the app")
+            elif (home / "share/applications/capturefab.desktop").exists() or (home / "share/icons/hicolor/256x256/apps/capturefab.png").exists():
+                errors.append(f"{label}: the launcher entry and icons of an earlier desktop install must be removed")
+            elif not (home / "Applications/Capturefab.app").is_dir():
+                errors.append(f"{label}: an earlier desktop app must stay until its user deletes it")
+
             for path in served.iterdir():
                 path.write_bytes(path.read_bytes() + b"tampered")
             home, result = install("corrupt")
             if result.returncode == 0 or "checksum mismatch" not in result.stderr:
                 errors.append(f"{label}: a corrupted download must fail with a checksum mismatch")
-            if (home / "bin").exists() or (home / "apps").exists():
+            if (home / "bin").exists() or (home / "share").exists():
                 errors.append(f"{label}: a corrupted download must install nothing")
+
+            _, legacy = installer(site, temp, system, "dmg")
+            home, result = install("legacy", script=legacy)
+            if result.returncode == 0 or "downloads.html" not in result.stderr or (home / "bin").exists():
+                errors.append(f"{label}: a disk-image release must fail, pointing to the downloads page, and install nothing")
+
+            # The latest release is still the desktop app: install nothing, and
+            # keep the launcher entry it added.
+            _, desktop = installer(site, temp, system, version="0.5.0")
+            home, result = install("desktop", script=desktop, setup=desktop_install)
+            if result.returncode == 0 or "no command-line release" not in result.stderr or "downloads.html" not in result.stderr:
+                errors.append(f"{label}: a desktop release (0.5.0 and earlier) must fail with 'no command-line release', pointing to the downloads page")
+            elif not (home / "share/applications/capturefab.desktop").exists() or not (home / "bin/capturefab").is_symlink() or (home / "share/capturefab").exists():
+                errors.append(f"{label}: a desktop release must install nothing and leave the earlier install as it was")
         finally:
             server.shutdown()
             server.server_close()
-        if kind == "dmg":
-            return
         empty = temp / "empty.sh"
         empty.write_text(site.installers(dict(schema_version=1, latest=None, releases=[]), "https://capturefab.example/")[0], encoding="utf-8")
         result = subprocess.run(["sh", str(empty)], capture_output=True, text=True, env=dict(os.environ, HOME=str(temp)), timeout=30)
-        if result.returncode == 0 or "no published release" not in result.stderr:
-            errors.append("install.sh: without a release it must fail with 'no published release'")
+        if result.returncode == 0 or "no command-line release" not in result.stderr:
+            errors.append("install.sh: without a release it must fail with 'no command-line release'")
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
@@ -927,9 +601,7 @@ def check_theme_contrast(root, errors):
 
 def validate(root=ROOT):
     errors = []
-    pages = check_pages(root, errors)
-    check_media(root, pages, errors)
-    check_image_provenance(root, pages, errors)
+    check_pages(root, errors)
     check_landing(root, errors)
     check_unused_css(root, errors)
     check_modules(root, errors)
@@ -959,17 +631,12 @@ def main():
     guides = subprocess.run([sys.executable, str(Path(__file__).with_name("site-guides.py")), "--check"], capture_output=True, text=True)
     if guides.returncode:
         errors.append(guides.stderr.strip() or "web/guides is stale; run scripts/site-guides.py")
-    spec = importlib.util.spec_from_file_location("docs_coverage", Path(__file__).with_name("docs-coverage.py"))
-    coverage = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(coverage)
-    try:
-        report = coverage.validate(ROOT.parent)
-        errors.extend(f"documentation coverage: {error}" for error in report["errors"])
-    except (OSError, ValueError, KeyError, TypeError) as error:
-        errors.append(f"cannot validate documentation coverage: {error}")
+    reference = subprocess.run([sys.executable, str(Path(__file__).with_name("site-reference.py")), "--check"], capture_output=True, text=True)
+    if reference.returncode:
+        errors.append(reference.stderr.strip() or "web/reference.html is stale; run scripts/site-reference.py")
     if errors:
         sys.exit("\n".join(errors))
-    print(f"Static site validated; installers checked and run against a local release, source-based documentation coverage, accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, resolvable module paths, no remote runtime dependencies.")
+    print(f"Static site validated; installers checked and run against a local release, including an upgrade from the desktop app, the command reference against the CLI schema snapshot, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, resolvable module paths, no remote runtime dependencies.")
 
 
 if __name__ == "__main__":

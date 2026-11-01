@@ -70,32 +70,6 @@ function openPage(options = {}) {
   const form = new Element('form');
   const motion = new Element();
   motion.matches = Boolean(options.reducedMotion);
-  const connection = new Element();
-  connection.saveData = Boolean(options.saveData);
-  const videos = Array.from({ length: options.videoCount ?? 2 }, () => {
-    const video = new Element('video');
-    video.paused = true;
-    video.playAttempts = 0;
-    video.rejectPlay = false;
-    // Real media events are asynchronous. Keep them separate from method calls
-    // so visibility changes and explicit controls can race as they do in a browser.
-    video.play = () => {
-      video.playAttempts += 1;
-      if (video.rejectPlay) return Promise.reject(new Error('Playback was blocked'));
-      if (video.paused) {
-        video.paused = false;
-        events.push(() => video.emit('play'));
-      }
-      return Promise.resolve();
-    };
-    video.pause = () => {
-      if (!video.paused) {
-        video.paused = true;
-        events.push(() => video.emit('pause'));
-      }
-    };
-    return video;
-  });
   // The hero and banner buttons, each in an .actions group with a processor line after it.
   const oneclick = [];
   const alts = [];
@@ -123,14 +97,9 @@ function openPage(options = {}) {
   document.hidden = Boolean(options.hidden);
   document.getElementById = (id) => ids.get(id) || null;
   document.querySelector = (selector) => ({ '.download-result': result, '.platform-form': form })[selector] || null;
-  document.querySelectorAll = (selector) => ({ '.product-video': videos, '[data-oneclick]': oneclick, '[data-oneclick-alt]': alts, '[data-run-hint]': runHints })[selector] || [];
+  document.querySelectorAll = (selector) => ({ '[data-oneclick]': oneclick, '[data-oneclick-alt]': alts, '[data-run-hint]': runHints })[selector] || [];
   document.createElement = (tag) => new Element(tag);
   document.createTextNode = (text) => ({ textContent: text });
-  const observers = [];
-  class Observer {
-    constructor(callback) { this.callback = callback; observers.push(this); }
-    observe() {}
-  }
   // Timers run at once; the page uses them only to let a native download start first.
   const windowListeners = new Map();
   const logged = [];
@@ -151,14 +120,12 @@ function openPage(options = {}) {
     console: { error: (error) => logged.push(error) },
     addEventListener(type, listener) { windowListeners.set(type, [...(windowListeners.get(type) || []), listener]); }
   };
-  if (options.observer !== false) window.IntersectionObserver = Observer;
   // A browser with ES modules has HTMLScriptElement.prototype.noModule.
   function HTMLScriptElement() {}
   HTMLScriptElement.prototype.noModule = false;
   const navigator = {
     platform: options.platform || '',
     userAgent: options.userAgent || '',
-    connection,
     ...(options.userAgentData ? { userAgentData: options.userAgentData } : {})
   };
   const fetchCalls = [];
@@ -167,10 +134,10 @@ function openPage(options = {}) {
     if (options.fetchError) return Promise.reject(new Error('Offline'));
     return Promise.resolve({ ok: true, json: async () => options.manifest ?? published });
   };
-  const globals = { document, window, navigator, fetch, URL, IntersectionObserver: Observer, ...(options.modules === false ? {} : { HTMLScriptElement }) };
+  const globals = { document, window, navigator, fetch, URL, ...(options.modules === false ? {} : { HTMLScriptElement }) };
   vm.runInNewContext(source, globals, { filename: 'web/app.js' });
   return {
-    ids, result, motion, connection, videos, document, fetchCalls, oneclick, alts, runHints, logged, windowListeners,
+    ids, result, motion, document, fetchCalls, oneclick, alts, runHints, logged, windowListeners,
     get hash() { return window.location.hash; },
     replaced: window.history.replaced,
     async settle() {
@@ -187,13 +154,7 @@ function openPage(options = {}) {
       }
     },
     navigate(hash) { window.location.hash = hash; for (const listener of windowListeners.get('hashchange') || []) listener({}); },
-    change(id, value) { const element = ids.get(id); element.value = value; element.emit('change'); },
-    intersect(index, ratio) {
-      for (const observer of observers) observer.callback([{ target: videos[index], isIntersecting: ratio > 0, intersectionRatio: ratio }]);
-    },
-    visibility(hidden) { document.hidden = hidden; document.emit('visibilitychange'); },
-    preference(reduced) { motion.matches = reduced; motion.emit('change'); },
-    dataSaving(enabled) { connection.saveData = enabled; connection.emit('change'); }
+    change(id, value) { const element = ids.get(id); element.value = value; element.emit('change'); }
   };
 }
 
@@ -203,8 +164,8 @@ async function downloads() {
     const manifest = structuredClone(published);
     manifest.releases.find((release) => release.version === manifest.latest).assets
       .filter((asset) => asset.os === 'macos').forEach((asset) => {
-        asset.name = asset.name.replace(/\.(zip|dmg)$/, `.${extension}`);
-        asset.url = asset.url.replace(/\.(zip|dmg)$/, `.${extension}`);
+        asset.name = asset.name.replace(/\.(zip|dmg|tar\.gz)$/, `.${extension}`);
+        asset.url = asset.url.replace(/\.(zip|dmg|tar\.gz)$/, `.${extension}`);
       });
     return manifest;
   };
@@ -227,9 +188,9 @@ async function downloads() {
   assert.equal(page.ids.get('verify-command').textContent, `cd ~/Downloads && echo "${desktop.sha256.toLowerCase()}  ${desktop.name}" | shasum -a 256 -c`, 'The Mac check prints OK or FAILED by itself');
   assert.match(page.ids.get('checksum-text').textContent, new RegExp(desktop.sha256));
   const macSteps = desktop.name.endsWith('.dmg')
-    ? /Open.*\.dmg.*Drag Capturefab to the Applications folder.*Local Network.*CLI/
-    : /Extract.*Move Capturefab\.app to Applications.*Local Network.*CLI/;
-  assert.match(page.ids.get('install-hint').textContent, macSteps, 'One macOS story: move the app, allow Local Network, then set up the CLI');
+    ? /Open.*\.dmg.*drag Capturefab to the Applications folder.*desktop app.*Local Network/
+    : /Extract the \.tar\.gz.*\.\/capturefab --help.*PATH.*Camera and Local Network/;
+  assert.match(page.ids.get('install-hint').textContent, macSteps, 'One macOS story per archive format');
   const firstLaunch = (hint) => hint.children.find((child) => child.tagName === 'A' && child.href === 'https://capturefab.example/docs.html#first-launch');
   assert.ok(firstLaunch(page.ids.get('install-hint')), 'The install hint links to the first-launch steps');
   page.change('os-select', 'windows');
@@ -243,18 +204,20 @@ async function downloads() {
   assert.equal(page.ids.get('verify-box').hidden, true);
   assert.equal(page.ids.get('install-hint').hidden, true);
 
-  const zip = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X', manifest: macManifest('zip') });
-  await zip.settle();
-  assert.match(zip.ids.get('install-hint').textContent, /Extract.*Move Capturefab\.app to Applications.*Local Network.*CLI/);
-  assert.doesNotMatch(zip.ids.get('install-hint').textContent, /disk image/);
+  // A command-line archive gets extract-and-run steps with the PATH link.
+  const archive = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X', manifest: macManifest('tar.gz') });
+  await archive.settle();
+  assert.match(archive.ids.get('install-hint').textContent, /Extract the \.tar\.gz archive.*\.\/capturefab --help.*PATH.*Camera and Local Network access for your terminal app/);
+  assert.doesNotMatch(archive.ids.get('install-hint').textContent, /Applications|desktop app|\.dmg/);
+  assert.ok(archive.ids.get('install-hint').children.some((child) => child.tagName === 'A' && child.href.endsWith('docs.html#cli-path')), 'The PATH step links to its guide');
+  assert.match(archive.oneclick[0].children.map((child) => child.textContent).join(' '), /CLI$/);
 
-  // A disk image release (after 0.4.0) gets drag-to-Applications steps.
+  // A 0.5 disk image release is the desktop app and says so.
   const imaged = macManifest('dmg');
   const dmg = openPage({ platform: 'MacIntel', userAgent: 'Macintosh; Intel Mac OS X', manifest: imaged });
   await dmg.settle();
-  assert.match(dmg.ids.get('install-hint').textContent, /Drag Capturefab to the Applications folder/);
+  assert.match(dmg.ids.get('install-hint').textContent, /drag Capturefab to the Applications folder\. This release is the desktop app/);
   assert.doesNotMatch(dmg.ids.get('install-hint').textContent, /Extract/);
-  assert.ok(dmg.ids.get('install-hint').textContent.includes('/Applications/Capturefab.app/Contents/MacOS/capturefab --help'));
   dmg.change('os-select', 'windows');
   assert.ok(dmg.ids.get('install-hint').textContent.includes('.\\capturefab.exe --help'));
 
@@ -349,7 +312,7 @@ async function signing() {
   const mac = openPage({ userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
   await mac.settle();
   assert.match(mac.ids.get('asset-detail').textContent, /Apple notarized$/);
-  assert.doesNotMatch(mac.ids.get('install-hint').textContent, /Control-click|SmartScreen/, 'A notarized Mac build needs no first-open workaround');
+  assert.doesNotMatch(mac.ids.get('install-hint').textContent, /If macOS blocks it|SmartScreen/, 'A notarized Mac build needs no first-open workaround');
   mac.change('os-select', 'windows');
   assert.match(mac.ids.get('asset-detail').textContent, /windows-aarch64\.zip · [0-9.]+ MiB · Unsigned$/);
   assert.match(mac.ids.get('install-hint').textContent, /SmartScreen.*More info → Run anyway/);
@@ -365,7 +328,7 @@ async function signing() {
   assert.match(page.ids.get('asset-detail').textContent, /Authenticode$/);
   assert.doesNotMatch(page.ids.get('install-hint').textContent, /SmartScreen/, 'Signed Windows builds must not mention SmartScreen');
   page.change('os-select', 'macos');
-  assert.match(page.ids.get('install-hint').textContent, /Control-click Capturefab\.app and choose Open/);
+  assert.match(page.ids.get('install-hint').textContent, /If macOS blocks it, allow it in System Settings › Privacy & Security/);
 }
 
 async function guessedProcessor() {
@@ -401,14 +364,21 @@ async function guessedProcessor() {
 }
 
 async function nextSteps() {
+  // The command-line release layout, whatever format the latest published release has.
+  const cli = structuredClone(published);
+  cli.releases.find((release) => release.version === cli.latest).assets
+    .filter((asset) => asset.os === 'macos').forEach((asset) => {
+      asset.name = asset.name.replace(/\.(zip|dmg)$/, '.tar.gz');
+      asset.url = asset.url.replace(/\.(zip|dmg)$/, '.tar.gz');
+    });
   const cases = [
-    ['macOS', 'arm', /Capturefab\.app/, 'macos', 'aarch64', '/Applications/Capturefab.app/Contents/MacOS/capturefab'],
+    ['macOS', 'arm', /\.\/capturefab --help/, 'macos', 'aarch64', './capturefab'],
     ['Windows', 'x86', /\.\\capturefab\.exe/, 'windows', 'x86_64', '.\\capturefab.exe'],
     ['Linux', 'x86', /\.\/capturefab/, 'linux', 'x86_64', './capturefab']
   ];
   for (const [platform, architecture, pattern, osId, archId, command] of cases) {
-    const asset = assetFor(published, osId, archId);
-    const page = openPage({ userAgentData: { platform, getHighEntropyValues: async () => ({ architecture, bitness: '64' }) } });
+    const asset = assetFor(cli, osId, archId);
+    const page = openPage({ manifest: cli, userAgentData: { platform, getHighEntropyValues: async () => ({ architecture, bitness: '64' }) } });
     await page.settle();
     assert.ok(page.runHints.every((hint) => hint.textContent.includes(` ${command} `)), `CLI examples name ${command}`);
     const [button] = page.oneclick;
@@ -420,7 +390,7 @@ async function nextSteps() {
     assert.equal(panel.hidden, false);
     const steps = page.ids.get('next-steps-list').children.map((item) => item.textContent).join(' ');
     assert.match(steps, pattern);
-    assert.match(steps, /Try a simulated camera/);
+    assert.match(steps, new RegExp(`Try the simulator camera: ${command.replace(/[.\\]/g, '\\$&')} capture -c sim:0`));
     assert.equal(page.ids.get('direct-download').href, asset.url);
     assert.equal(page.ids.get('direct-download').getAttribute('download'), asset.name);
     assert.equal(panel.placedBefore, page.alts[0], 'The panel follows the clicked button and its processor line');
@@ -431,14 +401,14 @@ async function nextSteps() {
     page.change('os-select', osId === 'linux' ? 'macos' : 'linux');
     assert.equal(panel.hidden, true, 'A new selection hides steps for the previous build');
   }
-  const linux = openPage({ userAgentData: { platform: 'Linux', getHighEntropyValues: async () => ({ architecture: 'x86', bitness: '64' }) } });
+  const linux = openPage({ manifest: cli, userAgentData: { platform: 'Linux', getHighEntropyValues: async () => ({ architecture: 'x86', bitness: '64' }) } });
   await linux.settle();
   linux.oneclick[0].emit('click');
   const linuxSteps = linux.ids.get('next-steps-list').children.map((item) => item.textContent);
   assert.equal(linuxSteps.filter((step) => /doctor/.test(step)).length, 1, 'Linux lists doctor once');
   assert.ok(linuxSteps.every((step) => !/(^|\s)capturefab doctor/.test(step)), 'doctor runs from the extracted folder');
 
-  const mac = openPage({ userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
+  const mac = openPage({ manifest: cli, userAgentData: { platform: 'macOS', getHighEntropyValues: async () => ({ architecture: 'arm', bitness: '64' }) } });
   await mac.settle();
   const hint = mac.ids.get('install-hint');
   assert.ok(hint.children.some((child) => child.tagName === 'A' && child.href.endsWith('docs.html#cli-path')), 'The macOS CLI step links to the PATH setup');
@@ -446,7 +416,7 @@ async function nextSteps() {
   assert.equal(mac.ids.get('next-steps').hidden, false);
   assert.equal(mac.ids.get('next-steps').placedBefore, hint);
   assert.equal(hint.hidden, true, 'The panel replaces the install hint it would repeat');
-  const cliStep = mac.ids.get('next-steps-list').children.find((item) => /For the CLI/.test(item.textContent));
+  const cliStep = mac.ids.get('next-steps-list').children.find((item) => /To type just capturefab/.test(item.textContent));
   assert.ok(cliStep.children.some((child) => child.tagName === 'A' && child.href.endsWith('docs.html#cli-path')), 'The panel keeps the link');
   mac.ids.get('next-steps-close').emit('click');
   assert.equal(hint.hidden, false, 'Closing the panel shows the install hint again');
@@ -457,111 +427,10 @@ async function nextSteps() {
   assert.equal(early.ids.get('next-steps').hidden, true, 'An unarmed button only scrolls to the download section');
 }
 
-async function visiblePlayback() {
-  const page = openPage({ downloads: false });
-  await page.settle();
-  assert.ok(page.videos.every((video) => video.paused), 'Wait for observed visibility before starting clips');
-  page.intersect(0, 0.39);
-  await page.settle();
-  assert.equal(page.videos[0].paused, true);
-  page.intersect(0, 0.5);
-  await page.settle();
-  assert.equal(page.videos[0].paused, false);
-  assert.equal(page.videos[1].paused, true, 'Offscreen clips must not load and play with a visible neighbor');
-  page.intersect(0, 0);
-  await page.settle();
-  assert.equal(page.videos[0].paused, true);
-  page.intersect(0, 0.8);
-  await page.settle();
-  assert.equal(page.videos[0].paused, false, 'An automatic offscreen pause may resume on return');
-  page.videos[0].pause();
-  await page.settle();
-  page.intersect(0, 0);
-  page.intersect(0, 0.8);
-  page.visibility(true);
-  page.visibility(false);
-  await page.settle();
-  assert.equal(page.videos[0].paused, true, 'A viewer pause must survive scrolling and tab changes');
-  page.intersect(1, 0.8);
-  await page.settle();
-  assert.equal(page.videos[1].paused, false, 'Pausing one clip must not stop other visible clips');
-  page.visibility(true);
-  await page.settle();
-  assert.equal(page.videos[1].paused, true, 'A hidden document must pause playback');
-  page.visibility(false);
-  await page.settle();
-  assert.equal(page.videos[1].paused, false);
-}
-
-async function motionAndDataPreferences() {
-  for (const preference of ['reducedMotion', 'saveData']) {
-    const page = openPage({ downloads: false, [preference]: true });
-    page.intersect(0, 0.8);
-    await page.settle();
-    assert.equal(page.videos[0].playAttempts, 0, `${preference} must suppress automatic playback`);
-    await page.videos[0].play();
-    await page.settle();
-    page.intersect(0, 0.9);
-    page.visibility(false);
-    await page.settle();
-    assert.equal(page.videos[0].paused, false, `${preference} must permit explicit native playback`);
-  }
-  const automatic = openPage({ downloads: false });
-  automatic.intersect(0, 0.8);
-  await automatic.settle();
-  automatic.preference(true);
-  await automatic.settle();
-  assert.equal(automatic.videos[0].paused, true, 'Enabling reduced motion must stop automatic playback');
-  automatic.preference(false);
-  await automatic.settle();
-  assert.equal(automatic.videos[0].paused, false);
-  automatic.dataSaving(true);
-  await automatic.settle();
-  assert.equal(automatic.videos[0].paused, true, 'Enabling data saving must stop automatic playback');
-
-  const starting = openPage({ downloads: false });
-  starting.intersect(0, 0.8);
-  // Change the preference before the browser delivers the queued play event.
-  // Cancellation queues pause after play; the stale play must not turn that
-  // automatic cancellation into a viewer pause or prevent later resumption.
-  starting.preference(true);
-  await starting.settle();
-  assert.equal(starting.videos[0].paused, true, 'A motion preference change must also cancel an automatic start before its play event arrives');
-  starting.preference(false);
-  await starting.settle();
-  assert.equal(starting.videos[0].paused, false, 'Canceling an automatic start must not count as a viewer pause');
-}
-
-async function missingObserverAndBlockedPlay() {
-  const manual = openPage({ downloads: false, observer: false });
-  await manual.settle();
-  assert.equal(manual.videos[0].playAttempts, 0, 'Without visibility observation, clips require native play controls');
-  await manual.videos[0].play();
-  await manual.settle();
-  manual.visibility(false);
-  await manual.settle();
-  assert.equal(manual.videos[0].paused, false, 'Missing IntersectionObserver must not interrupt a visible manual clip');
-  manual.visibility(true);
-  await manual.settle();
-  assert.equal(manual.videos[0].paused, true);
-
-  const blocked = openPage({ downloads: false });
-  blocked.videos[0].rejectPlay = true;
-  blocked.intersect(0, 0.8);
-  await blocked.settle();
-  assert.equal(blocked.videos[0].paused, true);
-  blocked.videos[0].rejectPlay = false;
-  await blocked.videos[0].play();
-  await blocked.settle();
-  blocked.intersect(0, 0.9);
-  await blocked.settle();
-  assert.equal(blocked.videos[0].paused, false, 'A rejected automatic start must leave native playback available');
-}
-
 (async () => {
-  for (const check of [downloads, signing, guessedProcessor, nextSteps, visiblePlayback, motionAndDataPreferences, missingObserverAndBlockedPlay]) {
+  for (const check of [downloads, signing, guessedProcessor, nextSteps]) {
     try { await check(); }
     catch (error) { console.error(`${check.name}:`, error); process.exitCode = 1; }
   }
-  if (!process.exitCode) console.log('Download selection, fallback and visible-video controls respect viewer choices, motion, data and visibility.');
+  if (!process.exitCode) console.log('Download selection, install steps for command-line and desktop-era archives, next steps and signature notes follow the release manifest.');
 })().catch((error) => { console.error(error); process.exitCode = 1; });

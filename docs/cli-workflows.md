@@ -1,267 +1,138 @@
 # CLI workflows
 
-Use ordinary commands for a quick capture and JSON workflow files for repeatable
-setup across cameras, scanners, streams and recordings. Open the desktop to see
-commands, acquisition and saved outputs as an agent works:
+Shell recipes for whole tasks. Each one runs on the simulator (`sim:0`); replace `-c sim:0` with
+your camera's `list` ID. Add `--json` when a script or an agent reads the output: stdout then
+holds exactly one JSON document, and the exit code says what kind of outcome it was (0 ok,
+1 failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage full, 130 interrupted).
+`capturefab schema COMMAND` describes any command's arguments and results.
+
+## Set up a bench camera
 
 ```sh
-capturefab gui --name bench
+capturefab list                                  # find the camera's ID
+capturefab info -c sim:0                         # size, format, exposure, gain, trigger
+capturefab inspect -c sim:0 --keep 15m           # exposure verdict, focus and a preview path
+capturefab inspect -c sim:0 --set exposure=6ms   # change and measure in one call
+capturefab set -c sim:0 roi=0,0,640,480 fps=30 --dry-run
+capturefab set -c sim:0 roi=0,0,640,480 fps=30
+capturefab preset save bench -c sim:0 --note 'ring light 60%'
 ```
 
-In another terminal:
+`--keep 15m` keeps the camera open in a session, so the commands after it start at once. `set`
+writes every value as one change, ordered so that geometry and frame rate stay valid, and puts
+every value back if one write fails. `--dry-run` shows the writes in order without changing
+anything. A preset restores the setup later, also on another camera of the same model:
+`capturefab preset apply bench -c CAMERA`.
+
+## Capture a sequence with names and tags
 
 ```sh
-capturefab --camera sim:0 capture -o first.jpg --json
-capturefab --camera sim:0 get Width Height --json
-capturefab --camera sim:0 record -o clip.mkv --duration 30s --json
+capturefab capture -c sim:0 -n 10 -o 'parts/{date}/{tag:part}-{seq:4}.png' --tag part=A-100 --tag station=3
 ```
 
-These commands attach to the only active session. A missing camera connects to
-that session for inspection, configuration, capture or recording. Existing
-`--camera` targets keep each desktop/browser client's local selection; `select ID`
-sets the session default for CLI commands without `--camera`. Use
-`--session bench` to pin a session, especially when several are running. Use
-`serve --name bench` for the same persistent behavior without a window, or
-`--direct --camera sim:0` for a temporary worker. `CAPTUREFAB_CAMERA` supplies a
-default source; `CAPTUREFAB_SESSION` pins camera/session commands. `--direct`
-overrides that environment default and conflicts only with explicit `--session`.
-`start`, `auto` and other persistent controls require an already connected camera.
+Templates: `{camera}`, `{serial}`, `{seq}` (`{seq:4}` pads to four digits), `{time}`, `{date}`,
+`{tag:KEY}` and `{ext}`. A folder (an existing one, or a name ending in `/`) gets
+`{camera}-{time}-{seq}.{ext}`. Tags also go into each image's metadata. Existing files are never
+overwritten; a name without `{seq}` that exists fails with `exists`, or is numbered with
+`--on-exists number`.
 
-For natural-language requests through the local Apple Intelligence model on a
-supported Mac running macOS 26 or later:
+## A time lapse that outlives the terminal
 
 ```sh
-capturefab assistant use apple_foundation_models
-capturefab assistant test apple_foundation_models --json
-capturefab --session bench assistant ask 'List the connected cameras.' --json
+capturefab capture -c sim:0 --every 30s --for 8h -o 'lapse/{seq:5}.jpg' --background
+capturefab jobs                         # progress: saved, planned, next_at
+capturefab jobs wait auto-1 --timeout 1m
+capturefab jobs stop auto-1             # end early; files saved so far stay
 ```
 
-Enable Apple Intelligence and let macOS download its model first. This provider
-needs no API key or server, processes text on-device, and never falls back to a
-remote API. It does not inspect camera images. See [AI capture assistant](assistant.md)
-for other providers, plan review and bounded tasks.
+`--background` starts a session if none holds the camera, submits the job and returns its ID.
+A session started this way ends once it has had no jobs and no requests for a minute. `--at 06:00` or `--in 10m`
+delays the first frame; `-n 100 --every 2s` bounds the series by count instead of time.
 
-## Validate and apply a file
-
-Save this UTF-8 JSON as `workflow.json`:
-
-```json
-{
-  "version": 1,
-  "steps": [
-    {"command": {"op": "connect", "camera": "sim:0", "timeout_ms": 2000}},
-    {"camera": "sim:0", "command": {"op": "set", "feature": "Width", "value": "640"}},
-    {"camera": "sim:0", "command": {"op": "set", "feature": "Height", "value": "480"}},
-    {"camera": "sim:0", "command": {
-      "op": "capture", "output": "captures/first.png",
-      "count": 1, "timeout_ms": 2000, "format": "png"
-    }}
-  ]
-}
-```
+## A triggered inspection station
 
 ```sh
-capturefab workflow validate workflow.json --json
-capturefab workflow apply workflow.json --dry-run --json
-capturefab --session bench workflow apply workflow.json --json
+capturefab session start --name station -c sim:0 --live --idle 8h
+capturefab set -c sim:0 trigger=line0:rising exposure=2ms
+capturefab capture -c sim:0 -n 1000 -o 'station/{time}.png' --timeout none --background
+capturefab session status station
 ```
 
-Validation and dry-run show the resolved, redacted plan without contacting a
-camera or requiring a session. Apply uses a persistent GUI or `serve` session;
-when there is exactly one, `--session` is optional. Every step passes offline
-validation before the first step executes. Device feature access/bounds, named
-destinations, encoder availability and output collisions are checked live.
+With a hardware trigger, `capture` saves one frame per trigger and waits for the next;
+`--timeout none` waits without limit, and a bounded `--timeout` ends with exit 4
+`trigger_timeout` and the trigger configuration in `error.details.trigger`. With
+`trigger=software`, `capture` fires the software trigger itself, and `exec -c CAM
+TriggerSoftware` fires one by hand. `--live` keeps the camera streaming between commands.
 
-Documents accept only `version` and `steps`; steps accept only optional `camera`
-and required `command`. Unknown and duplicate fields fail. The input limit is
-1 MiB and the step count is 1–256. `command` is the same tagged JSON command used
-by session RPC; inspect `capturefab schema --json` for its fields and limits.
-`connect` and `select` use `command.camera` and omit the outer step target.
-`discover` and `network_scan` also omit it. Other steps may target an existing
-camera, or omit `camera` to use the active selection. Workflow apply rejects a
-global `--camera`; unset `CAPTUREFAB_CAMERA` when using workflows.
-
-CLI conveniences are expressed as separate commands: `--set Width=640` becomes
-a `set` step; `--auto` becomes an `auto` step. Workflow capture formats are
-explicit, durations/timestamps use numeric milliseconds, and storage sizes use
-numeric bytes. There is no workflow `wait` step. A `forward` step can carry
-`duration_ms` (1 ms to 10 years), the CLI's `--duration`: the session then ends
-that recording or stream by itself, as `stop-forward` would, even after Apply
-exits.
-
-## Choose source and output paths
-
-| Source or output | Base and behavior |
-| --- | --- |
-| CLI/RPC `file:relative.mkv`, `sim:replay:relative-folder` source | Calling terminal's directory, including camera arguments and connect/select commands |
-| Workflow relative local source | Workflow file's directory, including connect/select commands and outer camera targets |
-| CLI/RPC local capture or recording path | Calling terminal's directory, including commands sent to another local session |
-| Workflow relative local path | Workflow file's directory; `captures/first.png` above is beside `workflow.json` |
-| Workflow read from stdin (`-`) | Calling terminal's directory |
-| Absolute local path | Used as supplied |
-| Named `destination` | `output` stays a relative name inside the saved folder |
-| Forwarding stream URL | Used as supplied, with credentials redacted in plans/status |
-
-Bare existing filenames are recognized as local file sources. Use `file:clip.mkv`
-to make a local source explicit when its name could also identify a camera.
-Network URLs, device locators and other camera IDs retain their meaning. For
-example, a workflow using `sim:replay:frames` reads `frames` beside that workflow
-file; the same CLI source reads it from the terminal's current directory.
-
-Use a directory for a frame sequence, or a template such as
-`run-1/frame-{frame}.png` or `line1/{date}/{camera}-{datetime}-{seq}.png`.
-Templates accept `{camera}`, `{date}`, `{time}`, `{datetime}`, `{seq}`,
-`{frame}` and `{tag:KEY}`; `{seq}` picks the next free number, so a rerun saves
-new files, and `{tag:KEY}` is the capture's `context` value for KEY as one safe
-folder or file name (an empty or missing tag is a usage error).
-Captures never overwrite existing files. A fixed filename fails when it exists
-unless the command has `"on_exists": "number"`; a directory continues its
-`frame-NNNNNN` numbering. A `"context"` object such as `{"line": "L1"}` tags
-captures, schedules and recordings. Workflow captures require a file/directory
-and cannot send a binary image to stdout. Ordinary CLI captures infer known
-single-file/template extensions; directory sequences default to PNG. `--format`
-overrides that inference.
-
-A `capture` command completes after its requested images are saved. A `schedule`
-command returns a job ID; its frames are acquired later. A `forward` command
-starts an encoder and returns while recording/forwarding continues. Keep the
-session running and inspect `jobs`/`status`; jobs do not survive session exit.
-Stopping acquisition with `stop` cancels pending jobs on that camera.
+## Several cameras at once
 
 ```sh
-capturefab --session bench --camera sim:0 jobs --json
-capturefab --session bench status --json
-capturefab --session bench --camera sim:0 cancel 1 --json
-capturefab --session bench --camera sim:0 stop-forward --json
+capturefab capture -c sim:0 -c sim:1 -o 'multi/{camera}-{seq}.png'
+capturefab get -c sim:0 -c sim:1 ExposureTime Width
+capturefab inspect -c sim:0 -c sim:1 --preview none
 ```
 
-## Timed recordings
+With `-c` repeated, the JSON result holds `cameras`, one entry per camera.
 
-A timed CLI recording finishes on its own, so it needs no separate stop:
+## Record and stream video
 
 ```sh
-capturefab --session bench --camera sim:recording record -o video/run-2.mkv --duration 30s --max-file-size 64MiB --json
+capturefab record -c sim:0 -o clip.mp4 --for 30s
+capturefab record -c sim:0 -o clip.mkv --codec ffv1 --for 2m          # lossless
+capturefab record -c sim:0 -o 'srt://localhost:8890?streamid=publish:cam' --background
+capturefab jobs stop all
 ```
 
-`--duration` works with sessions and direct workers. The CLI sends it as
-`duration_ms`, and the camera's worker stops the encoder at `until_ms` (in the
-reply, and as `forwarding_until_ms` in `status`), then commits and catalogs the
-file. The CLI stays alive until then and reports
-`"stopped": {"forwarding": null, "by": "duration"}`; it never stops a recording
-that another participant started on that camera afterwards. A recording that
-stops early or with a new camera error fails the command with that error. Ctrl-C
-stops the recording early. Without a duration, a session recording returns
-immediately and continues until stopped; a direct command remains in the
-foreground. Acquisition keeps running after a recording ends; stop it separately
-when done.
+Recordings go to `.mkv`, `.mp4`, `.mov`, `.ts` or `.webm` files, or to an `rtsp://`, `srt://`,
+`rtmp://` or `udp://` receiver such as MediaMTX. `--codec h264` (the default) uses a hardware
+encoder where one works (VideoToolbox, NVENC, Jetson's GStreamer encoder, AMF, Quick Sync,
+Vulkan, Media Foundation or V4L2) and libx264 otherwise; `hevc` and `av1` need a hardware
+encoder. `--max-size 2G` ends a file at that size; Ctrl-C ends an open-ended recording normally.
 
-Timed recordings count elapsed time and computer sleep. Moving the system clock
-backward does not extend them. Forward replies and active status include
-`forwarding_id`, an opaque 32-character lowercase hexadecimal identity. RPC
-`stop_forward_if` with that identity refuses a replacement recording. Timed CLI
-fallback and assistant cleanup use it; explicit human `stop-forward` still stops
-the current recording.
-
-The per-file cap remains enforced regardless of elapsed time. Hitting it stops
-recording, removes the partial file and reports a storage error, so size
-`--max-file-size` (`max_file_bytes`) for the whole duration: at `4M`, about
-36 MiB per minute plus 16 MiB of margin. Encoder support depends on the FFmpeg
-build and host; `ffmpeg --json` and `doctor --json` describe availability.
-
-## Restore a saved setup
-
-A step can restore a setup saved with `capturefab setup save NAME`. The session
-loads it by name when the step runs and applies it, without a preview, as one
-camera change:
-
-```json
-{"camera": "sim:0", "command": {"op": "apply_setup", "name": "bench"}}
-{"camera": "sim:0", "command": {"op": "apply_setup", "name": "bench", "strict": true}}
-```
-
-`strict` stops the workflow, changing nothing, when any saved value cannot be
-applied; `allow_other_model` applies the settings two different camera models
-share. Workflow steps skip the CLI's `--yes` confirmation for trigger and I/O
-changes, so review the setup with `capturefab setup diff NAME` first. The
-`setup` field takes a setup document instead of `name`, so a workflow can
-carry its own setup: the whole output of `capturefab setup show NAME --json`,
-or the `result` object inside its `{"version":1,"ok":true,...}` envelope.
-
-## Catalog captures
-
-Workflow steps can open a camera dataset and add notes without an outer `camera` target:
-
-```json
-{"command": {"op": "dataset_open", "path": "plant/line1.duckdb", "mode": "auto"}}
-{"command": {"op": "dataset_note", "text": "shift A start", "context": {"line": "L1"}}}
-{"command": {"op": "dataset_export", "output": "exports/shift-a", "formats": ["csv"]}}
-```
-
-`dataset_open.path` and `dataset_export.output` resolve beside the workflow file. The dataset stays open after Apply; close it with `{"op":"dataset_close"}`.
-
-## Recover and observe
-
-Workflow execution stops on the first error. Earlier settings, saved files and
-started jobs/encoders remain; there is no rollback. JSON errors include
-`error.details.completed`, `completed_steps`, a one-based `failed_step`, the
-failed command/target and its message. Inspect those results plus `status` and
-`jobs`, then correct and run the remaining steps. Replaying the whole file can
-encounter existing outputs or an already active encoder.
-
-`--timeout-ms` bounds frame/transport work. `--request-timeout 5m` bounds a client's
-wait for a session request; it does not cancel work already accepted by the
-session. Inspect status before retrying a write after a client timeout. JSON
-commands put one versioned success/error envelope on stdout and diagnostics on
-stderr; check the exit code before consuming `result`. `schema --json` wraps its
-contract in `result`; plain `schema` emits that contract directly.
-
-The GUI toolbar shows active client work and marks new actions in Activity while
-preserving open panels and keyboard focus. Activity distinguishes **CLI / API**
-from **GUI** and shows the target and queued/running/done/failed states, errors and
-saved paths across all cameras, including after selection/disconnect. Captures
-and scheduled frames update saved-file feedback. The same timeline is in
-`status --json`'s `result.activity`; status polling does not add entries. Journal
-strings and saved-path previews are capped: completed captures retain the first
-eight paths, `file_count` reports the total, and capture command results still
-return the complete file list. Scheduled job previews advance with acquired frames.
-
-Camera-targeted status retains the full coordinator context and queried camera
-fields together:
+## Password-protected cameras
 
 ```sh
-capturefab --session bench --camera sim:0 status --json
+printf '%s\n' "$PASSWORD" | capturefab login add rtsp://192.168.1.20/stream --user admin --password-stdin
+capturefab onvif resolve 192.168.1.10                     # an ONVIF camera's RTSP streams
+capturefab capture -c rtsp://192.168.1.20/stream -o door.png
+capturefab login list
+capturefab login rm rtsp://192.168.1.20/stream
 ```
 
-`result.target_camera` identifies the queried canonical camera;
-`result.active_camera` retains the coordinator's selection for untargeted CLI
-commands. `cameras`, `devices`, logs and activity remain available, so an agent can
-observe one camera without losing session context or changing client selections.
+`login add` connects once and saves the sign-in only if the camera accepts it (`--no-check` saves
+without connecting). The password comes from `--password-stdin` or `CAPTUREFAB_CAMERA_PASSWORD`,
+never the command line, and goes to the OS credential store; addresses and user names are listed
+in the state folder without secrets. Every later command for that address, `onvif://` included,
+uses the saved sign-in. Know the trade-offs before saving one:
 
-## Use the same files in PowerShell
+- FFmpeg's RTSP reader takes credentials only in its input URL, so they appear in its command
+  line, which other local users can read.
+- A saved password is sent to whatever answers at that host, port and path. Plain RTSP Basic
+  authentication and ONVIF over `http://` expose it on the network; prefer `rtsps://`, Digest
+  authentication and fixed addresses on trusted networks.
 
-File arguments work unchanged across platforms and avoid JSON quoting:
-
-```powershell
-capturefab workflow validate .\workflow.json --json
-capturefab --session bench workflow apply .\workflow.json --json
-```
-
-To supply stdin instead, use:
-
-```powershell
-Get-Content -Raw .\workflow.json | capturefab workflow validate - --json
-```
-
-The stdin form resolves outputs in the current terminal directory. Shell users
-can similarly redirect stdin with `capturefab workflow validate - --json < workflow.json`.
-
-## Resource budgets
-
-Use `capturefab resources --json` for current usage, automatic or chosen policy, effective limits and headroom. These settings apply locally across sessions sharing the same state directory, without connecting a camera.
+## A script that checks every result
 
 ```sh
-capturefab resources configure --cpu-threads 2 --camera-buffers 1GiB
-capturefab resources reset
+#!/bin/sh
+set -u
+out=$(capturefab capture --json -c sim:0 -o 'shots/{seq}.png')
+status=$?
+case $status in
+  0) printf '%s\n' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin)["files"][0])' ;;
+  3|4) echo "camera unavailable or slow; retry later: $out" >&2; exit "$status" ;;
+  *) echo "capture failed: $out" >&2; exit "$status" ;;
+esac
 ```
 
-`auto` restores one field to its automatic safeguard. CPU threads govern image operations and new codec instances; camera buffers are shared frame-ring allocations. Automatic pressure protection can reduce work below a user ceiling. Use `capturefab storage` for disk quotas and retention.
+## GigE network checks
+
+```sh
+capturefab network
+capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321
+```
+
+`network` lists the computer's IPv4 adapters and each GigE camera found, with how it is reached
+(link speed, MTU, subnet) and a summary of anything that limits it. `--tune` shares the link's
+bandwidth between the named cameras with packet delay or throughput limits; cameras keep it until
+they power off. Host addresses, routes and MTUs are never changed.

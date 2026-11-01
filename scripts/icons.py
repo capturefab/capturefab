@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Export every application icon from assets/icons/capturefab.svg.
+"""Export the Windows executable icon and the website icons from assets/icons/capturefab.svg.
 
 Requires rsvg-convert (librsvg). The generated files are checked in; normal
-application and release builds need no image tools or Python packages.
+builds and release builds need no image tools or Python packages.
 """
 
 from pathlib import Path
@@ -52,18 +52,6 @@ def main():
     (ICONS / "capturefab.ico").write_bytes(ico(images))
     (ICONS / "capturefab.res").write_bytes(windows_resource(images))
 
-    # Inset the tile to sit naturally alongside macOS app icons. Every Dock
-    # representation is rendered directly from the vector, including Retina.
-    mac_svg = svg.replace('viewBox="0 0 128 128"', 'viewBox="-10 -10 148 148"')
-    mac_images = {size: render(mac_svg, size) for size in (16, 32, 64, 128, 256, 512, 1024)}
-    chunks = b""
-    for kind, size in ((b"icp4", 16), (b"icp5", 32), (b"icp6", 64),
-                       (b"ic07", 128), (b"ic08", 256), (b"ic09", 512), (b"ic10", 1024),
-                       (b"ic11", 32), (b"ic12", 64), (b"ic13", 256), (b"ic14", 512)):
-        data = mac_images[size]
-        chunks += kind + struct.pack(">I", len(data) + 8) + data
-    (ICONS / "capturefab.icns").write_bytes(b"icns" + struct.pack(">I", len(chunks) + 8) + chunks)
-
     web = ROOT / "web"
     (web / "favicon.svg").write_text(svg)
     (web / "favicon.ico").write_bytes(ico({size: images[size] for size in (16, 32, 48)}))
@@ -71,7 +59,7 @@ def main():
     # iOS supplies its own corner mask; give it an opaque, full-bleed tile.
     touch = svg.replace('viewBox="0 0 128 128"', 'viewBox="4 4 120 120"').replace('rx="28"', 'rx="0"')
     (web / "apple-touch-icon.png").write_bytes(render(touch, 180))
-    print("Exported Capturefab icons for macOS, Windows and the web.")
+    print("Exported Capturefab icons for Windows and the web.")
 
 
 if __name__ == "__main__":

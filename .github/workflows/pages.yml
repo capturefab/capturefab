@@ -13,7 +13,9 @@ on:
       - scripts/site-release.py
       - scripts/publish-downloads.py
       - scripts/site-guides.py
+      - scripts/site-reference.py
       - docs/*.md
+      - docs/cli-schema.json
       - scripts/install-template.*
       - .github/workflows/pages.yml
   workflow_dispatch:

@@ -1,4 +1,8 @@
-# Release work
+# Agents
+
+Capturefab is a camera capture command-line tool. `CLAUDE.md` describes the code, how to build and test it, and the CLI contract; `web/agents.md` is for agents that use the CLI.
+
+## Release work
 
 When asked to release or fix a release candidate, carry the task through publication and verify the result. Read `docs/release.md` first. Use `python3 scripts/release-agent.py --help` for the release loop. Do not stop after merely starting a workflow and describe the release as complete.
 

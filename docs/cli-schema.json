@@ -1,0 +1,3298 @@
+{
+ "about": "Camera capture for people and agents: list, configure, capture and record cameras.",
+ "commands": {
+  "auto": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "default": "false",
+     "help": "Turn the camera's auto exposure, gain and white balance off, keeping their values",
+     "long": "--off",
+     "name": "off",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "OFF"
+    },
+    {
+     "default": "false",
+     "help": "Keep adjusting: the camera's continuous auto exposure, or Capturefab's in a session",
+     "long": "--continuous",
+     "name": "continuous",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "CONTINUOUS"
+    },
+    {
+     "default": "5s",
+     "help": "How long settling may take",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "Meter only this part of the frame: X,Y,W,H as fractions 0..1",
+     "long": "--region",
+     "name": "region",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "X,Y,W,H"
+    },
+    {
+     "help": "The longest exposure, as against motion blur: gain rises past it",
+     "long": "--max-exposure",
+     "name": "max_exposure",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "auto",
+   "contract_version": 1,
+   "effect": "camera_write",
+   "errors": [
+    "usage",
+    "failed",
+    "unsupported",
+    "interrupted",
+    "invalid_duration",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab auto -c sim:0",
+    "capturefab auto -c sim:0 --timeout 10s",
+    "capturefab auto -c sim:0 --off"
+   ],
+   "notes": [],
+   "result": {
+    "by": "camera|capturefab — whose auto exposure settled or runs: the camera's own (ExposureAuto Once or Continuous), or Capturefab's (with --region, --max-exposure, or when the camera has none)",
+    "camera": "string — camera ID",
+    "exposure_us": "float — the exposure held",
+    "gain_db": "float — the gain held",
+    "iterations": "int — exposure and gain changes made; by the camera, how often it was asked whether it was done",
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --continuous by capturefab: the session job it runs as, which jobs stop ends",
+    "limited_by": "exposure_max|exposure_min|gain_max|camera|timeout — what stopped it short of the target",
+    "mean": "float — mean brightness 0..1 at the end",
+    "mode": "off|continuous — with --off or --continuous",
+    "settled": "bool — brightness reached its target, or a limit; false is still exit 0"
+   },
+   "summary": "Settle exposure and gain, then hold them; or turn auto exposure off or on"
+  },
+  "capture": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "cameras",
+     "repeatable": true,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "File, folder (existing, or ending in /) or template with {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; - writes one image to stdout (default: this folder, as {camera}-{time}-{seq}.png)",
+     "long": "--output",
+     "name": "output",
+     "repeatable": false,
+     "required": false,
+     "short": "-o",
+     "type": "string",
+     "value_name": "PATH"
+    },
+    {
+     "help": "Frames to save, 1..100000",
+     "long": "--count",
+     "name": "count",
+     "repeatable": false,
+     "required": false,
+     "short": "-n",
+     "type": "string",
+     "value_name": "N"
+    },
+    {
+     "help": "Time between frames of a time lapse, with -n or --for",
+     "long": "--every",
+     "name": "every",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "How long a time lapse runs, with --every",
+     "long": "--for",
+     "name": "duration",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "Begin at a time: HH:MM[:SS] here, or RFC 3339",
+     "long": "--at",
+     "name": "at",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "TIME"
+    },
+    {
+     "help": "Begin after a delay",
+     "long": "--in",
+     "name": "after",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "choices": [
+      "png",
+      "jpg",
+      "raw"
+     ],
+     "help": "Image format when -o has no extension: png (default; 16-bit for Mono10..Mono16), jpg or raw (the exact bytes, with NAME.json beside)",
+     "long": "--format",
+     "name": "format",
+     "repeatable": false,
+     "required": false,
+     "short": "-f",
+     "type": "choice",
+     "value_name": "FORMAT"
+    },
+    {
+     "help": "JPEG quality, 1..100 (default 90)",
+     "long": "--quality",
+     "name": "quality",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "1-100"
+    },
+    {
+     "help": "Change settings first, as one atomic change (as set does); repeatable",
+     "long": "--set",
+     "name": "settings",
+     "repeatable": true,
+     "required": false,
+     "type": "assignment",
+     "value_name": "NAME=VALUE"
+    },
+    {
+     "default": "false",
+     "help": "Settle exposure and gain first, then hold them (as auto does)",
+     "long": "--auto",
+     "name": "auto",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "AUTO"
+    },
+    {
+     "default": "false",
+     "help": "Measure the last frame as inspect does, and preview it: the result's inspect block",
+     "long": "--inspect",
+     "name": "inspect",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "INSPECT"
+    },
+    {
+     "help": "Tag the files: {tag:KEY} in -o, and in each image's metadata; repeatable",
+     "long": "--tag",
+     "name": "tags",
+     "repeatable": true,
+     "required": false,
+     "type": "string",
+     "value_name": "KEY=VALUE"
+    },
+    {
+     "help": "How long to wait for each frame (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "default": "0",
+     "help": "Frames to let pass after the first one exposed after the last settings change, 0..10",
+     "long": "--fresh",
+     "name": "fresh",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "N"
+    },
+    {
+     "default": "2s",
+     "help": "How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 takes frames at once",
+     "long": "--warmup",
+     "name": "warmup",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "choices": [
+      "fail",
+      "number"
+     ],
+     "default": "fail",
+     "help": "When a file name without {seq} exists: fail, or number (-0001, -0002, ...)",
+     "long": "--on-exists",
+     "name": "on_exists",
+     "repeatable": false,
+     "required": false,
+     "type": "choice",
+     "value_name": "ON_EXISTS"
+    },
+    {
+     "help": "Append one JSON line per saved file (path, time, size, SHA-256, settings, tags) to this file",
+     "long": "--manifest",
+     "name": "manifest",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "FILE"
+    },
+    {
+     "choices": [
+      "file",
+      "none"
+     ],
+     "default": "file",
+     "help": "file: each file reaches the disk before it is reported; none: skip that, for scratch captures",
+     "long": "--sync",
+     "name": "sync",
+     "repeatable": false,
+     "required": false,
+     "type": "choice",
+     "value_name": "SYNC"
+    },
+    {
+     "default": "false",
+     "help": "Leave the capture running in a session and print its job at once",
+     "long": "--background",
+     "name": "background",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "BACKGROUND"
+    },
+    {
+     "default": "false",
+     "help": "Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second",
+     "long": "--progress",
+     "name": "progress",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "PROGRESS"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "default": "false",
+     "help": "Show the camera, files, settings and timing; capture nothing",
+     "long": "--dry-run",
+     "name": "dry_run",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "DRY_RUN"
+    }
+   ],
+   "command": "capture",
+   "contract_version": 1,
+   "effect": "file_write",
+   "effect_with": {
+    "--auto": "camera_write",
+    "--set": "camera_write"
+   },
+   "errors": [
+    "usage",
+    "failed",
+    "exists",
+    "storage_full",
+    "frame_timeout",
+    "trigger_timeout",
+    "interrupted",
+    "incomplete",
+    "invalid_duration",
+    "feature_not_found",
+    "out_of_range",
+    "unsupported",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "disconnected",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab capture -c sim:0 -o shot.png",
+    "capturefab capture -c sim:0 -n 10 -o frames/",
+    "capturefab capture -c sim:0 --every 10s --for 1h -o 'lapse/{seq}.jpg' --background",
+    "capturefab capture -c sim:0 -o - > frame.png"
+   ],
+   "notes": [],
+   "result": {
+    "after_change": "true — frames exposed before the camera's last settings change were let pass",
+    "auto": "true — with --dry-run and --auto",
+    "bandwidth_mbps": "float — with -c repeated, for GigE cameras that share a host network interface: the rate this one was paced to, its share of the interface (a warning when it could not be paced)",
+    "bit_depth": "int — bits per sample in the files: 16 for PNG of Mono10..Mono16 (samples at the top bits, sBIT says how many count), every bit for raw, else 8",
+    "bytes": "int — with -o -: the image's size",
+    "camera": "string — camera ID",
+    "cameras": "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,bandwidth_mbps?,warnings?,inspect?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
+    "consecutive": "bool — a burst's frames follow one another with no frame missing",
+    "count": "int — frames saved",
+    "device_ts_ns": "int — the camera's clock when the first frame was taken (GigE, U3V, sim); never a date",
+    "dropped": "int — frames lost while it ran: the encoders' queue was full, or the transport lost them",
+    "dry_run": "true — with --dry-run; nothing was captured",
+    "duration_s": "float — first to last frame, for several",
+    "ends_at": "string — with --dry-run, for a time lapse",
+    "every_s": "float — with --dry-run, for a time lapse",
+    "files": "[string] — absolute paths, in order; at most 1000, the rest counted in truncated",
+    "first_at": "string — with --dry-run and --at/--in",
+    "first_id": "int — a burst's first frame's block ID",
+    "format": "png|jpg|raw — with --dry-run",
+    "fps": "float — frames per second from the first frame to the last, by the camera's clock when it has one",
+    "frames": "int — frames the camera delivered while the capture ran, including those let pass",
+    "gaps": "int — block IDs missing between a burst's first and last frame",
+    "height": "int",
+    "incomplete": "int — frames that arrived incomplete, where the transport counts them",
+    "inspect": "{exposure,verdict,suggest?,focus?,preview?} — with --inspect: the last frame measured as inspect measures it",
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background, as jobs lists it, once armed or its first frame is saved",
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with --background and -c repeated",
+    "last_id": "int — a burst's last frame's block ID",
+    "output": "\"-\" — with -o -: the image went to stdout",
+    "pixel_format": "string — the camera's PFNC format",
+    "resent": "int — packets the camera sent again, where the transport counts them",
+    "settings": "{exposure_us?,auto_exposure?,gain_db?,gain?,auto_gain?,auto_wb?,fps?,trigger?,black_level?,gamma?,binning?,offset_x?,offset_y?,reverse_x?,reverse_y?} — the camera's settings when the first frame was taken, as the camera has them; trigger: off, or its source (software, line0)",
+    "settled": "false — its exposure was still changing when --warmup ran out (with a warning)",
+    "skew_ms": "int — with -c repeated: how far apart the cameras' first frames arrived; all were armed first and asked for a frame at the same moment",
+    "source_bits": "int — the camera's bits per sample, when the files keep fewer (color or Bayer PNG, JPEG)",
+    "time": "string — RFC 3339 time of the first frame",
+    "truncated": "int — files saved but not listed",
+    "warmup_ms": "int — how long a camera that sets its own exposure took to settle after it started",
+    "warnings": "[string]",
+    "width": "int"
+   },
+   "summary": "Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites"
+  },
+  "completions": {
+   "args": [
+    {
+     "choices": [
+      "bash",
+      "elvish",
+      "fish",
+      "powershell",
+      "zsh"
+     ],
+     "name": "shell",
+     "repeatable": false,
+     "required": true,
+     "type": "choice",
+     "value_name": "SHELL"
+    }
+   ],
+   "command": "completions",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab completions zsh > ~/.zfunc/_capturefab",
+    "capturefab completions bash > ~/.local/share/bash-completion/completions/capturefab"
+   ],
+   "notes": [],
+   "result": {
+    "script": "string — with --json: the completion script; without it, the script alone",
+    "shell": "string — with --json"
+   },
+   "summary": "Print shell completions: bash, zsh, fish, powershell, elvish"
+  },
+  "debug read": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "Address: decimal or 0x hexadecimal",
+     "name": "address",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "ADDRESS"
+    },
+    {
+     "default": "4",
+     "help": "Bytes to read, 1..65536",
+     "name": "length",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "LENGTH"
+    }
+   ],
+   "command": "debug read",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab debug read -c sim:0 0x100 4",
+    "capturefab --json debug read -c gige:00c0df123456 0x0938"
+   ],
+   "notes": [],
+   "result": {
+    "address": "int",
+    "hex": "string — the bytes read"
+   },
+   "summary": "Read raw camera memory"
+  },
+  "debug rpc": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    }
+   ],
+   "command": "debug rpc",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "echo '{\"op\":\"get_values\",\"names\":[{\"name\":\"Width\"}]}' | capturefab debug rpc -c sim:0",
+    "echo '{\"op\":\"status\"}' | capturefab --session bench debug rpc"
+   ],
+   "notes": [],
+   "summary": "Send one session command, a JSON object on stdin, and print its reply"
+  },
+  "debug write": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "Address: decimal or 0x hexadecimal",
+     "name": "address",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "ADDRESS"
+    },
+    {
+     "help": "Hex bytes, such as 00000001",
+     "name": "data",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "DATA"
+    }
+   ],
+   "command": "debug write",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab debug write -c sim:0 0x100 80020000",
+    "capturefab --json debug write -c gige:00c0df123456 0x0a00 00000002"
+   ],
+   "notes": [],
+   "result": {
+    "address": "int",
+    "written": "int — bytes"
+   },
+   "summary": "Write raw camera memory"
+  },
+  "debug xml": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "The file to write; it must not exist",
+     "long": "--output",
+     "name": "output",
+     "repeatable": false,
+     "required": false,
+     "short": "-o",
+     "type": "string",
+     "value_name": "FILE"
+    }
+   ],
+   "command": "debug xml",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "exists",
+    "storage_full",
+    "camera_not_found",
+    "unsupported"
+   ],
+   "examples": [
+    "capturefab debug xml -c sim:0 > camera.xml",
+    "capturefab debug xml -c gige:00c0df123456 -o camera.xml"
+   ],
+   "notes": [],
+   "result": {
+    "bytes": "int — with -o",
+    "path": "string — with -o",
+    "xml": "string — without -o"
+   },
+   "summary": "Print a camera's GenICam XML, or write it to a file"
+  },
+  "doctor": {
+   "args": [],
+   "command": "doctor",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab doctor",
+    "capturefab --json doctor"
+   ],
+   "notes": [],
+   "result": {
+    "arch": "string",
+    "checks": "[{name,status:ok|warn|fail,message,fix?}] — fix is a command or step that resolves a warning",
+    "dirs": "{runtime,state,cache,inspect} — runtime: sessions; state: presets, sign-ins; cache: FFmpeg; inspect: previews; null when there is none",
+    "features": "{usb,jpeg,keychain,shell} — what this build includes",
+    "ffmpeg": "{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted",
+    "folders": "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
+    "host": "{cpus,threads,cpu_quota,memory:{total_bytes,available_bytes,cgroup_limit_bytes,cgroup_used_bytes,budget_bytes}} — what cgroups leave this process",
+    "os": "string",
+    "read_only_root": "bool or null — the root file system is mounted read-only (Linux)",
+    "version": "string — Capturefab version",
+    "warm_sessions": "bool — camera commands can keep their camera open in the auto session"
+   },
+   "summary": "Check this computer: FFmpeg, folders, USB and GigE limits, with a fix for each warning"
+  },
+  "exec": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "A command feature, optionally at a bank: TriggerSoftware, UserSetSave[UserSet1]",
+     "name": "command",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "COMMAND"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "exec",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "feature_not_found",
+    "not_writable",
+    "feature_locked",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab exec -c sim:0 'TriggerSoftware[FrameStart]'",
+    "capturefab exec -c gige:00c0df123456 'UserSetSave[UserSet1]'"
+   ],
+   "notes": [],
+   "result": {
+    "camera": "string — camera ID",
+    "executed": "string — the command run, with its bank"
+   },
+   "summary": "Run a command feature, such as UserSetSave[UserSet1]"
+  },
+  "features": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "Only names containing this text, or matching a glob such as 'Exposure*'",
+     "name": "pattern",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "PATTERN"
+    },
+    {
+     "default": "false",
+     "help": "Every visibility level (Expert, Guru); a PATTERN or --category also searches every level",
+     "long": "--all",
+     "name": "all",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "ALL"
+    },
+    {
+     "help": "Only this category, such as ImageFormatControl",
+     "long": "--category",
+     "name": "category",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "features",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "feature_not_found",
+    "unsupported",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab features -c sim:0",
+    "capturefab features -c sim:0 Trigger",
+    "capturefab features -c sim:0 'Exposure*' --all",
+    "capturefab features -c sim:0 --category ImageFormatControl"
+   ],
+   "notes": [],
+   "result": {
+    "camera": "string — camera ID",
+    "features": "[{name,type:int|float|bool|enum|string|command,access:rw|ro|wo,value,unit,min,max,inc,choices,selectors,locked_by,category}] — Beginner features and common controls; every level with --all, a PATTERN or --category; locked_by when another setting locks it now",
+    "truncated": "int — rows left out beyond the first 200; narrow with PATTERN or --category"
+   },
+   "summary": "List a camera's features with values, ranges, choices and locks"
+  },
+  "get": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "cameras",
+     "repeatable": true,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "Features, banks (TriggerMode[FrameStart]) or controls (exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb)",
+     "name": "names",
+     "repeatable": true,
+     "required": true,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "get",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "feature_not_found",
+    "unsupported",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab get -c sim:0 ExposureTime Gain",
+    "capturefab get -c sim:0 exposure trigger roi",
+    "capturefab get -c sim:0 'TriggerMode[FrameStart]'",
+    "capturefab get -c sim:0 -c sim:1 Width"
+   ],
+   "notes": [],
+   "result": {
+    "camera": "string — camera ID",
+    "cameras": "[{camera,values}] — with -c repeated",
+    "values": "{name: value} — keys as named, with bank shorthand (TriggerMode[FrameStart]) where unambiguous; controls in the form set takes (exposure: \"10ms\")"
+   },
+   "summary": "Read features or controls in one call"
+  },
+  "info": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "info",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "feature_not_found",
+    "unsupported",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab info -c sim:0",
+    "capturefab --json info -c gige:00c0df123456",
+    "capturefab info -c sim:0 --keep 5m"
+   ],
+   "notes": [],
+   "result": {
+    "address": "string — IP address or device path",
+    "bits": "int — bits per sample",
+    "camera": "string — camera ID",
+    "controls": "{name:{feature,unit,min,max,value}} — canonical controls this camera has",
+    "exposure_us": "float — ExposureTime in microseconds",
+    "firmware": "string — DeviceFirmwareVersion or DeviceVersion",
+    "fps": "float — the rate the camera reports it runs at",
+    "fps_limit": "float — AcquisitionFrameRate when its limiter is on",
+    "gain": "float — Gain in gain_unit when not dB",
+    "gain_db": "float — Gain when its unit is dB",
+    "gain_unit": "string — the unit of gain",
+    "height": "int — image height in pixels",
+    "kind": "gige|u3v|webcam|screen|onvif|stream|file|sim",
+    "model": "string",
+    "pixel_format": "string — PFNC name such as Mono8",
+    "ptp": "string — PTP state when the camera reports one",
+    "serial": "string — when the camera reports one",
+    "timestamp_hz": "float — device timestamp ticks per second",
+    "trigger": "{selector,mode,source,activation} — the start trigger",
+    "vendor": "string",
+    "width": "int — image width in pixels"
+   },
+   "summary": "What a camera is and what it can do: size, format, exposure, gain, trigger, controls"
+  },
+  "inspect": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "cameras",
+     "repeatable": true,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "Measure only this part of the frame: X,Y,W,H as fractions 0..1",
+     "long": "--region",
+     "name": "region",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "X,Y,W,H"
+    },
+    {
+     "help": "Where to write the preview (it must not exist), or none (default: a private folder doctor shows)",
+     "long": "--preview",
+     "name": "preview",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "PATH"
+    },
+    {
+     "default": "768",
+     "help": "The preview's longest edge in pixels, 64..2048",
+     "long": "--size",
+     "name": "size",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "PX"
+    },
+    {
+     "default": "0",
+     "help": "Frames to let pass after the first one exposed after the last settings change, 0..9",
+     "long": "--fresh",
+     "name": "fresh",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "N"
+    },
+    {
+     "help": "How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer)",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "default": "2s",
+     "help": "How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 measures at once",
+     "long": "--warmup",
+     "name": "warmup",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "Change settings first, as one atomic change (as set does), then measure; repeatable",
+     "long": "--set",
+     "name": "settings",
+     "repeatable": true,
+     "required": false,
+     "type": "assignment",
+     "value_name": "NAME=VALUE"
+    },
+    {
+     "help": "Measure a frame every --every for this long (at most 50 samples), as for focusing: the series, and the sharpest frame's measurements and preview",
+     "long": "--for",
+     "name": "sample_for",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "Time between samples with --for (default 200ms)",
+     "long": "--every",
+     "name": "every",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "Share of the measured pixels at full scale above which the verdict says clipped_high (default: any pixel with --region, else 0.005)",
+     "long": "--clip-threshold",
+     "name": "clip_threshold",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "SHARE"
+    },
+    {
+     "default": "false",
+     "help": "Draw the preview in this terminal under the measurements (kitty, iTerm2, or colour blocks)",
+     "long": "--show",
+     "name": "show",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "SHOW"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "inspect",
+   "contract_version": 1,
+   "effect": "read",
+   "effect_with": {
+    "--set": "camera_write"
+   },
+   "errors": [
+    "usage",
+    "failed",
+    "frame_timeout",
+    "trigger_timeout",
+    "exists",
+    "storage_full",
+    "feature_not_found",
+    "out_of_range",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "disconnected",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab inspect -c sim:0",
+    "capturefab inspect -c sim:0 --set exposure=20ms --region 0.25,0.25,0.5,0.5",
+    "capturefab inspect -c sim:0 --keep 5m --preview none",
+    "capturefab inspect -c sim:0 --show"
+   ],
+   "notes": [],
+   "result": {
+    "after_change": "true — frames exposed before the camera's last settings change were let pass",
+    "best": "{t,sharpness} — with --for: the sharpest sample",
+    "camera": "string — camera ID",
+    "cameras": "[{camera,frame,exposure?,verdict,suggest?,focus?,settings,preview?,after_change?,frames?,dropped?,incomplete?,resent?,warmup_ms?,settled?,warnings?,series?,best?,histogram?,channels?,region?,notes?}] — with -c repeated",
+    "channels": "{red,green,blue} — with -v, for color",
+    "dropped": "int — frames the transport lost meanwhile, where it counts them",
+    "exposure": "{mean,p1,p50,p99,clipped_low,clipped_high,clipped_low_px?,clipped_high_px?,max?} — brightness 0..1; shares and counts of pixels at black and at full scale, counted over every pixel of the region at the camera's bit depth; max: the brightest sample as a share of full scale",
+    "focus": "{sharpness} — variance of the Laplacian over the region; compare between frames of one camera and scene (-v adds tenengrad, brenner, variance)",
+    "frame": "{width,height,pixel_format,bits?,id?,device_ts_ns?,time,age_ms} — the frame measured, taken after the command began: its block ID and the camera's clock (ns, never a date) where the transport has them, and when it arrived",
+    "frames": "int — frames received for this inspection, the one measured included",
+    "histogram": "[16 ints] — with -v: luminance histogram",
+    "incomplete": "int — frames that arrived incomplete meanwhile, where the transport counts them",
+    "notes": "[string] — with -v",
+    "preview": "string — the preview image's path; absent with --preview none",
+    "region": "{x,y,width,height,normalized} — with -v",
+    "resent": "int — packets the camera sent again meanwhile, where the transport counts them",
+    "series": "[{t,sharpness,mean}] — with --for: every sample, t in seconds from the first; the other fields describe the sharpest frame",
+    "settings": "{exposure_us?,gain_db?,gain?,fps?,pixel_format?} — in effect for the frame",
+    "settled": "false — its exposure was still changing when --warmup ran out (verdict not_settled, with a warning)",
+    "suggest": "{ev,exposure_us?,limited_by?:exposure_max|exposure_min|clipped} — how far to move exposure, in stops, toward mid-grey without clipping highlights; absent when close enough. clipped: most of the frame is clipped, so this is a first step; inspect again",
+    "verdict": "[ok|dark|bright|clipped_high|clipped_low|not_settled|not_measured]",
+    "warmup_ms": "int — how long a camera that sets its own exposure took to settle after it started",
+    "warnings": "[string] — such as a camera still settling when --warmup ran out (verdict not_settled)"
+   },
+   "summary": "Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview"
+  },
+  "jobs": {
+   "args": [],
+   "command": "jobs",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab jobs",
+    "capturefab jobs wait auto-1 --timeout 10m",
+    "capturefab jobs stop all"
+   ],
+   "notes": [],
+   "result": {
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session's, and those of a session that died, as lost"
+   },
+   "summary": "Captures and recordings running in sessions: list, stop, wait"
+  },
+  "jobs list": {
+   "args": [],
+   "command": "jobs list",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab jobs list",
+    "capturefab --json jobs"
+   ],
+   "notes": [],
+   "result": {
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session's, and those of a session that died, as lost"
+   },
+   "summary": "Every running session's jobs, finished ones included"
+  },
+  "jobs stop": {
+   "args": [
+    {
+     "help": "A job ID such as auto-1, or all",
+     "name": "id",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "ID"
+    }
+   ],
+   "command": "jobs stop",
+   "contract_version": 1,
+   "effect": "camera_write",
+   "errors": [
+    "usage",
+    "failed",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab jobs stop auto-1",
+    "capturefab jobs stop all"
+   ],
+   "notes": [],
+   "result": {
+    "stopped": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — the jobs as they are after stopping"
+   },
+   "summary": "Stop a job, or all of them; files saved so far stay"
+  },
+  "jobs wait": {
+   "args": [
+    {
+     "help": "A job ID such as auto-1",
+     "name": "id",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "ID"
+    },
+    {
+     "default": "none",
+     "help": "How long to wait; none waits until the job ends",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "default": "false",
+     "help": "Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second",
+     "long": "--progress",
+     "name": "progress",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "PROGRESS"
+    }
+   ],
+   "command": "jobs wait",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "timeout",
+    "interrupted",
+    "incomplete",
+    "session_not_found",
+    "storage_full",
+    "frame_timeout",
+    "trigger_timeout",
+    "exists",
+    "unavailable"
+   ],
+   "examples": [
+    "capturefab jobs wait auto-1",
+    "capturefab --json jobs wait auto-1 --timeout 10m"
+   ],
+   "notes": [],
+   "result": {
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — done; a failed job exits with its own error code and details.job"
+   },
+   "summary": "Wait for a job: exit 0 when done, its own code if it failed, 4 if still running"
+  },
+  "licenses": {
+   "args": [],
+   "command": "licenses",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab licenses",
+    "capturefab --json licenses"
+   ],
+   "notes": [],
+   "result": {
+    "capturefab": "string — Capturefab's MIT license",
+    "ffmpeg": "string — the bundled FFmpeg's GPL notice and license texts, or a note that this build has none"
+   },
+   "summary": "Print Capturefab's license and the bundled FFmpeg's license notice"
+  },
+  "list": {
+   "aliases": [
+    "ls"
+   ],
+   "args": [
+    {
+     "choices": [
+      "gige",
+      "u3v",
+      "webcam",
+      "onvif",
+      "screen",
+      "sim"
+     ],
+     "help": "Only these kinds (comma-separated); screen captures and sim:0 are listed only when named",
+     "long": "--kind",
+     "name": "kind",
+     "repeatable": true,
+     "required": false,
+     "type": "choice",
+     "value_name": "KIND"
+    },
+    {
+     "default": "1s",
+     "help": "How long GigE and ONVIF broadcasts collect answers",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "list",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "invalid_duration",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab list",
+    "capturefab list --kind gige,u3v --timeout 3s",
+    "capturefab list --kind sim",
+    "capturefab --json list"
+   ],
+   "notes": [],
+   "result": {
+    "cameras": "[{id,kind:gige|u3v|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used",
+    "warnings": "[string] — transports that could not be searched"
+   },
+   "summary": "List cameras: GigE Vision, USB3 Vision, webcams, ONVIF"
+  },
+  "login add": {
+   "args": [
+    {
+     "help": "A credential-free rtsp://, rtsps://, onvif:http://… or onvif://HOST address",
+     "name": "address",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "ADDRESS"
+    },
+    {
+     "help": "Camera user name",
+     "long": "--user",
+     "name": "user",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "USER"
+    },
+    {
+     "default": "false",
+     "help": "Read the password from stdin (an empty line is an empty password); otherwise CAPTUREFAB_CAMERA_PASSWORD",
+     "long": "--password-stdin",
+     "name": "password_stdin",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "PASSWORD_STDIN"
+    },
+    {
+     "default": "false",
+     "help": "Save without connecting to the camera first",
+     "long": "--no-check",
+     "name": "no_check",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "NO_CHECK"
+    }
+   ],
+   "command": "login add",
+   "contract_version": 1,
+   "effect": "file_write",
+   "errors": [
+    "usage",
+    "failed",
+    "auth_required",
+    "auth_rejected",
+    "unavailable",
+    "unsupported",
+    "timeout"
+   ],
+   "examples": [
+    "printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin",
+    "CAPTUREFAB_CAMERA_PASSWORD=secret capturefab login add onvif://cam.local --user admin"
+   ],
+   "notes": [],
+   "result": {
+    "check": "{ok,camera} — unless --no-check",
+    "login": "{address,user,saved_at}",
+    "replaced": "bool"
+   },
+   "summary": "Check a camera sign-in, then save it in the OS credential store"
+  },
+  "login list": {
+   "args": [],
+   "command": "login list",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab login list",
+    "capturefab --json login list"
+   ],
+   "notes": [],
+   "result": {
+    "logins": "[{address,user,saved_at}] — never passwords",
+    "supported": "bool — this build can save sign-ins"
+   },
+   "summary": "List saved camera sign-ins (never their passwords)"
+  },
+  "login rm": {
+   "args": [
+    {
+     "name": "address",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "ADDRESS"
+    }
+   ],
+   "command": "login rm",
+   "contract_version": 1,
+   "effect": "file_write",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab login rm rtsp://cam.local/stream",
+    "capturefab login rm onvif://cam.local"
+   ],
+   "notes": [],
+   "result": {
+    "removed": "string — the address",
+    "secret_forgotten": "bool"
+   },
+   "summary": "Forget a saved camera sign-in and delete its password"
+  },
+  "network": {
+   "args": [
+    {
+     "default": "false",
+     "help": "Apply bandwidth sharing (packet delay, throughput limits) to the cameras given with -c, or a session's cameras; they keep it until power-off",
+     "long": "--tune",
+     "name": "tune",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "TUNE"
+    },
+    {
+     "help": "GigE camera to tune, repeatable (with --tune; not read from CAPTUREFAB_CAMERA, so the read-only checks stay read-only)",
+     "long": "--camera",
+     "name": "cameras",
+     "repeatable": true,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "default": "1s",
+     "help": "How long GigE discovery collects answers",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "network",
+   "contract_version": 1,
+   "effect": "read",
+   "effect_with": {
+    "--tune": "camera_write"
+   },
+   "errors": [
+    "usage",
+    "failed",
+    "invalid_duration",
+    "camera_not_found",
+    "unavailable"
+   ],
+   "examples": [
+    "capturefab network",
+    "capturefab network --tune -c gige:00c0df123456 -c gige:00c0df654321"
+   ],
+   "notes": [],
+   "result": {
+    "cameras": "[{camera:{id,kind,vendor,model,serial?,address?},active,interface?,host_address?,reachable,health:unreachable|limited|unverified|ready|unstable,summary,details,tuning?}] — GigE cameras and how each is reached; active: a session holds it; host_address: this computer's address toward it",
+    "interfaces": "[{name,address,netmask,mtu?,speed_mbps?,kind:wired|wireless|loopback|other|unknown,up?}] — IPv4 adapters",
+    "time": "string — RFC 3339 UTC time of the scan",
+    "warnings": "[string]"
+   },
+   "summary": "Check GigE network paths; --tune applies bandwidth sharing to cameras"
+  },
+  "onvif resolve": {
+   "args": [
+    {
+     "help": "HOST[:PORT], http://HOST/onvif/device_service, or onvif://HOST",
+     "name": "host",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "HOST"
+    },
+    {
+     "help": "Only this profile token",
+     "long": "--profile",
+     "name": "profile",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "TOKEN"
+    },
+    {
+     "default": "5s",
+     "help": "How long the camera may take to answer",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "onvif resolve",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "auth_required",
+    "auth_rejected",
+    "unavailable",
+    "unsupported",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab onvif resolve cam.local",
+    "capturefab onvif resolve http://10.0.0.9/onvif/device_service --profile Profile_1",
+    "capturefab login add onvif://cam.local --user admin --password-stdin   # save its sign-in first"
+   ],
+   "notes": [],
+   "result": {
+    "endpoint": "string — the ONVIF device service asked",
+    "streams": "[{token,name,encoding,width,height,uri}] — uri opens with -c (credentials are never shown)"
+   },
+   "summary": "List an ONVIF camera's profiles and their RTSP stream URIs"
+  },
+  "preset apply": {
+   "args": [
+    {
+     "name": "name",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "Apply a preset document from a file instead of a saved preset",
+     "long": "--file",
+     "name": "file",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "FILE"
+    },
+    {
+     "default": "false",
+     "help": "Show what would change, disruptive changes included; change nothing",
+     "long": "--dry-run",
+     "name": "dry_run",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "DRY_RUN"
+    },
+    {
+     "default": "false",
+     "help": "Fail, changing nothing, if any saved value cannot be applied to this camera",
+     "long": "--strict",
+     "name": "strict",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "STRICT"
+    },
+    {
+     "default": "false",
+     "help": "Apply to a camera of another model; only settings both share change",
+     "long": "--allow-other-model",
+     "name": "allow_other_model",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "ALLOW_OTHER_MODEL"
+    },
+    {
+     "help": "Then save it in the camera's user set (default UserSet1) and make that the power-on default",
+     "long": "--persist",
+     "name": "persist",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "USERSET"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "preset apply",
+   "contract_version": 1,
+   "effect": "camera_write",
+   "errors": [
+    "usage",
+    "failed",
+    "unsupported",
+    "out_of_range",
+    "invalid_choice",
+    "not_writable",
+    "feature_locked",
+    "camera_not_found",
+    "camera_busy",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab preset apply bench -c sim:0 --dry-run",
+    "capturefab preset apply bench -c sim:0",
+    "capturefab preset apply --file bench.json -c sim:0 --strict",
+    "capturefab preset apply bench -c gige:00c0df123456 --persist UserSet1"
+   ],
+   "notes": [],
+   "result": {
+    "applied": "int — values written",
+    "auto_change": "{current,saved,action,risk} — Capturefab auto mode",
+    "auto_changed": "bool",
+    "camera": "{id,vendor,model,serial} — the camera compared",
+    "changes": "[{feature,at?,saved,current,risk:reversible|disruptive,stream_locked,warning?}] — disruptive changes may change triggering, I/O lines or acquisition rate",
+    "dry_run": "true — with --dry-run: nothing was written",
+    "match": "same_camera|same_model|other_model|unknown_source",
+    "matched": "[{feature,at?,value}]",
+    "not_applied": "[{feature,at?,status,saved,reason}]",
+    "persist": "{user_set,default} — with --dry-run --persist: the user set it would save",
+    "persisted": "{user_set,default} — with --persist",
+    "preset": "string — the preset's name",
+    "restarted_stream": "bool",
+    "restarts_stream": "bool — a running stream stops and starts once",
+    "risk": "reversible|disruptive — the whole change",
+    "unchanged": "int — values that already match",
+    "warnings": "[string]"
+   },
+   "summary": "Restore a preset as one camera change; a failure puts every value back"
+  },
+  "preset export": {
+   "args": [
+    {
+     "name": "name",
+     "repeatable": false,
+     "required": true,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "help": "The file to write; it must not exist",
+     "long": "--output",
+     "name": "output",
+     "repeatable": false,
+     "required": false,
+     "short": "-o",
+     "type": "string",
+     "value_name": "FILE"
+    }
+   ],
+   "command": "preset export",
+   "contract_version": 1,
+   "effect": "file_write",
+   "errors": [
+    "usage",
+    "failed",
+    "exists",
+    "storage_full",
+    "camera_not_found",
+    "unsupported"
+   ],
+   "examples": [
+    "capturefab preset export bench -o bench.json",
+    "capturefab preset export bench > bench.json"
+   ],
+   "notes": [],
+   "result": {
+    "auto": "{balance} — without -o",
+    "camera": "{transport,vendor,model,serial?,kind} — without -o",
+    "name": "string — without -o",
+    "note": "string — without -o",
+    "path": "string — with -o: the file written",
+    "preset": "string — with -o: the preset's name",
+    "saved_at": "string — without -o",
+    "skipped": "[{feature,at?,reason}] — without -o",
+    "values": "[{feature,value,at?:[{selector,value}]}] — without -o",
+    "version": "int — without -o: the document itself, as preset show prints it"
+   },
+   "summary": "Write a preset's document to a file, or to stdout"
+  },
+  "preset import": {
+   "args": [
+    {
+     "name": "file",
+     "repeatable": false,
+     "required": true,
+     "type": "string",
+     "value_name": "FILE"
+    },
+    {
+     "help": "Save it under this name instead of the one in the file",
+     "long": "--name",
+     "name": "name",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "default": "false",
+     "help": "Overwrite a saved preset with the same name",
+     "long": "--replace",
+     "name": "replace",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "REPLACE"
+    }
+   ],
+   "command": "preset import",
+   "contract_version": 1,
+   "effect": "file_write",
+   "errors": [
+    "usage",
+    "failed",
+    "exists",
+    "storage_full",
+    "camera_not_found",
+    "unsupported"
+   ],
+   "examples": [
+    "capturefab preset import bench.json",
+    "capturefab preset import bench.json --name bench2"
+   ],
+   "notes": [],
+   "result": {
+    "camera": "string — the camera read (save)",
+    "preset": "{name,camera,values,skipped,saved_at,path} — values is a count"
+   },
+   "summary": "Save a preset document from a file, such as one preset export wrote"
+  },
+  "preset list": {
+   "args": [],
+   "command": "preset list",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab preset list",
+    "capturefab --json preset list"
+   ],
+   "notes": [],
+   "result": {
+    "dir": "string — the folder that holds presets",
+    "presets": "[{name,transport?,vendor,model,serial?,saved_at,values,note?,status?:unreadable|newer_version,reason?}] — values is a count"
+   },
+   "summary": "List saved presets and the folder that holds them"
+  },
+  "preset rm": {
+   "args": [
+    {
+     "name": "name",
+     "repeatable": false,
+     "required": true,
+     "type": "name",
+     "value_name": "NAME"
+    }
+   ],
+   "command": "preset rm",
+   "contract_version": 1,
+   "effect": "file_write",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab preset rm bench",
+    "capturefab --json preset rm bench"
+   ],
+   "notes": [],
+   "result": {
+    "removed": "string — the preset's name"
+   },
+   "summary": "Delete a saved preset; no camera changes"
+  },
+  "preset save": {
+   "args": [
+    {
+     "name": "name",
+     "repeatable": false,
+     "required": true,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "A short note, such as the lighting it was tuned for",
+     "long": "--note",
+     "name": "note",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "NOTE"
+    },
+    {
+     "default": "false",
+     "help": "Overwrite a saved preset with the same name",
+     "long": "--replace",
+     "name": "replace",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "REPLACE"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "preset save",
+   "contract_version": 1,
+   "effect": "file_write",
+   "errors": [
+    "usage",
+    "failed",
+    "exists",
+    "storage_full",
+    "camera_not_found",
+    "unsupported"
+   ],
+   "examples": [
+    "capturefab preset save bench -c sim:0",
+    "capturefab preset save line1 -c gige:00c0df123456 --note 'ring light 60%'"
+   ],
+   "notes": [],
+   "result": {
+    "camera": "string — the camera read (save)",
+    "preset": "{name,camera,values,skipped,saved_at,path} — values is a count"
+   },
+   "summary": "Save the camera's current settings as a named preset"
+  },
+  "preset show": {
+   "args": [
+    {
+     "name": "name",
+     "repeatable": false,
+     "required": true,
+     "type": "name",
+     "value_name": "NAME"
+    }
+   ],
+   "command": "preset show",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab preset show bench",
+    "capturefab --json preset show bench"
+   ],
+   "notes": [],
+   "result": {
+    "auto": "{balance} — Capturefab auto mode, when saved on",
+    "camera": "{transport,vendor,model,serial?,kind}",
+    "name": "string",
+    "note": "string",
+    "saved_at": "string — RFC 3339",
+    "skipped": "[{feature,at?,reason}]",
+    "values": "[{feature,value,at?:[{selector,value}]}]",
+    "version": "int — document version"
+   },
+   "summary": "Show a saved preset's values"
+  },
+  "record": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "A file (.mkv, .mp4, .mov, .ts, .webm; it must not exist, or use {seq}) or a stream URL (rtsp://, srt://, rtmp://, udp://)",
+     "long": "--output",
+     "name": "output",
+     "repeatable": false,
+     "required": true,
+     "short": "-o",
+     "type": "string",
+     "value_name": "FILE|URL"
+    },
+    {
+     "help": "Stop after this long; without it, record until Ctrl-C (or jobs stop with --background)",
+     "long": "--for",
+     "name": "duration",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "Frames per second written (default: the camera's frame rate)",
+     "long": "--fps",
+     "name": "fps",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "N"
+    },
+    {
+     "choices": [
+      "h264",
+      "hevc",
+      "av1",
+      "ffv1"
+     ],
+     "default": "h264",
+     "help": "h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv)",
+     "long": "--codec",
+     "name": "codec",
+     "repeatable": false,
+     "required": false,
+     "type": "choice",
+     "value_name": "CODEC"
+    },
+    {
+     "default": "8M",
+     "help": "Target bitrate, such as 8M or 800k (not for ffv1)",
+     "long": "--bitrate",
+     "name": "bitrate",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "RATE"
+    },
+    {
+     "help": "End the recording, successfully, when the file reaches this size, such as 2G",
+     "long": "--max-size",
+     "name": "max_size",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "SIZE"
+    },
+    {
+     "help": "Change settings first, as one atomic change (as set does); repeatable",
+     "long": "--set",
+     "name": "settings",
+     "repeatable": true,
+     "required": false,
+     "type": "assignment",
+     "value_name": "NAME=VALUE"
+    },
+    {
+     "default": "false",
+     "help": "Settle exposure and gain first, then hold them (as auto does)",
+     "long": "--auto",
+     "name": "auto",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "AUTO"
+    },
+    {
+     "default": "10s",
+     "help": "How long to wait for the first frame; none waits for a trigger until stopped",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "default": "2s",
+     "help": "How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle before recording; 0 records at once",
+     "long": "--warmup",
+     "name": "warmup",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "default": "false",
+     "help": "Leave the recording running in a session and print its job once the first frame is encoded",
+     "long": "--background",
+     "name": "background",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "BACKGROUND"
+    },
+    {
+     "default": "false",
+     "help": "Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second",
+     "long": "--progress",
+     "name": "progress",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "PROGRESS"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "record",
+   "contract_version": 1,
+   "effect": "file_write",
+   "effect_with": {
+    "--auto": "camera_write",
+    "--set": "camera_write"
+   },
+   "errors": [
+    "usage",
+    "failed",
+    "exists",
+    "storage_full",
+    "frame_timeout",
+    "interrupted",
+    "invalid_duration",
+    "feature_not_found",
+    "out_of_range",
+    "unsupported",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "ffmpeg_missing",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab record -c sim:0 -o clip.mp4 --for 30s",
+    "capturefab record -c sim:0 -o clip.mkv --codec ffv1 --for 5m",
+    "capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background"
+   ],
+   "notes": [],
+   "result": {
+    "bytes": "int — the file's size",
+    "camera": "string — camera ID",
+    "codec": "h264|hevc|av1|ffv1",
+    "dropped": "int — frames the encoder could not take, and frames the transport lost",
+    "duration_s": "float",
+    "encoder": "string — the FFmpeg encoder used",
+    "ended": "duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it",
+    "finalized": "bool — the file was closed and is complete",
+    "fps": "float — the frame rate written: --fps, or the camera's",
+    "fps_actual": "float — frames per second encoded",
+    "frames": "int — frames encoded",
+    "height": "int",
+    "incomplete": "int — frames that arrived incomplete, where the transport counts them",
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded",
+    "output": "string — the file written (template expanded), or the stream URL with credentials redacted",
+    "resent": "int — packets the camera sent again, where the transport counts them",
+    "settled": "false — its exposure was still changing when --warmup ran out (with a warning)",
+    "warmup_ms": "int — how long a camera that sets its own exposure took to settle before recording",
+    "warnings": "[string]",
+    "width": "int"
+   },
+   "summary": "Record video to a file or stream it to rtsp://, srt://, rtmp:// or udp://"
+  },
+  "schema": {
+   "args": [
+    {
+     "help": "A command, such as set or preset apply",
+     "name": "command",
+     "repeatable": true,
+     "required": false,
+     "type": "string",
+     "value_name": "COMMAND"
+    }
+   ],
+   "command": "schema",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "auth_required",
+    "auth_rejected",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab schema",
+    "capturefab schema set",
+    "capturefab schema preset apply"
+   ],
+   "notes": [],
+   "result": {
+    "commands": "[{name,summary,effect,effect_with?}]",
+    "contract_version": "int",
+    "conventions": "{...}",
+    "errors": "[{code,exit,meaning}]",
+    "exit_codes": "{code: meaning}",
+    "grammars": "{selector,name,duration,template}"
+   },
+   "summary": "Describe commands, arguments, results and error codes as JSON"
+  },
+  "serve": {
+   "args": [
+    {
+     "default": "default",
+     "help": "Session name other commands pass to --session",
+     "long": "--name",
+     "name": "name",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "cameras",
+     "repeatable": true,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "default": "false",
+     "help": "Keep the cameras streaming, so captures take the newest frame at once",
+     "long": "--live",
+     "name": "live",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "LIVE"
+    }
+   ],
+   "command": "serve",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_busy",
+    "auth_required",
+    "auth_rejected",
+    "unavailable",
+    "invalid_duration",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab serve --name bench -c sim:0",
+    "capturefab serve -c gige:00c0df123456 --live"
+   ],
+   "notes": [],
+   "result": {
+    "cameras": "[string] — camera IDs it holds",
+    "pid": "int",
+    "ready": "bool — printed once the session takes requests",
+    "session": "string — its name, for --session"
+   },
+   "summary": "Run a session in the foreground (systemd, a terminal); Ctrl-C stops it"
+  },
+  "session list": {
+   "args": [],
+   "command": "session list",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab session list",
+    "capturefab --json session list"
+   ],
+   "notes": [],
+   "result": {
+    "sessions": "[{session,pid,uptime_s,cameras:[string]}]"
+   },
+   "summary": "The running sessions"
+  },
+  "session start": {
+   "args": [
+    {
+     "default": "default",
+     "help": "Session name other commands pass to --session",
+     "long": "--name",
+     "name": "name",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    },
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "cameras",
+     "repeatable": true,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "default": "false",
+     "help": "Keep the cameras streaming, so captures take the newest frame at once",
+     "long": "--live",
+     "name": "live",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "LIVE"
+    },
+    {
+     "default": "30m",
+     "help": "End after this long with no requests and no running jobs",
+     "long": "--idle",
+     "name": "idle",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "session start",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "camera_not_found",
+    "camera_busy",
+    "auth_required",
+    "auth_rejected",
+    "unavailable",
+    "invalid_duration",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab session start -c sim:0",
+    "capturefab session start --name line1 -c gige:00c0df123456 --live --idle 8h"
+   ],
+   "notes": [],
+   "result": {
+    "cameras": "[string] — camera IDs it holds",
+    "log": "string — where its output goes",
+    "pid": "int",
+    "session": "string — its name, for --session",
+    "started": "bool — false when it was already running",
+    "warnings": "[string]"
+   },
+   "summary": "Start a session in the background; it ends after --idle unused"
+  },
+  "session status": {
+   "args": [
+    {
+     "help": "The session (default: the only one running)",
+     "name": "name",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    }
+   ],
+   "command": "session status",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab session status",
+    "capturefab --json session status line1"
+   ],
+   "notes": [],
+   "result": {
+    "cameras": "[{id,state:idle|streaming|recording|error,error?:{code,message,hint?,details?:{exit?,signal?,stderr_tail?}},last_error?,config_state?:unknown,frames?,dropped?,lost?,incomplete?,resent?,fps?,jobs:[job]}] — job as jobs lists it; fps: the rate frames arrive at while it streams, by the camera's clock where it stamps them; error: the camera's worker exited (code worker_crashed, with its exit status or signal and last lines of stderr) or did not answer, and the next command on the camera starts another; last_error: the worker's last logged error; lost: frames lost on the way, incomplete: frames the transport received incomplete, resent: packets the camera sent again, where it can tell; config_state unknown: it exited during a settings change, until settings are written again",
+    "pid": "int",
+    "session": "string",
+    "uptime_s": "int"
+   },
+   "summary": "A session's cameras, their state and jobs"
+  },
+  "session stop": {
+   "args": [
+    {
+     "help": "The session (default: the only one running)",
+     "name": "name",
+     "repeatable": false,
+     "required": false,
+     "type": "name",
+     "value_name": "NAME"
+    }
+   ],
+   "command": "session stop",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab session stop",
+    "capturefab session stop line1"
+   ],
+   "notes": [],
+   "result": {
+    "pid": "int",
+    "session": "string",
+    "stopped": "bool — true once the process has exited"
+   },
+   "summary": "Stop a session once its recordings and captures are finished"
+  },
+  "set": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "NAME=VALUE: a feature (ExposureTime=10ms), a bank (TriggerMode[FrameStart]=On) or a control (exposure=5ms, roi=0,0,640,480)",
+     "name": "values",
+     "repeatable": true,
+     "required": true,
+     "type": "assignment",
+     "value_name": "NAME=VALUE"
+    },
+    {
+     "default": "false",
+     "help": "Check every value against the camera and show the writes in order; change nothing",
+     "long": "--dry-run",
+     "name": "dry_run",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "DRY_RUN"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "set",
+   "contract_version": 1,
+   "effect": "camera_write",
+   "errors": [
+    "usage",
+    "failed",
+    "feature_not_found",
+    "out_of_range",
+    "invalid_choice",
+    "not_writable",
+    "feature_locked",
+    "invalid_duration",
+    "unsupported",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "disconnected",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab set -c sim:0 exposure=5ms gain=3",
+    "capturefab set -c sim:0 ExposureTime=10ms Width=640",
+    "capturefab set -c sim:0 'TriggerMode[FrameStart]=On' trigger=line0:rising",
+    "capturefab set -c sim:0 roi=0,0,320,240 --dry-run"
+   ],
+   "notes": [],
+   "result": {
+    "camera": "string — camera ID",
+    "changed": "[{name,from,to}] — every value written, in order, `to` read back (may be rounded); autos turned off to unlock a value are listed too",
+    "dry_run": "true — with --dry-run",
+    "plan": "[{name,from,to}] — with --dry-run: the writes in order, none made",
+    "warnings": "[string] — with --dry-run: checks only the writes themselves can decide (a value another write of the change may unlock or bring into range)"
+   },
+   "summary": "Change features or controls as one atomic change; a failure restores every value"
+  },
+  "shell": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Cameras to connect now and keep connected, repeatable; the first is the camera of commands without -c",
+     "long": "--camera",
+     "name": "cameras",
+     "repeatable": true,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "help": "Run COMMAND, then the next -e, instead of reading stdin; repeatable",
+     "long": "--execute",
+     "name": "execute",
+     "repeatable": true,
+     "required": false,
+     "short": "-e",
+     "type": "string",
+     "value_name": "COMMAND"
+    },
+    {
+     "default": "false",
+     "help": "Without a terminal: go on after a command fails; the exit code is then the first failure's",
+     "long": "--keep-going",
+     "name": "keep_going",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "KEEP_GOING"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the cameras open in a session for this long after the shell's last use (default 60s; 0 holds them in the shell's own process)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "shell",
+   "contract_version": 1,
+   "effect": "disruptive",
+   "errors": [
+    "usage",
+    "failed",
+    "invalid_duration",
+    "feature_not_found",
+    "out_of_range",
+    "invalid_choice",
+    "not_writable",
+    "feature_locked",
+    "camera_ambiguous",
+    "camera_not_found",
+    "camera_busy",
+    "permission_denied",
+    "disconnected",
+    "worker_crashed",
+    "session_not_found",
+    "ffmpeg_missing",
+    "unavailable",
+    "auth_required",
+    "auth_rejected",
+    "frame_timeout",
+    "trigger_timeout",
+    "timeout",
+    "unsupported",
+    "exists",
+    "storage_full",
+    "incomplete",
+    "interrupted"
+   ],
+   "examples": [
+    "capturefab shell -c sim:0",
+    "printf 'set exposure=5ms\\ncapture -o a.png\\ninspect\\n' | capturefab shell -c sim:0 --json",
+    "capturefab shell -c sim:0 -e 'set gain=0' -e 'capture -o shot.png'"
+   ],
+   "notes": [
+    "Commands are the ones above without `capturefab`. In a terminal: line editing, history, Tab completion, `use CAM`, `cameras`, `show`, `help`, `exit`; Ctrl-C stops the command running. Otherwise each line of stdin (or each -e) runs in order and prints one result, one JSON line each with --json; the first failure ends the run unless --keep-going, and sets the exit code."
+   ],
+   "result": {
+    "cameras": "{cameras:[{id,state:connecting|connected|failed,default?,session?,error?}]}",
+    "help": "{help} — the text of help COMMAND, or of a line's --help",
+    "lines": "input: one command a line on stdin (blank and # lines skipped), or each -e; output: one line per command run, in order, its result or {error} as that command prints it (NDJSON with --json); the exit code is the first failure's",
+    "use": "{camera?} — the default camera"
+   },
+   "summary": "Run commands one after another with the cameras kept connected: a prompt in a terminal, one command a line otherwise"
+  },
+  "watch": {
+   "args": [
+    {
+     "env": "CAPTUREFAB_CAMERA",
+     "help": "Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)",
+     "long": "--camera",
+     "name": "camera",
+     "repeatable": false,
+     "required": false,
+     "short": "-c",
+     "type": "camera",
+     "value_name": "CAM"
+    },
+    {
+     "default": "250ms",
+     "help": "Time between measurements, 50ms or more",
+     "long": "--every",
+     "name": "every",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "Stop after this long (default: at Ctrl-C)",
+     "long": "--for",
+     "name": "duration",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "help": "Measure only this part of the frame: X,Y,W,H as fractions 0..1",
+     "long": "--region",
+     "name": "region",
+     "repeatable": false,
+     "required": false,
+     "type": "string",
+     "value_name": "X,Y,W,H"
+    },
+    {
+     "default": "false",
+     "help": "Draw the frame in the terminal under the measurements (kitty, iTerm2, or colour blocks)",
+     "long": "--show",
+     "name": "show",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "SHOW"
+    },
+    {
+     "help": "How long each measurement waits for its frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer)",
+     "long": "--timeout",
+     "name": "timeout",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    },
+    {
+     "env": "CAPTUREFAB_KEEP",
+     "help": "Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)",
+     "long": "--keep",
+     "name": "keep",
+     "repeatable": false,
+     "required": false,
+     "type": "duration",
+     "value_name": "DUR"
+    }
+   ],
+   "command": "watch",
+   "contract_version": 1,
+   "effect": "read",
+   "errors": [
+    "usage",
+    "failed",
+    "frame_timeout",
+    "trigger_timeout",
+    "storage_full",
+    "camera_not_found",
+    "camera_ambiguous",
+    "camera_busy",
+    "disconnected",
+    "session_not_found",
+    "unavailable",
+    "timeout"
+   ],
+   "examples": [
+    "capturefab watch -c sim:0",
+    "capturefab watch -c sim:0 --show --region 0.4,0.4,0.2,0.2",
+    "capturefab watch -c sim:0 --json --for 10s --every 1s"
+   ],
+   "notes": [
+    "Ctrl-C ends it (exit 0). Without a terminal, or with --json, each measurement is one JSON line."
+   ],
+   "result": {
+    "camera": "string — camera ID",
+    "dropped": "int — frames dropped on the way",
+    "exposure": "{mean,p1,p50,p99,clipped_low,clipped_high,…} — as inspect",
+    "focus": "{sharpness,best,best_t} — this frame's sharpness, and the sharpest so far with its t",
+    "fps": "float — the camera's frame rate as received, once a second of frames came",
+    "frame": "{width,height,pixel_format,id?,age_ms}",
+    "frames": "int — frames received since it began streaming",
+    "lost": "int — frames lost or incomplete in transfer",
+    "settings": "{exposure_us?,gain_db?,gain?,fps?,pixel_format?}",
+    "suggest": "{ev,exposure_us?,limited_by?} — as inspect",
+    "t": "float — seconds since watching began; one JSON line each --every (a terminal shows them redrawn instead)",
+    "verdict": "[ok|dark|bright|clipped_high|clipped_low|…] — as inspect"
+   },
+   "summary": "Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise"
+  }
+ },
+ "generated_by": "scripts/site-reference.py --binary target/debug/capturefab",
+ "global_options": [
+  {
+   "env": "CAPTUREFAB_JSON",
+   "help": "One JSON document on stdout: the result, or {\"error\":{...}} with a non-zero exit",
+   "long": "--json",
+   "short": null,
+   "value_name": null
+  },
+  {
+   "env": null,
+   "help": "No progress or notes on stderr; errors still print",
+   "long": "--quiet",
+   "short": "-q",
+   "value_name": null
+  },
+  {
+   "env": null,
+   "help": "More detail on stderr, including camera worker logs",
+   "long": "--verbose",
+   "short": "-v",
+   "value_name": null
+  },
+  {
+   "env": "CAPTUREFAB_SESSION",
+   "help": "Use this running session (session start or serve --name NAME)",
+   "long": "--session",
+   "short": null,
+   "value_name": "NAME"
+  },
+  {
+   "env": null,
+   "help": "Never use a running session: open the camera in a worker of this command",
+   "long": "--no-session",
+   "short": null,
+   "value_name": null
+  },
+  {
+   "env": null,
+   "help": "Print help (see more with '--help')",
+   "long": "--help",
+   "short": "-h",
+   "value_name": null
+  },
+  {
+   "env": null,
+   "help": "Print version",
+   "long": "--version",
+   "short": "-V",
+   "value_name": null
+  }
+ ],
+ "groups": {
+  "debug": {
+   "examples": [
+    "capturefab debug xml -c sim:0 > camera.xml",
+    "capturefab debug read -c sim:0 0x100 4",
+    "echo '{\"op\":\"status\"}' | capturefab --session bench debug rpc"
+   ],
+   "notes": [],
+   "summary": "Protocol tools: GenICam XML, raw registers, one session request"
+  },
+  "login": {
+   "examples": [
+    "printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin",
+    "capturefab login list",
+    "capturefab login rm rtsp://cam.local/stream"
+   ],
+   "notes": [],
+   "summary": "Save camera sign-ins for rtsp:// and ONVIF cameras in the OS credential store"
+  },
+  "onvif": {
+   "examples": [
+    "capturefab onvif resolve cam.local",
+    "capturefab onvif resolve cam.local --profile Profile_1"
+   ],
+   "notes": [],
+   "summary": "Resolve an ONVIF camera's RTSP streams"
+  },
+  "preset": {
+   "examples": [
+    "capturefab preset save bench -c sim:0",
+    "capturefab preset apply bench -c sim:0 --dry-run",
+    "capturefab preset list"
+   ],
+   "notes": [
+    "A preset lives on this computer and can be applied to any camera of the model; a user set (exec 'UserSetSave[UserSet1]', or preset apply --persist) lives in the camera."
+   ],
+   "summary": "Saved camera settings (host-side, portable between cameras of a model)"
+  },
+  "session": {
+   "examples": [
+    "capturefab session start -c sim:0 --live",
+    "capturefab session status",
+    "capturefab session stop"
+   ],
+   "notes": [
+    "Camera commands keep their camera open in the auto session for 60s after their last use (--keep DUR to change it, --keep 0 or --no-session for none), and use a session that holds their camera on their own."
+   ],
+   "summary": "Sessions keep cameras open between commands: start one in the background, stop it, see it"
+  }
+ },
+ "schema": {
+  "commands": [
+   {
+    "effect": "read",
+    "name": "list",
+    "summary": "List cameras: GigE Vision, USB3 Vision, webcams, ONVIF"
+   },
+   {
+    "effect": "read",
+    "name": "info",
+    "summary": "What a camera is and what it can do: size, format, exposure, gain, trigger, controls"
+   },
+   {
+    "effect": "read",
+    "name": "features",
+    "summary": "List a camera's features with values, ranges, choices and locks"
+   },
+   {
+    "effect": "read",
+    "name": "get",
+    "summary": "Read features or controls in one call"
+   },
+   {
+    "effect": "camera_write",
+    "name": "set",
+    "summary": "Change features or controls as one atomic change; a failure restores every value"
+   },
+   {
+    "effect": "disruptive",
+    "name": "exec",
+    "summary": "Run a command feature, such as UserSetSave[UserSet1]"
+   },
+   {
+    "effect": "file_write",
+    "effect_with": {
+     "--auto": "camera_write",
+     "--set": "camera_write"
+    },
+    "name": "capture",
+    "summary": "Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites"
+   },
+   {
+    "effect": "file_write",
+    "effect_with": {
+     "--auto": "camera_write",
+     "--set": "camera_write"
+    },
+    "name": "record",
+    "summary": "Record video to a file or stream it to rtsp://, srt://, rtmp:// or udp://"
+   },
+   {
+    "effect": "read",
+    "effect_with": {
+     "--set": "camera_write"
+    },
+    "name": "inspect",
+    "summary": "Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview"
+   },
+   {
+    "effect": "read",
+    "name": "watch",
+    "summary": "Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise"
+   },
+   {
+    "effect": "camera_write",
+    "name": "auto",
+    "summary": "Settle exposure and gain, then hold them; or turn auto exposure off or on"
+   },
+   {
+    "effect": "file_write",
+    "name": "preset save",
+    "summary": "Save the camera's current settings as a named preset"
+   },
+   {
+    "effect": "read",
+    "name": "preset list",
+    "summary": "List saved presets and the folder that holds them"
+   },
+   {
+    "effect": "read",
+    "name": "preset show",
+    "summary": "Show a saved preset's values"
+   },
+   {
+    "effect": "camera_write",
+    "name": "preset apply",
+    "summary": "Restore a preset as one camera change; a failure puts every value back"
+   },
+   {
+    "effect": "file_write",
+    "name": "preset rm",
+    "summary": "Delete a saved preset; no camera changes"
+   },
+   {
+    "effect": "file_write",
+    "name": "preset import",
+    "summary": "Save a preset document from a file, such as one preset export wrote"
+   },
+   {
+    "effect": "file_write",
+    "name": "preset export",
+    "summary": "Write a preset's document to a file, or to stdout"
+   },
+   {
+    "effect": "read",
+    "name": "jobs",
+    "summary": "Captures and recordings running in sessions: list, stop, wait"
+   },
+   {
+    "effect": "read",
+    "name": "jobs list",
+    "summary": "Every running session's jobs, finished ones included"
+   },
+   {
+    "effect": "camera_write",
+    "name": "jobs stop",
+    "summary": "Stop a job, or all of them; files saved so far stay"
+   },
+   {
+    "effect": "read",
+    "name": "jobs wait",
+    "summary": "Wait for a job: exit 0 when done, its own code if it failed, 4 if still running"
+   },
+   {
+    "effect": "disruptive",
+    "name": "session start",
+    "summary": "Start a session in the background; it ends after --idle unused"
+   },
+   {
+    "effect": "disruptive",
+    "name": "session stop",
+    "summary": "Stop a session once its recordings and captures are finished"
+   },
+   {
+    "effect": "read",
+    "name": "session status",
+    "summary": "A session's cameras, their state and jobs"
+   },
+   {
+    "effect": "read",
+    "name": "session list",
+    "summary": "The running sessions"
+   },
+   {
+    "effect": "disruptive",
+    "name": "serve",
+    "summary": "Run a session in the foreground (systemd, a terminal); Ctrl-C stops it"
+   },
+   {
+    "effect": "file_write",
+    "name": "login add",
+    "summary": "Check a camera sign-in, then save it in the OS credential store"
+   },
+   {
+    "effect": "read",
+    "name": "login list",
+    "summary": "List saved camera sign-ins (never their passwords)"
+   },
+   {
+    "effect": "file_write",
+    "name": "login rm",
+    "summary": "Forget a saved camera sign-in and delete its password"
+   },
+   {
+    "effect": "read",
+    "name": "onvif resolve",
+    "summary": "List an ONVIF camera's profiles and their RTSP stream URIs"
+   },
+   {
+    "effect": "read",
+    "effect_with": {
+     "--tune": "camera_write"
+    },
+    "name": "network",
+    "summary": "Check GigE network paths; --tune applies bandwidth sharing to cameras"
+   },
+   {
+    "effect": "read",
+    "name": "doctor",
+    "summary": "Check this computer: FFmpeg, folders, USB and GigE limits, with a fix for each warning"
+   },
+   {
+    "effect": "read",
+    "name": "schema",
+    "summary": "Describe commands, arguments, results and error codes as JSON"
+   },
+   {
+    "effect": "disruptive",
+    "name": "shell",
+    "summary": "Run commands one after another with the cameras kept connected: a prompt in a terminal, one command a line otherwise"
+   },
+   {
+    "effect": "read",
+    "name": "completions",
+    "summary": "Print shell completions: bash, zsh, fish, powershell, elvish"
+   },
+   {
+    "effect": "read",
+    "name": "debug xml",
+    "summary": "Print a camera's GenICam XML, or write it to a file"
+   },
+   {
+    "effect": "read",
+    "name": "debug read",
+    "summary": "Read raw camera memory"
+   },
+   {
+    "effect": "disruptive",
+    "name": "debug write",
+    "summary": "Write raw camera memory"
+   },
+   {
+    "effect": "disruptive",
+    "name": "debug rpc",
+    "summary": "Send one session command, a JSON object on stdin, and print its reply"
+   },
+   {
+    "effect": "read",
+    "name": "licenses",
+    "summary": "Print Capturefab's license and the bundled FFmpeg's license notice"
+   }
+  ],
+  "contract_version": 1,
+  "conventions": {
+   "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
+   "credentials": "never printed; URLs are redacted",
+   "describe": "capturefab schema COMMAND: arguments, result fields and errors",
+   "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION), --no-session (overrides it); before or after the command",
+   "jobs": "capture/record block until done; --background prints a job instead (jobs wait ID). Ctrl-C: capture exits 130 with details.files; open-ended record ends normally",
+   "json": "--json (or CAPTUREFAB_JSON=1): one line on stdout, the result on exit 0, else {\"error\":{code,message,hint?,details?}}: code is the reason (see errors), the exit code its category. No nulls; warnings ≤10",
+   "results": "snake_case keys; units in names (exposure_us); times RFC 3339 UTC; lists bounded with truncated",
+   "routing": "--session NAME, else a session holding the camera, else the auto session, open 60s after last use (--keep DUR); --keep 0 or --no-session: a worker of the command",
+   "streams": "NDJSON: watch a line per measurement, shell per command; capture, record, jobs wait --progress: stderr lines {progress:{job,state,saved,planned?,elapsed_s,left_s?,…}}"
+  },
+  "errors": [
+   {
+    "code": "failed",
+    "exit": 1,
+    "meaning": "the operation failed"
+   },
+   {
+    "code": "usage",
+    "exit": 2,
+    "meaning": "invalid arguments or input"
+   },
+   {
+    "code": "invalid_duration",
+    "exit": 2,
+    "meaning": "not a valid duration (see grammars.duration)"
+   },
+   {
+    "code": "feature_not_found",
+    "exit": 2,
+    "meaning": "no such feature or control; see details.did_you_mean"
+   },
+   {
+    "code": "out_of_range",
+    "exit": 2,
+    "meaning": "outside the feature's range; details {feature,value,min,max,inc,nearest,unit}"
+   },
+   {
+    "code": "invalid_choice",
+    "exit": 2,
+    "meaning": "not one of details.choices"
+   },
+   {
+    "code": "not_writable",
+    "exit": 2,
+    "meaning": "the feature is read-only"
+   },
+   {
+    "code": "feature_locked",
+    "exit": 1,
+    "meaning": "another setting locks the feature now; see details.locked_by"
+   },
+   {
+    "code": "camera_ambiguous",
+    "exit": 2,
+    "meaning": "several cameras match; pick one of details.candidates with -c"
+   },
+   {
+    "code": "camera_not_found",
+    "exit": 3,
+    "meaning": "no camera matches; details.candidates lists what answered"
+   },
+   {
+    "code": "camera_busy",
+    "exit": 3,
+    "meaning": "another process or job holds the camera; details.held_by when known"
+   },
+   {
+    "code": "permission_denied",
+    "exit": 3,
+    "meaning": "the OS refused access; see hint"
+   },
+   {
+    "code": "disconnected",
+    "exit": 3,
+    "meaning": "the camera went away"
+   },
+   {
+    "code": "worker_crashed",
+    "exit": 3,
+    "meaning": "the camera worker process died"
+   },
+   {
+    "code": "session_not_found",
+    "exit": 3,
+    "meaning": "no running session has that name"
+   },
+   {
+    "code": "ffmpeg_missing",
+    "exit": 3,
+    "meaning": "FFmpeg could not be found or started"
+   },
+   {
+    "code": "unavailable",
+    "exit": 3,
+    "meaning": "the camera, stream or service cannot be reached"
+   },
+   {
+    "code": "auth_required",
+    "exit": 3,
+    "meaning": "the camera needs a sign-in; run login add"
+   },
+   {
+    "code": "auth_rejected",
+    "exit": 3,
+    "meaning": "the camera refused the sign-in"
+   },
+   {
+    "code": "frame_timeout",
+    "exit": 4,
+    "meaning": "no frame arrived in time"
+   },
+   {
+    "code": "trigger_timeout",
+    "exit": 4,
+    "meaning": "a triggered camera got no trigger in time; details.trigger"
+   },
+   {
+    "code": "timeout",
+    "exit": 4,
+    "meaning": "the operation did not finish in time"
+   },
+   {
+    "code": "unsupported",
+    "exit": 5,
+    "meaning": "the camera or this build cannot do that"
+   },
+   {
+    "code": "exists",
+    "exit": 1,
+    "meaning": "the output exists (never overwritten); details.path"
+   },
+   {
+    "code": "storage_full",
+    "exit": 6,
+    "meaning": "disk full or below CAPTUREFAB_MIN_FREE; details {path,free_bytes?}"
+   },
+   {
+    "code": "incomplete",
+    "exit": 1,
+    "meaning": "fewer results than requested; see details"
+   },
+   {
+    "code": "interrupted",
+    "exit": 130,
+    "meaning": "stopped by a signal; details hold partial results"
+   }
+  ],
+  "exit_codes": {
+   "0": "ok",
+   "1": "failed",
+   "130": "interrupted (143 SIGTERM, 129 SIGHUP)",
+   "2": "usage or input",
+   "3": "unavailable",
+   "4": "timeout",
+   "5": "unsupported",
+   "6": "storage full"
+  },
+  "grammars": {
+   "duration": "number+unit, repeatable: 500us, 250ms, 2s, 5m, 1h30m; 0; none where a wait may be unlimited. A bare number is invalid_duration",
+   "name": "Feature | Feature[Selector=Value,…] | Feature[Value] (when one selector addresses it) | control: exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb",
+   "selector": "list id (gige:…, u3v:…, avfoundation:…, v4l2:…, dshow:…), serial, IPv4, rtsp(s)://, srt://, http(s)://, onvif://host[/path], file, sim:N[?drop=0..0.5&line0=every:DUR], sim:replay:PATH",
+   "template": "-o: {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; a folder holds {camera}-{time}-{seq}.{ext}; a taken name fails without {seq}, {time} or --on-exists number"
+  }
+ }
+}
