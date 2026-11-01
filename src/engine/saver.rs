@@ -46,6 +46,8 @@ pub(super) struct Save {
 /// A job's saved file, or why it was not saved.
 pub(super) struct Saved {
     pub(super) job: u64,
+    /// The number of the job's frame it was.
+    pub(super) index: u32,
     pub(super) result: Result<SavedShot>,
 }
 
@@ -99,8 +101,9 @@ impl Queue {
 struct Order {
     /// The number of the next shot to report.
     next: u64,
-    /// What became of each save of the shots encoded ahead of it.
-    done: BTreeMap<u64, Vec<(u64, Result<Written>)>>,
+    /// What became of each save of the shots encoded ahead of it: its job,
+    /// the job's frame number and its file.
+    done: BTreeMap<u64, Vec<(u64, u32, Result<Written>)>>,
 }
 
 pub(super) struct Saver {
@@ -178,6 +181,7 @@ impl Saver {
             for save in shot.saves {
                 let _ = self.outbox.send(Saved {
                     job: save.job,
+                    index: save.index,
                     result: Err(anyhow::anyhow!("no encoder thread could start")),
                 });
             }
@@ -196,12 +200,15 @@ impl Saver {
     /// saves no files after its end; they end as interrupted.
     pub(super) fn discard(&mut self, job: u64) {
         let mut state = self.queue.lock();
-        let mut taken = 0;
+        let mut taken = Vec::new();
         let mut emptied = Vec::new();
         state.shots.retain_mut(|(number, shot)| {
-            let before = shot.saves.len();
-            shot.saves.retain(|save| save.job != job);
-            taken += before - shot.saves.len();
+            shot.saves.retain(|save| {
+                if save.job == job {
+                    taken.push(save.index);
+                }
+                save.job != job
+            });
             if shot.saves.is_empty() {
                 emptied.push((*number, shot.frame.data.len()));
                 return false;
@@ -212,9 +219,10 @@ impl Saver {
             state.bytes = state.bytes.saturating_sub(*bytes);
         }
         drop(state);
-        for _ in 0..taken {
+        for index in taken {
             let _ = self.outbox.send(Saved {
                 job,
+                index,
                 result: Err(interrupted(
                     "the capture was stopped before this frame was saved",
                 )),
@@ -286,7 +294,7 @@ impl Encoder {
             let results = shot
                 .saves
                 .iter()
-                .map(|save| (save.job, (self.write)(&self.h, &shot, save)))
+                .map(|save| (save.job, save.index, (self.write)(&self.h, &shot, save)))
                 .collect::<Vec<_>>();
             drop(shot);
             {
@@ -315,7 +323,7 @@ fn report(
     h: &WorkerHandle,
     outbox: &Sender<Saved>,
     number: u64,
-    results: Vec<(u64, Result<Written>)>,
+    results: Vec<(u64, u32, Result<Written>)>,
 ) {
     let mut order = order.lock().unwrap_or_else(|e| e.into_inner());
     order.done.insert(number, results);
@@ -324,7 +332,7 @@ fn report(
         let Some(results) = order.done.remove(&next) else {
             return;
         };
-        for (job, result) in results {
+        for (job, index, result) in results {
             let result = result.and_then(|written| {
                 // The file is saved either way: it is reported before a
                 // manifest failure ends its job.
@@ -334,7 +342,7 @@ fn report(
                 }
                 Ok(written.shot)
             });
-            let _ = outbox.send(Saved { job, result });
+            let _ = outbox.send(Saved { job, index, result });
         }
         order.next += 1;
         let mut state = queue.lock();

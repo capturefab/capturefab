@@ -666,7 +666,21 @@ fn expand_control(camera: &mut Camera, control: &str, value: &str) -> Result<Vec
                 bank: bank.clone(),
             };
             if lower == "off" {
-                return Ok(vec![write(at("TriggerMode"), "Off".into())]);
+                // Every start trigger that holds frames back goes off.
+                let mut writes = vec![write(at("TriggerMode"), "Off".into())];
+                for other in other_start_banks(camera) {
+                    let on = with_bank(camera, &other, |camera| {
+                        Ok(camera.get("TriggerMode").is_ok_and(|mode| mode == "On"))
+                    })?;
+                    if on {
+                        let target = Target {
+                            feature: "TriggerMode".into(),
+                            bank: other,
+                        };
+                        writes.push(write(target, "Off".into()));
+                    }
+                }
+                return Ok(writes);
             }
             let (source, edge) = match lower.split_once(':') {
                 Some((source, edge)) => (source, Some(edge)),
@@ -1008,6 +1022,23 @@ fn order(camera: &mut Camera, writes: &mut Vec<Write>) {
         if raising == (rate < exposure) {
             let write = writes.remove(rate);
             writes.insert(exposure, write);
+        }
+    }
+    // A larger size may not fit beside the current offset: lower the
+    // offset first. A larger offset may not fit beside the current size:
+    // size first, as the geometry order has it.
+    for (size, offset) in [("Width", "OffsetX"), ("Height", "OffsetY")] {
+        let at = |feature: &str| writes.iter().position(|w| w.target.feature == feature);
+        let (Some(size_at), Some(offset_at)) = (at(size), at(offset)) else {
+            continue;
+        };
+        let current = camera.get(offset).ok().and_then(|v| v.as_f64());
+        let wanted = writes[offset_at].value.trim().parse::<f64>().ok();
+        if offset_at > size_at
+            && matches!((current, wanted), (Some(current), Some(wanted)) if wanted < current)
+        {
+            let write = writes.remove(offset_at);
+            writes.insert(size_at, write);
         }
     }
 }
@@ -1523,9 +1554,37 @@ pub struct Trigger {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation: Option<String>,
 }
+/// The start trigger in effect: the FrameStart trigger, or when it is off
+/// an acquisition or burst start trigger that is on, as that one holds
+/// frames back too.
 pub(crate) fn trigger_state(camera: &mut Camera) -> Result<Trigger> {
     let bank = trigger_bank(camera);
-    with_bank(camera, &bank, |camera| {
+    let frame = bank_trigger(camera, &bank)?;
+    if frame.mode == "On" {
+        return Ok(frame);
+    }
+    for bank in other_start_banks(camera) {
+        let trigger = bank_trigger(camera, &bank)?;
+        if trigger.mode == "On" {
+            return Ok(trigger);
+        }
+    }
+    Ok(frame)
+}
+/// The banks of the start triggers other than FrameStart that hold frames
+/// back: AcquisitionStart and FrameBurstStart.
+fn other_start_banks(camera: &mut Camera) -> Vec<Vec<(String, String)>> {
+    if !camera.has("TriggerSelector") || !has_choice(camera, "TriggerSelector", "FrameStart") {
+        return Vec::new();
+    }
+    ["AcquisitionStart", "FrameBurstStart"]
+        .into_iter()
+        .filter(|selector| has_choice(camera, "TriggerSelector", selector))
+        .map(|selector| vec![("TriggerSelector".to_owned(), selector.to_owned())])
+        .collect()
+}
+fn bank_trigger(camera: &mut Camera, bank: &[(String, String)]) -> Result<Trigger> {
+    with_bank(camera, bank, |camera| {
         let read = |camera: &mut Camera, feature: &str| {
             camera
                 .has(feature)

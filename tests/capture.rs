@@ -249,6 +249,70 @@ fn several_cameras_capture_at_once() {
 }
 
 #[test]
+fn several_cameras_stream_only_for_their_shots() {
+    let home = Home::new("several-timelapse");
+    let timelapse = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "-c",
+        "sim:1",
+        "-n",
+        "2",
+        "--every",
+        "1s",
+        "-o",
+        "lapse/{camera}-{seq}.png",
+    ]);
+    // Armed together for the first shot, then stopped between shots: at
+    // 30 fps a camera streaming throughout would send about 30 frames.
+    for camera in timelapse["cameras"].as_array().unwrap() {
+        assert_eq!(camera["count"], 2, "{camera}");
+        assert!(camera["frames"].as_u64().unwrap() < 15, "{camera}");
+    }
+}
+
+#[test]
+fn a_software_triggered_burst_fires_again_for_frames_lost_on_the_way() {
+    let home = Home::new("trigger-loss");
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "TriggerMode=On",
+        "TriggerSource=Software",
+        "ExposureTime=1000",
+    ]);
+    let burst = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0?drop=0.1",
+        "-n",
+        "30",
+        "-o",
+        "lossy/t-{seq}.png",
+    ]);
+    assert_eq!(burst["count"], 30, "{burst}");
+    let lost = burst["dropped"].as_u64().unwrap() + burst["incomplete"].as_u64().unwrap();
+    assert!(lost > 0, "{burst}");
+    // A line that never fires still ends the capture, saying so.
+    home.ok(&["set", "-c", "sim:0", "TriggerSource=Line1"]);
+    let silent = home.fails(
+        4,
+        &[
+            "capture",
+            "-c",
+            "sim:0",
+            "--timeout",
+            "200ms",
+            "-o",
+            "none.png",
+        ],
+    );
+    assert_eq!(silent["code"], "trigger_timeout", "{silent}");
+}
+
+#[test]
 fn dry_runs_resolve_without_capturing() {
     let home = Home::new("dry-run");
     let plan = home.ok(&[
@@ -382,6 +446,63 @@ fn a_hardware_triggered_camera_times_out_with_its_trigger() {
     );
     home.ok(&["set", "-c", "sim:0", "trigger=off"]);
     home.ok(&["capture", "-c", "sim:0", "--timeout", "2s", "-o", "t.png"]);
+    // A line that starts the acquisition holds every frame back too.
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "TriggerMode[TriggerSelector=AcquisitionStart]=On",
+        "TriggerSource[TriggerSelector=AcquisitionStart]=Line0",
+    ]);
+    let held = home.fails(
+        4,
+        &[
+            "capture",
+            "-c",
+            "sim:0",
+            "--timeout",
+            "300ms",
+            "-o",
+            "held.png",
+        ],
+    );
+    assert_eq!(held["code"], "trigger_timeout", "{held}");
+    assert_eq!(held["details"]["trigger"]["selector"], "AcquisitionStart");
+    assert!(
+        held["message"]
+            .as_str()
+            .unwrap()
+            .contains("AcquisitionStart"),
+        "{held}"
+    );
+    assert_eq!(
+        home.ok(&["info", "-c", "sim:0"])["trigger"]["selector"],
+        "AcquisitionStart"
+    );
+    assert_eq!(
+        home.ok(&["get", "-c", "sim:0", "trigger"])["values"]["trigger"],
+        "line0:rising"
+    );
+    assert_eq!(
+        home.fails(5, &["auto", "-c", "sim:0"])["code"],
+        "unsupported"
+    );
+    // trigger=off lets every start trigger go.
+    let off = home.ok(&["set", "-c", "sim:0", "trigger=off"]);
+    assert_eq!(
+        off["changed"],
+        json!([{"name":"TriggerMode[AcquisitionStart]","from":"On","to":"Off"}]),
+        "{off}"
+    );
+    home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "--timeout",
+        "2s",
+        "-o",
+        "free.png",
+    ]);
 }
 
 #[cfg(unix)]
@@ -756,6 +877,7 @@ fn a_camera_that_sets_its_own_exposure_settles_before_frames_are_taken() {
     let inspected = home.ok(&["inspect", "-c", "sim:0", "--preview", "none"]);
     assert!(inspected["warmup_ms"].is_u64(), "{inspected}");
     assert_eq!(inspected["verdict"], json!(["ok"]), "{inspected}");
+    assert!(inspected.get("settled").is_none(), "{inspected}");
     // Too short a warm-up for three steady frames says so.
     let short = home.ok(&[
         "capture",
@@ -768,6 +890,31 @@ fn a_camera_that_sets_its_own_exposure_settles_before_frames_are_taken() {
     ]);
     assert_eq!(short["settled"], false, "{short}");
     assert!(short["warnings"][0].as_str().unwrap().contains("--warmup"));
+    home.ok(&["set", "-c", "sim:0", "ExposureAuto=Off"]);
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "ExposureTime=50",
+        "ExposureAuto=Continuous",
+    ]);
+    let unsettled = home.ok(&[
+        "inspect",
+        "-c",
+        "sim:0",
+        "--warmup",
+        "20ms",
+        "--preview",
+        "none",
+    ]);
+    assert_eq!(unsettled["settled"], false, "{unsettled}");
+    assert!(
+        unsettled["verdict"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("not_settled")),
+        "{unsettled}"
+    );
     let none = home.ok(&["capture", "-c", "sim:0", "--warmup", "0", "-o", "none.png"]);
     assert!(none.get("warmup_ms").is_none(), "{none}");
     // A camera with manual exposure needs none.
@@ -873,10 +1020,14 @@ fn bursts_report_the_integrity_of_their_frames() {
     assert_eq!(lossy["resent"], 0, "{lossy}");
     // A session says the same of its camera.
     let _session = home.serve_with("lossy", &["sim:5?drop=0.2"], &["--live"]);
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     let status = home.ok(&["session", "status", "lossy"]);
     let camera = &status["cameras"][0];
     assert!(camera["frames"].as_u64().unwrap() > 0, "{status}");
+    // The rate frames arrive at, by the camera's clock: the 30 fps it
+    // streams less those lost.
+    let fps = camera["fps"].as_f64().unwrap();
+    assert!((5.0..32.0).contains(&fps), "{status}");
     assert!(
         camera["lost"].as_u64().unwrap() + camera["incomplete"].as_u64().unwrap() > 0,
         "{status}"

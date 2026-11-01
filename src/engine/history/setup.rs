@@ -1678,7 +1678,7 @@ mod tests {
                 &mut self.auto,
                 &mut self.jobs,
                 &mut 1,
-                &mut false,
+                &mut JobStream::default(),
                 command.into(),
             )
         }

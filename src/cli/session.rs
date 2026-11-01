@@ -622,6 +622,11 @@ fn camera_state(camera: &Value) -> Value {
         if let Some(resent) = camera["transport"]["resend_recovered"].as_u64() {
             value["resent"] = json!(resent);
         }
+        if state != "idle"
+            && let Some(fps) = camera["fps"].as_f64().filter(|fps| *fps > 0.0)
+        {
+            value["fps"] = json!((fps * 100.0).round() / 100.0);
+        }
     }
     // Why the worker is gone, or could not answer: its reason, and for a
     // crash its exit, signal and last lines of stderr.
@@ -717,7 +722,7 @@ pub const STATUS_FIELDS: &[(&str, &str)] = &[
     ("uptime_s", "int"),
     (
         "cameras",
-        "[{id,state:idle|streaming|recording|error,error?:{code,message,hint?,details?:{exit?,signal?,stderr_tail?}},last_error?,config_state?:unknown,frames?,dropped?,lost?,incomplete?,resent?,jobs:[job]}] — job as jobs lists it; error: the camera's worker exited (code worker_crashed, with its exit status or signal and last lines of stderr) or did not answer, and the next command on the camera starts another; last_error: the worker's last logged error; lost: frames lost on the way, incomplete: frames the transport received incomplete, resent: packets the camera sent again, where it can tell; config_state unknown: it exited during a settings change, until settings are written again",
+        "[{id,state:idle|streaming|recording|error,error?:{code,message,hint?,details?:{exit?,signal?,stderr_tail?}},last_error?,config_state?:unknown,frames?,dropped?,lost?,incomplete?,resent?,fps?,jobs:[job]}] — job as jobs lists it; fps: the rate frames arrive at while it streams, by the camera's clock where it stamps them; error: the camera's worker exited (code worker_crashed, with its exit status or signal and last lines of stderr) or did not answer, and the next command on the camera starts another; last_error: the worker's last logged error; lost: frames lost on the way, incomplete: frames the transport received incomplete, resent: packets the camera sent again, where it can tell; config_state unknown: it exited during a settings change, until settings are written again",
     ),
 ];
 pub const LIST_FIELDS: &[(&str, &str)] =

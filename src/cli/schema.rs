@@ -484,7 +484,7 @@ fn overview() -> Value {
         "commands": commands,
         "conventions": {
             "json": "--json (or CAPTUREFAB_JSON=1): exactly one single-line document on stdout. Exit 0: the result. Non-zero: {\"error\":{code,message,hint?,details?}}; code is a specific reason (errors), the exit code its category. No null values; warnings ≤10",
-            "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION, which --no-session overrides), --no-session; before or after the command",
+            "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION), --no-session (overrides it); before or after the command",
             "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
             "routing": "--session NAME, else a session holding the camera, else a worker of the command (--no-session forces it). --keep DUR: through a session that stays DUR after its last use (--keep 5m for loops)",
             "jobs": "capture/record block until done; --background prints a job instead (jobs wait ID). Ctrl-C: capture exits 130 with details.files; open-ended record ends normally",
@@ -493,9 +493,9 @@ fn overview() -> Value {
             "describe": "capturefab schema COMMAND: arguments, result fields and errors"
         },
         "grammars": {
-            "selector": "list id (gige:…, u3v:…, avfoundation:…, v4l2:…, dshow:…), serial, IPv4, rtsp(s)://, srt://, http(s)://, onvif://host[/path], file path, sim:N, sim:replay:PATH",
+            "selector": "list id (gige:…, u3v:…, avfoundation:…, v4l2:…, dshow:…), serial, IPv4, rtsp(s)://, srt://, http(s)://, onvif://host[/path], file, sim:N[?drop=0..0.5&line0=every:DUR], sim:replay:PATH",
             "name": "Feature | Feature[Selector=Value,…] | Feature[Value] (when one selector addresses it) | control: exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb",
-            "duration": "number+unit, repeatable: 500us, 250ms, 2s, 1.5s, 5m, 1h30m; 0; none where a wait may be unlimited. A bare number is invalid_duration",
+            "duration": "number+unit, repeatable: 500us, 250ms, 2s, 5m, 1h30m; 0; none where a wait may be unlimited. A bare number is invalid_duration",
             "template": "-o: {camera} {serial} {seq} {seq:N} {time} {date} {tag:KEY} {ext}; a folder holds {camera}-{time}-{seq}.{ext}; a taken name fails without {seq}, {time} or --on-exists number"
         },
         "exit_codes": exit_codes,

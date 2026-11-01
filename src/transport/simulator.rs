@@ -906,8 +906,9 @@ impl Backend for Simulator {
                 Start::FreeRun => {
                     // Keep to the frame clock, as a sensor does, instead of
                     // adding the time spent drawing; after a stall, restart
-                    // it rather than catch up.
-                    self.next = (self.next + self.period()).max(Instant::now());
+                    // it rather than catch up. The frame an acquisition
+                    // trigger let through restarts it too.
+                    self.next = (readout.max(self.next) + self.period()).max(Instant::now());
                 }
                 Start::Software => {
                     self.triggers.pop_front();
@@ -1388,6 +1389,27 @@ mod tests {
         gated.request_frame().unwrap();
         gated.next_frame(Duration::from_millis(500)).unwrap();
         gated.next_frame(Duration::from_millis(500)).unwrap();
+        // The frames after a line started the acquisition keep to the frame
+        // rate from that frame on.
+        let mut lined = camera("sim:0?line0=every:300ms");
+        lined.set("TriggerSelector", "AcquisitionStart").unwrap();
+        lined.set("TriggerMode", "On").unwrap();
+        lined.set("TriggerSource", "Line0").unwrap();
+        lined.start().unwrap();
+        let times = (0..3)
+            .map(|_| {
+                lined
+                    .next_frame(Duration::from_secs(1))
+                    .unwrap()
+                    .device_ts_ns
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let period = 1e9 / 30.0;
+        for pair in times.windows(2) {
+            let gap = (pair[1] - pair[0]) as f64;
+            assert!((gap - period).abs() < period * 0.2, "{times:?}");
+        }
         assert!(
             ["sim:0?drop=2", "sim:0?line0=50ms", "sim:0?fast=1"]
                 .iter()

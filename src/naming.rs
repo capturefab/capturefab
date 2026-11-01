@@ -419,8 +419,26 @@ fn expand(token: &Token, input: &NameInput) -> Result<String> {
 }
 
 /// `Ok` when nothing is at `path`; `OutputExists` when anything is, even a
-/// dangling symbolic link.
+/// dangling symbolic link. A `.raw` name is taken too when its sidecar's
+/// is, so a raw frame and its sidecar always go together.
 pub fn check_free(path: &Path) -> Result<()> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("raw"))
+    {
+        check_one(&sidecar(path))?;
+    }
+    check_one(path)
+}
+
+/// The `NAME.json` sidecar that describes the raw frame saved as `NAME`.
+pub fn sidecar(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".json");
+    path.with_file_name(name)
+}
+
+fn check_one(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Err(OutputExists(path.to_path_buf()).into()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -936,6 +954,38 @@ mod tests {
             .unwrap()
             .with_ymd_and_hms(2026, 10, 17, 10, 15, 0)
             .unwrap()
+    }
+
+    #[test]
+    fn a_raw_name_is_taken_while_its_sidecar_is() {
+        let dir = temp("sidecar");
+        std::fs::write(dir.join("x.raw.json"), b"{}").unwrap();
+        std::fs::write(dir.join("y-0001.raw.json"), b"{}").unwrap();
+        // Any other file's name stays free beside a .json of its name.
+        std::fs::write(dir.join("z.png.json"), b"{}").unwrap();
+        assert!(is_exists(&check_free(&dir.join("x.raw")).unwrap_err()));
+        check_free(&dir.join("z.png")).unwrap();
+        let mut namer = Namer::default();
+        let raw = Plan::new(dir.join("x.raw").to_str().unwrap(), 1, "raw");
+        let refused = namer
+            .candidate(&raw, &input(fixed_time()), OnExists::Fail)
+            .unwrap_err();
+        assert!(is_exists(&refused));
+        assert_eq!(
+            namer
+                .candidate(&raw, &input(fixed_time()), OnExists::Number)
+                .unwrap(),
+            dir.join("x-0001.raw")
+        );
+        let numbered = Plan::new(dir.join("y-{seq}.raw").to_str().unwrap(), 2, "raw");
+        assert_eq!(
+            namer
+                .candidate(&numbered, &input(fixed_time()), OnExists::Fail)
+                .unwrap(),
+            dir.join("y-0002.raw")
+        );
+        assert_eq!(sidecar(&dir.join("f.dat")), dir.join("f.dat.json"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

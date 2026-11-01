@@ -1214,6 +1214,18 @@ struct DecoderQueue {
     changed: Condvar,
     stopped: AtomicBool,
 }
+impl DecoderQueue {
+    /// The newest frame decoded so far, without waiting; the older ones
+    /// waiting with it are dropped.
+    fn newest(&self) -> Option<Frame> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let newest = state.frames.pop_back();
+        state.frames.clear();
+        drop(state);
+        self.changed.notify_all();
+        newest
+    }
+}
 struct Decoder {
     child: Child,
     thread: Option<JoinHandle<()>>,
@@ -1449,6 +1461,9 @@ impl Decoder {
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
         }
+    }
+    fn newest(&self) -> Option<Frame> {
+        self.queue.newest()
     }
     /// Why the stream ended, formatted the first time it is asked for. FFmpeg
     /// gets a moment to exit first, so the log it leaves is complete.
@@ -3178,10 +3193,22 @@ impl Backend for MediaBackend {
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.running, "media acquisition has not started");
         self.on_demand.get_or_insert(false);
-        let frame = match self.first.take() {
-            Some(frame) => frame,
+        let live = !self.file() && !self.clip();
+        let mut frame = match self.first.take() {
+            // The frame a live source opened with gives way to any it sent
+            // since: that one may be long past.
+            Some(first) if live => self
+                .decoder
+                .as_ref()
+                .and_then(Decoder::newest)
+                .unwrap_or(first),
+            Some(first) => first,
             None => self.decode(timeout)?,
         };
+        // A file's frames wait for their turn, so they arrive when taken.
+        if !live {
+            frame.wall_ms = 0;
+        }
         self.width = frame.width;
         self.height = frame.height;
         Ok(frame)
@@ -7423,6 +7450,28 @@ Error opening input files: Input/output error
             paced: true,
             on_demand: None,
         }
+    }
+    #[test]
+    fn a_live_source_gives_its_newest_frame_and_drops_the_older_ones() {
+        let frame = |id| Frame {
+            id,
+            width: 1,
+            height: 1,
+            pixel_format: RGB8,
+            device_ts_ns: None,
+            wall_ms: id,
+            data: vec![0; 3],
+        };
+        let queue = DecoderQueue {
+            state: Mutex::new(Decoded {
+                frames: (1..=3).map(frame).collect(),
+                error: None,
+            }),
+            changed: Condvar::new(),
+            stopped: AtomicBool::new(false),
+        };
+        assert_eq!(queue.newest().map(|frame| frame.id), Some(3));
+        assert!(queue.newest().is_none());
     }
     #[test]
     fn avfoundation_modes_keep_range_maxima_of_the_last_format_per_size() {

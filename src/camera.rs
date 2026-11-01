@@ -219,25 +219,48 @@ pub struct Camera {
 }
 /// Frames to come from before the last settings change. A change written
 /// while the camera streams reaches the frame whose exposure starts after
-/// it: on a free-running stream the frame being exposed and the one being
-/// read out still carry the old settings, as do the frames of software
-/// triggers fired before the change, and a hardware-triggered frame
-/// exposed before it. A frame of an acquisition started after the change
-/// is always new.
+/// it: on a free-running stream the frames already sent and waiting in the
+/// host's buffers, the frame being read out and the one being exposed
+/// still carry the old settings, as do the frames of software triggers
+/// fired before the change, and a hardware-triggered frame exposed before
+/// it. Where the camera's clock can be latched, a frame it stamped before
+/// the change, or the first one after, which may have been exposed in part
+/// before, predates it too, wherever it waited. A frame of an acquisition
+/// started after the change is always new.
 #[derive(Debug, Default)]
 struct Epoch {
     /// Frames still to come that may predate the change.
     stale: u32,
+    /// When no frame from before the change can come any more, so `stale`
+    /// counts no longer: after a stream is switched to software triggers,
+    /// no frame may come to count its frames in flight down.
+    counted_until: Option<Instant>,
     /// Until when a hardware-triggered camera's frames may predate it.
     stale_until: Option<Instant>,
+    /// The camera's clock at the change, where it can be latched.
+    since_ns: Option<u64>,
     /// Software triggers fired whose frames have not come yet.
     pending: u32,
     /// Whether the frame `next_frame` returned last may predate it.
     last_stale: bool,
 }
-/// Frames a free-running stream may deliver after a change that were
-/// exposed, at least in part, before it.
+/// Frames a free-running stream may deliver after a change, besides those
+/// already in the host's buffers, that were exposed at least in part
+/// before it: the one being read out and the one being exposed.
 const STALE_FRAMES: u32 = 2;
+/// What a settings change means for the frames to come; see
+/// `Camera::settings_changed`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Change {
+    /// For a camera that waits for a hardware trigger for each frame: how
+    /// long after the change a frame exposed before it may still come.
+    pub(crate) hardware_hold: Option<Duration>,
+    /// Whether it sent frames only when software triggered before the
+    /// change.
+    pub(crate) was_software: bool,
+    /// How long a frame being exposed at the change may take to come.
+    pub(crate) in_flight: Duration,
+}
 /// Reject malformed known source forms without checking availability or build capabilities.
 /// Bare camera IDs and serials are resolved against discovery results on open.
 pub fn validate_selector_shape(selector: &str) -> Result<()> {
@@ -927,11 +950,21 @@ impl Camera {
         if frame.wall_ms == 0 {
             frame.wall_ms = crate::scheduling::now_ms();
         }
+        let now = Instant::now();
         let epoch = &mut self.epoch;
-        epoch.last_stale = epoch.stale > 0
-            || epoch
-                .stale_until
-                .is_some_and(|until| Instant::now() < until);
+        let counted = epoch.stale > 0 && epoch.counted_until.is_none_or(|until| now < until);
+        let held = epoch.stale_until.is_some_and(|until| now < until);
+        let clocked = match (epoch.since_ns, frame.device_ts_ns) {
+            (Some(since), Some(stamped)) if stamped < since => true,
+            // The first frame stamped after the change, at the end of its
+            // exposure on some cameras, may have begun before it.
+            (Some(_), Some(_)) => {
+                epoch.since_ns = None;
+                true
+            }
+            _ => false,
+        };
+        epoch.last_stale = counted || held || clocked;
         epoch.stale = epoch.stale.saturating_sub(1);
         epoch.pending = epoch.pending.saturating_sub(1);
         Ok(frame)
@@ -947,21 +980,44 @@ impl Camera {
         }
         self.backend.request_frame()
     }
+    /// Give up on the frame of the oldest software trigger fired: the
+    /// transport lost it, or it never came.
+    pub(crate) fn trigger_unanswered(&mut self) {
+        self.epoch.pending = self.epoch.pending.saturating_sub(1);
+    }
     /// Note that settings were written: until frames exposed after the
     /// change come, `frame_predates_change` says so of each frame.
-    /// `hardware_trigger` is how long after the change a hardware-triggered
-    /// camera may still deliver a frame exposed before it (its exposure and
-    /// read-out); None for a camera that is not hardware-triggered.
-    pub(crate) fn settings_changed(&mut self, hardware_trigger: Option<Duration>) {
+    pub(crate) fn settings_changed(&mut self, change: Change) {
         if !self.streaming {
             return;
         }
-        if let Some(hold) = hardware_trigger {
-            self.epoch.stale_until = Instant::now().checked_add(hold);
+        // Frames already on their way left the camera before the change.
+        let buffered = self.backend.buffered_frames();
+        let now = Instant::now();
+        if let Some(hold) = change.hardware_hold {
+            self.epoch.stale = buffered;
+            self.epoch.counted_until = None;
+            self.epoch.stale_until = now.checked_add(hold);
         } else if self.software_triggered() {
-            self.epoch.stale = self.epoch.pending;
+            let in_flight = if change.was_software {
+                self.epoch.pending.max(buffered)
+            } else {
+                // Switched from free-running: its frames being read out
+                // and exposed may still come, or the camera may drop them.
+                self.epoch
+                    .pending
+                    .saturating_add(buffered)
+                    .saturating_add(STALE_FRAMES)
+            };
+            let counting = self.epoch.counted_until.is_none_or(|until| now < until);
+            let earlier = if counting { self.epoch.stale } else { 0 };
+            self.epoch.stale = earlier.max(in_flight);
+            self.epoch.counted_until = now.checked_add(change.in_flight);
         } else {
-            self.epoch.stale = STALE_FRAMES;
+            self.epoch.stale = buffered.saturating_add(STALE_FRAMES);
+            self.epoch.counted_until = None;
+            // A clock that reads 0 was never latched.
+            self.epoch.since_ns = self.backend.device_time_ns().filter(|ns| *ns > 0);
         }
     }
     /// Settings this process emulates for the camera; see
@@ -1514,6 +1570,170 @@ pub(crate) mod tests {
         assert!(taken(&log).is_empty());
         assert!(camera.is_streaming());
         camera.next_frame(Duration::from_millis(10)).unwrap();
+    }
+
+    /// A stream whose frames wait in the host's buffers, stamped by a clock
+    /// the camera can latch: the test queues the frames it sends.
+    struct Queued {
+        device: Device,
+        frames: std::collections::VecDeque<u64>,
+        buffered: u32,
+        clock: Option<u64>,
+    }
+    impl crate::types::RegisterIo for Queued {
+        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+            self.device.read_memory(address, length)
+        }
+        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+            self.device.write_memory(address, data)
+        }
+    }
+    impl Backend for Queued {
+        fn xml(&mut self) -> Result<String> {
+            self.device.xml()
+        }
+        fn start(&mut self, payload: usize) -> Result<()> {
+            self.device.start(payload)
+        }
+        fn next_frame(&mut self, _: Duration) -> Result<Frame> {
+            let stamped = self.frames.pop_front().context("frame timeout")?;
+            Ok(Frame {
+                id: stamped,
+                width: 4,
+                height: 4,
+                pixel_format: crate::types::MONO8,
+                device_ts_ns: Some(stamped),
+                wall_ms: 0,
+                data: vec![0; 16],
+            })
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.device.stop()
+        }
+        fn buffered_frames(&mut self) -> u32 {
+            self.buffered
+        }
+        fn device_time_ns(&mut self) -> Option<u64> {
+            self.clock
+        }
+    }
+    /// A streaming camera that sends frames stamped `stamps`, and which of
+    /// them predate a change made before the first.
+    fn after_change(
+        device: Device,
+        buffered: u32,
+        clock: Option<u64>,
+        change: impl FnOnce(&mut Camera) -> Change,
+        stamps: &[u64],
+    ) -> Vec<bool> {
+        let queued = Queued {
+            device,
+            frames: stamps.iter().copied().collect(),
+            buffered,
+            clock,
+        };
+        let mut camera =
+            Camera::from_backend(crate::transport::simulator::info(), Box::new(queued)).unwrap();
+        camera.start().unwrap();
+        let change = change(&mut camera);
+        camera.settings_changed(change);
+        stamps
+            .iter()
+            .map(|_| {
+                camera.next_frame(Duration::ZERO).unwrap();
+                camera.frame_predates_change()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frames_sent_before_a_change_predate_it_wherever_they_waited() {
+        let plain = || Device::new(OPEN_ACQUISITION);
+        // Three frames wait in the host's buffers, then come the frame being
+        // read out and the one being exposed.
+        assert_eq!(
+            after_change(plain(), 3, None, |_| Change::default(), &[1, 2, 3, 4, 5, 6]),
+            [true, true, true, true, true, false]
+        );
+        // The camera's clock says more: frames it stamped before the change
+        // waited in the camera itself, and the first after it may have
+        // begun before it.
+        assert_eq!(
+            after_change(
+                plain(),
+                0,
+                Some(1000),
+                |_| Change::default(),
+                &[10, 20, 900, 1010, 1040]
+            ),
+            [true, true, true, true, false]
+        );
+        // A clock that reads 0 was never latched.
+        assert_eq!(
+            after_change(plain(), 0, Some(0), |_| Change::default(), &[1, 2, 3]),
+            [true, true, false]
+        );
+        // A hardware-triggered camera's frames for a while, besides those
+        // already sent.
+        let hold = Change {
+            hardware_hold: Some(Duration::from_secs(60)),
+            ..Change::default()
+        };
+        assert_eq!(
+            after_change(plain(), 1, None, |_| hold, &[1, 2]),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn a_stream_switched_to_software_triggers_counts_its_frames_in_flight_for_a_while() {
+        let triggers = || Device::new(&format!("{OPEN_ACQUISITION}{TRIGGER_NODES}"));
+        let switch = |in_flight: Duration| {
+            move |camera: &mut Camera| {
+                camera.set("TriggerSelector", "FrameStart").unwrap();
+                camera.set("TriggerSource", "Software").unwrap();
+                camera.set("TriggerMode", "On").unwrap();
+                Change {
+                    in_flight,
+                    ..Change::default()
+                }
+            }
+        };
+        // The free-running frames being read out and exposed when the
+        // trigger went on, besides the one already sent.
+        assert_eq!(
+            after_change(
+                triggers(),
+                1,
+                None,
+                switch(Duration::from_secs(60)),
+                &[1, 2, 3, 4]
+            ),
+            [true, true, true, false]
+        );
+        // The camera dropped them: once they could have come, the frames of
+        // the triggers fired since are new.
+        let dropped = after_change(triggers(), 0, None, switch(Duration::ZERO), &[1]);
+        assert_eq!(dropped, [false]);
+        // Already software triggered: only the frames of triggers fired
+        // before the change predate it.
+        let mut camera = device_camera(
+            triggers()
+                .with(TRIGGER_SELECTOR, 1)
+                .with(FRAME_TRIGGER_MODE, 1),
+        );
+        camera.start().unwrap();
+        camera.request_frame().unwrap();
+        camera.settings_changed(Change {
+            was_software: true,
+            in_flight: Duration::from_secs(60),
+            ..Change::default()
+        });
+        camera.next_frame(Duration::from_millis(10)).unwrap();
+        assert!(camera.frame_predates_change());
+        camera.request_frame().unwrap();
+        camera.next_frame(Duration::from_millis(10)).unwrap();
+        assert!(!camera.frame_predates_change());
     }
 
     #[test]

@@ -378,15 +378,15 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
     let results = if cameras.len() == 1 {
         vec![each(cameras[0])]
     } else if !args.dry_run && !args.background {
-        let ready = std::sync::Barrier::new(cameras.len());
-        let start = std::sync::OnceLock::new();
+        let together = Together::new(cameras.len());
         std::thread::scope(|scope| {
             let threads = cameras
                 .iter()
-                .map(|camera| {
-                    let (args, plan, ready, start) = (&args, &plan, &ready, &start);
+                .enumerate()
+                .map(|(index, camera)| {
+                    let (args, plan, together) = (&args, &plan, &together);
                     scope.spawn(move || {
-                        shoot_together(*camera, global, route, args, plan, ready, start)
+                        shoot_together(index, *camera, global, route, args, plan, together)
                     })
                 })
                 .collect::<Vec<_>>();
@@ -522,7 +522,7 @@ fn prepare(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// How long a stopped capture may take to finish the shot being saved.
+/// How long a stopped capture may take to save the frames it took.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 /// The frame wait of most cameras when none is given.
 const DEFAULT_WAIT: Duration = Duration::from_secs(5);
@@ -536,32 +536,117 @@ fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
 /// How long after every camera of a capture is armed their first frames
 /// are due: time to send each its job.
 const SYNC_LEAD_MS: u64 = 300;
+/// How long before a later first frame the cameras are armed: time to start
+/// streaming, FFmpeg's included, beside their warm-up.
+const ARM_AHEAD_MS: u64 = 3000;
 
-/// Capture from one of several cameras together: connected, set and
-/// streaming (warmed up) like the others before any takes a frame, then
-/// each takes its first frame at or after the same moment. Every camera's
-/// thread reaches `ready` whatever happens to it, so none waits for ever.
+/// What the threads of a capture from several cameras share as they line
+/// up their cameras.
+struct Together {
+    /// Every camera is connected and set.
+    prepared: std::sync::Barrier,
+    /// Every camera is armed.
+    ready: std::sync::Barrier,
+    /// The GigE cameras, by thread.
+    gige: std::sync::Mutex<Vec<Option<crate::types::CameraInfo>>>,
+    /// Each one's share of a host interface it shares with others.
+    shares: std::sync::OnceLock<Vec<Option<crate::network::Share>>>,
+    /// When the first frames are due.
+    start: std::sync::OnceLock<u64>,
+}
+impl Together {
+    fn new(cameras: usize) -> Self {
+        Self {
+            prepared: std::sync::Barrier::new(cameras),
+            ready: std::sync::Barrier::new(cameras),
+            gige: std::sync::Mutex::new(vec![None; cameras]),
+            shares: std::sync::OnceLock::new(),
+            start: std::sync::OnceLock::new(),
+        }
+    }
+    /// Camera `index`'s share of its host interface, once every thread
+    /// said which camera it holds: GigE cameras that stream on one
+    /// interface at once split its bandwidth, or lose packets.
+    fn share(&self, index: usize) -> Option<crate::network::Share> {
+        self.shares
+            .get_or_init(|| {
+                let gige = self.gige.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let cameras = gige.iter().flatten().cloned().collect::<Vec<_>>();
+                if cameras.len() < 2 {
+                    return vec![None; gige.len()];
+                }
+                let Ok(scan) = crate::network::scan(&[], &cameras, NETWORK_PROBE) else {
+                    return vec![None; gige.len()];
+                };
+                let shares = crate::network::shares(&scan);
+                gige.iter()
+                    .map(|camera| {
+                        let camera = camera.as_ref()?;
+                        scan.cameras
+                            .iter()
+                            .position(|scanned| scanned.camera.id == camera.id)
+                            .and_then(|position| shares[position].clone())
+                    })
+                    .collect()
+            })
+            .get(index)
+            .cloned()
+            .flatten()
+    }
+}
+
+/// How long finding the host interfaces of GigE cameras may take.
+const NETWORK_PROBE: Duration = Duration::from_secs(1);
+
+/// The camera `client` holds, when it is a GigE camera.
+fn gige_camera(client: &Client) -> Option<crate::types::CameraInfo> {
+    let status = client.status().ok()?;
+    serde_json::from_value::<crate::types::CameraInfo>(status["info"].clone())
+        .ok()
+        .filter(|info| info.transport == crate::types::Transport::GigE)
+}
+
+/// Capture from one of several cameras together: connected, set, paced to
+/// their share of a network interface they share and streaming (warmed
+/// up) like the others before any takes a frame, then each takes its first
+/// frame at or after the same moment. Every camera's thread reaches each
+/// barrier whatever happens to it, so none waits for ever.
 fn shoot_together(
+    index: usize,
     camera: Option<&str>,
     global: &Global,
     route: Route,
     args: &CaptureArgs,
     plan: &Plan,
-    ready: &std::sync::Barrier,
-    start: &std::sync::OnceLock<u64>,
+    together: &Together,
 ) -> Result<Value> {
-    let armed = Client::open_with(global, camera, route).and_then(|client| {
+    let prepared = Client::open_with(global, camera, route).and_then(|client| {
         prepare(&client, args, plan)?;
+        Ok(client)
+    });
+    if let Ok(client) = &prepared {
+        together.gige.lock().unwrap_or_else(|e| e.into_inner())[index] = gige_camera(client);
+    }
+    together.prepared.wait();
+    let share = together.share(index);
+    let armed = prepared.and_then(|client| {
+        // A camera streams only from shortly before a later first frame.
+        if let Some(first_at) = plan.first_at_ms {
+            sleep_until(first_at.saturating_sub(ARM_AHEAD_MS + plan.warmup_ms))?;
+        }
         let arm = client.call(SessionCommand::Arm {
             warmup_ms: Some(plan.warmup_ms),
+            bytes_per_second: share.as_ref().map(|share| share.bytes_per_second),
         })?;
         Ok((client, arm))
     });
-    ready.wait();
+    together.ready.wait();
     let (client, arm) = armed?;
-    let first_at = plan
-        .first_at_ms
-        .unwrap_or_else(|| *start.get_or_init(|| crate::scheduling::now_ms() + SYNC_LEAD_MS));
+    let first_at = plan.first_at_ms.unwrap_or_else(|| {
+        *together
+            .start
+            .get_or_init(|| crate::scheduling::now_ms() + SYNC_LEAD_MS)
+    });
     let mut result = run_job(&client, args, plan, Some(first_at));
     // A camera armed for this streams no longer, unless it has work.
     if arm["started"] == true {
@@ -574,8 +659,47 @@ fn shoot_together(
     }
     if let Ok(value) = &mut result {
         freshness(value, &arm);
+        paced(value, &arm, share.as_ref());
     }
     result
+}
+
+/// What a result says of the pace a GigE camera was held to, sharing a
+/// host interface with others of the capture, or why it could not be.
+fn paced(value: &mut Value, arm: &Value, share: Option<&crate::network::Share>) {
+    let Some(share) = share else {
+        return;
+    };
+    if arm["network"].is_object() {
+        value["bandwidth_mbps"] =
+            json!((share.bytes_per_second as f64 * 8.0 / 1e6 * 10.0).round() / 10.0);
+    } else if let Some(error) = arm["network_error"].as_str() {
+        let warning = format!(
+            "it shares {} with {} other camera(s) but could not be paced to its share: {error}",
+            share.interface,
+            share.sharers - 1
+        );
+        let mut warnings = value["warnings"].as_array().cloned().unwrap_or_default();
+        warnings.push(json!(crate::scrub::redact_urls(&warning)));
+        value["warnings"] = json!(warnings);
+    }
+}
+
+/// Wait until `at_ms`, UTC Unix milliseconds, unless a signal comes first.
+fn sleep_until(at_ms: u64) -> Result<()> {
+    loop {
+        if signals::interrupted() {
+            return Err(Categorized::error(
+                ErrorKind::Interrupted,
+                "interrupted before capturing",
+            ));
+        }
+        let left = at_ms.saturating_sub(crate::scheduling::now_ms());
+        if left == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(left.min(100)));
+    }
 }
 
 /// Run the capture job on one camera, its first frame at `first_at_ms` or
@@ -594,8 +718,8 @@ fn run_job(
     if args.background {
         return started(client, &id, plan);
     }
-    // A signal stops the job: the frame being saved is kept, nothing after
-    // it starts.
+    // A signal stops the job: the frames it took are saved while there is
+    // time, and nothing after them starts.
     client.stop_on_signal(&id);
     let mut seq = 0;
     let mut stopping: Option<Instant> = None;
@@ -660,11 +784,17 @@ fn started(client: &Client, id: &str, plan: &Plan) -> Result<Value> {
 }
 
 /// What a job saved, for errors: its files and, when there were more than
-/// listed, how many.
+/// listed, how many; and the frames that came, were dropped or arrived
+/// incomplete, which may say why it failed.
 fn saved(job: &Value, detail: &Value) -> Value {
     let mut value = json!({ "files": detail["files"].as_array().cloned().unwrap_or_default() });
     if let Some(truncated) = detail["truncated"].as_u64() {
         value["truncated"] = json!(truncated);
+    }
+    for key in ["frames", "dropped", "incomplete"] {
+        if detail[key].is_u64() {
+            value[key] = detail[key].clone();
+        }
     }
     value["job"] = job.clone();
     value
@@ -1177,8 +1307,12 @@ pub const FIELDS: &[(&str, &str)] = &[
         "int — with -c repeated: how far apart the cameras' first frames arrived; all were armed first and asked for a frame at the same moment",
     ),
     (
+        "bandwidth_mbps",
+        "float — with -c repeated, for GigE cameras that share a host network interface: the rate this one was paced to, its share of the interface (a warning when it could not be paced)",
+    ),
+    (
         "cameras",
-        "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,warnings?,inspect?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
+        "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,bandwidth_mbps?,warnings?,inspect?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
     ),
     (
         "job",

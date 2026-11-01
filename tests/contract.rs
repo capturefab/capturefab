@@ -397,6 +397,51 @@ fn names_take_banks_and_canonical_controls() {
     assert_eq!(on(&["get", "roi"])["values"]["roi"], "0,0,320,240");
     on(&["set", "roi=full"]);
     assert_eq!(on(&["get", "roi"])["values"]["roi"], "0,0,1920,1080");
+    // From an offset region to a larger one that would not fit beside its
+    // offsets: they move to 0, the size changes, then they move again.
+    on(&["set", "roi=1500,800,320,240"]);
+    let moved = on(&["set", "roi=100,100,1600,900"]);
+    assert_eq!(
+        changed_names(&moved),
+        ["OffsetX", "OffsetY", "Width", "Height"],
+        "{moved}"
+    );
+    assert_eq!(on(&["get", "roi"])["values"]["roi"], "100,100,1600,900");
+    // Named features follow the same rule: an offset that goes down is
+    // written before a size that only then fits.
+    let wider = on(&["set", "Width=1900", "OffsetX=0"]);
+    assert_eq!(changed_names(&wider), ["OffsetX", "Width"], "{wider}");
+    // An offset that goes up waits for the size that makes room.
+    let narrower = on(&["set", "OffsetX=1000", "Width=900"]);
+    assert_eq!(changed_names(&narrower), ["Width", "OffsetX"], "{narrower}");
+    // Banks by their value alone, and an auto turned off before its value.
+    let digital = on(&["set", "Gain[DigitalAll]=3"]);
+    assert_eq!(
+        digital["changed"],
+        json!([{"name":"Gain[DigitalAll]","from":0.0,"to":3.0}])
+    );
+    assert_eq!(
+        on(&["get", "Gain[GainSelector=DigitalAll]", "Gain"])["values"],
+        json!({"Gain[DigitalAll]": 3.0, "Gain": 0.0})
+    );
+    on(&["set", "GainAuto=Continuous"]);
+    let gain = on(&["set", "Gain=2"]);
+    assert_eq!(
+        changed_names(&gain),
+        ["GainAuto", "Gain[AnalogAll]"],
+        "{gain}"
+    );
+    assert_eq!(on(&["get", "GainAuto"])["values"]["GainAuto"], "Off");
+}
+
+/// The features a set changed, in the order it wrote them.
+fn changed_names(result: &Value) -> Vec<&str> {
+    result["changed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|change| change["name"].as_str().unwrap())
+        .collect()
 }
 
 #[test]
@@ -465,6 +510,25 @@ fn set_is_one_atomic_change() {
     assert_eq!(
         on(&["get", "ExposureTime"])["values"]["ExposureTime"],
         3000.0
+    );
+    // A later write the change cannot fit puts every earlier one back: an
+    // offset bounded by the width just written.
+    on(&["set", "roi=100,0,640,480"]);
+    let failed = home.fails(
+        2,
+        &["--session", "atomic", "set", "OffsetX=1000", "Width=1000"],
+    );
+    assert_eq!(failed["code"], "out_of_range", "{failed}");
+    assert_eq!(failed["details"]["feature"], "OffsetX", "{failed}");
+    assert_eq!(failed["details"]["max"], 920.0, "{failed}");
+    assert_eq!(
+        failed["details"]["rollback"],
+        json!({"restored": ["Width"], "failed": []}),
+        "{failed}"
+    );
+    assert_eq!(
+        on(&["get", "Width", "OffsetX"])["values"],
+        json!({"Width": 640, "OffsetX": 100})
     );
     // Geometry cannot change while the camera streams.
     let _live = home.serve_with("live", &["sim:live"], &["--live"]);
@@ -613,6 +677,33 @@ fn debug_rpc_takes_public_commands_only() {
         &["--json", "debug", "rpc", "-c", "sim:0"],
     );
     assert_eq!(run.success()["values"]["TriggerMode[FrameStart]"], "Off");
+    // A capture takes one frame and counts what the transport lost before
+    // it; more frames are a schedule's.
+    let capture = |count: u32| {
+        let output = home.path("rpc.png");
+        format!(
+            r#"{{"op":"capture","output":{},"count":{count},"timeout_ms":2000,"format":"png"}}"#,
+            json!(output.to_str().unwrap())
+        )
+    };
+    let run = home.run_stdin(
+        &capture(1),
+        &["--json", "debug", "rpc", "-c", "sim:0?drop=0.3"],
+    );
+    let shot = run.success();
+    assert_eq!(shot["files"].as_array().unwrap().len(), 1, "{shot}");
+    let first = shot["frame"]["id"].as_u64().unwrap();
+    let lost = shot["dropped"].as_u64().unwrap() + shot["incomplete"].as_u64().unwrap();
+    assert_eq!(lost, first - 1, "{shot}");
+    let run = home.run_stdin(&capture(3), &["--json", "debug", "rpc", "-c", "sim:0"]);
+    assert!(
+        run.failure(2)["message"]
+            .as_str()
+            .unwrap()
+            .contains("schedule"),
+        "{}",
+        run.stdout
+    );
     let xml = home.ok(&["debug", "xml", "-c", "sim:0"]);
     assert!(xml["xml"].as_str().unwrap().contains("RegisterDescription"));
     let read = home.ok(&["debug", "read", "-c", "sim:0", "0x100", "4"]);
@@ -624,6 +715,12 @@ fn schema_describes_every_command_and_its_results() {
     let home = Home::new("schema");
     let schema = home.ok(&["schema"]);
     assert_eq!(schema["contract_version"], 1);
+    // The simulator's options for rehearsing frame loss and triggers.
+    let selector = schema["grammars"]["selector"].as_str().unwrap();
+    assert!(
+        selector.contains("drop=") && selector.contains("line0=every:"),
+        "{selector}"
+    );
     let commands = schema["commands"]
         .as_array()
         .unwrap()
@@ -1129,6 +1226,7 @@ fn preset_apply_refuses_before_changing_and_keeps_reasons() {
     // too, and nothing changes.
     let direct = |args: &[&str]| home.ok(&[&["--no-session"][..], args].concat());
     direct(&["preset", "save", "warm", "-c", "sim:thermal"]);
+    direct(&["set", "-c", "sim:thermal", "AcquisitionFrameRate=12"]);
     for flags in [&["--dry-run"][..], &[]] {
         let error = home.fails(
             5,
@@ -1148,6 +1246,10 @@ fn preset_apply_refuses_before_changing_and_keeps_reasons() {
         );
         assert_eq!(error["code"], "unsupported", "{error}");
     }
+    assert_eq!(
+        direct(&["get", "-c", "sim:thermal", "AcquisitionFrameRate"])["values"]["AcquisitionFrameRate"],
+        12.0
+    );
     // A saved value that does not fit fails with its own reason, and what
     // was written is put back.
     let mut document = on(&["preset", "show", "p1"]);

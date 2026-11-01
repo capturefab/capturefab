@@ -356,8 +356,16 @@ impl JobBook {
     pub(super) fn accepted(&self, number: u64, detail: Value) {
         let mut book = self.lock();
         if let Some(job) = book.find(number) {
-            if job.detail.is_null() {
-                job.follow(detail);
+            match (&mut job.detail, detail) {
+                (Value::Null, detail) => job.follow(detail),
+                // Its worker's lines that came first stay; the reply adds
+                // what only it says, such as a recording's warm-up.
+                (Value::Object(known), Value::Object(reply)) => {
+                    for (key, value) in reply {
+                        known.entry(key).or_insert(value);
+                    }
+                }
+                _ => {}
             }
             job.touch();
         }
@@ -676,6 +684,26 @@ mod tests {
         assert_eq!(doc["last_file"], "/b.png");
         assert!(!doc.to_string().contains("secret"), "{doc}");
         assert_eq!(job.detail()["files"], json!(["/a.png", "/b.png"]));
+    }
+
+    #[test]
+    fn a_reply_after_its_jobs_first_lines_adds_what_only_it_says() {
+        let book = JobBook::new("bench");
+        let number = book.start(JobKind::Record, "sim:0", None, false);
+        book.event(&Output::Progress {
+            job: number,
+            progress: json!({"written": 3}),
+        });
+        book.accepted(
+            number,
+            json!({"since_ms": 1, "warmup_ms": 52, "settled": false, "written": 0}),
+        );
+        let detail = book.get(number).unwrap().detail();
+        assert_eq!(
+            (&detail["written"], &detail["warmup_ms"], &detail["settled"]),
+            (&json!(3), &json!(52), &json!(false)),
+            "{detail}"
+        );
     }
 
     #[test]

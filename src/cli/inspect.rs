@@ -429,6 +429,9 @@ fn document(info: &Value, reply: &Value, threshold: f64, verbose: bool) -> Value
             "height": frame["height"],
             "pixel_format": frame["pixel_format"],
             "bits": info["bits"],
+            "id": frame["id"].as_u64().filter(|id| *id > 0),
+            "device_ts_ns": frame["device_ts_ns"],
+            "time": frame["wall_ms"].as_u64().filter(|ms| *ms > 0).map(crate::scheduling::rfc3339),
             "age_ms": frame["age_ms"],
         },
         "verdict": verdict,
@@ -468,6 +471,9 @@ fn document(info: &Value, reply: &Value, threshold: f64, verbose: bool) -> Value
     }
     if let Some(ms) = reply["warmup_ms"].as_u64() {
         value["warmup_ms"] = json!(ms);
+        if reply["settled"] == false {
+            value["settled"] = json!(false);
+        }
     }
     if reply["warnings"].is_array() {
         value["warnings"] = reply["warnings"].clone();
@@ -628,7 +634,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("camera", "string — camera ID"),
     (
         "frame",
-        "{width,height,pixel_format,bits?,age_ms} — the frame measured, taken after the command began",
+        "{width,height,pixel_format,bits?,id?,device_ts_ns?,time,age_ms} — the frame measured, taken after the command began: its block ID and the camera's clock (ns, never a date) where the transport has them, and when it arrived",
     ),
     (
         "exposure",
@@ -679,6 +685,10 @@ pub const FIELDS: &[(&str, &str)] = &[
         "int — how long a camera that sets its own exposure took to settle after it started",
     ),
     (
+        "settled",
+        "false — its exposure was still changing when --warmup ran out (verdict not_settled, with a warning)",
+    ),
+    (
         "warnings",
         "[string] — such as a camera still settling when --warmup ran out (verdict not_settled)",
     ),
@@ -693,7 +703,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("notes", "[string] — with -v"),
     (
         "cameras",
-        "[{camera,frame,exposure?,verdict,suggest?,focus?,settings,preview?,after_change?,frames?,dropped?,incomplete?,resent?,warmup_ms?,warnings?,series?,best?,histogram?,channels?,region?,notes?}] — with -c repeated",
+        "[{camera,frame,exposure?,verdict,suggest?,focus?,settings,preview?,after_change?,frames?,dropped?,incomplete?,resent?,warmup_ms?,settled?,warnings?,series?,best?,histogram?,channels?,region?,notes?}] — with -c repeated",
     ),
 ];
 

@@ -130,7 +130,7 @@ pub(super) struct Limits {
 pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Result<Value> {
     let info = client.call(SessionCommand::Info)?;
     adjustable(&info)?;
-    let once = once_features(client)?;
+    let once = once_features(client, &info)?;
     if limits.region.is_none() && limits.max_exposure_us.is_none() && !once.is_empty() {
         return settle_once(client, &info, &once, timeout);
     }
@@ -214,8 +214,9 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
 }
 
 /// The camera's own auto functions with a Once mode: ExposureAuto, and
-/// GainAuto beside it.
-fn once_features(client: &Client) -> Result<Vec<String>> {
+/// GainAuto beside it, and BalanceWhiteAuto on a color camera, which the
+/// image then needs balanced as much as exposed.
+fn once_features(client: &Client, info: &Value) -> Result<Vec<String>> {
     let listed = client.call(SessionCommand::FeatureList {
         filter: FeatureFilter {
             pattern: Some("*Auto".into()),
@@ -223,6 +224,10 @@ fn once_features(client: &Client) -> Result<Vec<String>> {
             category: None,
         },
     })?;
+    Ok(with_once(&listed, info))
+}
+
+fn with_once(listed: &Value, info: &Value) -> Vec<String> {
     let once = |name: &str| {
         listed["features"]
             .as_array()
@@ -237,13 +242,16 @@ fn once_features(client: &Client) -> Result<Vec<String>> {
             })
     };
     if !once("ExposureAuto") {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    Ok(["ExposureAuto", "GainAuto"]
+    let color = info["pixel_format"]
+        .as_str()
+        .is_some_and(|format| !format.starts_with("Mono"));
+    ["ExposureAuto", "GainAuto", "BalanceWhiteAuto"]
         .into_iter()
-        .filter(|name| once(name))
+        .filter(|name| (color || *name != "BalanceWhiteAuto") && once(name))
         .map(String::from)
-        .collect())
+        .collect()
 }
 
 /// Settle with the camera's own auto functions set to Once, which return
@@ -452,3 +460,28 @@ pub const FIELDS: &[(&str, &str)] = &[
         ),
     ),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_color_camera_balances_white_once_beside_exposure() {
+        let row = |name: &str, choices: &[&str]| json!({"name": name, "access": "rw", "choices": choices});
+        let listed = json!({"features": [
+            row("ExposureAuto", &["Off", "Once", "Continuous"]),
+            row("GainAuto", &["Off", "Once"]),
+            row("BalanceWhiteAuto", &["Off", "Once", "Continuous"]),
+        ]});
+        let color = json!({"pixel_format": "BayerRG8"});
+        assert_eq!(
+            with_once(&listed, &color),
+            ["ExposureAuto", "GainAuto", "BalanceWhiteAuto"]
+        );
+        let mono = json!({"pixel_format": "Mono8"});
+        assert_eq!(with_once(&listed, &mono), ["ExposureAuto", "GainAuto"]);
+        // White balance alone is not exposure.
+        let balance_only = json!({"features": [row("ExposureAuto", &["Off", "Continuous"]), row("BalanceWhiteAuto", &["Off", "Once"])]});
+        assert!(with_once(&balance_only, &color).is_empty());
+    }
+}

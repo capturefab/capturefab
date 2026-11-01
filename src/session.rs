@@ -87,6 +87,10 @@ pub enum SessionCommand {
         /// The longest warm-up, in milliseconds; 2 s when unset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warmup_ms: Option<u64>,
+        /// A GigE camera's share of the host interface it streams on beside
+        /// the others armed with it, which it is paced to before it starts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bytes_per_second: Option<u64>,
     },
     /// Read the camera's writable configuration values for a new saved
     /// setup. Read-only: selectors are switched only to read and restored.
@@ -588,10 +592,7 @@ impl SessionCommand {
                         "scheduled capture requires a file or directory"
                     );
                 } else {
-                    ensure!(
-                        output != "-" || *count == 1,
-                        "stdout output needs one frame"
-                    );
+                    ensure!(*count == 1, "{}", crate::engine::ONE_FRAME);
                 }
                 if let Self::Capture {
                     quality, stdout, ..
@@ -633,7 +634,16 @@ impl SessionCommand {
                     ensure!(*job != Some(0), "capture job ID must be positive");
                 }
             }
-            Self::Arm { warmup_ms } => validate_warmup(*warmup_ms)?,
+            Self::Arm {
+                warmup_ms,
+                bytes_per_second,
+            } => {
+                validate_warmup(*warmup_ms)?;
+                ensure!(
+                    *bytes_per_second != Some(0),
+                    "a camera's share of its network must be positive"
+                );
+            }
             Self::Wait {
                 job, timeout_ms, ..
             } => {
@@ -2300,11 +2310,15 @@ impl SessionHandle {
         };
         let detail = match kind {
             JobKind::Capture => reply["job"].clone(),
-            JobKind::Record => json!({
+            // The warm-up before the first frame is the recording's to
+            // report when it ends.
+            JobKind::Record => crate::types::without_nulls(json!({
                 "since_ms": reply["since_ms"],
                 "until_ms": reply["until_ms"],
                 "path": reply["path"],
-            }),
+                "warmup_ms": reply["warmup_ms"],
+                "settled": reply["settled"],
+            })),
             JobKind::Auto => reply["auto"].clone(),
         };
         self.inner.jobs.accepted(number, detail);

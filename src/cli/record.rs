@@ -336,10 +336,10 @@ impl Recording<'_> {
                 if job["state"] == "failed" {
                     return Err(self.failure(&job, &detail));
                 }
-                return Ok(json!({ "job": job }));
+                return Ok(warmed(json!({ "job": job }), &detail));
             }
             if job["state"] != "armed" {
-                return Ok(json!({ "job": job }));
+                return Ok(warmed(json!({ "job": job }), &detail));
             }
             if self.first_frame_wait().is_some() && self.first_frame_left().is_zero() {
                 let _ = self.stop();
@@ -485,15 +485,21 @@ impl Recording<'_> {
             value["fps_actual"] = json!((frames as f64 / duration_s * 100.0).round() / 100.0);
         }
         value["fps"] = json!(self.fps);
-        if let Some(ms) = detail["warmup_ms"].as_u64() {
-            value["warmup_ms"] = json!(ms);
-            if detail["settled"] == false {
-                value["settled"] = json!(false);
-                value["warnings"] = json!([crate::engine::unsettled_warning(ms)]);
-            }
-        }
-        crate::types::without_nulls(value)
+        crate::types::without_nulls(warmed(value, detail))
     }
+}
+
+/// A result with the warm-up the recording waited for, from its worker's
+/// account, and a warning when the camera had not settled.
+fn warmed(mut value: Value, detail: &Value) -> Value {
+    if let Some(ms) = detail["warmup_ms"].as_u64() {
+        value["warmup_ms"] = json!(ms);
+        if detail["settled"] == false {
+            value["settled"] = json!(false);
+            value["warnings"] = json!([crate::engine::unsettled_warning(ms)]);
+        }
+    }
+    value
 }
 
 fn text(value: &Value) -> String {

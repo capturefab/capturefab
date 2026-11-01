@@ -104,7 +104,7 @@ struct Harness {
     auto: Option<AutoController>,
     jobs: Vec<Scheduled>,
     next_job: u64,
-    scheduled_stream: bool,
+    scheduled_stream: JobStream,
 }
 
 impl Harness {
@@ -138,7 +138,7 @@ impl Harness {
             auto: None,
             jobs: Vec::new(),
             next_job: 1,
-            scheduled_stream: false,
+            scheduled_stream: JobStream::default(),
         };
         refresh(&harness.handle, &mut harness.camera, false);
         harness.backend.lock().unwrap().calls.clear();
@@ -188,6 +188,36 @@ fn running_preview_is_paused_tuned_and_resumed() {
     assert_eq!(result["tuning"]["throughput_limit_bps"], 33_333_000);
     assert!(harness.camera.as_ref().unwrap().is_streaming());
     assert!(harness.handle.snapshot().streaming);
+}
+
+#[test]
+fn a_camera_armed_beside_others_is_paced_to_its_share_first() {
+    let mut harness = Harness::new(Transport::GigE, false);
+    let arm = |bytes_per_second| SessionCommand::Arm {
+        warmup_ms: Some(0),
+        bytes_per_second,
+    };
+    let armed = harness.run(arm(Some(33_333_333))).unwrap();
+    assert_eq!(harness.transport_calls(), [Call::Optimize, Call::Start]);
+    assert_eq!(armed["network"]["throughput_limit_bps"], 33_333_000);
+    assert_eq!(armed["started"], true);
+    // One that cannot be paced streams anyway, and says why.
+    let mut harness = Harness::new(Transport::GigE, false);
+    harness.backend.lock().unwrap().fail_tuning = true;
+    let armed = harness.run(arm(Some(33_333_333))).unwrap();
+    assert!(
+        armed["network_error"]
+            .as_str()
+            .unwrap()
+            .contains("injected tuning failure"),
+        "{armed}"
+    );
+    assert!(harness.camera.as_ref().unwrap().is_streaming());
+    // Alone on its interface, it keeps the camera's own pace.
+    let mut harness = Harness::new(Transport::GigE, false);
+    let armed = harness.run(arm(None)).unwrap();
+    assert_eq!(harness.transport_calls(), [Call::Start]);
+    assert!(armed.get("network").is_none());
 }
 
 #[test]
@@ -289,6 +319,11 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
             },
             on_exists: Default::default(),
             next: None,
+            shots: 0,
+            free: Default::default(),
+            stop_by: None,
+            trigger: None,
+            unanswered: 0,
             saving: 0,
             baseline: None,
             info: crate::scheduling::CaptureJob {

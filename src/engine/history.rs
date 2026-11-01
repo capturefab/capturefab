@@ -375,7 +375,7 @@ pub(super) fn process(
     auto: &mut Option<AutoController>,
     jobs: &mut Vec<Scheduled>,
     next_job: &mut u64,
-    scheduled_stream: &mut bool,
+    scheduled_stream: &mut JobStream,
     command: WorkerCommand,
 ) -> Result<Value> {
     command.validate()?;
@@ -721,7 +721,7 @@ mod tests {
             Camera::from_backend(crate::transport::simulator::info(), Box::new(Banks)).unwrap(),
         );
         let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, false);
+        let (mut next, mut scheduled) = (1, JobStream::default());
         let mut run = |camera: &mut Option<Camera>, command| {
             process(
                 &h,
@@ -875,7 +875,7 @@ mod tests {
                 &mut None,
                 &mut Vec::new(),
                 &mut 1,
-                &mut false,
+                &mut JobStream::default(),
                 command,
             )
         };
@@ -985,7 +985,7 @@ mod tests {
         // Connecting walks the features once.
         refresh(&h, &mut camera, true);
         let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, false);
+        let (mut next, mut scheduled) = (1, JobStream::default());
         let mut walked = |camera: &mut Option<Camera>, command| {
             let before = walks.load(Ordering::Relaxed);
             let result = process(
@@ -1063,7 +1063,7 @@ mod tests {
             &mut None,
             &mut Vec::new(),
             &mut 1,
-            &mut false,
+            &mut JobStream::default(),
             WorkerCommand::SetMany {
                 values: vec![crate::session::FeatureValue {
                     feature: "Width".into(),

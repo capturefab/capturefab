@@ -89,6 +89,37 @@ fn a_timed_recording_ends_on_its_duration() {
     assert!(decodes(&home.path("lossless.mkv")));
 }
 
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_recording_reports_its_warm_up() {
+    let home = Home::new("record-warm-up");
+    // Far too dark, with the camera's own continuous auto exposure.
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "ExposureTime=50",
+        "ExposureAuto=Continuous",
+    ]);
+    let short = home.ok(&[
+        "record",
+        "-c",
+        "sim:0",
+        "-o",
+        "short.mp4",
+        "--for",
+        "1s",
+        "--warmup",
+        "50ms",
+    ]);
+    assert!(short["warmup_ms"].as_u64().unwrap() >= 50, "{short}");
+    assert_eq!(short["settled"], false, "{short}");
+    assert!(short["warnings"][0].as_str().unwrap().contains("--warmup"));
+    let settled = home.ok(&["record", "-c", "sim:0", "-o", "settled.mp4", "--for", "1s"]);
+    assert!(settled["warmup_ms"].is_u64(), "{settled}");
+    assert!(settled.get("settled").is_none(), "{settled}");
+}
+
 #[cfg(unix)]
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]

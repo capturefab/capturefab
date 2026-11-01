@@ -7,7 +7,7 @@ use std::time::Duration;
 /// One camera.
 #[derive(Debug, Clone, Default, Args)]
 pub struct CameraArg {
-    /// Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)
+    /// Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)
     #[arg(
         short = 'c',
         long = "camera",
@@ -21,7 +21,7 @@ pub struct CameraArg {
 /// One or more cameras, `-c` repeated.
 #[derive(Debug, Clone, Default, Args)]
 pub struct CamerasArg {
-    /// Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)
+    /// Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&line0=every:500ms] (default: the only one)
     #[arg(
         short = 'c',
         long = "camera",

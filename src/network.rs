@@ -864,6 +864,37 @@ where
     }
 }
 
+/// What a camera streaming beside others on one host interface may send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Share {
+    pub bytes_per_second: u64,
+    pub interface: String,
+    /// The cameras of the scan that share the interface, this one too.
+    pub sharers: usize,
+}
+
+/// The share of their host interface each camera of `scan` may send when
+/// they all stream at once, in the scan's order: None for a camera alone
+/// on its interface, or whose path is not known.
+pub fn shares(scan: &NetworkScan) -> Vec<Option<Share>> {
+    scan.cameras
+        .iter()
+        .map(|camera| {
+            let interface = camera.interface.as_ref().filter(|_| camera.reachable)?;
+            let sharers = scan
+                .cameras
+                .iter()
+                .filter(|other| other.reachable && other.interface.as_ref() == Some(interface))
+                .count();
+            (sharers >= 2).then(|| Share {
+                bytes_per_second: budget_bytes_per_second(camera, &scan.interfaces, sharers),
+                interface: interface.clone(),
+                sharers,
+            })
+        })
+        .collect()
+}
+
 /// Reserve 20% of the adapter's negotiated line rate for packet headers,
 /// control, resends and other traffic; share the remainder across active cameras
 /// on that adapter. Routed, wireless and unknown paths get conservative caps.
@@ -1604,6 +1635,32 @@ mod tests {
             budget_bytes_per_second(&checked(&interface, "10.0.0.2"), &[interface], 1),
             10_000_000
         );
+    }
+
+    #[test]
+    fn cameras_on_one_interface_share_it_and_a_lone_one_keeps_it() {
+        let wired = nic(InterfaceKind::Wired, Some(1000));
+        let mut other = nic(InterfaceKind::Wired, Some(1000));
+        other.name = "en9".into();
+        let mut lost = checked(&wired, "192.168.5.5");
+        lost.reachable = false;
+        let scan = NetworkScan {
+            interfaces: vec![wired.clone(), other.clone()],
+            cameras: vec![
+                checked(&wired, "192.168.5.2"),
+                checked(&other, "192.168.5.3"),
+                checked(&wired, "192.168.5.4"),
+                lost,
+            ],
+            warnings: Vec::new(),
+            scanned_at_ms: 0,
+        };
+        let shared = Some(Share {
+            bytes_per_second: 50_000_000,
+            interface: wired.name.clone(),
+            sharers: 2,
+        });
+        assert_eq!(shares(&scan), [shared.clone(), None, shared, None]);
     }
 
     #[test]

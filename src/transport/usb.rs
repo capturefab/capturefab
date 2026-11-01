@@ -13,6 +13,7 @@ use nusb::{
     },
 };
 use std::{
+    collections::VecDeque,
     num::NonZeroU8,
     time::{Duration, Instant},
 };
@@ -518,6 +519,8 @@ struct Stream {
     /// Transfers submitted and not yet returned.
     submitted: usize,
     frame: Option<Frame>,
+    /// Frames, or why one was lost, taken in ahead of `next`.
+    taken: VecDeque<Result<Frame>>,
     /// Linux refused a submit for lack of usbfs memory: hold buffers back
     /// until a transfer completes and frees some.
     starved: bool,
@@ -552,6 +555,7 @@ impl Stream {
             idle: Vec::new(),
             submitted: 0,
             frame: None,
+            taken: VecDeque::new(),
             starved: false,
         }
     }
@@ -571,6 +575,9 @@ impl Stream {
     /// Wait for the next whole frame. A lost frame returns one error, and
     /// the transfers after it go on to the next frame.
     fn next(&mut self, transfers: &mut impl Transfers, deadline: Instant) -> Result<Frame> {
+        if let Some(taken) = self.taken.pop_front() {
+            return taken;
+        }
         loop {
             if self.submitted == 0 {
                 // Linux refused every submit: retry shortly, as Aravis does.
@@ -592,6 +599,28 @@ impl Stream {
                 return Ok(frame);
             }
         }
+    }
+    /// Take in the transfers that already completed, keeping what they
+    /// hold for `next`. Returns how many frames it holds that `next` has
+    /// not returned, whole or in part.
+    fn take_in(&mut self, transfers: &mut impl Transfers) -> u32 {
+        while self.submitted > 0 {
+            let Some(completion) = transfers.wait(Duration::ZERO) else {
+                break;
+            };
+            self.submitted -= 1;
+            let received = self.receive(completion);
+            if !self.starved {
+                self.fill(transfers);
+            }
+            match received {
+                Ok(Some(frame)) => self.taken.push_back(Ok(frame)),
+                Ok(None) => {}
+                Err(error) => self.taken.push_back(Err(error)),
+            }
+        }
+        let frames = self.taken.iter().filter(|taken| taken.is_ok()).count();
+        u32::try_from(frames + usize::from(self.frame.is_some())).unwrap_or(u32::MAX)
     }
     fn receive(&mut self, completion: Completion) -> Result<Option<Frame>> {
         let Completion {
@@ -1216,6 +1245,12 @@ impl Backend for UsbBackend {
         }
         frame
     }
+    fn buffered_frames(&mut self) -> u32 {
+        match self.stream.as_mut() {
+            Some(stream) => stream.take_in(&mut self.stream_in),
+            None => 0,
+        }
+    }
     fn stop(&mut self) -> Result<()> {
         let was_started = self.stream.take().is_some();
         let result = if was_started {
@@ -1248,7 +1283,6 @@ impl Drop for UsbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
 
     #[test]
     fn open_failures_name_the_fix_for_this_os() {
@@ -1752,6 +1786,29 @@ mod tests {
             bus.send(&trailer(id, 12 * MPS));
             assert_eq!(next(&mut stream, &mut bus).unwrap().id, id);
         }
+    }
+    #[test]
+    fn frames_already_received_are_taken_in_and_returned_in_turn() {
+        let block = 4 * MPS;
+        let expected = 10 * MPS;
+        let (mut stream, mut bus) = streaming(expected, block);
+        bus.frame(1, &image(1, expected), block);
+        bus.frame(2, &image(2, expected), block);
+        // The third has its leader and part of its image so far.
+        bus.send(&leader(3, expected as u32, 1));
+        bus.send(&image(3, expected)[..block]);
+        assert_eq!(stream.take_in(&mut bus), 3);
+        assert!(bus.packets.is_empty());
+        for id in 1..=2 {
+            assert_eq!(next(&mut stream, &mut bus).unwrap().id, id);
+        }
+        for chunk in image(3, expected)[block..].chunks(block) {
+            bus.send(chunk);
+        }
+        bus.send(&trailer(3, expected));
+        let third = next(&mut stream, &mut bus).unwrap();
+        assert_eq!((third.id, third.data), (3, image(3, expected)));
+        assert_eq!(stream.take_in(&mut bus), 0);
     }
     #[test]
     fn image_ending_like_a_header_is_image_data() {

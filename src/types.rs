@@ -97,6 +97,17 @@ pub trait Backend: RegisterIo {
     fn stats(&self) -> Option<TransportStats> {
         None
     }
+    /// Take in what already arrived, keeping the frames for `next_frame`,
+    /// and say how many frames it holds that `next_frame` has not returned,
+    /// whole or in part: frames that left the camera before now.
+    fn buffered_frames(&mut self) -> u32 {
+        0
+    }
+    /// The camera's clock now, as `Frame::device_ts_ns` reads it, where the
+    /// transport can latch it.
+    fn device_time_ns(&mut self) -> Option<u64> {
+        None
+    }
     /// The settings this process keeps for a camera that has nowhere else
     /// to keep them, as a simulator's registers or a webcam's video mode:
     /// a real camera keeps its settings until it is powered off. None for a

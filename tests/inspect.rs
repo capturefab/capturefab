@@ -14,6 +14,12 @@ fn inspect_measures_a_fresh_frame_and_leaves_a_private_preview() {
     assert_eq!(measured["frame"]["width"], 640);
     assert_eq!(measured["frame"]["pixel_format"], "Mono8");
     assert_eq!(measured["frame"]["bits"], 8);
+    // Which frame it was, by the camera's clock and the host's.
+    assert!(measured["frame"]["id"].as_u64().unwrap() > 0, "{measured}");
+    assert!(measured["frame"]["device_ts_ns"].is_u64(), "{measured}");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(measured["frame"]["time"].as_str().unwrap()).is_ok()
+    );
     for key in ["mean", "p1", "p50", "p99", "clipped_low", "clipped_high"] {
         let share = measured["exposure"][key].as_f64().unwrap();
         assert!((0.0..=1.0).contains(&share), "{key}: {measured}");
