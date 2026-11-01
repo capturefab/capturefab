@@ -694,6 +694,7 @@ fn discard(_: &std::path::Path, dir: &std::path::Path, lock: fs::File) {
 /// A fallback copy private to this process, in a new temporary directory.
 fn private_copy(payload: &Payload<'_>) -> Result<Executable> {
     let directory = std::env::temp_dir().join(format!("capturefab-ffmpeg-{}", nonce()?));
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
     {

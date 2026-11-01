@@ -4,7 +4,6 @@ mod support;
 
 use serde_json::Value;
 use std::{
-    path::Path,
     process::Stdio,
     time::{Duration, Instant},
 };
@@ -186,7 +185,7 @@ fn serve_finishes_a_recording_on_a_signal() {
         let exit = serve.signal(signal);
         assert!(exit.success(), "{name}: {exit:?}");
         assert!(std::fs::metadata(&clip).unwrap().len() > 0);
-        assert!(decodes(Path::new(&clip)), "{name}");
+        assert!(decodes(std::path::Path::new(&clip)), "{name}");
         // Complete in the storage ledger too, with nothing left reserved.
         let storage = home.ok(&["storage", "status"]);
         assert_eq!(storage["files"], 1, "{name}: {storage}");

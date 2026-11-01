@@ -539,7 +539,7 @@ mod platform_stop {
         let theirs = std::path::PathBuf::from(String::from_utf8_lossy(&path).into_owned());
         std::env::current_exe().is_ok_and(|ours| theirs.file_name() == ours.file_name())
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     fn serves(_pid: libc::pid_t, _name: &str) -> bool {
         true
     }
