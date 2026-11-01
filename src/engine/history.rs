@@ -373,26 +373,26 @@ pub(super) fn process(
     jobs: &mut Vec<Scheduled>,
     next_job: &mut u64,
     scheduled_stream: &mut bool,
-    command: SessionCommand,
+    command: WorkerCommand,
 ) -> Result<Value> {
     command.validate()?;
-    if let SessionCommand::Set { feature, value } = &command {
+    if let WorkerCommand::Set { feature, value } = &command {
         camera_mut(camera)?.validate_set(feature, value)?;
     }
-    match &command {
+    match command.session() {
         // Reading and comparing switch selectors only to read, and restore them.
-        SessionCommand::ReadSetup => return setup::read(h, camera_mut(camera)?, auto),
-        SessionCommand::SetupDiff {
+        Some(SessionCommand::ReadSetup) => return setup::read(h, camera_mut(camera)?, auto),
+        Some(SessionCommand::SetupDiff {
             setup: Some(document),
             allow_other_model,
             ..
-        } => {
+        }) => {
             let holders = setup::stream_holders(forwarder, jobs);
             let c = camera_mut(camera)?;
             let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
             return Ok(setup::report(&plan, &c.info));
         }
-        SessionCommand::SetupDiff { .. } | SessionCommand::ApplySetup { setup: None, .. } => {
+        Some(SessionCommand::SetupDiff { .. } | SessionCommand::ApplySetup { setup: None, .. }) => {
             anyhow::bail!("preset names are resolved by the session coordinator")
         }
         _ => {}
@@ -401,11 +401,13 @@ pub(super) fn process(
     // replace is read first, and a failure puts every value back. A single
     // Set writes several only when it ends auto mode.
     let atomic = match &command {
-        SessionCommand::Set { feature, .. } => auto.as_ref().is_some_and(|a| a.manages(feature)),
-        SessionCommand::SetMany { .. }
-        | SessionCommand::Auto { .. }
-        | SessionCommand::Manual { .. }
-        | SessionCommand::ApplySetup { .. } => true,
+        WorkerCommand::Set { feature, .. } => auto.as_ref().is_some_and(|a| a.manages(feature)),
+        WorkerCommand::SetMany { .. }
+        | WorkerCommand::Session(
+            SessionCommand::Auto { .. }
+            | SessionCommand::Manual { .. }
+            | SessionCommand::ApplySetup { .. },
+        ) => true,
         _ => false,
     };
     if !atomic {
@@ -424,12 +426,12 @@ pub(super) fn process(
     // A setup is compared again here, by the camera's owner, right before
     // it is restored; only the values it changes are required readable.
     let setup_plan = match &command {
-        SessionCommand::ApplySetup {
+        WorkerCommand::Session(SessionCommand::ApplySetup {
             setup: Some(document),
             allow_other_model,
             strict,
             ..
-        } => {
+        }) => {
             let holders = setup::stream_holders(forwarder, jobs);
             let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
             plan.check(*strict)?;
@@ -442,7 +444,7 @@ pub(super) fn process(
     // written, so its feature need not be readable at the bank selected now
     // (an input line hides an output's source).
     let written = match &command {
-        SessionCommand::ApplySetup { .. } => setup_plan
+        WorkerCommand::Session(SessionCommand::ApplySetup { .. }) => setup_plan
             .iter()
             .flat_map(|plan| {
                 plan.changes()
@@ -450,17 +452,17 @@ pub(super) fn process(
                     .map(|row| row.address.feature.as_str())
             })
             .collect(),
-        SessionCommand::Set { feature, .. } => vec![feature.as_str()],
-        SessionCommand::SetMany { values } => {
+        WorkerCommand::Set { feature, .. } => vec![feature.as_str()],
+        WorkerCommand::SetMany { values } => {
             values.iter().map(|value| value.feature.as_str()).collect()
         }
         _ => Vec::new(),
     };
-    let apply_setup = matches!(command, SessionCommand::ApplySetup { .. });
+    let apply_setup = matches!(command.session(), Some(SessionCommand::ApplySetup { .. }));
     let mut before = match capture(h, c, auto, &written) {
         Ok(before) => before,
         // Its values must be restorable together, so it writes none.
-        Err(error) if apply_setup || matches!(command, SessionCommand::SetMany { .. }) => {
+        Err(error) if apply_setup || matches!(command, WorkerCommand::SetMany { .. }) => {
             return Err(error.context(format!(
                 "{} changed nothing: the values it would replace could not be read",
                 if apply_setup {
@@ -488,18 +490,18 @@ pub(super) fn process(
     let mut restart = false;
     let result = match &command {
         // Each write first records the bank it is about to change.
-        SessionCommand::SetMany { values } => {
+        WorkerCommand::SetMany { values } => {
             super::set_many(h, camera, auto, values, |camera, feature| {
                 extend(camera, &mut before, feature)
             })
         }
         // A streaming camera locks its geometry: stop it once, write, and
         // start it again after success or the rollback below.
-        SessionCommand::ApplySetup {
+        WorkerCommand::Session(SessionCommand::ApplySetup {
             setup: Some(document),
             strict,
             ..
-        } => {
+        }) => {
             let plan = setup_plan.as_ref().expect("planned above");
             restart = plan.restarts_stream;
             let stopped = if restart {
@@ -548,7 +550,7 @@ pub(super) fn process(
     let fields = before.values.keys().cloned().collect::<Vec<_>>();
     // What a failed preset wrote, for the rollback its error reports.
     let mut written = Vec::new();
-    if matches!(command, SessionCommand::ApplySetup { .. }) {
+    if apply_setup {
         let camera = camera_mut(camera)?;
         for address in &fields {
             let saved = &before.values[address];
@@ -574,7 +576,7 @@ pub(super) fn process(
         let error = error.context(format!(
             "failed command rollback: {rollback_error:#}{restart_note}"
         ));
-        if matches!(command, SessionCommand::ApplySetup { .. }) {
+        if apply_setup {
             return Err(crate::types::with_details(
                 error,
                 json!({"rollback": {"restored": [], "failed": [{"error": format!("{rollback_error:#}")}]}}),
@@ -583,10 +585,10 @@ pub(super) fn process(
         return Err(error);
     }
     // The context keeps the cause's category for the exit code.
-    if let SessionCommand::ApplySetup {
+    if let WorkerCommand::Session(SessionCommand::ApplySetup {
         setup: Some(document),
         ..
-    } = &command
+    }) = &command
     {
         let error = error.context(format!(
             "Restoring preset {} failed; every value was put back{restart_note}",
@@ -614,14 +616,14 @@ mod tests {
         h
     }
     fn get(h: &WorkerHandle, feature: &str) -> Value {
-        h.request(SessionCommand::Get {
+        h.request(WorkerCommand::Get {
             feature: feature.into(),
         })
         .unwrap()["value"]
             .clone()
     }
     fn set_many(h: &WorkerHandle, values: &[(&str, &str)]) -> Result<Value> {
-        h.request(SessionCommand::SetMany {
+        h.request(WorkerCommand::SetMany {
             values: values
                 .iter()
                 .map(|(feature, value)| crate::session::FeatureValue {
@@ -651,11 +653,15 @@ mod tests {
     #[test]
     fn failed_managed_write_does_not_leave_auto_disabled() {
         let h = connected();
-        h.request(SessionCommand::Auto { balance: Some(0.3) })
-            .unwrap();
+        h.request(SessionCommand::Auto {
+            balance: Some(0.3),
+            continuous: false,
+            job: None,
+        })
+        .unwrap();
         let exposure = get(&h, "ExposureTime");
         assert!(
-            h.request(SessionCommand::Set {
+            h.request(WorkerCommand::Set {
                 feature: "ExposureTime".into(),
                 value: "0".into()
             })
@@ -713,7 +719,7 @@ mod tests {
                 command,
             )
         };
-        let many = |values: &[(&str, &str)]| SessionCommand::SetMany {
+        let many = |values: &[(&str, &str)]| WorkerCommand::SetMany {
             values: values
                 .iter()
                 .map(|(feature, value)| crate::session::FeatureValue {
@@ -837,7 +843,7 @@ mod tests {
             .unwrap(),
         );
         refresh(&h, &mut camera, true);
-        let many = |values: &[(&str, &str)]| SessionCommand::SetMany {
+        let many = |values: &[(&str, &str)]| WorkerCommand::SetMany {
             values: values
                 .iter()
                 .map(|(feature, value)| crate::session::FeatureValue {
@@ -980,7 +986,7 @@ mod tests {
             .unwrap();
             (walks.load(Ordering::Relaxed) - before, result)
         };
-        let set = |feature: &str, value: &str| SessionCommand::Set {
+        let set = |feature: &str, value: &str| WorkerCommand::Set {
             feature: feature.into(),
             value: value.into(),
         };
@@ -991,7 +997,7 @@ mod tests {
         // writes together still end with only one full feature walk.
         let (count, result) = walked(
             &mut camera,
-            SessionCommand::SetMany {
+            WorkerCommand::SetMany {
                 values: [("Width", "256"), ("Height", "192")]
                     .into_iter()
                     .map(|(feature, value)| crate::session::FeatureValue {
@@ -1003,7 +1009,7 @@ mod tests {
         );
         assert_eq!(count, 1);
         assert_eq!(result["values"][1], json!({"name":"Height","value":192}));
-        assert_eq!(walked(&mut camera, SessionCommand::Start).0, 0);
+        assert_eq!(walked(&mut camera, SessionCommand::Start.into()).0, 0);
         let writable = |h: &WorkerHandle, name: &str| {
             h.snapshot()
                 .features
@@ -1016,7 +1022,7 @@ mod tests {
         // stopping unlocks both without another walk.
         assert_eq!(walked(&mut camera, set("ExposureTime", "5000")).0, 1);
         assert!(!writable(&h, "Width") && !writable(&h, "AcquisitionFrameRate"));
-        assert_eq!(walked(&mut camera, SessionCommand::Stop).0, 0);
+        assert_eq!(walked(&mut camera, SessionCommand::Stop.into()).0, 0);
         assert!(writable(&h, "Width") && writable(&h, "AcquisitionFrameRate"));
         assert!(!writable(&h, "DeviceScanType"));
         h.shutdown();
@@ -1043,7 +1049,7 @@ mod tests {
             &mut Vec::new(),
             &mut 1,
             &mut false,
-            SessionCommand::SetMany {
+            WorkerCommand::SetMany {
                 values: vec![crate::session::FeatureValue {
                     feature: "Width".into(),
                     value: "128".into(),

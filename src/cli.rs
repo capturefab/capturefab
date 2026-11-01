@@ -535,7 +535,7 @@ impl Client {
             None => default_camera()?,
         };
         crate::camera::validate_selector(&selector)?;
-        let local = SessionHandle::new();
+        let local = SessionHandle::direct(out.verbose);
         let client = Self {
             out,
             session: None,
@@ -631,9 +631,78 @@ impl Client {
     pub fn session(&self) -> Option<&str> {
         self.session.as_deref()
     }
+    /// Where this client's jobs run.
+    pub fn host(&self) -> JobHost {
+        match (&self.session, &self.local) {
+            (Some(session), _) => JobHost::Session(session.clone()),
+            (None, Some(local)) => JobHost::Direct(local.clone()),
+            (None, None) => unreachable!("a client has a session or a worker"),
+        }
+    }
+    /// Job `id` once it changed after `seq` or ended, waiting at most
+    /// `wait`: `{seq, job, detail}`.
+    pub fn wait_job(&self, id: &str, seq: u64, wait: Duration) -> Result<Value> {
+        self.host().wait(id, seq, wait)
+    }
+    /// Stop job `id` when a signal arrives, as one that came already does.
+    pub fn stop_on_signal(&self, id: &str) {
+        let host = self.host();
+        let id = id.to_owned();
+        let stop = move || {
+            let (host, id) = (host.clone(), id.clone());
+            // Off the signal thread, which must stay free for a second
+            // signal.
+            let _ = std::thread::Builder::new()
+                .name("capturefab-stop".into())
+                .spawn(move || {
+                    let _ = host.stop(&id);
+                });
+        };
+        if signals::interrupted() {
+            stop();
+        } else {
+            signals::on_signal(stop);
+        }
+    }
     /// The worker of this command, without a session.
     pub fn local(&self) -> Option<&SessionHandle> {
         self.local.as_ref()
+    }
+}
+
+/// Where a job runs: a session, or the workers of this command.
+#[derive(Clone)]
+pub(crate) enum JobHost {
+    Session(String),
+    Direct(SessionHandle),
+}
+impl JobHost {
+    /// Job `id` once it changed after `seq` or ended, waiting at most
+    /// `wait`: `{seq, job, detail}`.
+    pub fn wait(&self, id: &str, seq: u64, wait: Duration) -> Result<Value> {
+        let wait = wait.min(Duration::from_millis(crate::session::jobs::MAX_WAIT_MS));
+        match self {
+            Self::Session(name) => {
+                let command = SessionCommand::Wait {
+                    job: id.into(),
+                    after_seq: seq,
+                    timeout_ms: millis(wait),
+                };
+                ipc::call(name, command.clone(), default_timeout(&command))
+            }
+            Self::Direct(local) => local.wait_job(id, seq, wait),
+        }
+    }
+    /// Stop job `id` and wait for it to end: `{job, detail}`. A session is
+    /// asked on a connection of its own.
+    pub fn stop(&self, id: &str) -> Result<Value> {
+        match self {
+            Self::Session(name) => {
+                let command = SessionCommand::StopJob { job: id.into() };
+                ipc::call(name, command.clone(), default_timeout(&command))
+            }
+            Self::Direct(local) => local.stop_job(id),
+        }
     }
 }
 

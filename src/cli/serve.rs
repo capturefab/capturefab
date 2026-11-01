@@ -80,9 +80,14 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
     signals::take_over();
     let out = global.output();
     let mut ready = Ready::open(args.ready_fd)?;
-    let handle = SessionHandle::new();
+    let handle = match SessionHandle::named(&args.name).map_err(super::input) {
+        Ok(handle) => handle,
+        Err(error) => {
+            ready.say(&failure(&error));
+            return Err(error);
+        }
+    };
     let started = (|| -> Result<ipc::Server> {
-        ipc::validate_name(&args.name).map_err(super::input)?;
         // Cameras connect before the session is announced: one that fails
         // ends it, as the person who named it asked for all of them.
         for selector in &args.cameras.cameras {
@@ -152,7 +157,7 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
     if !global.json && !global.quiet {
         crate::doctor::print_warnings();
     }
-    let why = server.wait(|| jobs_running(&handle));
+    let why = server.wait(|| handle.has_jobs());
     // Recordings are finished before the descriptor goes.
     handle.shutdown();
     drop(server);
@@ -167,13 +172,4 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
         );
     }
     Ok(None)
-}
-
-/// Whether any camera of `handle` records or has a capture job to finish.
-fn jobs_running(handle: &SessionHandle) -> bool {
-    handle
-        .snapshot()
-        .cameras
-        .iter()
-        .any(|camera| camera.forwarding.is_some() || camera.jobs.iter().any(|job| job.active()))
 }

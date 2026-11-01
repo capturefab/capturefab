@@ -37,49 +37,75 @@ impl Kinds {
     }
 }
 
+/// How long past its timeout a transport's search may run before it is
+/// left behind.
+const DISCOVERY_GRACE: Duration = Duration::from_secs(2);
+
 /// Search the chosen transports in parallel; it returns when each has
 /// answered, which for the GigE and ONVIF broadcasts is when `timeout` ends.
-/// A transport that fails becomes a warning.
+/// A transport that fails becomes a warning, and one still searching past
+/// its deadline is left behind on its own thread, so a hung transport never
+/// holds up the caller: what the others found is returned, with a warning.
 pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<String>) {
-    let mut devices = Vec::new();
-    let mut warnings = Vec::new();
-    let (gige, onvif, native, usb) = std::thread::scope(|s| {
-        let g = kinds
-            .gige
-            .then(|| s.spawn(|| crate::transport::gige::discover(timeout)));
-        let o = kinds
-            .onvif
-            .then(|| s.spawn(|| crate::onvif::camera_infos(timeout)));
-        let n = kinds
-            .host
-            .then(|| s.spawn(|| crate::media::native_devices_with_timeout(timeout)));
-        #[cfg(feature = "usb")]
-        let u = kinds.u3v.then(|| s.spawn(crate::transport::usb::discover));
-        #[cfg(not(feature = "usb"))]
-        let u: Option<std::thread::ScopedJoinHandle<'_, Result<Vec<CameraInfo>>>> = None;
-        (
-            g.map(|g| g.join()),
-            o.map(|o| o.join()),
-            n.map(|n| n.join()),
-            u.map(|u| u.join()),
-        )
-    });
-    for (label, result) in [("GigE", gige), ("ONVIF", onvif), ("USB", usb)] {
-        match result {
-            None => {}
-            Some(Ok(Ok(v))) => devices.extend(v),
-            Some(Ok(Err(e))) => warnings.push(format!("{label} discovery: {e:#}")),
-            Some(Err(_)) => warnings.push(format!("{label} discovery worker stopped")),
+    enum Found {
+        Cameras(Vec<CameraInfo>),
+        Native(serde_json::Value),
+    }
+    type Search = Box<dyn FnOnce() -> Result<Found> + Send>;
+    let (sender, found) = std::sync::mpsc::channel::<(&'static str, Result<Found>)>();
+    let mut asked = Vec::new();
+    let mut searches: Vec<(&'static str, Search)> = Vec::new();
+    if kinds.gige {
+        searches.push((
+            "GigE",
+            Box::new(move || crate::transport::gige::discover(timeout).map(Found::Cameras)),
+        ));
+    }
+    if kinds.onvif {
+        searches.push((
+            "ONVIF",
+            Box::new(move || crate::onvif::camera_infos(timeout).map(Found::Cameras)),
+        ));
+    }
+    if kinds.host {
+        searches.push((
+            "Native camera",
+            Box::new(move || crate::media::native_devices_with_timeout(timeout).map(Found::Native)),
+        ));
+    }
+    #[cfg(feature = "usb")]
+    if kinds.u3v {
+        searches.push((
+            "USB",
+            Box::new(|| crate::transport::usb::discover().map(Found::Cameras)),
+        ));
+    }
+    for (label, search) in searches {
+        let sender = sender.clone();
+        let spawned = std::thread::Builder::new()
+            .name("capturefab-discovery".into())
+            .spawn(move || {
+                let _ = sender.send((label, search()));
+            });
+        if spawned.is_ok() {
+            asked.push(label);
         }
     }
-    if kinds.sim {
-        devices.push(crate::transport::simulator::info());
-    }
-    match native {
-        None => {}
-        Some(Ok(Ok(native))) => {
-            if let Some(items) = native["devices"].as_array() {
-                for d in items {
+    drop(sender);
+    let deadline = std::time::Instant::now() + timeout + DISCOVERY_GRACE;
+    let mut devices = Vec::new();
+    let mut warnings = Vec::new();
+    let mut answered = Vec::new();
+    while answered.len() < asked.len() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok((label, result)) = found.recv_timeout(left) else {
+            break;
+        };
+        answered.push(label);
+        match result {
+            Ok(Found::Cameras(found)) => devices.extend(found),
+            Ok(Found::Native(native)) => {
+                for d in native["devices"].as_array().into_iter().flatten() {
                     if let Some(id) = d["id"].as_str() {
                         devices.push(CameraInfo {
                             id: id.into(),
@@ -93,9 +119,19 @@ pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<
                     }
                 }
             }
+            Err(error) => warnings.push(format!("{label} discovery: {error:#}")),
         }
-        Some(Ok(Err(error))) => warnings.push(format!("Native camera discovery: {error:#}")),
-        Some(Err(_)) => warnings.push("Native camera discovery worker stopped".into()),
+    }
+    for label in asked.iter().filter(|label| !answered.contains(label)) {
+        warnings.push(format!(
+            "{label} discovery did not answer within {}; listed without it",
+            crate::scheduling::format_duration(
+                u64::try_from((timeout + DISCOVERY_GRACE).as_millis()).unwrap_or(u64::MAX)
+            )
+        ));
+    }
+    if kinds.sim {
+        devices.push(crate::transport::simulator::info());
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
     devices.dedup_by(|a, b| a.id == b.id);
@@ -508,7 +544,14 @@ impl Camera {
             let (info, backend) = crate::onvif::connect_with(selector, login, timeout)?;
             return Self::from_backend(info, backend);
         }
-        let info = if selector.starts_with("sim:") {
+        let info = Self::identify(selector, known, timeout)?;
+        Self::open_identified(selector, info, timeout, login)
+    }
+    /// What `selector` names, read without opening the camera: a GigE camera
+    /// answers its identity to anyone. Not for ONVIF sources, which open as
+    /// they are identified.
+    pub fn identify(selector: &str, known: &[CameraInfo], timeout: Duration) -> Result<CameraInfo> {
+        Ok(if selector.starts_with("sim:") {
             crate::transport::simulator::info_named(selector)
         } else if crate::media::is_source(selector) {
             crate::media::info(selector)?
@@ -526,7 +569,15 @@ impl Camera {
                 }
                 Resolution::NotFound => return Err(selector_not_matched(selector, known, &[])),
             }
-        };
+        })
+    }
+    /// Open the camera `identify` found for `selector`.
+    pub fn open_identified(
+        selector: &str,
+        info: CameraInfo,
+        timeout: Duration,
+        login: Option<&crate::logins::CameraLogin>,
+    ) -> Result<Self> {
         let backend: Box<dyn Backend> = match info.transport {
             Transport::Simulator => crate::transport::simulator::open(&info.id, timeout)?,
             Transport::Media => {

@@ -664,6 +664,20 @@ fn probe_identity(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
 /// Confirm a camera's unicast control path, without acquiring control or
 /// changing any register. Broadcast discovery alone does not prove reachability.
 /// All three reads share one deadline, including retries and pending ACKs.
+/// How long the camera at `info` keeps the control privilege of a
+/// controller that went silent: its heartbeat timeout, which anyone may read.
+pub fn heartbeat_timeout(info: &CameraInfo, timeout: Duration) -> Result<Duration> {
+    let ip: Ipv4Addr = info
+        .address
+        .as_deref()
+        .context("GigE camera has no address")?
+        .parse()
+        .context("invalid camera IPv4 address")?;
+    let mut control = Control::connect(SocketAddrV4::new(ip, GVCP_PORT), timeout)?;
+    Ok(Duration::from_millis(u64::from(
+        control.read_register(HEARTBEAT_TIMEOUT)?,
+    )))
+}
 pub fn probe_network(ip: Ipv4Addr, timeout: Duration) -> Result<Ipv4Addr> {
     ensure!(
         !ip.is_unspecified() && !ip.is_multicast() && ip != Ipv4Addr::BROADCAST,

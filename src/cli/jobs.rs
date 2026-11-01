@@ -1,13 +1,14 @@
-//! `capturefab jobs`: the captures and recordings running in sessions, as
-//! job documents built from each session's status, and how to stop or wait
-//! for one. A job's ID is `<session>-<n>`; n counts a session's jobs.
+//! `capturefab jobs`: the captures, recordings and continuous auto exposure
+//! running in sessions, as each session's job book has them, and how to stop
+//! or wait for one. A job's ID is `<session>-<n>`; n counts a session's
+//! jobs. The jobs of a session that died are read from what it saved.
 use super::{Global, output::Report};
 use crate::{
     ipc,
     session::SessionCommand as Request,
     types::{Categorized, ErrorKind},
 };
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use std::{
@@ -47,9 +48,6 @@ pub enum JobsAction {
     },
 }
 
-/// How often waits look at a session's jobs.
-pub(super) const POLL: Duration = Duration::from_millis(200);
-
 pub fn run(global: &Global, args: JobsArgs) -> Result<Report> {
     match args.action.unwrap_or(JobsAction::List) {
         JobsAction::List => list(global),
@@ -58,125 +56,9 @@ pub fn run(global: &Global, args: JobsArgs) -> Result<Report> {
     }
 }
 
-fn rfc3339(ms: u64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(i64::try_from(ms).unwrap_or(i64::MAX))
-        .unwrap_or_default()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-}
-
-/// A capture job of `camera` (a session status entry) as a job document.
-pub(super) fn capture(session: &str, camera: &Value, job: &Value) -> Value {
-    let now = crate::scheduling::now_ms();
-    let saved = job["captured"].as_u64().unwrap_or(0);
-    let state = match job["status"].as_str().unwrap_or_default() {
-        "pending" if saved == 0 && job["first_at_ms"].as_u64().unwrap_or(0) > now => "armed",
-        "pending" | "running" => "running",
-        "complete" => "done",
-        "cancelled" => "cancelled",
-        _ => "failed",
-    };
-    let count = job["count"].as_u64().unwrap_or(1);
-    let first_at = job["first_at_ms"].as_u64().unwrap_or(0);
-    let interval = job["interval_ms"].as_u64().unwrap_or(0);
-    let mut value = json!({
-        "id": format!("{session}-{}", job["id"]),
-        "camera": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
-        "kind": "capture",
-        "state": state,
-        "saved": saved,
-        "planned": count,
-        "last_file": job["last_file"],
-        "started": job["created_ms"].as_u64().map(rfc3339),
-        "ended": job["ended_ms"].as_u64().map(rfc3339),
-    });
-    if matches!(state, "armed" | "running") {
-        if let Some(next) = job["next_at_ms"].as_u64().filter(|next| *next > now) {
-            value["next_at"] = json!(rfc3339(next));
-        }
-        if interval > 0 {
-            value["ends_at"] = json!(rfc3339(
-                first_at.saturating_add(interval.saturating_mul(count.saturating_sub(1)))
-            ));
-        }
-    }
-    if state == "failed" {
-        value["error"] = error_object(job);
-    }
-    crate::types::without_nulls(value)
-}
-
-/// `{code,message}` of a failed capture job.
-fn error_object(job: &Value) -> Value {
-    json!({
-        "code": job["error_tag"]["code"].as_str().unwrap_or("failed"),
-        "message": crate::scrub::redact_urls(job["error"].as_str().unwrap_or("the job failed")),
-    })
-}
-
-/// Recording `entry` of `camera` (a session status entry and one of its
-/// `recordings`) as a job document.
-pub(super) fn recording(session: &str, camera: &Value, entry: &Value) -> Value {
-    let progress = &entry["progress"];
-    let file = &progress["recording"];
-    let running = entry["running"] == true;
-    let ended = entry["ended"].as_str().unwrap_or_default();
-    let state = if running {
-        if progress["written"].as_u64().unwrap_or(0) == 0 {
-            "armed"
-        } else {
-            "running"
-        }
-    } else if ended == "failed" {
-        "failed"
-    } else {
-        "done"
-    };
-    let mut value = json!({
-        "id": format!("{session}-{}", entry["job"]),
-        "camera": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
-        "kind": "record",
-        "state": state,
-        "saved": u64::from(file.is_object()),
-        "bytes": file["bytes"],
-        "last_file": entry["output"].as_str().map(crate::media::redact_url),
-        "started": entry["since_ms"].as_u64().or(file["started_ms"].as_u64()).map(rfc3339),
-        "ends_at": entry["until_ms"].as_u64().filter(|_| running).map(rfc3339),
-        "ended": entry["ended_ms"].as_u64().filter(|_| !running).map(rfc3339),
-    });
-    if state == "failed" {
-        value["error"] = json!({
-            "code": entry["error_tag"]["code"].as_str().unwrap_or("failed"),
-            "message": crate::scrub::redact_urls(entry["error"].as_str().unwrap_or("the recording failed")),
-        });
-    }
-    crate::types::without_nulls(value)
-}
-
-/// Recording job `job` of `camera`, a session status entry: the session's
-/// record of it.
-pub(super) fn recording_entry(camera: &Value, job: u64) -> Option<&Value> {
-    camera["recordings"]
-        .as_array()?
-        .iter()
-        .find(|entry| entry["job"] == job)
-}
-
-/// Every job of `camera`, a session status entry.
-pub(super) fn of_camera(session: &str, camera: &Value) -> Vec<Value> {
-    let mut jobs = camera["jobs"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|job| capture(session, camera, job))
-        .collect::<Vec<_>>();
-    jobs.extend(
-        camera["recordings"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|entry| recording(session, camera, entry)),
-    );
-    jobs
+/// Every job of camera `camera`, a session status entry.
+pub(super) fn of_camera(camera: &Value) -> Vec<Value> {
+    camera["jobs"].as_array().cloned().unwrap_or_default()
 }
 
 /// A job in one line, for people.
@@ -207,36 +89,50 @@ pub(super) fn line(job: &Value) -> String {
     text
 }
 
-/// The status of every running session, by name; sessions that do not
-/// answer are left out.
-fn sessions() -> Vec<(String, Value)> {
-    ipc::sessions()
-        .into_iter()
-        .filter_map(|descriptor| {
-            ipc::call(&descriptor.name, Request::Status, Duration::from_secs(5))
-                .ok()
-                .map(|state| (descriptor.name, state))
-        })
-        .collect()
+/// Whether a job document is of a job that has ended.
+pub(super) fn ended(job: &Value) -> bool {
+    !matches!(
+        job["state"].as_str(),
+        Some("armed" | "running" | "stopping")
+    )
 }
 
-/// Every job of session `name`'s status.
-fn jobs_of(name: &str, state: &Value) -> Vec<Value> {
-    state["cameras"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .flat_map(|camera| of_camera(name, camera))
-        .collect()
+/// Every job of the running sessions, and of sessions that died with jobs
+/// running, as lost: by session.
+fn every_job(global: &Global) -> Vec<(String, Vec<Value>)> {
+    let running = ipc::sessions();
+    let mut all = running
+        .iter()
+        .filter_map(|descriptor| {
+            let jobs = ipc::call(&descriptor.name, Request::Jobs, Duration::from_secs(5)).ok()?;
+            Some((
+                descriptor.name.clone(),
+                jobs["jobs"].as_array().cloned().unwrap_or_default(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for name in crate::session::jobs::saved_sessions() {
+        if running.iter().any(|descriptor| descriptor.name == name) {
+            continue;
+        }
+        let jobs = crate::session::jobs::orphaned(crate::session::jobs::read(&name))
+            .iter()
+            .map(|job| job.doc(&name))
+            .collect::<Vec<_>>();
+        if !jobs.is_empty() {
+            all.push((name, jobs));
+        }
+    }
+    all.retain(|(name, _)| global.session.as_deref().is_none_or(|only| only == name));
+    all.sort_by(|a, b| a.0.cmp(&b.0));
+    all
 }
 
 fn list(global: &Global) -> Result<Report> {
-    let mut jobs = Vec::new();
-    for (name, state) in sessions() {
-        if global.session.as_deref().is_none_or(|only| only == name) {
-            jobs.extend(jobs_of(&name, &state));
-        }
-    }
+    let jobs = every_job(global)
+        .into_iter()
+        .flat_map(|(_, jobs)| jobs)
+        .collect::<Vec<_>>();
     let mut text = String::new();
     if jobs.is_empty() {
         text.push_str("No jobs.\n");
@@ -247,103 +143,62 @@ fn list(global: &Global) -> Result<Report> {
     Ok(Report::json(json!({ "jobs": jobs })).text(text))
 }
 
-/// The session and number of a job ID.
-fn parse(id: &str) -> Result<(String, u64)> {
-    id.rsplit_once('-')
-        .and_then(|(session, number)| {
-            Some((
-                session.to_owned(),
-                number.parse::<u64>().ok().filter(|n| *n > 0)?,
-            ))
-        })
-        .filter(|(session, _)| ipc::validate_name(session).is_ok())
-        .ok_or_else(|| {
-            Categorized::new(ErrorKind::Usage, format!("'{id}' is not a job ID"))
-                .hint("job IDs look like auto-1; capturefab jobs lists them")
-                .into()
-        })
-}
-
-/// Job `id` in its session now: the document, and the camera status entry
-/// that holds it.
-fn find(id: &str) -> Result<(Value, Value)> {
-    let (session, number) = parse(id)?;
-    let state = ipc::call(&session, Request::Status, Duration::from_secs(5))?;
-    for camera in state["cameras"].as_array().into_iter().flatten() {
-        if let Some(job) = of_camera(&session, camera)
-            .into_iter()
-            .find(|job| job["id"] == id)
-        {
-            return Ok((job, camera.clone()));
-        }
+/// The session of job ID `id`.
+fn session_of(id: &str) -> Result<String> {
+    let (session, _) = crate::session::split_job(id)?;
+    if session == crate::session::DIRECT {
+        return Err(Categorized::new(
+            ErrorKind::Usage,
+            format!("{id} ran in a command's own worker, which has ended"),
+        )
+        .into());
     }
-    Err(Categorized::new(
-        ErrorKind::Usage,
-        format!("session {session} has no job {number}"),
-    )
-    .hint("capturefab jobs lists the jobs of every running session")
-    .into())
+    Ok(session.to_owned())
 }
 
-/// Stop job `job` of `camera` in `session`.
-pub(super) fn stop_job(session: &str, camera: &Value, job: &Value) -> Result<()> {
-    let target = camera["info"]["id"].as_str().context("camera without ID")?;
-    let number = parse(job["id"].as_str().unwrap_or_default())?.1;
-    let command = if job["kind"] == "record" {
-        Request::StopForwardIf {
-            forwarding_id: recording_entry(camera, number)
-                .and_then(|entry| entry["forwarding_id"].as_str())
-                .context("recording without an identity")?
-                .to_owned(),
-        }
-    } else {
-        Request::CancelJob { id: number }
-    };
-    ipc::call_to(
-        session,
-        Some(target),
-        command.clone(),
-        crate::session::default_request_timeout(&command),
-    )
-    .map(drop)
-}
-
-fn active(job: &Value) -> bool {
-    matches!(job["state"].as_str(), Some("armed" | "running"))
+/// A job of a session that is not running: lost, or ended, as it saved it.
+fn saved_job(session: &str, id: &str) -> Result<Value> {
+    crate::session::jobs::orphaned(crate::session::jobs::read(session))
+        .iter()
+        .map(|job| job.doc(session))
+        .find(|job| job["id"] == id)
+        .ok_or_else(|| {
+            Categorized::new(
+                ErrorKind::SessionNotFound,
+                format!("session {session} is not running"),
+            )
+            .hint("capturefab jobs lists the jobs of every running session")
+            .into()
+        })
 }
 
 fn stop(global: &Global, id: &str) -> Result<Report> {
     let targets = if id == "all" {
-        sessions()
+        every_job(global)
             .into_iter()
-            .filter(|(name, _)| global.session.as_deref().is_none_or(|only| only == name))
-            .flat_map(|(name, state)| {
-                state["cameras"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .flat_map(move |camera| {
-                        let name = name.clone();
-                        of_camera(&name, &camera)
-                            .into_iter()
-                            .filter(active)
-                            .map(move |job| (name.clone(), camera.clone(), job))
-                            .collect::<Vec<_>>()
-                    })
+            .flat_map(|(session, jobs)| {
+                jobs.into_iter()
+                    .filter(|job| !ended(job))
+                    .map(move |job| (session.clone(), job))
             })
             .collect::<Vec<_>>()
     } else {
-        let (job, camera) = find(id)?;
-        vec![(parse(id)?.0, camera, job)]
+        let session = session_of(id)?;
+        if ipc::running_session(&session).is_none() {
+            vec![(session.clone(), saved_job(&session, id)?)]
+        } else {
+            vec![(session, json!({"id": id}))]
+        }
     };
     let mut stopped = Vec::new();
-    for (session, camera, job) in targets {
-        if active(&job) {
-            stop_job(&session, &camera, &job)?;
-        }
+    for (session, job) in targets {
         let id = job["id"].as_str().unwrap_or_default().to_owned();
-        stopped.push(find(&id).map(|(job, _)| job).unwrap_or(job));
+        if job.get("state").is_some_and(|_| ended(&job)) {
+            stopped.push(job);
+            continue;
+        }
+        let reply = super::JobHost::Session(session).stop(&id)?;
+        stopped.push(reply["job"].clone());
     }
     let mut text = String::new();
     if stopped.is_empty() {
@@ -357,16 +212,27 @@ fn stop(global: &Global, id: &str) -> Result<Report> {
 
 fn wait(id: &str, timeout: super::args::Wait) -> Result<Report> {
     super::signals::take_over();
+    let session = session_of(id)?;
+    if ipc::running_session(&session).is_none() {
+        return finished(saved_job(&session, id)?);
+    }
+    let host = super::JobHost::Session(session);
     let deadline = match timeout {
         super::args::Wait::For(wait) => Instant::now().checked_add(wait),
         super::args::Wait::Forever => None,
     };
+    let mut seq = 0;
     loop {
-        let (job, _) = find(id)?;
-        if !active(&job) {
+        let left = deadline.map_or(Duration::MAX, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        let reply = host.wait(id, seq, left.min(Duration::from_secs(1)))?;
+        seq = reply["seq"].as_u64().unwrap_or(seq);
+        let job = reply["job"].clone();
+        if ended(&job) {
             return finished(job);
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        if left.is_zero() {
             return Err(Categorized::new(
                 ErrorKind::Timeout,
                 format!(
@@ -385,24 +251,24 @@ fn wait(id: &str, timeout: super::args::Wait) -> Result<Report> {
                     .into(),
             );
         }
-        std::thread::sleep(POLL);
     }
 }
 
 /// A finished job as a result (done) or as its own error.
 fn finished(job: Value) -> Result<Report> {
+    let id = job["id"].as_str().unwrap_or_default().to_owned();
     match job["state"].as_str() {
         Some("done") => {
             let text = format!("{}\n", line(&job));
             Ok(Report::json(json!({ "job": job })).text(text))
         }
-        Some("cancelled") => Err(Categorized::new(
+        Some("cancelled" | "interrupted" | "lost") => Err(Categorized::new(
             ErrorKind::Incomplete,
-            format!(
-                "job {} was stopped after {} file(s)",
-                job["id"].as_str().unwrap_or_default(),
-                job["saved"]
-            ),
+            match job["state"].as_str() {
+                Some("lost") => format!("job {id} was lost when its session ended"),
+                Some("interrupted") => format!("job {id} ended with its session"),
+                _ => format!("job {id} was stopped after {} file(s)", job["saved"]),
+            },
         )
         .details(json!({ "job": job }))
         .into()),
@@ -428,13 +294,17 @@ fn finished(job: Value) -> Result<Report> {
 /// this.
 macro_rules! job_row {
     () => {
-        "{id,camera,kind:capture|record,state:armed|running|done|failed|cancelled,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}"
+        "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}"
     };
 }
 pub(super) use job_row;
 pub const LIST_FIELDS: &[(&str, &str)] = &[(
     "jobs",
-    concat!("[", job_row!(), "] — every running session's"),
+    concat!(
+        "[",
+        job_row!(),
+        "] — every running session's, and those of a session that died, as lost"
+    ),
 )];
 pub const STOP_FIELDS: &[(&str, &str)] = &[(
     "stopped",
@@ -453,27 +323,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn job_ids_name_a_session_and_a_number() {
-        assert_eq!(parse("auto-3").unwrap(), ("auto".into(), 3));
-        assert_eq!(parse("line-1-12").unwrap(), ("line-1".into(), 12));
-        for bad in ["auto", "auto-0", "-3", "auto-x", "a b-1"] {
-            assert!(parse(bad).is_err(), "{bad}");
+    fn only_session_jobs_can_be_waited_for_by_id() {
+        assert_eq!(session_of("line-1-12").unwrap(), "line-1");
+        for bad in ["auto", "auto-0", "-3", "auto-x", "a b-1", "direct-1"] {
+            assert!(session_of(bad).is_err(), "{bad}");
         }
-    }
-
-    #[test]
-    fn capture_jobs_read_as_job_documents() {
-        let camera = json!({"info": {"id": "rtsp://u:secret@cam/live"}});
-        let job = json!({"id": 4, "status": "failed", "count": 3, "captured": 1,
-            "first_at_ms": 0, "interval_ms": 0, "created_ms": 1, "ended_ms": 2,
-            "last_file": "/tmp/a.png", "error": "no trigger",
-            "error_tag": {"code": "trigger_timeout"}});
-        let doc = capture("bench", &camera, &job);
-        assert_eq!(doc["id"], "bench-4");
-        assert_eq!(doc["state"], "failed");
-        assert_eq!(doc["error"]["code"], "trigger_timeout");
-        assert!(!doc.to_string().contains("secret"), "{doc}");
-        assert_eq!(doc["planned"], 3);
-        assert!(doc.get("next_at").is_none());
+        assert!(ended(&json!({"state": "lost"})));
+        assert!(!ended(&json!({"state": "stopping"})));
     }
 }

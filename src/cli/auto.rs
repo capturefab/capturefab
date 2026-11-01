@@ -104,7 +104,11 @@ pub(super) fn settle(client: &Client, timeout: Duration) -> Result<Value> {
     let info = client.call(SessionCommand::Info)?;
     adjustable(&info)?;
     let streaming = client.status()?["streaming"] == true;
-    client.call(SessionCommand::Auto { balance: None })?;
+    client.call(SessionCommand::Auto {
+        balance: None,
+        continuous: false,
+        job: None,
+    })?;
     let started = !streaming && client.call(SessionCommand::Start).is_ok();
     let deadline = Instant::now() + timeout;
     let watched = (|| -> Result<(Value, bool)> {
@@ -130,11 +134,9 @@ pub(super) fn settle(client: &Client, timeout: Duration) -> Result<Value> {
     if started {
         let camera = client.status()?;
         let busy = camera["forwarding"].is_string()
-            || camera["jobs"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|job| matches!(job["status"].as_str(), Some("pending" | "running")));
+            || super::jobs::of_camera(&camera)
+                .iter()
+                .any(|job| !super::jobs::ended(job));
         if !busy {
             client.call(SessionCommand::Stop)?;
         }
@@ -218,11 +220,18 @@ fn continuous(client: &Client) -> Result<Value> {
         })?;
         "camera"
     } else if client.session().is_some() {
-        client.call(SessionCommand::Auto { balance: None })?;
-        if client.status()?["streaming"] != true {
-            client.call(SessionCommand::Start)?;
-        }
-        "capturefab"
+        // A job of the session, which streams the camera until stopped.
+        let reply = client.call(SessionCommand::Auto {
+            balance: None,
+            continuous: true,
+            job: None,
+        })?;
+        return Ok(json!({
+            "camera": info["camera"],
+            "mode": "continuous",
+            "by": "capturefab",
+            "job": reply["job"],
+        }));
     } else {
         return Err(Usage(format!(
             "{} has no continuous auto exposure of its own, and Capturefab's runs only in a session",
@@ -252,5 +261,12 @@ pub const FIELDS: &[(&str, &str)] = &[
     (
         "by",
         "camera|capturefab — with --continuous: whose auto exposure runs",
+    ),
+    (
+        "job",
+        concat!(
+            super::jobs::job_row!(),
+            " — with --continuous by capturefab: the session job it runs as, which jobs stop ends"
+        ),
     ),
 ];

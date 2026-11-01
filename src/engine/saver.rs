@@ -1,7 +1,7 @@
 //! Scheduled shots are encoded and written on their own thread, so a slow
 //! encoder or disk never holds up acquisition on the camera thread.
 use super::*;
-use std::sync::atomic::AtomicUsize;
+use std::sync::{atomic::AtomicUsize, mpsc::SyncSender};
 
 /// The most frames the saver holds: one being saved and one waiting.
 const FRAMES: usize = 2;

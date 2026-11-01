@@ -192,6 +192,20 @@ pub struct Simulator {
     epoch: Instant,
     frame_id: u64,
     scene: (u32, u32, Vec<(f32, u8)>),
+    /// Panic after this many frames: `?panic=after:N`, a fault-test hook
+    /// honored only with CAPTUREFAB_TEST_HOOKS=1.
+    panic_after: Option<u64>,
+}
+/// The frame count of a selector's `?panic=after:N`, when test hooks are on.
+fn panic_after(selector: &str) -> Option<u64> {
+    if std::env::var_os("CAPTUREFAB_TEST_HOOKS").is_none_or(|hooks| hooks != "1") {
+        return None;
+    }
+    selector
+        .split_once('?')?
+        .1
+        .split('&')
+        .find_map(|option| option.strip_prefix("panic=after:")?.parse().ok())
 }
 impl Default for Simulator {
     fn default() -> Self {
@@ -211,6 +225,7 @@ impl Simulator {
             epoch: Instant::now(),
             frame_id: 0,
             scene: (0, 0, Vec::new()),
+            panic_after: panic_after(selector),
         };
         s.put_u32(0x100, 640);
         s.put_u32(0x104, if kind == SimKind::Line { 16 } else { 480 });
@@ -407,6 +422,9 @@ impl Backend for Simulator {
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.running, "camera is not streaming");
+        if self.panic_after.is_some_and(|after| self.frame_id >= after) {
+            panic!("simulated camera fault after {} frames", self.frame_id);
+        }
         // TriggerMode and TriggerSource at TriggerSelector=FrameStart: a
         // hardware line that never fires.
         if self.u32(0x168) == 1 && self.u32(0x170) != 0 {

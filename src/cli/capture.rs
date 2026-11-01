@@ -198,7 +198,8 @@ impl Plan {
         }
         Ok(plan)
     }
-    /// The job request for one camera.
+    /// The job request for one camera; a capture this command waits for
+    /// holds a lease, so the session stops it if this command goes away.
     fn request(&self, args: &CaptureArgs, quality: Option<u8>) -> SessionCommand {
         SessionCommand::Schedule {
             output: self.output.clone(),
@@ -213,6 +214,7 @@ impl Plan {
             utc_offset_s: Some(crate::naming::local_offset()),
             quality,
             job: None,
+            lease: !args.background,
         }
     }
 }
@@ -424,42 +426,42 @@ fn prepare(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
+/// How long a stopped capture may take to finish the shot being saved.
+const STOP_GRACE: Duration = Duration::from_secs(2);
+
 /// Run the capture job on one camera and wait for it, or leave it running.
 fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
     prepare(client, args, plan)?;
     let reply = client.call(plan.request(args, args.quality))?;
     let id = reply["job"]["id"]
-        .as_u64()
-        .context("capture job without ID")?;
-    let session = client.session().unwrap_or("direct").to_owned();
+        .as_str()
+        .context("capture job without ID")?
+        .to_owned();
     if args.background {
-        return started(client, &session, id, plan);
+        return started(client, &id, plan);
     }
-    let mut pause = Duration::from_millis(10);
+    // A signal stops the job: the frame being saved is kept, nothing after
+    // it starts.
+    client.stop_on_signal(&id);
+    let mut seq = 0;
     let mut stopping: Option<Instant> = None;
     loop {
-        let camera = client.status()?;
-        let job = find(&camera, id).context("the capture job is gone")?;
-        let active = matches!(job["status"].as_str(), Some("pending" | "running"));
-        if !active {
-            return finished(&session, &camera, &job, stopping.is_some());
+        let wait = match stopping {
+            Some(since) => STOP_GRACE.saturating_sub(since.elapsed()),
+            None => Duration::from_secs(25),
+        };
+        let reply = client.wait_job(&id, seq, wait.max(Duration::from_millis(1)))?;
+        seq = reply["seq"].as_u64().unwrap_or(seq);
+        let (job, detail) = (&reply["job"], &reply["detail"]);
+        if jobs::ended(job) {
+            return finished(job, detail, stopping.is_some() || signals::interrupted());
         }
         if signals::interrupted() {
-            match stopping {
-                None => {
-                    // The frame being saved is kept; nothing after it starts.
-                    let _ = client.call(SessionCommand::CancelJob { id });
-                    stopping = Some(Instant::now());
-                }
-                Some(since) if since.elapsed() > Duration::from_secs(2) => {
-                    return Err(interrupted(&session, &camera, &job));
-                }
-                Some(_) => {}
+            let since = *stopping.get_or_insert_with(Instant::now);
+            if since.elapsed() >= STOP_GRACE {
+                return Err(interrupted(job, detail));
             }
         }
-        // Look again soon for a quick shot, less often for a long job.
-        std::thread::sleep(pause);
-        pause = (pause * 3 / 2).min(Duration::from_millis(250));
     }
 }
 
@@ -467,125 +469,114 @@ fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
 /// or with its first frame saved; or its failure. A job that cannot take
 /// its first frame fails within the frame timeout; one that may wait for a
 /// trigger without a limit is returned as it is after a moment.
-fn started(client: &Client, session: &str, id: u64, plan: &Plan) -> Result<Value> {
+fn started(client: &Client, id: &str, plan: &Plan) -> Result<Value> {
     let begun = Instant::now();
     let wait = if plan.timeout_ms >= crate::scheduling::MAX_DURATION_MS {
         Duration::from_secs(2)
     } else {
         Duration::from_millis(plan.timeout_ms) + Duration::from_secs(1)
     };
-    let mut pause = Duration::from_millis(10);
+    let mut seq = 0;
     loop {
-        let camera = client.status()?;
-        let job = find(&camera, id).context("the capture job is gone")?;
-        let saved = job["captured"].as_u64().unwrap_or(0);
-        let armed = job["first_at_ms"].as_u64().unwrap_or(0) > crate::scheduling::now_ms();
-        match job["status"].as_str() {
-            Some("pending" | "running")
-                if saved == 0 && !armed && begun.elapsed() < wait && !signals::interrupted() =>
-            {
-                std::thread::sleep(pause);
-                pause = (pause * 3 / 2).min(Duration::from_millis(250));
+        let left = wait.saturating_sub(begun.elapsed());
+        let reply = client.wait_job(id, seq, left.max(Duration::from_millis(1)))?;
+        seq = reply["seq"].as_u64().unwrap_or(seq);
+        let job = &reply["job"];
+        match job["state"].as_str() {
+            Some("failed" | "cancelled" | "interrupted") => {
+                return finished(job, &reply["detail"], false);
             }
-            Some("pending" | "running" | "complete") => {
-                return Ok(json!({ "job": jobs::capture(session, &camera, &job) }));
-            }
-            _ => return finished(session, &camera, &job, false),
+            Some("running" | "stopping")
+                if job["saved"].as_u64().unwrap_or(0) == 0
+                    && !left.is_zero()
+                    && !signals::interrupted() => {}
+            _ => return Ok(json!({ "job": job })),
         }
     }
-}
-
-/// Job `id` in a camera's status entry.
-fn find(camera: &Value, id: u64) -> Option<Value> {
-    camera["jobs"]
-        .as_array()?
-        .iter()
-        .find(|job| job["id"] == id)
-        .cloned()
 }
 
 /// What a job saved, for errors: its files and, when there were more than
 /// listed, how many.
-fn saved(job: &Value) -> Value {
-    let files = job["files"].as_array().cloned().unwrap_or_default();
-    let mut value = json!({ "files": files });
-    let count = job["captured"].as_u64().unwrap_or(0);
-    if count > files.len() as u64 {
-        value["truncated"] = json!(count - files.len() as u64);
+fn saved(job: &Value, detail: &Value) -> Value {
+    let mut value = json!({ "files": detail["files"].as_array().cloned().unwrap_or_default() });
+    if let Some(truncated) = detail["truncated"].as_u64() {
+        value["truncated"] = json!(truncated);
     }
+    value["job"] = job.clone();
     value
 }
 
-fn interrupted(session: &str, camera: &Value, job: &Value) -> anyhow::Error {
-    let mut details = saved(job);
-    details["job"] = jobs::capture(session, camera, job);
+fn interrupted(job: &Value, detail: &Value) -> anyhow::Error {
     Categorized::new(
         ErrorKind::Interrupted,
         format!(
             "interrupted after {} of {} frame(s)",
-            job["captured"], job["count"]
+            job["saved"], job["planned"]
         ),
     )
-    .details(details)
+    .details(saved(job, detail))
     .into()
 }
 
 /// The result of a finished job, or its failure with what it saved.
-fn finished(session: &str, camera: &Value, job: &Value, stopped: bool) -> Result<Value> {
-    match job["status"].as_str() {
-        Some("complete") => Ok(result(camera, job)),
-        Some("cancelled") if stopped => Err(interrupted(session, camera, job)),
-        Some("cancelled") => {
-            let mut details = saved(job);
-            details["job"] = jobs::capture(session, camera, job);
-            Err(Categorized::new(
-                ErrorKind::Incomplete,
-                format!(
-                    "the capture was stopped after {} of {} frame(s)",
-                    job["captured"], job["count"]
-                ),
-            )
-            .details(details)
-            .into())
-        }
-        _ => {
-            let tag =
-                serde_json::from_value::<crate::types::ErrorTag>(job["error_tag"].clone()).ok();
-            let message =
-                crate::scrub::redact_urls(job["error"].as_str().unwrap_or("capture failed"));
-            let mut details = saved(job);
-            details["job"] = jobs::capture(session, camera, job);
-            Err(crate::types::with_details(
-                exists_hint(crate::types::error_from_tag(tag, message)),
-                details,
-            ))
-        }
+fn finished(job: &Value, detail: &Value, stopped: bool) -> Result<Value> {
+    match job["state"].as_str() {
+        Some("done") => Ok(result(job, detail)),
+        Some("cancelled") if stopped => Err(interrupted(job, detail)),
+        Some("cancelled" | "interrupted") => Err(Categorized::new(
+            ErrorKind::Incomplete,
+            format!(
+                "the capture was stopped after {} of {} frame(s)",
+                job["saved"], job["planned"]
+            ),
+        )
+        .details(saved(job, detail))
+        .into()),
+        _ => Err(crate::types::with_details(
+            exists_hint(job_error(job, detail)),
+            saved(job, detail),
+        )),
     }
 }
 
-/// A finished job's result.
-fn result(camera: &Value, job: &Value) -> Value {
-    let files = job["files"].as_array().cloned().unwrap_or_default();
-    let count = job["captured"].as_u64().unwrap_or(0);
-    let frame = &job["frame"];
-    let first = job["first_ms"].as_u64();
+/// The error a failed job ended with: in full in its account, with its
+/// reason, hint and details.
+pub(super) fn job_error(job: &Value, detail: &Value) -> anyhow::Error {
+    let error = if detail["error"].is_object() {
+        &detail["error"]
+    } else {
+        &job["error"]
+    };
+    let mut error = error.clone();
+    if let Some(message) = error["message"].as_str() {
+        error["message"] = json!(crate::scrub::redact_urls(message));
+    }
+    crate::session::protocol::from_wire(&error)
+}
+
+/// A finished job's result, from its document and its worker's account.
+fn result(job: &Value, detail: &Value) -> Value {
+    let files = detail["files"].as_array().cloned().unwrap_or_default();
+    let count = job["saved"].as_u64().unwrap_or(0);
+    let frame = &detail["frame"];
+    let first = detail["first_ms"].as_u64();
     let mut value = json!({
-        "camera": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
+        "camera": job["camera"],
         "files": files,
         "count": count,
         "width": frame["width"],
         "height": frame["height"],
         "pixel_format": frame["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
-        "settings": settings(&job["settings"]),
+        "settings": settings(&detail["settings"]),
         "time": first.map(jobs_time),
     });
     if count > 1
-        && let (Some(first), Some(ended)) = (first, job["ended_ms"].as_u64())
+        && let (Some(first), Some(ended)) = (first, detail["ended_ms"].as_u64())
     {
         value["duration_s"] = json!(ended.saturating_sub(first) as f64 / 1000.0);
     }
-    if count > files.len() as u64 {
-        value["truncated"] = json!(count - files.len() as u64);
+    if let Some(truncated) = detail["truncated"].as_u64() {
+        value["truncated"] = json!(truncated);
     }
     crate::types::without_nulls(value)
 }
@@ -727,7 +718,7 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         utc_offset_s: Some(crate::naming::local_offset()),
     })?;
     let frame = local.captured_frame()?;
-    let meta = &reply["frames"][0];
+    let meta = &reply["frame"];
     let image = crate::engine::encode_still(&frame, plan.format, args.quality, None)?;
     let camera = client.status()?;
     let mut stdout = std::io::stdout().lock();

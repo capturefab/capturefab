@@ -129,22 +129,7 @@ impl Harness {
         }
         // The commands under test run synchronously, without a second camera
         // owner or a background acquisition changing their state.
-        let (sender, _) = mpsc::sync_channel(32);
-        let handle = WorkerHandle {
-            sender,
-            state: Arc::new(RwLock::new(WorkerSnapshot::default())),
-            counters: Arc::default(),
-            frame: Arc::new(RwLock::new(None)),
-            quitting: Arc::new(AtomicBool::new(false)),
-            thread: Arc::new(Mutex::new(None)),
-            ring: None,
-            ring_note: Arc::default(),
-            saved: Arc::default(),
-            recording: Arc::default(),
-            forward_clock: Arc::default(),
-            names: Arc::default(),
-            logins: crate::logins::Logins::system(),
-        };
+        let handle = WorkerHandle::idle();
         let mut harness = Self {
             handle,
             camera: Some(camera),
@@ -160,7 +145,7 @@ impl Harness {
         harness
     }
 
-    fn run(&mut self, command: SessionCommand) -> Result<Value> {
+    fn run(&mut self, command: impl Into<WorkerCommand>) -> Result<Value> {
         process_plain(
             &self.handle,
             &mut self.camera,
@@ -169,12 +154,12 @@ impl Harness {
             &mut self.jobs,
             &mut self.next_job,
             &mut self.scheduled_stream,
-            command,
+            command.into(),
         )
     }
 
     fn optimize(&mut self) -> Result<Value> {
-        self.run(SessionCommand::OptimizeNetwork {
+        self.run(WorkerCommand::OptimizeNetwork {
             bytes_per_second: 33_333_333,
         })
     }
@@ -326,6 +311,7 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
             warm: None,
             utc_offset_s: None,
             quality: None,
+            reported: false,
         });
         let error = harness.optimize().unwrap_err();
         assert!(error.to_string().contains("scheduled captures"));

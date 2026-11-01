@@ -50,11 +50,8 @@ pub(crate) mod volumes;
 
 /// The `capturefab` executable: the hidden camera worker mode, or the CLI.
 pub fn run() {
-    if std::env::args().nth(1).as_deref() == Some("__worker") {
-        let result = std::env::args_os()
-            .nth(2)
-            .ok_or_else(|| anyhow::anyhow!("missing shared ring"))
-            .and_then(|ring| session::run_worker(&ring));
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__worker")) {
+        let result = session::run_worker(std::env::args_os().skip(2));
         if let Err(e) = result {
             eprintln!("capturefab worker: {}", scrub::scrub(&format!("{e:#}")));
             std::process::exit(1)

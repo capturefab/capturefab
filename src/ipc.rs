@@ -146,6 +146,8 @@ struct Shared {
     used: std::sync::Mutex<Instant>,
     /// Requests in progress.
     busy: AtomicUsize,
+    /// Clients waiting for a job.
+    waiting: AtomicUsize,
     /// How long the session waits unused before it exits; None for ever.
     idle: std::sync::Mutex<Option<Duration>>,
     quit: (std::sync::Mutex<Option<Quit>>, std::sync::Condvar),
@@ -201,11 +203,14 @@ fn deserialize_optional_command<'de, D: serde::Deserializer<'de>>(
 struct ClientSlot(Arc<AtomicUsize>);
 impl ClientSlot {
     fn acquire(clients: &Arc<AtomicUsize>) -> Option<Self> {
+        Self::acquire_within(clients, MAX_CLIENTS)
+    }
+    fn acquire_within(clients: &Arc<AtomicUsize>, most: usize) -> Option<Self> {
         // Count first; the guard undoes the increment if over the limit. Unlike
         // a CAS loop this works on every supported toolchain.
         let previous = clients.fetch_add(1, Ordering::AcqRel);
         let slot = Self(clients.clone());
-        (previous < MAX_CLIENTS).then_some(slot)
+        (previous < most).then_some(slot)
     }
 }
 impl Drop for ClientSlot {
@@ -214,6 +219,10 @@ impl Drop for ClientSlot {
     }
 }
 const MAX_CLIENTS: usize = 16;
+/// Clients that may wait for jobs at once, so others can still connect.
+const MAX_WAITERS: usize = 12;
+/// Connections over `MAX_CLIENTS` being told so at once.
+const MAX_REFUSALS: usize = 16;
 pub struct Server {
     path: PathBuf,
     token: String,
@@ -799,7 +808,14 @@ fn serve_client(
             "remote captures require an output file"
         );
         // Looking at a session, or waiting for its jobs, is not using it.
-        let use_ = !matches!(command, SessionCommand::Status | SessionCommand::Jobs);
+        let use_ = !matches!(
+            command,
+            SessionCommand::Status | SessionCommand::Jobs | SessionCommand::Wait { .. }
+        );
+        let _waiting = match command {
+            SessionCommand::Wait { .. } => Some(Waiter::enter(&shared.waiting)?),
+            _ => None,
+        };
         let cameras = matches!(
             command,
             SessionCommand::Connect { .. } | SessionCommand::Disconnect
@@ -824,23 +840,64 @@ fn serve_client(
     })();
     let response = match result {
         Ok(v) => json!({"version":VERSION,"ok":true,"result":v}),
-        Err(e) => {
-            let mut error = json!({"message":format!("{e:#}")});
-            // A request the caller must change keeps exit code 2 across the
-            // connection, and every failure its reason, hint and details;
-            // the text alone may not say so.
-            if let Some(tag) = crate::types::error_tag(&e)
-                && let (Some(error), Ok(Value::Object(tag))) =
-                    (error.as_object_mut(), serde_json::to_value(tag))
-            {
-                error.extend(tag);
-            }
-            json!({"version":VERSION,"ok":false,"error":error})
-        }
+        // A request the caller must change keeps exit code 2 across the
+        // connection, and every failure its reason, hint and details; the
+        // text alone may not say so.
+        Err(e) => json!({
+            "version": VERSION,
+            "ok": false,
+            "error": crate::session::protocol::wire_error(&e),
+        }),
     };
     serde_json::to_writer(&mut stream, &response)?;
     stream.write_all(b"\n")?;
     Ok(())
+}
+/// A client waiting for a job, counted while it waits.
+struct Waiter<'a>(&'a AtomicUsize);
+impl<'a> Waiter<'a> {
+    fn enter(waiting: &'a AtomicUsize) -> Result<Self> {
+        let waiter = Self(waiting);
+        if waiting.fetch_add(1, Ordering::AcqRel) >= MAX_WAITERS {
+            return Err(busy(format!(
+                "{MAX_WAITERS} clients are already waiting for this session's jobs"
+            )));
+        }
+        Ok(waiter)
+    }
+}
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+/// The session cannot take another client now.
+fn busy(message: String) -> anyhow::Error {
+    crate::types::Categorized::new(crate::types::ErrorKind::Unavailable, message)
+        .hint("retry in a moment")
+        .into()
+}
+/// The reply a client gets when the session has too many: read its request
+/// so it sees the answer, not a reset connection.
+fn refuse(mut stream: TcpStream) {
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    if let Ok(deadline) = rpc_deadline(Duration::from_secs(1))
+        && let Ok(clone) = stream.try_clone()
+    {
+        let _ = read_rpc_line(clone, MAX_REQUEST, deadline);
+    }
+    let error = busy(format!(
+        "the session is serving {MAX_CLIENTS} clients already"
+    ));
+    let response = json!({
+        "version": VERSION,
+        "ok": false,
+        "error": crate::session::protocol::wire_error(&error),
+    });
+    if serde_json::to_writer(&mut stream, &response).is_ok() {
+        let _ = stream.write_all(b"\n");
+    }
 }
 /// Publish `descriptor` atomically, so discovery never reads a partially
 /// written file.
@@ -951,11 +1008,13 @@ impl Server {
         let thread_stop = stop.clone();
         let server_token = token.clone();
         let clients = Arc::new(AtomicUsize::new(0));
+        let refusals = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(Shared {
             dir: dir.to_owned(),
             descriptor: std::sync::Mutex::new(descriptor),
             used: std::sync::Mutex::new(Instant::now()),
             busy: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             idle: std::sync::Mutex::new(idle),
             quit: Default::default(),
         });
@@ -983,7 +1042,16 @@ impl Server {
                         Err(_) => break,
                     };
                     let Some(slot) = ClientSlot::acquire(&clients) else {
-                        drop(stream);
+                        // Told why, on a short-lived thread of its own; past
+                        // that many, the connection is closed.
+                        if let Some(refusal) = ClientSlot::acquire_within(&refusals, MAX_REFUSALS) {
+                            let _ = std::thread::Builder::new()
+                                .name("capturefab-rpc-refusal".into())
+                                .spawn(move || {
+                                    let _refusal = refusal;
+                                    refuse(stream);
+                                });
+                        }
                         continue;
                     };
                     let h = h.clone();
@@ -1407,6 +1475,7 @@ mod tests {
             descriptor: std::sync::Mutex::new(test_descriptor("t", "127.0.0.1:1".parse().unwrap())),
             used: std::sync::Mutex::new(Instant::now()),
             busy: AtomicUsize::new(0),
+            waiting: AtomicUsize::new(0),
             idle: std::sync::Mutex::new(None),
             quit: Default::default(),
         })
@@ -1911,6 +1980,52 @@ mod tests {
         assert_eq!(response["version"], VERSION);
         server.join().unwrap().unwrap();
         h.shutdown();
+    }
+    #[test]
+    fn a_full_session_says_so_and_waits_leave_room_for_others() {
+        let dir = TestDir::new();
+        let handle = SessionHandle::new();
+        let _server =
+            Server::start_in(handle.clone(), "full", SessionKind::Serve, &dir.0, None).unwrap();
+        let descriptor = read_descriptor_in(&dir.0, "full").unwrap();
+        // Clients that connect and say nothing hold their slots.
+        let idle = (0..MAX_CLIENTS)
+            .map(|_| TcpStream::connect(descriptor.address).unwrap())
+            .collect::<Vec<_>>();
+        std::thread::sleep(Duration::from_millis(100));
+        let error = send_request(
+            &descriptor,
+            None,
+            Some(SessionCommand::Status),
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::cli::error_code(&error),
+            ("unavailable", 3),
+            "{error:#}"
+        );
+        drop(idle);
+        std::thread::sleep(Duration::from_millis(100));
+        send_request(
+            &descriptor,
+            None,
+            Some(SessionCommand::Status),
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        // Waits take at most MAX_WAITERS slots.
+        let shared = test_shared();
+        let waiters = (0..MAX_WAITERS)
+            .map(|_| Waiter::enter(&shared.waiting).unwrap())
+            .collect::<Vec<_>>();
+        let error = Waiter::enter(&shared.waiting).err().unwrap();
+        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+        drop(waiters);
+        assert_eq!(shared.waiting.load(Ordering::Acquire), 0);
+        handle.shutdown();
     }
     #[test]
     fn names_cannot_escape_directory() {

@@ -1154,7 +1154,7 @@ pub(super) fn apply(
     let mut result = outcome(plan, &c.info, &restored.unavailable);
     match &setup.auto {
         Some(saved) => {
-            let entered = enter_auto(h, camera, auto, forwarder, jobs, Some(saved.balance))?;
+            let entered = enter_auto(h, camera, auto, forwarder, jobs, Some(saved.balance), None)?;
             result["auto"] = entered["auto"].clone();
         }
         None => {
@@ -1201,14 +1201,14 @@ mod tests {
         h
     }
     fn get(h: &WorkerHandle, feature: &str) -> Value {
-        h.request(SessionCommand::Get {
+        h.request(WorkerCommand::Get {
             feature: feature.into(),
         })
         .unwrap()["value"]
             .clone()
     }
     fn set(h: &WorkerHandle, feature: &str, value: &str) {
-        h.request(SessionCommand::Set {
+        h.request(WorkerCommand::Set {
             feature: feature.into(),
             value: value.into(),
         })
@@ -1305,6 +1305,7 @@ mod tests {
             utc_offset_s: None,
             quality: None,
             job: None,
+            lease: false,
         })
         .unwrap();
         let mut narrow = setup.clone();
@@ -1500,6 +1501,8 @@ mod tests {
         let manual = saved(&h, "manual");
         h.request(SessionCommand::Auto {
             balance: Some(0.25),
+            continuous: false,
+            job: None,
         })
         .unwrap();
         let automatic = saved(&h, "auto");
@@ -1669,7 +1672,7 @@ mod tests {
                 &mut self.jobs,
                 &mut 1,
                 &mut false,
-                command,
+                command.into(),
             )
         }
         fn c(&mut self) -> &mut Camera {

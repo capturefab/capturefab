@@ -45,7 +45,7 @@ zeroize = "1"
 # Share modes for the frame ring's backing file, and the inheritable pipe
 # a detached session reports ready on.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # Ctrl-C, Ctrl-Break and a closed console where there are no Unix signals,
 # which go through libc.

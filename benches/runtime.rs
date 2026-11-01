@@ -396,9 +396,10 @@ fn main() {
                 .unwrap();
         }
         for _ in 0..200 {
-            let missing = SessionCommand::Get {
-                feature: "NoSuchFeature".into(),
-            };
+            let missing = SessionCommand::from_json_slice(
+                br#"{"op":"get_values","names":[{"name":"NoSuchFeature"}]}"#,
+            )
+            .unwrap();
             let _ = h.request_to("sim:0", missing);
         }
         let snapshot = h.snapshot();

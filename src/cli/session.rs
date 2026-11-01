@@ -561,7 +561,7 @@ fn status(global: &Global, name: Option<String>) -> Result<Report> {
         .as_array()
         .into_iter()
         .flatten()
-        .map(|camera| camera_state(&name, camera))
+        .map(camera_state)
         .collect::<Vec<_>>();
     let mut text = format!(
         "Session {name} (pid {}, up {}):\n",
@@ -596,7 +596,7 @@ fn status(global: &Global, name: Option<String>) -> Result<Report> {
 }
 
 /// A camera as `session status` shows it.
-fn camera_state(session: &str, camera: &Value) -> Value {
+fn camera_state(camera: &Value) -> Value {
     let state = if camera["exited"] == true {
         "error"
     } else if camera["forwarding"].is_string() {
@@ -609,7 +609,7 @@ fn camera_state(session: &str, camera: &Value) -> Value {
     let mut value = json!({
         "id": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
         "state": state,
-        "jobs": super::jobs::of_camera(session, camera),
+        "jobs": super::jobs::of_camera(camera),
     });
     if let Some(frames) = camera["frames"].as_u64().filter(|frames| *frames > 0) {
         value["frames"] = json!(frames);
@@ -677,7 +677,7 @@ pub const STATUS_FIELDS: &[(&str, &str)] = &[
     ("uptime_s", "int"),
     (
         "cameras",
-        "[{id,state:idle|streaming|recording|error,error?,frames?,dropped?,jobs:[job]}] — job as jobs lists it; error: the camera's worker exited and the camera is unusable until the session is stopped",
+        "[{id,state:idle|streaming|recording|error,error?,frames?,dropped?,jobs:[job]}] — job as jobs lists it; error: the camera's worker exited, and the next command on the camera starts another",
     ),
 ];
 pub const LIST_FIELDS: &[(&str, &str)] =
