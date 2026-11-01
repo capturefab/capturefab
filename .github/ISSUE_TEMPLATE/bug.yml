@@ -10,8 +10,8 @@ body:
     id: version
     attributes:
       label: Capturefab version
-      description: Help > Report a Problem fills this in. Otherwise run `capturefab --version`.
-      placeholder: "0.4.0"
+      description: The output of `capturefab --version`.
+      placeholder: "capturefab 0.5.0"
     validations:
       required: true
   - type: input
@@ -31,9 +31,7 @@ body:
         - Webcam
         - RTSP, SRT or other stream
         - ONVIF
-        - Hub (Home Assistant, Frigate, go2rtc, UniFi Protect)
         - Video file or folder
-        - Document scanner
         - Simulator
         - Other or not camera-related
     validations:
@@ -47,18 +45,18 @@ body:
     id: what
     attributes:
       label: What happened
-      description: What you did, what you expected and what happened instead. Include the exact command if you used the CLI.
+      description: What you did, what you expected and what happened instead. Include the exact command.
     validations:
       required: true
   - type: textarea
-    id: activity
+    id: output
     attributes:
-      label: Activity error
-      description: In the app, Activity shows connection and capture errors; Copy log copies them. Review the text before you paste it.
+      label: Command output
+      description: The command's output with `--json` added, which includes `error.code`, `error.message` and `error.details`. Add `-v` for camera worker logs on stderr. Review the text before you paste it.
       render: text
   - type: textarea
     id: doctor
     attributes:
       label: Doctor output
-      description: The output of `capturefab doctor`. It lists local folders; review it before you paste it.
+      description: The output of `capturefab --json doctor`. It lists local folders; review it before you paste it.
       render: text

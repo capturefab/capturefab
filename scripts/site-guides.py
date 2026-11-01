@@ -11,12 +11,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / 'web'
-GUIDES = ['assistant', 'camera-compatibility', 'cli-workflows', 'ffmpeg-build', 'line-computer',
-          'plant-floor', 'remote-control', 'simulation', 'video-analytics']
+GUIDES = ['camera-compatibility', 'cli-workflows', 'ffmpeg-build', 'line-computer', 'plant-floor', 'simulation']
 # README sections and the site page that covers each one.
-README = {'build-test-and-release': '../downloads.html#source', 'save-to-drives-and-folders': '../docs.html#destinations',
-          'repeatable-workflows': '../docs.html#workflows', 'host-checks-and-efficiency-mode': '../docs.html#resources',
-          'gige-network-setup': '../docs.html#discovery'}
+README = {'build-from-source': '../downloads.html#source', 'for-ai-agents-and-scripts': '../agents.md',
+          'sessions-and-jobs': '../docs.html#sessions', 'configuration': '../docs.html#environment'}
 LINK = re.compile(r'(\]\()([^)\s]+)(\))')
 HEADER = '<!-- Generated from {source} by scripts/site-guides.py. Edit the source, then run the script. -->\n\n'
 
