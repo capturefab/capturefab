@@ -121,6 +121,12 @@ pub enum SessionCommand {
         /// Keep adjusting as a job of the session, until stopped.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         continuous: bool,
+        /// Meter only this normalized x, y, width, height part of the frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<[f64; 4]>,
+        /// The longest exposure, in microseconds, before gain is raised.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_exposure_us: Option<f64>,
         /// The job's number, which the coordinator assigns.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job: Option<u64>,
@@ -198,6 +204,10 @@ pub enum SessionCommand {
         /// come, unset waits up to 2 s.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warmup_ms: Option<u64>,
+        /// Measure the last frame on its encoder, and preview it, as
+        /// inspect does.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        inspect: bool,
         /// The job's number, which the coordinator assigns so that jobs are
         /// numbered across a session's cameras.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -511,13 +521,20 @@ impl SessionCommand {
                 }
             }
             Self::Auto {
-                balance: Some(balance),
+                balance,
+                region,
+                max_exposure_us,
                 ..
             } => {
                 ensure!(
-                    balance.is_finite() && (0.0..=1.0).contains(balance),
+                    balance.is_none_or(|balance| balance.is_finite() && (0.0..=1.0).contains(&balance)),
                     "auto balance must be a finite number from 0 (quality) to 1 (frame rate)"
                 );
+                ensure!(
+                    max_exposure_us.is_none_or(|us| us.is_finite() && us > 0.0),
+                    "the longest exposure must be a positive time"
+                );
+                crate::inspect::validate(0, 1, 0, *region)?;
             }
             Self::Capture {
                 output,
@@ -3065,11 +3082,15 @@ mod tests {
                 balance: Some(f64::NAN),
                 continuous: false,
                 job: None,
+                max_exposure_us: None,
+                region: None,
             },
             SessionCommand::Auto {
                 balance: Some(1.01),
                 continuous: false,
                 job: None,
+                max_exposure_us: None,
+                region: None,
             },
             SessionCommand::ReadMemory {
                 address: u64::MAX,

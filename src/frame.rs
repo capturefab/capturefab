@@ -783,6 +783,71 @@ pub fn exposure(frame: &Frame) -> Result<Exposure> {
     })
 }
 
+/// Pixels at the ends of a frame's range, counted over every pixel at the
+/// frame's own bit depth: a 2,000-pixel highlight on a 20-megapixel sensor
+/// counts whole, where a sampled histogram would miss it.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
+pub struct Clipping {
+    /// Pixels at full scale in any channel.
+    pub high_px: u64,
+    /// Pixels at zero in every channel.
+    pub low_px: u64,
+    pub pixels: u64,
+    /// The brightest sample, as a fraction of full scale.
+    pub max: f64,
+}
+
+/// Count `frame`'s clipped pixels at native depth: samples of a Mono10 frame
+/// clip at 1023, a Mono8 or RGB8 one at 255, each Bayer sample on its own.
+pub fn clipping(frame: &Frame) -> Result<Clipping> {
+    let pixels = checked_pixels(frame)?;
+    let frame = &*unpacked(frame)?;
+    let format = frame.pixel_format;
+    let wide = wide_gray_bits(format).or_else(|| wide_bayer(format).map(|(_, shift)| 8 + shift));
+    let (channels, bits) = match format {
+        MONO8 | 0x0108_00b1 | 0x0108_00c6 | 0x0108_0008..=0x0108_000b => (1, 8),
+        RGB8 | 0x0218_0015 => (3, 8),
+        _ => match wide {
+            Some(bits) => (1, bits),
+            None => bail!("cannot count clipping in {}", pixel_format_name(format)),
+        },
+    };
+    let full = (1u32 << bits) - 1;
+    let (mut high, mut low, mut top) = (0u64, 0u64, 0u32);
+    let truncated = || format!("truncated {} frame", pixel_format_name(format));
+    if bits > 8 {
+        ensure!(frame.data.len() >= pixels * 2, truncated());
+        for sample in frame.data[..pixels * 2].as_chunks::<2>().0 {
+            // Bits above the format's are not part of the sample.
+            let sample = u32::from(u16::from_le_bytes(*sample)) & full;
+            top = top.max(sample);
+            high += u64::from(sample == full);
+            low += u64::from(sample == 0);
+        }
+    } else if channels == 1 {
+        ensure!(frame.data.len() >= pixels, truncated());
+        for &sample in &frame.data[..pixels] {
+            top = top.max(u32::from(sample));
+            high += u64::from(sample == 255);
+            low += u64::from(sample == 0);
+        }
+    } else {
+        ensure!(frame.data.len() >= pixels * 3, truncated());
+        for pixel in frame.data[..pixels * 3].as_chunks::<3>().0 {
+            let brightest = pixel[0].max(pixel[1]).max(pixel[2]);
+            top = top.max(u32::from(brightest));
+            high += u64::from(brightest == 255);
+            low += u64::from(brightest == 0);
+        }
+    }
+    Ok(Clipping {
+        high_px: high,
+        low_px: low,
+        pixels: pixels as u64,
+        max: f64::from(top) / f64::from(full),
+    })
+}
+
 /// How sharp a region is by four common focus measures, each larger when
 /// sharper, in 8-bit luminance units. Absolute values depend on the scene;
 /// compare them while focusing on one subject.
@@ -1754,6 +1819,36 @@ mod tests {
         assert!(!convertible(0));
         assert!(exposure(&f(0, vec![0; 6])).is_err());
         assert!(exposure(&f(RGB8, vec![0; 5])).is_err());
+    }
+    #[test]
+    fn clipping_counts_every_pixel_at_native_depth() {
+        let clipped = |frame: Frame| {
+            let clipping = clipping(&frame).unwrap();
+            (clipping.high_px, clipping.low_px, clipping.max)
+        };
+        let sized = |fmt, data: Vec<u8>| Frame {
+            width: 4,
+            height: 1,
+            ..f(fmt, data)
+        };
+        assert_eq!(clipped(sized(MONO8, vec![0, 255, 254, 9])), (1, 1, 1.0));
+        // 4095 is full scale for Mono12, whatever the bits above it say.
+        assert_eq!(
+            clipped(sized(0x0110_0005, le16(&[0x0FFF, 0xFFFF, 0x0FFE, 0]))),
+            (2, 1, 1.0)
+        );
+        // Packed Mono10p: 1023 is full scale.
+        assert_eq!(clipped(sized(0x010a_0046, vec![0xFF; 5])), (4, 0, 1.0));
+        // Color clips in any channel and is black in all of them.
+        assert_eq!(
+            clipped(sized(RGB8, vec![255, 0, 0, 0, 0, 0, 1, 2, 3, 0, 0, 0])),
+            (1, 2, 1.0)
+        );
+        // A Bayer mosaic counts each sample at its own depth.
+        let (high, low, max) = clipped(sized(0x0110_0011, le16(&[2047, 0, 4095, 1])));
+        assert_eq!((high, low), (1, 1));
+        assert!((max - 1.0).abs() < 1e-9);
+        assert!(clipping(&sized(0x0110_00b8, vec![0; 2])).is_err());
     }
     #[test]
     fn exposure_reports_channels_clipping_and_mean() {

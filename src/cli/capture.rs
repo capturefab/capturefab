@@ -75,6 +75,9 @@ pub struct CaptureArgs {
     /// Settle exposure and gain first, then hold them (as auto does)
     #[arg(long)]
     pub auto: bool,
+    /// Measure the last frame as inspect does, and preview it: the result's inspect block
+    #[arg(long)]
+    pub inspect: bool,
     /// Tag the files: {tag:KEY} in -o, and in each image's metadata; repeatable
     #[arg(long = "tag", value_name = "KEY=VALUE", value_parser = crate::context::parse_pair)]
     pub tags: Vec<(String, String)>,
@@ -263,6 +266,7 @@ impl Plan {
             quality,
             fresh: args.fresh,
             warmup_ms: Some(self.warmup_ms),
+            inspect: args.inspect,
             job: None,
             lease: !args.background,
         }
@@ -454,7 +458,7 @@ fn prepare(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         })?;
     }
     if args.auto {
-        super::auto::settle(client, Duration::from_secs(5))?;
+        super::auto::settle(client, Duration::from_secs(5), &Default::default())?;
     }
     if signals::interrupted() {
         return Err(Categorized::error(
@@ -495,12 +499,17 @@ fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
         seq = reply["seq"].as_u64().unwrap_or(seq);
         let (job, detail) = (&reply["job"], &reply["detail"]);
         if jobs::ended(job) {
-            return finished(
+            let mut value = finished(
                 job,
                 detail,
                 plan.format,
                 stopping.is_some() || signals::interrupted(),
-            );
+            )?;
+            if args.inspect && detail["inspect"].is_object() {
+                let info = client.call(SessionCommand::Info)?;
+                value["inspect"] = super::inspect::compact(&info, &detail["inspect"]);
+            }
+            return Ok(value);
         }
         if signals::interrupted() {
             let since = *stopping.get_or_insert_with(Instant::now);
@@ -744,6 +753,12 @@ fn dry_run(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
 /// the command quietly.
 fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     use std::io::IsTerminal;
+    if args.inspect {
+        return Err(Usage(
+            "--inspect measures a saved frame; give a file or folder with -o".into(),
+        )
+        .into());
+    }
     if args.cameras.cameras.len() > 1
         || plan.count > 1
         || plan.interval_ms > 0
@@ -1041,12 +1056,16 @@ pub const FIELDS: &[(&str, &str)] = &[
         "false — its exposure was still changing when --warmup ran out (with a warning)",
     ),
     ("warnings", "[string]"),
+    (
+        "inspect",
+        "{exposure,verdict,suggest?,focus?,preview?} — with --inspect: the last frame measured as inspect measures it",
+    ),
     ("duration_s", "float — first to last frame, for several"),
     ("output", "\"-\" — with -o -: the image went to stdout"),
     ("bytes", "int — with -o -: the image's size"),
     (
         "cameras",
-        "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,warnings?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
+        "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,warnings?,inspect?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
     ),
     (
         "job",

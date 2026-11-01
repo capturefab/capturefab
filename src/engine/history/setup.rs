@@ -1309,6 +1309,7 @@ mod tests {
             lease: false,
             fresh: 0,
             warmup_ms: None,
+            inspect: false,
         })
         .unwrap();
         let mut narrow = setup.clone();
@@ -1507,6 +1508,8 @@ mod tests {
             balance: Some(0.25),
             continuous: false,
             job: None,
+            max_exposure_us: None,
+            region: None,
         })
         .unwrap();
         let automatic = saved(&h, "auto");

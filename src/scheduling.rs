@@ -85,6 +85,9 @@ pub struct CaptureJob {
     pub last_ts_ns: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_ms: Option<u64>,
+    /// The last frame's measurements and preview, when asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspect: Option<serde_json::Value>,
 }
 /// Files a job lists; a longer job keeps counting in `captured`, and its
 /// newest file is `last_file`.

@@ -1995,6 +1995,7 @@ fn process_plain(
             quality,
             fresh,
             warmup_ms,
+            inspect,
             job,
             ..
         } => {
@@ -2017,6 +2018,7 @@ fn process_plain(
             let label = crate::naming::camera_name(info);
             let source = Source {
                 id: info.id.as_str().into(),
+                kind: info.profile.kind,
             };
             let now_ms = crate::scheduling::now_ms();
             let first_at_ms = first_at_ms.max(now_ms);
@@ -2068,6 +2070,7 @@ fn process_plain(
                 wait: Duration::ZERO,
                 fresh,
                 warmup_ms,
+                inspect,
                 format,
                 sync,
                 manifest,
@@ -2089,8 +2092,18 @@ fn process_plain(
             h.log("info", format!("Capture job {} scheduled", info.id));
             Ok(json!({"job":info}))
         }
-        SessionCommand::Auto { balance, job, .. } => {
-            enter_auto(h, camera, auto, forwarder, jobs, balance, job)
+        SessionCommand::Auto {
+            balance,
+            job,
+            region,
+            max_exposure_us,
+            ..
+        } => {
+            let entered = enter_auto(h, camera, auto, forwarder, jobs, balance, job)?;
+            if let (Some(controller), Some(c)) = (auto.as_mut(), camera.as_mut()) {
+                controller.set_limits(c, region, max_exposure_us)?;
+            }
+            Ok(entered)
         }
         SessionCommand::Manual { revert } => {
             let c = camera_mut(camera)?;
@@ -2346,6 +2359,8 @@ fn process_plain(
 #[derive(Clone, Default)]
 struct Source {
     id: Arc<str>,
+    /// What it images, which says what inspecting its frames measures.
+    kind: crate::camera_profile::CameraKind,
 }
 
 struct Scheduled {
@@ -2359,6 +2374,8 @@ struct Scheduled {
     fresh: u32,
     /// The longest warm-up after the job starts the camera.
     warmup_ms: Option<u64>,
+    /// Inspect its last frame.
+    inspect: bool,
     format: String,
     sync: crate::storage::SyncMode,
     /// Where a line for each saved file goes.
@@ -2489,6 +2506,7 @@ impl Scheduled {
             manifest: self.manifest.clone(),
             source: self.source.clone(),
             context: self.info.context.clone(),
+            inspect: self.inspect && self.index() + 1 == self.info.count,
         }
     }
     /// Schedule the next shot one interval after every shot so far: saved,
@@ -3043,6 +3061,9 @@ fn finish(h: &WorkerHandle, job: &mut Scheduled, result: Result<saver::SavedShot
             info.last_ms = Some(shot.wall_ms);
             info.last_id = Some(shot.id);
             info.last_ts_ns = shot.device_ts_ns;
+            if shot.inspection.is_some() {
+                info.inspect = shot.inspection;
+            }
             if info.active() {
                 info.error = None;
                 info.error_tag = None;
@@ -3810,6 +3831,7 @@ mod tests {
             lease: false,
             fresh: 0,
             warmup_ms: None,
+            inspect: false,
         };
         let frames = root.join("f-{frame}.raw").to_string_lossy().into_owned();
         handle.request(schedule(frames.clone(), 3, "raw")).unwrap();
@@ -4531,6 +4553,7 @@ mod tests {
                 lease: false,
                 fresh: 0,
                 warmup_ms: None,
+                inspect: false,
             })
             .unwrap();
         assert_eq!(job["job"]["context"]["lot"], "7");
@@ -4613,6 +4636,7 @@ mod tests {
             fresh: 0,
             wait: Duration::ZERO,
             warmup_ms: None,
+            inspect: false,
         }
     }
     /// What the saver reports for a shot it wrote to `save.path`.
@@ -4648,6 +4672,7 @@ mod tests {
                 device_ts_ns: shot.frame.device_ts_ns,
                 wall_ms: shot.wall_ms,
                 settings: Default::default(),
+                inspection: None,
             },
         }
     }
@@ -4960,6 +4985,7 @@ mod tests {
                 device_ts_ns: None,
                 wall_ms: 0,
                 settings: Default::default(),
+                inspection: None,
             }),
         );
         tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
@@ -5050,6 +5076,7 @@ mod tests {
                 device_ts_ns: None,
                 wall_ms: 0,
                 settings: Default::default(),
+                inspection: None,
             });
             finish(&h, job, result);
         };
@@ -5176,6 +5203,8 @@ mod tests {
             balance,
             continuous: false,
             job: None,
+            max_exposure_us: None,
+            region: None,
         })
     }
     fn set(h: &WorkerHandle, feature: &str, value: &str) {
@@ -5288,6 +5317,8 @@ mod tests {
             balance: None,
             continuous: true,
             job: Some(7),
+            max_exposure_us: None,
+            region: None,
         })
         .unwrap();
         let ended = |h: &WorkerHandle| {
@@ -5734,6 +5765,8 @@ mod tests {
                 balance: Some(1.0),
                 continuous: false,
                 job: None,
+                max_exposure_us: None,
+                region: None,
             }
             .into(),
         )

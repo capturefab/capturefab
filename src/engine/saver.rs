@@ -39,6 +39,8 @@ pub(super) struct Save {
     pub(super) manifest: Option<Arc<super::saved::Manifest>>,
     pub(super) source: Source,
     pub(super) context: crate::context::Context,
+    /// Measure the frame and preview it, as inspect does: the job's last.
+    pub(super) inspect: bool,
 }
 
 /// A job's saved file, or why it was not saved.
@@ -56,6 +58,8 @@ pub(super) struct SavedShot {
     pub(super) device_ts_ns: Option<u64>,
     pub(super) wall_ms: u64,
     pub(super) settings: serde_json::Map<String, Value>,
+    /// Its measurements and preview, when asked for.
+    pub(super) inspection: Option<Value>,
 }
 
 /// A published file, waiting for its turn to be reported.
@@ -376,6 +380,22 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
         Some(save.job),
         &save.context,
     );
+    // Measured here, from the frame in memory, beside the file.
+    let inspection = save
+        .inspect
+        .then(|| {
+            inspector::measurements(
+                &shot.frame,
+                save.source.kind,
+                &save.source.id,
+                None,
+                crate::inspect::default_edge(),
+                Default::default(),
+                None,
+            )
+        })
+        .transpose()
+        .unwrap_or_else(|error| Some(json!({ "notes": [format!("not measured: {error:#}")] })));
     let line = save.manifest.as_ref().map(|manifest| {
         let settings = Value::Object(shot.acquisition.settings.clone());
         (
@@ -397,6 +417,7 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
             device_ts_ns: shot.frame.device_ts_ns,
             wall_ms: shot.wall_ms,
             settings: shot.acquisition.settings.clone(),
+            inspection,
         },
     })
 }

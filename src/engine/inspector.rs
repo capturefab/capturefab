@@ -445,44 +445,15 @@ pub(super) fn no_new_frame(camera: &str, wait: Duration) -> anyhow::Error {
 /// Measure a job's frame and write its preview: the reply.
 fn measure(job: &Job) -> Result<Value> {
     let request = &job.request;
-    let mut inspection = crate::inspect::inspect(
+    let mut reply = measurements(
         &job.frame,
         job.camera.profile.kind,
+        &job.camera.id,
         request.region,
         request.max_dimension,
         request.format,
+        request.preview.as_deref(),
     )?;
-    let image = inspection.image.take();
-    let mut reply = serde_json::to_value(&inspection)?;
-    if let Some(fields) = reply.as_object_mut() {
-        fields.remove("image");
-    }
-    if let Some(image) = image {
-        let extension = if image.mime == "image/jpeg" {
-            "jpg"
-        } else {
-            "png"
-        };
-        let path = match &request.preview {
-            Some(path) => {
-                crate::storage::save_one(&image.bytes, path)?;
-                path.clone()
-            }
-            None => private_image(
-                &preview_dir(),
-                &safe_label(&job.camera.id),
-                &image.bytes,
-                extension,
-            )?,
-        };
-        reply["image"] = json!({
-            "mime": image.mime,
-            "width": image.width,
-            "height": image.height,
-            "bytes": image.bytes.len(),
-            "path": path,
-        });
-    }
     if !job.notes.is_empty() {
         reply["settled"] = json!(false);
     }
@@ -517,6 +488,47 @@ fn measure(job: &Job) -> Result<Value> {
         "source": job.source,
         "waited_frames": job.waited,
     });
+    Ok(reply)
+}
+
+/// Measure `frame`'s `region` and write its preview, to `preview` or the
+/// private folder: the reply's measurements and `image`.
+pub(super) fn measurements(
+    frame: &Frame,
+    kind: crate::camera_profile::CameraKind,
+    camera: &str,
+    region: Option<[f64; 4]>,
+    max_dimension: u32,
+    format: PreviewFormat,
+    preview: Option<&Path>,
+) -> Result<Value> {
+    let mut inspection = crate::inspect::inspect(frame, kind, region, max_dimension, format)?;
+    let image = inspection.image.take();
+    let mut reply = serde_json::to_value(&inspection)?;
+    if let Some(fields) = reply.as_object_mut() {
+        fields.remove("image");
+    }
+    if let Some(image) = image {
+        let extension = if image.mime == "image/jpeg" {
+            "jpg"
+        } else {
+            "png"
+        };
+        let path = match preview {
+            Some(path) => {
+                crate::storage::save_one(&image.bytes, path)?;
+                path.to_path_buf()
+            }
+            None => private_image(&preview_dir(), &safe_label(camera), &image.bytes, extension)?,
+        };
+        reply["image"] = json!({
+            "mime": image.mime,
+            "width": image.width,
+            "height": image.height,
+            "bytes": image.bytes.len(),
+            "path": path,
+        });
+    }
     Ok(reply)
 }
 

@@ -2,7 +2,12 @@
 //! keeps the colour filter phase, exposure, auto-meter and focus
 //! measurements, and a bounded JPEG or PNG preview. The session's `frame`
 //! command answers with these for agents, scripts and remote clients.
-use crate::{camera_profile::CameraKind, frame, jpeg::Raster, types::Frame};
+use crate::{
+    camera_profile::CameraKind,
+    frame::{self, Clipping},
+    jpeg::Raster,
+    types::Frame,
+};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, ops::RangeInclusive};
@@ -278,6 +283,8 @@ pub struct Measurements {
     pub exposure: Option<ExposureSummary>,
     /// Brightness as auto exposure meters it, at native bit depth.
     pub auto_meter: Option<crate::auto::Meter>,
+    /// Clipped pixels over the whole region at native bit depth.
+    pub clipping: Option<Clipping>,
     /// Focus scores of the region at full resolution. Absolute values depend
     /// on the scene; compare them for one region of one camera.
     pub focus: Option<Focus>,
@@ -324,6 +331,17 @@ fn measure_view(frame: &Frame, view: &Frame, kind: CameraKind, rect: [u32; 4]) -
         Err(error) => measured
             .notes
             .push(format!("exposure not measured: {error:#}")),
+    }
+    match frame::clipping(view) {
+        Ok(clipping) => {
+            measured.clipping = Some(Clipping {
+                max: round4(clipping.max),
+                ..clipping
+            })
+        }
+        Err(error) => measured
+            .notes
+            .push(format!("clipping not counted: {error:#}")),
     }
     measured.auto_meter = crate::auto::meter(view).map(|meter| crate::auto::Meter {
         mean: round4(meter.mean),

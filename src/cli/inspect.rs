@@ -10,7 +10,7 @@ use crate::{
     session::SessionCommand,
     types::{Categorized, ErrorKind, Usage},
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use clap::Args;
 use serde_json::{Value, json};
 use std::{fmt::Write as _, path::PathBuf, time::Duration};
@@ -40,11 +40,28 @@ pub struct InspectArgs {
     /// Change settings first, as one atomic change (as set does), then measure; repeatable
     #[arg(long = "set", value_name = "NAME=VALUE")]
     pub settings: Vec<String>,
+    /// Measure a frame every --every for this long (at most 50 samples), as for focusing: the series, and the sharpest frame's measurements and preview
+    #[arg(long = "for", value_name = "DUR", value_parser = super::args::duration)]
+    pub sample_for: Option<Duration>,
+    /// Time between samples with --for (default 200ms)
+    #[arg(long, value_name = "DUR", value_parser = super::args::duration, requires = "sample_for")]
+    pub every: Option<Duration>,
+    /// Share of the measured pixels at full scale above which the verdict says clipped_high (default: any pixel with --region, else 0.005)
+    #[arg(long, value_name = "SHARE", value_parser = parse_share)]
+    pub clip_threshold: Option<f64>,
     #[command(flatten)]
     pub keep: KeepArg,
 }
 
-fn parse_region(text: &str) -> std::result::Result<[f64; 4], String> {
+fn parse_share(text: &str) -> std::result::Result<f64, String> {
+    text.trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|share| (0.0..=1.0).contains(share))
+        .ok_or_else(|| "a share is a number from 0 to 1, such as 0.001".to_owned())
+}
+
+pub(super) fn parse_region(text: &str) -> std::result::Result<[f64; 4], String> {
     let parts = text
         .split(',')
         .map(|part| part.trim().parse::<f64>())
@@ -72,6 +89,24 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
     }
     if millis(args.warmup) > crate::session::MAX_WARMUP_MS {
         return Err(Usage("--warmup is at most 60s".into()).into());
+    }
+    if let Some(duration) = args.sample_for {
+        let every = args.every.unwrap_or(DEFAULT_EVERY);
+        if every.is_zero() {
+            return Err(Usage("--every must be longer than 0".into()).into());
+        }
+        let samples = millis(duration) / millis(every).max(1) + 1;
+        if samples > MAX_SAMPLES {
+            return Err(Usage(format!(
+                "--for {} --every {} takes {samples} samples; at most {MAX_SAMPLES}: use --every {}",
+                super::args::duration_text(duration),
+                super::args::duration_text(every),
+                super::args::duration_text(Duration::from_millis(
+                    millis(duration).div_ceil(MAX_SAMPLES - 1)
+                ))
+            ))
+            .into());
+        }
     }
     let settings = args
         .settings
@@ -184,31 +219,139 @@ fn inspect(
         },
         _ => PreviewFormat::Auto,
     };
-    let reply = client
-        .call(SessionCommand::Frame {
-            // The worker counts the frame measured too.
-            fresh: args.fresh + 1,
-            timeout_ms: args.timeout.map_or(0, millis),
-            max_dimension: if matches!(preview, Preview::None) {
-                0
-            } else {
-                args.size
-            },
-            format,
-            region: args.region,
-            preview: match preview {
+    let threshold = args.clip_threshold.unwrap_or(if args.region.is_some() {
+        0.0
+    } else {
+        crate::inspect::CLIP_WARN
+    });
+    let frame = |fresh: u32, preview: Option<String>, max_dimension: u32| {
+        client
+            .call(SessionCommand::Frame {
+                // The worker counts the frame measured too.
+                fresh: fresh + 1,
+                timeout_ms: args.timeout.map_or(0, millis),
+                max_dimension,
+                format,
+                region: args.region,
+                preview,
+                warmup_ms: Some(millis(args.warmup)),
+            })
+            .map_err(trigger_hint)
+    };
+    let size = if matches!(preview, Preview::None) {
+        0
+    } else {
+        args.size
+    };
+    let Some(duration) = args.sample_for else {
+        let reply = frame(
+            args.fresh,
+            match preview {
                 Preview::File(path) => Some(path.to_string_lossy().into_owned()),
                 _ => None,
             },
-            warmup_ms: Some(millis(args.warmup)),
-        })
-        .map_err(trigger_hint)?;
-    let mut value = document(&info, &reply, verbose);
-    // The camera's worker wrote the preview where it was asked to go.
-    if let Some(path) = reply["image"]["path"].as_str() {
-        value["preview"] = json!(path);
+            size,
+        )?;
+        let mut value = document(&info, &reply, threshold, verbose);
+        // The camera's worker wrote the preview where it was asked to go.
+        if let Some(path) = reply["image"]["path"].as_str() {
+            value["preview"] = json!(path);
+        }
+        return Ok(value);
+    };
+    // A series: the camera streams while it lasts, so each sample is the
+    // next frame rather than a new start.
+    let every = args.every.unwrap_or(DEFAULT_EVERY);
+    let streaming = client.status()?["streaming"] == true;
+    let started = !streaming && client.call(SessionCommand::Start).is_ok();
+    let sampled = sample(duration, every, args.fresh, |fresh| {
+        frame(fresh, None, size)
+    });
+    if started {
+        let camera = client.status()?;
+        let busy = camera["forwarding"].is_string()
+            || super::jobs::of_camera(&camera)
+                .iter()
+                .any(|job| !super::jobs::ended(job));
+        if !busy {
+            client.call(SessionCommand::Stop)?;
+        }
+    }
+    let (series, best) = sampled?;
+    let mut value = document(&info, &best.reply, threshold, verbose);
+    value["series"] = json!(series);
+    value["best"] = json!({"t": best.t, "sharpness": best.sharpness});
+    if let Some(path) = best.reply["image"]["path"].as_str() {
+        match preview {
+            // The best frame's preview goes where it was asked to.
+            Preview::File(file) => {
+                let bytes = std::fs::read(path)?;
+                crate::storage::save_one(&bytes, file)?;
+                value["preview"] = json!(file);
+            }
+            _ => value["preview"] = json!(path),
+        }
     }
     Ok(value)
+}
+
+/// How often a series samples by default.
+const DEFAULT_EVERY: Duration = Duration::from_millis(200);
+/// The most samples a series takes.
+const MAX_SAMPLES: u64 = 50;
+
+/// The sharpest sample of a series so far.
+struct Best {
+    t: f64,
+    sharpness: f64,
+    reply: Value,
+}
+
+/// Measure a frame every `every` for `duration`, a person moving the focus
+/// meanwhile: each sample's time, sharpness and brightness, and the
+/// sharpest one's measurements.
+fn sample(
+    duration: Duration,
+    every: Duration,
+    fresh: u32,
+    mut frame: impl FnMut(u32) -> Result<Value>,
+) -> Result<(Vec<Value>, Best)> {
+    let began = std::time::Instant::now();
+    let mut series = Vec::new();
+    let mut best: Option<Best> = None;
+    for index in 0..MAX_SAMPLES {
+        let due = every.saturating_mul(u32::try_from(index).unwrap_or(u32::MAX));
+        if due > duration {
+            break;
+        }
+        std::thread::sleep(due.saturating_sub(began.elapsed()));
+        if super::signals::interrupted() {
+            return Err(
+                Categorized::new(ErrorKind::Interrupted, "interrupted while sampling")
+                    .details(json!({ "series": series }))
+                    .into(),
+            );
+        }
+        // The first sample lets --fresh frames pass; later ones take the
+        // next frame.
+        let reply = frame(if index == 0 { fresh } else { 0 })?;
+        let t = (began.elapsed().as_secs_f64() * 1000.0).round() / 1000.0;
+        let sharpness = reply["focus"]["laplacian"].as_f64().unwrap_or(0.0);
+        series.push(json!({
+            "t": t,
+            "sharpness": sharpness,
+            "mean": reply["exposure"]["mean"],
+        }));
+        if best.as_ref().is_none_or(|best| sharpness > best.sharpness) {
+            best = Some(Best {
+                t,
+                sharpness,
+                reply,
+            });
+        }
+    }
+    let best = best.context("no sample was taken")?;
+    Ok((series, best))
 }
 
 /// A trigger timeout says what inspect can do about it.
@@ -232,20 +375,39 @@ fn trigger_hint(error: anyhow::Error) -> anyhow::Error {
 
 /// The compact document: what an agent needs to judge the frame and what to
 /// change. Under -v, the histogram, channels and every focus metric too.
-fn document(info: &Value, reply: &Value, verbose: bool) -> Value {
+/// The shares of the measured pixels clipped high and low: counted over
+/// every pixel at native bit depth when the worker could, else from the
+/// sampled histogram.
+fn clipped(reply: &Value) -> (f64, f64) {
+    let clipping = &reply["clipping"];
+    let exposure = &reply["exposure"];
+    match clipping["pixels"].as_f64().filter(|pixels| *pixels > 0.0) {
+        Some(pixels) => (
+            clipping["high_px"].as_f64().unwrap_or(0.0) / pixels,
+            clipping["low_px"].as_f64().unwrap_or(0.0) / pixels,
+        ),
+        None => (
+            exposure["highlights"].as_f64().unwrap_or(0.0),
+            exposure["shadows"].as_f64().unwrap_or(0.0),
+        ),
+    }
+}
+
+fn document(info: &Value, reply: &Value, threshold: f64, verbose: bool) -> Value {
     let frame = &reply["frame"];
     let exposure = &reply["exposure"];
     let measured = exposure.is_object();
+    let (clipped_high, clipped_low) = clipped(reply);
     let mut verdict = Vec::new();
     if !measured {
         verdict.push("not_measured");
     } else {
         let share = |key: &str| exposure[key].as_f64().unwrap_or(0.0);
         let mean = share("mean");
-        if share("highlights") > crate::inspect::CLIP_WARN {
+        if clipped_high > threshold {
             verdict.push("clipped_high");
         }
-        if share("shadows") > crate::inspect::CLIP_WARN {
+        if clipped_low > crate::inspect::CLIP_WARN {
             verdict.push("clipped_low");
         }
         if mean < crate::inspect::DARK {
@@ -273,13 +435,17 @@ fn document(info: &Value, reply: &Value, verbose: bool) -> Value {
         "settings": settings(info),
     });
     if measured {
+        let round = |share: f64| (share * 1e6).round() / 1e6;
         value["exposure"] = json!({
             "mean": exposure["mean"],
             "p1": exposure["p01"],
             "p50": exposure["p50"],
             "p99": exposure["p99"],
-            "clipped_low": exposure["shadows"],
-            "clipped_high": exposure["highlights"],
+            "clipped_low": round(clipped_low),
+            "clipped_high": round(clipped_high),
+            "clipped_low_px": reply["clipping"]["low_px"],
+            "clipped_high_px": reply["clipping"]["high_px"],
+            "max": reply["clipping"]["max"],
         });
         if let Some(suggest) = suggest(info, reply) {
             value["suggest"] = suggest;
@@ -315,6 +481,22 @@ fn document(info: &Value, reply: &Value, verbose: bool) -> Value {
     crate::types::without_nulls(value)
 }
 
+/// The compact block `capture --inspect` attaches: the measured frame's
+/// exposure, verdict, suggestion, focus and preview.
+pub(super) fn compact(info: &Value, reply: &Value) -> Value {
+    let document = document(info, reply, crate::inspect::CLIP_WARN, false);
+    let mut value = json!({});
+    for key in ["exposure", "verdict", "suggest", "focus"] {
+        if let Some(field) = document.get(key) {
+            value[key] = field.clone();
+        }
+    }
+    if let Some(path) = reply["image"]["path"].as_str() {
+        value["preview"] = json!(path);
+    }
+    value
+}
+
 /// The settings that shape exposure, from `info`.
 fn settings(info: &Value) -> Value {
     crate::types::without_nulls(json!({
@@ -344,7 +526,7 @@ fn suggest(info: &Value, reply: &Value) -> Option<Value> {
     // much darker, so a mostly clipped frame steps further the more of it
     // is clipped (4 stops when all of it is), and the suggestion is a
     // bound to measure again.
-    let clipped = exposure["highlights"].as_f64().unwrap_or(0.0);
+    let (clipped, _) = clipped(reply);
     if clipped > crate::inspect::CLIP_WARN {
         ev = ev.min(-1.0 / 3.0);
     }
@@ -450,7 +632,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ),
     (
         "exposure",
-        "{mean,p1,p50,p99,clipped_low,clipped_high} — brightness 0..1 and shares of pixels at black and full scale",
+        "{mean,p1,p50,p99,clipped_low,clipped_high,clipped_low_px?,clipped_high_px?,max?} — brightness 0..1; shares and counts of pixels at black and at full scale, counted over every pixel of the region at the camera's bit depth; max: the brightest sample as a share of full scale",
     ),
     (
         "verdict",
@@ -500,13 +682,18 @@ pub const FIELDS: &[(&str, &str)] = &[
         "warnings",
         "[string] — such as a camera still settling when --warmup ran out (verdict not_settled)",
     ),
+    (
+        "series",
+        "[{t,sharpness,mean}] — with --for: every sample, t in seconds from the first; the other fields describe the sharpest frame",
+    ),
+    ("best", "{t,sharpness} — with --for: the sharpest sample"),
     ("histogram", "[16 ints] — with -v: luminance histogram"),
     ("channels", "{red,green,blue} — with -v, for color"),
     ("region", "{x,y,width,height,normalized} — with -v"),
     ("notes", "[string] — with -v"),
     (
         "cameras",
-        "[{camera,frame,exposure?,verdict,suggest?,focus?,settings,preview?,histogram?,channels?,region?,notes?}] — with -c repeated",
+        "[{camera,frame,exposure?,verdict,suggest?,focus?,settings,preview?,after_change?,frames?,dropped?,incomplete?,resent?,warmup_ms?,warnings?,series?,best?,histogram?,channels?,region?,notes?}] — with -c repeated",
     ),
 ];
 

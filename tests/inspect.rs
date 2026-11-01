@@ -184,3 +184,138 @@ fn auto_settles_then_holds_or_turns_off() {
     let direct = home.ok(&["--no-session", "auto", "-c", "sim:9", "--continuous"]);
     assert_eq!(direct["by"], "camera");
 }
+
+#[test]
+fn clipping_is_counted_over_every_pixel_at_the_cameras_bit_depth() {
+    let home = Home::new("clipping");
+    // Mid-grey but for the marker lines, which clip at Mono12's 4095.
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "PixelFormat=Mono12",
+        "ExposureTime=10000",
+        "Gain=1",
+    ]);
+    let whole = home.ok(&["inspect", "-c", "sim:0", "--preview", "none"]);
+    let exposure = &whole["exposure"];
+    let clipped = exposure["clipped_high_px"].as_u64().unwrap();
+    // Every pixel of the 640-pixel marker row and the moving column, and a
+    // few of the brightest of the scene.
+    assert!((640..5000).contains(&clipped), "{whole}");
+    assert_eq!(exposure["max"], 1.0, "{whole}");
+    // ...but any clipped pixel inside a region counts, unless a threshold
+    // allows it.
+    let marked = home.ok(&[
+        "inspect",
+        "-c",
+        "sim:0",
+        "--preview",
+        "none",
+        "--region",
+        "0.4,0.4,0.2,0.2",
+    ]);
+    assert!(
+        marked["verdict"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("clipped_high")),
+        "{marked}"
+    );
+    let allowed = home.ok(&[
+        "inspect",
+        "-c",
+        "sim:0",
+        "--preview",
+        "none",
+        "--region",
+        "0.4,0.4,0.2,0.2",
+        "--clip-threshold",
+        "0.5",
+    ]);
+    assert!(
+        !allowed["verdict"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("clipped_high")),
+        "{allowed}"
+    );
+}
+
+#[test]
+fn a_series_samples_focus_and_keeps_the_sharpest_frame() {
+    let home = Home::new("series");
+    let series = home.ok(&[
+        "inspect",
+        "-c",
+        "sim:microscope",
+        "--for",
+        "600ms",
+        "--every",
+        "200ms",
+        "--preview",
+        "best.jpg",
+    ]);
+    let samples = series["series"].as_array().unwrap();
+    assert_eq!(samples.len(), 4, "{series}");
+    let sharpest = samples
+        .iter()
+        .map(|sample| sample["sharpness"].as_f64().unwrap())
+        .fold(0.0, f64::max);
+    assert_eq!(series["best"]["sharpness"].as_f64(), Some(sharpest));
+    assert_eq!(series["focus"]["sharpness"].as_f64(), Some(sharpest));
+    assert!(home.path("best.jpg").is_file());
+    assert_eq!(
+        home.fails(
+            2,
+            &["inspect", "-c", "sim:0", "--for", "1m", "--every", "100ms"]
+        )["code"],
+        "usage"
+    );
+    // A capture measures its last frame the same way.
+    let shot = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "-n",
+        "2",
+        "--inspect",
+        "-o",
+        "shots/",
+    ]);
+    assert_eq!(shot["inspect"]["verdict"], json!(["ok"]), "{shot}");
+    assert!(Path::new(shot["inspect"]["preview"].as_str().unwrap()).is_file());
+}
+
+#[test]
+fn auto_meters_a_region_and_keeps_exposure_short_when_asked() {
+    let home = Home::new("auto-limits");
+    let _session = home.serve("limits", &["sim:0"]);
+    home.ok(&["set", "-c", "sim:0", "exposure=1ms"]);
+    // Capturefab's auto mode keeps to the limits; gain makes up the rest.
+    let capped = home.ok(&[
+        "auto",
+        "-c",
+        "sim:0",
+        "--max-exposure",
+        "3ms",
+        "--region",
+        "0.25,0.25,0.5,0.5",
+        "--timeout",
+        "10s",
+    ]);
+    assert_eq!(capped["by"], "capturefab", "{capped}");
+    assert!(capped["exposure_us"].as_f64().unwrap() <= 3000.0, "{capped}");
+    assert!(capped["gain_db"].as_f64().unwrap() > 0.0, "{capped}");
+    assert_eq!(capped["settled"], true, "{capped}");
+    // Without limits the camera's own auto exposure runs once.
+    home.ok(&["set", "-c", "sim:0", "exposure=1ms", "Gain=0"]);
+    let once = home.ok(&["auto", "-c", "sim:0", "--timeout", "10s"]);
+    assert_eq!(once["by"], "camera", "{once}");
+    assert_eq!(once["settled"], true, "{once}");
+    assert!(once["exposure_us"].as_f64().unwrap() > 3000.0, "{once}");
+    assert_eq!(
+        home.ok(&["get", "-c", "sim:0", "ExposureAuto"])["values"]["ExposureAuto"],
+        "Off"
+    );
+}

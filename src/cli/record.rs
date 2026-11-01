@@ -219,7 +219,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         })?;
     }
     if args.auto {
-        super::auto::settle(&client, Duration::from_secs(5))?;
+        super::auto::settle(&client, Duration::from_secs(5), &Default::default())?;
     }
     let info = client.call(SessionCommand::Info)?;
     let fps = args.fps.unwrap_or_else(|| camera_fps(&info));

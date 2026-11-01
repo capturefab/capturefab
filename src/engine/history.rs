@@ -670,6 +670,8 @@ mod tests {
             balance: Some(0.3),
             continuous: false,
             job: None,
+            max_exposure_us: None,
+            region: None,
         })
         .unwrap();
         let exposure = get(&h, "ExposureTime");

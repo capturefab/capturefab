@@ -408,6 +408,10 @@ pub struct AutoController {
     link_fps: Option<f64>,
     bandwidth: Option<Bandwidth>,
     white_balance: Option<WhiteBalance>,
+    /// The part of the frame metered, normalized; all of it when None.
+    region: Option<[f64; 4]>,
+    /// The longest exposure, in microseconds, before gain is raised.
+    max_exposure: Option<f64>,
 }
 
 impl AutoController {
@@ -463,6 +467,27 @@ impl AutoController {
         }
         Ok(())
     }
+    /// Meter only `region` of the frame, and keep exposure at most
+    /// `max_exposure` microseconds, raising gain instead, as against motion
+    /// blur.
+    pub fn set_limits(
+        &mut self,
+        camera: &mut Camera,
+        region: Option<[f64; 4]>,
+        max_exposure: Option<f64>,
+    ) -> Result<()> {
+        ensure!(
+            max_exposure.is_none_or(|us| us.is_finite() && us > 0.0),
+            "the longest exposure must be a positive time"
+        );
+        if (region, max_exposure) != (self.region, self.max_exposure) {
+            (self.region, self.max_exposure) = (region, max_exposure);
+            self.samples.clear();
+            self.in_band = 0;
+            self.plan(camera);
+        }
+        Ok(())
+    }
     pub fn set_forward_fps(&mut self, fps: Option<f64>) -> Result<()> {
         ensure!(
             fps.is_none_or(|fps| fps.is_finite() && fps > 0.0),
@@ -491,7 +516,11 @@ impl AutoController {
             return;
         }
         self.last_meter = Some(now);
-        let Some(m) = meter(frame) else {
+        let region = self.region.and_then(|region| {
+            let px = crate::inspect::region_pixels(region, frame.width, frame.height);
+            crate::inspect::crop(frame, px).ok()
+        });
+        let Some(m) = meter(region.as_ref().unwrap_or(frame)) else {
             self.unmetered = true;
             return;
         };
@@ -984,6 +1013,9 @@ impl AutoController {
             p.exposure_cap = p
                 .exposure_cap
                 .max(free.min(c.exposure_bounds.max.unwrap_or(f64::INFINITY)));
+        }
+        if let Some(max) = self.max_exposure {
+            p.exposure_cap = p.exposure_cap.min(max).max(p.exposure_lower);
         }
         self.policy = p;
         match self.status.strategy.as_str() {

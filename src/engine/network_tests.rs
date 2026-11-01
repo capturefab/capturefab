@@ -319,6 +319,7 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
             fresh: 0,
             wait: Duration::ZERO,
             warmup_ms: None,
+            inspect: false,
         });
         let error = harness.optimize().unwrap_err();
         assert!(error.to_string().contains("scheduled captures"));
