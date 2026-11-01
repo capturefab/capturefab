@@ -170,6 +170,7 @@ fn run_with(command: &LoginCommand, session: Option<&str>, timeout: Duration) ->
             let check = if *no_check {
                 None
             } else {
+                let _checking = super::term::activity("checking the sign-in…");
                 Some(check(&target, &login, timeout)?)
             };
             let saved = Logins::system().save(&address, &login)?;

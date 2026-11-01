@@ -7,29 +7,77 @@
 //! everything they started, with an `interrupted` error unless the command
 //! already printed its document. The first signal sets the exit code: 130
 //! for SIGINT, 143 for SIGTERM, 129 for SIGHUP.
+//!
+//! In a shell each command runs in a scope of its own: a signal interrupts
+//! the command running, as it would the process, and the shell goes on. A
+//! command that does not take signals over, or one interrupted twice, is
+//! left to finish on its own while the shell takes the next.
 use super::output::Output;
 use anyhow::Result;
-use std::sync::{
-    Mutex, OnceLock,
-    atomic::{AtomicBool, AtomicI32, Ordering},
+use std::{
+    cell::Cell,
+    sync::{
+        Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 type Handler = Box<dyn FnMut() + Send>;
 
-/// The first signal, 0 before any.
+/// The first signal, 0 before any (in a shell: in the running command).
 static SIGNAL: AtomicI32 = AtomicI32::new(0);
+/// The latest signal.
+static LAST: AtomicI32 = AtomicI32::new(0);
+/// Signals seen (in a shell: by the running command).
+static SEEN: AtomicUsize = AtomicUsize::new(0);
 /// Set by commands that end their own work on a signal.
 static GRACEFUL: AtomicBool = AtomicBool::new(false);
 static HANDLERS: Mutex<Vec<Handler>> = Mutex::new(Vec::new());
 /// Run on a second signal, before the process exits.
 static KILLERS: Mutex<Vec<Handler>> = Mutex::new(Vec::new());
 static OUTPUT: OnceLock<Output> = OnceLock::new();
+/// Wakes `sleep`ers when a signal arrives.
+static NAP: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
+
+/// What a shell is told of a signal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellSignal {
+    /// The command of this scope was interrupted and does not end its own
+    /// work: stop waiting for it.
+    Interrupted(u64),
+    /// The command of this scope was interrupted again.
+    Again(u64),
+    /// A signal between commands.
+    Idle(i32),
+}
+type Notify = Box<dyn Fn(ShellSignal) + Send + Sync>;
+/// Set once commands run as a shell's: where signals go.
+static SHELL: OnceLock<Notify> = OnceLock::new();
+/// The newest command scope begun, and the one running (0 between them).
+static NEWEST: AtomicU64 = AtomicU64::new(0);
+static RUNNING: AtomicU64 = AtomicU64::new(0);
+/// The newest scope a signal interrupted.
+static SIGNALLED: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    /// The scope of the command this thread runs, 0 for other threads.
+    static SCOPE: Cell<u64> = const { Cell::new(0) };
+}
 
 const SIGINT: i32 = 2;
 
-/// Whether a signal has arrived.
+/// Whether a signal has arrived: in a shell, for the command this thread
+/// runs, or for one the shell has since left behind.
 pub fn interrupted() -> bool {
-    SIGNAL.load(Ordering::Acquire) != 0
+    if SHELL.get().is_none() {
+        return SIGNAL.load(Ordering::Acquire) != 0;
+    }
+    let newest = NEWEST.load(Ordering::Acquire);
+    let mine = match SCOPE.with(Cell::get) {
+        0 => newest,
+        scope => scope,
+    };
+    mine < newest || (mine > 0 && SIGNALLED.load(Ordering::Acquire) >= mine)
 }
 
 /// The exit code of a command a signal interrupted: 128 plus the signal.
@@ -64,6 +112,28 @@ pub fn on_second(killer: impl FnMut() + Send + 'static) {
         .push(Box::new(killer));
 }
 
+/// Sleep for `duration`, or less when a signal arrives.
+pub fn sleep(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    let mut nap = NAP.0.lock().unwrap_or_else(|e| e.into_inner());
+    while !interrupted() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        nap = NAP
+            .1
+            .wait_timeout(nap, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
+fn wake_sleepers() {
+    let _nap = NAP.0.lock().unwrap_or_else(|e| e.into_inner());
+    NAP.1.notify_all();
+}
+
 /// Handle signals for this invocation, reporting with `out`.
 pub fn install(out: Output) -> Result<()> {
     if OUTPUT.set(out).is_err() {
@@ -72,13 +142,80 @@ pub fn install(out: Output) -> Result<()> {
     platform::install()
 }
 
-/// The first signal: run the handlers, then exit unless the command took
-/// over. Runs on the watcher thread, never in the signal handler itself.
-fn first() {
+/// Whether commands run as a shell's.
+pub fn in_shell() -> bool {
+    SHELL.get().is_some()
+}
+
+/// Run commands as a shell's from now on: signals go to `notify` instead
+/// of ending the process.
+pub fn shell(notify: impl Fn(ShellSignal) + Send + Sync + 'static) {
+    let _ = SHELL.set(Box::new(notify));
+}
+
+/// Begin a command's scope: no signal, handler or takeover of an earlier
+/// command carries into it. The thread that runs the command `enter`s it.
+pub fn begin() -> u64 {
+    let scope = NEWEST.fetch_add(1, Ordering::AcqRel) + 1;
+    SIGNAL.store(0, Ordering::Release);
+    SEEN.store(0, Ordering::Release);
+    GRACEFUL.store(false, Ordering::Release);
+    HANDLERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    KILLERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    RUNNING.store(scope, Ordering::Release);
+    scope
+}
+
+/// Run on this thread as the command of `scope`.
+pub fn enter(scope: u64) {
+    SCOPE.with(|cell| cell.set(scope));
+}
+
+/// The shell is between commands.
+pub fn end() {
+    RUNNING.store(0, Ordering::Release);
+}
+
+/// A signal arrived: what the process, or the shell, does about it. Runs
+/// on the watcher thread, never in the signal handler itself.
+fn arrived() {
+    let Some(notify) = SHELL.get() else {
+        if SEEN.fetch_add(1, Ordering::AcqRel) == 0 {
+            wake_sleepers();
+            first();
+        } else {
+            second();
+        }
+        return;
+    };
+    let scope = RUNNING.load(Ordering::Acquire);
+    if scope == 0 {
+        notify(ShellSignal::Idle(LAST.load(Ordering::Acquire)));
+        return;
+    }
+    if SEEN.fetch_add(1, Ordering::AcqRel) > 0 {
+        notify(ShellSignal::Again(scope));
+        return;
+    }
+    SIGNALLED.fetch_max(scope, Ordering::AcqRel);
+    wake_sleepers();
+    run_handlers();
+    if !GRACEFUL.load(Ordering::Acquire) {
+        notify(ShellSignal::Interrupted(scope));
+    }
+}
+
+fn run_handlers() {
     let handlers = std::mem::take(&mut *HANDLERS.lock().unwrap_or_else(|e| e.into_inner()));
     for mut handler in handlers {
         handler();
     }
+}
+
+/// The first signal: run the handlers, then exit unless the command took
+/// over.
+fn first() {
+    run_handlers();
     if !GRACEFUL.load(Ordering::Acquire) {
         let out = OUTPUT.get().copied().unwrap_or_default();
         let error =
@@ -116,6 +253,7 @@ mod platform {
 
     extern "C" fn handle(signal: libc::c_int) {
         let _ = SIGNAL.compare_exchange(0, signal, Ordering::AcqRel, Ordering::Acquire);
+        LAST.store(signal, Ordering::Release);
         let fd = PIPE.load(Ordering::Acquire);
         if fd >= 0 {
             let byte = 1u8;
@@ -157,18 +295,12 @@ mod platform {
         std::thread::Builder::new()
             .name("capturefab-signals".into())
             .spawn(move || {
-                let mut seen = 0;
                 loop {
                     let mut byte = 0u8;
                     // SAFETY: reads one byte into a local.
                     let count = unsafe { libc::read(read, (&raw mut byte).cast(), 1) };
                     if count == 1 {
-                        seen += 1;
-                        if seen == 1 {
-                            first();
-                        } else {
-                            second();
-                        }
+                        arrived();
                     } else if count == 0
                         || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
                     {
@@ -205,14 +337,10 @@ mod platform {
 
     /// Ctrl-C, Ctrl-Break and closing the console all count as SIGINT.
     pub(super) fn install() -> Result<()> {
-        let seen = std::sync::atomic::AtomicUsize::new(0);
         ctrlc::set_handler(move || {
             let _ = SIGNAL.compare_exchange(0, SIGINT, Ordering::AcqRel, Ordering::Acquire);
-            if seen.fetch_add(1, Ordering::AcqRel) == 0 {
-                first();
-            } else {
-                second();
-            }
+            LAST.store(SIGINT, Ordering::Release);
+            arrived();
         })
         .context("install signal handler")
     }

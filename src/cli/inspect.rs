@@ -3,7 +3,7 @@
 //! and writes the preview, by default to a private folder; this turns the
 //! measurements into a short document with a verdict and a suggested
 //! exposure.
-use super::{Client, Global, args::CamerasArg, args::KeepArg, millis, output::Report};
+use super::{Client, Global, args::CamerasArg, args::KeepArg, millis, output::Report, term};
 use crate::{
     controls::Assignment,
     inspect::PreviewFormat,
@@ -49,6 +49,9 @@ pub struct InspectArgs {
     /// Share of the measured pixels at full scale above which the verdict says clipped_high (default: any pixel with --region, else 0.005)
     #[arg(long, value_name = "SHARE", value_parser = parse_share)]
     pub clip_threshold: Option<f64>,
+    /// Draw the preview in this terminal under the measurements (kitty, iTerm2, or colour blocks)
+    #[arg(long)]
+    pub show: bool,
     #[command(flatten)]
     pub keep: KeepArg,
 }
@@ -129,13 +132,18 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
         }
         None => Preview::Private,
     };
+    if args.show && matches!(preview, Preview::None) {
+        return Err(Usage("--show draws the preview; leave out --preview none".into()).into());
+    }
+    // A preview drawn here is PNG, which every terminal path reads.
+    let show = args.show && !global.json && term::stdout_is_tty() && term::graphics().is_some();
     let cameras = match args.cameras.cameras.as_slice() {
         [] => vec![None],
         cameras => cameras.iter().map(|camera| Some(camera.as_str())).collect(),
     };
     let each = |camera: Option<&str>| -> Result<Value> {
         let client = Client::open_with(global, camera, args.keep.route())?;
-        inspect(&client, &args, &settings, &preview, global.verbose)
+        inspect(&client, &args, &settings, &preview, global.verbose, show)
     };
     let value = if cameras.len() == 1 {
         each(cameras[0])?
@@ -179,11 +187,32 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
         }
         json!({ "cameras": shown })
     };
+    let shown = |value: &Value| {
+        let mut shown = text(value);
+        if show && let Some(preview) = value["preview"].as_str() {
+            shown.push_str(&picture(std::path::Path::new(preview)));
+        }
+        shown
+    };
     let text = match value["cameras"].as_array() {
-        Some(cameras) => cameras.iter().map(text).collect(),
-        None => text(&value),
+        Some(cameras) => cameras.iter().map(shown).collect(),
+        None => shown(&value),
     };
     Ok(Report::json(value).text(text))
+}
+
+/// The preview at `path` drawn for this terminal, under text of about six
+/// lines; nothing when it cannot be read.
+fn picture(path: &std::path::Path) -> String {
+    let Some(graphics) = term::graphics() else {
+        return String::new();
+    };
+    let (cols, rows) = term::picture_box(8);
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| term::picture(&bytes, graphics, cols, rows, None).ok())
+        .map(|picture| picture.text)
+        .unwrap_or_default()
 }
 
 enum Preview {
@@ -198,6 +227,7 @@ fn inspect(
     settings: &[Assignment],
     preview: &Preview,
     verbose: bool,
+    show: bool,
 ) -> Result<Value> {
     if !settings.is_empty() {
         client.call(SessionCommand::SetValues {
@@ -217,6 +247,7 @@ fn inspect(
             Some("jpg" | "jpeg") => PreviewFormat::Jpeg,
             _ => PreviewFormat::Auto,
         },
+        _ if show => PreviewFormat::Png,
         _ => PreviewFormat::Auto,
     };
     let threshold = args.clip_threshold.unwrap_or(if args.region.is_some() {
@@ -224,7 +255,9 @@ fn inspect(
     } else {
         crate::inspect::CLIP_WARN
     });
+    let camera = crate::media::redact_url(info["camera"].as_str().unwrap_or("the camera"));
     let frame = |fresh: u32, preview: Option<String>, max_dimension: u32| {
+        let _waiting = term::activity(format!("waiting for a frame from {camera}…"));
         client
             .call(SessionCommand::Frame {
                 // The worker counts the frame measured too.
@@ -268,14 +301,7 @@ fn inspect(
         frame(fresh, None, size)
     });
     if started {
-        let camera = client.status()?;
-        let busy = camera["forwarding"].is_string()
-            || super::jobs::of_camera(&camera)
-                .iter()
-                .any(|job| !super::jobs::ended(job));
-        if !busy {
-            client.call(SessionCommand::Stop)?;
-        }
+        stop_unless_busy(client)?;
     }
     let (series, best) = sampled?;
     let mut value = document(&info, &best.reply, threshold, verbose);
@@ -293,6 +319,20 @@ fn inspect(
         }
     }
     Ok(value)
+}
+
+/// Stop a camera this command started streaming, unless a recording or a
+/// job now uses it.
+pub(super) fn stop_unless_busy(client: &Client) -> Result<()> {
+    let camera = client.status()?;
+    let busy = camera["forwarding"].is_string()
+        || super::jobs::of_camera(&camera)
+            .iter()
+            .any(|job| !super::jobs::ended(job));
+    if !busy {
+        client.call(SessionCommand::Stop)?;
+    }
+    Ok(())
 }
 
 /// How often a series samples by default.
@@ -324,7 +364,7 @@ fn sample(
         if due > duration {
             break;
         }
-        std::thread::sleep(due.saturating_sub(began.elapsed()));
+        super::signals::sleep(due.saturating_sub(began.elapsed()));
         if super::signals::interrupted() {
             return Err(
                 Categorized::new(ErrorKind::Interrupted, "interrupted while sampling")
@@ -393,7 +433,7 @@ fn clipped(reply: &Value) -> (f64, f64) {
     }
 }
 
-fn document(info: &Value, reply: &Value, threshold: f64, verbose: bool) -> Value {
+pub(super) fn document(info: &Value, reply: &Value, threshold: f64, verbose: bool) -> Value {
     let frame = &reply["frame"];
     let exposure = &reply["exposure"];
     let measured = exposure.is_object();

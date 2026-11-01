@@ -2,7 +2,7 @@
 //! running in sessions, as each session's job book has them, and how to stop
 //! or wait for one. A job's ID is `<session>-<n>`; n counts a session's
 //! jobs. The jobs of a session that died are read from what it saved.
-use super::{Global, output::Report};
+use super::{Global, output::Report, term};
 use crate::{
     ipc,
     session::SessionCommand as Request,
@@ -221,6 +221,8 @@ fn wait(id: &str, timeout: super::args::Wait) -> Result<Report> {
         super::args::Wait::For(wait) => Instant::now().checked_add(wait),
         super::args::Wait::Forever => None,
     };
+    let began = Instant::now();
+    let shown = term::activity(format!("waiting for job {id}…"));
     let mut seq = 0;
     loop {
         let left = deadline.map_or(Duration::MAX, |deadline| {
@@ -232,6 +234,7 @@ fn wait(id: &str, timeout: super::args::Wait) -> Result<Report> {
         if ended(&job) {
             return finished(job);
         }
+        shown.progress(progress(&job, began));
         if left.is_zero() {
             return Err(Categorized::new(
                 ErrorKind::Timeout,
@@ -251,6 +254,57 @@ fn wait(id: &str, timeout: super::args::Wait) -> Result<Report> {
                     .into(),
             );
         }
+    }
+}
+
+/// How far job `job` is, for the status line: what it saved or recorded,
+/// how long this has waited for it since `began`, and how long it has
+/// left or until its next frame.
+pub(super) fn progress(job: &Value, began: Instant) -> String {
+    let elapsed = began.elapsed();
+    let mut parts = Vec::new();
+    let saved = job["saved"].as_u64().unwrap_or(0);
+    match (job["kind"].as_str(), job["planned"].as_u64()) {
+        (Some("record"), _) => parts.push(format!("recording {}", term::clock(elapsed))),
+        (_, Some(planned)) => parts.push(format!("{saved}/{planned} saved")),
+        _ => parts.push(format!("{saved} saved")),
+    }
+    if let Some(bytes) = job["bytes"].as_u64().filter(|bytes| *bytes > 0) {
+        parts.push(crate::types::human_bytes(bytes));
+    }
+    if job["kind"] != "record" {
+        parts.push(term::clock(elapsed));
+    }
+    let until = |key: &str| {
+        let at = chrono::DateTime::parse_from_rfc3339(job[key].as_str()?).ok()?;
+        (at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .to_std()
+            .ok()
+    };
+    let estimate = || {
+        let planned = job["planned"].as_u64()?;
+        (saved > 0 && planned > saved)
+            .then(|| elapsed.mul_f64((planned - saved) as f64 / saved as f64))
+    };
+    if let Some(left) = until("ends_at").or_else(estimate) {
+        parts.push(format!("{} left", term::clock(left)));
+    } else if let Some(next) = until("next_at") {
+        parts.push(format!("next in {}", term::clock(next)));
+    }
+    format!(
+        "{}: {}",
+        crate::media::redact_url(job["camera"].as_str().unwrap_or("camera")),
+        parts.join(" · ")
+    )
+}
+
+/// How long a wait for a job's next change may take: about a second when
+/// the status line shows its progress, so its clock moves.
+pub(super) fn wait_step(wait: Duration) -> Duration {
+    if term::live() {
+        wait.min(Duration::from_secs(1))
+    } else {
+        wait
     }
 }
 
@@ -330,5 +384,29 @@ mod tests {
         }
         assert!(ended(&json!({"state": "lost"})));
         assert!(!ended(&json!({"state": "stopping"})));
+    }
+
+    #[test]
+    fn progress_says_what_a_job_did_and_what_is_left() {
+        let began = Instant::now() - Duration::from_millis(2500);
+        let burst = json!({"camera": "sim:0", "kind": "capture", "saved": 5, "planned": 10});
+        assert_eq!(
+            progress(&burst, began),
+            "sim:0: 5/10 saved · 0:02 · 0:02 left"
+        );
+        let lapse = json!({
+            "camera": "sim:0", "kind": "capture", "saved": 1, "planned": 3,
+            "ends_at": crate::scheduling::rfc3339(crate::scheduling::now_ms() + 20_500),
+        });
+        assert_eq!(
+            progress(&lapse, began),
+            "sim:0: 1/3 saved · 0:02 · 0:20 left"
+        );
+        let recording = json!({
+            "camera": "rtsp://admin:secret@cam/live", "kind": "record", "saved": 0, "bytes": 3_145_728,
+        });
+        let shown = progress(&recording, began);
+        assert!(shown.ends_with(": recording 0:02 · 3.0 MiB"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
     }
 }

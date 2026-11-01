@@ -61,6 +61,12 @@ impl Output {
         if !claim() {
             return super::signals::exit_code();
         }
+        self.print(report)
+    }
+    /// Print a result as one of several, as a shell does for each command:
+    /// whether this invocation printed before does not matter.
+    pub fn print(&self, report: Report) -> i32 {
+        super::term::before_output();
         let written = if self.json {
             write_json(&document(report.value))
         } else {
@@ -88,20 +94,25 @@ impl Output {
     /// Report an error unless this invocation already printed its
     /// document; its exit code, or None when it did not print.
     pub fn error_once(&self, error: &anyhow::Error) -> Option<i32> {
-        if error.chain().any(|cause| {
-            cause
-                .downcast_ref::<io::Error>()
-                .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
-        }) {
+        if closed_pipe(error) {
             // The reader went away, as with `| head`: nothing to report.
             return Some(0);
         }
-        let classified = classify(error);
-        let code = classified.kind.code().0;
-        let exit = exit_code(error);
         if !claim() {
             return None;
         }
+        Some(self.print_error(error))
+    }
+    /// Report an error as one of several, as a shell does for each
+    /// command; its exit code.
+    pub fn print_error(&self, error: &anyhow::Error) -> i32 {
+        if closed_pipe(error) {
+            return 0;
+        }
+        super::term::before_output();
+        let classified = classify(error);
+        let code = classified.kind.code().0;
+        let exit = exit_code(error);
         let message = crate::scrub::scrub(&format!("{error:#}")).into_owned();
         if self.json {
             let mut body = json!({"code": code, "message": message});
@@ -123,8 +134,17 @@ impl Output {
                 eprintln!("details: {details}");
             }
         }
-        Some(exit)
+        exit
     }
+}
+
+/// Whether `error` comes from writing to a reader that went away.
+fn closed_pipe(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
+    })
 }
 
 /// The exit code `error` ends the process with: its reason's category, and

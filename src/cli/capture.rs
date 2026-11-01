@@ -7,7 +7,7 @@ use super::{
     args::{CamerasArg, KeepArg, Wait},
     jobs, millis,
     output::Report,
-    signals,
+    signals, term,
 };
 use crate::{
     controls::Assignment,
@@ -720,16 +720,19 @@ fn run_job(
     // A signal stops the job: the frames it took are saved while there is
     // time, and nothing after them starts.
     client.stop_on_signal(&id);
+    let began = Instant::now();
+    let shown = term::activity("capturing…");
     let mut seq = 0;
     let mut stopping: Option<Instant> = None;
     loop {
         let wait = match stopping {
             Some(since) => STOP_GRACE.saturating_sub(since.elapsed()),
-            None => Duration::from_secs(25),
+            None => jobs::wait_step(Duration::from_secs(25)),
         };
         let reply = client.wait_job(&id, seq, wait.max(Duration::from_millis(1)))?;
         seq = reply["seq"].as_u64().unwrap_or(seq);
         let (job, detail) = (&reply["job"], &reply["detail"]);
+        shown.progress(jobs::progress(job, began));
         if jobs::ended(job) {
             let mut value = finished(
                 job,

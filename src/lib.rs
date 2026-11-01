@@ -1,12 +1,13 @@
 /// Diagnostics on stderr that never panic. std's `eprintln!` panics when
 /// writing fails, as it does with EIO once the terminal hangs up, which is
 /// SIGHUP's usual cause: shutdown would then stop halfway. This one drops the
-/// line instead. Defined before the modules, it stands in for std's in all of
-/// them.
+/// line instead, and takes a status line off the terminal first. Defined
+/// before the modules, it stands in for std's in all of them.
 #[macro_export]
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
         use ::std::io::Write as _;
+        $crate::cli::term::before_output();
         let _ = ::std::writeln!(::std::io::stderr(), $($arg)*);
     }};
 }
