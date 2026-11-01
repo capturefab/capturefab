@@ -77,6 +77,8 @@ pub(super) struct Waiting {
     /// Frames were let pass because they were exposed before the camera's
     /// last settings change.
     after_change: bool,
+    /// The camera's counters when the request began.
+    baseline: Baseline,
     deadline: Instant,
     reply: Answer,
 }
@@ -92,6 +94,9 @@ struct Job {
     waited: u32,
     after_change: bool,
     warmup: Option<Warmup>,
+    /// Frames the transport lost and that arrived incomplete while the
+    /// frame was awaited, and packets resent, where it counts them.
+    lost: Option<(u64, u64, u64)>,
     notes: Vec<String>,
     reply: Answer,
 }
@@ -190,6 +195,7 @@ pub(super) fn begin(
             left: request.fresh.saturating_sub(1),
             waited: 0,
             after_change: false,
+            baseline: Baseline::now(h),
             deadline,
             request,
             reply: envelope.reply,
@@ -198,6 +204,7 @@ pub(super) fn begin(
     }
     let info = c.info.clone();
     let count = request.fresh.max(1);
+    let baseline = Baseline::now(h);
     match acquire(
         h,
         camera,
@@ -215,6 +222,7 @@ pub(super) fn begin(
             waited: count,
             after_change: false,
             warmup,
+            lost: losses(&baseline, h),
             notes: if settled {
                 Vec::new()
             } else {
@@ -333,6 +341,7 @@ pub(super) fn serve(
             waited: item.waited + 1,
             after_change: item.after_change,
             warmup: None,
+            lost: losses(&item.baseline, h),
             notes: Vec::new(),
             reply: item.reply,
         });
@@ -385,6 +394,13 @@ pub(super) fn expire(
         forget(h, item.id);
         (item.reply)(Err(error));
     }
+}
+
+/// Frames lost and incomplete since `baseline`, and packets resent, when
+/// the transport counts them.
+fn losses(baseline: &Baseline, h: &WorkerHandle) -> Option<(u64, u64, u64)> {
+    let (_, lost, incomplete, resent) = baseline.since(h);
+    Some((lost?, incomplete?, resent?))
 }
 
 /// A request that will not be answered later: its cancel flag is let go.
@@ -472,6 +488,12 @@ fn measure(job: &Job) -> Result<Value> {
     }
     if job.after_change {
         reply["after_change"] = json!(true);
+    }
+    reply["frames"] = json!(job.waited);
+    if let Some((lost, incomplete, resent)) = job.lost {
+        reply["dropped"] = json!(lost);
+        reply["incomplete"] = json!(incomplete);
+        reply["resent"] = json!(resent);
     }
     if let Some(warmup) = job.warmup {
         reply["warmup_ms"] = json!(warmup.ms);

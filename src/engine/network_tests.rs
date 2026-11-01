@@ -289,7 +289,8 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
             },
             on_exists: Default::default(),
             next: None,
-            saving: false,
+            saving: 0,
+            baseline: None,
             info: crate::scheduling::CaptureJob {
                 id: 1,
                 status: status.into(),

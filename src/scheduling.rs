@@ -12,7 +12,7 @@ pub struct CaptureJob {
     pub output: String,
     pub count: u32,
     pub captured: u32,
-    /// Shots not taken because the saver already held two frames.
+    /// Frames not taken because the encoders' queue was full.
     #[serde(default)]
     pub skipped: u32,
     /// Shots that failed for a reason that may pass, such as a network
@@ -60,6 +60,31 @@ pub struct CaptureJob {
     /// Whether every warm-up settled before its limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled: Option<bool>,
+    /// Frames the camera delivered while the job ran.
+    #[serde(default)]
+    pub frames: u64,
+    /// Frames lost while it ran: those the encoders' queue had no room for,
+    /// and those the transport lost on the way.
+    #[serde(default)]
+    pub dropped: u64,
+    /// Frames that arrived incomplete while it ran, and packets the camera
+    /// sent again, where the transport counts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resent: Option<u64>,
+    /// The first and the newest saved frame: block IDs, the camera's clock
+    /// and when they arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_ts_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ts_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ms: Option<u64>,
 }
 /// Files a job lists; a longer job keeps counting in `captured`, and its
 /// newest file is `last_file`.

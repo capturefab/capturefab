@@ -610,17 +610,58 @@ fn result(job: &Value, detail: &Value) -> Value {
         "pixel_format": frame["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
         "settings": crate::engine::saved::settings(&detail["settings"]),
         "time": first.map(rfc3339),
+        "device_ts_ns": detail["first_ts_ns"],
     });
-    if count > 1
-        && let (Some(first), Some(ended)) = (first, detail["ended_ms"].as_u64())
-    {
-        value["duration_s"] = json!(ended.saturating_sub(first) as f64 / 1000.0);
-    }
+    integrity(&mut value, detail, count);
     if let Some(truncated) = detail["truncated"].as_u64() {
         value["truncated"] = json!(truncated);
     }
     freshness(&mut value, detail);
     crate::types::without_nulls(value)
+}
+
+/// What a result says of the frames' integrity, from the worker's account:
+/// frames delivered, dropped and incomplete while the capture ran, and
+/// packets resent; for several frames the time and rate from the first to
+/// the last (by the camera's clock when it has one), and for a burst
+/// whether its frames' block IDs follow one another.
+fn integrity(value: &mut Value, detail: &Value, count: u64) {
+    value["frames"] = detail["frames"].clone();
+    value["dropped"] = json!(detail["dropped"].as_u64().unwrap_or(0));
+    for key in ["incomplete", "resent"] {
+        value[key] = detail[key].clone();
+    }
+    if count < 2 {
+        return;
+    }
+    let span = |first: &str, last: &str| {
+        detail[first]
+            .as_u64()
+            .zip(detail[last].as_u64())
+            .map(|(first, last)| last.saturating_sub(first))
+    };
+    if let Some(ms) = span("first_ms", "last_ms") {
+        value["duration_s"] = json!(ms as f64 / 1000.0);
+    }
+    let seconds = span("first_ts_ns", "last_ts_ns")
+        .map(|ns| ns as f64 / 1e9)
+        .or_else(|| span("first_ms", "last_ms").map(|ms| ms as f64 / 1000.0))
+        .filter(|seconds| *seconds > 0.0);
+    if let Some(seconds) = seconds {
+        value["fps"] = json!(((count - 1) as f64 / seconds * 100.0).round() / 100.0);
+    }
+    if detail["interval_ms"].as_u64() == Some(0)
+        && let (Some(first), Some(last)) = (detail["first_id"].as_u64(), detail["last_id"].as_u64())
+    {
+        value["first_id"] = json!(first);
+        value["last_id"] = json!(last);
+        // Block IDs that wrapped around say nothing of gaps.
+        if last >= first {
+            let gaps = (last - first + 1).saturating_sub(count);
+            value["gaps"] = json!(gaps);
+            value["consecutive"] = json!(gaps == 0);
+        }
+    }
 }
 
 /// What a result says of the frames' freshness, from the worker's account:
@@ -821,6 +862,11 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         "pixel_format": meta["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
         "settings": crate::engine::saved::settings(&meta["settings"]),
         "time": meta["wall_ms"].as_u64().map(rfc3339),
+        "device_ts_ns": meta["device_ts_ns"],
+        "frames": reply["frames"],
+        "dropped": reply["dropped"],
+        "incomplete": reply["incomplete"],
+        "resent": reply["resent"],
     }));
     freshness(&mut value, &reply);
     // The image owns stdout; the result goes to stderr in one write.
@@ -920,6 +966,40 @@ pub const FIELDS: &[(&str, &str)] = &[
     ),
     ("time", "string — RFC 3339 time of the first frame"),
     (
+        "device_ts_ns",
+        "int — the camera's clock when the first frame was taken (GigE, U3V, sim); never a date",
+    ),
+    (
+        "frames",
+        "int — frames the camera delivered while the capture ran, including those let pass",
+    ),
+    (
+        "dropped",
+        "int — frames lost while it ran: the encoders' queue was full, or the transport lost them",
+    ),
+    (
+        "incomplete",
+        "int — frames that arrived incomplete, where the transport counts them",
+    ),
+    (
+        "resent",
+        "int — packets the camera sent again, where the transport counts them",
+    ),
+    (
+        "fps",
+        "float — frames per second from the first frame to the last, by the camera's clock when it has one",
+    ),
+    ("first_id", "int — a burst's first frame's block ID"),
+    ("last_id", "int — a burst's last frame's block ID"),
+    (
+        "gaps",
+        "int — block IDs missing between a burst's first and last frame",
+    ),
+    (
+        "consecutive",
+        "bool — a burst's frames follow one another with no frame missing",
+    ),
+    (
         "after_change",
         "true — frames exposed before the camera's last settings change were let pass",
     ),
@@ -937,7 +1017,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("bytes", "int — with -o -: the image's size"),
     (
         "cameras",
-        "[{camera,files,count,truncated?,width,height,pixel_format,settings,time,duration_s?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
+        "[{camera,files,count,truncated?,width,height,pixel_format,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,warnings?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
     ),
     (
         "job",

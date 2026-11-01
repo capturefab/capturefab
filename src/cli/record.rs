@@ -472,6 +472,8 @@ impl Recording<'_> {
             "duration_s": (duration_s * 1000.0).round() / 1000.0,
             "frames": frames,
             "dropped": detail["dropped"],
+            "incomplete": detail["incomplete"],
+            "resent": detail["resent"],
             "width": self.info["width"],
             "height": self.info["height"],
             "codec": self.args.codec.name(),
@@ -520,7 +522,18 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("bytes", "int — the file's size"),
     ("duration_s", "float"),
     ("frames", "int — frames encoded"),
-    ("dropped", "int — frames the encoder could not take"),
+    (
+        "dropped",
+        "int — frames the encoder could not take, and frames the transport lost",
+    ),
+    (
+        "incomplete",
+        "int — frames that arrived incomplete, where the transport counts them",
+    ),
+    (
+        "resent",
+        "int — packets the camera sent again, where the transport counts them",
+    ),
     ("width", "int"),
     ("height", "int"),
     ("fps_actual", "float — frames per second encoded"),

@@ -295,6 +295,11 @@ fn document(info: &Value, reply: &Value, verbose: bool) -> Value {
     if reply["after_change"] == true {
         value["after_change"] = json!(true);
     }
+    for key in ["frames", "dropped", "incomplete", "resent"] {
+        if !reply[key].is_null() {
+            value[key] = reply[key].clone();
+        }
+    }
     if let Some(ms) = reply["warmup_ms"].as_u64() {
         value["warmup_ms"] = json!(ms);
     }
@@ -470,6 +475,22 @@ pub const FIELDS: &[(&str, &str)] = &[
     (
         "after_change",
         "true — frames exposed before the camera's last settings change were let pass",
+    ),
+    (
+        "frames",
+        "int — frames received for this inspection, the one measured included",
+    ),
+    (
+        "dropped",
+        "int — frames the transport lost meanwhile, where it counts them",
+    ),
+    (
+        "incomplete",
+        "int — frames that arrived incomplete meanwhile, where the transport counts them",
+    ),
+    (
+        "resent",
+        "int — packets the camera sent again meanwhile, where the transport counts them",
     ),
     (
         "warmup_ms",

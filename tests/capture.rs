@@ -9,7 +9,14 @@ use support::cli::Home;
 /// The result keys that say when, not what.
 fn without_timing(mut value: Value) -> Value {
     if let Some(fields) = value.as_object_mut() {
-        for key in ["files", "time", "duration_s"] {
+        for key in [
+            "files",
+            "time",
+            "duration_s",
+            "device_ts_ns",
+            "frames",
+            "fps",
+        ] {
             fields.remove(key);
         }
     }
@@ -807,4 +814,66 @@ fn hardware_triggers_wait_as_long_as_asked() {
         home.fails(5, &["auto", "-c", "sim:0?line0=every:300ms"])["code"],
         "unsupported"
     );
+}
+
+#[test]
+fn bursts_report_the_integrity_of_their_frames() {
+    let home = Home::new("integrity");
+    let clean = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "--set",
+        "AcquisitionFrameRate=60",
+        "-n",
+        "10",
+        "-o",
+        "clean/",
+    ]);
+    assert_eq!(clean["count"], 10, "{clean}");
+    assert_eq!(
+        (
+            clean["dropped"].clone(),
+            clean["gaps"].clone(),
+            clean["consecutive"].clone()
+        ),
+        (json!(0), json!(0), json!(true)),
+        "{clean}"
+    );
+    assert_eq!(
+        clean["last_id"].as_u64().unwrap() - clean["first_id"].as_u64().unwrap(),
+        9
+    );
+    assert!(clean["frames"].as_u64().unwrap() >= 10, "{clean}");
+    // Measured by the camera's clock.
+    let fps = clean["fps"].as_f64().unwrap();
+    assert!((55.0..65.0).contains(&fps), "{clean}");
+    assert!(clean["device_ts_ns"].is_u64(), "{clean}");
+    // A transport that loses frames: the burst still saves every frame
+    // asked for, and says which were missing.
+    let lossy = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0?drop=0.1",
+        "-n",
+        "20",
+        "-o",
+        "lossy/",
+    ]);
+    assert_eq!(lossy["count"], 20, "{lossy}");
+    assert_eq!(lossy["consecutive"], false, "{lossy}");
+    let lost = lossy["dropped"].as_u64().unwrap() + lossy["incomplete"].as_u64().unwrap();
+    assert!(lost > 0 && lossy["gaps"].as_u64().unwrap() > 0, "{lossy}");
+    assert_eq!(lossy["resent"], 0, "{lossy}");
+    // A session says the same of its camera.
+    let _session = home.serve_with("lossy", &["sim:5?drop=0.2"], &["--live"]);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let status = home.ok(&["session", "status", "lossy"]);
+    let camera = &status["cameras"][0];
+    assert!(camera["frames"].as_u64().unwrap() > 0, "{status}");
+    assert!(
+        camera["lost"].as_u64().unwrap() + camera["incomplete"].as_u64().unwrap() > 0,
+        "{status}"
+    );
+    assert_eq!(camera["resent"], 0, "{status}");
 }
