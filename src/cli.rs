@@ -812,7 +812,7 @@ fn resolve_session(cli: &mut Cli) -> Result<()> {
         }
         _ => {
             return input(Err(anyhow::anyhow!(
-                "multiple sessions are running ({}); choose --session NAME or --direct --camera ID; list them with capturefab sessions",
+                "multiple sessions are running ({}); choose --session NAME or --direct --camera ID",
                 sessions
                     .iter()
                     .map(|session| session.name.as_str())
@@ -1957,29 +1957,6 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
             out,
             "Use status --json for full state, jobs for captures, and history for undo/redo."
         )?;
-    } else if let Some(sessions) = value["sessions"].as_array() {
-        if sessions.is_empty() {
-            writeln!(
-                out,
-                "No sessions running. Start one with capturefab serve --name NAME."
-            )?;
-        } else {
-            writeln!(out, "{:<28} {:<8} {:<8} STATE", "SESSION", "KIND", "PID")?;
-            for session in sessions {
-                writeln!(
-                    out,
-                    "{:<28} {:<8} {:<8} {}",
-                    session["name"].as_str().unwrap_or(""),
-                    session["kind"].as_str().unwrap_or(""),
-                    session["pid"].as_u64().unwrap_or(0),
-                    if session["active"] == true {
-                        "active"
-                    } else {
-                        "stale"
-                    }
-                )?;
-            }
-        }
     } else if value["files"].is_array() {
         write!(out, "{}", summary::capture_summary(&value))?;
     } else if matches!(&cli.command, Some(Command::Capture { .. })) && value["job"].is_object() {

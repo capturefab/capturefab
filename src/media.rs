@@ -3628,7 +3628,6 @@ fn encoder_candidates(family: &str) -> Vec<&'static str> {
             "h264_nvenc",
             "nvv4l2h264enc",
             "h264_amf",
-            "h264_qsv",
             "h264_vulkan",
             "h264_v4l2m2m",
             "libx264",
@@ -3637,17 +3636,10 @@ fn encoder_candidates(family: &str) -> Vec<&'static str> {
             "hevc_nvenc",
             "nvv4l2h265enc",
             "hevc_amf",
-            "hevc_qsv",
             "hevc_vulkan",
             "hevc_v4l2m2m",
         ],
-        ("av1", "linux") => vec![
-            "av1_nvenc",
-            "nvv4l2av1enc",
-            "av1_amf",
-            "av1_qsv",
-            "av1_vulkan",
-        ],
+        ("av1", "linux") => vec!["av1_nvenc", "nvv4l2av1enc", "av1_amf", "av1_vulkan"],
         ("h264", "windows") => vec![
             "h264_nvenc",
             "h264_qsv",
@@ -4909,8 +4901,6 @@ impl Drop for Forwarder {
 mod tests {
     use super::*;
 
-    /// Trimmed `ffmpeg -hide_banner -encoders` output of FFmpeg 9.0.2 on
-    /// macOS, with a stderr line appended as `bounded_output` does.
     use crate::genicam::NodeMap;
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

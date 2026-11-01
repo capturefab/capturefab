@@ -23,16 +23,14 @@ fn test_cache() -> PathBuf {
     std::env::temp_dir().join("capturefab-test-cache")
 }
 
-/// The binary with isolated state, and an update URL that goes nowhere: a
-/// closed loopback port, never capturefab.com.
+/// The binary with isolated state.
 fn binary(dir: &PathBuf) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
     command
         .env_remove("CAPTUREFAB_SESSION")
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", dir)
-        .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .env("CAPTUREFAB_UPDATE_URL", "http://127.0.0.1:9/releases.json");
+        .env("CAPTUREFAB_CACHE_DIR", test_cache());
     command
 }
 
@@ -227,11 +225,14 @@ fn ambiguous_sessions_require_target_and_direct_bypasses_them() {
     let out = cmd(&dir, &["--json", "--camera", "sim:0", "set", "Width=64"]);
     assert_eq!(out.status.code(), Some(2));
     let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
+    // The message names the sessions itself and points at no listing command.
+    let message = failure["error"]["message"].as_str().unwrap();
     assert!(
-        failure["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("multiple sessions")
+        message.starts_with("multiple sessions are running (")
+            && message.contains("first")
+            && message.contains("second")
+            && message.ends_with("choose --session NAME or --direct --camera ID"),
+        "{message}"
     );
     for name in ["first", "second"] {
         assert!(
@@ -584,6 +585,7 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
         vec!["--camera", "FiLe:", "capture", "-o", "unused.png"],
         vec!["connect", "sim:replay:"],
         vec!["connect", "file:"],
+        vec!["select", "sim:replay:"],
         vec!["select", "file:"],
     ] {
         let result = cmd(&dir, &[&["--json"][..], args.as_slice()].concat());
