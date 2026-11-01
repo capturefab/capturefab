@@ -908,9 +908,43 @@ mod tests {
                 .is_err()
         );
         let id = info.id.clone();
-        let camera = Camera::open(&id, &[info], Duration::from_secs(2)).unwrap();
+        let camera =
+            Camera::open(&id, std::slice::from_ref(&info), Duration::from_secs(2)).unwrap();
         assert_eq!(camera.info.id, id);
+        // Its XML was kept on disk, and a kept copy that does not parse is
+        // forgotten and read from the camera again.
+        let served = camera.xml().to_owned();
         drop(camera);
+        let kept = std::fs::read_dir(crate::ipc::cache_dir().unwrap().join("xml"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| std::fs::read_to_string(path).is_ok_and(|xml| xml == served))
+            .collect::<Vec<_>>();
+        assert!(!kept.is_empty());
+        for path in &kept {
+            std::fs::write(path, "<RegisterDescription").unwrap();
+        }
+        let camera =
+            Camera::open(&id, std::slice::from_ref(&info), Duration::from_secs(2)).unwrap();
+        assert_eq!(camera.xml(), served);
+        drop(camera);
+        // A camera a recent discovery found is opened at its address only
+        // while the same camera answers there.
+        assert!(crate::camera::still_there(&info));
+        let other = crate::types::CameraInfo {
+            serial: "ANOTHER".into(),
+            ..info
+        };
+        assert!(!crate::camera::still_there(&other));
+        // Its discovery ID is looked for on GigE alone, and the search ends
+        // as soon as it answers; then the cache names it.
+        let began = std::time::Instant::now();
+        let (found, _) = crate::camera::lookup(&id, Duration::from_secs(20));
+        assert!(found.iter().any(|camera| camera.id == id), "{found:?}");
+        let (cached, _) = crate::camera::lookup(&id, Duration::from_secs(20));
+        assert!(cached.iter().any(|camera| camera.id == id), "{cached:?}");
+        assert!(began.elapsed() < Duration::from_secs(10));
         drop(server);
     }
 

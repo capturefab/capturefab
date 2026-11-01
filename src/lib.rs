@@ -20,6 +20,7 @@ pub(crate) mod camera_profile;
 pub(crate) mod cli;
 pub(crate) mod context;
 pub(crate) mod controls;
+pub(crate) mod discovery;
 pub(crate) mod doctor;
 pub(crate) mod engine;
 pub(crate) mod frame;
@@ -46,6 +47,7 @@ mod test_cameras;
 pub(crate) mod transport;
 pub(crate) mod types;
 pub(crate) mod volumes;
+pub(crate) mod xml_cache;
 
 /// The `capturefab` executable: the hidden camera worker mode, or the CLI.
 pub fn run() {

@@ -174,6 +174,15 @@ impl Shared {
             *idle = (*idle).max(keep);
         }
     }
+    /// How long until the session ends unused, when it has an idle time:
+    /// all of it while a request runs.
+    fn idle_left(&self) -> Option<Duration> {
+        let idle = (*Self::locked(&self.idle))?;
+        if self.busy.load(Ordering::Acquire) > 0 {
+            return Some(idle);
+        }
+        Some(idle.saturating_sub(Self::locked(&self.used).elapsed()))
+    }
     /// Rewrite the descriptor when the cameras it lists changed.
     fn publish(&self, cameras: Vec<HeldCamera>) {
         let mut descriptor = Self::locked(&self.descriptor);
@@ -785,7 +794,11 @@ fn serve_client(
                 request.command.is_none() && request.camera.is_none(),
                 "session probes cannot include a command or camera"
             );
-            return Ok(json!({"probe":true}));
+            let mut probe = json!({"probe": true});
+            if let Some(left) = shared.idle_left().filter(|_| !h.has_jobs()) {
+                probe["idle_ms"] = json!(millis(left));
+            }
+            return Ok(probe);
         }
         if request.stop {
             ensure!(
@@ -956,7 +969,8 @@ fn refusal() -> Vec<u8> {
     line
 }
 /// Publish `descriptor` atomically, so discovery never reads a partially
-/// written file.
+/// written file. It is not synced to the disk: it means something only
+/// while its session runs, which no power loss outlives.
 fn write_descriptor(dir: &Path, descriptor: &Descriptor) -> Result<()> {
     let path = descriptor_path_in(dir, &descriptor.name)?;
     let mut suffix = [0u8; 8];
@@ -983,7 +997,6 @@ fn write_descriptor(dir: &Path, descriptor: &Descriptor) -> Result<()> {
         })?;
         serde_json::to_writer(&mut file, descriptor)?;
         file.write_all(b"\n")?;
-        file.sync_all()?;
         drop(file);
         fs::rename(&temp_path, &path)?;
         Ok(())
@@ -1254,6 +1267,21 @@ pub fn call_keeping(
         timeout,
     )
 }
+/// Say to the session `descriptor` names that a command is about to use it:
+/// keep it at least `keep` after now, or with no keep just check that it
+/// answers.
+pub fn touch(descriptor: &Descriptor, keep: Option<Duration>) -> Result<()> {
+    send(
+        descriptor,
+        Request {
+            keep_ms: keep.map(millis),
+            probe: keep.is_none(),
+            ..Request::to(descriptor)
+        },
+        Duration::from_secs(2),
+    )
+    .map(drop)
+}
 /// Keep session `name` at least `keep` after now.
 pub fn keep(name: &str, keep: Duration) -> Result<()> {
     let descriptor = read_descriptor(name)?;
@@ -1372,7 +1400,7 @@ fn send(descriptor: &Descriptor, request: Request, timeout: Duration) -> Result<
 }
 fn descriptor_active(descriptor: &Descriptor) -> bool {
     send_request(descriptor, None, None, true, PROBE_TIMEOUT)
-        .is_ok_and(|response| response == json!({"probe":true}))
+        .is_ok_and(|response| response["probe"] == true)
 }
 fn descriptors_in(dir: &Path) -> Result<Vec<Descriptor>> {
     if !dir.exists() {
@@ -1423,6 +1451,34 @@ fn running_in(dir: &Path, descriptor: &Descriptor) -> bool {
     let held = fs::File::open(dir.join(format!("{}.session.lock", descriptor.name)))
         .is_ok_and(|lock| FileExt::try_lock_shared(&lock).is_err());
     held && process_alive(descriptor.pid)
+}
+/// How long until session `name` ends unused, when it runs, has an idle
+/// time and no job: what a command the camera it holds refuses is told.
+pub fn idle_left(name: &str) -> Option<Duration> {
+    let descriptor = running_session(name)?;
+    let probe = send_request(&descriptor, None, None, true, PROBE_TIMEOUT).ok()?;
+    probe["idle_ms"].as_u64().map(Duration::from_millis)
+}
+/// Wait up to `wait` for session `name`, which is ending, to be gone, so
+/// another may start under its name.
+pub fn wait_ended(name: &str, wait: Duration) -> Result<()> {
+    let deadline = Instant::now() + wait;
+    let mut pause = Duration::from_millis(1);
+    while running_session(name).is_some() {
+        if Instant::now() >= deadline {
+            return Err(crate::types::Categorized::new(
+                crate::types::ErrorKind::Timeout,
+                format!("session {name} is still ending"),
+            )
+            .hint(format!(
+                "try again, or stop it with capturefab session stop {name}"
+            ))
+            .into());
+        }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
+    }
+    Ok(())
 }
 /// Session `name`'s descriptor, when that session runs.
 pub fn running_session(name: &str) -> Option<Descriptor> {

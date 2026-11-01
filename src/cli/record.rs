@@ -206,9 +206,8 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         global,
         args.camera.camera.as_deref(),
         Route {
-            keep: args.keep.route().keep,
             background: args.background,
-            ..Route::default()
+            ..args.keep.route()
         }
         .waiting(args.timeout),
     )?;

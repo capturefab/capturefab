@@ -174,7 +174,12 @@ pub(super) fn ensure(
     // or several agents' calls) take turns: one starts it, the rest use it.
     let _turn = ipc::start_turn(name)?;
     if ipc::running_session(name).is_some() {
-        return ipc::keep(name, idle);
+        match ipc::keep(name, idle) {
+            Ok(()) => return Ok(()),
+            // It ended unused just now: start another once it is gone.
+            Err(error) if super::session_gone(&error) => ipc::wait_ended(name, ENDING)?,
+            Err(error) => return Err(error),
+        }
     }
     let cameras = selector.map(str::to_owned).into_iter().collect::<Vec<_>>();
     let mut warnings = Vec::new();
@@ -189,6 +194,30 @@ pub(super) fn ensure(
         Err(_) if ipc::running_session(name).is_some() => ipc::keep(name, idle),
         Err(error) => Err(error),
     }
+}
+
+/// How long a session that ends unused may take to be gone before another
+/// starts under its name.
+const ENDING: Duration = Duration::from_secs(5);
+
+/// Whether this process can start a session: its runtime folder, which
+/// holds the session's descriptor, and the folder of its log are writable.
+pub(super) fn can_start() -> bool {
+    let writable = |dir: &std::path::Path| {
+        if ipc::ensure_private_dir(dir).is_err() {
+            return false;
+        }
+        let probe = dir.join(format!(".write-{}", std::process::id()));
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&probe)
+            .is_ok();
+        let _ = std::fs::remove_file(&probe);
+        written
+    };
+    writable(&ipc::runtime_dir()) && log_path(super::AUTO_SESSION).parent().is_some_and(writable)
 }
 
 /// Session `name`'s descriptor when it runs, or `session_not_found`; what a
@@ -478,6 +507,9 @@ fn stop(global: &Global, name: Option<String>) -> Result<Report> {
         }
     }
     let deadline = Instant::now() + STOP_WAIT;
+    // Most sessions are gone within milliseconds; one finishing recordings
+    // takes longer, and is looked at less often.
+    let mut pause = Duration::from_millis(1);
     while ipc::process_alive(pid) && ipc::running_session(&name).is_some() {
         if Instant::now() >= deadline {
             return Err(Categorized::new(
@@ -490,7 +522,8 @@ fn stop(global: &Global, name: Option<String>) -> Result<Report> {
             .hint(format!("see {}", log_path(&name).display()))
             .into());
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(Duration::from_millis(50));
     }
     let text = format!("Stopped session {name}.\n");
     Ok(Report::json(json!({"session": name, "pid": pid, "stopped": true})).text(text))

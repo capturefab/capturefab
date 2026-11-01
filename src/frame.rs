@@ -1720,7 +1720,7 @@ mod tests {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         assert!(
             (1..=spare_cores(cores)).contains(&worker_threads(64 << 20)),
-            "resource pressure may reduce parallel work, but never exceed available spare cores"
+            "CAPTUREFAB_THREADS may reduce parallel work, but never exceed available spare cores"
         );
     }
     #[test]

@@ -1103,22 +1103,22 @@ impl RegisterIo for UsbBackend {
         self.control.write_memory(address, data)
     }
 }
-/// The address and size of each manifest entry for a raw or zipped device
-/// XML, newest version first. GenCP puts the file type in bits 0-2 of the
-/// entry's second word, where 1 is a Buffer XML holding only chunk nodes,
-/// and the 6-bit file format in bits 10-15.
-fn device_xml_entries(entries: &[u8]) -> Result<Vec<(u64, u64)>> {
+/// Each manifest entry for a raw or zipped device XML, with its address
+/// and size, newest version first. GenCP puts the file type in bits 0-2 of
+/// the entry's second word, where 1 is a Buffer XML holding only chunk
+/// nodes, and the 6-bit file format in bits 10-15.
+fn device_xml_entries(entries: &[u8]) -> Result<Vec<([u8; 64], u64, u64)>> {
     let mut candidates = Vec::new();
     for entry in entries.as_chunks::<64>().0 {
         let schema = le32(entry, 4)?;
         if schema & 7 == 0 && (schema >> 10) & 0x3f <= 1 {
-            candidates.push((le32(entry, 0)?, le64(entry, 8)?, le64(entry, 16)?));
+            candidates.push((le32(entry, 0)?, *entry, le64(entry, 8)?, le64(entry, 16)?));
         }
     }
     candidates.sort_by_key(|e| std::cmp::Reverse(e.0));
     Ok(candidates
         .into_iter()
-        .map(|(_, address, size)| (address, size))
+        .map(|(_, entry, address, size)| (entry, address, size))
         .collect())
 }
 fn parse_leader(bytes: &[u8]) -> Result<Frame> {
@@ -1191,10 +1191,21 @@ impl Backend for UsbBackend {
             count * 64,
         )?;
         let mut last_error = anyhow!("USB manifest contains no raw or ZIP device XML entry");
-        for (address, size) in device_xml_entries(&entries)? {
+        // The manifest entry (version, address, size and a SHA-1 where the
+        // device gives one) and the model and device version name the XML
+        // on disk; a copy kept there is parsed below like a download.
+        let identity = [self.read_memory(0x0044, 64)?, self.read_memory(0x00c4, 64)?].concat();
+        for (entry, address, size) in device_xml_entries(&entries)? {
             if size == 0 || size > 32 * 1024 * 1024 {
                 last_error = anyhow!("GenICam manifest XML size is outside 1..32 MiB");
                 continue;
+            }
+            let key = crate::xml_cache::key(&[&entry, &identity]);
+            if let Some(xml) = crate::xml_cache::load(&key) {
+                if crate::genicam::NodeMap::parse(&xml).is_ok() {
+                    return Ok(xml);
+                }
+                crate::xml_cache::forget(&key);
             }
             match self
                 .read_memory(address, size as usize)
@@ -1203,7 +1214,10 @@ impl Backend for UsbBackend {
                     crate::genicam::NodeMap::parse(&xml)?;
                     Ok(xml)
                 }) {
-                Ok(xml) => return Ok(xml),
+                Ok(xml) => {
+                    crate::xml_cache::store(&key, &xml);
+                    return Ok(xml);
+                }
                 Err(error) => last_error = error,
             }
         }
@@ -1491,10 +1505,16 @@ mod tests {
             entry(0x0300_0000, schema(0, 33), 0x4000, 400),
         ]
         .concat();
+        let found = device_xml_entries(&manifest).unwrap();
         assert_eq!(
-            device_xml_entries(&manifest).unwrap(),
+            found
+                .iter()
+                .map(|(_, address, size)| (*address, *size))
+                .collect::<Vec<_>>(),
             [(0x2000, 200), (0x3000, 300)]
         );
+        // The whole entry, its SHA-1 included, names a cached copy.
+        assert_eq!(found[0].0, entry(0x0100_0002, schema(0, 1), 0x2000, 200));
     }
     /// A camera's control endpoints, replying to each read from a script.
     #[derive(Default)]

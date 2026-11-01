@@ -1236,8 +1236,8 @@ pub(crate) const ACQUISITION_FEATURES: &[&str] = &[
 ];
 
 /// What a camera was doing when a still was taken: its make and the current
-/// values of [`ACQUISITION_FEATURES`]. Read once per capture command (and per
-/// frame while auto exposure adjusts the camera) and once per scheduled shot.
+/// values of [`ACQUISITION_FEATURES`]. Read once per capture command, and for
+/// scheduled shots at most once a second, with what auto exposure wrote since.
 #[derive(Debug, Clone, Default)]
 pub(super) struct Acquisition {
     vendor: String,
@@ -1246,6 +1246,14 @@ pub(super) struct Acquisition {
 }
 
 impl Acquisition {
+    /// Take the values auto exposure wrote since this was read.
+    fn overlay(&mut self, values: &BTreeMap<String, Value>) {
+        for (name, value) in values {
+            if ACQUISITION_FEATURES.contains(&name.as_str()) {
+                self.settings.insert(name.clone(), value.clone());
+            }
+        }
+    }
     /// Whether the camera's own auto exposure, gain or white balance was on,
     /// so its values may differ on the next frame.
     fn firmware_auto(&self) -> bool {
@@ -1766,6 +1774,8 @@ fn process_plain(
             }
             let duration = timeout(timeout_ms)?;
             // Each worker opens one camera, so it has discovered nothing yet.
+            // A selector that says what it opens never waits for discovery;
+            // a serial, name or model is looked up.
             let mut known = Vec::new();
             if !selector.starts_with("sim:")
                 && !crate::media::is_source(&selector)
@@ -1776,7 +1786,7 @@ fn process_plain(
                     .parse::<std::net::Ipv4Addr>()
                     .is_err()
             {
-                let (devices, warnings) = crate::camera::discover(duration, false)?;
+                let (devices, warnings) = crate::camera::lookup(&selector, duration);
                 known = devices;
                 for w in warnings {
                     h.log("warn", w);
@@ -1894,7 +1904,9 @@ fn process_plain(
                     .unwrap_or_else(|e| e.into_inner())
                     .forwarding_progress = None;
             }
-            refresh(h, camera, true);
+            // No walk of every feature: on GigE that is hundreds of round
+            // trips, and commands read what they need.
+            refresh(h, camera, false);
             h.log(
                 "info",
                 format!("Connected to {}", crate::media::redact_url(&selector)),
@@ -2386,7 +2398,20 @@ fn process_plain(
             // What the transport counted while it ran, which also says why
             // a frame never came.
             let counted = baseline.counts(&Baseline::with(h, c.stats()), unanswered);
-            let stopped = if !was_streaming { c.stop() } else { Ok(()) };
+            let lingering = (!was_streaming && result.is_ok())
+                .then(|| linger(c))
+                .flatten();
+            if let Some(linger) = lingering {
+                scheduled_stream.started = true;
+                scheduled_stream.linger_until = Some(Instant::now() + linger);
+            } else if was_streaming {
+                used(scheduled_stream, c);
+            }
+            let stopped = if !was_streaming && lingering.is_none() {
+                c.stop()
+            } else {
+                Ok(())
+            };
             refresh(h, camera, false);
             // The file's name reaches the disk before the reply.
             if sync.is_file()
@@ -2932,6 +2957,8 @@ pub(super) struct JobStream {
     /// Until when it streams for the first frame of jobs armed together,
     /// whether or not one is due yet.
     pub(super) armed_until: Option<Instant>,
+    /// Until when it goes on streaming with nothing to do; see `linger`.
+    pub(super) linger_until: Option<Instant>,
 }
 /// How long an armed camera streams for jobs that never come.
 const ARM_HOLD: Duration = Duration::from_secs(30);
@@ -3044,25 +3071,54 @@ fn tick_jobs(
             h.log("error", format!("Capture job {}: {error:#}", job.info.id));
         }
     }
-    // A shot with the saver holds the stream too: a job due again once it is
-    // saved would otherwise restart the camera, and warm it up, every shot.
-    if stream.started
+    // A shot with the saver holds the stream while its job still wants
+    // frames: a burst would otherwise restart the camera, and warm it up,
+    // as each shot is saved. A job with every frame taken lets it go at
+    // once, so its end is seen as the encoders finish rather than at the
+    // next frame.
+    let now = Instant::now();
+    let needed = jobs
+        .iter()
+        .any(|j| j.info.active() && (j.deadline.is_some() || (j.saving > 0 && j.wants())));
+    if needed {
+        stream.linger_until = None;
+    } else if stream.started
         && !forwarding
-        && stream
-            .armed_until
-            .is_none_or(|until| Instant::now() >= until)
-        && !jobs
-            .iter()
-            .any(|j| j.info.active() && (j.deadline.is_some() || j.saving > 0))
+        && stream.armed_until.is_none_or(|until| now >= until)
+        && let Some(c) = camera.as_mut()
     {
-        if let Some(c) = camera.as_mut() {
-            let _ = c.stop();
+        match (stream.linger_until, linger(c)) {
+            // A camera that is slow to start lingers for the next command.
+            (None, Some(linger)) => stream.linger_until = Some(now + linger),
+            (Some(until), _) if now < until => {}
+            _ => {
+                let _ = c.stop();
+                *stream = JobStream::default();
+                changed = true;
+            }
         }
-        *stream = JobStream::default();
-        changed = true;
     }
     if changed {
         jobs_changed(h, camera, jobs);
+    }
+}
+/// How long a camera started for a capture or an inspection goes on
+/// streaming once nothing needs its frames, for the next command of a
+/// tight loop: live FFmpeg sources (webcams, streams), which take a long
+/// time to start. Cameras that start at once stop at once, a file starts
+/// from its beginning each time as it does for a command of its own, and
+/// none streams idle for long: a webcam's light goes off.
+pub(super) fn linger(c: &Camera) -> Option<Duration> {
+    c.lingers().then_some(MEDIA_LINGER)
+}
+/// See `linger`.
+const MEDIA_LINGER: Duration = Duration::from_secs(5);
+/// Linger again from now when `stream` lingers: a command used it.
+pub(super) fn used(stream: &mut JobStream, c: &Camera) {
+    if stream.linger_until.is_some()
+        && let Some(linger) = linger(c)
+    {
+        stream.linger_until = Some(Instant::now() + linger);
     }
 }
 /// Publish changed jobs.
@@ -3639,6 +3695,9 @@ fn worker(h: WorkerHandle) {
     // most once a second instead of once per shot: reading them costs a
     // register round trip per feature, which a fast schedule cannot spare.
     let mut settings = AcquisitionCache::default();
+    // Whether Capturefab's auto exposure was still moving the camera at the
+    // last frame.
+    let mut auto_moving = false;
     let mut inspector = inspector::Inspector::default();
     let mut waiting: Vec<inspector::Waiting> = Vec::new();
     // The emulated settings last kept for the next worker.
@@ -3672,6 +3731,7 @@ fn worker(h: WorkerHandle) {
                     request,
                     &mut inspector,
                     &mut waiting,
+                    &mut scheduled_stream,
                 );
                 *h.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 h.beat();
@@ -3725,6 +3785,12 @@ fn worker(h: WorkerHandle) {
         if saved(&h, &mut jobs, &saver) {
             jobs_changed(&h, &mut camera, &mut jobs);
         }
+        // Inspections waiting for frames keep a lingering stream.
+        if !waiting.is_empty()
+            && let Some(c) = camera.as_ref()
+        {
+            used(&mut scheduled_stream, c);
+        }
         tick_jobs(
             &h,
             &mut camera,
@@ -3763,10 +3829,12 @@ fn worker(h: WorkerHandle) {
                     }
                     let settled = auto.as_ref().is_none_or(AutoController::converged);
                     let room = saver.has_room(frame.data.len());
-                    if !settled {
-                        // Auto exposure is still moving the camera.
+                    // Auto exposure moved the camera until now: read what it
+                    // left once, for the shots to come.
+                    if settled && std::mem::take(&mut auto_moving) {
                         settings.invalidate();
                     }
+                    auto_moving |= !settled;
                     let saves = shoot(&h, c, &mut jobs, settled, room);
                     // The jobs armed together took their first frame: from
                     // now on the camera streams only while one needs it.
@@ -3794,10 +3862,17 @@ fn worker(h: WorkerHandle) {
                         forward_failed(&h, &mut forwarder, &mut auto, e);
                     }
                     if let Some(frame) = shot {
+                        let mut acquisition = settings.get(c, Instant::now());
+                        // While auto exposure moves the camera, the values it
+                        // last wrote, rather than a read of every setting
+                        // for each frame.
+                        if let Some(controller) = auto.as_ref().filter(|_| !settled) {
+                            acquisition.overlay(controller.values());
+                        }
                         saver.offer(saver::Shot {
                             wall_ms: frame.wall_ms,
                             frame,
-                            acquisition: settings.get(c, Instant::now()),
+                            acquisition,
                             saves,
                         });
                     }
@@ -5198,6 +5273,33 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn a_job_with_every_frame_at_the_encoders_lets_the_stream_go() {
+        let h = WorkerHandle::new();
+        let mut camera = Some(Camera::open("sim:0", &[], Duration::from_secs(1)).unwrap());
+        let dir = temp_dir("taken-stream");
+        let mut job = armed(1, &dir);
+        job.deadline = None;
+        job.info.count = 1;
+        let mut jobs = vec![job];
+        let mut stream = JobStream::default();
+        tick_jobs(&h, &mut camera, &mut jobs, &mut stream, false, false);
+        assert!(stream.started && camera.as_ref().unwrap().is_streaming());
+        camera
+            .as_mut()
+            .unwrap()
+            .next_frame(Duration::from_secs(1))
+            .unwrap();
+        assert!(!shoot(&h, camera.as_mut().unwrap(), &mut jobs, true, true).is_empty());
+        assert_eq!(jobs[0].saving, 1);
+        // Its one frame is being saved: nothing needs the camera, which
+        // stops now rather than at the next frame, and does not linger.
+        tick_jobs(&h, &mut camera, &mut jobs, &mut stream, false, false);
+        assert!(!stream.started && !camera.as_ref().unwrap().is_streaming());
+        assert!(linger(camera.as_ref().unwrap()).is_none());
+        h.shutdown();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn captures_grabs_and_schedules_trigger_a_software_triggered_camera() {
         use crate::camera::tests::{
             Device, FRAME_TRIGGER_MODE, OPEN_ACQUISITION, TRIGGER_NODES, device_camera, events,
@@ -5222,6 +5324,7 @@ mod tests {
             1,
             Instant::now() + wait,
             wait,
+            None,
             None,
         )
         .unwrap();
@@ -5926,6 +6029,7 @@ mod tests {
                 1,
                 Instant::now() + wait,
                 wait,
+                None,
                 None,
             )
             .unwrap_err();

@@ -361,9 +361,8 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
         Route::default()
     } else {
         Route {
-            keep: args.keep.route().keep,
             background: args.background,
-            ..Route::default()
+            ..args.keep.route()
         }
     }
     .waiting(args.timeout.unwrap_or(Wait::For(DEFAULT_WAIT)));

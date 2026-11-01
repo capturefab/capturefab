@@ -154,7 +154,8 @@ impl Inspector {
 
 /// Take up frame request `envelope`. A streaming camera's next frames serve
 /// it as they arrive; a stopped camera acquires them now, as many as it
-/// asks to let pass and one more, and stops again.
+/// asks to let pass and one more, and stops again unless it lingers.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn begin(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
@@ -163,6 +164,7 @@ pub(super) fn begin(
     mut request: Request,
     inspector: &mut Inspector,
     waiting: &mut Vec<Waiting>,
+    stream: &mut super::JobStream,
 ) {
     let Some(c) = camera.as_mut() else {
         (envelope.reply)(Err(no_camera()));
@@ -189,6 +191,8 @@ pub(super) fn begin(
             finish(h, envelope.id, envelope.reply, Err(error));
             return;
         }
+        // A camera that lingers goes on streaming until this is served.
+        super::used(stream, c);
         waiting.push(Waiting {
             id: envelope.id,
             cancel,
@@ -213,6 +217,7 @@ pub(super) fn begin(
         deadline,
         request.timeout,
         request.warmup_ms,
+        Some(stream),
     ) {
         Ok((frame, received, settled, warmup)) => inspector.inspect(Job {
             frame: Arc::new(frame),
@@ -237,8 +242,10 @@ pub(super) fn begin(
 
 /// Acquire `count` frames from a stopped camera, warming up one that sets
 /// its own exposure and settling Capturefab's auto exposure first, and stop
-/// it again: the last frame, when it came, whether auto exposure had
-/// settled, and the warm-up.
+/// it again, or with `stream` leave a camera that lingers streaming for a
+/// moment: the last frame, when it came, whether auto exposure had settled,
+/// and the warm-up.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn acquire(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
@@ -247,6 +254,7 @@ pub(super) fn acquire(
     deadline: Instant,
     wait: Duration,
     warmup_ms: Option<u64>,
+    stream: Option<&mut super::JobStream>,
 ) -> Result<(Frame, Instant, bool, Option<Warmup>)> {
     let c = camera_mut(camera)?;
     let was_streaming = c.is_streaming();
@@ -284,7 +292,19 @@ pub(super) fn acquire(
         let (frame, received) = last.context("no frame was asked for")?;
         Ok((frame, received, settled, warmup))
     })();
-    let stopped = if !was_streaming { c.stop() } else { Ok(()) };
+    let lingers = match (stream, super::linger(c)) {
+        (Some(stream), Some(linger)) if !was_streaming && result.is_ok() => {
+            stream.started = true;
+            stream.linger_until = Some(Instant::now() + linger);
+            true
+        }
+        _ => false,
+    };
+    let stopped = if !was_streaming && !lingers {
+        c.stop()
+    } else {
+        Ok(())
+    };
     refresh(h, camera, false);
     let acquired = result?;
     stopped?;

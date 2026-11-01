@@ -41,6 +41,9 @@ pub struct Row {
     pub serial: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// The session that holds it open: `{session, idle_releases_in_s?}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_by: Option<Value>,
 }
 
 /// The `list` result.
@@ -54,7 +57,7 @@ impl ListResult {
     pub const FIELDS: &[(&str, &str)] = &[
         (
             "cameras",
-            "[{id,kind:gige|u3v|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address}] — pass id to -c",
+            "[{id,kind:gige|u3v|webcam|screen|onvif|stream|file|sim,vendor,model,serial,address,held_by?:{session,idle_releases_in_s?}}] — pass id to -c; held_by: a session keeps it open, the auto session for idle_releases_in_s more seconds unless used",
         ),
         (
             "warnings",
@@ -77,6 +80,32 @@ pub fn row(info: &CameraInfo) -> Row {
             .as_ref()
             .filter(|address| **address != info.id && !media)
             .map(|address| crate::media::redact_url(address)),
+        held_by: None,
+    }
+}
+
+/// Say which session holds each of `rows` open, and when it lets go of it
+/// unused; the sessions' descriptors list what they hold.
+fn held(rows: &mut [Row]) {
+    let sessions = crate::ipc::sessions();
+    let mut left = std::collections::BTreeMap::new();
+    for row in rows.iter_mut() {
+        let Some(session) = sessions.iter().find(|session| {
+            session
+                .cameras
+                .iter()
+                .any(|camera| camera.named_by(&row.id).is_some())
+        }) else {
+            continue;
+        };
+        let idle = *left
+            .entry(session.name.clone())
+            .or_insert_with(|| crate::ipc::idle_left(&session.name));
+        let mut held_by = json!({"session": session.name});
+        if let Some(idle) = idle {
+            held_by["idle_releases_in_s"] = json!(idle.as_millis().div_ceil(1000));
+        }
+        row.held_by = Some(held_by);
     }
 }
 
@@ -100,11 +129,12 @@ pub fn list(global: &Global, args: ListArgs) -> Result<Report> {
         "onvif" => all || named(Kind::Onvif),
         _ => all,
     };
-    let rows = devices
+    let mut rows = devices
         .iter()
         .map(row)
         .filter(|row| wanted(row.kind))
         .collect::<Vec<_>>();
+    held(&mut rows);
     let result = ListResult {
         cameras: rows,
         warnings: warnings
@@ -119,7 +149,7 @@ pub fn list(global: &Global, args: ListArgs) -> Result<Report> {
         );
     } else {
         text.push_str(&table(
-            &["ID", "KIND", "MODEL", "SERIAL", "ADDRESS"],
+            &["ID", "KIND", "MODEL", "SERIAL", "ADDRESS", "HELD BY"],
             result
                 .cameras
                 .iter()
@@ -130,6 +160,11 @@ pub fn list(global: &Global, args: ListArgs) -> Result<Report> {
                         row.model.clone(),
                         row.serial.clone().unwrap_or_default(),
                         row.address.clone().unwrap_or_default(),
+                        row.held_by
+                            .as_ref()
+                            .and_then(|held| held["session"].as_str())
+                            .map(|session| format!("session {session}"))
+                            .unwrap_or_default(),
                     ]
                 })
                 .collect(),

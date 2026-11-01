@@ -136,45 +136,56 @@ fn addresses(
     Ok(addresses)
 }
 
-/// Read the configuration values a command may change: every one the last
-/// feature walk found, which every edit ends with, so an edit does not walk
-/// every feature again; the values are read now. Auto mode's controls and
-/// every gain and white-balance bank are included, since auto can change
-/// them. `written` requires each named feature, including controls absent
-/// from the feature tree.
+/// Features written together: changing one can change what the others
+/// allow (an offset its width, binning the width, the pixel format the
+/// size), so a checkpoint of one holds all of them.
+const COUPLED: [&[&str]; 2] = [
+    &[
+        "OffsetX",
+        "OffsetY",
+        "Width",
+        "Height",
+        "BinningHorizontal",
+        "BinningVertical",
+        "DecimationHorizontal",
+        "DecimationVertical",
+        "PixelFormat",
+    ],
+    &[
+        "AcquisitionFrameRate",
+        "AcquisitionFrameRateEnable",
+        "ExposureTime",
+    ],
+];
+
+/// Read the configuration values a command may change, now, and only
+/// those: the features it writes with the rest of their coupled group, what
+/// auto mode manages, and the exposure, gain and white-balance features an
+/// auto mode it ends may have locked. Every gain and white-balance bank is
+/// included, since auto can change them; any other feature stays at its
+/// current bank. Never a walk of every feature, which on GigE is hundreds
+/// of round trips. `written` requires each named feature, including
+/// controls absent from the feature tree.
 fn capture(
-    h: &WorkerHandle,
     camera: &mut Camera,
     auto: &Option<AutoController>,
     written: &[&str],
 ) -> Result<Configuration> {
-    let mut walked = h
-        .state
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .features
-        .iter()
-        .filter(|feature| feature.value.is_some())
-        .map(|feature| feature.name.clone())
-        .collect::<Vec<_>>();
-    if walked.is_empty() {
-        walked = camera
-            .features()
-            .into_iter()
-            .filter(|feature| feature.value.is_some())
-            .map(|feature| feature.name)
-            .collect();
-    }
-    let mut names = walked
-        .into_iter()
-        .filter(|name| camera.is_configuration_value(name))
-        .collect::<BTreeSet<_>>();
-    // Explicit writes must be restorable; stale cached names may be skipped
-    // when they are no longer readable, just as a fresh walk would skip them.
     let mut required = written
         .iter()
         .map(|&name| name.to_owned())
         .collect::<BTreeSet<_>>();
+    let mut names = BTreeSet::new();
+    for group in COUPLED {
+        if group.iter().any(|name| required.contains(*name)) {
+            names.extend(
+                group
+                    .iter()
+                    .filter(|name| camera.has(name) && camera.is_configuration_value(name))
+                    .map(|name| (*name).to_owned()),
+            );
+        }
+    }
     if let Some(controller) = auto {
         required.extend(controller.status().managed.iter().cloned());
     }
@@ -471,7 +482,7 @@ pub(super) fn process(
     let together = apply_setup || matches!(command, WorkerCommand::SetMany { .. });
     #[cfg(not(test))]
     let together = apply_setup;
-    let mut before = match capture(h, c, auto, &written) {
+    let mut before = match capture(c, auto, &written) {
         Ok(before) => before,
         // Its values must be restorable together, so it writes none.
         Err(error) if together => {

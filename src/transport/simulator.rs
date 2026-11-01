@@ -111,7 +111,7 @@ impl Options {
                     options.line0 = Some(every);
                 }
                 // Fault-test hooks, honored only with CAPTUREFAB_TEST_HOOKS=1.
-                "panic" | "connect" => {}
+                "panic" | "connect" | "exclusive" => {}
                 _ => bail!("unknown simulator option {key}; use drop=0.02 or line0=every:500ms"),
             }
         }
@@ -377,6 +377,11 @@ pub struct Simulator {
 /// The frame count of a selector's `?panic=after:N`, when test hooks are on.
 fn panic_after(selector: &str) -> Option<u64> {
     test_hook(selector, "panic=after:")
+}
+/// Whether a selector's `?exclusive=1` makes the simulator a device one
+/// process at a time owns, as a GigE camera is, when test hooks are on.
+pub fn exclusive(selector: &str) -> bool {
+    test_hook(selector, "exclusive=") == Some(1)
 }
 /// The number after `prefix` in a selector's options, when test hooks are
 /// on: `?panic=after:N` frames, or `?connect=after:MS`, which makes opening

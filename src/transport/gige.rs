@@ -6,6 +6,7 @@
 use crate::types::{
     Backend, CameraInfo, Categorized, Frame, RegisterIo, Transport, TransportStats,
 };
+use crate::xml_cache;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Cursor, ErrorKind, Read};
@@ -239,6 +240,14 @@ fn interface_pinned_socket(_index: u32, _name: &str) -> Option<UdpSocket> {
 /// default-route network, and cameras whose address does not match the
 /// interface's subnet (which ignore directed broadcasts) are still listed.
 pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
+    discover_until(timeout, &mut |_| false)
+}
+/// `discover`, telling `found` of each camera as it answers; it returns at
+/// once, with what answered so far, when `found` says that was the one.
+pub fn discover_until(
+    timeout: Duration,
+    found: &mut dyn FnMut(&CameraInfo) -> bool,
+) -> Result<Vec<CameraInfo>> {
     let deadline = Instant::now() + bounded_timeout(timeout);
     let request = command_packet(DISCOVERY, 0xffff, 0x11, &[]);
     let mut sockets = Vec::new();
@@ -337,7 +346,11 @@ pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
                             continue;
                         }
                         if let Ok(info) = discovery_info(ack.payload, *source.ip()) {
+                            let wanted = !cameras.contains_key(&info.id) && found(&info);
                             cameras.insert(info.id.clone(), info);
+                            if wanted {
+                                return Ok(cameras.into_values().collect());
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -801,6 +814,9 @@ struct GigE {
     stats: TransportStats,
     stream: Option<Stream>,
     xml_cache: Option<String>,
+    /// The key of the XML read from the disk cache, while it may still turn
+    /// out wrong.
+    xml_key: Option<String>,
 }
 
 /// Acquire camera control. An independent heartbeat keeps the connection alive
@@ -919,6 +935,7 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         stats: TransportStats::default(),
         stream: None,
         xml_cache: None,
+        xml_key: None,
     })
 }
 
@@ -948,8 +965,21 @@ impl Backend for GigE {
             let result = (|| -> Result<String> {
                 let url = fixed_text(&self.read_memory(url_address, 512)?);
                 let local = parse_local_url(&url)?;
+                // The URL (a SHA-1 in its query where the device gives one),
+                // the vendor, model and device version, and the end of the
+                // file name the XML on disk.
+                let identity = self.read_memory(0x48, 0x60)?;
+                let tail = xml_cache::TAIL.min(local.length);
+                let end = self.read_memory(local.address + (local.length - tail) as u64, tail)?;
+                let key = xml_cache::key(&[url.as_bytes(), &identity, &end]);
+                if let Some(xml) = xml_cache::load(&key) {
+                    self.xml_key = Some(key);
+                    return Ok(xml);
+                }
                 let data = self.read_memory(local.address, local.length)?;
-                decode_xml(&local.name, data)
+                let xml = decode_xml(&local.name, data)?;
+                xml_cache::store(&key, &xml);
+                Ok(xml)
             })();
             match result {
                 Ok(xml) => {
@@ -964,6 +994,13 @@ impl Backend for GigE {
             }
         }
         bail!("unable to load camera GenICam XML: {}", errors.join("; "))
+    }
+    fn forget_xml(&mut self) -> bool {
+        self.xml_cache = None;
+        self.xml_key
+            .take()
+            .inspect(|key| xml_cache::forget(key))
+            .is_some()
     }
     fn start(&mut self, payload_size: usize) -> Result<()> {
         self.heartbeat.check()?;

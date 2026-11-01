@@ -34,10 +34,11 @@ pub struct CamerasArg {
 }
 
 /// `--keep DUR`: run through a session that stays this long after its
-/// last use, started if none holds the camera.
+/// last use, started if none holds the camera. Without it a command keeps
+/// its camera warm for `WARM`; `--keep 0` runs it alone.
 #[derive(Debug, Clone, Default, Args)]
 pub struct KeepArg {
-    /// Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)
+    /// Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)
     #[arg(
         long,
         value_name = "DUR",
@@ -48,7 +49,10 @@ pub struct KeepArg {
 }
 impl KeepArg {
     pub fn route(&self) -> super::Route {
-        super::Route::keep(self.keep.filter(|keep| !keep.is_zero()))
+        match self.keep {
+            None => super::Route::warm(),
+            Some(keep) => super::Route::keep(Some(keep).filter(|keep| !keep.is_zero())),
+        }
     }
 }
 

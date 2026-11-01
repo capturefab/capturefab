@@ -22,7 +22,7 @@ fn lockable(info: &CameraInfo) -> bool {
     match info.transport {
         Transport::GigE | Transport::Usb3 => true,
         Transport::Media => crate::media::is_host_camera(&info.id),
-        Transport::Simulator => false,
+        Transport::Simulator => crate::transport::simulator::exclusive(&info.id),
     }
 }
 
@@ -64,21 +64,7 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
     if fs2::FileExt::try_lock_exclusive(&file).is_err() {
         let mut owner = String::new();
         let _ = file.read_to_string(&mut owner);
-        let owner = serde_json::from_str::<Value>(&owner).unwrap_or_default();
-        let shown = match (owner["pid"].as_u64(), owner["session"].as_str()) {
-            (Some(pid), Some(session)) => format!("process {pid} (session {session})"),
-            (Some(pid), None) => format!("process {pid}"),
-            _ => "another capturefab process".into(),
-        };
-        let mut error = Categorized::new(
-            ErrorKind::CameraBusy,
-            format!("{} is held by {shown}", crate::media::redact_url(&info.id)),
-        )
-        .hint("use that session (--session NAME), or stop it first");
-        if owner.is_object() {
-            error = error.details(json!({ "held_by": owner }));
-        }
-        return Err(error.into());
+        return Err(busy(info, serde_json::from_str(&owner).unwrap_or_default()));
     }
     let owner = json!({"pid": std::process::id(), "session": session});
     let _ = file.set_len(0);
@@ -86,6 +72,59 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
     let _ = file.write_all(owner.to_string().as_bytes());
     let _ = file.flush();
     Ok(Some(CameraLock(file)))
+}
+
+/// `camera_busy` for the camera `info` names, which the worker `owner`
+/// names holds: a session, with how long until it lets the camera go
+/// unused, or a command of its own.
+fn busy(info: &CameraInfo, mut owner: Value) -> anyhow::Error {
+    let camera = crate::media::redact_url(&info.id);
+    let session = owner["session"]
+        .as_str()
+        .filter(|session| *session != crate::session::DIRECT)
+        .map(str::to_owned);
+    let left = session.as_deref().and_then(crate::ipc::idle_left);
+    if let (Some(left), Some(owner)) = (left, owner.as_object_mut()) {
+        owner.insert(
+            "idle_releases_in_s".into(),
+            json!(left.as_millis().div_ceil(1000)),
+        );
+    }
+    let pid = owner["pid"]
+        .as_u64()
+        .map(|pid| format!(" (process {pid})"))
+        .unwrap_or_default();
+    let releases = left
+        .map(|left| {
+            format!(
+                ", which lets it go after {} unused",
+                crate::scheduling::format_duration(left.as_millis().div_ceil(1000) as u64 * 1000)
+            )
+        })
+        .unwrap_or_default();
+    let (message, hint) = match session.as_deref() {
+        Some(crate::cli::AUTO_SESSION) => (
+            format!("{camera} is kept open by the auto session{pid}{releases}"),
+            "use it as you are (commands find it), stop it with `capturefab session stop auto`, or pass --keep 0 so commands open cameras for themselves alone".to_owned(),
+        ),
+        Some(name) => (
+            format!("{camera} is held by session {name}{pid}{releases}"),
+            format!("use that session (--session {name}), or stop it with `capturefab session stop {name}`"),
+        ),
+        None if owner["pid"].is_u64() => (
+            format!("{camera} is held by another capturefab command{pid}"),
+            "wait for it to finish".to_owned(),
+        ),
+        None => (
+            format!("{camera} is held by another capturefab process"),
+            "wait for it to finish, or stop the session that holds it".to_owned(),
+        ),
+    };
+    let mut error = Categorized::new(ErrorKind::CameraBusy, message).hint(hint);
+    if owner.is_object() {
+        error = error.details(json!({ "held_by": owner }));
+    }
+    error.into()
 }
 
 /// Open a GigE camera whose control privilege may still be held by a worker

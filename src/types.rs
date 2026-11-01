@@ -80,6 +80,11 @@ pub trait RegisterIo: Send {
 /// Owns transport resources; called exclusively by the camera worker thread.
 pub trait Backend: RegisterIo {
     fn xml(&mut self) -> Result<String>;
+    /// Forget the XML `xml` read from the disk cache, which did not parse,
+    /// so the next call reads it from the device. Whether there was one.
+    fn forget_xml(&mut self) -> bool {
+        false
+    }
     /// Configure receiving before the owner executes AcquisitionStart.
     fn start(&mut self, payload_size: usize) -> Result<()>;
     /// Request one frame from an on-demand source. Streaming transports need
@@ -107,6 +112,12 @@ pub trait Backend: RegisterIo {
     /// transport can latch it.
     fn device_time_ns(&mut self) -> Option<u64> {
         None
+    }
+    /// Whether, started for a capture or an inspection, it should go on
+    /// streaming a moment after: a live FFmpeg source, slow to start, whose
+    /// next frame is the newest either way.
+    fn lingers(&self) -> bool {
+        false
     }
     /// The settings this process keeps for a camera that has nowhere else
     /// to keep them, as a simulator's registers or a webcam's video mode:

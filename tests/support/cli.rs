@@ -41,7 +41,9 @@ impl Home {
         std::fs::create_dir_all(&home.work).unwrap();
         home
     }
-    /// The binary with isolated state, run in the work folder.
+    /// The binary with isolated state, run in the work folder. Camera
+    /// commands open their camera for themselves alone, as with `--keep 0`,
+    /// unless a test asks for the warm default (`warm`).
     pub fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_capturefab"));
         command
@@ -49,6 +51,7 @@ impl Home {
             .env_remove("CAPTUREFAB_CAMERA")
             .env_remove("CAPTUREFAB_JSON")
             .env_remove("CAPTUREFAB_CAMERA_PASSWORD")
+            .env("CAPTUREFAB_KEEP", "0")
             .env("CAPTUREFAB_SESSION_DIR", &self.sessions)
             .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .current_dir(&self.work)
@@ -57,6 +60,17 @@ impl Home {
     }
     pub fn run(&self, args: &[&str]) -> Run {
         Run::of(self.command().args(args).output().unwrap(), args)
+    }
+    /// The binary as people run it: camera commands keep their camera warm
+    /// in the `auto` session.
+    pub fn warm_command(&self) -> Command {
+        let mut command = self.command();
+        command.env_remove("CAPTUREFAB_KEEP");
+        command
+    }
+    /// `ARGS` with the warm default.
+    pub fn warm(&self, args: &[&str]) -> Run {
+        Run::of(self.warm_command().args(args).output().unwrap(), args)
     }
     pub fn run_env(&self, env: &[(&str, &str)], args: &[&str]) -> Run {
         Run::of(
@@ -236,6 +250,10 @@ pub struct Run {
     pub raw: Vec<u8>,
 }
 impl Run {
+    /// What a command run by the caller printed.
+    pub fn of_output(output: std::process::Output, args: &[&str]) -> Self {
+        Self::of(output, args)
+    }
     fn of(output: std::process::Output, args: &[&str]) -> Self {
         Self {
             args: args.iter().map(|arg| (*arg).to_owned()).collect(),

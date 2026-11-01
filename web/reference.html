@@ -108,6 +108,7 @@
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
 <tr><td><code>--note</code></td><td>A short note, such as the lighting it was tuned for</td><td>—</td></tr>
 <tr><td><code>--replace</code></td><td>Overwrite a saved preset with the same name</td><td>false</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-preset-list"><code>capturefab preset list</code></h3>
 <p>List saved presets and the folder that holds them. Effect: read.</p>
@@ -126,6 +127,7 @@
 <tr><td><code>--strict</code></td><td>Fail, changing nothing, if any saved value cannot be applied to this camera</td><td>false</td></tr>
 <tr><td><code>--allow-other-model</code></td><td>Apply to a camera of another model; only settings both share change</td><td>false</td></tr>
 <tr><td><code>--persist</code></td><td>Then save it in the camera's user set (default UserSet1) and make that the power-on default</td><td>—</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-preset-rm"><code>capturefab preset rm</code></h3>
 <p>Delete a saved preset; no camera changes. Effect: file_write.</p>

@@ -572,6 +572,9 @@ impl Shared {
     /// lingers, then end what it left running in its group.
     fn reap(&self) -> Option<ExitStatus> {
         let deadline = Instant::now() + Duration::from_secs(2);
+        // A worker exits within a millisecond or two of closing its
+        // output: look again soon, then less and less often.
+        let mut pause = Duration::from_micros(50);
         let status = loop {
             if let Ok(Some(status)) = locked(&self.child).try_wait() {
                 break Some(status);
@@ -580,7 +583,8 @@ impl Shared {
                 self.kill();
                 break locked(&self.child).wait().ok();
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(5));
         };
         // A worker that died leaves its FFmpeg running in its group.
         self.tree.terminate(self.pid);
@@ -637,8 +641,10 @@ impl Shared {
     /// exit is seen, such as a panic's message after its backtrace.
     fn drain_errors(&self) {
         let deadline = Instant::now() + Duration::from_millis(500);
+        let mut pause = Duration::from_micros(50);
         while !self.errors_ended.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(pause);
+            pause = (pause * 2).min(Duration::from_millis(5));
         }
     }
     /// Keep the worker's last stderr lines and pass them on, tagged with its

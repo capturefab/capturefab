@@ -34,8 +34,10 @@ pub struct AutoArgs {
     pub keep: KeepArg,
 }
 
-/// How often settling looks at the camera's auto state.
-const POLL: Duration = Duration::from_millis(100);
+/// How often settling looks at the camera's auto state: within a frame of
+/// a fast camera, so the command ends soon after exposure settles; a look
+/// is one short request, or a register read or two.
+const POLL: Duration = Duration::from_millis(25);
 
 pub fn run(global: &Global, args: AutoArgs) -> Result<Report> {
     signals::take_over();

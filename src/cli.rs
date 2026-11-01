@@ -192,7 +192,7 @@ pub enum Command {
     /// Sessions keep cameras open between commands: start one in the background, stop it, see it
     #[command(
         subcommand,
-        after_help = "Commands use a session that holds their camera on their own; --keep 5m starts one for interactive loops.\n\nExamples:\n  capturefab session start -c sim:0 --live\n  capturefab session status\n  capturefab session stop"
+        after_help = "Camera commands keep their camera open in the auto session for 60s after their last use (--keep DUR to change it, --keep 0 or --no-session for none), and use a session that holds their camera on their own.\n\nExamples:\n  capturefab session start -c sim:0 --live\n  capturefab session status\n  capturefab session stop"
     )]
     Session(session::SessionAction),
     /// Run a session in the foreground (systemd, a terminal); Ctrl-C stops it
@@ -388,11 +388,15 @@ pub fn run(mut cli: Cli) -> Result<Option<Report>> {
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long finding the cameras of a default `-c` waits.
 const DEFAULT_DISCOVERY: Duration = Duration::from_secs(1);
-/// The session `--keep` and `--background` start when none holds the camera.
+/// The session `--keep`, `--background` and the warm default start when
+/// none holds the camera.
 pub(crate) const AUTO_SESSION: &str = "auto";
 /// How long a session started for `--background` alone stays once its jobs
 /// are done.
 const BACKGROUND_IDLE: Duration = Duration::from_secs(60);
+/// How long a camera command keeps its camera open after it, in the `auto`
+/// session, without `--keep`: the next command finds it connected.
+pub(crate) const WARM: Duration = Duration::from_secs(60);
 
 /// What a camera command asks of its route besides the global flags.
 #[derive(Debug, Clone, Copy, Default)]
@@ -400,6 +404,11 @@ pub(crate) struct Route {
     /// `--keep DUR`: run through a session that holds the camera and stays
     /// at least this long after its last use.
     pub keep: Option<Duration>,
+    /// The keep is the warm default rather than asked for: `--no-session`
+    /// and a named session drop it, it never lengthens a session other than
+    /// `auto`, and where no session can start the command runs with a
+    /// worker of its own.
+    pub warm: bool,
     /// `--background`: the command leaves a job running in a session.
     pub background: bool,
     /// How long opening the camera may take, when longer than usual:
@@ -414,6 +423,23 @@ impl Route {
         Self {
             keep,
             ..Self::default()
+        }
+    }
+    /// The default of a camera command: keep the camera warm in the `auto`
+    /// session for `WARM`.
+    pub fn warm() -> Self {
+        Self {
+            keep: Some(WARM),
+            warm: true,
+            ..Self::default()
+        }
+    }
+    /// The same route without a session to keep.
+    fn cold(self) -> Self {
+        Self {
+            keep: None,
+            warm: false,
+            ..self
         }
     }
     /// A route whose camera may take up to `wait` (none: a minute) to open.
@@ -435,6 +461,11 @@ impl Route {
     /// How long a session started for this command waits unused.
     fn idle(self) -> Duration {
         self.keep.unwrap_or(BACKGROUND_IDLE)
+    }
+    /// The keep to send session `name` with each request: the warm default
+    /// keeps only the session it starts.
+    fn keep_for(self, name: &str) -> Option<Duration> {
+        self.keep.filter(|_| !self.warm || name == AUTO_SESSION)
     }
 }
 
@@ -489,12 +520,10 @@ impl Client {
     pub fn open_with(global: &Global, selector: Option<&str>, route: Route) -> Result<Self> {
         let selector = selector.map(caller_selector).transpose()?;
         let out = global.output();
-        // CAPTUREFAB_KEEP is a default, which --no-session overrides.
-        let route = if global.no_session && global.keep_from_env {
-            Route {
-                keep: None,
-                ..route
-            }
+        // CAPTUREFAB_KEEP and the warm default are defaults, which
+        // --no-session overrides.
+        let mut route = if global.no_session && (route.warm || global.keep_from_env) {
+            route.cold()
         } else {
             route
         };
@@ -505,6 +534,11 @@ impl Client {
             .into());
         }
         if let Some(name) = &global.session {
+            // A session named for the command keeps the idle time it was
+            // started with.
+            if route.warm {
+                route = route.cold();
+            }
             if route.needs_session() {
                 session::ensure(name, selector.as_deref(), route.idle(), global)?;
             }
@@ -517,9 +551,20 @@ impl Client {
                 Ok(client) => return Ok(client),
                 // A session that is stopping, or gone, leaves the camera to
                 // this command; one that holds it and failed says why.
-                Err(Unusable::Gone(_)) if !route.needs_session() => {}
+                Err(Unusable::Gone(_)) if !route.needs_session() || route.warm => {}
                 Err(unusable) => return Err(unusable.error()),
             }
+        }
+        // Where no session can start, such as on a read-only system, the
+        // warm default leaves the camera to this command.
+        if route.warm && !session::can_start() {
+            if out.verbose {
+                crate::eprintln!(
+                    "capturefab: no writable runtime folder ({}); the camera is opened for this command alone",
+                    ipc::runtime_dir().display()
+                );
+            }
+            route = route.cold();
         }
         if route.needs_session() {
             let selector = match selector {
@@ -558,7 +603,7 @@ impl Client {
         selector: Option<String>,
         route: Route,
     ) -> std::result::Result<Self, Unusable> {
-        let keep = route.keep;
+        let keep = route.keep_for(name);
         let unusable = |error: anyhow::Error| {
             if session_gone(&error) {
                 Unusable::Gone(error)
@@ -581,20 +626,29 @@ impl Client {
             keep,
             stdout: None,
         };
-        let (target, first) = match (&selector, held) {
-            (Some(selector), false) => (
-                None,
-                SessionCommand::connect(selector.clone(), route.connect()),
-            ),
-            _ => (client.target.as_deref(), SessionCommand::Status),
-        };
-        let reply = ipc::call_keeping(name, target, first.clone(), default_timeout(&first), keep)
-            .map_err(unusable)?;
-        // Without -c, the session's only camera, named from now on so a
-        // camera connected later does not change what this command uses.
-        if selector.is_none() {
-            let cameras = reply["cameras"].as_array().cloned().unwrap_or_default();
-            client.target = Some(only_camera(name, &cameras).map_err(Unusable::Failed)?);
+        match (&selector, held) {
+            (Some(selector), false) => {
+                let connect = SessionCommand::connect(selector.clone(), route.connect());
+                ipc::call_keeping(name, None, connect.clone(), default_timeout(&connect), keep)
+                    .map_err(unusable)?;
+            }
+            // The session runs and holds it: one short request says it still
+            // answers, and keeps it.
+            (Some(_), true) => ipc::touch(&descriptor, keep).map_err(unusable)?,
+            // Without -c, the session's only camera, named from now on so a
+            // camera connected later does not change what this command uses.
+            (None, _) => {
+                let reply = ipc::call_keeping(
+                    name,
+                    None,
+                    SessionCommand::Status,
+                    default_timeout(&SessionCommand::Status),
+                    keep,
+                )
+                .map_err(unusable)?;
+                let cameras = reply["cameras"].as_array().cloned().unwrap_or_default();
+                client.target = Some(only_camera(name, &cameras).map_err(Unusable::Failed)?);
+            }
         }
         Ok(client)
     }

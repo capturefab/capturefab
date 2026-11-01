@@ -486,7 +486,7 @@ fn overview() -> Value {
             "json": "--json (or CAPTUREFAB_JSON=1): exactly one single-line document on stdout. Exit 0: the result. Non-zero: {\"error\":{code,message,hint?,details?}}; code is a specific reason (errors), the exit code its category. No null values; warnings ≤10",
             "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION), --no-session (overrides it); before or after the command",
             "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
-            "routing": "--session NAME, else a session holding the camera, else a worker of the command (--no-session forces it). --keep DUR: through a session that stays DUR after its last use (--keep 5m for loops)",
+            "routing": "--session NAME, else a session holding the camera, else the auto session, open 60s after last use (--keep DUR); --keep 0 or --no-session: a worker of the command",
             "jobs": "capture/record block until done; --background prints a job instead (jobs wait ID). Ctrl-C: capture exits 130 with details.files; open-ended record ends normally",
             "results": "snake_case keys; units in names (exposure_us); times RFC 3339 UTC; lists bounded with truncated",
             "credentials": "never printed; URLs are redacted",

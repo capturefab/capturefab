@@ -1237,6 +1237,8 @@ struct Coordinator {
     log: Mutex<SessionLog>,
     jobs: JobBook,
     watchdog: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// Set by `shutdown` to wake the watchdog from its wait at once.
+    watch_stop: Arc<(Mutex<bool>, Condvar)>,
     /// The write end of the pipe the next worker writes an image captured
     /// to stdout to, which `stdout_pipe` made.
     output: Mutex<Option<std::io::PipeWriter>>,
@@ -1409,14 +1411,16 @@ impl SessionHandle {
                 log: Mutex::default(),
                 jobs,
                 watchdog: Mutex::new(None),
+                watch_stop: Arc::default(),
                 output: Mutex::new(None),
                 spawned: Mutex::default(),
             }),
         };
         let weak = Arc::downgrade(&handle.inner);
+        let stop = handle.inner.watch_stop.clone();
         let watchdog = std::thread::Builder::new()
             .name("capturefab-watchdog".into())
-            .spawn(move || watch(weak));
+            .spawn(move || watch(weak, &stop));
         if let Ok(watchdog) = watchdog {
             *locked(&handle.inner.watchdog) = Some(watchdog);
         }
@@ -2694,6 +2698,11 @@ impl SessionHandle {
                 .end_camera(&key, jobs::JobState::Interrupted, &stopping());
         }
         self.inner.jobs.flush();
+        {
+            let (stop, wake) = &*self.inner.watch_stop;
+            *locked(stop) = true;
+            wake.notify_all();
+        }
         if let Some(watchdog) = locked(&self.inner.watchdog).take() {
             let _ = watchdog.join();
         }
@@ -2731,10 +2740,21 @@ fn inline(command: &SessionCommand) -> bool {
 }
 
 /// Watch a coordinator's workers until it shuts down: end those that hang,
-/// stop jobs whose client stopped waiting, and save the job book.
-fn watch(coordinator: Weak<Coordinator>) {
+/// stop jobs whose client stopped waiting, and save the job book. `stop`
+/// ends the wait between looks at once, so a shutdown never waits for it.
+fn watch(coordinator: Weak<Coordinator>, stop: &(Mutex<bool>, Condvar)) {
     loop {
-        std::thread::sleep(Duration::from_millis(500));
+        let (stopped, wake) = stop;
+        let stopped = wake
+            .wait_timeout_while(locked(stopped), Duration::from_millis(500), |stopped| {
+                !*stopped
+            })
+            .unwrap_or_else(PoisonError::into_inner)
+            .0;
+        if *stopped {
+            return;
+        }
+        drop(stopped);
         let Some(inner) = coordinator.upgrade() else {
             return;
         };

@@ -1332,6 +1332,7 @@ impl Decoder {
             }
             None => canonical_scheme(source),
         };
+        cmd.args(probing(source));
         cmd.args(options);
         if matches!(scheme(source).as_deref(), Some("rtsp" | "rtsps")) {
             // RTP interleaved over TCP first. A camera that answers SETUP with
@@ -1677,6 +1678,49 @@ impl ReplayDecoder {
                 .wait_timeout(state, remaining)
                 .unwrap_or_else(|e| e.into_inner());
         }
+    }
+}
+/// How much of an input FFmpeg reads before it decodes, which for a live
+/// source is how long the first frame waits. By default FFmpeg reads up to
+/// 5 s of a stream to measure its frame rate, which frames passed through
+/// as they come never need: a camera on this computer sends whole frames,
+/// whose first says all there is to know, and a network stream says its
+/// codec and size within half a second, the rest of the wait being for its
+/// next keyframe. Packets read while probing are kept (no `-fflags
+/// nobuffer`), so the keyframe they hold is decoded rather than waited for
+/// again. Files are read from the disk at once, and probed in full.
+fn probing(source: &str) -> &'static [&'static str] {
+    if is_host_camera(source) {
+        &["-probesize", "32", "-analyzeduration", "100000"]
+    } else if is_live_stream(source) {
+        &["-probesize", "500000", "-analyzeduration", "500000"]
+    } else {
+        &[]
+    }
+}
+/// An http(s) URL naming a video file rather than a live stream.
+fn is_video_file_url(source: &str) -> bool {
+    const VIDEO: [&str; 10] = [
+        "mp4", "m4v", "mov", "mkv", "webm", "avi", "mpg", "mpeg", "wmv", "ogv",
+    ];
+    let path = source.split(['?', '#']).next().unwrap_or_default();
+    matches!(scheme(source).as_deref(), Some("http" | "https"))
+        && path
+            .rsplit('/')
+            .next()
+            .and_then(|name| name.rsplit_once('.'))
+            .is_some_and(|(_, extension)| {
+                VIDEO
+                    .iter()
+                    .any(|video| extension.eq_ignore_ascii_case(video))
+            })
+}
+/// A network source that sends as it goes rather than a file it serves.
+fn is_live_stream(source: &str) -> bool {
+    match scheme(source).as_deref() {
+        Some("rtsp" | "rtsps" | "srt" | "rtmp" | "rtmps" | "udp" | "tcp" | "rtp") => true,
+        Some("http" | "https") => !is_video_file_url(source),
+        _ => false,
     }
 }
 fn native_input(source: &str) -> Result<Option<(&'static str, String)>> {
@@ -2385,6 +2429,25 @@ pub fn is_host_camera(selector: &str) -> bool {
         Some("avfoundation" | "v4l2" | "dshow")
     )
 }
+/// Whether the host camera a recent listing found as `info` is still the
+/// device its ID opens. Webcams listed by name keep it; a Linux video node
+/// still has the name it was listed with, as one renumbered after a replug
+/// may not; a webcam listed by its index is listed again.
+pub fn host_camera_unchanged(info: &CameraInfo) -> bool {
+    let Some((backend, device)) = info.id.split_once(':') else {
+        return false;
+    };
+    match backend {
+        "avfoundation" => !device.is_empty() && !device.bytes().all(|b| b.is_ascii_digit()),
+        "dshow" => true,
+        "v4l2" => device
+            .strip_prefix("/dev/")
+            .filter(|node| node.starts_with("video") && !node.contains('/'))
+            .and_then(|node| fs::read_to_string(format!("/sys/class/video4linux/{node}/name")).ok())
+            .is_some_and(|name| name.trim() == info.model),
+        _ => false,
+    }
+}
 fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
     if !is_host_camera(source) {
         return Ok((source.into(), None));
@@ -2463,6 +2526,10 @@ struct MediaBackend {
     /// Whether this acquisition's first frame was asked for on demand, by a
     /// capture, rather than taken by a live view; unknown until then.
     on_demand: Option<bool>,
+    /// A capture asked a paced file for frames while the frame it opened
+    /// with was still there: that frame is taken, and the file starts again
+    /// unpaced only if another is asked for.
+    unpace: bool,
 }
 /// How a media source's stream ended, for callers that act on the end rather
 /// than on the wording of its error.
@@ -2730,20 +2797,7 @@ impl MediaBackend {
     /// An http(s) URL naming a video file rather than a live stream: it
     /// finishes like a local file instead of reconnecting.
     fn clip(&self) -> bool {
-        const VIDEO: [&str; 10] = [
-            "mp4", "m4v", "mov", "mkv", "webm", "avi", "mpg", "mpeg", "wmv", "ogv",
-        ];
-        let path = self.source.split(['?', '#']).next().unwrap_or_default();
-        matches!(scheme(&self.source).as_deref(), Some("http" | "https"))
-            && path
-                .rsplit('/')
-                .next()
-                .and_then(|name| name.rsplit_once('.'))
-                .is_some_and(|(_, extension)| {
-                    VIDEO
-                        .iter()
-                        .any(|video| extension.eq_ignore_ascii_case(video))
-                })
+        is_video_file_url(&self.source)
     }
     fn input_options(&self) -> Vec<String> {
         if self.file() && self.paced && self.on_demand != Some(true) {
@@ -2948,6 +3002,7 @@ fn open_source(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
         reconnect: None,
         paced: true,
         on_demand: None,
+        unpace: false,
     };
     if let Some(options) = options {
         (backend.modes, backend.formats) = probe(&backend.source);
@@ -3162,6 +3217,9 @@ impl RegisterIo for MediaBackend {
     }
 }
 impl Backend for MediaBackend {
+    fn lingers(&self) -> bool {
+        !self.file() && !self.clip()
+    }
     fn xml(&mut self) -> Result<String> {
         Ok(backend_xml(self.native, &self.modes, self.file()))
     }
@@ -3175,23 +3233,39 @@ impl Backend for MediaBackend {
     }
     /// A capture that asks for frames before a live view takes any reads a
     /// paced file as fast as it asks, like frames from a triggered camera;
-    /// the file starts again unpaced.
+    /// the file starts again unpaced. Its first frame is the one it opened
+    /// with when that is still there, so one frame needs one FFmpeg.
     fn request_frame(&mut self) -> Result<()> {
         if self.on_demand.is_none() {
             self.on_demand = Some(true);
             if self.file() && self.paced {
-                (self.decoder, self.first) = (None, None);
-                self.decoder = Some(Decoder::spawn_configured(
-                    &self.source,
-                    self.timeout,
-                    &self.input_options(),
-                )?);
+                if self.first.is_some() {
+                    self.unpace = true;
+                } else {
+                    self.decoder = None;
+                    self.decoder = Some(Decoder::spawn_configured(
+                        &self.source,
+                        self.timeout,
+                        &self.input_options(),
+                    )?);
+                }
             }
         }
         Ok(())
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.running, "media acquisition has not started");
+        if self.unpace && self.first.is_none() {
+            self.unpace = false;
+            self.decoder = None;
+            self.decoder = Some(Decoder::spawn_configured(
+                &self.source,
+                self.timeout,
+                &self.input_options(),
+            )?);
+            // It starts again with the frame already taken.
+            self.decode(timeout)?;
+        }
         self.on_demand.get_or_insert(false);
         let live = !self.file() && !self.clip();
         let mut frame = match self.first.take() {
@@ -3217,6 +3291,7 @@ impl Backend for MediaBackend {
         self.running = false;
         self.decoder.take();
         self.first = None;
+        self.unpace = false;
         self.reconnect = None;
         Ok(())
     }
@@ -5788,6 +5863,23 @@ for i in 1 2 3; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
         assert_eq!(launches.lines().count(), 3, "{launches}");
         assert!(paced(launches.lines().last().unwrap()), "{launches}");
         camera.stop().unwrap();
+        // One frame asked for is the one the file opened with: no second
+        // FFmpeg.
+        let mut camera = open_url(clip.to_str().unwrap(), Duration::from_secs(2)).unwrap();
+        camera.start(12).unwrap();
+        camera.request_frame().unwrap();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        assert_eq!(fake.read("argv").lines().count(), 4);
+        // A second starts it again unpaced, past the frame already taken.
+        camera.request_frame().unwrap();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        camera.next_frame(Duration::from_secs(2)).unwrap();
+        let launches = fake.read("argv");
+        assert_eq!(launches.lines().count(), 5, "{launches}");
+        assert!(!paced(launches.lines().last().unwrap()), "{launches}");
+        let finished = camera.next_frame(Duration::from_secs(2)).unwrap_err();
+        assert_eq!(stream_end(&finished), Some(StreamEnd::Finished));
+        camera.stop().unwrap();
     }
     #[test]
     #[cfg(unix)]
@@ -7449,6 +7541,7 @@ Error opening input files: Input/output error
             reconnect: None,
             paced: true,
             on_demand: None,
+            unpace: false,
         }
     }
     #[test]

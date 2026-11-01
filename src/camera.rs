@@ -49,38 +49,91 @@ const DISCOVERY_GRACE: Duration = Duration::from_secs(2);
 /// A transport that fails becomes a warning, and one still searching past
 /// its deadline is left behind on its own thread, so a hung transport never
 /// holds up the caller: what the others found is returned, with a warning.
+/// What it found is kept a minute for `lookup`. Without a network, GigE and
+/// ONVIF are not waited for.
 pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<String>) {
+    search(timeout, kinds, None)
+}
+
+/// Which cameras a search is for: it ends as soon as one answers.
+type Want = std::sync::Arc<dyn Fn(&CameraInfo) -> bool + Send + Sync>;
+
+/// Whether this computer has a network a GigE or ONVIF camera can answer
+/// on: an IPv4 address other than loopback.
+fn networked() -> bool {
+    if_addrs::get_if_addrs().is_ok_and(|interfaces| {
+        interfaces.iter().any(|interface| {
+            matches!(&interface.addr, if_addrs::IfAddr::V4(v4)
+                if !v4.ip.is_loopback() && !v4.ip.is_unspecified())
+        })
+    })
+}
+
+/// `discover_kinds`, ending as soon as a camera `want` names answers.
+fn search(
+    timeout: Duration,
+    mut kinds: Kinds,
+    want: Option<Want>,
+) -> (Vec<CameraInfo>, Vec<String>) {
     enum Found {
+        One(CameraInfo),
         Cameras(Vec<CameraInfo>),
         Native(serde_json::Value),
     }
-    type Search = Box<dyn FnOnce() -> Result<Found> + Send>;
-    let (sender, found) = std::sync::mpsc::channel::<(&'static str, Result<Found>)>();
+    type Message = (&'static str, Result<Found>);
+    type Search = Box<dyn FnOnce(&std::sync::mpsc::Sender<Message>) -> Result<Found> + Send>;
+    // Without a network no broadcast can be answered: nothing to wait for.
+    if (kinds.gige || kinds.onvif) && !networked() {
+        kinds.gige = false;
+        kinds.onvif = false;
+    }
+    let (sender, found) = std::sync::mpsc::channel::<Message>();
+    // Each camera a broadcast finds is told as it answers, and ends that
+    // search when it is the one wanted.
+    let stream =
+        |label: &'static str, sender: &std::sync::mpsc::Sender<Message>, want: &Option<Want>| {
+            let sender = sender.clone();
+            let want = want.clone();
+            move |info: &CameraInfo| {
+                let _ = sender.send((label, Ok(Found::One(info.clone()))));
+                want.as_ref().is_some_and(|want| want(info))
+            }
+        };
     let mut asked = Vec::new();
     let mut searches: Vec<(&'static str, Search)> = Vec::new();
     if kinds.gige {
+        let want = want.clone();
         searches.push((
             "GigE",
-            Box::new(move || crate::transport::gige::discover(timeout).map(Found::Cameras)),
+            Box::new(move |sender| {
+                crate::transport::gige::discover_until(timeout, &mut stream("GigE", sender, &want))
+                    .map(Found::Cameras)
+            }),
         ));
     }
     if kinds.onvif {
+        let want = want.clone();
         searches.push((
             "ONVIF",
-            Box::new(move || crate::onvif::camera_infos(timeout).map(Found::Cameras)),
+            Box::new(move |sender| {
+                crate::onvif::camera_infos_until(timeout, &mut stream("ONVIF", sender, &want))
+                    .map(Found::Cameras)
+            }),
         ));
     }
     if kinds.host {
         searches.push((
             "Native camera",
-            Box::new(move || crate::media::native_devices_with_timeout(timeout).map(Found::Native)),
+            Box::new(move |_| {
+                crate::media::native_devices_with_timeout(timeout).map(Found::Native)
+            }),
         ));
     }
     #[cfg(feature = "usb")]
     if kinds.u3v {
         searches.push((
             "USB",
-            Box::new(|| crate::transport::usb::discover().map(Found::Cameras)),
+            Box::new(|_| crate::transport::usb::discover().map(Found::Cameras)),
         ));
     }
     for (label, search) in searches {
@@ -88,7 +141,8 @@ pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<
         let spawned = std::thread::Builder::new()
             .name("capturefab-discovery".into())
             .spawn(move || {
-                let _ = sender.send((label, search()));
+                let result = search(&sender);
+                let _ = sender.send((label, result));
             });
         if spawned.is_ok() {
             asked.push(label);
@@ -99,39 +153,36 @@ pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<
     let mut devices = Vec::new();
     let mut warnings = Vec::new();
     let mut answered = Vec::new();
-    while answered.len() < asked.len() {
+    let wanted = |devices: &[CameraInfo]| {
+        want.as_ref()
+            .is_some_and(|want| devices.iter().any(|info| want(info)))
+    };
+    while answered.len() < asked.len() && !wanted(&devices) {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         let Ok((label, result)) = found.recv_timeout(left) else {
             break;
         };
-        answered.push(label);
         match result {
-            Ok(Found::Cameras(found)) => devices.extend(found),
-            Ok(Found::Native(native)) => {
-                for d in native["devices"].as_array().into_iter().flatten() {
-                    if let Some(id) = d["id"].as_str() {
-                        devices.push(CameraInfo {
-                            id: id.into(),
-                            transport: Transport::Media,
-                            vendor: std::env::consts::OS.into(),
-                            model: d["name"].as_str().unwrap_or("Host camera").into(),
-                            serial: id.into(),
-                            address: Some(id.into()),
-                            profile: Default::default(),
-                        });
-                    }
-                }
+            Ok(Found::One(info)) => {
+                devices.push(info);
+                continue;
             }
+            Ok(Found::Cameras(found)) => devices.extend(found),
+            Ok(Found::Native(native)) => devices.extend(native_cameras(&native)),
             Err(error) => warnings.push(format!("{label} discovery: {error:#}")),
         }
+        answered.push(label);
     }
-    for label in asked.iter().filter(|label| !answered.contains(label)) {
-        warnings.push(format!(
-            "{label} discovery did not answer within {}; listed without it",
-            crate::scheduling::format_duration(
-                u64::try_from((timeout + DISCOVERY_GRACE).as_millis()).unwrap_or(u64::MAX)
-            )
-        ));
+    let complete = !wanted(&devices);
+    if complete {
+        for label in asked.iter().filter(|label| !answered.contains(label)) {
+            warnings.push(format!(
+                "{label} discovery did not answer within {}; listed without it",
+                crate::scheduling::format_duration(
+                    u64::try_from((timeout + DISCOVERY_GRACE).as_millis()).unwrap_or(u64::MAX)
+                )
+            ));
+        }
     }
     if kinds.sim {
         devices.push(crate::transport::simulator::info());
@@ -141,8 +192,105 @@ pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<
     for info in &mut devices {
         info.profile = crate::camera_profile::detect(info, &[]);
     }
+    // A search to the end says which cameras of the transports that
+    // answered are gone; one that ended early only adds what it found.
+    let searched = |info: &CameraInfo| {
+        let label = match info.transport {
+            Transport::GigE => "GigE",
+            Transport::Usb3 => "USB",
+            Transport::Simulator => return false,
+            Transport::Media if crate::onvif::is_source(&info.id) => "ONVIF",
+            Transport::Media => "Native camera",
+        };
+        answered.contains(&label)
+    };
+    crate::discovery::store(
+        &devices,
+        complete.then_some(&searched as &dyn Fn(&CameraInfo) -> bool),
+    );
     (devices, warnings)
 }
+
+/// The host cameras FFmpeg listed.
+fn native_cameras(native: &serde_json::Value) -> Vec<CameraInfo> {
+    native["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| {
+            let id = d["id"].as_str()?;
+            Some(CameraInfo {
+                id: id.into(),
+                transport: Transport::Media,
+                vendor: std::env::consts::OS.into(),
+                model: d["name"].as_str().unwrap_or("Host camera").into(),
+                serial: id.into(),
+                address: Some(id.into()),
+                profile: Default::default(),
+            })
+        })
+        .collect()
+}
+
+/// The cameras to resolve `selector` among, a serial, name, model or
+/// discovered ID: those discovery found within the last minute when one of
+/// them is still the camera it names, else those a search finds, which ends
+/// as soon as the camera that has this ID, serial or address answers.
+pub fn lookup(selector: &str, timeout: Duration) -> (Vec<CameraInfo>, Vec<String>) {
+    let cached = crate::discovery::fresh();
+    if let Resolution::Exact(info) | Resolution::Loose { info, .. } =
+        resolve_selector(selector, &cached)
+        && still_there(&info)
+    {
+        return (cached, Vec::new());
+    }
+    let wanted = selector.to_owned();
+    let want: Want = std::sync::Arc::new(move |info: &CameraInfo| names_exactly(&wanted, info));
+    search(timeout, kinds_for(selector), Some(want))
+}
+
+/// The transports a camera named `selector` may be on.
+fn kinds_for(selector: &str) -> Kinds {
+    let only = |gige, u3v| Kinds {
+        gige,
+        u3v,
+        host: false,
+        onvif: false,
+        sim: false,
+    };
+    if prefixed(selector, "gige:") || mac_id(selector).is_some() {
+        only(true, false)
+    } else if prefixed(selector, "usb:") || prefixed(selector, "u3v:") {
+        only(false, true)
+    } else {
+        Kinds {
+            sim: false,
+            ..Kinds::all()
+        }
+    }
+}
+
+/// Whether the camera a recent discovery found as `info` is still that
+/// camera, where that is quick to tell: a GigE camera answers at its
+/// address with the same MAC and serial; a Linux video node still has its
+/// name; a webcam named by its name is that webcam. USB enumeration is
+/// quick, and other cameras are looked for again.
+pub(crate) fn still_there(info: &CameraInfo) -> bool {
+    match info.transport {
+        Transport::GigE => info
+            .address
+            .as_deref()
+            .and_then(|address| address.parse::<Ipv4Addr>().ok())
+            .and_then(|ip| crate::transport::gige::probe(ip, STILL_THERE).ok())
+            .is_some_and(|probed| probed.id == info.id && probed.serial == info.serial),
+        Transport::Media if crate::onvif::is_source(&info.id) => false,
+        Transport::Media => crate::media::host_camera_unchanged(info),
+        Transport::Usb3 | Transport::Simulator => false,
+    }
+}
+/// How long a GigE camera a recent discovery found has to answer at its
+/// address before it is looked for again.
+const STILL_THERE: Duration = Duration::from_millis(250);
 
 /// What a camera is, in the words `list` and `info` use: `gige`, `u3v`,
 /// `webcam`, `screen` (a screen or Desk View capture), `onvif`, `stream`,
@@ -342,15 +490,32 @@ pub fn is_explicit_selector(selector: &str) -> bool {
         || crate::media::is_source(selector)
 }
 
-/// Resolve a bare selector against discovered cameras. Exact ID, serial or
-/// address wins; otherwise a unique case-insensitive model or name match,
-/// then a unique run of whole model words.
+/// The discovery ID of the GigE camera a MAC address written with colons
+/// or dashes (`00:c0:df:12:34:56`) names.
+fn mac_id(selector: &str) -> Option<String> {
+    let groups = selector.split([':', '-']).collect::<Vec<_>>();
+    (groups.len() == 6
+        && groups
+            .iter()
+            .all(|group| group.len() == 2 && group.bytes().all(|b| b.is_ascii_hexdigit())))
+    .then(|| format!("gige:{}", groups.concat().to_ascii_lowercase()))
+}
+
+/// Whether `selector` is the ID, serial, address or MAC address of `info`.
+fn names_exactly(selector: &str, info: &CameraInfo) -> bool {
+    info.id == selector
+        || info.serial == selector
+        || info.address.as_deref() == Some(selector)
+        || mac_id(selector).is_some_and(|id| id == info.id)
+}
+
+/// Resolve a bare selector against discovered cameras. Exact ID, serial,
+/// address or MAC address wins; otherwise a unique case-insensitive model
+/// or name match, then a unique run of whole model words.
 pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
     let exact: Vec<_> = known
         .iter()
-        .filter(|d| {
-            d.id == selector || d.serial == selector || d.address.as_deref() == Some(selector)
-        })
+        .filter(|d| names_exactly(selector, d))
         .cloned()
         .collect();
     match exact.len() {
@@ -656,8 +821,17 @@ impl Camera {
         Self::from_backend(info, backend)
     }
     pub fn from_backend(mut info: CameraInfo, mut backend: Box<dyn Backend>) -> Result<Self> {
-        let xml = backend.xml().context("load camera GenICam XML")?;
-        let nodes = NodeMap::parse(&xml).context("parse camera GenICam XML")?;
+        let mut xml = backend.xml().context("load camera GenICam XML")?;
+        let nodes = match NodeMap::parse(&xml) {
+            // A copy from the disk cache that does not parse is read again
+            // from the device.
+            Err(_) if backend.forget_xml() => {
+                xml = backend.xml().context("load camera GenICam XML")?;
+                NodeMap::parse(&xml)
+            }
+            parsed => parsed,
+        }
+        .context("parse camera GenICam XML")?;
         let mut profile_metadata = nodes.profile_features(backend.as_mut());
         info.profile = crate::camera_profile::detect(&info, &profile_metadata);
         // Feature evidence must be implemented and available now. Only the
@@ -1172,6 +1346,10 @@ impl Camera {
         self.software_triggers = None;
         self.backend.write_memory(address, data)
     }
+    /// See `Backend::lingers`.
+    pub(crate) fn lingers(&self) -> bool {
+        self.backend.lingers()
+    }
     pub fn is_streaming(&self) -> bool {
         self.streaming
     }
@@ -1187,6 +1365,54 @@ pub(crate) mod tests {
     use super::*;
     use crate::camera_profile::{CameraCapability, CameraKind, DetectionSource};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn selectors_are_looked_for_only_where_they_can_be() {
+        let gige = CameraInfo {
+            id: "gige:00c0df123456".into(),
+            transport: Transport::GigE,
+            vendor: "Acme".into(),
+            model: "Line Scan 4K".into(),
+            serial: "SN42".into(),
+            address: Some("192.168.1.20".into()),
+            profile: Default::default(),
+        };
+        for selector in [
+            "gige:00c0df123456",
+            "SN42",
+            "192.168.1.20",
+            "00:C0:DF:12:34:56",
+            "00-c0-df-12-34-56",
+        ] {
+            assert!(names_exactly(selector, &gige), "{selector}");
+        }
+        assert!(!names_exactly("SN4", &gige));
+        assert!(!names_exactly("00c0df12345", &gige));
+        assert_eq!(
+            resolve_selector("00:c0:df:12:34:56", std::slice::from_ref(&gige)),
+            Resolution::Exact(gige)
+        );
+        let only = |gige, u3v| Kinds {
+            gige,
+            u3v,
+            host: false,
+            onvif: false,
+            sim: false,
+        };
+        assert_eq!(kinds_for("gige:00c0df123456"), only(true, false));
+        assert_eq!(kinds_for("00:c0:df:12:34:56"), only(true, false));
+        assert_eq!(kinds_for("usb:2676:ba02:SN1"), only(false, true));
+        // A serial or a model may be anywhere but the simulator.
+        assert_eq!(
+            kinds_for("SN42"),
+            Kinds {
+                sim: false,
+                ..Kinds::all()
+            }
+        );
+        // A 12-digit serial is not a MAC address.
+        assert!(mac_id("123456789012").is_none());
+    }
 
     #[test]
     fn opened_media_sources_keep_their_kind() {

@@ -207,6 +207,14 @@ fn repeat_offsets(first_delay_ms: u64) -> [Duration; 3] {
     })
 }
 pub fn discover(timeout: Duration) -> Result<Vec<OnvifDevice>> {
+    discover_until(timeout, &mut |_| false)
+}
+/// `discover`, telling `found` of each device as it answers; it returns at
+/// once, with what answered so far, when `found` says that was the one.
+fn discover_until(
+    timeout: Duration,
+    found: &mut dyn FnMut(&OnvifDevice) -> bool,
+) -> Result<Vec<OnvifDevice>> {
     validate_timeout(timeout)?;
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .context("cannot open ONVIF discovery socket")?;
@@ -274,10 +282,15 @@ pub fn discover(timeout: Duration) -> Result<Vec<OnvifDevice>> {
         match socket.recv_from(&mut buffer) {
             Ok((n, source)) => {
                 if let Ok(xml) = std::str::from_utf8(&buffer[..n])
-                    && let Ok(found) = parse_discovery(xml, source)
+                    && let Ok(answered) = parse_discovery(xml, source)
                 {
-                    for device in found {
+                    let mut wanted = false;
+                    for device in answered {
+                        wanted |= found(&device);
                         merge_device(&mut devices, device);
+                    }
+                    if wanted {
+                        break;
                     }
                 }
             }
@@ -1704,27 +1717,39 @@ pub fn connect_with(
     Ok((info, backend))
 }
 pub fn camera_infos(timeout: Duration) -> Result<Vec<crate::types::CameraInfo>> {
-    Ok(discover(timeout)?
-        .into_iter()
-        .map(|device| {
-            let endpoint = crate::media::redact_url(&device.endpoint);
-            let name = device
-                .scopes
-                .iter()
-                .find_map(|scope| scope.strip_prefix("onvif://www.onvif.org/name/"))
-                .and_then(|name| percent_decode(name).ok())
-                .unwrap_or_else(|| "Network camera".into());
-            crate::types::CameraInfo {
-                id: format!("onvif:{endpoint}"),
-                transport: crate::types::Transport::Media,
-                vendor: "ONVIF".into(),
-                model: name,
-                serial: device.uuid,
-                address: Some(endpoint),
-                profile: Default::default(),
-            }
-        })
-        .collect())
+    camera_infos_until(timeout, &mut |_| false)
+}
+/// `camera_infos`, telling `found` of each camera as it answers; it returns
+/// at once when `found` says that was the one.
+pub fn camera_infos_until(
+    timeout: Duration,
+    found: &mut dyn FnMut(&crate::types::CameraInfo) -> bool,
+) -> Result<Vec<crate::types::CameraInfo>> {
+    Ok(
+        discover_until(timeout, &mut |device| found(&camera_info(device.clone())))?
+            .into_iter()
+            .map(camera_info)
+            .collect(),
+    )
+}
+/// A discovered device as `list` shows it.
+fn camera_info(device: OnvifDevice) -> crate::types::CameraInfo {
+    let endpoint = crate::media::redact_url(&device.endpoint);
+    let name = device
+        .scopes
+        .iter()
+        .find_map(|scope| scope.strip_prefix("onvif://www.onvif.org/name/"))
+        .and_then(|name| percent_decode(name).ok())
+        .unwrap_or_else(|| "Network camera".into());
+    crate::types::CameraInfo {
+        id: format!("onvif:{endpoint}"),
+        transport: crate::types::Transport::Media,
+        vendor: "ONVIF".into(),
+        model: name,
+        serial: device.uuid,
+        address: Some(endpoint),
+        profile: Default::default(),
+    }
 }
 
 #[cfg(test)]

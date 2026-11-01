@@ -2,7 +2,7 @@
 //! them against a camera and restore them as one change. A preset lives on
 //! this computer and works with any camera of the model; a camera's user
 //! sets live in the camera (`--persist` writes one).
-use super::{Client, Global, args::CameraArg, output::Report};
+use super::{Client, Global, args::CameraArg, args::KeepArg, output::Report};
 use crate::session::SessionCommand;
 use crate::setup::{self as setups, Setup, Store};
 use crate::types::{Categorized, ErrorKind, Usage};
@@ -28,6 +28,8 @@ pub enum PresetCommand {
         /// Overwrite a saved preset with the same name
         #[arg(long)]
         replace: bool,
+        #[command(flatten)]
+        keep: KeepArg,
     },
     /// List saved presets and the folder that holds them
     #[command(after_help = "Examples:\n  capturefab preset list\n  capturefab --json preset list")]
@@ -61,6 +63,8 @@ pub enum PresetCommand {
         /// Then save it in the camera's user set (default UserSet1) and make that the power-on default
         #[arg(long, value_name = "USERSET", num_args = 0..=1, default_missing_value = "UserSet1")]
         persist: Option<String>,
+        #[command(flatten)]
+        keep: KeepArg,
     },
     /// Delete a saved preset; no camera changes
     #[command(
@@ -200,10 +204,11 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             camera,
             note,
             replace,
+            keep,
         } => {
             // Store::save checks again under its lock.
             store.check_free(&name, replace).map_err(taken)?;
-            let client = Client::open(global, camera.camera.as_deref())?;
+            let client = Client::open_with(global, camera.camera.as_deref(), keep.route())?;
             let reading = serde_json::from_value(client.call(SessionCommand::ReadSetup)?)
                 .context("read the camera's settings")?;
             let setup = setups::from_read(&name, note, reading)?;
@@ -227,13 +232,14 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             strict,
             allow_other_model,
             persist,
+            keep,
         } => {
             let file = file.as_deref().map(absolute).transpose()?;
             let (name, setup) = load(&name, &file)?;
             if let Some(user_set) = &persist {
                 crate::controls::Name::parse(user_set)?;
             }
-            let client = Client::open(global, camera.camera.as_deref())?;
+            let client = Client::open_with(global, camera.camera.as_deref(), keep.route())?;
             // A camera that cannot keep the preset is refused before
             // anything changes.
             let persisting = persist
