@@ -64,7 +64,7 @@ def builds(ver, root):
             raise ValueError(f'invalid or failed Windows build report: {report_path.name}')
         assets = report.get('assets')
         if not isinstance(assets, list) or len(assets) != 1:
-            raise ValueError(f'the Windows desktop package is required: {report_path.name}')
+            raise ValueError(f'the native-tested Windows package is required: {report_path.name}')
         packages = []
         for item in assets:
             if not isinstance(item, dict):
