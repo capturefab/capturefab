@@ -537,6 +537,21 @@ fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
     );
     Ok(d)
 }
+/// Whether `path` is the descriptor of session `name` from another protocol
+/// version, such as one Capturefab 0.5 published.
+fn other_protocol(path: &Path, name: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Published {
+        version: u32,
+        name: String,
+    }
+    fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 4096)
+        && fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Published>(&bytes).ok())
+            .is_some_and(|published| published.version != VERSION && published.name == name)
+}
 #[cfg(test)]
 fn read_line(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>> {
     use std::io::Read;
@@ -721,6 +736,10 @@ impl Server {
                 kind_name(existing.kind),
                 existing.pid
             );
+            fs::remove_file(&path)?;
+        } else if other_protocol(&path, name) {
+            // Sessions of every version hold the name lock while they run,
+            // so this one was left by a session that crashed or was killed.
             fs::remove_file(&path)?;
         }
         ensure!(
@@ -1647,7 +1666,7 @@ mod tests {
         peer.join().unwrap();
     }
     #[test]
-    fn sessions_of_an_older_protocol_are_never_listed_or_chosen() {
+    fn sessions_of_an_older_protocol_are_never_chosen_and_free_their_name_once_gone() {
         let dir = TestDir::new();
         let address = "127.0.0.1:12345".parse().unwrap();
         let mut old = test_descriptor("old", address);
@@ -1662,6 +1681,24 @@ mod tests {
         assert_eq!(names, ["current"]);
         let error = read_descriptor_in(&dir.0, "old").unwrap_err();
         assert!(error.to_string().contains("protocol version"), "{error:#}");
+        let handle = SessionHandle::new();
+        // While an older session runs, it holds the name.
+        let lock = lock_file(&dir.0.join("old.session.lock")).unwrap();
+        lock.try_lock_exclusive().unwrap();
+        let error = match Server::start_in(handle.clone(), "old", SessionKind::Serve, &dir.0) {
+            Ok(_) => panic!("a running older session was replaced"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("is already running"), "{error}");
+        assert!(descriptor_path_in(&dir.0, "old").unwrap().exists());
+        // Its descriptor outlives a crash, and then the name is free.
+        drop(lock);
+        let server = Server::start_in(handle.clone(), "old", SessionKind::Serve, &dir.0).unwrap();
+        let current = read_descriptor_in(&dir.0, "old").unwrap();
+        assert_eq!(current.version, VERSION);
+        assert!(descriptor_active(&current));
+        drop(server);
+        handle.shutdown();
     }
     #[test]
     fn descriptor_discovery_is_sorted_and_ignores_application_state() {

@@ -331,9 +331,7 @@ pub fn auth_error(address: &str, had_credentials: bool) -> anyhow::Error {
         );
     }
     let advice = if can_remember() {
-        format!(
-            "sign in from the app or run `capturefab login add {address} --user USER --password-stdin`"
-        )
+        format!("run `capturefab login add {address} --user USER --password-stdin`")
     } else {
         let scheme = address.split("://").next().unwrap_or("rtsp");
         format!("include them in the address ({scheme}://USER:PASSWORD@…)")

@@ -1972,6 +1972,71 @@ fn serve_under_nohup_ignores_sighup() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// How many times a thread has gone to sleep and been woken.
+#[cfg(target_os = "linux")]
+fn voluntary_switches(task: &std::path::Path) -> u64 {
+    std::fs::read_to_string(task.join("status"))
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+        .expect("Linux reports context switches per thread")
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn an_idle_serve_and_its_listener_sleep_until_there_is_work() {
+    use std::time::{Duration, Instant};
+    let root = temp_root("idle");
+    let dir = root.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let fixture = Fixture {
+        child: serve_with(&dir, &root, "idle", &[("CAPTUREFAB_CAMERA", "sim:0")]),
+        dir: root,
+    };
+    let pid = fixture.child.id();
+    let tasks = std::path::Path::new("/proc")
+        .join(pid.to_string())
+        .join("task");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // A thread takes its name once it first runs, which can be after serve
+    // reports that it is ready.
+    let listener = loop {
+        let listener = std::fs::read_dir(&tasks)
+            .unwrap()
+            .map(|task| task.unwrap().path())
+            .find(|task| {
+                std::fs::read_to_string(task.join("comm"))
+                    .is_ok_and(|name| name.trim() == "capturefab-rpc")
+            });
+        if let Some(listener) = listener {
+            break listener;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "serve runs a session listener thread"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // The main thread waits for a signal and the listener for a connection;
+    // neither wakes to check for them.
+    let threads = [tasks.join(pid.to_string()), listener];
+    std::thread::sleep(Duration::from_millis(300));
+    let before = threads.each_ref().map(|task| voluntary_switches(task));
+    std::thread::sleep(Duration::from_secs(1));
+    for (task, before) in threads.iter().zip(before) {
+        let woken = voluntary_switches(task) - before;
+        assert!(
+            woken <= 2,
+            "{} woke {woken} times in a second",
+            task.display()
+        );
+    }
+    drop(fixture);
+}
+
 /// A terminal sends Ctrl-C, and the shell the SIGHUP of a closed terminal,
 /// to serve's whole process group. Its camera workers are not in it, so serve
 /// still finishes a recording in its selected folder and storage ledger.

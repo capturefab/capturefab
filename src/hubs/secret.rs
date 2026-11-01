@@ -218,7 +218,7 @@ pub fn resolve(hub: &Hub) -> Result<Option<Secret>> {
                     })
                 }
                 _ => Err(missing(format!(
-                    "{variable} is not set in the process that opened hub {}; a GUI started from the Dock, Finder or Start menu does not see shell variables; save the secret with --secret-stdin instead",
+                    "{variable} is not set in the process that opened hub {}; a serve session started as a service does not see shell variables; save the secret with --secret-stdin instead",
                     hub.name
                 ))),
             }

@@ -2,14 +2,13 @@
 //!
 //! The only request is a plain GET of the static `releases.json` that the
 //! website publishes: no identifiers, cookies, query string or version in the
-//! User-Agent. The desktop app checks at most once a day unless that is
-//! turned off (Settings › Updates, `CAPTUREFAB_UPDATE_CHECK=off` or a policy
-//! file); `capturefab version --check` and "Check for Updates…" check on
-//! request. Nothing is ever downloaded or installed: a found release is shown
-//! with its notes, its download link and the file's SHA-256.
+//! User-Agent. Nothing checks on its own: `capturefab version --check` checks
+//! on request, unless `CAPTUREFAB_UPDATE_CHECK=off` or a policy file turns
+//! checks off. Nothing is ever downloaded or installed: a found release is
+//! shown with its notes, its download link and the file's SHA-256.
 //!
-//! What the last check found lives in `<state>/updates.json`, outside the GUI
-//! preferences so that `doctor` and `version` read it in any build. Whether a
+//! What the last check found lives in `<state>/updates.json`, so that
+//! `doctor` and `version` read it in any build. Whether a
 //! release is new is decided again on every read, against this build's
 //! version, so an upgrade never leaves a stale "available".
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -1099,7 +1098,8 @@ pub fn report(settings: &Settings, policy: &Policy) -> Value {
     let status = settings.status();
     json!({
         "compiled": cfg!(feature = "updates"),
-        "automatic": settings.automatic() && policy.allowed() && cfg!(feature = "updates"),
+        // Only the desktop app checked on its own.
+        "automatic": false,
         "policy": match policy {
             Policy::Allowed => Value::Null,
             Policy::Off(source) => source.json(),
@@ -1175,7 +1175,7 @@ pub fn human(value: &Value) -> String {
                 "Capturefab {} is available{}.\n",
                 text(latest),
                 if value["skipped"] == true {
-                    " (skipped in the desktop app)"
+                    " (skipped earlier)"
                 } else {
                     ""
                 }
@@ -1222,14 +1222,8 @@ pub fn human(value: &Value) -> String {
         ));
     } else if check["compiled"] != true {
         out.push_str("Update checks: not in this build.\n");
-    } else if check["automatic"] == true {
-        out.push_str(
-            "Update checks: once a day in the desktop app. Turn off in Settings › Updates.\n",
-        );
     } else {
-        out.push_str(
-            "Update checks: off. Turn on in Settings › Updates, or run capturefab version --check.\n",
-        );
+        out.push_str("Update checks: only when you run capturefab version --check.\n");
     }
     match check["last_checked"].as_str() {
         None => out.push_str("Last check: never\n"),
@@ -1273,12 +1267,12 @@ pub fn doctor_notes() -> Vec<(String, String)> {
 pub fn schema_contract() -> Value {
     json!({
         "manifest": UPDATE_URL,
-        "automatic": "desktop app only: at most once a day, on unless turned off in Settings › Updates; never from the CLI or serve",
+        "automatic": "never: the CLI and serve do not check on their own",
         "manual": "capturefab version --check",
         "request": "GET with Accept: application/json and User-Agent: capturefab; no cookies, query string, identifiers or version; redirects are not followed; at most 256 KiB",
         "state": "updates.json in the state directory: automatic, skipped, last_checked, last_outcome",
         "environment": {
-            CHECK_ENV: "off (also 0, false, never) disables automatic and requested checks; other values are ignored",
+            CHECK_ENV: "off (also 0, false, never) disables checks; other values are ignored",
             URL_ENV: "an https:// mirror of releases.json, or http:// on loopback",
         },
         "policy_file": {

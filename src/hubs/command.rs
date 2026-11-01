@@ -83,7 +83,7 @@ pub struct Server {
     /// Read the secret from stdin and save it in the OS credential store: a long-lived access token (Home Assistant: Profile > Security), a password (Frigate, go2rtc) or an API key (UniFi Protect)
     #[arg(long, conflicts_with = "secret_env")]
     pub secret_stdin: bool,
-    /// Read the secret from environment variable VAR (CAPTUREFAB_HUB_...) in the process that opens the camera: a GUI or serve session, or this CLI
+    /// Read the secret from environment variable VAR (CAPTUREFAB_HUB_...) in the process that opens the camera: a serve session, or this CLI
     #[arg(long, value_name = "VAR")]
     pub secret_env: Option<String>,
     /// The server's TLS certificate fingerprint, SHA256:AB:CD:... (openssl x509 -noout -fingerprint -sha256); a different certificate is refused

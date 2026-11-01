@@ -172,6 +172,10 @@ struct Entry {
     /// Legacy unsent file: retain its old protection when reading existing ledgers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_upload: bool,
+    /// Legacy task namespace: a directory that 0.4 and 0.5 reserved for
+    /// dataset tasks. Kept as recorded only while an older process holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    namespace: Option<Value>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Ledger {
@@ -312,6 +316,28 @@ fn regular_private(path: &Path, max_bytes: u64) -> Result<Metadata> {
 fn contended(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::WouldBlock
         || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+/// A reservation's lease file in the private directory.
+enum Lease {
+    /// Its writer still holds it.
+    Live,
+    /// Its writer is gone: the file, locked here, when it still exists.
+    Stale(Option<(File, PathBuf)>),
+}
+fn check_lease(directory: &Path, name: &str) -> Result<Lease> {
+    let path = directory.join(name);
+    match regular_private(&path, 0) {
+        Ok(_) => {
+            let lease = private_options().open(&path)?;
+            match lease.try_lock_exclusive() {
+                Ok(()) => Ok(Lease::Stale(Some((lease, path)))),
+                Err(error) if contended(&error) => Ok(Lease::Live),
+                Err(error) => Err(error).context("inspect capture reservation lease"),
+            }
+        }
+        Err(error) if not_found(&error) => Ok(Lease::Stale(None)),
+        Err(error) => Err(error),
+    }
 }
 /// Other processes held the storage lock for the whole wait; a later try
 /// may succeed. Callers that retry recognize it with [`is_busy`].
@@ -482,6 +508,7 @@ impl Manager {
             modified_ns: None,
             changed: false,
             pending_upload: false,
+            namespace: None,
         });
         if let Err(error) = locked.persist() {
             drop(file);
@@ -1095,6 +1122,23 @@ impl Locked {
             if !full && entry.lease.is_none() {
                 continue;
             }
+            if entry.namespace.is_some() {
+                // The dataset tasks these held are gone. Once no older
+                // process holds one, its record and charge go; the directory
+                // and everything in it stay on disk.
+                let lease = match &entry.lease {
+                    Some(name) => check_lease(&self.directory, name)?,
+                    None => Lease::Stale(None),
+                };
+                if let Lease::Stale(file) = lease {
+                    missing.push(index);
+                    if let Some((file, path)) = file {
+                        drop(file);
+                        let _ = fs::remove_file(path);
+                    }
+                }
+                continue;
+            }
             let mut touched = false;
             let meta = current_meta(entry, &mut verified)?;
             let current_bytes = meta.as_ref().map_or(0, Metadata::len);
@@ -1120,25 +1164,11 @@ impl Locked {
             }
             let mut stale = entry.lease.is_none();
             let mut stale_lease = None;
-            if let Some(name) = &entry.lease {
-                let path = self.directory.join(name);
-                match regular_private(&path, 0) {
-                    Ok(_) => {
-                        let lease = private_options().open(&path)?;
-                        match lease.try_lock_exclusive() {
-                            Ok(()) => {
-                                stale = true;
-                                stale_lease = Some((lease, path));
-                            }
-                            Err(error) if contended(&error) => {}
-                            Err(error) => {
-                                return Err(error).context("inspect capture reservation lease");
-                            }
-                        }
-                    }
-                    Err(error) if not_found(&error) => stale = true,
-                    Err(error) => return Err(error),
-                }
+            if let Some(name) = &entry.lease
+                && let Lease::Stale(file) = check_lease(&self.directory, name)?
+            {
+                stale = true;
+                stale_lease = file;
             }
             if stale {
                 match meta {
@@ -1210,7 +1240,11 @@ impl Locked {
             .is_some_and(|age| now().saturating_sub(entry.created) >= age)
     }
     fn removable(entry: &Entry) -> bool {
-        entry.lease.is_none() && !entry.changed && entry.sha256.is_some() && !entry.pending_upload
+        entry.lease.is_none()
+            && !entry.changed
+            && entry.sha256.is_some()
+            && !entry.pending_upload
+            && entry.namespace.is_none()
     }
     /// Expired and removable. A protected file past the age limit, such as a
     /// live or interrupted recording or one awaiting upload, must not block
@@ -1224,7 +1258,9 @@ impl Locked {
         self.ledger
             .entries
             .iter()
-            .position(|entry| entry.path == path && entry.lease.is_none())
+            .position(|entry| {
+                entry.path == path && entry.lease.is_none() && entry.namespace.is_none()
+            })
             .ok_or_else(|| anyhow!("{} is not a finished Capturefab capture", path.display()))
     }
     /// Remove one capture if it is still exactly the file recorded; the
@@ -2748,6 +2784,7 @@ mod tests {
                 modified_ns: meta.modified().ok().and_then(nanos),
                 changed: false,
                 pending_upload: false,
+                namespace: None,
             });
         }
         locked.compact().unwrap();
@@ -3108,6 +3145,82 @@ mod tests {
         assert_eq!(fs::read_to_string(&snapshot).unwrap(), snapshot_bytes);
         assert_eq!(fs::read_to_string(&journal).unwrap(), journal_bytes);
         assert_eq!(fs::read(temp.path("capture")).unwrap(), b"data");
+    }
+    #[test]
+    fn task_namespaces_from_older_versions_leave_the_ledger_but_not_the_disk() {
+        let temp = Temp::new();
+        let manager = temp.manager();
+        let policy = policy(100, 10, "stop");
+        completed(&manager, &temp.path("capture"), &policy, b"data");
+        let base = fs::canonicalize(&temp.0).unwrap();
+        let parent = identity(&fs::symlink_metadata(&base).unwrap());
+        // As 0.4 and 0.5 recorded them: a directory with a reserved cap.
+        let namespace = |name: &str, cap: u64, phase: &str, leased: bool| {
+            let path = base.join(name);
+            fs::create_dir(&path).unwrap();
+            fs::write(path.join("task.db"), name).unwrap();
+            let id = nonce().unwrap();
+            let lease = leased.then(|| format!("storage-{id}.lease"));
+            let record =
+                json!({"cap": cap, "phase": phase, "uncertain": false, "parent_identity": parent});
+            let entry: Entry = serde_json::from_value(json!({
+                "id": id, "path": path, "base": base,
+                "identity": identity(&fs::symlink_metadata(&path).unwrap()),
+                "created": now(), "bytes": 0, "reserved": cap, "lease": lease,
+                "sha256": null, "modified_ns": null, "changed": true,
+                "namespace": record,
+            }))
+            .unwrap();
+            (entry, record)
+        };
+        let (retained, _) = namespace("retained", 1 << 30, "retained", false);
+        // A task whose process crashed: its lease file is gone.
+        let (crashed, _) = namespace("crashed", 1 << 30, "active", true);
+        let (live, record) = namespace("live", 10, "active", true);
+        let lease_path = manager.directory.join(live.lease.as_ref().unwrap());
+        let lease = private_options()
+            .create_new(true)
+            .open(&lease_path)
+            .unwrap();
+        lease.lock_exclusive().unwrap();
+        {
+            let mut locked = manager.lock().unwrap();
+            for entry in [retained, crashed, live] {
+                locked.push(entry);
+            }
+            locked.persist().unwrap();
+        }
+        forget(&manager);
+        let status = manager.lock().unwrap().status().unwrap();
+        assert_eq!(status["files"], 2, "{status}");
+        assert_eq!(status["allocated_bytes"], 14, "{status}");
+        // An older process's live namespace is never a capture to remove,
+        // and its record is rewritten as it was.
+        assert!(manager.lock().unwrap().find(&temp.path("live")).is_err());
+        manager.lock().unwrap().compact().unwrap();
+        let snapshot: Value =
+            serde_json::from_slice(&fs::read(manager.directory.join(SNAPSHOT)).unwrap()).unwrap();
+        let kept: Vec<_> = snapshot["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry.get("namespace"))
+            .collect();
+        assert_eq!(kept, [&record]);
+        completed(&manager, &temp.path("next"), &policy, b"next");
+        drop(lease);
+        forget(&manager);
+        let locked = without_leases(&manager);
+        assert_eq!(locked.ledger.entries.len(), 2);
+        assert_eq!(locked.allocated().unwrap(), 8);
+        drop(locked);
+        assert!(!lease_path.exists());
+        for name in ["retained", "crashed", "live"] {
+            assert_eq!(
+                fs::read_to_string(temp.path(name).join("task.db")).unwrap(),
+                name
+            );
+        }
     }
     #[test]
     fn usage_and_policy_are_read_without_the_lock() {
