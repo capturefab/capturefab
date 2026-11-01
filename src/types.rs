@@ -253,7 +253,7 @@ impl ErrorKind {
             Self::StorageFull => (
                 "storage_full",
                 6,
-                "below the free-space floor (CAPTUREFAB_MIN_FREE); details path, free_bytes",
+                "disk full or below CAPTUREFAB_MIN_FREE; details path, free_bytes if known",
             ),
             Self::Incomplete => ("incomplete", 1, "fewer results than requested; see details"),
             Self::Interrupted => (

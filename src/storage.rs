@@ -147,32 +147,64 @@ pub fn ensure_room(path: &Path, adding: u64) -> Result<()> {
     };
     let floor = floor(space.total)?;
     if floor > 0 && space.free.saturating_sub(adding) < floor {
-        return Err(full(path, space.free, floor));
+        let free = space.free;
+        return Err(full(path, NoRoom::Floor { free, floor }));
     }
     Ok(())
 }
 
-fn full(path: &Path, free: u64, floor: u64) -> anyhow::Error {
-    Categorized::new(
-        ErrorKind::StorageFull,
-        format!(
-            "{} free on the disk of {}, and Capturefab leaves {} free",
-            human_bytes(free),
-            path.display(),
-            human_bytes(floor)
-        ),
-    )
-    .hint(format!(
-        "free some space, write to another disk, or lower {MIN_FREE_ENV} (0 turns the floor off)"
-    ))
-    .details(serde_json::json!({ "path": path, "free_bytes": free }))
-    .into()
+/// Why a disk has no room for more of a file.
+#[derive(Clone, Debug)]
+enum NoRoom {
+    /// `free` bytes are left, below the `floor` Capturefab keeps.
+    Floor { free: u64, floor: u64 },
+    /// A write was refused: the disk, or the user's quota on it, is full.
+    Refused(String),
 }
 
-/// The folder `path` goes in, created when missing, unless it is under the
-/// mount point of a drive that is not there, or `adding` bytes there would
-/// leave less than the floor free.
+/// `storage_full` for `path`, with `{path, free_bytes}` either way.
+fn full(path: &Path, no_room: NoRoom) -> anyhow::Error {
+    let (message, free, hint) = match no_room {
+        NoRoom::Floor { free, floor } => (
+            format!(
+                "{} free on the disk of {}, and Capturefab leaves {} free",
+                human_bytes(free),
+                path.display(),
+                human_bytes(floor)
+            ),
+            Some(free),
+            format!(
+                "free some space, write to another disk, or lower {MIN_FREE_ENV} (0 turns the floor off)"
+            ),
+        ),
+        NoRoom::Refused(error) => (
+            format!("cannot write {}: {error}", path.display()),
+            space(path).map(|space| space.free),
+            "free some space or write to another disk".into(),
+        ),
+    };
+    Categorized::new(ErrorKind::StorageFull, message)
+        .hint(hint)
+        .details(serde_json::json!({ "path": path, "free_bytes": free }))
+        .into()
+}
+
+/// Whether a write failed for want of room rather than for another reason.
+fn no_room(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded
+    )
+}
+
+/// The folder `path` goes in, created when missing, unless the path has
+/// control characters, it is under the mount point of a drive that is not
+/// there, or `adding` bytes there would leave less than the floor free.
 fn folder(path: &Path, adding: u64) -> Result<PathBuf> {
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.iter().any(u8::is_ascii_control) {
+        return Err(Usage("an output path must not contain control characters".into()).into());
+    }
     path.file_name()
         .filter(|name| !name.is_empty() && *name != "." && *name != "..")
         .ok_or_else(|| anyhow!("capture output must name a file"))?;
@@ -261,10 +293,14 @@ pub fn save_one(bytes: &[u8], path: &Path) -> Result<Stored> {
     Ok(stored)
 }
 
-/// `OutputExists` for a name that is taken, else what failed writing it.
+/// `OutputExists` for a name that is taken, `storage_full` for a disk with
+/// no room, else what failed writing it.
 fn failed(path: &Path, error: io::Error) -> anyhow::Error {
     if error.kind() == io::ErrorKind::AlreadyExists {
         return OutputExists(path.to_path_buf()).into();
+    }
+    if no_room(&error) {
+        return full(path, NoRoom::Refused(error.to_string()));
     }
     anyhow::Error::from(error).context(format!("cannot write {}", path.display()))
 }
@@ -441,27 +477,31 @@ pub enum Cut {
     Failed,
 }
 
-/// What a recording found when it last looked at its disk, for whoever
-/// stops the recording, which a disk below its floor must do.
+/// What a recording found about its disk, for whoever stops the
+/// recording, which a disk below its floor or full must do.
 #[derive(Debug)]
 pub struct Alarm {
     path: PathBuf,
-    /// Free bytes, and the floor, once the disk is below it.
-    low: Mutex<Option<(u64, u64)>>,
+    /// Why the disk has no room, once it has none.
+    no_room: Mutex<Option<NoRoom>>,
 }
 impl Alarm {
     /// The `storage_full` error to stop the recording with, once its disk
-    /// is below the floor.
+    /// is below the floor or refused a write for want of room.
     pub fn error(&self) -> Option<anyhow::Error> {
-        let low = *self.low.lock().unwrap_or_else(PoisonError::into_inner);
-        low.map(|(free, floor)| full(&self.path, free, floor))
+        let no_room = self.no_room.lock().unwrap_or_else(PoisonError::into_inner);
+        no_room.clone().map(|no_room| full(&self.path, no_room))
+    }
+    fn raise(&self, no_room: NoRoom) {
+        *self.no_room.lock().unwrap_or_else(PoisonError::into_inner) = Some(no_room);
     }
 }
 
 /// A recording's file: bytes streamed into a new file under its name, up to
 /// an exact size when it has one. Its disk is looked at every 64 MiB or
 /// second; below the floor its [`Alarm`] goes off while it keeps taking
-/// bytes, so the recording can be finished properly.
+/// bytes, so the recording can be finished properly. A write the full disk
+/// refuses sets it off too.
 pub struct Recording {
     file: Option<File>,
     path: PathBuf,
@@ -496,7 +536,7 @@ impl Recording {
             looked: (0, Instant::now()),
             alarm: Arc::new(Alarm {
                 path: path.to_path_buf(),
-                low: Mutex::new(None),
+                no_room: Mutex::new(None),
             }),
             cut: None,
         })
@@ -526,12 +566,8 @@ impl Recording {
             && let Ok(floor) = floor(space.total)
             && space.free < floor
         {
-            let mut low = self
-                .alarm
-                .low
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            *low = Some((space.free, floor));
+            let free = space.free;
+            self.alarm.raise(NoRoom::Floor { free, floor });
         }
     }
     /// Close the file with its bytes on disk, and its folder: its size and
@@ -581,6 +617,9 @@ impl Write for Recording {
         let count = file.write(bytes).map_err(|error| {
             // A failed write wrote nothing, so the bytes before it stand.
             self.cut = Some(Cut::Failed);
+            if no_room(&error) {
+                self.alarm.raise(NoRoom::Refused(error.to_string()));
+            }
             let message = format!("cannot write recording {}: {error}", self.path.display());
             io::Error::new(error.kind(), message)
         })?;
@@ -694,6 +733,55 @@ mod tests {
         let error = save(b"two", &path, SyncMode::File, false).unwrap_err();
         assert_eq!(reason(&error), ErrorKind::Exists);
         assert_eq!(fs::read(&path).unwrap(), b"one");
+    }
+
+    #[test]
+    fn output_paths_with_control_characters_create_nothing() {
+        let temp = Temp::new("control");
+        for name in ["a\nb.png", "a\0b.png"] {
+            let path = temp.path("new").join(name);
+            let errors = [
+                save(b"x", &path, SyncMode::File, false).unwrap_err(),
+                save_one(b"x", &path).unwrap_err(),
+                Recording::create(&path, None, false).err().unwrap(),
+            ];
+            for error in errors {
+                assert_eq!(reason(&error), ErrorKind::Usage, "{error:#}");
+            }
+            assert!(!temp.path("new").exists(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_disk_with_no_room_is_storage_full_with_its_free_space() {
+        let temp = Temp::new("no-room");
+        let mut recording = Recording::create(&temp.path("clip.mkv"), None, false).unwrap();
+        SPACE.set(Some(|_| {
+            Some(Space {
+                free: 4096,
+                total: 10 << 30,
+            })
+        }));
+        let path = temp.path("shot.png");
+        let error = failed(&path, io::ErrorKind::StorageFull.into());
+        assert_eq!(reason(&error), ErrorKind::StorageFull);
+        let details = crate::types::classify(&error).details.unwrap();
+        assert_eq!(details["path"], path.to_str().unwrap());
+        assert_eq!(details["free_bytes"], 4096);
+        // A recording whose disk refuses a write raises its alarm, as one
+        // below the floor does, where a device that is always full exists.
+        let Ok(device) = OpenOptions::new().write(true).open("/dev/full") else {
+            return;
+        };
+        recording.write_all(b"header").unwrap();
+        recording.file = Some(device);
+        let alarm = recording.alarm();
+        recording.write_all(b"video").unwrap_err();
+        assert_eq!(recording.cut(), Some(Cut::Failed));
+        let error = alarm.error().expect("no room");
+        assert_eq!(reason(&error), ErrorKind::StorageFull);
+        let details = crate::types::classify(&error).details.unwrap();
+        assert_eq!(details["free_bytes"], 4096);
     }
 
     #[test]

@@ -500,6 +500,9 @@ thread_local! {
     /// A stand-in FFmpeg for the current test thread.
     static FAKE_FFMPEG: std::cell::RefCell<Option<Arc<Executable>>> =
         const { std::cell::RefCell::new(None) };
+    /// What a test does once a push has looked for the recording's end.
+    static PUSH_RACE: std::cell::Cell<Option<fn(&WriterQueue)>> =
+        const { std::cell::Cell::new(None) };
 }
 pub(crate) fn executable() -> Result<Arc<Executable>> {
     #[cfg(test)]
@@ -4682,6 +4685,12 @@ impl Forwarder {
     /// Queue a frame for encoding; it is owned so its buffer moves to the
     /// writer thread without a copy.
     pub fn push(&mut self, frame: Frame) -> Result<bool> {
+        // The output thread notes why the file ended before it fails the
+        // queue, so a failure seen once the file has ended is that end.
+        self.queue_frame(frame)
+            .map_err(|error| self.storage_end().unwrap_or(error))
+    }
+    fn queue_frame(&mut self, frame: Frame) -> Result<bool> {
         if self.process.is_none() {
             self.spawn(
                 frame.width,
@@ -4708,12 +4717,16 @@ impl Forwarder {
             return Err(end);
         }
         let process = self.process.as_mut().unwrap();
+        #[cfg(test)]
+        if let Some(race) = PUSH_RACE.get() {
+            race(&process.queue);
+        }
         // An encoder that died at start leaves a broken pipe behind; falling
         // back to the next one comes first.
         if let Some(status) = process.child.try_wait()?
             && self.fall_back(status)?
         {
-            return self.push(frame);
+            return self.queue_frame(frame);
         }
         let process = self.process.as_mut().unwrap();
         let stored_error = process
@@ -5877,37 +5890,9 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
             ..stream(encoder, 30.0)
         }
     }
-    /// Run the calling test again in a child process with its own session
-    /// directory, so what it records never meets another test's files. True
-    /// in the child, which does the work.
-    #[cfg(unix)]
-    fn in_own_session(test: &str) -> bool {
-        if std::env::var_os("CAPTUREFAB_OWN_SESSION_TEST").is_some() {
-            return true;
-        }
-        let dir = temp_dir("session").join("session");
-        crate::ipc::ensure_private_dir(&dir).unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", &format!("media::tests::{test}"), "--nocapture"])
-            .env("CAPTUREFAB_SESSION_DIR", &dir)
-            .env("CAPTUREFAB_OWN_SESSION_TEST", "1")
-            .output()
-            .unwrap();
-        let _ = fs::remove_dir_all(dir.parent().unwrap());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(
-            output.status.success() && stdout.contains("1 passed"),
-            "{stdout}{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        false
-    }
     #[test]
     #[cfg(unix)]
     fn recordings_get_each_new_frame_once_on_the_wall_clock() {
-        if !in_own_session("recordings_get_each_new_frame_once_on_the_wall_clock") {
-            return;
-        }
         let fake = Fake::new(
             "unique",
             r#"echo "$*" >> "$dir/argv"
@@ -5968,9 +5953,6 @@ esac"#,
     #[test]
     #[cfg(unix)]
     fn a_recording_keeps_its_video_when_ffmpeg_must_be_stopped() {
-        if !in_own_session("a_recording_keeps_its_video_when_ffmpeg_must_be_stopped") {
-            return;
-        }
         let fake = Fake::new(
             "stuck",
             r#"case "$*" in
@@ -5990,6 +5972,37 @@ esac"#,
         );
         assert_eq!(forward.stats().recording.unwrap().bytes, 10_000);
         assert_eq!(fs::read(&output).unwrap().len(), 10_000);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_recording_that_fills_up_during_a_push_ends_at_its_maximum_size() {
+        let fake = Fake::new(
+            "full-during-push",
+            r#"case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) sleep 0.2; head -c 10000 /dev/zero; cat > /dev/null ;;
+esac"#,
+        );
+        let output = fake.dir.join("full.mkv");
+        let mut config = recording(&output, "libx264");
+        config.max_file_bytes = Some(5000);
+        let mut forward = Forwarder::new(config).unwrap();
+        // The file fills up after the push has looked for its end, and
+        // before the push hands the frame on.
+        PUSH_RACE.set(Some(|queue| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while queue.state.lock().unwrap().error.is_none() {
+                assert!(Instant::now() < deadline, "the file never filled up");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }));
+        let error = forward.push(tiny(8, 4)).unwrap_err();
+        PUSH_RACE.set(None);
+        assert!(error.is::<crate::storage::MaxSize>(), "{error:#}");
+        forward.stop().unwrap();
+        assert_eq!(forward.stats().recording.unwrap().bytes, 5000);
+        assert_eq!(fs::read(&output).unwrap().len(), 5000);
     }
     #[test]
     #[cfg(unix)]
@@ -6093,9 +6106,6 @@ esac"#
     #[test]
     #[cfg(unix)]
     fn an_encoder_that_exits_at_start_falls_back_once_to_a_new_file() {
-        if !in_own_session("an_encoder_that_exits_at_start_falls_back_once_to_a_new_file") {
-            return;
-        }
         let first = encoder_candidates("h264")[0];
         let fake = Fake::new(
             "fallback",
@@ -6142,11 +6152,6 @@ esac"#
     #[test]
     #[cfg(unix)]
     fn an_encoder_that_fails_after_writing_video_keeps_it_instead_of_falling_back() {
-        if !in_own_session(
-            "an_encoder_that_fails_after_writing_video_keeps_it_instead_of_falling_back",
-        ) {
-            return;
-        }
         let first = encoder_candidates("h264")[0];
         let fake = Fake::new(
             "late-failure",
