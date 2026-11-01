@@ -40,7 +40,6 @@ pub(crate) mod scrub;
 pub(crate) mod secret_input;
 pub(crate) mod session;
 pub(crate) mod setup;
-pub(crate) mod shared_memory;
 pub(crate) mod storage;
 #[cfg(test)]
 mod test_cameras;
@@ -85,9 +84,6 @@ pub mod testing {
     }
     pub mod session {
         pub use crate::session::{SessionCommand, SessionHandle};
-    }
-    pub mod shared_memory {
-        pub use crate::shared_memory::SharedRing;
     }
     pub mod storage {
         pub use crate::storage::{StoragePolicy, configure_policy, save_bytes};

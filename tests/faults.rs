@@ -368,3 +368,54 @@ fn a_panicking_worker_is_reported_with_its_last_words() {
     let camera = &home.ok(&["session", "status", "panic"])["cameras"][0];
     assert_eq!(camera["state"], "error", "{camera}");
 }
+
+/// The jobs of a session that died read as lost, with what they saved.
+#[cfg(unix)]
+#[test]
+fn a_dead_sessions_jobs_read_as_lost() {
+    let home = Home::new("fault-lost");
+    let started = home.ok(&["session", "start", "--name", "doomed", "-c", "sim:0"]);
+    let pid = started["pid"].as_i64().unwrap() as i32;
+    let job = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "--every",
+        "100ms",
+        "-n",
+        "1000",
+        "-o",
+        "lapse/",
+        "--background",
+    ]);
+    let id = job["job"]["id"].as_str().unwrap().to_owned();
+    // Saved counts reach the job book's file within a second.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while home.ok(&["jobs"])["jobs"][0]["saved"].as_u64().unwrap_or(0) < 3 {
+        assert!(Instant::now() < deadline, "no frames saved");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+    send(pid, libc::SIGKILL);
+    assert!(!support::cli::process_lives(pid));
+    let jobs = home.ok(&["jobs"]);
+    let lost = &jobs["jobs"][0];
+    assert_eq!(lost["id"], id.as_str(), "{jobs}");
+    assert_eq!(lost["state"], "lost", "{jobs}");
+    assert!(lost["saved"].as_u64().unwrap() >= 3, "{jobs}");
+    let waited = home.fails(1, &["jobs", "wait", &id]);
+    assert_eq!(waited["code"], "incomplete");
+    assert_eq!(waited["details"]["job"]["state"], "lost");
+    // A session of the same name goes on numbering after them.
+    home.ok(&["session", "start", "--name", "doomed", "-c", "sim:0"]);
+    let next = home.ok(&[
+        "--session",
+        "doomed",
+        "capture",
+        "-o",
+        "next/",
+        "--background",
+    ]);
+    assert_ne!(next["job"]["id"], id.as_str());
+    home.ok(&["session", "stop", "doomed"]);
+}

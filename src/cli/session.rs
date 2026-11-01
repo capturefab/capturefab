@@ -618,6 +618,9 @@ fn camera_state(camera: &Value) -> Value {
     if let Some(error) = camera["last_error"].as_str() {
         value["error"] = json!(crate::scrub::redact_urls(error));
     }
+    if let Some(config) = camera["config_state"].as_str() {
+        value["config_state"] = json!(config);
+    }
     value
 }
 
@@ -677,7 +680,7 @@ pub const STATUS_FIELDS: &[(&str, &str)] = &[
     ("uptime_s", "int"),
     (
         "cameras",
-        "[{id,state:idle|streaming|recording|error,error?,frames?,dropped?,jobs:[job]}] — job as jobs lists it; error: the camera's worker exited, and the next command on the camera starts another",
+        "[{id,state:idle|streaming|recording|error,error?,config_state?:unknown,frames?,dropped?,jobs:[job]}] — job as jobs lists it; error: the camera's worker exited, and the next command on the camera starts another; config_state unknown: it exited during a settings change, until settings are written again",
     ),
 ];
 pub const LIST_FIELDS: &[(&str, &str)] =

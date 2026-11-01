@@ -29,7 +29,6 @@ if-addrs = "0.13"
 socket2 = { version = "0.6", features = ["all"] }
 getrandom = "0.3"
 nusb = { version = "0.2.7", optional = true }
-memmap2 = "0.9"
 base64 = "0.22"
 sha1 = "0.10"
 md-5 = "0.10"
@@ -42,19 +41,20 @@ turbojpeg = { version = "1.5", optional = true, default-features = false, featur
 keyring = { version = "4.2", optional = true }
 zeroize = "1"
 
-# Share modes for the frame ring's backing file, and the inheritable pipe
-# a detached session reports ready on.
+# Inheritable pipes (a detached session's ready line, a worker's stdout
+# capture), the job objects that hold camera workers and what they start,
+# and a worker's private protocol handle.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # Ctrl-C, Ctrl-Break and a closed console where there are no Unix signals,
 # which go through libc.
 [target.'cfg(not(unix))'.dependencies]
 ctrlc = { version = "3.4", features = ["termination"] }
 
-# Host facts for doctor (sysctl, statfs, access), and anonymous shared memory
-# for frame rings (memfd_create, shm_open) with descriptor inheritance by
-# camera workers.
+# Host facts for doctor (sysctl, statfs, access), process groups and signals
+# for camera workers, and descriptor inheritance for a worker's stdout
+# capture.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

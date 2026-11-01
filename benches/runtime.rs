@@ -3,7 +3,6 @@ use capturefab::testing::jpeg;
 use capturefab::testing::{
     frame,
     session::{SessionCommand, SessionHandle},
-    shared_memory::SharedRing,
     storage::{self, StoragePolicy},
     types::{Frame, MONO8, RGB8},
 };
@@ -272,52 +271,6 @@ fn main() {
     }
     let data = vec![0x5a; 8 << 20];
     b.run("sha256/8MiB", data.len(), || Sha256::digest(&data));
-    let dir = temp("ring");
-    for (name, format) in [("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
-        let f = frame(1920, 1200, format);
-        let mut writer = SharedRing::create(&dir, 16 << 20).unwrap();
-        let mut reader = writer.reader().unwrap();
-        b.run(
-            &format!("ring/write+take/{name}/1920x1200"),
-            f.data.len(),
-            || {
-                writer.write(&f, false).unwrap();
-                reader.take_latest().unwrap().unwrap()
-            },
-        );
-    }
-    // The GUI's per-frame display pipeline, end to end on the parent side:
-    // old = fresh ring copy, cached-frame clone, RGB decode, RGBA expansion;
-    // new = ring copy into the reused cache, one direct RGBA decode.
-    for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
-        let f = frame(1920, 1200, format);
-        let mut writer = SharedRing::create(&dir, 16 << 20).unwrap();
-        let mut reader = writer.reader().unwrap();
-        b.run(
-            &format!("display-old/{name}/1920x1200"),
-            f.data.len(),
-            || {
-                writer.write(&f, false).unwrap();
-                let cached = reader.take_latest().unwrap().unwrap();
-                let rgb = frame::rgb(&cached.clone()).unwrap();
-                rgb.as_chunks::<3>()
-                    .0
-                    .iter()
-                    .map(|p| [p[0], p[1], p[2], 255])
-                    .collect::<Vec<_>>()
-            },
-        );
-        let mut cached = Frame::default();
-        b.run(
-            &format!("display-new/{name}/1920x1200"),
-            f.data.len(),
-            || {
-                writer.write(&f, false).unwrap();
-                reader.take_latest_into(&mut cached).unwrap();
-                frame::convert(&cached, |[r, g, b]| [r, g, b, 255]).unwrap()
-            },
-        );
-    }
     let session = temp("session");
     unsafe { std::env::set_var("CAPTUREFAB_SESSION_DIR", &session) };
     let output = temp("output");
@@ -411,7 +364,7 @@ fn main() {
         b.run("session/snapshot/8-sim-cameras", 0, || h.snapshot());
         h.shutdown();
     }
-    for path in [dir, session, output] {
+    for path in [session, output] {
         let _ = std::fs::remove_dir_all(path);
     }
 }

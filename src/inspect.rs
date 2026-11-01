@@ -1,4 +1,4 @@
-//! One frame made readable without the shared ring: a digital crop that
+//! One frame made readable: a digital crop that
 //! keeps the colour filter phase, exposure, auto-meter and focus
 //! measurements, and a bounded JPEG or PNG preview. The session's `frame`
 //! command answers with these for agents, scripts and remote clients.

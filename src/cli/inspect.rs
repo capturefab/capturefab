@@ -1,7 +1,8 @@
 //! `capturefab inspect`: measure a fresh frame without saving a capture.
-//! The session coordinator takes the frame and measures it, off the camera
-//! thread; this turns the measurements into a short document with a
-//! verdict, a suggested exposure and a preview image in a private folder.
+//! The camera's worker takes the frame, measures it off its camera thread
+//! and writes the preview, by default to a private folder; this turns the
+//! measurements into a short document with a verdict and a suggested
+//! exposure.
 use super::{Client, Global, args::CamerasArg, args::KeepArg, output::Report};
 use crate::{
     controls::Assignment,
@@ -9,17 +10,10 @@ use crate::{
     session::SessionCommand,
     types::{Categorized, ErrorKind, Usage},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use clap::Args;
 use serde_json::{Value, json};
-use std::{
-    fmt::Write as _,
-    fs::{self, OpenOptions},
-    io::{self, Write as _},
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fmt::Write as _, path::PathBuf, time::Duration};
 
 #[derive(Debug, Args)]
 pub struct InspectArgs {
@@ -57,10 +51,6 @@ fn parse_region(text: &str) -> std::result::Result<[f64; 4], String> {
     Ok(region)
 }
 
-/// The most previews the private folder keeps, and their total size.
-const MAX_IMAGES: usize = 64;
-const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
-static NEXT_IMAGE: AtomicU64 = AtomicU64::new(1);
 /// How long the frame may take to arrive.
 const WAIT: Duration = Duration::from_secs(5);
 /// Brightness auto exposure aims for, as `auto` does.
@@ -68,12 +58,6 @@ const TARGET: f64 = 0.45;
 /// The clipped share past which a frame says too little to suggest an
 /// exact exposure.
 const SATURATED: f64 = 0.25;
-
-/// Where previews go unless --preview says otherwise: private, bounded,
-/// and shown by doctor, so a person can allow reading it once.
-pub(crate) fn preview_dir() -> PathBuf {
-    crate::ipc::runtime_dir().join("inspect")
-}
 
 pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
     let settings = args
@@ -198,14 +182,16 @@ fn inspect(
             },
             format,
             region: args.region,
+            preview: match preview {
+                Preview::File(path) => Some(path.to_string_lossy().into_owned()),
+                _ => None,
+            },
         })
         .map_err(trigger_hint)?;
     let mut value = document(&info, &reply, verbose);
-    if let Some(image) = reply.get("image").filter(|image| image.is_object()) {
-        let path = deliver(image, preview, &info)?;
-        if let Some(path) = path {
-            value["preview"] = json!(path);
-        }
+    // The camera's worker wrote the preview where it was asked to go.
+    if let Some(path) = reply["image"]["path"].as_str() {
+        value["preview"] = json!(path);
     }
     Ok(value)
 }
@@ -373,129 +359,6 @@ fn suggest(info: &Value, reply: &Value) -> Option<Value> {
     Some(value)
 }
 
-/// Write the preview where it was asked to go: its path.
-fn deliver(image: &Value, preview: &Preview, info: &Value) -> Result<Option<PathBuf>> {
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(image["base64"].as_str().context("preview without data")?)
-        .context("preview data")?;
-    let extension = if image["mime"] == "image/jpeg" {
-        "jpg"
-    } else {
-        "png"
-    };
-    Ok(match preview {
-        Preview::None => None,
-        Preview::Private => Some(private_image(
-            &preview_dir(),
-            &safe_label(info["camera"].as_str().unwrap_or("camera")),
-            &bytes,
-            extension,
-        )?),
-        Preview::File(path) => {
-            crate::storage::save_bytes(&bytes, path, &super::capture::storage_policy())?;
-            Some(path.clone())
-        }
-    })
-}
-
-/// A file name part made of a camera ID: credentials redacted first, then
-/// anything but letters, digits, - and _ replaced.
-fn safe_label(value: &str) -> String {
-    // Redact before replacing punctuation: otherwise a URL password loses
-    // its URL shape and would survive into the name.
-    let value = crate::scrub::redact_urls(&crate::media::redact_url(value));
-    let label: String = value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
-                c
-            } else {
-                '-'
-            }
-        })
-        .take(64)
-        .collect();
-    if label.is_empty() {
-        "camera".into()
-    } else {
-        label
-    }
-}
-
-/// Write `bytes` as a new private file in `dir` (0700, files 0600, never a
-/// symlinked folder), then keep only the newest `MAX_IMAGES` files and
-/// `MAX_IMAGE_BYTES` there.
-fn private_image(dir: &Path, label: &str, bytes: &[u8], extension: &str) -> Result<PathBuf> {
-    crate::ipc::ensure_private_dir(dir)?;
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    for _ in 0..100 {
-        let seq = NEXT_IMAGE.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "{label}-{stamp}-{}-{seq}.{extension}",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(bytes) {
-                    let _ = fs::remove_file(&path);
-                    return Err(error.into());
-                }
-                drop(file);
-                prune_images(dir, Some(&path))?;
-                return Ok(path);
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Err(anyhow!("no free preview name in {}", dir.display()))
-}
-
-/// Remove all but the newest previews, never `keep`.
-fn prune_images(dir: &Path, keep: Option<&Path>) -> Result<()> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        let meta = fs::symlink_metadata(entry.path())?;
-        if meta.is_file() && !meta.file_type().is_symlink() {
-            files.push((
-                entry.path(),
-                meta.modified().unwrap_or(UNIX_EPOCH),
-                meta.len(),
-            ));
-        }
-    }
-    files.sort_by(|a, b| {
-        (keep == Some(b.0.as_path()))
-            .cmp(&(keep == Some(a.0.as_path())))
-            .then_with(|| b.1.cmp(&a.1))
-            .then_with(|| b.0.cmp(&a.0))
-    });
-    let mut bytes = 0u64;
-    for (index, (path, _, size)) in files.into_iter().enumerate() {
-        bytes = bytes.saturating_add(size);
-        if index >= MAX_IMAGES || bytes > MAX_IMAGE_BYTES {
-            match fs::remove_file(path) {
-                Ok(()) => (),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-                Err(error) => return Err(error.into()),
-            }
-        }
-    }
-    Ok(())
-}
-
 fn text(value: &Value) -> String {
     if let Some(error) = value.get("error") {
         return format!(
@@ -595,74 +458,6 @@ pub const FIELDS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn private_images_are_bounded_private_and_never_follow_symlinks() {
-        let root = std::env::temp_dir().join(format!(
-            "capturefab-inspect-images-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        for index in 0..MAX_IMAGES + 3 {
-            private_image(&root, &format!("camera-{index}"), b"jpeg", "jpg").unwrap();
-        }
-        assert_eq!(fs::read_dir(&root).unwrap().count(), MAX_IMAGES);
-        // Sparse files exercise the byte limit without consuming 80 MiB
-        // on the shared build disk.
-        for index in 0..2 {
-            let path = private_image(&root, &format!("large-{index}"), b"jpeg", "jpg").unwrap();
-            OpenOptions::new()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_len(40 * 1024 * 1024)
-                .unwrap();
-        }
-        prune_images(&root, None).unwrap();
-        let size: u64 = fs::read_dir(&root)
-            .unwrap()
-            .map(|entry| entry.unwrap().metadata().unwrap().len())
-            .sum();
-        assert!(size <= MAX_IMAGE_BYTES);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{PermissionsExt, symlink};
-            assert_eq!(
-                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-            for file in fs::read_dir(&root).unwrap() {
-                assert_eq!(
-                    file.unwrap().metadata().unwrap().permissions().mode() & 0o777,
-                    0o600
-                );
-            }
-            let link = root.with_extension("link");
-            symlink(&root, &link).unwrap();
-            assert!(private_image(&link, "camera", b"jpeg", "jpg").is_err());
-            fs::remove_file(link).unwrap();
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn preview_names_carry_no_credentials() {
-        for camera in [
-            "rtsp://alice:private-password@host/path",
-            "rtsp://host/path?password=private-password",
-        ] {
-            let label = safe_label(camera);
-            assert!(!label.contains("private-password"), "{label}");
-            assert!(
-                !label.contains("alice") || camera.contains("alice"),
-                "{label}"
-            );
-        }
-        assert_eq!(safe_label(""), "camera");
-    }
 
     #[test]
     fn suggestions_aim_for_mid_grey_within_the_exposure_range() {

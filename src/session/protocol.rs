@@ -27,10 +27,6 @@ pub(crate) const MAX_REQUEST: usize = 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WorkerCommand {
-    /// Acquire one frame without saving it, for an inspection.
-    Grab {
-        timeout_ms: u64,
-    },
     /// Apply this camera's share of the GigE bandwidth a network scan planned.
     OptimizeNetwork {
         bytes_per_second: u64,
@@ -73,7 +69,6 @@ impl WorkerCommand {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         use anyhow::ensure;
         match self {
-            Self::Grab { timeout_ms } => super::validate_timeout(*timeout_ms),
             Self::OptimizeNetwork { bytes_per_second } => {
                 ensure!(
                     (1..=125_000_000_000).contains(bytes_per_second),
@@ -98,12 +93,28 @@ impl WorkerCommand {
             Self::Session(command) => command.validate(),
         }
     }
+    /// Whether it writes camera settings: a worker ended while it ran may
+    /// leave the camera half-configured.
+    pub(crate) fn changes_settings(&self) -> bool {
+        match self {
+            Self::Set { .. } | Self::SetMany { .. } | Self::Execute { .. } => true,
+            Self::Session(command) => matches!(
+                command,
+                SessionCommand::SetValues { dry_run: false, .. }
+                    | SessionCommand::ApplySetup { .. }
+                    | SessionCommand::Exec { .. }
+                    | SessionCommand::WriteMemory { .. }
+                    | SessionCommand::Auto { .. }
+                    | SessionCommand::Manual { .. }
+            ),
+            _ => false,
+        }
+    }
     /// How long the camera thread may take on this command once it starts,
     /// before its worker counts as hung: the frame waits and work it may
     /// do. The coordinator never ends a worker sooner than 10 s.
     pub(crate) fn budget_ms(&self) -> u64 {
         match self {
-            Self::Grab { timeout_ms } => timeout_ms.saturating_add(5_000),
             Self::Session(command) => match command {
                 SessionCommand::Capture {
                     count, timeout_ms, ..
@@ -243,10 +254,10 @@ mod tests {
             serde_json::from_str::<Input>(&line).unwrap()
         };
         assert!(matches!(
-            run(WorkerCommand::Grab { timeout_ms: 5 }),
+            run(WorkerCommand::Features),
             Input::Run {
                 id: 3,
-                command: WorkerCommand::Grab { timeout_ms: 5 }
+                command: WorkerCommand::Features
             }
         ));
         assert!(matches!(
@@ -263,8 +274,27 @@ mod tests {
             json!({"op": "shutdown"})
         );
         // An internal operation never parses as a public command.
-        assert!(SessionCommand::from_json_slice(br#"{"op":"grab","timeout_ms":5}"#).is_err());
+        assert!(SessionCommand::from_json_slice(br#"{"op":"features"}"#).is_err());
         assert!(serde_json::from_str::<Input>(r#"{"op":"run","id":1}"#).is_err());
+    }
+
+    #[test]
+    fn settings_changes_are_known_by_what_they_write() {
+        let set = |dry_run| SessionCommand::SetValues {
+            values: vec![crate::controls::Assignment::parse("Width=320").unwrap()],
+            dry_run,
+        };
+        assert!(WorkerCommand::from(set(false)).changes_settings());
+        assert!(!WorkerCommand::from(set(true)).changes_settings());
+        assert!(!WorkerCommand::from(SessionCommand::Info).changes_settings());
+        assert!(!WorkerCommand::Features.changes_settings());
+        assert!(
+            WorkerCommand::Set {
+                feature: "Width".into(),
+                value: "320".into()
+            }
+            .changes_settings()
+        );
     }
 
     #[test]

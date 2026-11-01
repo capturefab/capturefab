@@ -236,8 +236,8 @@ pub struct Server {
 }
 
 /// Session descriptors and their locks, and files that matter only while
-/// the processes using them run, such as frame rings where anonymous shared
-/// memory is unavailable.
+/// the processes using them run: camera locks, inspection previews and
+/// images captured to stdout through a session.
 /// CAPTUREFAB_SESSION_DIR overrides it together with the state directory.
 pub fn runtime_dir() -> PathBuf {
     if let Some(dir) = var("CAPTUREFAB_SESSION_DIR") {
@@ -804,8 +804,8 @@ fn serve_client(
         };
         command.validate()?;
         ensure!(
-            !matches!(&command,SessionCommand::Capture{output,..} if output=="-"),
-            "remote captures require an output file"
+            !matches!(&command, SessionCommand::Capture { output, stdout: None, .. } if output == "-"),
+            "a capture to stdout through a session needs a stdout file"
         );
         // Looking at a session, or waiting for its jobs, is not using it.
         let use_ = !matches!(
@@ -1176,8 +1176,8 @@ pub fn call_keeping(
 ) -> Result<Value> {
     command.validate()?;
     ensure!(
-        !matches!(&command, SessionCommand::Capture { output, .. } if output == "-"),
-        "remote captures require an output file"
+        !matches!(&command, SessionCommand::Capture { output, stdout: None, .. } if output == "-"),
+        "a capture to stdout through a session needs a stdout file"
     );
     if let Some(camera) = camera {
         crate::session::validate_selector(camera)?;

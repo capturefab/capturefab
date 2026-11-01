@@ -26,29 +26,35 @@ const WATCHDOG: Duration = Duration::from_secs(10);
 struct Arguments {
     verbose: bool,
     session: String,
-    ring: std::ffi::OsString,
+    /// The inherited pipe an image captured to stdout goes to.
+    output: Option<u64>,
 }
 fn arguments(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<Arguments> {
-    let mut verbose = false;
-    let mut session = String::from("direct");
-    let mut ring = None;
+    let mut arguments = Arguments {
+        verbose: false,
+        session: String::from(crate::session::DIRECT),
+        output: None,
+    };
     while let Some(arg) = args.next() {
+        let mut value = |name: &str| {
+            args.next()
+                .and_then(|value| value.into_string().ok())
+                .with_context(|| format!("{name} needs a value"))
+        };
         match arg.to_str() {
-            Some("--verbose") => verbose = true,
-            Some("--session") => {
-                session = args
-                    .next()
-                    .and_then(|name| name.into_string().ok())
-                    .context("--session needs a name")?;
+            Some("--verbose") => arguments.verbose = true,
+            Some("--session") => arguments.session = value("--session")?,
+            Some("--output-fd") => {
+                arguments.output = Some(
+                    value("--output-fd")?
+                        .parse()
+                        .context("--output-fd is not a descriptor")?,
+                );
             }
-            _ => ring = Some(arg),
+            _ => anyhow::bail!("unknown worker argument {}", arg.to_string_lossy()),
         }
     }
-    Ok(Arguments {
-        verbose,
-        session,
-        ring: ring.context("missing shared ring")?,
-    })
+    Ok(arguments)
 }
 
 #[derive(Serialize)]
@@ -97,10 +103,8 @@ pub fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> 
         protocol: PROTOCOL,
         build: env!("CARGO_PKG_VERSION").into(),
     });
-    let ring = std::sync::Arc::new(std::sync::Mutex::new(
-        crate::shared_memory::SharedRing::open(&args.ring)?,
-    ));
-    let handle = WorkerHandle::serving(ring, events.clone(), args.session);
+    let output = args.output.map(platform::inherited).transpose()?;
+    let handle = WorkerHandle::serving(events.clone(), args.session, output);
     let stopping = Arc::new(AtomicBool::new(false));
     {
         // The camera thread ends only when told to; if it ends otherwise
@@ -283,8 +287,20 @@ fn write_lines(mut output: std::fs::File, events: &Events) {
 
 #[cfg(unix)]
 mod platform {
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use std::os::fd::FromRawFd;
+
+    /// The pipe the coordinator passed as descriptor `fd`.
+    pub(super) fn inherited(fd: u64) -> Result<std::fs::File> {
+        let fd = i32::try_from(fd).context("--output-fd is not a descriptor")?;
+        // SAFETY: the coordinator passed this descriptor for this process
+        // alone to write one image to and close; it is set close-on-exec so
+        // FFmpeg never holds it.
+        unsafe {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+            Ok(std::fs::File::from_raw_fd(fd))
+        }
+    }
 
     /// Keep the original stdout for the protocol alone, and point fd 1 at
     /// stderr: a stray print, or a child that inherits stdout, cannot
@@ -310,6 +326,13 @@ mod platform {
 mod platform {
     use anyhow::Result;
     use std::os::windows::io::FromRawHandle;
+
+    /// The pipe the coordinator passed as handle `handle`.
+    pub(super) fn inherited(handle: u64) -> Result<std::fs::File> {
+        // SAFETY: the coordinator made this pipe handle inheritable for this
+        // process alone to write one image to and close.
+        Ok(unsafe { std::fs::File::from_raw_handle(handle as usize as _) })
+    }
     use windows_sys::Win32::{
         Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE},
         System::{
@@ -354,16 +377,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn worker_arguments_name_the_session_and_ring_last() {
+    fn worker_arguments_name_the_session_and_output() {
         let parse = |args: &[&str]| arguments(args.iter().map(std::ffi::OsString::from));
-        let parsed = parse(&["--verbose", "--session", "bench", "fd:5"]).unwrap();
+        let parsed = parse(&["--verbose", "--session", "bench", "--output-fd", "5"]).unwrap();
         assert!(parsed.verbose);
         assert_eq!(parsed.session, "bench");
-        assert_eq!(parsed.ring, "fd:5");
-        let plain = parse(&["fd:5"]).unwrap();
+        assert_eq!(parsed.output, Some(5));
+        let plain = parse(&[]).unwrap();
         assert!(!plain.verbose);
         assert_eq!(plain.session, "direct");
+        assert_eq!(plain.output, None);
         assert!(parse(&["--session"]).is_err());
-        assert!(parse(&[]).is_err());
+        assert!(parse(&["--output-fd", "x"]).is_err());
+        assert!(parse(&["fd:5"]).is_err());
     }
 }

@@ -410,6 +410,9 @@ pub(crate) struct Route {
     /// How long opening the camera may take, when longer than usual:
     /// capture's and record's `--timeout`, for slow streams.
     pub connect: Option<Duration>,
+    /// `capture -o -`: a worker of this command writes the image to a pipe
+    /// this command reads.
+    pub stdout: bool,
 }
 impl Route {
     pub fn keep(keep: Option<Duration>) -> Self {
@@ -451,6 +454,8 @@ pub(crate) struct Client {
     local: Option<SessionHandle>,
     /// `--keep`: sent with each request that uses the session.
     keep: Option<Duration>,
+    /// The pipe this command's worker writes an image captured to stdout to.
+    stdout: Option<std::io::PipeReader>,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -536,12 +541,14 @@ impl Client {
         };
         crate::camera::validate_selector(&selector)?;
         let local = SessionHandle::direct(out.verbose);
+        let stdout = route.stdout.then(|| local.stdout_pipe()).transpose()?;
         let client = Self {
             out,
             session: None,
             target: None,
             local: Some(local.clone()),
             keep: None,
+            stdout,
         };
         client.call(SessionCommand::connect(selector, route.connect()))?;
         Ok(client)
@@ -576,6 +583,7 @@ impl Client {
             target: selector.clone(),
             local: None,
             keep,
+            stdout: None,
         };
         let (target, first) = match (&selector, held) {
             (Some(selector), false) => (
@@ -667,6 +675,11 @@ impl Client {
     /// The worker of this command, without a session.
     pub fn local(&self) -> Option<&SessionHandle> {
         self.local.as_ref()
+    }
+    /// The pipe this command's worker writes an image captured to stdout
+    /// to, once.
+    pub fn take_stdout(&mut self) -> Option<std::io::PipeReader> {
+        self.stdout.take()
     }
 }
 

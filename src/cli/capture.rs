@@ -311,7 +311,7 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
         Route {
             keep: args.keep.route().keep,
             background: args.background,
-            connect: None,
+            ..Route::default()
         }
     }
     .waiting(args.timeout);
@@ -656,8 +656,11 @@ fn dry_run(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
     Ok(crate::types::without_nulls(value))
 }
 
-/// One frame to stdout, from a worker of this command: the encoded image,
-/// with the result on stderr in JSON mode.
+/// One frame to stdout: the encoded image, with the result on stderr in
+/// JSON mode. A worker of this command writes it to a pipe this copies; a
+/// session that holds the camera, or a typed --session, writes it to a
+/// private file this streams and deletes. A closed stdout (`| head`) ends
+/// the command quietly.
 fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     use std::io::IsTerminal;
     if args.cameras.cameras.len() > 1
@@ -673,41 +676,31 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         )
         .into());
     }
-    if global.session.is_some() && !global.session_from_env {
-        return Err(Usage(
-            "-o - takes the frame in a worker of this command; drop --session, or give a file"
-                .into(),
-        )
-        .into());
-    }
     if std::io::stdout().is_terminal() {
         return Err(Usage(
             "refusing to write an image to the terminal; redirect it (capture -o - > frame.png) or give a file with -o".into(),
         )
         .into());
     }
-    // The frame comes from this process's own worker, whatever session
-    // CAPTUREFAB_SESSION names.
-    let direct = Global {
-        session: None,
-        no_session: true,
+    // CAPTUREFAB_SESSION and CAPTUREFAB_KEEP never take the camera into a
+    // session for this; a session that holds it already is used.
+    let routed = Global {
+        session: global.session.clone().filter(|_| !global.session_from_env),
         session_from_env: false,
         ..global.clone()
     };
-    let client = Client::open_with(
-        &direct,
+    let mut client = Client::open_with(
+        &routed,
         args.cameras.cameras.first().map(String::as_str),
-        Route::default().waiting(args.timeout),
+        Route {
+            stdout: true,
+            ..Route::default()
+        }
+        .waiting(args.timeout),
     )?;
-    let local = client
-        .local()
-        .context("stdout capture needs a worker")?
-        .clone();
-    let interrupt = local.clone();
     signals::take_over();
-    signals::on_signal(move || interrupt.interrupt());
     prepare(&client, args, plan)?;
-    let reply = client.call(SessionCommand::Capture {
+    let request = |stdout: Option<String>| SessionCommand::Capture {
         output: "-".into(),
         count: 1,
         timeout_ms: plan.timeout_ms,
@@ -716,23 +709,82 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         on_exists: Default::default(),
         context: plan.context.clone(),
         utc_offset_s: Some(crate::naming::local_offset()),
-    })?;
-    let frame = local.captured_frame()?;
+        quality: args.quality,
+        stdout,
+    };
+    let copied = if client.session().is_some() {
+        let file = stdout_file()?;
+        let reply = client.call(request(Some(file.to_string_lossy().into_owned())));
+        let copied = reply.as_ref().ok().map(|_| {
+            std::fs::File::open(&file)
+                .and_then(|mut image| std::io::copy(&mut image, &mut std::io::stdout().lock()))
+        });
+        let _ = std::fs::remove_file(&file);
+        (reply?, copied)
+    } else {
+        let mut pipe = client
+            .take_stdout()
+            .context("stdout capture needs a worker of this command")?;
+        let local = client
+            .local()
+            .context("stdout capture needs a worker of this command")?
+            .clone();
+        signals::on_signal(move || local.interrupt());
+        // Copied as the worker writes, so an image larger than the pipe
+        // never waits on this command. A reader that goes away is noted
+        // before the pipe closes, so the worker's failed write after it is
+        // known for what it is.
+        let closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let copier = {
+            let closed = closed.clone();
+            std::thread::Builder::new()
+                .name("capturefab-stdout".into())
+                .spawn(move || {
+                    let copied = std::io::copy(&mut pipe, &mut std::io::stdout().lock());
+                    if copied
+                        .as_ref()
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe)
+                    {
+                        closed.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    copied
+                })
+                .context("start the stdout copier")?
+        };
+        let reply = match client.call(request(None)) {
+            Ok(reply) => reply,
+            Err(_) if closed.load(std::sync::atomic::Ordering::Acquire) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let copied = copier
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("the stdout copier stopped")));
+        (reply, Some(copied))
+    };
+    let (reply, copied) = copied;
+    match copied {
+        Some(Ok(_)) => {}
+        Some(Err(error)) if error.kind() == std::io::ErrorKind::BrokenPipe => {
+            // The reader went away, as `| head` does: nothing to report.
+            if let Some(local) = client.local() {
+                local.interrupt();
+            }
+            return Ok(());
+        }
+        Some(Err(error)) => return Err(error).context("write the image to stdout"),
+        None => {}
+    }
+    let _ = std::io::stdout().flush();
     let meta = &reply["frame"];
-    let image = crate::engine::encode_still(&frame, plan.format, args.quality, None)?;
     let camera = client.status()?;
-    let mut stdout = std::io::stdout().lock();
-    stdout.write_all(&image)?;
-    stdout.flush()?;
-    drop(stdout);
     let value = crate::types::without_nulls(json!({
         "camera": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
         "output": "-",
-        "bytes": image.len(),
+        "bytes": meta["file_bytes"],
         "count": 1,
-        "width": frame.width,
-        "height": frame.height,
-        "pixel_format": crate::inspect::pixel_format_label(frame.pixel_format),
+        "width": meta["width"],
+        "height": meta["height"],
+        "pixel_format": meta["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
         "settings": settings(&meta["settings"]),
         "time": meta["wall_ms"].as_u64().map(jobs_time),
     }));
@@ -741,6 +793,26 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         let _ = super::output::write_json(&super::output::document(value));
     }
     Ok(())
+}
+
+/// A new private file for an image a session captures to stdout, in the
+/// runtime folder's `out`, or the system's temporary folder when that is
+/// unusable. Files left there by commands that died are swept first.
+fn stdout_file() -> Result<std::path::PathBuf> {
+    let dir = crate::session::stdout_dir();
+    let dir = if crate::ipc::ensure_private_dir(&dir).is_ok() {
+        crate::session::sweep_stdout_files(&dir);
+        dir
+    } else {
+        std::env::temp_dir()
+    };
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).map_err(|error| anyhow::anyhow!("random file name: {error}"))?;
+    let suffix = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(dir.join(format!("{}-{suffix}", std::process::id())))
 }
 
 fn text(value: &Value) -> String {

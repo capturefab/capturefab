@@ -209,7 +209,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         Route {
             keep: args.keep.route().keep,
             background: args.background,
-            connect: None,
+            ..Route::default()
         }
         .waiting(args.timeout),
     )?;

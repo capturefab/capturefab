@@ -350,8 +350,7 @@ fn checks(facts: &Facts) -> Vec<Check> {
 /// Without XDG_RUNTIME_DIR, Capturefab uses the login's runtime directory
 /// for a lingering user, so a service and an SSH shell find the same
 /// sessions. Otherwise logind removes it at logout, taking a service's
-/// session with it, so Capturefab falls back to disk. Frame rings are
-/// anonymous memory either way.
+/// session with it, so Capturefab falls back to disk.
 fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place) -> Check {
     let dir = login.display();
     let runtime = runtime.path.display();

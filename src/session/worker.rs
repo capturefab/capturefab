@@ -50,6 +50,8 @@ enum Waiter {
         sender: mpsc::Sender<Result<Value>>,
         /// When the camera thread took the request, and its budget.
         started: Option<(Instant, Duration)>,
+        /// It writes camera settings.
+        changes: bool,
     },
     Ping,
 }
@@ -70,13 +72,14 @@ pub(super) struct Shared {
     hung: AtomicBool,
     /// It was told to exit.
     closing: AtomicBool,
+    /// It ended in the middle of a settings change.
+    interrupted_change: AtomicBool,
     exit: Mutex<Option<Value>>,
     exited: Condvar,
     tail: Mutex<VecDeque<String>>,
     /// The ID of the camera it serves, once connected.
     pub(super) label: Mutex<String>,
     tree: tree::Tree,
-    pub(super) feed: Arc<super::Feed>,
 }
 
 /// A worker process. Dropping it ends the process.
@@ -131,28 +134,26 @@ pub(super) fn command(executable: std::path::PathBuf, options: &Options) -> Comm
 }
 
 impl Worker {
-    /// Start a worker and wait for it to say hello.
-    pub(super) fn spawn(options: &Options, sink: Sink) -> Result<Self> {
-        let capacity = super::frame_capacity()?;
-        let dir = crate::ipc::runtime_dir();
-        crate::ipc::ensure_private_dir(&dir)?;
-        // Ring files are left behind only when a process dies; clear them
-        // before this coordinator's first camera.
-        static SWEEP: std::sync::Once = std::sync::Once::new();
-        SWEEP.call_once(|| crate::shared_memory::sweep(&dir));
-        let ring = crate::shared_memory::SharedRing::create(&dir, capacity)?;
-        let mut command = command(executable()?, options);
-        ring.pass_to(&mut command);
-        let child = command.spawn().context("launch camera capture process")?;
-        Self::attach(child, ring, sink)
-    }
-    /// Take over a worker process started with `ring`.
-    pub(super) fn attach(
-        mut child: Child,
-        mut ring: crate::shared_memory::SharedRing,
+    /// Start a worker and wait for it to say hello. With `output`, the
+    /// worker inherits that pipe's write end, which an image captured to
+    /// stdout goes to.
+    pub(super) fn spawn(
+        options: &Options,
+        output: Option<std::io::PipeWriter>,
         sink: Sink,
     ) -> Result<Self> {
-        ring.passed();
+        let mut command = command(executable()?, options);
+        if let Some(output) = &output {
+            tree::pass(&mut command, output)?;
+        }
+        let child = command.spawn().context("launch camera capture process")?;
+        // Only the worker holds the write end now, so the reader sees the
+        // end of the image when the worker closes it, or exits.
+        drop(output);
+        Self::attach(child, sink)
+    }
+    /// Take over a worker process.
+    pub(super) fn attach(mut child: Child, sink: Sink) -> Result<Self> {
         let tree = tree::Tree::adopt(&child);
         let input = child.stdin.take().context("worker stdin")?;
         let output = child.stdout.take().context("worker stdout")?;
@@ -168,12 +169,12 @@ impl Worker {
             ping: AtomicBool::new(false),
             hung: AtomicBool::new(false),
             closing: AtomicBool::new(false),
+            interrupted_change: AtomicBool::new(false),
             exit: Mutex::new(None),
             exited: Condvar::new(),
             tail: Mutex::default(),
             label: Mutex::new(String::new()),
             tree,
-            feed: Arc::new(super::Feed::new(ring)),
         });
         let worker = Self(shared.clone());
         {
@@ -233,6 +234,7 @@ impl Worker {
             Waiter::Reply {
                 sender,
                 started: None,
+                changes: command.changes_settings(),
             },
         );
         if let Err(error) = self.0.send(&Input::Run { id, command }) {
@@ -286,6 +288,7 @@ impl Worker {
             Waiter::Reply {
                 sender,
                 started: None,
+                changes: false,
             },
         );
         self.0.send(&Input::Status { id })?;
@@ -391,6 +394,11 @@ impl Drop for Worker {
 }
 
 impl Shared {
+    /// Whether it ended in the middle of a settings change, which may have
+    /// left the camera half-configured.
+    pub(super) fn interrupted_change(&self) -> bool {
+        self.interrupted_change.load(Ordering::Acquire)
+    }
     fn send(&self, input: &Input) -> Result<()> {
         let mut line = serde_json::to_vec(input)?;
         line.push(b'\n');
@@ -536,6 +544,18 @@ impl Shared {
         *locked(&self.exit) = Some(wire.clone());
         self.exited.notify_all();
         let calls = std::mem::take(&mut *locked(&self.calls));
+        if calls.values().any(|waiter| {
+            matches!(
+                waiter,
+                Waiter::Reply {
+                    started: Some(_),
+                    changes: true,
+                    ..
+                }
+            )
+        }) {
+            self.interrupted_change.store(true, Ordering::Release);
+        }
         for waiter in calls.into_values() {
             if let Waiter::Reply { sender, .. } = waiter {
                 let _ = sender.send(Err(protocol::from_wire(&wire)));
@@ -671,6 +691,28 @@ fn read_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<Option<Op
 
 #[cfg(unix)]
 mod tree {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+
+    /// Let the worker `command` starts inherit `output`, and name it.
+    pub(super) fn pass(
+        command: &mut std::process::Command,
+        output: &std::io::PipeWriter,
+    ) -> anyhow::Result<()> {
+        let fd = output.as_raw_fd();
+        command.args(["--output-fd", &fd.to_string()]);
+        // SAFETY: fcntl is async-signal-safe, as pre_exec requires; the
+        // descriptor is this process's own pipe, which outlives the spawn.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
+
     /// A worker's process group, which it leads.
     pub(super) struct Tree;
     impl Tree {
@@ -691,15 +733,32 @@ mod tree {
 
 #[cfg(windows)]
 mod tree {
+    use anyhow::Context;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, HANDLE},
+        Foundation::{CloseHandle, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation},
         System::JobObjects::{
             AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject, TerminateJobObject,
         },
     };
+
+    /// Let the worker `command` starts inherit `output`, and name it.
+    pub(super) fn pass(
+        command: &mut std::process::Command,
+        output: &std::io::PipeWriter,
+    ) -> anyhow::Result<()> {
+        let handle = output.as_raw_handle();
+        // SAFETY: the handle is this process's own pipe end.
+        if unsafe { SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+            == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("stdout capture pipe");
+        }
+        command.args(["--output-fd", &(handle as usize).to_string()]);
+        Ok(())
+    }
 
     /// A job object holding a worker and every process it starts, which are
     /// ended when it closes.
