@@ -1121,7 +1121,8 @@ fn parse_leader(bytes: &[u8]) -> Result<Frame> {
         width,
         height,
         pixel_format: le32(bytes, 28)?,
-        timestamp_ns: le64(bytes, 20)?,
+        device_ts_ns: Some(le64(bytes, 20)?),
+        wall_ms: 0,
         data: Vec::new(),
     })
 }

@@ -169,7 +169,7 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<SavedShot> {
     );
     let listed = save.manifest.as_ref().map(|manifest| {
         let settings = Value::Object(shot.acquisition.settings.clone());
-        manifest.append(&file.manifest_line(&save.source.id, &settings, save.source.device_clock))
+        manifest.append(&file.manifest_line(&save.source.id, &settings))
     });
     // The file is saved either way: it is reported before a manifest
     // failure ends its job.

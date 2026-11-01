@@ -1467,7 +1467,8 @@ mod tests {
         assert_eq!(details["failures"][0]["feature"], "Width", "{details}");
         let restored = details["rollback"]["restored"].as_array().unwrap();
         assert!(
-            restored.contains(&json!("Gain")) && restored.contains(&json!("ExposureTime")),
+            restored.contains(&json!("Gain[GainSelector=AnalogAll]"))
+                && restored.contains(&json!("ExposureTime")),
             "{details}"
         );
         assert_eq!(get(&h, "Gain").as_f64(), Some(5.0));

@@ -1235,12 +1235,14 @@ fn still_meta(
     let mut meta = json!({
         "capturefab": env!("CARGO_PKG_VERSION"),
         "frame_id": frame.id,
-        "timestamp_ns": frame.timestamp_ns,
         "wall_ms": wall_ms,
         "width": frame.width,
         "height": frame.height,
         "pixel_format": crate::frame::pixel_format_name(frame.pixel_format),
     });
+    if let Some(device_ts_ns) = frame.device_ts_ns {
+        meta["device_ts_ns"] = json!(device_ts_ns);
+    }
     if !acquisition.vendor.is_empty() || !acquisition.model.is_empty() {
         meta["camera"] = json!({"vendor": acquisition.vendor, "model": acquisition.model});
     }
@@ -1300,7 +1302,7 @@ fn image_file(
         context: context.clone(),
         item: crate::engine::saved::SavedItem::Capture {
             frame_id: frame.id,
-            timestamp_ns: frame.timestamp_ns,
+            device_ts_ns: frame.device_ts_ns,
             width: frame.width,
             height: frame.height,
             pixel_format: frame.pixel_format,
@@ -1917,10 +1919,6 @@ fn process_plain(
             let label = crate::naming::camera_name(info);
             let source = Source {
                 id: info.id.as_str().into(),
-                device_clock: matches!(
-                    info.transport,
-                    crate::types::Transport::GigE | crate::types::Transport::Usb3
-                ),
             };
             let now_ms = crate::scheduling::now_ms();
             let first_at_ms = first_at_ms.max(now_ms);
@@ -2202,8 +2200,6 @@ fn process_plain(
 #[derive(Clone, Default)]
 struct Source {
     id: Arc<str>,
-    /// Its frames carry the camera's own timestamps.
-    device_clock: bool,
 }
 
 struct Scheduled {
@@ -4159,7 +4155,8 @@ mod tests {
             width: 8,
             height: 8,
             pixel_format: crate::types::MONO8,
-            timestamp_ns: id,
+            device_ts_ns: Some(id),
+            wall_ms: 0,
             data: vec![id as u8; 64],
         }
     }
@@ -4748,7 +4745,8 @@ mod tests {
             width: 2,
             height: 1,
             pixel_format: crate::types::MONO8,
-            timestamp_ns: 9,
+            device_ts_ns: Some(9),
+            wall_ms: 0,
             data: vec![0, 0],
         };
         let context = crate::context::Context::from([("part".into(), "B-7".into())]);

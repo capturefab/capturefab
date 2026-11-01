@@ -39,7 +39,16 @@ pub struct Frame {
     pub width: u32,
     pub height: u32,
     pub pixel_format: u32,
-    pub timestamp_ns: u64,
+    /// The camera's own clock when it took the frame, in nanoseconds, from a
+    /// GigE Vision or USB3 Vision leader (or the simulator's clock). It is
+    /// comparable only between frames of one camera, or of cameras that
+    /// share a PTP clock, and is never a date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_ts_ns: Option<u64>,
+    /// When the host received it, UTC Unix milliseconds; set by
+    /// `Camera::next_frame`.
+    #[serde(default)]
+    pub wall_ms: u64,
     #[serde(skip)]
     pub data: Vec<u8>,
 }
@@ -87,6 +96,17 @@ pub trait Backend: RegisterIo {
     }
     fn stats(&self) -> Option<TransportStats> {
         None
+    }
+    /// The settings this process keeps for a camera that has nowhere else
+    /// to keep them, as a simulator's registers or a webcam's video mode:
+    /// a real camera keeps its settings until it is powered off. None for a
+    /// camera that keeps its own.
+    fn emulated_settings(&mut self) -> Option<serde_json::Value> {
+        None
+    }
+    /// Take back settings `emulated_settings` gave in another process.
+    fn restore_settings(&mut self, _settings: &serde_json::Value) -> Result<()> {
+        Ok(())
     }
 }
 

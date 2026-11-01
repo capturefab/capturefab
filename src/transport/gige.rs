@@ -12,7 +12,7 @@ use std::io::{Cursor, ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const GVCP_PORT: u16 = 3956;
 const DISCOVERY: u16 = 0x0002;
@@ -2253,22 +2253,19 @@ impl Assembler {
         if let Some(bytes) = swapped {
             data.chunks_exact_mut(bytes).for_each(<[u8]>::reverse);
         }
-        let timestamp_ns = if self.timestamp_frequency == 0 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .min(u64::MAX as u128) as u64
-        } else {
+        // Without its tick frequency the camera's clock cannot be read as
+        // nanoseconds; the host time of the frame still says when it came.
+        let device_ts_ns = (self.timestamp_frequency != 0).then(|| {
             ((leader.timestamp as u128 * 1_000_000_000) / self.timestamp_frequency as u128)
                 .min(u64::MAX as u128) as u64
-        };
+        });
         self.ready.push_back(Frame {
             id: frame.block,
             width: leader.width,
             height,
             pixel_format: leader.pixel_format,
-            timestamp_ns,
+            device_ts_ns,
+            wall_ms: 0,
             data,
         });
     }
@@ -3071,7 +3068,7 @@ mod tests {
             let first = gvsp(id, 1, 3, extended, &[1, 2, 3, 4, 5, 6, 7, 8]);
             let frame = assembler.push(&first).unwrap().unwrap();
             assert_eq!(frame.data, (1..=16).collect::<Vec<_>>());
-            assert_eq!(frame.timestamp_ns, 1_234_000_000);
+            assert_eq!(frame.device_ts_ns, Some(1_234_000_000));
             assert_eq!(frame.id, id);
             assert!(assembler.push(&first).unwrap().is_none());
         }

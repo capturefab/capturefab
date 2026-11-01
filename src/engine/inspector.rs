@@ -441,7 +441,7 @@ fn measure(job: &Job) -> Result<Value> {
         "width": frame.width,
         "height": frame.height,
         "pixel_format": crate::inspect::pixel_format_label(frame.pixel_format),
-        "timestamp_ns": frame.timestamp_ns,
+        "device_ts_ns": frame.device_ts_ns,
         "age_ms": u64::try_from(job.received.elapsed().as_millis()).unwrap_or(u64::MAX),
         "source": job.source,
         "waited_frames": job.waited,

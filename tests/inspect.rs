@@ -172,10 +172,15 @@ fn auto_settles_then_holds_or_turns_off() {
         home.ok(&["get", "-c", "sim:0", "ExposureAuto"])["values"]["ExposureAuto"],
         "Off"
     );
-    // The simulator has no continuous auto exposure; Capturefab's runs in
-    // the session.
+    // The camera's own continuous auto exposure runs, direct too, until
+    // turned off.
     let continuous = home.ok(&["auto", "-c", "sim:0", "--continuous"]);
-    assert_eq!(continuous["by"], "capturefab");
-    let direct = home.fails(2, &["--no-session", "auto", "-c", "sim:9", "--continuous"]);
-    assert_eq!(direct["code"], "usage");
+    assert_eq!(continuous["by"], "camera");
+    assert_eq!(
+        home.ok(&["get", "-c", "sim:0", "ExposureAuto"])["values"]["ExposureAuto"],
+        "Continuous"
+    );
+    home.ok(&["auto", "-c", "sim:0", "--off"]);
+    let direct = home.ok(&["--no-session", "auto", "-c", "sim:9", "--continuous"]);
+    assert_eq!(direct["by"], "camera");
 }

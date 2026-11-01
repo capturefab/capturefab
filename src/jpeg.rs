@@ -203,7 +203,8 @@ mod tests {
             width,
             height,
             pixel_format,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data: (0..width as usize * height as usize * bytes)
                 .map(|i| (i * 7 + i / 64) as u8)
                 .collect(),

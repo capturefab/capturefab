@@ -256,7 +256,7 @@ fn info_and_features_describe_the_camera() {
         "--category",
         "ImageFormatControl",
     ]);
-    assert_eq!(category["features"].as_array().unwrap().len(), 3);
+    assert_eq!(category["features"].as_array().unwrap().len(), 9);
     assert_eq!(
         home.fails(2, &["features", "-c", "sim:0", "--category", "Nope"])["code"],
         "feature_not_found"
@@ -1100,23 +1100,53 @@ fn preset_apply_refuses_before_changing_and_keeps_reasons() {
     let on = |args: &[&str]| home.ok(&[&["--session", "reasons"][..], args].concat());
     on(&["preset", "save", "p1"]);
     on(&["set", "ExposureTime=2000", "Gain=5"]);
-    // The simulator has no user sets: --persist is refused up front, in a
-    // dry run too, and nothing changes.
+    // --persist then saves the camera's own user set and makes it the one
+    // the camera loads when it powers on.
+    let planned = on(&["preset", "apply", "p1", "--persist", "--dry-run"]);
+    assert_eq!(
+        planned["persist"],
+        json!({"user_set": "UserSet1", "default": "UserSetDefault"}),
+        "{planned}"
+    );
+    assert_eq!(
+        on(&["get", "ExposureTime"])["values"]["ExposureTime"],
+        2000.0
+    );
+    on(&["preset", "apply", "p1", "--persist"]);
+    assert_eq!(
+        on(&["get", "UserSetDefault", "ExposureTime"])["values"],
+        json!({"UserSetDefault": "UserSet1", "ExposureTime": 10000.0})
+    );
+    on(&["set", "ExposureTime=2000"]);
+    on(&["exec", "UserSetLoad[UserSet1]"]);
+    assert_eq!(
+        on(&["get", "ExposureTime"])["values"]["ExposureTime"],
+        10000.0
+    );
+    on(&["set", "ExposureTime=2000", "Gain=5"]);
+    // A camera without user sets refuses --persist up front, in a dry run
+    // too, and nothing changes.
+    let direct = |args: &[&str]| home.ok(&[&["--no-session"][..], args].concat());
+    direct(&["preset", "save", "warm", "-c", "sim:thermal"]);
     for flags in [&["--dry-run"][..], &[]] {
         let error = home.fails(
             5,
             &[
-                &["--session", "reasons", "preset", "apply", "p1", "--persist"][..],
+                &[
+                    "--no-session",
+                    "preset",
+                    "apply",
+                    "warm",
+                    "-c",
+                    "sim:thermal",
+                    "--persist",
+                ][..],
                 flags,
             ]
             .concat(),
         );
         assert_eq!(error["code"], "unsupported", "{error}");
     }
-    assert_eq!(
-        on(&["get", "ExposureTime"])["values"]["ExposureTime"],
-        2000.0
-    );
     // A saved value that does not fit fails with its own reason, and what
     // was written is put back.
     let mut document = on(&["preset", "show", "p1"]);
@@ -1143,7 +1173,7 @@ fn preset_apply_refuses_before_changing_and_keeps_reasons() {
         error["details"]["rollback"]["restored"]
             .as_array()
             .unwrap()
-            .contains(&json!("Gain")),
+            .contains(&json!("Gain[GainSelector=AnalogAll]")),
         "{error}"
     );
     assert_eq!(on(&["get", "Gain"])["values"]["Gain"], 5.0);

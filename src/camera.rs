@@ -893,7 +893,11 @@ impl Camera {
     }
     pub fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.streaming, "camera is not streaming");
-        self.backend.next_frame(timeout)
+        let mut frame = self.backend.next_frame(timeout)?;
+        if frame.wall_ms == 0 {
+            frame.wall_ms = crate::scheduling::now_ms();
+        }
+        Ok(frame)
     }
     /// Ask for the next frame. A camera whose start trigger is On with a
     /// Software source sends one only after TriggerSoftware; one waiting for
@@ -1234,7 +1238,8 @@ pub(crate) mod tests {
                 width: 4,
                 height: 4,
                 pixel_format: crate::types::MONO8,
-                timestamp_ns: self.frames,
+                device_ts_ns: Some(self.frames),
+                wall_ms: 0,
                 data: vec![0; 16],
             })
         }

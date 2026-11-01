@@ -655,7 +655,8 @@ mod tests {
             width,
             height,
             pixel_format,
-            timestamp_ns: 99,
+            device_ts_ns: Some(99),
+            wall_ms: 0,
             data,
         }
     }

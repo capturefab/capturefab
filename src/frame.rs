@@ -1144,7 +1144,8 @@ mod tests {
             width: 2,
             height: 1,
             pixel_format: fmt,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data,
         }
     }

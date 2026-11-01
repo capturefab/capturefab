@@ -44,7 +44,7 @@ impl Backend for NetworkBackend {
         let extra = r#"
             <Integer Name="DeviceLinkSpeed"><Value>125000000</Value><ImposedAccessMode>RO</ImposedAccessMode><Unit>Bps</Unit></Integer>
             <Integer Name="DeviceLinkThroughputLimit"><pValue>ThroughputReg</pValue><Min>1000</Min><Max>100000000</Max><Inc>1000</Inc></Integer>
-            <IntReg Name="ThroughputReg"><Address>0x180</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
+            <IntReg Name="ThroughputReg"><Address>0x1D0</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
         "#;
         Ok(self.simulator.xml()?.replace(
             "</RegisterDescription>",
@@ -112,7 +112,7 @@ impl Harness {
         let backend = Arc::new(Mutex::new(BackendState::default()));
         let mut simulator = Simulator::default();
         simulator
-            .write_memory(0x180, &100_000_000u32.to_le_bytes())
+            .write_memory(0x1D0, &100_000_000u32.to_le_bytes())
             .unwrap();
         let mut info = crate::transport::simulator::info();
         info.transport = transport;

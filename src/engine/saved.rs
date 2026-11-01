@@ -16,7 +16,9 @@ use std::{
 pub enum SavedItem {
     Capture {
         frame_id: u64,
-        timestamp_ns: u64,
+        /// The camera's clock when it took the frame; see `Frame`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_ts_ns: Option<u64>,
         width: u32,
         height: u32,
         pixel_format: u32,
@@ -67,12 +69,11 @@ pub struct RecordedFile {
 impl SavedFile {
     /// A capture's `--manifest` line: `{file, camera, time, device_ts_ns?,
     /// frame_id?, width, height, pixel_format, bytes, sha256, settings,
-    /// tags}`. `features` are the camera's values when the frame came;
-    /// `device_clock` says its timestamp is the camera's own clock.
-    pub fn manifest_line(&self, camera: &str, features: &Value, device_clock: bool) -> Value {
+    /// tags}`. `features` are the camera's values when the frame came.
+    pub fn manifest_line(&self, camera: &str, features: &Value) -> Value {
         let SavedItem::Capture {
             frame_id,
-            timestamp_ns,
+            device_ts_ns,
             width,
             height,
             pixel_format,
@@ -85,7 +86,7 @@ impl SavedFile {
             "file": self.path,
             "camera": crate::media::redact_url(camera),
             "time": crate::scheduling::rfc3339(self.wall_ms),
-            "device_ts_ns": (device_clock && *timestamp_ns > 0).then_some(*timestamp_ns),
+            "device_ts_ns": device_ts_ns,
             "frame_id": (*frame_id > 0).then_some(*frame_id),
             "width": width,
             "height": height,
@@ -217,7 +218,7 @@ mod tests {
             context: Context::from([("lot".into(), "7".into())]),
             item: SavedItem::Capture {
                 frame_id: 12,
-                timestamp_ns: 5_000,
+                device_ts_ns: Some(5_000),
                 width: 64,
                 height: 48,
                 pixel_format: crate::types::MONO8,
@@ -227,7 +228,7 @@ mod tests {
             },
         };
         let features = json!({"ExposureTime": 2000.0});
-        let line = file.manifest_line("rtsp://user:secret@cam/live", &features, true);
+        let line = file.manifest_line("rtsp://user:secret@cam/live", &features);
         assert_eq!(
             line,
             json!({
@@ -245,9 +246,13 @@ mod tests {
                 "tags": {"lot": "7"},
             })
         );
-        // A host clock's timestamps are no device time.
-        let line = file.manifest_line("sim:0", &Value::Null, false);
-        assert!(line.get("device_ts_ns").is_none(), "{line}");
+        // A frame without the camera's clock has no device time.
+        let mut hosted = file.clone();
+        if let SavedItem::Capture { device_ts_ns, .. } = &mut hosted.item {
+            *device_ts_ns = None;
+        }
+        let hosted = hosted.manifest_line("sim:0", &Value::Null);
+        assert!(hosted.get("device_ts_ns").is_none(), "{hosted}");
         let dir = std::env::temp_dir().join(format!("capturefab-manifest-{}", std::process::id()));
         let path = dir.join("runs/manifest.jsonl");
         let manifest = Manifest::open(&path).unwrap();

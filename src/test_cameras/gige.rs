@@ -818,7 +818,7 @@ fn packet(block: u16, id: usize, kind: u32, data: &[u8]) -> Vec<u8> {
 }
 fn frame_packets(block: u16, frame: &Frame, chunk: usize) -> Vec<Vec<u8>> {
     let mut leader = vec![0, 0, 0, 1];
-    leader.extend(frame.timestamp_ns.to_be_bytes());
+    leader.extend(frame.device_ts_ns.unwrap_or_default().to_be_bytes());
     leader.extend(frame.pixel_format.to_be_bytes());
     leader.extend(frame.width.to_be_bytes());
     leader.extend(frame.height.to_be_bytes());

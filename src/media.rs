@@ -1247,7 +1247,7 @@ fn ppm_token(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     }
     Ok(token)
 }
-fn read_ppm(reader: &mut impl BufRead, id: u64, timestamp_ns: u64) -> Result<Frame> {
+fn read_ppm(reader: &mut impl BufRead, id: u64) -> Result<Frame> {
     ensure!(
         ppm_token(reader)? == b"P6",
         "FFmpeg emitted an unsupported image format"
@@ -1280,7 +1280,8 @@ fn read_ppm(reader: &mut impl BufRead, id: u64, timestamp_ns: u64) -> Result<Fra
         width,
         height,
         pixel_format: RGB8,
-        timestamp_ns,
+        device_ts_ns: None,
+        wall_ms: 0,
         data,
     })
 }
@@ -1370,16 +1371,15 @@ impl Decoder {
             stopped: AtomicBool::new(false),
         });
         let shared = queue.clone();
-        let epoch = Instant::now();
         let live = scheme(source).is_some_and(|s| s != "file");
         let thread = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut id = 0;
             while !shared.stopped.load(Ordering::Relaxed) {
                 id += 1;
-                // Stamp a frame when it has arrived, not when its wait began.
-                let result = read_ppm(&mut reader, id, 0).map(|mut frame| {
-                    frame.timestamp_ns = epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+                // Stamp a frame when it has arrived, not when it is taken.
+                let result = read_ppm(&mut reader, id).map(|mut frame| {
+                    frame.wall_ms = crate::scheduling::now_ms();
                     frame
                 });
                 let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -5868,7 +5868,8 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
             width,
             height,
             pixel_format: RGB8,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data: vec![7; (width * height * 3) as usize],
         }
     }
@@ -6186,9 +6187,9 @@ esac"#
         bytes.extend(b"P6\n1 1\n255\n");
         bytes.extend([1, 2, 3]);
         let mut reader = BufReader::new(bytes.as_slice());
-        let a = read_ppm(&mut reader, 1, 0).unwrap();
+        let a = read_ppm(&mut reader, 1).unwrap();
         assert_eq!(a.data, [10, 32, 13, 0, 255, 1]);
-        assert_eq!(read_ppm(&mut reader, 2, 0).unwrap().data, [1, 2, 3]);
+        assert_eq!(read_ppm(&mut reader, 2).unwrap().data, [1, 2, 3]);
     }
     #[test]
     fn ppm_rejects_oversize_truncation_and_sample_depth() {
@@ -6197,7 +6198,7 @@ esac"#
             &b"P6\n1 1\n65535\n"[..],
             &b"P6\n1 1\n255\n\0"[..],
         ] {
-            assert!(read_ppm(&mut BufReader::new(bytes), 1, 0).is_err());
+            assert!(read_ppm(&mut BufReader::new(bytes), 1).is_err());
         }
     }
     #[test]
@@ -6408,7 +6409,8 @@ esac"#
             width: 3,
             height: 3,
             pixel_format: crate::types::MONO8,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data: (1..=9).collect(),
         };
         // Luma plane, then 2x2 U and V planes for odd dimensions.
@@ -6426,7 +6428,8 @@ esac"#
             width,
             height: 1,
             pixel_format,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data,
         };
         let le =
@@ -6501,7 +6504,8 @@ esac"#
                 width,
                 height,
                 pixel_format: format,
-                timestamp_ns: 0,
+                device_ts_ns: None,
+                wall_ms: 0,
                 data,
             };
             let padded = raw.bytes(frame(3, 2, (1..=13).collect())).unwrap();
@@ -6525,7 +6529,8 @@ esac"#
             width: 3,
             height: 1,
             pixel_format: crate::types::MONO8,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data: vec![1, 2, 3],
         };
         assert_eq!(mono.bytes(odd).unwrap(), [1, 2, 3]);
@@ -6555,7 +6560,8 @@ esac"#
                 width: width as u32,
                 height: height as u32,
                 pixel_format: format,
-                timestamp_ns: 0,
+                device_ts_ns: None,
+                wall_ms: 0,
                 data,
             };
             let expected = crate::frame::rgb(&frame).unwrap();
@@ -6711,7 +6717,8 @@ esac"#
                 width: width as u32,
                 height: height as u32,
                 pixel_format,
-                timestamp_ns: 0,
+                device_ts_ns: None,
+                wall_ms: 0,
                 data,
             };
             let expected = crate::frame::rgb(&frame).unwrap();
@@ -6869,7 +6876,8 @@ esac"#
                     width: width as u32,
                     height: height as u32,
                     pixel_format: RGB8,
-                    timestamp_ns: 0,
+                    device_ts_ns: None,
+                    wall_ms: 0,
                     data: pictures[id as usize % pictures.len()].clone(),
                 })
                 .unwrap();
@@ -6955,7 +6963,8 @@ esac"#
                     width: width as u32,
                     height: height as u32,
                     pixel_format: RGB8,
-                    timestamp_ns: 0,
+                    device_ts_ns: None,
+                    wall_ms: 0,
                     data: vec![(id * 8) as u8; width * height * 3],
                 })
                 .unwrap();
@@ -7041,7 +7050,8 @@ esac"#
             width: 640,
             height: 480,
             pixel_format: RGB8,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data,
         };
         forward.push(frame.clone()).unwrap();
@@ -7079,7 +7089,8 @@ esac"#
             width: 64,
             height: 48,
             pixel_format: RGB8,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data: vec![0; 64 * 48 * 3],
         };
         let error = forward.push(frame.clone()).unwrap_err();
@@ -7115,7 +7126,8 @@ esac"#
             width: 64,
             height: 48,
             pixel_format: RGB8,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data: vec![127; 64 * 48 * 3],
         };
         forward.push(frame.clone()).unwrap();
@@ -7172,7 +7184,8 @@ esac"#
                 width: 160,
                 height: 120,
                 pixel_format: RGB8,
-                timestamp_ns: id * 33_333_333,
+                device_ts_ns: None,
+                wall_ms: id * 33,
                 data,
             };
             let _ = forward.push(frame);
