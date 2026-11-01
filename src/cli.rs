@@ -18,7 +18,10 @@ mod record;
 mod schema;
 mod serve;
 mod session;
+mod shell;
 mod signals;
+pub(crate) mod term;
+mod watch;
 
 #[cfg(test)]
 pub(crate) use output::error_code;
@@ -168,9 +171,14 @@ pub enum Command {
     Record(record::RecordArgs),
     /// Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview
     #[command(
-        after_help = "Examples:\n  capturefab inspect -c sim:0\n  capturefab inspect -c sim:0 --set exposure=20ms --region 0.25,0.25,0.5,0.5\n  capturefab inspect -c sim:0 --keep 5m --preview none"
+        after_help = "Examples:\n  capturefab inspect -c sim:0\n  capturefab inspect -c sim:0 --set exposure=20ms --region 0.25,0.25,0.5,0.5\n  capturefab inspect -c sim:0 --keep 5m --preview none\n  capturefab inspect -c sim:0 --show"
     )]
     Inspect(inspect::InspectArgs),
+    /// Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise
+    #[command(
+        after_help = "Ctrl-C ends it (exit 0). Without a terminal, or with --json, each measurement is one JSON line.\n\nExamples:\n  capturefab watch -c sim:0\n  capturefab watch -c sim:0 --show --region 0.4,0.4,0.2,0.2\n  capturefab watch -c sim:0 --json --for 10s --every 1s"
+    )]
+    Watch(watch::WatchArgs),
     /// Settle exposure and gain, then hold them; or turn auto exposure off or on
     #[command(
         after_help = "Examples:\n  capturefab auto -c sim:0\n  capturefab auto -c sim:0 --timeout 10s\n  capturefab auto -c sim:0 --off"
@@ -228,6 +236,11 @@ pub enum Command {
         /// A command, such as set or preset apply
         command: Vec<String>,
     },
+    /// Run commands one after another with the cameras kept connected: a prompt in a terminal, one command a line otherwise
+    #[command(
+        after_help = "Commands are the ones above without `capturefab`. In a terminal: line editing, history, Tab completion, `use CAM`, `cameras`, `show`, `help`, `exit`; Ctrl-C stops the command running. Otherwise each line of stdin (or each -e) runs in order and prints one result, one JSON line each with --json; the first failure ends the run unless --keep-going, and sets the exit code.\n\nExamples:\n  capturefab shell -c sim:0\n  printf 'set exposure=5ms\\ncapture -o a.png\\ninspect\\n' | capturefab shell -c sim:0 --json\n  capturefab shell -c sim:0 -e 'set gain=0' -e 'capture -o shot.png'"
+    )]
+    Shell(shell::ShellArgs),
     /// Print shell completions: bash, zsh, fish, powershell, elvish
     #[command(
         after_help = "Examples:\n  capturefab completions zsh > ~/.zfunc/_capturefab\n  capturefab completions bash > ~/.local/share/bash-completion/completions/capturefab"
@@ -266,11 +279,33 @@ pub fn main() -> i32 {
     if let Err(error) = signals::install(out) {
         return out.error(&error);
     }
+    term::enable(out.quiet);
+    if let Some(Command::Shell(_)) = &cli.command
+        && let Some(Command::Shell(args)) = cli.command.take()
+    {
+        return shell::main(cli.global, args, &matches);
+    }
+    // Every command says what it is doing once it takes a moment, except
+    // those that wait for typing on stdin, and serve, which says it is ready.
+    let path = command_path(&matches);
+    let _activity = (!matches!(path.as_str(), "serve" | "debug rpc" | "login add"))
+        .then(|| term::activity(format!("{path}…")));
     match run(cli) {
         Ok(Some(report)) => out.result(report),
         Ok(None) => 0,
         Err(error) => out.error(&error),
     }
+}
+
+/// The command `matches` names, with its subcommands: `preset apply`.
+fn command_path(matches: &clap::ArgMatches) -> String {
+    let mut path = Vec::new();
+    let mut matches = matches;
+    while let Some((name, sub)) = matches.subcommand() {
+        path.push(name);
+        matches = sub;
+    }
+    path.join(" ")
 }
 
 /// Whether the command's `--keep` came from CAPTUREFAB_KEEP.
@@ -290,19 +325,19 @@ fn clap_failure(error: &clap::Error, json: bool) -> i32 {
         return 0;
     }
     if json {
-        let _ = output::write_json(&output::clap_error(error, missing_subcommand()));
+        let group = missing_subcommand(std::env::args().skip(1));
+        let _ = output::write_json(&output::clap_error(error, group));
     } else {
         let _ = error.print();
     }
     2
 }
 
-/// The deepest command group the arguments name, with its subcommands:
-/// what a missing-subcommand error lists.
-fn missing_subcommand() -> Option<(String, Vec<String>)> {
+/// The deepest command group `args` name, with its subcommands: what a
+/// missing-subcommand error lists.
+fn missing_subcommand(mut args: impl Iterator<Item = String>) -> Option<(String, Vec<String>)> {
     let mut command = Cli::tree();
     let mut path = vec!["capturefab".to_owned()];
-    let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--session" {
             args.next();
@@ -351,6 +386,7 @@ pub fn run(mut cli: Cli) -> Result<Option<Report>> {
         Command::Capture(args) => return capture::run(global, args),
         Command::Record(args) => record::run(global, args)?,
         Command::Inspect(args) => inspect::run(global, args)?,
+        Command::Watch(args) => return watch::run(global, args),
         Command::Auto(args) => auto::run(global, args)?,
         Command::Preset(command) => preset::run(global, command)?,
         Command::Jobs(args) => jobs::run(global, args)?,
@@ -381,6 +417,9 @@ pub fn run(mut cli: Cli) -> Result<Option<Report>> {
         }
         Command::Debug(command) => return debug::run(global, command),
         Command::Licenses => doctor::licenses(),
+        Command::Shell(_) => {
+            return Err(Usage("this is a shell already; type its commands".into()).into());
+        }
     }))
 }
 
@@ -475,9 +514,12 @@ pub(crate) struct Client {
     pub out: Output,
     session: Option<String>,
     /// The camera as the session is asked for it: the selector typed, which
-    /// the session resolves, or none for the session's only camera.
+    /// the session resolves, or none for the session's only camera. For the
+    /// workers a shell holds, the camera's ID there.
     target: Option<String>,
     local: Option<SessionHandle>,
+    /// `local` holds a shell's cameras, which outlive this command.
+    shared: bool,
     /// `--keep`: sent with each request that uses the session.
     keep: Option<Duration>,
     /// The pipe this command's worker writes an image captured to stdout to.
@@ -489,6 +531,14 @@ pub(crate) struct Client {
 impl Drop for Client {
     fn drop(&mut self) {
         if let Some(local) = &self.local {
+            if self.shared {
+                if self.out.verbose
+                    && let Ok(state) = self.call(SessionCommand::Status)
+                {
+                    self.print_log(&state);
+                }
+                return;
+            }
             if self.out.verbose {
                 for line in local.snapshot().logs {
                     eprintln!("capturefab: [{}] {}", line.level, line.message);
@@ -501,6 +551,15 @@ impl Drop for Client {
             self.print_session_log(session);
         }
     }
+}
+
+/// The workers a shell holds its cameras in when no session can: a command
+/// that would open a worker of its own uses the shell's, which stays.
+static HELD: std::sync::OnceLock<SessionHandle> = std::sync::OnceLock::new();
+
+/// Hold the cameras commands open for themselves in `handle` from now on.
+fn hold(handle: SessionHandle) {
+    let _ = HELD.set(handle);
 }
 /// Why a session could not take a command: it is stopping or gone, which
 /// lets automatic routing use a worker of this command, or it failed.
@@ -528,6 +587,10 @@ impl Client {
         let since_ms = crate::scheduling::now_ms();
         let selector = selector.map(caller_selector).transpose()?;
         let out = global.output();
+        let _activity = term::activity(match &selector {
+            Some(selector) => format!("connecting to {}…", crate::media::redact_url(selector)),
+            None => "connecting…".to_owned(),
+        });
         // CAPTUREFAB_KEEP and the warm default are defaults, which
         // --no-session overrides.
         let mut route = if global.no_session && (route.warm || global.keep_from_env) {
@@ -582,7 +645,7 @@ impl Client {
         if route.needs_session() {
             let selector = match selector {
                 Some(selector) => selector,
-                None => default_camera()?,
+                None => default_camera(out)?,
             };
             let started = session::ensure(AUTO_SESSION, Some(&selector), route.idle(), global)?;
             return Self::in_session(out, AUTO_SESSION, Some(selector), route, since_ms, started)
@@ -590,9 +653,12 @@ impl Client {
         }
         let selector = match selector {
             Some(selector) => selector,
-            None => default_camera()?,
+            None => default_camera(out)?,
         };
         crate::camera::validate_selector(&selector)?;
+        if let Some(held) = HELD.get().filter(|_| !route.stdout) {
+            return Self::held(out, held, selector, route, since_ms);
+        }
         let local = SessionHandle::direct(out.verbose);
         signals::on_second(local.killer());
         let stdout = route.stdout.then(|| local.stdout_pipe()).transpose()?;
@@ -601,12 +667,48 @@ impl Client {
             session: None,
             target: None,
             local: Some(local.clone()),
+            shared: false,
             keep: None,
             stdout,
             since_ms,
         };
         client.call(SessionCommand::connect(selector, route.connect()))?;
         Ok(client)
+    }
+    /// Use the worker a shell holds for `selector`, connecting the camera
+    /// there first when it is not yet.
+    fn held(
+        out: Output,
+        handle: &SessionHandle,
+        selector: String,
+        route: Route,
+        since_ms: u64,
+    ) -> Result<Self> {
+        let held = handle
+            .held_cameras()
+            .into_iter()
+            .filter_map(|camera| Some((camera.named_by(&selector)?, camera.id)))
+            .min();
+        let id = match held {
+            Some((_, id)) => id,
+            None => {
+                let reply = handle.request(SessionCommand::connect(selector, route.connect()))?;
+                reply["connected"]["id"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow::anyhow!("camera connected without an ID"))?
+            }
+        };
+        Ok(Self {
+            out,
+            session: None,
+            target: Some(id),
+            local: Some(handle.clone()),
+            shared: true,
+            keep: None,
+            stdout: None,
+            since_ms,
+        })
     }
     /// Use session `name` for `selector`, connecting the camera there when
     /// it does not hold it yet; otherwise a short request checks that the
@@ -640,6 +742,7 @@ impl Client {
             session: Some(name.to_owned()),
             target: selector.clone(),
             local: None,
+            shared: false,
             keep,
             stdout: None,
             since_ms,
@@ -688,7 +791,14 @@ impl Client {
                     keep,
                 )
             }
-            (None, Some(local)) => local.request(command),
+            // A shell's command that a signal interrupted stops waiting,
+            // and what only it waited for, such as an inspection, stops.
+            (None, Some(local)) => match &self.target {
+                Some(target) if self.shared => {
+                    local.request_for(Some(target), command, &signals::interrupted)
+                }
+                _ => local.request(command),
+            },
             (None, None) => unreachable!("a client has a session or a worker"),
         }
     }
@@ -705,6 +815,10 @@ impl Client {
         ) else {
             return;
         };
+        self.print_log(&state);
+    }
+    /// The lines of the log in status `state` since this command began.
+    fn print_log(&self, state: &Value) {
         let camera = state["cameras"][0]["info"]["id"]
             .as_str()
             .map(|id| format!("[{}] ", crate::media::redact_url(id)));
@@ -775,6 +889,11 @@ impl Client {
     /// The worker of this command, without a session.
     pub fn local(&self) -> Option<&SessionHandle> {
         self.local.as_ref()
+    }
+    /// Whether the camera stays open once this command ends: in a session,
+    /// or in the workers a shell holds.
+    pub fn outlives(&self) -> bool {
+        self.session.is_some() || self.shared
     }
     /// The pipe this command's worker writes an image captured to stdout
     /// to, once.
@@ -925,13 +1044,16 @@ fn route_to(sessions: &[ipc::Descriptor], selector: Option<&str>) -> Option<Stri
 }
 
 /// The camera a command without `-c` uses: the only one `list` finds,
-/// leaving out simulators and screen captures.
-fn default_camera() -> Result<String> {
+/// leaving out simulators and screen captures. Of several, a person at a
+/// terminal picks one.
+fn default_camera(out: Output) -> Result<String> {
     let kinds = crate::camera::Kinds {
         sim: false,
         ..crate::camera::Kinds::all()
     };
+    let searching = term::activity("looking for cameras…");
     let (devices, _) = crate::camera::discover_kinds(DEFAULT_DISCOVERY, kinds);
+    drop(searching);
     let devices = devices
         .into_iter()
         .filter(|info| !matches!(crate::camera::kind(info), "sim" | "screen"))
@@ -951,12 +1073,61 @@ fn default_camera() -> Result<String> {
                 .details(json!({"candidates": []}))
                 .into(),
         ),
-        _ => Err(Categorized::new(
-            ErrorKind::CameraAmbiguous,
-            format!("{} cameras found; choose one with -c", devices.len()),
-        )
-        .details(json!({"candidates": candidates()}))
-        .into()),
+        _ => {
+            if let Some(index) = pick_camera(out, &devices)? {
+                return Ok(devices[index].id.clone());
+            }
+            Err(Categorized::new(
+                ErrorKind::CameraAmbiguous,
+                format!("{} cameras found; choose one with -c", devices.len()),
+            )
+            .details(json!({"candidates": candidates()}))
+            .into())
+        }
+    }
+}
+
+/// Which of `devices` the person at this terminal picks, when someone is
+/// there to ask: never for JSON, scripts or a shell's commands, which have
+/// `use`. Ctrl-C at the prompt is `interrupted`, also for a command that
+/// took signals over, which would otherwise wait on.
+fn pick_camera(out: Output, devices: &[crate::types::CameraInfo]) -> Result<Option<usize>> {
+    if !term::can_pick(out.json) || signals::in_shell() {
+        return Ok(None);
+    }
+    let interrupted = || Categorized::error(ErrorKind::Interrupted, "interrupted");
+    // Ctrl-C while looking for cameras: no one wants to pick one now.
+    if signals::interrupted() {
+        return Err(interrupted());
+    }
+    let labels = devices
+        .iter()
+        .map(|device| {
+            let row = camera::row(device);
+            let mut label = format!("{}  {}", row.id, row.kind);
+            for part in [&row.vendor, &row.model] {
+                if !part.is_empty() {
+                    label.push_str("  ");
+                    label.push_str(part);
+                }
+            }
+            label
+        })
+        .collect::<Vec<_>>();
+    term::before_output();
+    let _paused = term::pause();
+    match term::pick_until(
+        labels,
+        || std::io::stdin().lock(),
+        std::io::stderr(),
+        &signals::interrupted,
+    ) {
+        Ok(picked) => Ok(picked),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            crate::eprintln!();
+            Err(interrupted())
+        }
+        Err(_) => Ok(None),
     }
 }
 

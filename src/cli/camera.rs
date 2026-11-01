@@ -119,7 +119,9 @@ pub fn list(global: &Global, args: ListArgs) -> Result<Report> {
         onvif: all || named(Kind::Onvif),
         sim: named(Kind::Sim),
     };
+    let searching = super::term::activity("searching for cameras…");
     let (devices, warnings) = crate::camera::discover_kinds(args.timeout, kinds);
+    drop(searching);
     let wanted = |kind: &str| match kind {
         "screen" => named(Kind::Screen),
         "sim" => named(Kind::Sim),

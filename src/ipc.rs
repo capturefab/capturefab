@@ -1089,12 +1089,71 @@ fn send_request(
         timeout,
     )
 }
+/// Requests in flight by their owner, a command a shell runs or one that
+/// stops waiting for its own, so it can close those it no longer waits
+/// for: the session then cancels what only they waited for, as it does
+/// when a command's process exits.
+static OWNED: std::sync::Mutex<Vec<(u64, u64, TcpStream)>> = std::sync::Mutex::new(Vec::new());
+static NEXT_OWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+thread_local! {
+    static OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// An owner for requests that close together.
+pub fn new_owner() -> u64 {
+    NEXT_OWNER.fetch_add(1, Ordering::Relaxed)
+}
+/// Requests this thread sends from now on belong to `owner`.
+pub fn own_requests(owner: u64) {
+    OWNER.with(|cell| cell.set(owner));
+}
+/// The owner of the requests this thread sends, 0 for none.
+pub fn requests_owner() -> u64 {
+    OWNER.with(std::cell::Cell::get)
+}
+/// Close the connections of `owner`'s requests in flight.
+pub fn close_requests(owner: u64) {
+    let owned = OWNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (_, _, stream) in owned.iter().filter(|(of, _, _)| *of == owner) {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+/// A request's connection, listed while it is in flight.
+struct Owned(Option<u64>);
+impl Owned {
+    fn list(stream: &TcpStream) -> Self {
+        let owner = OWNER.with(std::cell::Cell::get);
+        let Some(clone) = (owner != 0).then(|| stream.try_clone().ok()).flatten() else {
+            return Self(None);
+        };
+        let key = NEXT_OWNED.fetch_add(1, Ordering::Relaxed);
+        OWNED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((owner, key, clone));
+        Self(Some(key))
+    }
+}
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if let Some(key) = self.0 {
+            OWNED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(_, listed, _)| *listed != key);
+        }
+    }
+}
+
 fn send(descriptor: &Descriptor, request: Request, timeout: Duration) -> Result<Value> {
     let deadline = rpc_deadline(timeout)?;
     let request = serde_json::to_vec(&request)?;
     ensure!(request.len() < MAX_REQUEST, "RPC request exceeds 1 MiB");
     let mut stream = TcpStream::connect_timeout(&descriptor.address, remaining(deadline)?)
         .map_err(|error| rpc_network_error(&descriptor.name, "connecting", error))?;
+    let _owned = Owned::list(&stream);
     // A single budget covers connect, sending, and the response. A timeout is
     // never retried because the coordinator may already have applied a write.
     let mut message = request;

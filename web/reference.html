@@ -173,6 +173,7 @@
 <tr><td><code>--manifest</code></td><td>Append one JSON line per saved file (path, time, size, SHA-256, settings, tags) to this file</td><td>—</td></tr>
 <tr><td><code>--sync</code></td><td>file: each file reaches the disk before it is reported; none: skip that, for scratch captures</td><td>file, none</td></tr>
 <tr><td><code>--background</code></td><td>Leave the capture running in a session and print its job at once</td><td>false</td></tr>
+<tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>false</td></tr>
 <tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 <tr><td><code>--dry-run</code></td><td>Show the camera, files, settings and timing; capture nothing</td><td>false</td></tr>
 </tbody></table></div>
@@ -191,6 +192,7 @@
 <tr><td><code>--timeout</code></td><td>How long to wait for the first frame; none waits for a trigger until stopped</td><td>10s</td></tr>
 <tr><td><code>--warmup</code></td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle before recording; 0 records at once</td><td>2s</td></tr>
 <tr><td><code>--background</code></td><td>Leave the recording running in a session and print its job once the first frame is encoded</td><td>false</td></tr>
+<tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>false</td></tr>
 <tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-inspect"><code>capturefab inspect</code></h3>
@@ -207,6 +209,18 @@
 <tr><td><code>--for</code></td><td>Measure a frame every --every for this long (at most 50 samples), as for focusing: the series, and the sharpest frame's measurements and preview</td><td>—</td></tr>
 <tr><td><code>--every</code></td><td>Time between samples with --for (default 200ms)</td><td>—</td></tr>
 <tr><td><code>--clip-threshold</code></td><td>Share of the measured pixels at full scale above which the verdict says clipped_high (default: any pixel with --region, else 0.005)</td><td>—</td></tr>
+<tr><td><code>--show</code></td><td>Draw the preview in this terminal under the measurements (kitty, iTerm2, or colour blocks)</td><td>false</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-watch"><code>capturefab watch</code></h3>
+<p>Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise. Ctrl-C ends it (exit 0). Effect: read.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
+<tr><td><code>--every</code></td><td>Time between measurements, 50ms or more</td><td>250ms</td></tr>
+<tr><td><code>--for</code></td><td>Stop after this long (default: at Ctrl-C)</td><td>—</td></tr>
+<tr><td><code>--region</code></td><td>Measure only this part of the frame: X,Y,W,H as fractions 0..1</td><td>—</td></tr>
+<tr><td><code>--show</code></td><td>Draw the frame in the terminal under the measurements (kitty, iTerm2, or colour blocks)</td><td>false</td></tr>
+<tr><td><code>--timeout</code></td><td>How long each measurement waits for its frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer)</td><td>—</td></tr>
 <tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-auto"><code>capturefab auto</code></h3>
@@ -234,6 +248,7 @@
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>ID</code></td><td>A job ID such as auto-1</td><td>Required</td></tr>
 <tr><td><code>--timeout</code></td><td>How long to wait; none waits until the job ends</td><td>none</td></tr>
+<tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>false</td></tr>
 </tbody></table></div>
 <h3 id="command-session"><code>capturefab session</code></h3>
 <p>Sessions keep cameras open between commands: start, stop, status, list. A session started in the background ends after its idle time with no requests and no running jobs; its output goes to a log in the state folder.</p>
@@ -307,6 +322,14 @@
 <p>Describe commands, arguments, results and error codes as JSON. Effect: read.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>COMMAND</code></td><td>A command, such as set or preset apply</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-shell"><code>capturefab shell</code></h3>
+<p>Run commands one after another with the cameras kept connected: a prompt in a terminal, one command a line otherwise. Commands are the command line's without <code>capturefab</code>; the prompt adds <code>use CAM</code>, <code>cameras</code>, <code>show</code>, <code>help</code> and <code>exit</code>. With --json each command prints one JSON line. Effect: disruptive.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>-c</code>, <code>--camera</code></td><td>Cameras to connect now and keep connected, repeatable; the first is the camera of commands without -c</td><td>—</td></tr>
+<tr><td><code>-e</code>, <code>--execute</code></td><td>Run COMMAND, then the next -e, instead of reading stdin; repeatable</td><td>—</td></tr>
+<tr><td><code>--keep-going</code></td><td>Without a terminal: go on after a command fails; the exit code is then the first failure's</td><td>false</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the cameras open in a session for this long after the shell's last use (default 60s; 0 holds them in the shell's own process)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-completions"><code>capturefab completions</code></h3>
 <p>Print shell completions: bash, zsh, fish, powershell, elvish. Effect: read.</p>

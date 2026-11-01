@@ -8,13 +8,16 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["usb", "jpeg", "keychain"]
+default = ["usb", "jpeg", "keychain", "shell"]
 usb = ["dep:nusb"]
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
 # OS credential store (Keychain / Credential Manager / Secret Service) for
 # saved camera sign-ins.
 keychain = ["dep:keyring"]
+# Line editing, history and tab completion in `capturefab shell`; without it
+# the shell reads plain lines.
+shell = ["dep:rustyline"]
 
 [dependencies]
 anyhow = "1"
@@ -40,6 +43,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
 keyring = { version = "4.2", optional = true }
 zeroize = "1"
+rustyline = { version = "18", optional = true, default-features = false, features = ["with-file-history"] }
 
 # Inheritable pipes (a detached session's ready line, a worker's stdout
 # capture), the job objects that hold camera workers and what they start,

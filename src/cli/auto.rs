@@ -146,6 +146,7 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
     })?;
     let started = !streaming && client.call(SessionCommand::Start).is_ok();
     let deadline = Instant::now() + timeout;
+    let _settling = super::term::activity("settling exposure…");
     let watched = (|| -> Result<(Value, bool)> {
         loop {
             let auto = client.status()?["auto"].clone();
@@ -161,7 +162,7 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
                     "interrupted while settling exposure",
                 ));
             }
-            std::thread::sleep(POLL);
+            signals::sleep(POLL);
         }
     })();
     // Hold what auto mode reached, also when it was cut short.
@@ -282,6 +283,7 @@ fn settle_once(
     set("Once")?;
     let started = !streaming && client.call(SessionCommand::Start).is_ok();
     let deadline = Instant::now() + timeout;
+    let _settling = super::term::activity("settling exposure…");
     let mut polls = 0u32;
     let watched = (|| -> Result<bool> {
         loop {
@@ -304,7 +306,7 @@ fn settle_once(
                 ));
             }
             polls += 1;
-            std::thread::sleep(POLL);
+            signals::sleep(POLL);
         }
     })();
     // Measured on the settled stream, before it stops.

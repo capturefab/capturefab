@@ -46,7 +46,9 @@
     "session start": "reference.html#command-session-start",
     "session status": "reference.html#command-session-status",
     "session stop": "reference.html#command-session-stop",
-    "set": "reference.html#command-set"
+    "set": "reference.html#command-set",
+    "shell": "reference.html#command-shell",
+    "watch": "reference.html#command-watch"
   },
   "rpc": {
     "network_scan": "reference.html#rpc-network-scan",
