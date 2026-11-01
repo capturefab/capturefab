@@ -391,22 +391,7 @@ pub fn convert_into<P: Copy + Default + Send>(
     out.clear();
     convert_to(frame, out, pixel)
 }
-/// `convert` into memory the caller already owns, exactly one pixel per
-/// element, such as a buffer shared with an accelerator, so the image is
-/// written where it is consumed instead of being copied there.
-pub fn convert_slice<P: Copy + Default + Send>(
-    frame: &Frame,
-    out: &mut [P],
-    pixel: impl Fn([u8; 3]) -> P + Sync,
-) -> Result<()> {
-    ensure!(
-        out.len() == checked_pixels(frame)?,
-        "conversion buffer does not match the image size"
-    );
-    convert_to(frame, out, pixel)
-}
-/// Where `convert_to` writes: an empty growable buffer, or a slice of exactly
-/// the image size.
+/// Where `convert_to` writes: an empty growable buffer.
 trait Sink<'a, P: 'a> {
     /// Pixels in order.
     fn stream(self, pixels: impl Iterator<Item = P>);
@@ -421,16 +406,6 @@ impl<'a, P: Copy + Default + 'a> Sink<'a, P> for &'a mut Vec<P> {
     }
     fn prefilled(self, len: usize) -> &'a mut [P] {
         self.resize(len, P::default());
-        self
-    }
-}
-impl<'a, P: 'a> Sink<'a, P> for &'a mut [P] {
-    fn stream(self, pixels: impl Iterator<Item = P>) {
-        for (dst, p) in self.iter_mut().zip(pixels) {
-            *dst = p;
-        }
-    }
-    fn prefilled(self, _: usize) -> &'a mut [P] {
         self
     }
 }
@@ -879,33 +854,6 @@ fn sampled(source: &Frame, (max_width, max_height): (u32, u32)) -> Result<(u32, 
     Ok((width, height, rgba))
 }
 
-/// Bounds for `preview_rgba` that keep at least `shown` pixels each way, so
-/// a view that many pixels across never enlarges the picture, while
-/// shrinking it as far as whole factors allow.
-pub fn covering(frame: &Frame, (shown_width, shown_height): (u32, u32)) -> (u32, u32) {
-    let factor = (frame.width / shown_width.max(1))
-        .min(frame.height / shown_height.max(1))
-        .max(1);
-    // A mosaic shrinks by whole quads, two pixels at a time.
-    let factor = if is_bayer(frame.pixel_format) {
-        factor & !1
-    } else {
-        factor
-    };
-    shrunk_size(frame, factor.max(1))
-}
-/// The size `shrink` makes `frame` by `factor`: in whole quads for a mosaic.
-fn shrunk_size(frame: &Frame, factor: u32) -> (u32, u32) {
-    if factor <= 1 {
-        return (frame.width, frame.height);
-    }
-    let unit = if is_bayer(frame.pixel_format) { 2 } else { 1 };
-    let blocks = factor / unit;
-    (
-        (frame.width / unit).div_ceil(blocks),
-        (frame.height / unit).div_ceil(blocks),
-    )
-}
 /// `shrink` by the smallest factor that fits `frame` within `bounds`; None
 /// when it already fits or cannot be shrunk.
 pub(crate) fn shrink_to(frame: &Frame, (max_width, max_height): (u32, u32)) -> Option<Frame> {
@@ -1086,15 +1034,6 @@ pub(crate) fn shrink(frame: &Frame, factor: u32) -> Option<Frame> {
         data,
         ..*frame
     })
-}
-
-pub fn luminance_histogram(rgba: &[u8]) -> [u32; 64] {
-    let pixels = rgba.as_chunks::<4>().0;
-    let mut bins = [0; 64];
-    for p in pixels.iter().step_by(pixels.len().div_ceil(65_536).max(1)) {
-        bins[(p[0] as usize * 54 + p[1] as usize * 183 + p[2] as usize * 19) >> 10] += 1;
-    }
-    bins
 }
 
 /// The most bytes of provenance JSON a saved still carries. Context (16
@@ -1527,49 +1466,6 @@ mod tests {
         assert!(shrink(&f(0x0120_00bf, vec![0; 8]), 2).is_none());
     }
     #[test]
-    fn covering_bounds_never_enlarge_a_view() {
-        for format in [MONO8, RGB8, 0x0108_0009] {
-            let bytes = if format == RGB8 { 3 } else { 1 };
-            let frame = Frame {
-                width: 2448,
-                height: 2048,
-                ..f(format, vec![90; 2448 * 2048 * bytes])
-            };
-            for shown in [
-                (2448, 2048),
-                (2000, 1700),
-                (1224, 1024),
-                (1000, 900),
-                (700, 600),
-                (300, 200),
-                (1, 1),
-            ] {
-                let bounds = covering(&frame, shown);
-                let (w, h, rgba) = preview_rgba(&frame, bounds.0, bounds.1).unwrap();
-                assert_eq!((w, h), bounds, "{format:x} {shown:?}");
-                assert!(
-                    w >= shown.0 && h >= shown.1,
-                    "{format:x} {shown:?}: {w}x{h}"
-                );
-                // As small as whole factors allow: twice as many is too many.
-                assert!(
-                    w < 2 * shown.0.max(1224) || h < 2 * shown.1,
-                    "{format:x} {shown:?}: {w}x{h}"
-                );
-                assert!(rgba.iter().all(|&v| v == 90 || v == 255));
-            }
-            assert_eq!(covering(&frame, (3000, 3000)), (2448, 2048));
-        }
-        // A mosaic shown at more than half its size keeps every pixel.
-        let bayer = Frame {
-            width: 2448,
-            height: 2048,
-            ..f(0x0108_0009, vec![])
-        };
-        assert_eq!(covering(&bayer, (1300, 1100)), (2448, 2048));
-        assert_eq!(covering(&bayer, (800, 700)), (1224, 1024));
-    }
-    #[test]
     fn quad_scopes_agree_with_the_demosaic() {
         // A smooth scene with fine texture, sampled through each mosaic, against
         // the same pixels demosaiced, which is what the scopes measured before.
@@ -1713,11 +1609,7 @@ mod tests {
                 };
                 let full = rgb(&frame).unwrap();
                 assert_eq!(convert(&frame, |p| p).unwrap().into_flattened(), full);
-                // Into caller-owned memory, and into a reused buffer.
-                let mut slice = vec![[7u8; 3]; (width * height) as usize];
-                convert_slice(&frame, &mut slice, |p| p).unwrap();
-                assert_eq!(slice.into_flattened(), full);
-                assert!(convert_slice(&frame, &mut [[0u8; 3]; 1][..0], |p| p).is_err());
+                // Into a reused buffer.
                 let mut reused = vec![[1u8; 3]; 3];
                 convert_into(&frame, &mut reused, |p| p).unwrap();
                 assert_eq!(reused.into_flattened(), full);
@@ -1874,26 +1766,6 @@ mod tests {
             let score = sharpness(&fine, [0, 0, w, h]).unwrap();
             assert!(score.laplacian > 0.0 && score.variance > 0.0, "{score:?}");
         }
-    }
-    #[test]
-    fn histogram_bins_sampled_luminance() {
-        let bins = luminance_histogram(&[0, 0, 0, 255, 255, 255, 255, 255, 128, 128, 128, 255]);
-        assert_eq!(
-            (bins[0], bins[32], bins[63], bins.iter().sum::<u32>()),
-            (1, 1, 1, 3)
-        );
-        assert_eq!(
-            luminance_histogram(&vec![9; 4 * 65_536 * 3])
-                .iter()
-                .sum::<u32>(),
-            65_536
-        );
-        assert!(
-            luminance_histogram(&vec![9; 4 * 131_071])
-                .iter()
-                .sum::<u32>()
-                <= 65_536
-        );
     }
     fn decode_png(data: &[u8]) -> (png::ColorType, png::BitDepth, Vec<u8>, png::Info<'static>) {
         let mut reader = png::Decoder::new(data).read_info().unwrap();
@@ -2193,7 +2065,6 @@ mod tests {
                 sharpness(&reference, [0, 0, 6, 4]).unwrap()
             );
             assert_eq!(shrunk(&frame), shrunk(&reference), "{name}");
-            assert_eq!(covering(&frame, (2, 2)), covering(&reference, (2, 2)));
             assert_eq!(
                 preview_rgba(&frame, 3, 2).unwrap(),
                 preview_rgba(&reference, 3, 2).unwrap()

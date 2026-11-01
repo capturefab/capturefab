@@ -1011,16 +1011,6 @@ pub fn active_sessions() -> Result<Vec<Descriptor>> {
         .filter(descriptor_active)
         .collect())
 }
-pub fn list() -> Result<Value> {
-    let sessions: Vec<_> = descriptors_in(&runtime_dir())?
-        .into_iter()
-        .map(|descriptor| {
-            let active = descriptor_active(&descriptor);
-            json!({"name":descriptor.name,"kind":descriptor.kind,"pid":descriptor.pid,"active":active})
-        })
-        .collect();
-    Ok(json!({"sessions":sessions}))
-}
 
 #[cfg(test)]
 mod tests {

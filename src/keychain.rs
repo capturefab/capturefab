@@ -44,13 +44,6 @@ pub fn delete_secret(service: &str, account: &str) -> Result<()> {
     }
 }
 
-/// Whether the OS credential store holds this secret.
-pub fn has_secret(service: &str, account: &str) -> bool {
-    keyring::Entry::new(service, account)
-        .and_then(|entry| entry.get_password())
-        .is_ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

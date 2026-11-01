@@ -1,20 +1,13 @@
-//! Secrets piped to the CLI (`--secret-stdin`, `--password-stdin` and the
-//! like), so they never appear in arguments, shell history or process lists.
+//! Passwords piped to the CLI (`--password-stdin`), so they never appear in
+//! arguments, shell history or process lists.
 use anyhow::{Result, ensure};
 use std::io::Read;
 use zeroize::Zeroizing;
 
-/// Read a secret from stdin: at most 4096 bytes plus one terminal newline
-/// (LF or CRLF), which is removed. Other bytes, including spaces, are kept.
-/// The bytes are cleared from memory when the secret drops.
-pub fn read_stdin_secret(reader: impl Read, what: &str) -> Result<Zeroizing<String>> {
-    let secret = read(reader, what)?;
-    ensure!(!secret.is_empty(), "{what} must contain 1..4096 bytes");
-    Ok(secret)
-}
-
-/// Like [`read_stdin_secret`], but an empty line is an empty password, as
-/// many cameras ship with.
+/// Read a password from stdin: at most 4096 bytes plus one terminal newline
+/// (LF or CRLF), which is removed. Other bytes, including spaces, are kept,
+/// and an empty line is an empty password, as many cameras ship with. The
+/// bytes are cleared from memory when the password drops.
 pub fn read_stdin_password(reader: impl Read, what: &str) -> Result<Zeroizing<String>> {
     read(reader, what)
 }
@@ -59,17 +52,16 @@ mod tests {
             ("key\n\n", "key\n"),
         ] {
             assert_eq!(
-                read_stdin_secret(input.as_bytes(), "x").unwrap().as_str(),
+                read_stdin_password(input.as_bytes(), "x").unwrap().as_str(),
                 expected
             );
         }
-        assert!(read_stdin_secret("\n".as_bytes(), "x").is_err());
         assert_eq!(
             read_stdin_password("\n".as_bytes(), "x").unwrap().as_str(),
             ""
         );
-        assert!(read_stdin_secret("x".repeat(5000).as_bytes(), "x").is_err());
-        let invalid = read_stdin_secret(&[0xff, 0xfe][..], "x").unwrap_err();
+        assert!(read_stdin_password("x".repeat(5000).as_bytes(), "x").is_err());
+        let invalid = read_stdin_password(&[0xff, 0xfe][..], "x").unwrap_err();
         assert!(
             format!("{invalid:#}").starts_with("x stdin must be UTF-8: invalid utf-8"),
             "{invalid:#}"

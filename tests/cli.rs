@@ -2642,6 +2642,7 @@ fn naming_root(name: &str) -> PathBuf {
 }
 
 #[test]
+#[cfg_attr(not(feature = "jpeg"), ignore = "needs the jpeg feature")]
 fn capture_outputs_number_templates_and_carry_context() {
     let root = naming_root("naming-cli");
     let dir = root.join("sessions");
@@ -2759,6 +2760,7 @@ fn capture_outputs_number_templates_and_carry_context() {
 /// frame and stays stopped, a live one waits for frames published after the
 /// request, regions crop the full-resolution frame, and nothing is saved.
 #[test]
+#[cfg_attr(not(feature = "jpeg"), ignore = "needs the jpeg feature")]
 fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
     use base64::Engine;
     use std::io::Write;
@@ -2839,7 +2841,7 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
         .decode(image["base64"].as_str().unwrap())
         .unwrap();
     assert_eq!(bytes.len() as u64, image["bytes"].as_u64().unwrap());
-    assert!(capturefab::jpeg::well_formed(&bytes, 256, 192));
+    assert!(capturefab::testing::jpeg::well_formed(&bytes, 256, 192));
     let status = session(&["status"]);
     assert_eq!(status["streaming"], false);
     assert!(
@@ -3242,6 +3244,7 @@ fn text(output: &std::process::Output) -> (String, String) {
 
 /// Capture names mean what they look like, and human output summarizes.
 #[test]
+#[cfg_attr(not(feature = "jpeg"), ignore = "needs the jpeg feature")]
 fn capture_output_paths_and_summaries() {
     let root = temp_root("capture-guardrails");
     let dir = root.join("sessions");

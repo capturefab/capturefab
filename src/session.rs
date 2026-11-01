@@ -7,12 +7,9 @@ use crate::{
     shared_memory::{DEFAULT_CAPACITY, RingCounters, SharedRing},
     types::{CameraInfo, Frame},
 };
-pub use activity::{
-    ActivityJob, ActivityOrigin, ActivityState, ActivityView, ActorKind, SessionActivity,
-    SessionActor,
-};
+pub use activity::{ActivityOrigin, ActivityView, ActorKind, SessionActivity, SessionActor};
 use anyhow::{Context, Result, ensure};
-pub use log::{LogEntry, LogTimestamp};
+pub use log::LogEntry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -3220,6 +3217,7 @@ impl SessionHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{activity::ActivityState, log::LogTimestamp};
     use crate::shared_memory::Published;
     #[test]
     fn workers_start_in_the_hidden_worker_mode() {

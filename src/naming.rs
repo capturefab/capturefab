@@ -147,14 +147,6 @@ pub fn tag_keys(template: &str) -> Vec<String> {
     keys
 }
 
-/// The tag keys a template uses that have no usable value in `context`.
-pub fn missing_tags(template: &str, context: &Context) -> Vec<String> {
-    tag_keys(template)
-        .into_iter()
-        .filter(|key| tag_value(key, context).is_err())
-        .collect()
-}
-
 /// Make a tag value one safe file or folder name: separators and characters
 /// Windows refuses become `_`, trailing dots and spaces go, `.`, `..` and
 /// empty values are refused, a leading dot (a hidden name) and device names
@@ -356,71 +348,6 @@ pub fn camera_label(info: &CameraInfo) -> String {
     } else {
         label
     }
-}
-
-/// Show what a template expands to now; {seq} is shown as `####`, and a
-/// {tag:KEY} without a usable value stays visible as `{tag:KEY}`.
-pub fn preview(template: &str, camera: &str, context: &Context, now: DateTime<Local>) -> String {
-    preview_numbered(template, camera, context, now, None)
-}
-
-/// `preview` with {seq} as `seq` when it is known, else `####`.
-pub fn preview_numbered(
-    template: &str,
-    camera: &str,
-    context: &Context,
-    now: DateTime<Local>,
-    seq: Option<u32>,
-) -> String {
-    let Ok(tokens) = tokens(template) else {
-        return template.into();
-    };
-    let input = NameInput {
-        camera,
-        now,
-        index: 0,
-        context,
-    };
-    tokens
-        .iter()
-        .map(|t| match (t, seq) {
-            (Token::Seq, Some(seq)) => format!("{seq:04}"),
-            (Token::Seq, None) => "####".into(),
-            (Token::Tag(key), _) => {
-                tag_value(key, context).unwrap_or_else(|_| format!("{{tag:{key}}}"))
-            }
-            (t, _) => expand(t, &input).unwrap_or_default(),
-        })
-        .collect()
-}
-
-/// The number {seq} would take in `template`'s next file now: one past the
-/// highest already in its folder, past any taken name. Read-only: it
-/// reserves nothing, creates nothing, and shares no state with the namer
-/// that saves, so the file saved may still take a later number. `None`
-/// when the template has no {seq}, names no file, or uses {tag:KEY}, whose
-/// folder and count depend on the tags of the capture.
-pub fn peek_next(template: &str, camera: &str, now: DateTime<Local>) -> Option<u32> {
-    let tokens = tokens(template).ok()?;
-    if !tokens.contains(&Token::Seq) || tokens.iter().any(|t| matches!(t, Token::Tag(_))) {
-        return None;
-    }
-    let context = Context::new();
-    let input = NameInput {
-        camera,
-        now,
-        index: 0,
-        context: &context,
-    };
-    let mut namer = Namer::default();
-    namer
-        .candidate(
-            &Plan::Template(template.to_owned()),
-            &input,
-            OnExists::Number,
-        )
-        .ok()?;
-    namer.next.values().next().copied()
 }
 
 fn expand(token: &Token, input: &NameInput) -> Result<String> {
@@ -902,16 +829,8 @@ mod tests {
     }
 
     #[test]
-    fn expansion_and_preview() {
+    fn expansion() {
         let now = fixed_time();
-        assert_eq!(
-            preview("{date}/{camera}-{datetime}-{seq}.png", "A-1", &NO_TAGS, now),
-            "2026-10-17/A-1-20261017-101500-####.png"
-        );
-        assert_eq!(
-            preview("t{time}-{frame}", "c", &NO_TAGS, now),
-            "t101500-000001"
-        );
         let dir = temp("expand");
         let template = format!("{}/{{date}}/{{camera}}-{{frame}}.png", dir.display());
         let path = Namer::default()
@@ -945,33 +864,6 @@ mod tests {
         input.now = fixed_time() + chrono::Duration::seconds(1);
         let second = namer.candidate(&plan, &input, OnExists::Fail).unwrap();
         assert_eq!(second, dir.join("A-20261017-101501-0014.png"));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn peeking_the_next_number_reads_without_reserving() {
-        let dir = temp("peek");
-        let template = format!("{}/{{camera}}-{{datetime}}-{{seq}}.png", dir.display());
-        assert_eq!(peek_next(&template, "A", fixed_time()), Some(1));
-        let missing = format!("{}/missing/{{camera}}-{{seq}}.png", dir.display());
-        assert_eq!(peek_next(&missing, "A", fixed_time()), Some(1));
-        for name in ["A-20261017-101500-0007.png", "A-20261017-101501-0012.png"] {
-            std::fs::write(dir.join(name), b"x").unwrap();
-        }
-        assert_eq!(peek_next(&template, "A", fixed_time()), Some(13));
-        // Nothing was reserved, and nothing was created.
-        assert_eq!(peek_next(&template, "A", fixed_time()), Some(13));
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
-        let fixed = format!("{}/{{camera}}.png", dir.display());
-        assert_eq!(peek_next(&fixed, "A", fixed_time()), None);
-        assert_eq!(
-            preview_numbered("{camera}-{seq}.png", "A", &NO_TAGS, fixed_time(), Some(13)),
-            "A-0013.png"
-        );
-        assert_eq!(
-            preview("{camera}-{seq}.png", "A", &NO_TAGS, fixed_time()),
-            "A-####.png"
-        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1135,23 +1027,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_tags_are_usage_errors_and_previews_show_them() {
-        let now = fixed_time();
+    fn missing_tags_are_usage_errors() {
         let template = "shots/{tag:label}/{camera}-{seq}.png";
         let error = validate_request(template, 1, OnExists::Fail, &NO_TAGS).unwrap_err();
         assert!(error.is::<crate::types::Usage>(), "{error}");
         assert!(error.to_string().contains("'label' is empty"), "{error}");
         let blank = Context::from([("label".into(), "  ".into())]);
         assert!(validate_request(template, 1, OnExists::Fail, &blank).is_err());
-        assert_eq!(missing_tags(template, &blank), ["label"]);
-        assert_eq!(
-            preview(template, "c", &NO_TAGS, now),
-            "shots/{tag:label}/c-####.png"
-        );
         let good = Context::from([("label".into(), "a/b".into())]);
         validate_request(template, 1, OnExists::Fail, &good).unwrap();
-        assert!(missing_tags(template, &good).is_empty());
-        assert_eq!(preview(template, "c", &good, now), "shots/a_b/c-####.png");
         // Network outputs keep refusing braces elsewhere and are not expanded.
         validate_request("rtsp://host/live", 1, OnExists::Fail, &NO_TAGS).unwrap();
     }

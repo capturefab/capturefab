@@ -8,7 +8,7 @@
 //! between C libraries, so they compare within ±1 per sample.
 //!
 //! `CAPTUREFAB_BLESS=1 cargo test --test frame_golden` rewrites the file.
-use capturefab::{
+use capturefab::testing::{
     camera::Camera,
     camera_profile::CameraKind,
     frame, inspect,
@@ -495,7 +495,7 @@ fn jpegs() -> Vec<Value> {
             b"x".to_vec(),
         ),
     ] {
-        cases.push(match capturefab::jpeg::insert_com(&jpeg, &payload) {
+        cases.push(match capturefab::testing::jpeg::insert_com(&jpeg, &payload) {
             Ok(out) => json!({ "jpeg": hex(&jpeg), "payload": hex(&payload), "out": hex(&out) }),
             Err(error) => {
                 json!({ "jpeg": hex(&jpeg), "payload": hex(&payload), "error": format!("{error:#}") })

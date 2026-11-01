@@ -2873,13 +2873,13 @@ mod tests {
             .iter()
             .find(|c| c["op"] == "forward" && c["duration_ms"].is_u64())
             .expect("a timed forward example");
-        assert!(
-            timed["max_file_bytes"].as_u64().unwrap()
-                >= crate::media::estimate_recording_bytes(
-                    timed["bitrate"].as_str().unwrap(),
-                    timed["duration_ms"].as_u64().unwrap()
-                )
-                .unwrap()
+        assert_eq!(
+            timed["max_file_bytes"].as_u64().unwrap(),
+            crate::media::recording_reservation(
+                timed["bitrate"].as_str().unwrap(),
+                timed["duration_ms"].as_u64().unwrap()
+            )
+            .unwrap()
         );
         assert_eq!(contract["auto"]["settled"], json!(["stable", "limited"]));
     }

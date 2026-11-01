@@ -1,6 +1,6 @@
 #[cfg(feature = "jpeg")]
-use capturefab::jpeg;
-use capturefab::{
+use capturefab::testing::jpeg;
+use capturefab::testing::{
     frame,
     session::{SessionCommand, SessionHandle},
     shared_memory::SharedRing,
@@ -330,7 +330,7 @@ fn main() {
             || {
                 index += 1;
                 storage::save_bytes(
-                    &capturefab::frame::encode(&f, encoding).unwrap(),
+                    &capturefab::testing::frame::encode(&f, encoding).unwrap(),
                     &output.join(format!("{index}.{encoding}")),
                     &StoragePolicy::default(),
                 )
@@ -358,7 +358,7 @@ fn main() {
         let large = format!("storage/save_bytes/5MB/ledger{entries}");
         let mut save = || {
             index += 1;
-            let bytes = capturefab::frame::encode(&tiny, "raw").unwrap();
+            let bytes = capturefab::testing::frame::encode(&tiny, "raw").unwrap();
             storage::save_bytes(&bytes, &output.join(format!("{index}.raw")), &policy).unwrap();
             index
         };

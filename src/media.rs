@@ -947,90 +947,7 @@ pub(crate) fn ffmpeg_health() -> Result<FfmpegHealth> {
         version,
     })
 }
-/// How long a failed encoder listing is remembered before FFmpeg runs again.
-const ENCODER_RETRY: Duration = Duration::from_secs(60);
-/// What `encoder_names` learned from FFmpeg so far in this process.
-enum EncoderListing {
-    Unknown,
-    Listed(Arc<Vec<String>>),
-    Failed { at: Instant, error: String },
-}
-static ENCODER_NAMES: Mutex<EncoderListing> = Mutex::new(EncoderListing::Unknown);
 
-/// Names of the encoders in this FFmpeg build, such as `libx264` and
-/// `h264_videotoolbox`. FFmpeg runs once per process, with only `-encoders`;
-/// a failure is remembered for a minute, so callers that refresh often do
-/// not relaunch (or re-extract) a missing or broken FFmpeg each time.
-pub fn encoder_names() -> Result<Arc<Vec<String>>> {
-    listed_encoders(&ENCODER_NAMES, Instant::now(), || {
-        let exe = executable()?;
-        // Share the process/boot cache used by recording encoder probes.
-        let listing = encoder_listing(&exe)?;
-        let names = parse_encoder_names(&listing);
-        ensure!(!names.is_empty(), "FFmpeg listed no encoders");
-        Ok(names)
-    })
-}
-
-fn listed_encoders(
-    cache: &Mutex<EncoderListing>,
-    now: Instant,
-    list: impl FnOnce() -> Result<Vec<String>>,
-) -> Result<Arc<Vec<String>>> {
-    // Held while FFmpeg runs, so concurrent callers share one run.
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    match &*cache {
-        EncoderListing::Listed(names) => return Ok(names.clone()),
-        EncoderListing::Failed { at, error }
-            if now.saturating_duration_since(*at) < ENCODER_RETRY =>
-        {
-            bail!("{error}")
-        }
-        _ => {}
-    }
-    match list() {
-        Ok(names) => {
-            let names = Arc::new(names);
-            *cache = EncoderListing::Listed(names.clone());
-            Ok(names)
-        }
-        Err(error) => {
-            *cache = EncoderListing::Failed {
-                at: now,
-                error: format!("{error:#}"),
-            };
-            Err(error)
-        }
-    }
-}
-
-/// Encoder names from `ffmpeg -encoders` output: the second column of each
-/// row after the `------` line that ends the flag legend. Rows start with
-/// six or more capital-letter-or-dot flags, which skips stderr noise.
-fn parse_encoder_names(listing: &str) -> Vec<String> {
-    let separator = |line: &str| {
-        let line = line.trim();
-        !line.is_empty() && line.bytes().all(|b| b == b'-')
-    };
-    listing
-        .lines()
-        .skip_while(|line| !separator(line))
-        .skip(1)
-        .filter_map(|line| {
-            let mut columns = line.split_whitespace();
-            let (flags, name) = (columns.next()?, columns.next()?);
-            (flags.len() >= 6
-                && flags.bytes().all(|b| b == b'.' || b.is_ascii_uppercase())
-                && name
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'))
-            .then(|| name.to_owned())
-        })
-        .collect()
-}
-pub fn native_devices() -> Result<Value> {
-    native_devices_with_timeout(Duration::from_secs(8))
-}
 pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let _ = timeout;
@@ -2131,17 +2048,8 @@ fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
     }
 }
 /// How a host camera's connect error begins when the system refused access;
-/// `cli::error_code` and the desktop's settings shortcut both read it.
+/// `cli::error_code` reads it.
 pub const CAMERA_ACCESS_DENIED: &str = "camera access denied";
-
-/// Whether `error` says the system refused access to a host camera, however
-/// session or IPC layers prefixed it.
-pub fn is_camera_access_denied(error: &str) -> bool {
-    error
-        .lines()
-        .next()
-        .is_some_and(|line| line.to_ascii_lowercase().contains(CAMERA_ACCESS_DENIED))
-}
 
 fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> Option<String> {
     let lower = log.to_ascii_lowercase();
@@ -3471,37 +3379,11 @@ pub fn validate_encoder(codec: &str, encoder: &str) -> Result<()> {
 pub fn validate_bitrate(bitrate: &str) -> Result<()> {
     bits_per_second(bitrate).map(|_| ())
 }
-/// The bytes a recording at `bitrate` (such as `4M`) writes in `duration_ms`:
-/// bits per second times seconds, over 8, rounded up. Encoders overshoot and
-/// containers add a little; `recording_reservation` allows for both.
-pub fn estimate_recording_bytes(bitrate: &str, duration_ms: u64) -> Result<u64> {
-    Ok(estimated_bytes(bits_per_second(bitrate)?, duration_ms))
-}
 /// The `max_file_bytes` to reserve for a recording at `bitrate` that lasts
 /// `duration_ms`: the estimate plus 25% and 16 MiB, rounded up to a whole
 /// MiB. A recording stops when it outgrows its reservation, so err high.
 pub fn recording_reservation(bitrate: &str, duration_ms: u64) -> Result<u64> {
     Ok(reservation_bytes(bits_per_second(bitrate)?, duration_ms))
-}
-/// The longest recording at `bitrate`, in whole minutes (as milliseconds,
-/// at most 10 years), whose `recording_reservation` fits in
-/// `max_file_bytes`; 0 when not even one minute fits.
-pub fn max_duration_for(bitrate: &str, max_file_bytes: u64) -> Result<u64> {
-    const MINUTE: u64 = 60_000;
-    let bits = bits_per_second(bitrate)?;
-    let fits = |minutes: u64| reservation_bytes(bits, minutes * MINUTE) <= max_file_bytes;
-    // The reservation grows with the duration: find the last minute that
-    // fits. `low` is 0 or a count of minutes that fits.
-    let (mut low, mut high) = (0, crate::scheduling::MAX_DURATION_MS / MINUTE);
-    while low < high {
-        let middle = low + (high - low).div_ceil(2);
-        if fits(middle) {
-            low = middle;
-        } else {
-            high = middle - 1;
-        }
-    }
-    Ok(low * MINUTE)
 }
 fn estimated_bytes(bits_per_second: u64, duration_ms: u64) -> u64 {
     let bits = u128::from(bits_per_second) * u128::from(duration_ms);
@@ -4187,12 +4069,6 @@ fn encoder_output_options(encoder: &str, input: EncoderInput) -> Vec<String> {
         options.extend(["-hw_encoding", "1"].map(str::to_owned));
     }
     options
-}
-/// Check a forwarding URL or recording path without opening an encoder.
-pub fn validate_forward_output(output: &str) -> Result<()> {
-    output_args(output)?;
-    recording_output(output)?;
-    Ok(())
 }
 
 fn output_args(output: &str) -> Result<Vec<String>> {
@@ -5029,91 +4905,6 @@ mod tests {
 
     /// Trimmed `ffmpeg -hide_banner -encoders` output of FFmpeg 9.0.2 on
     /// macOS, with a stderr line appended as `bounded_output` does.
-    const ENCODER_LISTING: &str = "Encoders:
- V..... = Video
- A..... = Audio
- S..... = Subtitle
- .F.... = Frame-level multithreading
- ..S... = Slice-level multithreading
- ...X.. = Codec is experimental
- ....B. = Supports draw_horiz_band
- .....D = Supports direct rendering method 1
- ------
- V....D a64multi             Multicolor charset for Commodore 64 (codec a64_multi)
- V..... libsvtav1            SVT-AV1(Scalable Video Technology for AV1) encoder (codec av1)
- V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)
- V....D libx264rgb           libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 RGB (codec h264)
- V....D h264_videotoolbox    VideoToolbox H.264 Encoder (codec h264)
- V....D libx265              libx265 H.265 / HEVC (codec hevc)
- V....D hevc_videotoolbox    VideoToolbox H.265 Encoder (codec hevc)
- VFS..D mjpeg                MJPEG (Motion JPEG)
- V..X.D avui                 Avid Meridien Uncompressed
- A....D aac                  AAC (Advanced Audio Coding)
- A..... aac_at               aac (AudioToolbox) (codec aac)
- S..... dvbsub               DVB subtitles (codec dvb_subtitle)
-[warning] Some stderr line from FFmpeg
-";
-
-    #[test]
-    fn encoder_names_come_from_the_table_after_the_legend() {
-        assert_eq!(
-            parse_encoder_names(ENCODER_LISTING),
-            [
-                "a64multi",
-                "libsvtav1",
-                "libx264",
-                "libx264rgb",
-                "h264_videotoolbox",
-                "libx265",
-                "hevc_videotoolbox",
-                "mjpeg",
-                "avui",
-                "aac",
-                "aac_at",
-                "dvbsub"
-            ]
-        );
-        // Without the legend's end there is no table to read.
-        assert!(parse_encoder_names(" V....D libx264 libx264 H.264").is_empty());
-        assert!(parse_encoder_names("").is_empty());
-    }
-
-    #[test]
-    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
-    fn ffmpeg_encoder_names_list_the_build_once() {
-        let names = encoder_names().unwrap();
-        // The camera-focused payload keeps raw video; PNG stills use our
-        // native encoder and are not part of the bundled FFmpeg recipe.
-        assert!(names.iter().any(|name| name == "rawvideo"), "{names:?}");
-        assert!(Arc::ptr_eq(&names, &encoder_names().unwrap()));
-    }
-
-    #[test]
-    fn encoder_listing_is_kept_and_failures_retried_after_a_minute() {
-        let cache = Mutex::new(EncoderListing::Unknown);
-        let start = Instant::now();
-        let runs = std::cell::Cell::new(0);
-        let failing = || {
-            runs.set(runs.get() + 1);
-            Err(anyhow!("FFmpeg encoder query failed"))
-        };
-        let listing = || {
-            runs.set(runs.get() + 1);
-            Ok(vec!["libx264".to_string()])
-        };
-        let error = listed_encoders(&cache, start, failing).unwrap_err();
-        assert_eq!(error.to_string(), "FFmpeg encoder query failed");
-        // Within a minute the failure is answered without running FFmpeg.
-        let error = listed_encoders(&cache, start + Duration::from_secs(59), listing).unwrap_err();
-        assert_eq!(error.to_string(), "FFmpeg encoder query failed");
-        assert_eq!(runs.get(), 1);
-        let names = listed_encoders(&cache, start + ENCODER_RETRY, listing).unwrap();
-        assert_eq!(*names, ["libx264"]);
-        // A listing is kept for the rest of the process.
-        let again = listed_encoders(&cache, start + Duration::from_secs(3600), failing).unwrap();
-        assert!(Arc::ptr_eq(&names, &again));
-        assert_eq!(runs.get(), 2);
-    }
     use crate::genicam::NodeMap;
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -7424,14 +7215,14 @@ esac"#
         const MIB: u64 = 1024 * 1024;
         let hour = 3_600_000;
         // 4 Mbit/s for an hour is 1.8 GB, far above the default 512 MiB cap.
-        assert_eq!(estimate_recording_bytes("4M", hour).unwrap(), 1_800_000_000);
-        assert_eq!(estimate_recording_bytes("1", 1).unwrap(), 1);
-        assert_eq!(estimate_recording_bytes("4M", 0).unwrap(), 0);
+        assert_eq!(estimated_bytes(4_000_000, hour), 1_800_000_000);
+        assert_eq!(estimated_bytes(1, 1), 1);
+        assert_eq!(estimated_bytes(4_000_000, 0), 0);
         assert_eq!(
-            estimate_recording_bytes("4294967295", crate::scheduling::MAX_DURATION_MS).unwrap(),
+            estimated_bytes(4_294_967_295, crate::scheduling::MAX_DURATION_MS),
             169_423_574_885_865_000
         );
-        assert!(estimate_recording_bytes("4MM", hour).is_err());
+        assert!(recording_reservation("4MM", hour).is_err());
         // 1.8 GB plus 25% and 16 MiB is 2,266,777,216 bytes: 2162 MiB, rounded up.
         let reserved = recording_reservation("4M", hour).unwrap();
         assert_eq!(reserved, 2162 * MIB);
@@ -7443,26 +7234,6 @@ esac"#
             0
         );
         assert!(recording_reservation("", hour).is_err());
-    }
-    #[test]
-    fn the_longest_recording_that_fits_is_in_whole_minutes() {
-        let minute = 60_000;
-        // 4 Mbit/s reserves about 36 MiB a minute plus 16 MiB.
-        let longest = max_duration_for("4M", default_recording_cap()).unwrap();
-        assert_eq!(longest, 13 * minute);
-        assert!(recording_reservation("4M", longest).unwrap() <= default_recording_cap());
-        assert!(recording_reservation("4M", longest + minute).unwrap() > default_recording_cap());
-        let hour = recording_reservation("4M", 60 * minute).unwrap();
-        assert_eq!(max_duration_for("4M", hour).unwrap(), 60 * minute);
-        assert_eq!(max_duration_for("4M", hour - 1).unwrap(), 59 * minute);
-        // Not even a minute: the 16 MiB margin alone, or nothing.
-        assert_eq!(max_duration_for("4M", 16 * 1024 * 1024).unwrap(), 0);
-        assert_eq!(max_duration_for("4M", 0).unwrap(), 0);
-        assert_eq!(
-            max_duration_for("1", u64::MAX).unwrap(),
-            crate::scheduling::MAX_DURATION_MS
-        );
-        assert!(max_duration_for("fast", u64::MAX).is_err());
     }
     #[test]
     fn host_cameras_are_named_by_their_operating_system_scheme() {
@@ -8381,14 +8152,9 @@ Error opening input files: Input/output error
             ("v4l2:/dev/video0", "Permission denied"),
         ] {
             let denied = native_failure(log, false, source, timeout).unwrap();
-            assert!(is_camera_access_denied(&denied), "{denied}");
-            assert!(is_camera_access_denied(&format!(
-                "connect avfoundation:0: {denied}\nmore detail"
-            )));
+            assert!(denied.starts_with(CAMERA_ACCESS_DENIED), "{denied}");
+            assert_eq!(crate::cli::error_code(&anyhow!(denied)).1, 3);
         }
-        assert!(!is_camera_access_denied(
-            "camera is in use by another application"
-        ));
         let blocked = native_failure(
             "[dshow @ 000001b5e2a6c3c0] Could not run graph (sometimes caused by a device already in use by other application)\n[in#0 @ 000001b5e2a6c000] Error opening input: I/O error\n",
             false,
@@ -8396,11 +8162,10 @@ Error opening input files: Input/output error
             timeout,
         )
         .unwrap();
-        assert!(is_camera_access_denied(&blocked), "{blocked}");
+        assert!(blocked.contains(CAMERA_ACCESS_DENIED), "{blocked}");
         assert!(blocked.contains("in use by another application"));
         assert!(blocked.contains("Privacy & security > Camera"));
         assert_eq!(crate::cli::error_code(&anyhow!(blocked)).1, 3);
-        assert!(!is_camera_access_denied("timed out\ncamera access denied"));
         assert_eq!(
             failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot Use FaceTime HD Camera").unwrap(),
             "camera is in use by another application"

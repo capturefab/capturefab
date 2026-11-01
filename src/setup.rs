@@ -354,10 +354,6 @@ impl Summary {
             reason: Some(printable(reason)),
         }
     }
-    /// True for a setup the store can read.
-    pub fn readable(&self) -> bool {
-        self.status.is_none()
-    }
 }
 
 /// `text` without control characters, bounded, for a reason taken from a
@@ -1158,25 +1154,6 @@ impl Store {
             .into());
         }
         Ok(setup)
-    }
-    /// Every saved setup `get` would open, in name order, with the names
-    /// of the files it would refuse.
-    pub fn load(&self) -> Result<(Vec<Setup>, Vec<String>)> {
-        let mut setups = Vec::new();
-        let mut unreadable = Vec::new();
-        for path in self.files()? {
-            match stem(&path).map(|name| self.read_named(&path, name)) {
-                Some(Ok(setup)) => setups.push(setup),
-                None => continue,
-                Some(Err(_)) => unreadable.push(
-                    path.file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                        .unwrap_or_default(),
-                ),
-            }
-        }
-        setups.sort_by_key(|setup| setup.name.to_ascii_lowercase());
-        Ok((setups, unreadable))
     }
     /// The saved setup, or an `unavailable` error suggesting a close name.
     pub fn get(&self, name: &str) -> Result<Setup> {
@@ -2097,7 +2074,13 @@ mod tests {
             .import(&store.dir().join("other.json"), Some("other"), true)
             .unwrap();
         assert_eq!(store.get("other").unwrap().name, "other");
-        assert!(store.list().unwrap().iter().all(Summary::readable));
+        assert!(
+            store
+                .list()
+                .unwrap()
+                .iter()
+                .all(|summary| summary.status.is_none())
+        );
         fs::copy(&bench, store.dir().join("other.json")).unwrap();
         // Deleting other removes other.json and says so; bench stays.
         assert_eq!(store.remove("other").unwrap().name, "other");
@@ -2188,7 +2171,7 @@ mod tests {
         json["note"] = serde_json::json!("a\tb\nc");
         fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
         let list = store.list().unwrap();
-        assert!(list[0].readable(), "{list:?}");
+        assert!(list[0].status.is_none(), "{list:?}");
         assert_eq!(list[0].note.as_deref(), Some("a b c"));
         assert_eq!(store.get("tabbed").unwrap().note.as_deref(), Some("a b c"));
         // A new file with one is still refused.

@@ -517,13 +517,6 @@ impl Logins {
             store: can_remember().then_some(store),
         }
     }
-    /// The index alone, for listing without any credential store.
-    pub fn index_only(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            dir: dir.into(),
-            store: None,
-        }
-    }
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -636,9 +629,6 @@ impl Logins {
             .logins
             .into_iter()
             .find(|entry| entry.address == address))
-    }
-    pub fn is_saved(&self, address: &str) -> Result<bool> {
-        Ok(self.entry(address)?.is_some())
     }
     /// Save a sign-in that worked. The secret is written first; when the
     /// index cannot be written the previous secret is restored.
@@ -854,14 +844,16 @@ mod tests {
             "ad%20min%3A1%40x@onvif:http://192.168.1.64:80/onvif/device_service"
         );
         assert_eq!(encode("a-z_A.Z~09 /é"), "a-z_A.Z~09%20%2F%C3%A9");
-        let (logins, store) = logins("pinned");
-        logins
-            .save(&address, &CameraLogin::new("user", "secret").unwrap())
-            .unwrap();
-        assert_eq!(
-            store.secrets.lock().unwrap().keys().collect::<Vec<_>>(),
-            ["user@rtsp://host:554/path"]
-        );
+        if can_remember() {
+            let (logins, store) = logins("pinned");
+            logins
+                .save(&address, &CameraLogin::new("user", "secret").unwrap())
+                .unwrap();
+            assert_eq!(
+                store.secrets.lock().unwrap().keys().collect::<Vec<_>>(),
+                ["user@rtsp://host:554/path"]
+            );
+        }
     }
 
     #[test]
@@ -1096,30 +1088,13 @@ mod tests {
     }
 
     #[test]
-    fn an_index_only_handle_lists_but_never_saves() {
-        let logins = Logins::index_only(temp("index-only"));
-        assert!(logins.list().unwrap().is_empty());
-        assert!(matches!(
-            logins.remembered("rtsp://cam:554/x").unwrap(),
-            Remembered::None
-        ));
-        let error = logins
-            .save("rtsp://cam:554/x", &CameraLogin::new("a", "b").unwrap())
-            .unwrap_err();
-        assert_eq!(crate::cli::error_code(&error), ("unsupported", 5));
-        assert_eq!(
-            crate::cli::error_code(&logins.forget("rtsp://cam:554/x").unwrap_err()),
-            ("unsupported", 5)
-        );
-    }
-
-    #[test]
     fn oversized_or_unknown_indexes_are_refused() {
         let dir = temp("oversized");
         crate::ipc::ensure_private_dir(&dir).unwrap();
+        let logins = Logins::with(dir.clone(), Arc::new(MemoryStore::default()));
         fs::write(dir.join(INDEX), vec![b' '; MAX_FILE + 1]).unwrap();
-        assert!(Logins::index_only(&dir).list().is_err());
+        assert!(logins.list().is_err());
         fs::write(dir.join(INDEX), r#"{"version":2,"logins":[]}"#).unwrap();
-        assert!(Logins::index_only(&dir).list().is_err());
+        assert!(logins.list().is_err());
     }
 }
