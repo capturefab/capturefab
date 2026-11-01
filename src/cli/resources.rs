@@ -76,8 +76,8 @@ pub fn run(command: Option<&ResourcesCommand>) -> Result<Value> {
         }
         _ => {}
     }
-    // A short-lived CLI needs two host CPU observations; the desktop and
-    // server already have a continuing sampler. Never invent a zero load.
+    // A short-lived CLI needs two host CPU observations; a serve session
+    // already has a continuing sampler. Never invent a zero load.
     if resources::host::sample().cpu_percent.is_none() {
         std::thread::sleep(std::time::Duration::from_millis(1010));
     }

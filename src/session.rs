@@ -45,12 +45,12 @@ pub enum SessionCommand {
     Connect {
         camera: String,
         timeout_ms: u64,
-        /// A camera sign-in sent beside a credential-free selector. Local
-        /// IPC and the worker pipe only: the remote API refuses it.
+        /// A camera sign-in sent beside a credential-free selector, over local
+        /// IPC and the worker pipe.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         login: Option<crate::logins::CameraLogin>,
         /// Whether the worker may use a sign-in saved on this host when no
-        /// `login` is sent. Assistant connects send false.
+        /// `login` is sent.
         #[serde(default = "yes", skip_serializing_if = "is_true")]
         saved_login: bool,
     },
@@ -79,9 +79,9 @@ pub enum SessionCommand {
     Undo,
     /// Reapply the last reverted change on the addressed camera.
     Redo,
-    /// Replay a specific acknowledged checkpoint, used by the GUI's shared
-    /// timeline. Tokens are tied to a worker lifetime and cannot target a
-    /// replacement connection accidentally.
+    /// Replay a specific acknowledged checkpoint. Tokens are tied to a
+    /// worker lifetime and cannot target a replacement connection
+    /// accidentally.
     ReplayCameraChange {
         token: String,
         undo: bool,
@@ -126,8 +126,8 @@ pub enum SessionCommand {
         /// each `{feature, at}` or a bare feature name, which confirms only
         /// a value without banks. When given, the worker refuses, before
         /// any write, a restore whose fresh comparison makes another
-        /// disruptive change. Absent, no confirmation is checked (RPC and
-        /// workflow callers).
+        /// disruptive change. Absent, no confirmation is checked (RPC
+        /// callers).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confirmed_disruptive: Option<Vec<crate::setup::Confirmed>>,
     },
@@ -250,114 +250,6 @@ pub enum SessionCommand {
     StopForwardIf {
         forwarding_id: String,
     },
-    /// Open or create the session's dataset catalog (one .duckdb file).
-    DatasetOpen {
-        path: String,
-        #[serde(default)]
-        mode: crate::dataset::OpenMode,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        max_bytes: Option<u64>,
-    },
-    DatasetClose,
-    DatasetStatus,
-    /// Add a timestamped note to the open dataset.
-    DatasetNote {
-        text: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        context: crate::context::Context,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        camera: Option<String>,
-    },
-    /// One read-only SELECT on the open dataset.
-    DatasetQuery {
-        sql: String,
-        #[serde(default = "crate::dataset::default_query_limit")]
-        limit: u32,
-        #[serde(default)]
-        timeout_ms: u64,
-    },
-    /// Write data files, manifest.json and README.md into a new folder.
-    DatasetExport {
-        output: String,
-        #[serde(default)]
-        formats: Vec<crate::dataset::ExportFormat>,
-        #[serde(default)]
-        tables: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        since_ms: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        until_ms: Option<u64>,
-        #[serde(default)]
-        storage: crate::storage::StoragePolicy,
-        /// Copy captured images (and recordings) into the export.
-        #[serde(default, skip_serializing_if = "crate::dataset::MediaExport::is_none")]
-        media: crate::dataset::MediaExport,
-        /// Group copied files in folders named after this capture tag.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        group_by: Option<String>,
-    },
-    /// Open only while the coordinator still has the approved dataset slot.
-    DatasetOpenIf {
-        expected_slot_id: Option<String>,
-        path: String,
-        #[serde(default)]
-        mode: crate::dataset::OpenMode,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        max_bytes: Option<u64>,
-    },
-    /// Close only the exact open instance that was approved.
-    DatasetCloseIf {
-        slot_id: String,
-    },
-    DatasetNoteIf {
-        slot_id: String,
-        text: String,
-        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        context: crate::context::Context,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        camera: Option<String>,
-    },
-    /// Read an approved open instance, bounding the complete JSON response.
-    DatasetQueryIf {
-        slot_id: String,
-        sql: String,
-        #[serde(default = "crate::dataset::default_query_limit")]
-        limit: u32,
-        #[serde(default)]
-        timeout_ms: u64,
-        max_result_bytes: u32,
-    },
-    /// Run model SQL only after protected metadata has been projected into a
-    /// bounded private snapshot of the approved open instance.
-    DatasetModelQueryIf {
-        slot_id: String,
-        sql: String,
-        #[serde(default = "crate::dataset::default_query_limit")]
-        limit: u32,
-        #[serde(default)]
-        timeout_ms: u64,
-        max_result_bytes: u32,
-    },
-    /// Export an approved open instance within a finite byte/time allowance.
-    DatasetExportIf {
-        slot_id: String,
-        output: String,
-        /// Canonical capture root pinned by the checked tool at review time.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        approved_root: Option<String>,
-        #[serde(default)]
-        formats: Vec<crate::dataset::ExportFormat>,
-        #[serde(default)]
-        tables: Vec<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        since_ms: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        until_ms: Option<u64>,
-        #[serde(default)]
-        storage: crate::storage::StoragePolicy,
-        max_bytes: u64,
-        timeout_ms: u64,
-    },
 }
 /// One feature assignment of `SetMany`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,8 +287,6 @@ pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
                     | "features"
                     | "xml"
                     | "stop_forward"
-                    | "dataset_close"
-                    | "dataset_status"
                     | "read_setup"
             )
         })
@@ -705,44 +595,14 @@ impl SessionCommand {
                 }
                 .validate()?;
             }
-            Self::DatasetOpen { .. }
-            | Self::DatasetClose
-            | Self::DatasetStatus
-            | Self::DatasetNote { .. }
-            | Self::DatasetQuery { .. }
-            | Self::DatasetExport { .. }
-            | Self::DatasetOpenIf { .. }
-            | Self::DatasetCloseIf { .. }
-            | Self::DatasetNoteIf { .. }
-            | Self::DatasetQueryIf { .. }
-            | Self::DatasetModelQueryIf { .. }
-            | Self::DatasetExportIf { .. } => crate::dataset::validate_command(self)?,
             _ => {}
         }
         Ok(())
     }
-    /// Commands the coordinator answers itself, without a camera worker.
-    pub fn is_dataset(&self) -> bool {
-        matches!(
-            self,
-            Self::DatasetOpen { .. }
-                | Self::DatasetClose
-                | Self::DatasetStatus
-                | Self::DatasetNote { .. }
-                | Self::DatasetQuery { .. }
-                | Self::DatasetExport { .. }
-                | Self::DatasetOpenIf { .. }
-                | Self::DatasetCloseIf { .. }
-                | Self::DatasetNoteIf { .. }
-                | Self::DatasetQueryIf { .. }
-                | Self::DatasetModelQueryIf { .. }
-                | Self::DatasetExportIf { .. }
-        )
-    }
 }
 /// How long a client waits for the session to answer `command` unless told
 /// otherwise: a minute, or longer for commands whose own timeouts or work
-/// can exceed it (multi-frame captures, exports).
+/// can exceed it (multi-frame captures, setup restores).
 pub fn default_request_timeout(command: &SessionCommand) -> Duration {
     Duration::from_millis(match command {
         SessionCommand::Capture {
@@ -753,19 +613,9 @@ pub fn default_request_timeout(command: &SessionCommand) -> Duration {
         // Waiting for the camera's turn, or starting a stopped camera and
         // settling its auto exposure, can outlast the frame wait itself.
         SessionCommand::Frame { timeout_ms, .. } => timeout_ms.saturating_add(15_000),
-        SessionCommand::DatasetExport { .. } => 600_000,
         // The worker bounds the writes to 90 s; a rollback may take as long,
         // and restarting the stream follows.
         SessionCommand::ApplySetup { .. } => 240_000,
-        SessionCommand::DatasetExportIf { timeout_ms, .. } => timeout_ms.saturating_add(10_000),
-        SessionCommand::DatasetQuery { timeout_ms, .. }
-        | SessionCommand::DatasetQueryIf { timeout_ms, .. }
-        | SessionCommand::DatasetModelQueryIf { timeout_ms, .. } => (if *timeout_ms == 0 {
-            30_000
-        } else {
-            *timeout_ms
-        })
-        .saturating_add(10_000),
         _ => 60_000,
     })
 }
@@ -1175,9 +1025,6 @@ pub struct SessionSnapshot {
     pub transport: Option<crate::types::TransportStats>,
     #[serde(default)]
     pub history: CameraHistoryStatus,
-    /// The session's open dataset catalog.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dataset: Option<crate::dataset::DatasetStatus>,
 }
 impl SessionSnapshot {
     /// Project one participant's local view without changing shared selection.
@@ -1279,7 +1126,6 @@ fn addressed_status(
         json!(snapshot.activity_revision),
     );
     fields.insert("logs".into(), serde_json::to_value(&snapshot.logs)?);
-    fields.insert("dataset".into(), serde_json::to_value(&snapshot.dataset)?);
     Ok(camera_state)
 }
 type Reply = Receiver<Result<Value>>;
@@ -1369,7 +1215,8 @@ struct WorkerReply<'a> {
     snapshot: &'a SessionSnapshot,
     #[serde(skip_serializing_if = "Kept::is_nothing")]
     kept: Kept,
-    /// Files saved since the previous reply, for the coordinator's dataset.
+    /// Files saved since the previous reply. The coordinator does not read
+    /// them; draining the worker's log in every reply keeps it bounded.
     #[serde(skip_serializing_if = "crate::engine::saved::SavedBatch::is_empty")]
     saved: crate::engine::saved::SavedBatch,
 }
@@ -1388,8 +1235,6 @@ struct ParentReply<S = SessionSnapshot> {
     snapshot: Option<S>,
     #[serde(default)]
     kept: Kept,
-    #[serde(default)]
-    saved: crate::engine::saved::SavedBatch,
 }
 /// What a reply leaves out because the previous reply on the same pipe
 /// already carried it: features, camera history, and the log lines the
@@ -1527,8 +1372,6 @@ impl Report {
         })
     }
 }
-/// Saved files a worker reported more than this many of are counted as lost.
-const SAVED_CAP: usize = 100_000;
 struct Process {
     child: Child,
     input: ChildStdin,
@@ -1543,16 +1386,11 @@ struct Process {
     revision: Arc<AtomicU64>,
     /// The efficiency setting the worker was last given.
     efficiency: crate::efficiency::Mode,
-    /// Saved files reported by the worker, not yet given to the dataset.
-    saved: Vec<crate::engine::saved::SavedFile>,
-    saved_camera: Option<crate::engine::saved::SavedCamera>,
-    saved_seq: u64,
-    saved_gaps: u64,
 }
 // Linux can briefly refuse exec after a newly written helper was closed,
 // including while another process is completing a concurrent fork/exec. No
 // child was started on ETXTBSY, so retry only that error for a bounded time.
-#[cfg(any(feature = "gui", feature = "nvjpeg", feature = "vaapi"))]
+#[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
 pub(crate) fn spawn_helper(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::Child> {
@@ -1648,10 +1486,6 @@ impl Process {
             quiet: false,
             revision,
             efficiency,
-            saved: Vec::new(),
-            saved_camera: None,
-            saved_seq: 0,
-            saved_gaps: 0,
         })
     }
     fn call(&mut self, command: SessionCommand) -> Result<Value> {
@@ -1706,7 +1540,7 @@ impl Process {
         if status && !full && self.quiet && data == self.reply {
             return Ok(None);
         }
-        let mut reply = match serde_json::from_slice::<ParentReply>(&data) {
+        let reply = match serde_json::from_slice::<ParentReply>(&data) {
             Ok(reply) => reply,
             Err(e) => {
                 eprintln!("capturefab: ignoring unreadable worker snapshot: {e}");
@@ -1719,12 +1553,9 @@ impl Process {
                     code: reply.code,
                     snapshot: None,
                     kept: Kept::default(),
-                    saved: reply.saved,
                 }
             }
         };
-        // Before the ok check: a failed command may already have saved files.
-        self.keep_saved(std::mem::take(&mut reply.saved));
         if let Some(snapshot) = reply.snapshot {
             self.quiet =
                 reply.ok && reply.kept.features && reply.kept.history && snapshot.logs.is_empty();
@@ -1749,45 +1580,6 @@ impl Process {
         let preview_skipped = u64::from(self.feed.counters.preview_skipped());
         self.report.camera(self.child.id(), preview_skipped)
     }
-    fn keep_saved(&mut self, batch: crate::engine::saved::SavedBatch) {
-        if let Some(camera) = batch.camera {
-            self.saved_camera = Some(camera);
-        }
-        // Entries the worker dropped are the oldest, so the jump to the next
-        // item's sequence number counts them; `batch.lost` would count twice.
-        for item in batch.items {
-            // Sequence numbers increase by one; a jump means lost entries.
-            self.saved_gaps += item.seq.saturating_sub(self.saved_seq + 1);
-            self.saved_seq = self.saved_seq.max(item.seq);
-            if self.saved.len() >= SAVED_CAP {
-                self.saved_gaps += 1;
-            } else {
-                self.saved.push(item);
-            }
-        }
-    }
-    /// Ask the worker until its saved-file log is empty; each reply drains a
-    /// bounded number of entries.
-    fn drain_saved(&mut self) {
-        for _ in 0..64 {
-            let before = self.saved_seq;
-            if self.exchange(SessionCommand::Status).is_err() || self.saved_seq == before {
-                break;
-            }
-        }
-    }
-    /// Saved files and missed-entry count collected since the last call.
-    fn take_saved(&mut self) -> (crate::engine::saved::SavedBatch, u64) {
-        let batch = crate::engine::saved::SavedBatch {
-            camera: self
-                .saved_camera
-                .clone()
-                .or_else(|| self.report.snapshot.connected.as_ref().map(Into::into)),
-            items: std::mem::take(&mut self.saved),
-            lost: 0,
-        };
-        (batch, std::mem::take(&mut self.saved_gaps))
-    }
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -1808,7 +1600,6 @@ impl Drop for Process {
     }
 }
 struct Coordinator {
-    analytics: crate::analytics::Analytics,
     started: Instant,
     state: RwLock<SessionSnapshot>,
     workers: RwLock<BTreeMap<String, Arc<Mutex<Process>>>>,
@@ -1831,11 +1622,9 @@ struct Coordinator {
     revision: Arc<AtomicU64>,
     log: Mutex<SessionLog>,
     activity: Arc<activity::Activity>,
-    dataset: Arc<crate::dataset::Slot>,
 }
 impl Drop for Coordinator {
     fn drop(&mut self) {
-        self.dataset.close_quiet();
         // The poller holds only a Weak; wake it so it exits now, not next tick.
         if let Some(poller) = self.poller.get() {
             poller.unpark();
@@ -1966,12 +1755,6 @@ fn poll_pace(workers: bool, quick: bool, efficient: bool) -> (u8, Option<Duratio
 #[derive(Clone)]
 pub struct SessionHandle {
     inner: Arc<Coordinator>,
-    /// A permission on this client handle, inherited by its command tasks.
-    /// Remote clients opt in separately from local IPC/GUI clients.
-    allow_hub_connect: bool,
-    /// Whether cameras may open with a sign-in saved on this host. Remote
-    /// clients opt in with `serve --allow-saved-sign-ins`.
-    allow_saved_logins: bool,
 }
 impl Default for SessionHandle {
     fn default() -> Self {
@@ -1981,10 +1764,7 @@ impl Default for SessionHandle {
 impl SessionHandle {
     pub fn new() -> Self {
         let h = Self {
-            allow_hub_connect: true,
-            allow_saved_logins: true,
             inner: Arc::new(Coordinator {
-                analytics: crate::analytics::Analytics::new(),
                 started: Instant::now(),
                 state: RwLock::new(SessionSnapshot::default()),
                 workers: RwLock::new(BTreeMap::new()),
@@ -2001,7 +1781,6 @@ impl SessionHandle {
                 revision: Arc::default(),
                 log: Mutex::default(),
                 activity: Arc::new(activity::Activity::default()),
-                dataset: Arc::new(crate::dataset::Slot::new()),
             }),
         };
         let weak = Arc::downgrade(&h.inner);
@@ -2020,11 +1799,7 @@ impl SessionHandle {
                     if inner.quitting.load(Ordering::Acquire) {
                         break;
                     }
-                    let h = Self {
-                        inner,
-                        allow_hub_connect: true,
-                        allow_saved_logins: true,
-                    };
+                    let h = Self { inner };
                     h.refresh_workers();
                     h.store_snapshot();
                     wait = h.next_poll();
@@ -2105,10 +1880,6 @@ impl SessionHandle {
             .write()
             .unwrap_or_else(PoisonError::into_inner)
     }
-    pub(crate) fn without_hub_connect(mut self) -> Self {
-        self.allow_hub_connect = false;
-        self
-    }
     fn loose_camera(&self, camera: String) -> String {
         if crate::camera::is_explicit_selector(&camera) {
             return camera;
@@ -2137,38 +1908,6 @@ impl SessionHandle {
             _ => camera,
         }
     }
-    pub(crate) fn deny_saved_logins(mut self) -> Self {
-        self.allow_saved_logins = false;
-        self
-    }
-    /// Refuse a camera whose sign-in is saved on this host when this client
-    /// may not use saved sign-ins. Reads only the index.
-    fn check_saved_login_connect(&self, camera: &str) -> Result<()> {
-        if self.allow_saved_logins {
-            return Ok(());
-        }
-        let Ok(key) = crate::logins::key(camera) else {
-            return Ok(());
-        };
-        if crate::logins::Logins::system()
-            .is_saved(&key.address)
-            .unwrap_or(true)
-        {
-            return Err(crate::types::Usage(
-                "this camera uses a sign-in saved on this host; start serve with --allow-saved-sign-ins"
-                    .into(),
-            )
-            .into());
-        }
-        Ok(())
-    }
-    fn check_hub_connect(&self, camera: &str) -> Result<()> {
-        ensure!(
-            self.allow_hub_connect || !crate::hubs::is_source(camera),
-            "hub cameras cannot be opened through the remote API; start serve with --allow-hubs to allow it"
-        );
-        Ok(())
-    }
     /// Refresh every idle worker's snapshot; busy workers report on their reply.
     fn refresh_workers(&self) {
         let workers = self.workers();
@@ -2185,10 +1924,6 @@ impl SessionHandle {
                     "camera worker exited before schedule completed",
                 );
             }
-            let (batch, gaps) = p.take_saved();
-            // Never hold a worker lock across DuckDB.
-            drop(p);
-            self.inner.dataset.record_saved(batch, gaps);
         }
     }
     /// Give a connected worker's frames and status to the session.
@@ -2341,7 +2076,6 @@ impl SessionHandle {
         let activity = self.inner.activity.snapshot();
         state.activity = activity.activity;
         state.activity_revision = activity.revision;
-        state.dataset = self.inner.dataset.status_cached();
         project_selected(&mut state);
         let log = locked(&self.inner.log);
         state.logs = log.lines();
@@ -2661,8 +2395,7 @@ impl SessionHandle {
         if matches!(
             command,
             SessionCommand::Status | SessionCommand::Activity { .. }
-        ) || command.is_dataset()
-        {
+        ) {
             return None;
         }
         let target = match command {
@@ -2728,8 +2461,7 @@ impl SessionHandle {
                     | SessionCommand::NetworkScan { .. }
                     | SessionCommand::Select { .. }
                     | SessionCommand::Status
-            ) || command.is_dataset()
-            {
+            ) {
                 None
             } else {
                 self.inner
@@ -3049,9 +2781,6 @@ impl SessionHandle {
             SessionCommand::NetworkScan { timeout_ms } => {
                 self.scan_network(Duration::from_millis(timeout_ms), origin, &actor)
             }
-            command if command.is_dataset() => {
-                crate::dataset::coordinator::run(&self.inner.dataset, command)
-            }
             // Both read the snapshot this request stores, without building another.
             SessionCommand::Status if target.is_some() => {
                 self.target(target)?;
@@ -3139,8 +2868,8 @@ impl SessionHandle {
                 // under.
                 let camera = self.onvif_alias(camera);
                 // A unique loose name ("C920") among cached cameras becomes
-                // that camera's ID, so connected workers and the permission
-                // check below see one identity. Hub cameras never match.
+                // that camera's ID, so connected workers see one identity.
+                // Hub cameras never match.
                 let camera = self.loose_camera(camera);
                 if login.is_some() && crate::logins::key(&camera).is_err() {
                     return Err(crate::types::Usage(
@@ -3148,11 +2877,6 @@ impl SessionHandle {
                     )
                     .into());
                 }
-                // Discovery and queued commands can change aliases after
-                // the HTTP server validates a request. Enforce the client's
-                // permission on the identity actually being connected.
-                self.check_hub_connect(&camera)?;
-                self.check_saved_login_connect(&camera)?;
                 if let Some(connected) = self.connected_hub_camera(&camera)? {
                     return Ok(connected);
                 }
@@ -3164,10 +2888,6 @@ impl SessionHandle {
                         .connected
                         .clone()
                         .context("worker has no camera")?;
-                    self.check_hub_connect(&info.id)?;
-                    // A camera the desktop opened with a saved password is
-                    // not handed to a client that may not use one.
-                    self.check_saved_login_connect(&info.id)?;
                     self.edit_state().active_camera = Some(info.id.clone());
                     return Ok(json!({"connected":info,"worker_pid":p.child.id()}));
                 }
@@ -3201,8 +2921,7 @@ impl SessionHandle {
                     camera,
                     timeout_ms,
                     login,
-                    // Belt and braces: the index can change between checks.
-                    saved_login: saved_login && self.allow_saved_logins,
+                    saved_login,
                 })?;
                 let info = p
                     .report
@@ -3245,53 +2964,19 @@ impl SessionHandle {
                     .id
                     .clone();
                 drop(p);
-                let mut final_snapshot = self.assemble().0;
                 let mut p = w.lock().unwrap_or_else(|e| e.into_inner());
-                let result = p.call(SessionCommand::Disconnect);
-                // The worker exits once dropped; collect what it still holds,
-                // keeping the disconnect reply's final counters.
-                let disconnected = p.report.snapshot.clone();
-                p.drain_saved();
-                p.report.snapshot = disconnected;
-                let (batch, gaps) = p.take_saved();
-                let result = match result {
-                    Ok(result) => result,
-                    Err(e) => {
-                        drop(p);
-                        self.inner.dataset.record_saved(batch, gaps);
-                        return Err(e);
-                    }
-                };
+                let result = p.call(SessionCommand::Disconnect)?;
                 self.inner.activity.cancel_jobs(
                     Some(&id),
                     Some(p.child.id()),
                     "camera disconnected before schedule completed",
                 );
-                // The disconnect reply carries the final counters but clears
-                // the camera identity. Preserve that identity so even a stream
-                // shorter than a status poll contributes all its activity.
-                if let Some(camera) = final_snapshot.cameras.iter_mut().find(|c| c.info.id == id) {
-                    camera.frames = p.report.snapshot.frames;
-                    camera.received_bytes = p.report.snapshot.received_bytes;
-                    camera.preview_skipped = u64::from(p.feed.counters.preview_skipped());
-                    camera.dropped = p
-                        .report
-                        .snapshot
-                        .dropped
-                        .saturating_add(camera.preview_skipped);
-                    camera.lost = frames_lost(&p.report.snapshot);
-                    camera.streaming = false;
-                    camera.fps = 0.0;
-                    camera.stale = false;
-                }
                 // Its last lines, such as why it stopped, stay in the session log.
                 let mut log = locked(&self.inner.log);
                 log.take(&p.report.log);
                 log.forget(p.report.log.source);
                 drop(log);
                 drop(p);
-                self.inner.dataset.record_saved(batch, gaps);
-                self.inner.analytics.observe_final(&final_snapshot);
                 self.inner
                     .feeds
                     .write()
@@ -3322,7 +3007,7 @@ impl SessionHandle {
             command => {
                 let w = self.target(target)?;
                 let schedule = matches!(command, SessionCommand::Schedule { .. });
-                let (result, (batch, gaps), fresh) = {
+                let (result, fresh) = {
                     let mut worker = w.lock().unwrap_or_else(|e| e.into_inner());
                     let mut result = worker.call(command);
                     if schedule
@@ -3331,9 +3016,8 @@ impl SessionHandle {
                     {
                         fields.insert("worker_pid".into(), json!(worker.child.id()));
                     }
-                    (result, worker.take_saved(), worker.camera())
+                    (result, worker.camera())
                 };
-                self.inner.dataset.record_saved(batch, gaps);
                 self.store_snapshot_with(fresh);
                 result
             }
@@ -3379,11 +3063,7 @@ impl SessionHandle {
                     .unwrap_or(u64::MAX)
                     .clamp(1, 60_000),
             };
-            let (grabbed, (batch, gaps)) = {
-                let mut p = locked(&w);
-                (p.call(grab), p.take_saved())
-            };
-            self.inner.dataset.record_saved(batch, gaps);
+            let grabbed = locked(&w).call(grab);
             self.store_snapshot();
             let grabbed = grabbed.map_err(|error| grab_failed(error, &info.id, timeout))?;
             let notes = if grabbed["auto_settled"] == false {
@@ -3437,7 +3117,6 @@ impl SessionHandle {
             *entry = fresh;
             project_selected(&mut snapshot);
         }
-        self.inner.analytics.observe(&snapshot);
         if snapshot.cameras.iter().any(|camera| camera.streaming) {
             self.hurry(SLOW);
         }
@@ -3462,15 +3141,7 @@ impl SessionHandle {
         }
         *state = snapshot;
     }
-    pub fn analytics(&self) -> &crate::analytics::Analytics {
-        &self.inner.analytics
-    }
-    /// The session's dataset catalog slot.
-    pub fn dataset(&self) -> &Arc<crate::dataset::Slot> {
-        &self.inner.dataset
-    }
-    /// Before workers are dropped: stop recordings cleanly and catalog the
-    /// files every worker still holds.
+    /// Before workers are dropped: stop recordings cleanly.
     fn finalize_workers(&self) {
         for (id, w) in self.workers() {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -3486,7 +3157,7 @@ impl SessionHandle {
             };
             let Some(mut p) = guard else {
                 eprintln!(
-                    "capturefab: camera {id} stayed busy; its last saved files may not be cataloged"
+                    "capturefab: camera {id} stayed busy; a recording on it may not be finalized"
                 );
                 continue;
             };
@@ -3495,10 +3166,6 @@ impl SessionHandle {
             {
                 eprintln!("capturefab: stop recording on {id}: {e:#}");
             }
-            p.drain_saved();
-            let (batch, gaps) = p.take_saved();
-            drop(p);
-            self.inner.dataset.record_saved(batch, gaps);
         }
     }
     pub fn uptime_seconds(&self) -> f64 {
@@ -3509,8 +3176,8 @@ impl SessionHandle {
     }
     pub fn shutdown(&self) {
         if self.inner.quitting.swap(true, Ordering::AcqRel) {
-            // Another thread (a Ctrl-C handler) is finishing recordings and
-            // the dataset; returning now would let the process exit first.
+            // Another thread (a Ctrl-C handler) is finishing recordings;
+            // returning now would let the process exit first.
             let (done, finished) = &self.inner.shut_down;
             let _ = finished
                 .wait_timeout_while(locked(done), Duration::from_secs(30), |done| !*done)
@@ -3533,7 +3200,6 @@ impl SessionHandle {
             .cancel_jobs(None, None, "session stopped before schedule completed");
         self.wake();
         self.finalize_workers();
-        self.inner.dataset.close_quiet();
         for feed in self
             .inner
             .feeds
@@ -3715,11 +3381,6 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
 
 #[cfg(test)]
 impl SessionHandle {
-    /// Forget that anyone looked, as three seconds without a look would.
-    #[cfg(feature = "gui")]
-    pub(crate) fn unwatch(&self) {
-        self.inner.watched.store(0, Ordering::Relaxed);
-    }
     /// A session whose selected camera, "cam", is fed by a ring without a
     /// worker, and that ring's writer, for tests of frame consumers.
     pub(crate) fn fed(capacity: usize) -> (Self, SharedRing) {
@@ -3764,29 +3425,6 @@ mod tests {
         );
     }
     #[test]
-    fn remote_hub_permission_is_checked_after_a_queued_alias_is_resolved() {
-        let handle = SessionHandle::new();
-        let remote = handle.clone().without_hub_connect();
-        let command = SessionCommand::connect("home/camera.front_door".into(), 1000);
-        // Keep Connect queued while discovery publishes a previously
-        // unknown serial alias. An HTTP-only preflight check sees no hub.
-        let turn = handle.command_turn(None, &command).unwrap();
-        let reply = remote.submit(command).unwrap();
-        let mut camera = crate::transport::simulator::info_named("sim:0");
-        camera.id = "hub:home/camera.front_door".into();
-        camera.serial = "home/camera.front_door".into();
-        camera.address = Some(camera.id.clone());
-        handle.inner.state.write().unwrap().devices.push(camera);
-        drop(turn);
-        let error = reply
-            .recv_timeout(Duration::from_secs(2))
-            .unwrap()
-            .unwrap_err();
-        assert!(error.to_string().contains("--allow-hubs"), "{error:#}");
-        assert!(handle.workers().is_empty());
-        handle.shutdown();
-    }
-    #[test]
     fn loose_names_resolve_to_one_local_camera_id_never_a_hub() {
         let handle = SessionHandle::new();
         let mut webcam = crate::transport::simulator::info_named("sim:0");
@@ -3802,24 +3440,10 @@ mod tests {
             handle.loose_camera("c920".into()),
             "avfoundation:HD Pro Webcam C920"
         );
-        // A hub camera keeps its exact selector, so the remote permission
-        // check always sees the hub identity.
+        // A hub camera keeps its exact selector.
         assert_eq!(handle.loose_camera("front door".into()), "front door");
         assert_eq!(handle.loose_camera("sim:3".into()), "sim:3");
         handle.shutdown();
-    }
-    #[test]
-    fn parent_replies_carry_saved_files_even_when_failed() {
-        let old: ParentReply = serde_json::from_str(r#"{"ok":true,"snapshot":null}"#).unwrap();
-        assert!(old.saved.is_empty());
-        let failed: ParentReply = serde_json::from_str(
-            r#"{"ok":false,"error":"frame 3 timed out","saved":{"camera":{"id":"sim:0","transport":"simulator","vendor":"","model":"","serial":""},
-               "items":[{"seq":1,"wall_ms":5,"path":"/a.png","bytes":1,"kind":"capture","frame_id":1,"timestamp_ns":2,
-               "width":3,"height":4,"pixel_format":5,"format":"png","origin":"capture"}],"lost":2}}"#,
-        )
-        .unwrap();
-        assert!(!failed.ok);
-        assert_eq!((failed.saved.items.len(), failed.saved.lost), (1, 2));
     }
     #[test]
     fn request_timeouts_cover_the_work_a_command_can_wait_for() {
@@ -3840,22 +3464,8 @@ mod tests {
             Duration::from_secs(120)
         );
         assert_eq!(
-            timeout(r#"{"op":"dataset_export","output":"export"}"#),
-            Duration::from_secs(600)
-        );
-        assert_eq!(
-            timeout(r#"{"op":"dataset_query","sql":"SELECT 1"}"#),
-            Duration::from_secs(40)
-        );
-        assert_eq!(
-            timeout(r#"{"op":"dataset_query","sql":"SELECT 1","timeout_ms":5000}"#),
-            Duration::from_secs(15)
-        );
-        assert_eq!(
-            timeout(
-                r#"{"op":"dataset_model_query_if","slot_id":"0123456789abcdef0123456789abcdef","sql":"SELECT 1","timeout_ms":5000,"max_result_bytes":16384}"#
-            ),
-            Duration::from_secs(15)
+            timeout(r#"{"op":"apply_setup","name":"bench"}"#),
+            Duration::from_secs(240)
         );
         assert_eq!(timeout(r#"{"op":"status"}"#), Duration::from_secs(60));
         assert_eq!(timeout(r#"{"op":"frame"}"#), Duration::from_secs(18));
@@ -3883,7 +3493,7 @@ mod tests {
                 .find("context")
                 .is_none()
         );
-        for op in ["dataset_close", "dataset_status"] {
+        for op in ["jobs", "read_setup"] {
             let extra = format!(r#"{{"op":"{op}","x":1}}"#);
             assert!(
                 SessionCommand::from_json_slice(extra.as_bytes()).is_err(),
@@ -3893,7 +3503,6 @@ mod tests {
             SessionCommand::from_json_slice(bare.as_bytes()).unwrap();
         }
         let snapshot = serde_json::to_value(SessionSnapshot::default()).unwrap();
-        assert!(snapshot.get("dataset").is_none());
         assert!(snapshot.get("forwarding_until_ms").is_none());
         // A forward without a duration keeps its old shape both ways.
         let old = br#"{"op":"forward","output":"a.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M"}"#;
@@ -5712,7 +5321,7 @@ mod tests {
     }
 
     #[test]
-    fn onvif_serials_resolve_to_their_address_and_saved_sign_ins_need_permission() {
+    fn onvif_serials_resolve_to_their_address() {
         let handle = SessionHandle::new();
         handle.set_devices_for_test(vec![CameraInfo {
             id: "onvif:http://session-onvif.invalid/onvif/device_service".into(),
@@ -5728,26 +5337,6 @@ mod tests {
             "onvif:http://session-onvif.invalid/onvif/device_service"
         );
         assert_eq!(handle.onvif_alias("sim:0".into()), "sim:0");
-        #[cfg(feature = "keychain")]
-        {
-            let address = "rtsp://session-saved.invalid:554/live";
-            crate::logins::Logins::system()
-                .save(
-                    address,
-                    &crate::logins::CameraLogin::new("admin", "session-pw").unwrap(),
-                )
-                .unwrap();
-            let remote = handle.clone().deny_saved_logins();
-            let error = remote
-                .request(SessionCommand::connect(address.into(), 1000))
-                .unwrap_err();
-            assert!(
-                format!("{error:#}").contains("--allow-saved-sign-ins"),
-                "{error:#}"
-            );
-            assert!(remote.check_saved_login_connect("sim:0").is_ok());
-            assert!(handle.check_saved_login_connect(address).is_ok());
-        }
         handle.shutdown();
     }
     #[test]

@@ -347,12 +347,6 @@ pub(super) fn storage_summary(value: &Value) -> String {
             "{changed} file(s) changed outside Capturefab; they are kept and never removed automatically.\n"
         ));
     }
-    let retained = quota["retained_namespaces"].as_array().map_or(0, Vec::len);
-    if retained > 0 {
-        out.push_str(&format!(
-            "{retained} retained task workspace(s); see capturefab storage task-data list.\n"
-        ));
-    }
     if let Some(ledger) = quota["ledger"].as_str() {
         out.push_str(&format!("Ledger: {ledger}\n"));
     }
@@ -612,13 +606,13 @@ mod tests {
 
     #[test]
     fn storage_reads_as_a_budget() {
-        let status = json!({"ledger":"/s/storage.json","policy":{"max_bytes":10u64<<30,"max_files":10000,"max_age_seconds":null,"on_full":"stop"},"over_limit":false,"allocated_bytes":1_677_722,"reserved_bytes":0,"files":6,"active_reservations":0,"externally_changed_files":0,"free_bytes":2u64<<30,"namespace_accounting":"jargon","retained_namespaces":[]});
+        let status = json!({"ledger":"/s/storage.json","policy":{"max_bytes":10u64<<30,"max_files":10000,"max_age_seconds":null,"on_full":"stop"},"over_limit":false,"allocated_bytes":1_677_722,"reserved_bytes":0,"files":6,"active_reservations":0,"externally_changed_files":0,"free_bytes":2u64<<30});
         let text = storage_summary(&status);
         assert!(
             text.starts_with("Using 1.6 MiB of 10 GiB (6 of 10000 files) · when full: stop · 2 GiB free on disk\n"),
             "{text}"
         );
-        assert!(!text.contains("jargon") && !text.contains("Over limit") && !text.contains('{'));
+        assert!(!text.contains("Over limit") && !text.contains('{'));
         let mut over = status.clone();
         over["over_limit"] = json!(true);
         over["externally_changed_files"] = json!(2);

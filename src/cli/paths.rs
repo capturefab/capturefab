@@ -39,10 +39,6 @@ pub(crate) fn resolve_selector(selector: &mut String, base: &Path) -> Result<()>
 /// destination outputs keep their own base; stream URLs are untouched.
 pub(crate) fn resolve_outputs(command: &mut SessionCommand, base: &Path) -> Result<()> {
     match command {
-        SessionCommand::DatasetOpen { path, .. }
-        | SessionCommand::DatasetOpenIf { path, .. }
-        | SessionCommand::DatasetExport { output: path, .. }
-        | SessionCommand::DatasetExportIf { output: path, .. } => resolve_path(path, base),
         SessionCommand::Capture {
             output,
             destination: None,

@@ -1,7 +1,6 @@
 //! Host checks for `doctor`: where sessions, state and temporary files live,
-//! kernel limits that cap camera throughput, the storage budget against the
-//! capture disk and the graphics adapter the desktop window would get, each
-//! turned into a check with a copyable fix.
+//! kernel limits that cap camera throughput and the storage budget against
+//! the capture disk, each turned into a check with a copyable fix.
 #![allow(unsafe_code)]
 
 use crate::efficiency::{self, Mode, Resolved};
@@ -133,10 +132,6 @@ struct UsbCamera {
 /// What the checks look at, gathered once.
 struct Facts {
     efficiency: Resolved,
-    /// Settings › Performance, unless Automatic.
-    desktop: Option<Mode>,
-    /// The GPU probe's answer, when it ran.
-    graphics: Option<Value>,
     /// Where sessions are found, with their short-lived files.
     runtime: Place,
     /// Settings, saved destinations and the storage ledger.
@@ -158,8 +153,6 @@ struct Facts {
     working_directory: Place,
     /// The default capture folder's disk, where `storage --json` measures.
     captures: Place,
-    /// macOS: this executable runs from the disk image or a translocated copy.
-    install: Option<crate::volumes::InstallLocation>,
     /// IPv4 adapters, for the full report only: `serve`'s warnings never
     /// need them, and on Windows listing them runs PowerShell.
     interfaces: Option<Vec<NetworkInterface>>,
@@ -203,11 +196,6 @@ impl Facts {
             ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG").is_some(),
             private_dirs,
             efficiency: efficiency::current(),
-            #[cfg(feature = "gui")]
-            desktop: crate::gui::saved_performance(),
-            #[cfg(not(feature = "gui"))]
-            desktop: None,
-            graphics: None,
             budget,
             used,
             runtime: Place::of(crate::ipc::runtime_dir()),
@@ -230,56 +218,31 @@ impl Facts {
             usb: usb_cameras(),
             working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
             captures: capture_place(),
-            install: std::env::current_exe()
-                .ok()
-                .and_then(|exe| crate::volumes::install_location(&exe)),
         }
     }
 }
 
-/// The host part of `doctor`. The GPU probe starts first and runs in a
-/// helper process while the rest of the report is gathered.
-pub struct HostReport {
-    graphics: Option<std::thread::JoinHandle<Value>>,
-}
-impl HostReport {
-    pub fn start() -> Self {
-        Self {
-            #[cfg(feature = "gui")]
-            graphics: Some(std::thread::spawn(graphics)),
-            #[cfg(not(feature = "gui"))]
-            graphics: None,
-        }
-    }
-    pub fn finish(self, report: &mut Value) {
-        let mut facts = Facts::gather(true);
-        facts.graphics = self.graphics.map(|probe| {
-            probe
-                .join()
-                .unwrap_or_else(|_| json!({"available":false,"reason":"the GPU probe failed"}))
-        });
-        report["host"] = json!(efficiency::host());
-        report["efficiency"] = json!(facts.efficiency);
-        report["paths"] = json!({
-            "runtime": facts.runtime,
-            "state": facts.state,
-            "cache": crate::ipc::cache_dir().map(Place::of),
-            "temp": Place::of(std::env::temp_dir()),
-            "working_directory": facts.working_directory,
-        });
-        report["limits"] = json!(facts.limits);
-        report["graphics"] = facts
-            .graphics
-            .clone()
-            .unwrap_or_else(|| json!({"available":false,"reason":"not compiled in"}));
-        let mut checks = checks(&facts);
-        checks.extend(
-            crate::updates::doctor_notes()
-                .into_iter()
-                .map(|(message, fix)| Check::warn("updates", message, fix)),
-        );
-        report["checks"] = json!(checks);
-    }
+/// Add the host part of `doctor` to `report`: host facts, paths, limits
+/// and the checks.
+pub fn add_host(report: &mut Value) {
+    let facts = Facts::gather(true);
+    report["host"] = json!(efficiency::host());
+    report["efficiency"] = json!(facts.efficiency);
+    report["paths"] = json!({
+        "runtime": facts.runtime,
+        "state": facts.state,
+        "cache": crate::ipc::cache_dir().map(Place::of),
+        "temp": Place::of(std::env::temp_dir()),
+        "working_directory": facts.working_directory,
+    });
+    report["limits"] = json!(facts.limits);
+    let mut checks = checks(&facts);
+    checks.extend(
+        crate::updates::doctor_notes()
+            .into_iter()
+            .map(|(message, fix)| Check::warn("updates", message, fix)),
+    );
+    report["checks"] = json!(checks);
 }
 
 /// For `serve`: one line naming what `doctor` warns about.
@@ -347,8 +310,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
 }
 
 fn checks(facts: &Facts) -> Vec<Check> {
-    let mut checks = vec![efficiency_check(&facts.efficiency, facts.desktop)];
-    checks.extend(facts.graphics.as_ref().map(graphics_check));
+    let mut checks = vec![efficiency_check(&facts.efficiency)];
     checks.extend(
         facts
             .missed_runtime_dir
@@ -375,7 +337,6 @@ fn checks(facts: &Facts) -> Vec<Check> {
     );
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
-    checks.extend(facts.install.map(install_check));
     checks.extend(
         facts
             .used
@@ -384,9 +345,7 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks
 }
 
-/// `desktop` is Settings › Performance, which only the desktop window
-/// applies: it is named when the window would run otherwise than this.
-fn efficiency_check(resolved: &Resolved, desktop: Option<Mode>) -> Check {
+fn efficiency_check(resolved: &Resolved) -> Check {
     let mode = if resolved.efficient {
         "Efficient"
     } else {
@@ -397,18 +356,7 @@ fn efficiency_check(resolved: &Resolved, desktop: Option<Mode>) -> Check {
     } else {
         resolved.reasons.join(", ")
     };
-    let mut message = format!("{mode} mode: {why}.");
-    let window = match desktop {
-        Some(Mode::Efficient) if !resolved.efficient => Some("Efficient"),
-        Some(Mode::Smooth) if resolved.efficient => Some("Smooth"),
-        _ => None,
-    };
-    if let Some(window) = window {
-        message.push_str(&format!(
-            " The desktop window runs {window}, as set in its Settings › Performance, which applies there only."
-        ));
-    }
-    let mut check = Check::ok("efficiency", message);
+    let mut check = Check::ok("efficiency", format!("{mode} mode: {why}."));
     if resolved.efficient && resolved.setting == Mode::Auto {
         check.fix = Some(
             "To stay smooth anyway, use --efficiency smooth or CAPTUREFAB_EFFICIENCY=smooth."
@@ -416,37 +364,6 @@ fn efficiency_check(resolved: &Resolved, desktop: Option<Mode>) -> Check {
         );
     }
     check
-}
-
-fn graphics_check(graphics: &Value) -> Check {
-    let adapter = graphics["adapter"].as_str().unwrap_or("unknown adapter");
-    if graphics["available"] != true {
-        Check::warn(
-            "graphics",
-            format!(
-                "No GPU adapter ({}), so the desktop window would draw in software.",
-                graphics["reason"].as_str().unwrap_or("unknown reason")
-            ),
-            "Install the GPU's Vulkan, Metal, Direct3D 12 or OpenGL driver.".into(),
-        )
-    } else if graphics["software"] == true {
-        Check::warn(
-            "graphics",
-            format!(
-                "The desktop window would draw on the CPU ({adapter}): no hardware GPU driver is in use."
-            ),
-            "Install the GPU's Vulkan or OpenGL driver.".into(),
-        )
-    } else {
-        Check::ok(
-            "graphics",
-            format!(
-                "GPU: {adapter} ({}, {}).",
-                graphics["backend"].as_str().unwrap_or("unknown backend"),
-                graphics["device_type"].as_str().unwrap_or("unknown type")
-            ),
-        )
-    }
 }
 
 /// Without XDG_RUNTIME_DIR, Capturefab uses the login's runtime directory
@@ -541,24 +458,6 @@ fn login_dir_problem(login: &Path, why: LoginDir) -> (String, String) {
 /// Informational rather than a warning: by default state is on disk, so
 /// memory means the user chose it, and only they know whether it must
 /// outlive a reboot.
-/// The app runs from a path that goes away: the mounted disk image, or a
-/// copy macOS made of a quarantined app.
-fn install_check(location: crate::volumes::InstallLocation) -> Check {
-    let message = match location {
-        crate::volumes::InstallLocation::DiskImage => {
-            "Capturefab is running from the disk image; its path stops working once you eject it."
-        }
-        crate::volumes::InstallLocation::Translocated => {
-            "Capturefab is running from a temporary copy macOS made; its path changes on every launch."
-        }
-    };
-    Check::warn(
-        "install_location",
-        message.into(),
-        "Drag Capturefab.app to /Applications and open it from there.".into(),
-    )
-}
-
 fn session_check(state: &Place, session_dir_set: bool) -> Check {
     if !state.ram_backed {
         return Check::ok(
@@ -770,7 +669,7 @@ pub fn usb_access_fix() -> String {
 pub const USB_ACCESS_DENIED: &str = "No permission to";
 
 /// `message` with [`usb_access_fix`] on a line of its own (see
-/// [`fix_line`]), so the desktop app can offer to copy it.
+/// [`fix_line`]), so a caller can offer it on its own.
 pub fn with_usb_access_fix(message: impl std::fmt::Display) -> String {
     format!("{message}\n{FIX_PREFIX}{}", usb_access_fix())
 }
@@ -1008,135 +907,6 @@ fn usb_cameras() -> Vec<UsbCamera> {
     Vec::new()
 }
 
-/// How long the GPU probe may take: a healthy driver answers in well under a
-/// second, a broken one may never answer.
-#[cfg(feature = "gui")]
-const GPU_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// The adapter the desktop window would get, asked in a helper process: a
-/// broken Vulkan or OpenGL driver can crash or hang whoever loads it.
-#[cfg(feature = "gui")]
-fn graphics() -> Value {
-    probe_graphics()
-        .unwrap_or_else(|error| json!({"available":false,"reason":format!("{error:#}")}))
-}
-
-#[cfg(feature = "gui")]
-fn probe_graphics() -> anyhow::Result<Value> {
-    use anyhow::{Context, anyhow, ensure};
-    use std::{
-        io::{BufRead, BufReader, Read},
-        process::{Command, Stdio},
-        sync::mpsc,
-    };
-    let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
-        .unwrap_or_else(|| "capturefab".into());
-    let mut child = crate::session::spawn_helper(
-        Command::new(executable)
-            .arg("__gpu-probe")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()),
-    )
-    .context("launch the GPU probe")?;
-    let stdout = child.stdout.take().context("GPU probe output")?;
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let _ = BufReader::new(stdout.take(64 * 1024)).read_line(&mut line);
-        let _ = sender.send(line);
-    });
-    let line = receiver.recv_timeout(GPU_PROBE_DEADLINE);
-    // A process stuck in a graphics driver may survive even SIGKILL, so it
-    // is reaped in the background rather than waited for.
-    let _ = child.kill();
-    std::thread::spawn(move || child.wait());
-    let line = line.map_err(|_| {
-        anyhow!(
-            "the graphics driver did not answer within {} s",
-            GPU_PROBE_DEADLINE.as_secs()
-        )
-    })?;
-    ensure!(
-        !line.is_empty(),
-        "the GPU probe stopped without an answer; the graphics driver may have crashed"
-    );
-    Ok(serde_json::from_str(&line)?)
-}
-
-/// Hidden `__gpu-probe` mode: print the adapter iced would request, without
-/// a window, as one JSON line.
-#[cfg(feature = "gui")]
-pub fn run_gpu_probe() -> anyhow::Result<()> {
-    use iced::{executor::Executor, wgpu};
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()),
-        ..Default::default()
-    });
-    let adapter = iced::executor::Default::new()?.block_on(instance.request_adapter(
-        &wgpu::RequestAdapterOptions {
-            power_preference:
-                wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        },
-    ));
-    let report = match adapter {
-        Ok(adapter) => adapter_report(&adapter.get_info(), &adapter.limits()),
-        Err(error) => json!({"available":false,"reason":error.to_string()}),
-    };
-    crate::cli::write_json(&report)
-}
-
-#[cfg(feature = "gui")]
-fn adapter_report(info: &iced::wgpu::AdapterInfo, allowed: &iced::wgpu::Limits) -> Value {
-    use iced::wgpu::{DeviceType, Limits};
-    // iced asks for the default limits, then the downlevel ones; frames wider
-    // or taller than the granted texture size are converted on the CPU.
-    let texture = [Limits::default(), Limits::downlevel_defaults()]
-        .into_iter()
-        .map(|limits| Limits {
-            max_bind_groups: 2,
-            max_non_sampler_bindings: 2048,
-            ..limits
-        })
-        .find(|limits| limits.check_limits(allowed))
-        .map(|limits| limits.max_texture_dimension_2d);
-    let device_type = match info.device_type {
-        DeviceType::IntegratedGpu => "integrated",
-        DeviceType::DiscreteGpu => "discrete",
-        DeviceType::VirtualGpu => "virtual",
-        DeviceType::Cpu => "cpu",
-        DeviceType::Other => "other",
-    };
-    json!({
-        "available": true,
-        "adapter": info.name,
-        "backend": info.backend.to_str(),
-        "device_type": device_type,
-        "driver": info.driver,
-        "max_texture_dimension_2d": texture,
-        "software": software_adapter(info.device_type == DeviceType::Cpu, &info.name),
-    })
-}
-
-/// Software rasterizers, including GL drivers that do not report a CPU type.
-#[cfg(any(feature = "gui", test))]
-fn software_adapter(cpu: bool, name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    cpu || [
-        "llvmpipe",
-        "lavapipe",
-        "softpipe",
-        "swiftshader",
-        "basic render",
-    ]
-    .iter()
-    .any(|software| name.contains(software))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,22 +920,6 @@ mod tests {
             total_bytes: Some(free * 2),
             free_bytes: Some(free),
         }
-    }
-
-    #[test]
-    fn running_from_the_disk_image_warns() {
-        use crate::volumes::InstallLocation;
-        for location in [InstallLocation::DiskImage, InstallLocation::Translocated] {
-            let check = install_check(location);
-            assert_eq!(check.id, "install_location");
-            assert_eq!(check.level, Level::Warn);
-            assert!(check.fix.unwrap().contains("/Applications"));
-        }
-        assert!(
-            install_check(InstallLocation::DiskImage)
-                .message
-                .contains("disk image")
-        );
     }
 
     #[test]
@@ -1608,7 +1362,7 @@ mod tests {
             .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
             .collect();
         assert_eq!(rules, UDEV_RULES);
-        // The desktop app and the USB open error offer the same command.
+        // doctor and the USB open error offer the same command.
         assert_eq!(
             fix_line(&with_usb_access_fix("x")),
             Some(usb_access_fix().as_str())
@@ -1621,7 +1375,7 @@ mod tests {
         assert_eq!(crate::cli::error_code(&error).1, 3);
         let code = crate::types::error_transport_code(&error);
         assert_eq!(code, Some("unavailable"));
-        // As a worker reply carries it to the coordinator and the GUI.
+        // As a worker reply carries it to the coordinator and the CLI.
         let rebuilt = crate::types::error_from_transport(code, format!("{error:#}"));
         assert_eq!(crate::cli::error_code(&rebuilt).1, 3);
         let message = format!("{rebuilt:#}");
@@ -1645,13 +1399,13 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_and_graphics_checks_explain_themselves() {
+    fn efficiency_checks_explain_themselves() {
         let auto = Resolved {
             setting: Mode::Auto,
             efficient: true,
             reasons: vec!["2 CPU cores".into()],
         };
-        let check = efficiency_check(&auto, None);
+        let check = efficiency_check(&auto);
         assert_eq!(
             (check.level, check.message.as_str()),
             (Level::Ok, "Efficient mode: 2 CPU cores.")
@@ -1662,31 +1416,9 @@ mod tests {
             efficient: false,
             reasons: Vec::new(),
         };
-        let smooth = efficiency_check(&auto_smooth, None);
+        let smooth = efficiency_check(&auto_smooth);
         assert_eq!(smooth.message, "Smooth mode: auto found no constraint.");
         assert_eq!(smooth.fix, None);
-        // Only the desktop window applies its own setting, so doctor says
-        // when that window runs otherwise.
-        assert_eq!(
-            efficiency_check(&auto_smooth, Some(Mode::Efficient)).message,
-            "Smooth mode: auto found no constraint. The desktop window runs Efficient, as set in its Settings › Performance, which applies there only."
-        );
-        assert_eq!(
-            efficiency_check(&auto, Some(Mode::Efficient)).message,
-            "Efficient mode: 2 CPU cores."
-        );
-        let software = json!({"available":true,"adapter":"llvmpipe (LLVM 17.0.6, 256 bits)","backend":"vulkan","device_type":"cpu","software":true});
-        assert_eq!(graphics_check(&software).level, Level::Warn);
-        let missing = json!({"available":false,"reason":"no adapter"});
-        assert!(graphics_check(&missing).message.contains("no adapter"));
-        let metal = json!({"available":true,"adapter":"Apple M4 Max","backend":"metal","device_type":"integrated","software":false});
-        assert_eq!(
-            graphics_check(&metal).message,
-            "GPU: Apple M4 Max (metal, integrated)."
-        );
-        assert!(software_adapter(false, "llvmpipe (LLVM 15.0.7, 128 bits)"));
-        assert!(software_adapter(true, "Unknown"));
-        assert!(!software_adapter(false, "V3D 7.1"));
     }
 
     #[test]

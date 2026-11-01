@@ -151,7 +151,6 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<String> {
     .with_context(|| format!("save {}", save.path.display()))?;
     report_image(
         h,
-        &save.resolved,
         &path,
         stored,
         &shot.frame,

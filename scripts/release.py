@@ -297,22 +297,6 @@ MEDIA = [('FFMPEG', 'ffmpeg', 'GPL-3.0-or-later', 'https://ffmpeg.org/'), ('X264
          ('NV_HEADERS', 'nv-codec-headers', 'MIT', 'https://github.com/FFmpeg/nv-codec-headers'), ('VULKAN_HEADERS', 'Vulkan-Headers', 'Apache-2.0 OR MIT', 'https://github.com/KhronosGroup/Vulkan-Headers'),
          ('LIBVPL', 'libvpl', 'MIT', 'https://github.com/intel/libvpl'), ('AMF', 'AMF', 'MIT', 'https://github.com/GPUOpen-LibrariesAndSDKs/AMF')]
 
-WEB_CLIENT = ROOT / 'web-client'
-
-def web_dist():
-    """The browser client web-client/build.sh built, or None. Release builds
-    embed it when it exists (the embedded-web feature), so `serve --listen`
-    needs no --web-dir."""
-    dist = WEB_CLIENT / 'dist'
-    return dist if all((dist / name).is_file() for name in ('index.html', 'capturefab_web_bg.wasm')) else None
-
-def web_metadata():
-    return json.loads(run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', 'wasm32-unknown-unknown', '--manifest-path', WEB_CLIENT / 'Cargo.toml'], cwd=ROOT, capture_output=True, text=True).stdout)
-
-def cargo_features(web):
-    """The release cargo feature flags, plus embedded-web with a built client."""
-    return ['--features', 'embedded-web'] if web else []
-
 def crate_components(metadata, lock):
     """CycloneDX components for the crates a package links, with Cargo.lock checksums."""
     checksums = dict(((m[1], m[2]), m[3]) for m in re.finditer(r'\[\[package\]\]\nname = "([^"]+)"\nversion = "([^"]+)"\n(?:source = "[^"]*"\n)?(?:checksum = "([0-9a-f]{64})")?', lock))
@@ -328,16 +312,11 @@ def crate_components(metadata, lock):
         crates.append(item)
     return crates
 
-def cyclonedx(metadata, lock, recipe, ver, repository, serial, web=None):
+def cyclonedx(metadata, lock, recipe, ver, repository, serial):
     """A CycloneDX 1.6 SBOM for every platform of a release: the Rust crates
-    linked with all features, with Cargo.lock checksums, those of the browser
-    client when `web` holds its metadata and lock file, and the media payload
+    linked with all features, with Cargo.lock checksums, and the media payload
     components pinned by the FFmpeg build recipe."""
     crates = crate_components(metadata, lock)
-    if web:
-        known = {item['bom-ref'] for item in crates}
-        crates += [item for item in crate_components(*web) if item['bom-ref'] not in known]
-        crates.sort(key=lambda item: (item['name'], item['version']))
     pinned = dict(re.findall(r'^([A-Z0-9_]+)=(\S+)$', recipe, re.M))
     media = []
     for prefix, name, license_, url in MEDIA:
@@ -356,10 +335,9 @@ def cyclonedx(metadata, lock, recipe, ver, repository, serial, web=None):
             'components': crates + media,
             'dependencies': [dict(ref='capturefab', dependsOn=[c['bom-ref'] for c in crates] + ['media:ffmpeg']), dict(ref='media:ffmpeg', dependsOn=[m['bom-ref'] for m in media if m['bom-ref'] != 'media:ffmpeg'])]}
 
-def sbom(output, ver, repository, web=False):
+def sbom(output, ver, repository):
     metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--all-features'], cwd=ROOT, capture_output=True, text=True).stdout
-    web = (web_metadata(), (WEB_CLIENT / 'Cargo.lock').read_text()) if web else None
-    document = cyclonedx(json.loads(metadata), (ROOT / 'Cargo.lock').read_text(), (ROOT / 'scripts' / 'build-ffmpeg.sh').read_text(), ver, repository, uuid.uuid4(), web)
+    document = cyclonedx(json.loads(metadata), (ROOT / 'Cargo.lock').read_text(), (ROOT / 'scripts' / 'build-ffmpeg.sh').read_text(), ver, repository, uuid.uuid4())
     path = output / f'capturefab-{ver}-sbom.cdx.json'
     path.write_text(json.dumps(document, indent=1) + '\n')
     return path
@@ -380,13 +358,9 @@ def license_notices(metadata, title='Rust crates compiled into this Capturefab e
             texts.setdefault(text, []).append(label)
     return f'{title}\n' + ''.join(f'\n===== {", ".join(names)} =====\n\n{text}\n' for text, names in texts.items())
 
-def notices(target, web=False):
+def notices(target):
     metadata = run(['cargo', 'metadata', '--format-version', '1', '--locked', '--filter-platform', target], cwd=ROOT, capture_output=True, text=True).stdout
-    text = license_notices(json.loads(metadata))
-    if web:
-        text += '\n' + license_notices(web_metadata(), 'Rust crates compiled into the browser client (web-client) built into this executable for serve --listen, and their license texts.')
-    text += f"\n===== Phosphor Icons 2.1.2 font (MIT), assets/fonts =====\n\n{(ROOT / 'assets/fonts/Phosphor-LICENSE.txt').read_text(encoding='utf-8').strip()}\n"
-    return text
+    return license_notices(json.loads(metadata))
 
 def link(base, name):
     return f'{base.rstrip("/")}/{name}' if base else name
@@ -551,7 +525,7 @@ def codesign_dmg(path):
     run(['codesign', '--force', '--timestamp', '--sign', os.environ['MACOS_SIGN_IDENTITY'], path])
     run(['codesign', '--verify', '--strict', path])
 
-def macos_readme(version, arch, app_signed, browser):
+def macos_readme(version, arch, app_signed):
     text = (f'Capturefab {version} (macOS {arch})\n'
             'Install: drag Capturefab to the Applications folder, then open it from Applications. Eject this disk image afterwards.\n'
             'Command line: the app contains the CLI. Run\n'
@@ -563,17 +537,15 @@ def macos_readme(version, arch, app_signed, browser):
             f'App signature: {app_signed}. Verify the downloaded disk image against the release SHA256SUMS.\n'
             'Licenses: Capturefab.app/Contents/Resources/licenses (Finder: Control-click the app, Show Package Contents).\n'
             'Corresponding source: the release source and media-sources archives.\n')
-    return text + (BROWSER_README if browser else '')
+    return text
 
-BROWSER_README = 'Remote browser: capturefab serve --name line1 --listen TAILNET-IP:8787 serves the browser interface. Anyone who can reach that address can control the cameras; bind it to a Tailscale or loopback address.\n'
-
-def licenses(args, browser, folder):
+def licenses(args, folder):
     shutil.copy2(ROOT / 'LICENSE', folder / 'LICENSE')
     shutil.copytree(Path(args.ffmpeg_bundle) / 'licenses', folder / 'media-licenses')
     shutil.copy2(Path(args.ffmpeg_bundle) / 'build-manifest.txt', folder / 'media-build-manifest.txt')
-    (folder / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target, browser), encoding='utf-8')
+    (folder / 'THIRD-PARTY-LICENSES.txt').write_text(notices(args.target), encoding='utf-8')
 
-def package_macos(args, binary, browser, output, stem, temp):
+def package_macos(args, binary, output, stem, temp):
     stage = Path(temp) / stem
     app = stage / 'Capturefab.app'
     contents = app / 'Contents'
@@ -589,7 +561,7 @@ def package_macos(args, binary, browser, output, stem, temp):
     (contents / 'Info.plist').write_bytes(plistlib.dumps(info))
     # Resources are sealed by the signature, so the licenses go in first; they
     # then stay with the executable after the drag to Applications.
-    licenses(args, browser, contents / 'Resources' / 'licenses')
+    licenses(args, contents / 'Resources' / 'licenses')
     os.symlink('/Applications', stage / 'Applications')
     signed = 'unsigned'
     notary = os.environ.get('MACOS_NOTARY_PROFILE')
@@ -608,7 +580,7 @@ def package_macos(args, binary, browser, output, stem, temp):
             gatekeeper(app)
             signed = 'apple-notarized'
     # The README reports the app's state; the image is signed after it exists.
-    (stage / 'README.txt').write_text(macos_readme(args.version, args.arch, signed, browser), encoding='utf-8')
+    (stage / 'README.txt').write_text(macos_readme(args.version, args.arch, signed), encoding='utf-8')
     dmg = output / f'{stem}.dmg'
     make_dmg(stage, dmg, f'Capturefab {args.version}')
     if signed != 'unsigned':
@@ -629,18 +601,16 @@ def package(args, binary):
         check_compatibility(executable, args.os, args.arch)
     if not embeds(binary, ffmpeg):
         raise ValueError(f'{binary} does not embed {ffmpeg}')
-    web = web_dist()
-    browser = bool(web) and embeds(binary, web / 'capturefab_web_bg.wasm')
     if not args.skip_smoke:
         smoke(binary)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     stem = f'capturefab-{args.version}-{args.os}-{args.arch}'
     signed = 'unsigned'
-    extra = dict(target=args.target, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed', **(dict(browser_client=True) if browser else {}))
+    extra = dict(target=args.target, validation='cross-compiled' if args.skip_smoke else 'native-smoke-passed')
     with tempfile.TemporaryDirectory(prefix='capturefab-package-') as temp:
         if args.os == 'macos':
-            path, signed = package_macos(args, binary, browser, output, stem, temp)
+            path, signed = package_macos(args, binary, output, stem, temp)
             return record(path, args.os, args.arch, platform_signature=signed, **extra)
         stage = Path(temp) / stem
         stage.mkdir()
@@ -651,30 +621,17 @@ def package(args, binary):
             tool = os.environ.get('WINDOWS_SIGNTOOL', 'signtool.exe')
             run([tool, 'sign', '/fd', 'SHA256', '/tr', 'http://timestamp.digicert.com', '/td', 'SHA256', '/f', os.environ['WINDOWS_CERTIFICATE_PFX'], '/p', os.environ.get('WINDOWS_CERTIFICATE_PASSWORD', ''), executable])
             signed = 'authenticode'
-        licenses(args, browser, stage)
-        readme = f'Capturefab {args.version}\n{args.os}/{args.arch}\nRun capturefab --help for CLI usage. With no arguments it opens the GUI, or lists the CLI commands when no display is available. capturefab doctor checks this computer.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates and bundled fonts), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n'
-        if browser:
-            readme += BROWSER_README
+        licenses(args, stage)
+        readme = f'Capturefab {args.version}\n{args.os}/{args.arch}\nRun capturefab --help for CLI usage; with no arguments it prints the same help. capturefab doctor checks this computer.\nFFmpeg is embedded; no separately installed media executable or camera SDK is required.\nPlatform signature: {signed}. Verify the download against the release SHA256SUMS.\nLicenses: LICENSE (Capturefab), THIRD-PARTY-LICENSES.txt (Rust crates), media-licenses/ (FFmpeg payload).\nCorresponding source: the release source and media-sources archives.\n'
         if args.os == 'linux':
             readme += f'Run it as a service on a Raspberry Pi, Jetson or industrial PC: {LINE_COMPUTER}\n'
         (stage / 'README.txt').write_text(readme)
         if args.os == 'linux':
-            applications = stage / 'share/applications'
-            applications.mkdir(parents=True)
-            shutil.copy2(ROOT / 'assets/capturefab.desktop', applications / 'capturefab.desktop')
-            for size, suffix in [('scalable', 'svg'), ('256x256', 'png')]:
-                icons = stage / 'share/icons/hicolor' / size / 'apps'
-                icons.mkdir(parents=True)
-                shutil.copy2(ROOT / f'assets/icons/capturefab.{suffix}', icons / f'capturefab.{suffix}')
             rules = stage / 'share/udev/rules.d'
             rules.mkdir(parents=True)
             shutil.copy2(ROOT / f'assets/udev/{UDEV_RULE}', rules / UDEV_RULE)
-            (stage / 'INSTALL-DESKTOP.txt').write_text(
-                'To add Capturefab to your application launcher, install capturefab on your PATH,\n'
-                'then copy the contents of share/ into ~/.local/share/ (or /usr/local/share/\n'
-                'for all users). Keep the applications/ and icons/ subdirectories intact.\n'
-                '\n'
-                'USB3 Vision cameras: copying share/ into ~/.local/share does not install the\n'
+            (stage / 'INSTALL-USB.txt').write_text(
+                'USB3 Vision cameras: putting capturefab on your PATH does not install the\n'
                 'udev rule that lets you open them. Install it once, then replug the camera:\n'
                 '  sudo install -m 644 share/udev/rules.d/70-capturefab-usb3vision.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add\n'
             )
@@ -766,11 +723,8 @@ def build(args):
             if args.binary:
                 binary = Path(args.binary).resolve()
             else:
-                web = web_dist()
-                command = ['cargo', 'build', '--locked', '--release', '--target', args.target, *cargo_features(web)]
+                command = ['cargo', 'build', '--locked', '--release', '--target', args.target]
                 env = dict(os.environ, CAPTUREFAB_FFMPEG_BINARY=str((Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')).resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
-                if web:
-                    env['CAPTUREFAB_WEB_DIST'] = str(web.resolve())
                 run(command, cwd=ROOT, env=env)
                 binary = (ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / args.target / 'release' / ('capturefab.exe' if args.os == 'windows' else 'capturefab')).resolve()
             assets.append(package(args, binary))
@@ -828,7 +782,7 @@ def assemble(args):
         raise ValueError('no verified build assets found; refusing to create a release')
     assets = [successes.get(key) or dict(os=key[0], arch=key[1], name=f'capturefab-{ver}-{key[0]}-{key[1]}', available=False, reason=failures.get(key, 'Not built for this release')) for key in TARGETS]
     source = source_archive(output, ver)
-    bill = sbom(output, ver, args.repository, any(item.get('browser_client') for item in successes.values()))
+    bill = sbom(output, ver, args.repository)
     signature = 'SHA256SUMS.asc' if args.gpg_key else None
     download = lambda path: dict(name=path.name, sha256=digest(path), size=path.stat().st_size, url=link(args.download_base, path.name))
     # The release notes and downloads live on the site; the build system is not a distribution channel.
@@ -844,7 +798,7 @@ def assemble(args):
     if signature:
         run(['gpg', '--batch', '--yes', '--pinentry-mode', 'loopback', '--passphrase-fd', '0', '--local-user', args.gpg_key, '--armor', '--detach-sign', '--output', output / signature, output / 'SHA256SUMS'], input=os.environ.get('RELEASE_GPG_PASSPHRASE', ''), text=True)
     unavailable = [f'- {a["os"]} {a["arch"]}: {a["reason"]}' for a in assets if not a['available']]
-    notes = [f'Capturefab {ver}', '', 'One executable per platform: it opens the GUI with no arguments (or lists the CLI commands when no display is available) and provides the CLI and authenticated session automation.', '', 'Build artifacts:']
+    notes = [f'Capturefab {ver}', '', 'One executable per platform: the CLI and authenticated session automation.', '', 'Build artifacts:']
     notes += [f'- {key[0]} {key[1]}: {item["validation"]}, platform signature {item["platform_signature"]}' for key, item in successes.items()]
     if any(key[0] == 'macos' for key in successes):
         notes += ['- macOS: open the .dmg and drag Capturefab to Applications. Where the platform signature says apple-notarized, both the disk image and the app inside are notarized and stapled.',

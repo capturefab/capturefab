@@ -207,7 +207,7 @@ pub(super) fn next_steps(devices: &[Value], kind: DeviceList) -> Vec<String> {
                 .or_else(|| devices.first());
             if let Some(device) = example {
                 hints.push(format!(
-                    "Next: capturefab --camera {} capture -o 'shot-{{seq}}.png'   (or open the desktop app: capturefab)",
+                    "Next: capturefab --camera {} capture -o 'shot-{{seq}}.png'",
                     crate::hint::shell_quote(&crate::media::redact_url(text(device, "id")))
                 ));
             }
@@ -366,7 +366,7 @@ mod tests {
         let hints = next_steps(&[simulator(), webcam()], DeviceList::Discover);
         assert_eq!(
             hints[0],
-            "Next: capturefab --camera 'avfoundation:Government Cheese Camera' capture -o 'shot-{seq}.png'   (or open the desktop app: capturefab)"
+            "Next: capturefab --camera 'avfoundation:Government Cheese Camera' capture -o 'shot-{seq}.png'"
         );
         assert!(hints[1].contains("No GigE/USB3 Vision cameras answered"));
         let hints = next_steps(&[simulator(), gige()], DeviceList::Discover);

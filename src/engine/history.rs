@@ -1973,7 +1973,7 @@ mod tests {
         assert_eq!(count, 1);
         assert!(result["camera_change"]["token"].is_string());
         assert_eq!(result["history"]["undo"], "Set Width");
-        // A grouped assistant edit shares the cached checkpoint names too:
+        // A grouped edit shares the cached checkpoint names too:
         // all writes together still end with only one full feature walk.
         let (count, result) = walked(
             &mut camera,

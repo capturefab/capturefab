@@ -322,10 +322,6 @@ impl Activity {
                 | SessionCommand::ReadMemory { .. }
                 | SessionCommand::ReadSetup
                 | SessionCommand::SetupDiff { .. }
-                | SessionCommand::DatasetStatus
-                | SessionCommand::DatasetQuery { .. }
-                | SessionCommand::DatasetQueryIf { .. }
-                | SessionCommand::DatasetModelQueryIf { .. }
         ) {
             return None;
         }
@@ -640,27 +636,7 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
         StopForward | StopForwardIf { .. } => {
             ("stop_forward", "Stop forwarding / recording".into())
         }
-        DatasetOpen { path, .. } | DatasetOpenIf { path, .. } => {
-            ("dataset_open", format!("Open dataset {}", file_name(path)))
-        }
-        DatasetClose | DatasetCloseIf { .. } => ("dataset_close", "Close dataset".into()),
-        DatasetStatus => ("dataset_status", "Read dataset status".into()),
-        DatasetNote { .. } | DatasetNoteIf { .. } => ("dataset_note", "Add dataset note".into()),
-        DatasetQuery { .. } | DatasetQueryIf { .. } | DatasetModelQueryIf { .. } => {
-            ("dataset_query", "Query dataset".into())
-        }
-        DatasetExport { output, .. } | DatasetExportIf { output, .. } => (
-            "dataset_export",
-            format!("Export dataset → {}", file_name(output)),
-        ),
     }
-}
-/// The last component of a path, so activity never shows a full folder tree.
-fn file_name(path: &str) -> String {
-    std::path::Path::new(path).file_name().map_or_else(
-        || path.to_owned(),
-        |name| name.to_string_lossy().into_owned(),
-    )
 }
 fn output_label(output: &str, destination: &Option<String>) -> String {
     match destination {

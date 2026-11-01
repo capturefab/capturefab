@@ -195,12 +195,6 @@ pub(crate) fn pin(efficient: bool) {
     PINNED.set(Some(efficient));
 }
 
-/// What `pin` holds `efficient` at on this test's thread, if anything.
-#[cfg(all(test, feature = "gui"))]
-pub(crate) fn pinned() -> Option<bool> {
-    PINNED.get()
-}
-
 /// The `--efficiency` flag of this process, if given.
 pub fn configure(flag: Option<Mode>) {
     STATE.update(|overrides| overrides.flag = flag);
@@ -422,16 +416,8 @@ fn power() -> (bool, bool) {
     (power_sources::on_battery(), low_power_mode())
 }
 
-/// NSProcessInfo knows; it has no answer before macOS 12.
-#[cfg(all(target_os = "macos", feature = "gui"))]
-fn low_power_mode() -> bool {
-    use objc2::{runtime::NSObjectProtocol, sel};
-    let info = objc2_foundation::NSProcessInfo::processInfo();
-    info.respondsToSelector(sel!(isLowPowerModeEnabled)) && info.isLowPowerModeEnabled()
-}
-
-/// Headless builds link no Foundation binding, so ask pmset once, briefly.
-#[cfg(all(target_os = "macos", not(feature = "gui")))]
+/// No Foundation binding is linked, so ask pmset once, briefly.
+#[cfg(target_os = "macos")]
 fn low_power_mode() -> bool {
     use std::{io::Read, process::Stdio, time::Duration, time::Instant};
     let Ok(mut child) = std::process::Command::new("/usr/bin/pmset")
@@ -462,7 +448,7 @@ fn low_power_mode() -> bool {
 }
 
 /// `lowpowermode 1`, or `powermode 1` on Macs that also offer High Power.
-#[cfg(any(all(target_os = "macos", not(feature = "gui")), test))]
+#[cfg(any(target_os = "macos", test))]
 fn pmset_low_power(text: &str) -> bool {
     text.lines().any(|line| {
         let mut words = line.split_whitespace();

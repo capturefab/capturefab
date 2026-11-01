@@ -307,44 +307,6 @@ def command_paths(root, with_arguments=False):
     return result
 
 
-def tool_names(root):
-    tokens = rust_tokens((root / "src/tools/mod.rs").read_text(encoding="utf-8"))
-    try:
-        start = tokens.index("CATALOG")
-        start = tokens.index("=", start) + 1
-        if tokens[start] == "&":
-            start += 1
-        entries = list(split_items(tokens[start + 1:closing(tokens, start)]))
-    except (ValueError, KeyError, IndexError) as error:
-        raise ValueError("cannot read tools CATALOG") from error
-    names, modules = set(), {}
-    for entry in entries:
-        if len(entry) != 3 or entry[1] != "::":
-            raise ValueError(f"unsupported CATALOG entry: {entry}")
-        module, _, const = entry
-        if module not in modules:
-            modules[module] = rust_tokens((root / f"src/tools/{module}.rs").read_text(encoding="utf-8"))
-        tokens = modules[module]
-        try:
-            i = next(i for i in range(len(tokens) - 2) if tokens[i:i + 2] == ["const", const])
-            i = tokens.index("=", i) + 1
-            if tokens[i:i + 2] == ["ToolSpec", "{"]:
-                end = closing(tokens, i + 1)
-                fields = list(split_items(tokens[i + 2:end]))
-                value = next(field[2] for field in fields if field[:2] == ["name", ":"])
-            else:
-                if tokens[i + 1] != "(":
-                    raise ValueError("tool specification must be a struct or factory call")
-                value = tokens[i + 2]
-            name = json.loads(value)
-        except (ValueError, IndexError, StopIteration) as error:
-            raise ValueError(f"cannot read ToolSpec {module}::{const}") from error
-        if name in names:
-            raise ValueError(f"duplicate tool name: {name}")
-        names.add(name)
-    return names
-
-
 def rpc_names(root):
     return {
         (attr_values(v["attrs"], "serde", "rename") or [snake_case(v["name"])])[0]
@@ -440,8 +402,7 @@ def compare_names(label, actual, documented, errors):
 def validate(root=ROOT):
     root = Path(root)
     cli = json.loads((root / "docs/cli-coverage.json").read_text(encoding="utf-8"))
-    desktop = json.loads((root / "docs/desktop-coverage.json").read_text(encoding="utf-8"))
-    if cli.get("schema_version") != 1 or desktop.get("version") != 1:
+    if cli.get("schema_version") != 1:
         raise ValueError("unsupported documentation coverage inventory version")
     errors, counts, pages = [], {}, {}
 
@@ -463,7 +424,7 @@ def validate(root=ROOT):
             errors.append(f"{label}: missing or unexplained documentation anchor: {url}")
 
     commands, arguments = command_paths(root, with_arguments=True)
-    for label, actual in (("commands", commands), ("tools", tool_names(root)), ("rpc", rpc_names(root))):
+    for label, actual in (("commands", commands), ("rpc", rpc_names(root))):
         documented = cli.get(label)
         if not isinstance(documented, dict):
             raise ValueError(f"{label}: expected coverage mapping")
@@ -493,36 +454,6 @@ def validate(root=ROOT):
             errors.append(f"{label}: missing code reference: {', '.join(absent)}")
     counts["argument_spellings"] = {"documented": argument_documented, "total": argument_total}
 
-    features = desktop.get("features")
-    if not isinstance(features, dict) or not features:
-        raise ValueError("desktop: expected nonempty features mapping")
-    represented_actions, represented_routes = set(), set()
-    valid_features = 0
-    for key, feature in features.items():
-        before = len(errors)
-        if not isinstance(feature, dict) or not isinstance(feature.get("source"), str) or not isinstance(feature.get("terms"), list) or not feature["terms"]:
-            errors.append(f"desktop {key}: expected source, nonempty terms and url")
-            continue
-        path = root / feature["source"]
-        if Path(feature["source"]).is_absolute() or ".." in Path(feature["source"]).parts or not path.is_file():
-            errors.append(f"desktop {key}: missing or invalid source: {feature['source']}")
-            continue
-        source = path.read_text(encoding="utf-8")
-        for term in feature["terms"]:
-            if not isinstance(term, str) or not term or term not in source:
-                errors.append(f"desktop {key}: source term no longer exists: {term!r}")
-            elif feature["source"] == "src/gui/keys.rs":
-                represented_actions.update(re.findall(r"\bAction::(\w+)\b", term))
-            elif feature["source"] == "src/remote.rs":
-                represented_routes.update(re.findall(r"/(?:api/[a-z0-9_.-]+|health|metrics)", term))
-        target(feature.get("url"), f"desktop {key}")
-        if len(errors) == before:
-            valid_features += 1
-    actions = {v["name"] for v in enum_variants((root / "src/gui/keys.rs").read_text(encoding="utf-8"), "Action")}
-    routes = set(re.findall(r'"(/(?:api/[a-z0-9_.-]+|health|metrics))"', (root / "src/remote.rs").read_text(encoding="utf-8")))
-    counts["keyboard_actions"] = compare_names("keyboard actions", actions, represented_actions, errors)
-    counts["http_routes"] = compare_names("HTTP routes", routes, represented_routes, errors)
-    counts["desktop_features"] = {"documented": valid_features, "total": len(features)}
     return {"ok": not errors, "coverage": counts, "errors": errors}
 
 

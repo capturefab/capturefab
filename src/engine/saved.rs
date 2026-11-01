@@ -4,7 +4,7 @@ use crate::{context::Context, types::CameraInfo};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-/// Saved-file entries a worker keeps until the coordinator collects them.
+/// Saved-file entries a worker keeps until its replies drain them.
 pub const SAVED_LOG_CAP: usize = 100_000;
 
 /// The camera that produced a batch of saved files. Its source address is
@@ -71,8 +71,6 @@ pub struct SavedFile {
     pub bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
     #[serde(default, skip_serializing_if = "Context::is_empty")]
     pub context: Context,
     #[serde(flatten)]

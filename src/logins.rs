@@ -205,7 +205,7 @@ impl std::fmt::Debug for CameraLogin {
 }
 
 /// Plaintext, for the worker pipe and the token-authenticated loopback IPC
-/// only; the remote API refuses commands that carry a login.
+/// only.
 impl Serialize for CameraLogin {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;

@@ -167,7 +167,7 @@ impl WorkerHandle {
         s.fps = f64::from_bits(self.counters.fps_bits.load(Ordering::Relaxed));
         s
     }
-    /// Report a finished file to the coordinator's dataset; stamps its `seq`.
+    /// Record a finished file in the saved-file log; stamps its `seq`.
     pub(crate) fn push_saved(&self, file: crate::engine::saved::SavedFile) {
         self.saved
             .lock()
@@ -714,8 +714,6 @@ fn end_forward(
                     path: absolute_path(std::path::Path::new(&file.path)),
                     bytes: file.bytes,
                     sha256: Some(file.sha256),
-                    destination: file.destination,
-
                     context,
                     item: crate::engine::saved::SavedItem::Recording {
                         started_ms: file.started_ms,
@@ -981,11 +979,10 @@ fn still_meta(
     meta
 }
 
-/// Report a locally saved image to the coordinator's dataset.
+/// Record a locally saved image in the saved-file log.
 #[allow(clippy::too_many_arguments)]
 fn report_image(
     h: &WorkerHandle,
-    resolved: &crate::destination::Resolved,
     path: &std::path::Path,
     stored: crate::storage::Stored,
     frame: &Frame,
@@ -1000,8 +997,6 @@ fn report_image(
         path: absolute_path(path),
         bytes: stored.bytes,
         sha256: Some(stored.sha256),
-        destination: resolved.destination.clone(),
-
         context: context.clone(),
         item: crate::engine::saved::SavedItem::Capture {
             frame_id: frame.id,
@@ -1129,20 +1124,6 @@ fn process_plain(
         }
         SessionCommand::Select { .. } => anyhow::bail!("selection belongs to the coordinator"),
         SessionCommand::Activity { .. } => anyhow::bail!("activity belongs to the coordinator"),
-        SessionCommand::DatasetOpen { .. }
-        | SessionCommand::DatasetClose
-        | SessionCommand::DatasetStatus
-        | SessionCommand::DatasetNote { .. }
-        | SessionCommand::DatasetQuery { .. }
-        | SessionCommand::DatasetExport { .. }
-        | SessionCommand::DatasetOpenIf { .. }
-        | SessionCommand::DatasetCloseIf { .. }
-        | SessionCommand::DatasetNoteIf { .. }
-        | SessionCommand::DatasetQueryIf { .. }
-        | SessionCommand::DatasetModelQueryIf { .. }
-        | SessionCommand::DatasetExportIf { .. } => {
-            anyhow::bail!("datasets belong to the coordinator")
-        }
         SessionCommand::NetworkScan { .. } => {
             anyhow::bail!("network scan belongs to the coordinator")
         }
@@ -1761,8 +1742,7 @@ fn process_plain(
                             .with_context(|| format!("save {}", first.display()))?;
                             let file = path.to_string_lossy().into_owned();
                             report_image(
-                                h, &resolved, &path, stored, &frame, &format, wall_ms, None,
-                                &context,
+                                h, &path, stored, &frame, &format, wall_ms, None, &context,
                             );
                             metadata["file"] = json!(file);
                             metadata["file_bytes"] = json!(bytes.len());
@@ -1963,8 +1943,8 @@ pub fn preflight_recording_output(
 }
 /// A name that cannot mean what it says is a usage error: several frames
 /// sent to one image name, or an image extension naming another format.
-/// The CLI checks the name as typed; session clients such as workflows and
-/// the desktop app keep the folder and format rules they always had.
+/// The CLI checks the name as typed; RPC clients keep the folder and format
+/// rules they always had.
 pub fn check_capture_name(output: &str, count: u32, format: &str) -> Result<()> {
     if output == "-" {
         return Ok(());
@@ -3576,8 +3556,8 @@ mod tests {
         connect(&h, "1000");
         let dir = temp_dir("guardrails");
         // The CLI refuses these names as typed (check_capture_name); the
-        // worker keeps serving workflows, the desktop app and other clients
-        // as before: a sequence fills a folder, and the format wins.
+        // worker keeps serving RPC clients as before: a sequence fills a
+        // folder, and the format wins.
         let v = h
             .request(capture_to(&dir.join("shot.raw"), 3, OnExists::Fail))
             .unwrap();
@@ -5245,7 +5225,7 @@ esac"#;
             login: None,
             saved_login,
         };
-        // An assistant connect never reads the store.
+        // A connect that refuses saved sign-ins never reads the store.
         assert!(h.request(connect(false)).is_err());
         assert_eq!(store.reads.load(Ordering::SeqCst), 0);
         // A saved sign-in is looked up when none was sent.

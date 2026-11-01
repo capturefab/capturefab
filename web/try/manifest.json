@@ -1,8 +1,0 @@
-{
-  "file": "capturefab.wasm",
-  "sha256": "177d790802f7f1063d80cd5e1c7bb4afcd18c46d57f4a3b256399cb8dc63c112",
-  "size_bytes": 211178,
-  "source_sha256": "120a1924f2e7a546bd8ea5fcbe29ffc61e76cd13a91b0bae230dad3501d11dc0",
-  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
-  "abi": 1
-}

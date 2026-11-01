@@ -1,6 +1,6 @@
 //! Output file naming: templates with {camera}, {date}, {time}, {datetime},
 //! {seq}, {frame} and {tag:KEY}, and what to do when a name is taken. Names
-//! are picked only in the camera worker; the CLI and GUI validate and preview.
+//! are picked only in the camera worker; the CLI validates and previews.
 //! {tag:KEY} is the capture context value for KEY made into one safe path
 //! component, so a label such as `defect` can choose a folder.
 use crate::{context::Context, storage::OutputExists, types::CameraInfo};

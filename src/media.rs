@@ -542,7 +542,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 /// Makes `path` this test thread's FFmpeg, or, with `None`, stops.
-#[cfg(test)]
+#[cfg(all(test, feature = "hubs"))]
 pub(crate) fn set_fake_ffmpeg(path: Option<PathBuf>) {
     FAKE_FFMPEG.set(path.map(|path| Arc::new(Executable::external(path))));
 }

@@ -19,14 +19,6 @@ fn main() {
         }
         return;
     }
-    #[cfg(feature = "gui")]
-    if std::env::args().nth(1).as_deref() == Some("__gpu-probe") {
-        if let Err(e) = capturefab::doctor::run_gpu_probe() {
-            eprintln!("capturefab GPU probe: {e:#}");
-            std::process::exit(1)
-        }
-        return;
-    }
     #[cfg(feature = "nvjpeg")]
     if std::env::args().nth(1).as_deref() == Some("__nvjpeg") {
         if let Err(e) = capturefab::nvjpeg::run_helper() {
@@ -71,89 +63,17 @@ fn main() {
             return;
         }
         let (code, exit) = cli::error_code(&error);
-        let workflow_failure = error.downcast_ref::<capturefab::workflow::WorkflowFailure>();
-        let check_failure = error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<capturefab::tools::CheckFailure>());
-        let plan_failure = error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<capturefab::tools::PlanFailure>());
-        let confirmation = error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<cli::ToolsConfirmationRequired>());
-        let assistant_failure = error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<cli::AssistantTaskFailure>());
-        #[cfg(feature = "ai")]
-        let provider_failure = error
-            .chain()
-            .find_map(|cause| cause.downcast_ref::<capturefab::assistant::http::ProviderError>());
-        // Classify typed failures before removing any registered hub secret.
-        let message = check_failure
-            .map(ToString::to_string)
-            .or_else(|| plan_failure.map(ToString::to_string))
-            .or_else(|| confirmation.map(ToString::to_string))
-            .or_else(|| assistant_failure.map(ToString::to_string))
-            .or_else(|| workflow_failure.map(ToString::to_string))
-            .unwrap_or_else(|| format!("{error:#}"));
-        #[cfg(feature = "ai")]
-        let message = provider_failure.map(ToString::to_string).unwrap_or(message);
-        let message = capturefab::hubs::scrub::scrub(&message).into_owned();
+        let message = capturefab::hubs::scrub::scrub(&format!("{error:#}")).into_owned();
         let hint = typed_output
             .as_deref()
             .and_then(|output| cli::exists_hint(&error, output));
         if json_mode {
             let mut envelope =
                 json!({"version":1,"ok":false,"error":{"code":code,"message":message}});
-            if let Some(failure) = assistant_failure {
-                envelope["error"]["details"] = failure.details();
-            } else if let Some(failure) = check_failure {
-                envelope["error"]["details"] = failure.details();
-            } else if let Some(failure) = plan_failure {
-                envelope["error"]["details"] = failure.details();
-            } else if let Some(confirmation) = confirmation {
-                envelope["error"]["details"] = confirmation.details();
-            } else if let Some(failure) = workflow_failure {
-                envelope["error"]["details"] = failure.result();
-            }
-            #[cfg(feature = "ai")]
-            if let Some(failure) = provider_failure {
-                envelope["error"]["message"] = json!(failure.to_string());
-                let mut details = assistant_failure
-                    .map(cli::AssistantTaskFailure::details)
-                    .unwrap_or_else(|| json!({}));
-                if let (Some(report), Some(provider)) =
-                    (details.as_object_mut(), failure.details().as_object())
-                {
-                    report.extend(
-                        provider
-                            .iter()
-                            .map(|(key, value)| (key.clone(), value.clone())),
-                    );
-                }
-                envelope["error"]["details"] = details;
-            }
             if let Some(hint) = hint {
-                if !envelope["error"]["details"].is_object() {
-                    envelope["error"]["details"] = json!({});
-                }
-                envelope["error"]["details"]["hint"] = json!(hint);
+                envelope["error"]["details"] = json!({"hint":hint});
             }
             let _ = cli::write_json(&envelope);
-        } else if let Some(failure) = assistant_failure {
-            let _ = failure.print_human();
-            eprintln!("capturefab: {message}");
-        } else if let Some(failure) = check_failure {
-            for (step, issues) in &failure.issues_by_step {
-                for issue in issues {
-                    let field = issue
-                        .field
-                        .as_deref()
-                        .map(|field| format!(" ({field})"))
-                        .unwrap_or_default();
-                    eprintln!("capturefab: step {step}{field}: {}", issue.message);
-                }
-            }
         } else {
             eprintln!("capturefab: {message}");
             if let Some(hint) = hint {

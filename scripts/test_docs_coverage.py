@@ -44,19 +44,19 @@ class SourceParserTests(unittest.TestCase):
             write(root, "src/cli.rs", '''pub enum Command {
                 #[command(visible_alias = "stores")]
                 Storage { #[command(subcommand)] command: crate::example_store::Command },
-                Tools { #[command(subcommand)] command: Option<ToolsCommand> },
+                Setup { #[command(subcommand)] command: Option<SetupCommand> },
                 #[command(hide = true)] Internal,
             }''')
             write(root, "src/example_store.rs", '''pub enum Command {
                 Init, #[command(hide = true)] Run,
                 #[cfg(feature = "optional")] ExportCredentials,
             }''')
-            write(root, "src/cli/tools.rs", '''pub enum ToolsCommand {
+            write(root, "src/cli/setup.rs", '''pub enum SetupCommand {
                 #[command(name = "inspect", visible_aliases = ["read", "show"])] Describe,
             }''')
             self.assertEqual(coverage.command_paths(root), {
                 "help", "storage", "stores", "storage init", "storage export-credentials",
-                "tools", "tools inspect", "tools read", "tools show",
+                "setup", "setup inspect", "setup read", "setup show",
             })
 
     def test_unresolved_child_enum_fails_instead_of_claiming_full_coverage(self):
@@ -65,20 +65,6 @@ class SourceParserTests(unittest.TestCase):
             write(root, "src/cli.rs", "enum Command { New { #[command(subcommand)] child: MissingCommand } }")
             with self.assertRaisesRegex(ValueError, "cannot resolve subcommand enum"):
                 coverage.command_paths(root)
-
-    def test_tools_resolve_only_registered_structs_and_factories(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            write(root, "src/tools/mod.rs", "static CATALOG: &[ToolSpec] = &[read::FIRST, read::SECOND];")
-            write(root, "src/tools/read.rs", '''
-                pub const UNUSED: ToolSpec = observe("not_registered", "Ignored");
-                pub const FIRST: ToolSpec = observe("first", "Read camera");
-                pub const SECOND: ToolSpec = ToolSpec { title: "Second", name: "second", };
-            ''')
-            self.assertEqual(coverage.tool_names(root), {"first", "second"})
-            write(root, "src/tools/mod.rs", "static CATALOG: &[ToolSpec] = &[read::MISSING];")
-            with self.assertRaisesRegex(ValueError, "cannot read ToolSpec"):
-                coverage.tool_names(root)
 
     def test_rpc_rename_and_worker_only_exclusion(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -160,31 +146,19 @@ class InventoryTests(unittest.TestCase):
         files = {
             "src/cli.rs": "pub struct Cli {} pub enum Command { One }",
             "src/session.rs": "pub enum SessionCommand { Frame, Grab { timeout_ms: u64 } }",
-            "src/tools/mod.rs": "static CATALOG: &[ToolSpec] = &[read::GET];",
-            "src/tools/read.rs": 'pub const GET: ToolSpec = observe("get", "Get camera");',
-            "src/gui/keys.rs": "pub enum Action { Capture, Undo } // Action::Capture Action::Undo",
-            "src/remote.rs": 'match path { "/health" => health(), _ => missing() }',
             "web/reference.html": '''<article><h3 id="one">One</h3><p>Save one image.</p>
                 <h3 id="help">Help</h3><p>Show command help.</p>
-                <h3 id="get">Get</h3><p>Read the camera.</p>
                 <h3 id="frame">Frame</h3><p>Read a preview.</p></article>''',
-            "web/desktop.html": '<article id="desktop"><h2>Controls</h2><p>Capture images and undo camera changes.</p></article>',
         }
         for path, text in files.items():
             write(self.root, path, text)
         self.cli = {"schema_version": 1,
                     "commands": {key: f"reference.html#{key}" for key in ("one", "help")},
-                    "tools": {"get": "reference.html#get"},
                     "rpc": {"frame": "reference.html#frame"}}
-        self.desktop = {"version": 1, "features": {
-            "keys": {"source": "src/gui/keys.rs", "terms": ["Action::Capture", "Action::Undo"], "url": "desktop.html#desktop"},
-            "health": {"source": "src/remote.rs", "terms": ['"/health"'], "url": "desktop.html#desktop"},
-        }}
         self.save()
 
     def save(self):
         write(self.root, "docs/cli-coverage.json", json.dumps(self.cli))
-        write(self.root, "docs/desktop-coverage.json", json.dumps(self.desktop))
 
     def test_full_inventory_passes(self):
         report = coverage.validate(self.root)
@@ -200,24 +174,16 @@ class InventoryTests(unittest.TestCase):
         self.assertIn("new-feature", " ".join(report["errors"]))
         self.assertIn("stale documentation entries: removed", " ".join(report["errors"]))
 
-    def test_stale_source_tokens_missing_actions_and_new_routes_fail(self):
-        write(self.root, "src/gui/keys.rs", "pub enum Action { Capture, Undo, NewAction } // Action::Capture")
-        write(self.root, "src/remote.rs", 'match path { "/health" => health(), "/api/new" => new() }')
-        report = coverage.validate(self.root)
-        errors = " ".join(report["errors"])
-        self.assertFalse(report["ok"])
-        self.assertIn("source term no longer exists: 'Action::Undo'", errors)
-        self.assertIn("NewAction", errors)
-        self.assertIn("/api/new", errors)
-
     def test_missing_and_unexplained_targets_fail(self):
         self.cli["commands"]["one"] = "reference.html#absent"
-        write(self.root, "web/desktop.html", '<article id="desktop"><h2>Controls</h2><a href="reference.html">Read more</a></article>')
+        self.cli["rpc"]["frame"] = "reference.html#links"
+        write(self.root, "web/reference.html", (self.root / "web/reference.html").read_text()
+              + '<article id="links"><h2>Frame</h2><a href="other.html">Read more</a></article>')
         self.save()
         report = coverage.validate(self.root)
         self.assertFalse(report["ok"])
         self.assertTrue(any("reference.html#absent" in error for error in report["errors"]))
-        self.assertTrue(any("desktop.html#desktop" in error for error in report["errors"]))
+        self.assertTrue(any("reference.html#links" in error for error in report["errors"]))
 
     def test_remote_and_traversal_targets_fail(self):
         for target in ("https://example.com/docs#one", "../outside.html#one", "/absolute.html#one"):

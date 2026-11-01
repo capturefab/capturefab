@@ -254,7 +254,6 @@ fn the_schema_and_doctor_describe_hubs() {
         "secret_env",
         "accept_certificate",
         "tls_server_name",
-        "allow_hubs",
     ] {
         assert!(text.contains(needle), "{needle}");
     }

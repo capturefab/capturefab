@@ -306,10 +306,9 @@ pub fn schema_contract() -> serde_json::Value {
         "kinds": kinds,
         "secrets": {
             "keychain": format!("OS credential store, service {}", registry::KEYCHAIN_SERVICE),
-            "environment": "a CAPTUREFAB_HUB_* variable in the process that opens or lists the camera (a GUI or serve session, or this CLI)",
+            "environment": "a CAPTUREFAB_HUB_* variable in the process that opens or lists the camera (a serve session, or this CLI)",
             "argv": "never: --secret-stdin or --secret-env VAR",
         },
-        "remote": "serve --listen refuses hub cameras unless started with --allow-hubs",
         "results": {
             "list": {"hubs": "[record]"},
             "add": {"hub": "record", "replaced": "bool", "check": "{ok, product, version, name, cameras, warnings} unless --no-check", "certificate": "{fingerprint, trust} for pinned hubs", "warnings": "[string]"},

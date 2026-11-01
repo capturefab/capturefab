@@ -112,8 +112,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" || true
 
-  no-gui:
-    name: Build without the GUI
+  features:
+    name: Build feature subsets
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -131,61 +131,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
-      # Every default feature except the window, so the GUI-free code paths keep compiling.
-      - run: cargo build --locked --no-default-features --features usb,scanner,jpeg,nvjpeg,vaapi,videotoolbox,parquet,hubs,updates
+      # Builds without optional features keep compiling, alone and with hubs.
       - run: cargo check --locked --no-default-features
       - run: cargo check --locked --no-default-features --features hubs
-
-  wasm:
-    name: WASM remote workbench
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal -c clippy -c rustfmt -t wasm32-unknown-unknown --no-self-update && rustup default stable
-      - uses: ./.github/actions/setup-ffmpeg
-        with:
-          runner-image: ubuntu-24.04
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-on-failure: true
-          # The embedded-client integration test builds the native crate, too.
-          workspaces: |
-            . -> target
-            web-client -> target
-      - run: cargo fmt --manifest-path web-client/Cargo.toml --check
-      - run: cargo test --manifest-path web-client/Cargo.toml --locked
-      - run: cargo clippy --manifest-path web-client/Cargo.toml --locked --target wasm32-unknown-unknown -- -D warnings
-      - run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
-      - run: sh web-client/build.sh
-      # The client just built, served from inside the executable.
-      - run: cargo test --locked --no-default-features --features embedded-web --test remote
-
-  try-wasm:
-    name: In-browser try (WASM)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: rustup toolchain install stable --profile minimal -c clippy -c rustfmt -t wasm32-unknown-unknown --no-self-update && rustup default stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          cache-on-failure: true
-          workspaces: web-try -> target
-      - run: cargo fmt --manifest-path web-try/Cargo.toml --check
-      - run: cargo test --manifest-path web-try/Cargo.toml --locked
-      - run: cargo clippy --manifest-path web-try/Cargo.toml --locked --all-targets -- -D warnings
-      - run: cargo clippy --manifest-path web-try/Cargo.toml --locked --target wasm32-unknown-unknown -- -D warnings
-      # A fresh build, kept out of web/try, must pass the same golden checks as the committed one.
-      - run: python3 scripts/build-try.py --out target/try-check
-      # Files, not the directory: Node 22 treats a directory argument as a module path.
-      - run: node --test scripts/try-tests/*.test.mjs
-        env:
-          CAPTUREFAB_TRY_WASM: target/try-check/capturefab.wasm
 
   site:
     name: Site and release scripts
@@ -200,9 +148,6 @@ jobs:
       - run: node --check web/docs.js
       - run: node scripts/test-docs-search.js
       - run: node scripts/test-site-ui.js
-      - run: for f in web/try/*.mjs; do node --check "$f"; done
-      # The committed web/try/capturefab.wasm against the golden results; this job has no Rust.
-      - run: node --test scripts/try-tests/*.test.mjs
       - run: python3 -m unittest discover -s scripts -v
       # The site's /download/* Worker is TypeScript, which Node 24 runs directly.
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0

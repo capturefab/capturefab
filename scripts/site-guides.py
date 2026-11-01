@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish the user guides in docs/ and the example workflows as web/guides/.
+"""Publish the user guides in docs/ as web/guides/.
 
 The site links to these copies, never to the source repository. Relative links
 are rewritten to the copies or to site pages; a link to any other repository
@@ -13,7 +13,6 @@ ROOT = Path(__file__).resolve().parents[1]
 WEB = ROOT / 'web'
 GUIDES = ['assistant', 'camera-compatibility', 'cli-workflows', 'ffmpeg-build', 'line-computer',
           'plant-floor', 'remote-control', 'simulation', 'video-analytics']
-EXAMPLES = ROOT / 'examples' / 'workflows'
 # README sections and the site page that covers each one.
 README = {'build-test-and-release': '../downloads.html#source', 'save-to-drives-and-folders': '../docs.html#destinations',
           'repeatable-workflows': '../docs.html#workflows', 'host-checks-and-efficiency-mode': '../docs.html#resources',
@@ -35,10 +34,6 @@ def rewrite(target, source):
         return README[anchor]
     if path == '../web/agents.md':
         return f'../agents.md{fragment}'
-    if path.rstrip('/') == '../examples/workflows':
-        return '#start-from-an-example'
-    if path.startswith('../examples/workflows/') and (EXAMPLES / path.rsplit('/', 1)[1]).is_file():
-        return f'workflows/{path.rsplit("/", 1)[1]}{fragment}'
     raise ValueError(f'{source}: no published page for the link {target}; add it to scripts/site-guides.py')
 
 
@@ -48,8 +43,6 @@ def pages(web=WEB):
         source = f'docs/{name}.md'
         text = (ROOT / source).read_text(encoding='utf-8')
         out[web / 'guides' / f'{name}.md'] = HEADER.format(source=source) + LINK.sub(lambda m: m[1] + rewrite(m[2], source) + m[3], text)
-    for example in sorted(EXAMPLES.glob('*.json')):
-        out[web / 'guides' / 'workflows' / example.name] = example.read_text(encoding='utf-8')
     return out
 
 

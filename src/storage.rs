@@ -14,18 +14,10 @@
 //! files are kept. A crash between those two steps leaves records that loading
 //! skips by number. A crash during an append leaves an unterminated last line,
 //! which the next locker truncates; any other unreadable record fails closed.
-//! Version 3 records both individual captures and task namespaces. Known older
-//! ledgers are upgraded only after their complete journal has been validated.
-mod namespace;
-mod output_directory;
+//! Version 3 is current. Known older ledgers are upgraded only after their
+//! complete journal has been validated.
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use fs2::FileExt;
-pub(crate) use namespace::{
-    RetainedNamespaceLease, ensure_not_task_namespace, recover_task_namespaces,
-    reserve_task_namespace,
-};
-pub(crate) use output_directory::NamespaceRemovalReceipt;
-pub(crate) use output_directory::{OutputDirectory, OutputDirectoryPlan};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -34,7 +26,7 @@ use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Mutex, PoisonError},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -58,7 +50,7 @@ const COMMIT_TRIES: u32 = 3;
 /// backlog, such as a new age limit or a machine that was off, cannot hold
 /// the lock for long. A full budget removes as many as it needs.
 const EXPIRED_BATCH: usize = 32;
-/// Free space a save must leave on the disk it writes to, as datasets do.
+/// Free space a save must leave on the disk it writes to.
 /// A fixed amount rather than a share of the disk: the free space reported
 /// to unprivileged processes already excludes what ext4 reserves for the
 /// system (5%), and a percentage would refuse saves on a large, mostly full
@@ -180,8 +172,6 @@ struct Entry {
     /// Legacy unsent file: retain its old protection when reading existing ledgers.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pending_upload: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    namespace: Option<namespace::NamespaceRecord>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Ledger {
@@ -405,23 +395,13 @@ impl Manager {
         removed
     }
     fn writer(&self, path: &Path, policy: &StoragePolicy, reserve: u64) -> Result<StorageWriter> {
-        self.writer_for(path, policy, reserve, None, SaveKind::Recording)
-    }
-    fn writer_anchored(
-        &self,
-        path: &Path,
-        policy: &StoragePolicy,
-        reserve: u64,
-        directory: Option<Arc<OutputDirectory>>,
-    ) -> Result<StorageWriter> {
-        self.writer_for(path, policy, reserve, directory, SaveKind::File)
+        self.writer_for(path, policy, reserve, SaveKind::Recording)
     }
     fn writer_for(
         &self,
         path: &Path,
         policy: &StoragePolicy,
         reserve: u64,
-        directory: Option<Arc<OutputDirectory>>,
         kind: SaveKind,
     ) -> Result<StorageWriter> {
         policy.validate()?;
@@ -434,7 +414,6 @@ impl Manager {
             kind.budget_hint()
         );
         let mut locked = self.lock()?;
-        namespace::ensure_write_allowed(&locked, path)?;
         let policy = policy.constrained_by(&locked.configured_policy()?);
         ensure!(
             reserve <= policy.max_bytes,
@@ -443,15 +422,7 @@ impl Manager {
             human_bytes(policy.max_bytes),
             kind.configured_hint()
         );
-        let (base, path) = if let Some(directory) = &directory {
-            directory.verify()?;
-            let name = path
-                .file_name()
-                .ok_or_else(|| anyhow!("capture output must name a file"))?;
-            (directory.path().to_owned(), directory.path().join(name))
-        } else {
-            output_path(path)?
-        };
+        let (base, path) = output_path(path)?;
         match fs::symlink_metadata(&path) {
             Ok(_) => return Err(OutputExists(path).into()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -486,11 +457,7 @@ impl Manager {
         let lease_path = locked.directory.join(&lease_name);
         let lease = private_options().create_new(true).open(&lease_path)?;
         lease.lock_exclusive()?;
-        let opened = match &directory {
-            Some(directory) => directory.create_new(path.file_name().expect("output file name")),
-            None => private_options().create_new(true).open(&path),
-        };
-        let file = match opened {
+        let file = match private_options().create_new(true).open(&path) {
             Ok(file) => file,
             Err(error) => {
                 drop(lease);
@@ -515,21 +482,16 @@ impl Manager {
             modified_ns: None,
             changed: false,
             pending_upload: false,
-            namespace: None,
         });
         if let Err(error) = locked.persist() {
             drop(file);
             drop(lease);
-            if directory.is_none()
-                && fs::symlink_metadata(&path)
-                    .is_ok_and(|meta| identity(&meta) == file_identity && meta.len() == 0)
+            if fs::symlink_metadata(&path)
+                .is_ok_and(|meta| identity(&meta) == file_identity && meta.len() == 0)
             {
                 let _ = fs::remove_file(&path);
             }
             let _ = fs::remove_file(&lease_path);
-            if directory.is_some() {
-                return Err(error).with_context(|| format!("new empty export file {} remains without a confirmed storage record after the ledger failure; inspect this file before removing the export folder", path.display()));
-            }
             return Err(error);
         }
         Ok(StorageWriter {
@@ -549,7 +511,6 @@ impl Manager {
             failed: false,
             cut: false,
             finalized: false,
-            _directory: directory,
         })
     }
 }
@@ -746,7 +707,6 @@ fn check_entry(entry: &Entry) -> Result<()> {
         ),
         "invalid storage capture hash"
     );
-    namespace::validate_entry(entry)?;
     Ok(())
 }
 /// A journal's header and the length of its line.
@@ -954,10 +914,6 @@ impl Locked {
         for entry in &self.ledger.entries {
             check_entry(entry)?;
             ensure!(
-                entry.namespace.is_none() || self.ledger.version == LEDGER_VERSION,
-                "task namespaces require storage ledger version 3"
-            );
-            ensure!(
                 ids.insert(&entry.id),
                 "invalid storage ledger reservation id"
             );
@@ -1108,7 +1064,7 @@ impl Locked {
         }
         result
     }
-    /// Totals for readers that must not take the lock, such as the GUI. Best
+    /// Totals for readers that must not take the lock, such as doctor. Best
     /// effort: the ledger is the record, and the next commit rewrites this.
     fn write_summary(&self) {
         let Ok(allocated_bytes) = self.allocated() else {
@@ -1136,15 +1092,6 @@ impl Locked {
         let mut missing = Vec::new();
         let mut verified = HashSet::new();
         for (index, entry) in self.ledger.entries.iter_mut().enumerate() {
-            if entry.namespace.is_some() {
-                let reconciled = namespace::reconcile_entry(entry, &self.directory)?;
-                if reconciled.unpublished {
-                    missing.push(index);
-                } else if reconciled.changed {
-                    self.dirty.push(entry.id.clone());
-                }
-                continue;
-            }
             if !full && entry.lease.is_none() {
                 continue;
             }
@@ -1255,8 +1202,6 @@ impl Locked {
             "active_reservations": self.ledger.entries.iter().filter(|entry| entry.lease.is_some()).count(),
             "externally_changed_files": self.ledger.entries.iter().filter(|entry| entry.changed).count(),
             "free_bytes": free_bytes(&capture_root()),
-            "namespace_accounting": "Full reserved logical EOF extent caps; retained after close or client loss until confirmed anchored removal. No physical disk quota or retained-size shrink.",
-            "retained_namespaces": namespace::status(&self.ledger),
         }))
     }
     fn expired(&self, entry: &Entry, policy: &StoragePolicy) -> bool {
@@ -1265,11 +1210,7 @@ impl Locked {
             .is_some_and(|age| now().saturating_sub(entry.created) >= age)
     }
     fn removable(entry: &Entry) -> bool {
-        entry.namespace.is_none()
-            && entry.lease.is_none()
-            && !entry.changed
-            && entry.sha256.is_some()
-            && !entry.pending_upload
+        entry.lease.is_none() && !entry.changed && entry.sha256.is_some() && !entry.pending_upload
     }
     /// Expired and removable. A protected file past the age limit, such as a
     /// live or interrupted recording or one awaiting upload, must not block
@@ -1283,9 +1224,7 @@ impl Locked {
         self.ledger
             .entries
             .iter()
-            .position(|entry| {
-                entry.path == path && entry.lease.is_none() && entry.namespace.is_none()
-            })
+            .position(|entry| entry.path == path && entry.lease.is_none())
             .ok_or_else(|| anyhow!("{} is not a finished Capturefab capture", path.display()))
     }
     /// Remove one capture if it is still exactly the file recorded; the
@@ -1455,10 +1394,7 @@ impl Locked {
             .ledger
             .entries
             .iter()
-            .filter(|entry| {
-                (entry.lease.is_some() || entry.namespace.is_some())
-                    && on_disk(entry, device) != Some(false)
-            })
+            .filter(|entry| entry.lease.is_some() && on_disk(entry, device) != Some(false))
             .map(|entry| entry.reserved.saturating_sub(entry.bytes))
             .sum();
         let needed = FREE_SPACE_FLOOR
@@ -1554,8 +1490,6 @@ pub struct StorageWriter {
     /// every byte before it intact; see `finish_cut`.
     cut: bool,
     finalized: bool,
-    /// Keep directory anchors (and Windows rename guards) through commit.
-    _directory: Option<Arc<OutputDirectory>>,
 }
 impl Write for StorageWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
@@ -1808,19 +1742,6 @@ pub fn create_writer(
     Manager::global().writer(path, policy, reserve_bytes)
 }
 
-pub(crate) fn create_writer_in(
-    directory: &Arc<OutputDirectory>,
-    name: &str,
-    policy: &StoragePolicy,
-    reserve_bytes: u64,
-) -> Result<StorageWriter> {
-    Manager::global().writer_anchored(
-        &directory.path().join(name),
-        policy,
-        reserve_bytes,
-        Some(directory.clone()),
-    )
-}
 /// A finished output's size and SHA-256, as recorded in the ledger.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stored {
@@ -1907,7 +1828,7 @@ impl SaveKind {
 /// Save already encoded bytes as a new file.
 pub fn save_bytes(bytes: &[u8], path: &Path, policy: &StoragePolicy) -> Result<Stored> {
     let mut writer =
-        Manager::global().writer_for(path, policy, bytes.len() as u64, None, SaveKind::File)?;
+        Manager::global().writer_for(path, policy, bytes.len() as u64, SaveKind::File)?;
     writer.write_all(bytes)?;
     let stored = Stored {
         bytes: writer.bytes_written(),
@@ -2827,7 +2748,6 @@ mod tests {
                 modified_ns: meta.modified().ok().and_then(nanos),
                 changed: false,
                 pending_upload: false,
-                namespace: None,
             });
         }
         locked.compact().unwrap();

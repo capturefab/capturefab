@@ -16,7 +16,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const VERSION: u32 = 1;
+/// The session protocol: descriptors, requests and replies. A session of
+/// another version, such as one started by Capturefab 0.5, is never listed,
+/// chosen or sent a request.
+pub const VERSION: u32 = 2;
 const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
@@ -108,7 +111,7 @@ pub fn runtime_dir() -> PathBuf {
     let login = login_runtime_dir().filter(|(_, login)| *login == LoginDir::Usable);
     runtime_dir_in(&var, login.map(|(dir, _)| dir))
 }
-/// What must outlive a reboot: GUI settings, saved destinations and the storage ledger. The Linux runtime directory is a RAM disk
+/// What must outlive a reboot: saved destinations, setups and sign-in indexes, and the storage ledger. The Linux runtime directory is a RAM disk
 /// that logout clears, so there they live under XDG_STATE_HOME; elsewhere
 /// the two are one directory.
 pub fn state_dir() -> PathBuf {
@@ -120,9 +123,8 @@ pub fn state_dir() -> PathBuf {
     }
     state_dir_in(&var, cfg!(target_os = "linux"))
 }
-/// The per-user cache, for what can be made again: the extracted FFmpeg, its
-/// encoder probes and, on Linux, dataset staging. CAPTUREFAB_CACHE_DIR
-/// overrides it.
+/// The per-user cache, for what can be made again: the extracted FFmpeg and
+/// its encoder probes. CAPTUREFAB_CACHE_DIR overrides it.
 pub fn cache_dir() -> Option<PathBuf> {
     if let Some(dir) = var("CAPTUREFAB_CACHE_DIR") {
         return Some(dir);
@@ -431,7 +433,7 @@ impl std::fmt::Display for MissingSession {
         let name = &self.0;
         write!(
             f,
-            "session '{name}' not found; run capturefab gui --name {name} or capturefab serve --name {name}"
+            "session '{name}' not found; run capturefab serve --name {name}"
         )
     }
 }
@@ -442,7 +444,7 @@ impl std::error::Error for MissingSession {}
 fn missing_session_error(name: &str, active: &[Descriptor]) -> anyhow::Error {
     let message = if active.is_empty() {
         format!(
-            "session '{name}' is not running, and no sessions are running; start one with capturefab gui --name {name} or capturefab serve --name {name}"
+            "session '{name}' is not running, and no sessions are running; start one with capturefab serve --name {name}"
         )
     } else {
         let running = active
@@ -506,7 +508,7 @@ fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
         }
         Err(error) => {
             return Err(anyhow::Error::from(error).context(format!(
-                "session '{name}' not found; run capturefab gui --name {name} or capturefab serve --name {name}"
+                "session '{name}' not found; run capturefab serve --name {name}"
             )));
         }
     };
@@ -1565,7 +1567,7 @@ mod tests {
             .unwrap();
             // Another loopback service may speak JSON, but it is not this session.
             stream
-                .write_all(b"{\"version\":1,\"ok\":true,\"result\":{\"probe\":false}}\n")
+                .write_all(b"{\"version\":2,\"ok\":true,\"result\":{\"probe\":false}}\n")
                 .unwrap();
         });
         assert!(!descriptor_active(&descriptor));
@@ -1645,6 +1647,23 @@ mod tests {
         peer.join().unwrap();
     }
     #[test]
+    fn sessions_of_an_older_protocol_are_never_listed_or_chosen() {
+        let dir = TestDir::new();
+        let address = "127.0.0.1:12345".parse().unwrap();
+        let mut old = test_descriptor("old", address);
+        old.version = 1;
+        dir.write_descriptor(&old);
+        dir.write_descriptor(&test_descriptor("current", address));
+        let names: Vec<_> = descriptors_in(&dir.0)
+            .unwrap()
+            .into_iter()
+            .map(|descriptor| descriptor.name)
+            .collect();
+        assert_eq!(names, ["current"]);
+        let error = read_descriptor_in(&dir.0, "old").unwrap_err();
+        assert!(error.to_string().contains("protocol version"), "{error:#}");
+    }
+    #[test]
     fn descriptor_discovery_is_sorted_and_ignores_application_state() {
         let dir = TestDir::new();
         for name in ["zebra", "alpha"] {
@@ -1665,11 +1684,11 @@ mod tests {
     fn malformed_requests_return_actionable_errors() {
         for (request, field) in [
             (
-                "{\"version\":1,\"token\":\"t\",\"command\":{\"op\":\"status\"},\"camrea\":\"sim:0\"}\n",
+                "{\"version\":2,\"token\":\"t\",\"command\":{\"op\":\"status\"},\"camrea\":\"sim:0\"}\n",
                 "camrea",
             ),
             (
-                "{\"version\":1,\"token\":\"t\",\"command\":{\"op\":\"status\",\"unknown\":1}}\n",
+                "{\"version\":2,\"token\":\"t\",\"command\":{\"op\":\"status\",\"unknown\":1}}\n",
                 "unknown",
             ),
         ] {
