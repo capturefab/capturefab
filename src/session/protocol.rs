@@ -116,12 +116,12 @@ impl WorkerCommand {
     pub(crate) fn budget_ms(&self) -> u64 {
         match self {
             Self::Session(command) => match command {
-                SessionCommand::Capture {
-                    count, timeout_ms, ..
-                } => timeout_ms
-                    .saturating_mul(u64::from(*count))
-                    .saturating_add(60_000),
-                SessionCommand::Frame { timeout_ms, .. } => timeout_ms.saturating_add(15_000),
+                SessionCommand::Capture { .. } | SessionCommand::Frame { .. } => {
+                    crate::session::default_request_timeout(command)
+                        .as_millis()
+                        .try_into()
+                        .unwrap_or(u64::MAX)
+                }
                 SessionCommand::ApplySetup { .. } => 240_000,
                 SessionCommand::Connect { timeout_ms, .. } => timeout_ms.saturating_add(30_000),
                 _ => 60_000,

@@ -163,7 +163,9 @@
 <tr><td><code>--set</code></td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>—</td></tr>
 <tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>false</td></tr>
 <tr><td><code>--tag</code></td><td>Tag the files: {tag:KEY} in -o, and in each image's metadata; repeatable</td><td>—</td></tr>
-<tr><td><code>--timeout</code></td><td>How long to wait for each frame; none waits for a trigger until stopped</td><td>5s</td></tr>
+<tr><td><code>--timeout</code></td><td>How long to wait for each frame (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped</td><td>—</td></tr>
+<tr><td><code>--fresh</code></td><td>Frames to let pass after the first one exposed after the last settings change, 0..10</td><td>0</td></tr>
+<tr><td><code>--warmup</code></td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 takes frames at once</td><td>2s</td></tr>
 <tr><td><code>--on-exists</code></td><td>When a file name without {seq} exists: fail, or number (-0001, -0002, ...)</td><td>fail, number</td></tr>
 <tr><td><code>--manifest</code></td><td>Append one JSON line per saved file (path, time, size, SHA-256, settings, tags) to this file</td><td>—</td></tr>
 <tr><td><code>--sync</code></td><td>file: each file reaches the disk before it is reported; none: skip that, for scratch captures</td><td>file, none</td></tr>
@@ -184,6 +186,7 @@
 <tr><td><code>--set</code></td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>—</td></tr>
 <tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>false</td></tr>
 <tr><td><code>--timeout</code></td><td>How long to wait for the first frame; none waits for a trigger until stopped</td><td>10s</td></tr>
+<tr><td><code>--warmup</code></td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle before recording; 0 records at once</td><td>2s</td></tr>
 <tr><td><code>--background</code></td><td>Leave the recording running in a session and print its job once the first frame is encoded</td><td>false</td></tr>
 <tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
@@ -194,7 +197,9 @@
 <tr><td><code>--region</code></td><td>Measure only this part of the frame: X,Y,W,H as fractions 0..1</td><td>—</td></tr>
 <tr><td><code>--preview</code></td><td>Where to write the preview (it must not exist), or none (default: a private folder doctor shows)</td><td>—</td></tr>
 <tr><td><code>--size</code></td><td>The preview's longest edge in pixels, 64..2048</td><td>768</td></tr>
-<tr><td><code>--fresh</code></td><td>Frames to let pass before the one measured, 0..10 (1: a frame exposed after this command began)</td><td>1</td></tr>
+<tr><td><code>--fresh</code></td><td>Frames to let pass after the first one exposed after the last settings change, 0..9</td><td>0</td></tr>
+<tr><td><code>--timeout</code></td><td>How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer)</td><td>—</td></tr>
+<tr><td><code>--warmup</code></td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 measures at once</td><td>2s</td></tr>
 <tr><td><code>--set</code></td><td>Change settings first, as one atomic change (as set does), then measure; repeatable</td><td>—</td></tr>
 <tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>

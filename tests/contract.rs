@@ -485,10 +485,11 @@ fn sessions_are_used_when_they_hold_the_camera() {
         home.ok(&["get", "-c", "sim:first", "Width"])["values"]["Width"],
         320
     );
-    // --no-session opens a worker of its own, with the camera's defaults.
+    // --no-session opens a worker of its own; the simulated camera keeps
+    // its settings, as a real one does until it is powered off.
     assert_eq!(
         home.ok(&["--no-session", "get", "-c", "sim:first", "Width"])["values"]["Width"],
-        640
+        320
     );
     // Without -c, the only session with exactly one camera.
     assert_eq!(home.ok(&["get", "Width"])["camera"], "sim:first");

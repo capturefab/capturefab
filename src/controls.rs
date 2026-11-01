@@ -1738,6 +1738,22 @@ pub(crate) fn bits(pixel_format: &str) -> Option<u32> {
     digits.chars().rev().collect::<String>().parse().ok()
 }
 
+/// The camera's exposure time and frame rate, when it has them: what its
+/// frame waits, and the time after a change before its frames show it,
+/// follow.
+pub(crate) fn frame_timing(camera: &mut Camera) -> (Option<Duration>, Option<f64>) {
+    let exposure = first_present(camera, &EXPOSURE).and_then(|feature| {
+        let unit = camera.feature_unit(feature).unwrap_or("us").to_owned();
+        let value = number(camera, &[feature])?;
+        let us = in_time_unit(Duration::from_secs(1), &unit).map_or(value, |per| value * 1e6 / per);
+        Duration::try_from_secs_f64(us / 1e6).ok()
+    });
+    let fps = number(camera, &RESULTING_RATE)
+        .or_else(|| number(camera, &FRAME_RATE))
+        .filter(|fps| fps.is_finite() && *fps > 0.0);
+    (exposure, fps)
+}
+
 pub(crate) fn info(camera: &mut Camera) -> Info {
     let pixel_format = camera
         .has("PixelFormat")

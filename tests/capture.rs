@@ -19,11 +19,12 @@ fn without_timing(mut value: Value) -> Value {
 #[test]
 fn direct_and_session_results_are_the_same_apart_from_timing() {
     let home = Home::new("same-results");
-    // A worker of a command keeps no settings after it, so each direct
-    // command sets what it needs.
+    // A camera keeps its settings between commands, so each direct and
+    // session command finds the camera as the one before left it.
     let direct = |args: &[&str]| home.ok(&[&["--no-session"][..], args].concat());
-    let get = direct(&["get", "-c", "sim:0", "Width", "exposure"]);
     let set = direct(&["set", "-c", "sim:0", "Width=320"]);
+    let get = direct(&["get", "-c", "sim:0", "Width", "exposure"]);
+    assert_eq!(get["values"]["Width"], 320);
     let capture = direct(&[
         "capture",
         "-c",
@@ -42,10 +43,12 @@ fn direct_and_session_results_are_the_same_apart_from_timing() {
         "--preview",
         "none",
     ]);
+    // Back as the session will find it.
+    direct(&["set", "-c", "sim:0", "Width=640"]);
     let _session = home.serve("same", &["sim:0"]);
     let session = |args: &[&str]| home.ok(&[&["--session", "same"][..], args].concat());
-    assert_eq!(session(&["get", "-c", "sim:0", "Width", "exposure"]), get);
     assert_eq!(session(&["set", "-c", "sim:0", "Width=320"]), set);
+    assert_eq!(session(&["get", "-c", "sim:0", "Width", "exposure"]), get);
     let shot = session(&[
         "capture",
         "-c",
@@ -351,13 +354,12 @@ fn a_hardware_triggered_camera_times_out_with_its_trigger() {
     );
     assert!(timeout["hint"].as_str().unwrap().contains("--timeout"));
     assert_eq!(timeout["details"]["files"], json!([]));
-    // An inspection says the same, with what it can do: it has no
-    // --timeout.
-    let inspected = home.fails(4, &["inspect", "-c", "sim:0"]);
+    // An inspection says the same, with what it can do.
+    let inspected = home.fails(4, &["inspect", "-c", "sim:0", "--timeout", "300ms"]);
     assert_eq!(inspected["code"], "trigger_timeout");
     let hint = inspected["hint"].as_str().unwrap();
     assert!(
-        !hint.contains("--timeout") && hint.contains("trigger=off"),
+        hint.contains("--timeout") && hint.contains("trigger=off"),
         "{hint}"
     );
     // Auto exposure has nothing to meter.
@@ -640,4 +642,169 @@ fn a_disk_below_the_free_space_floor_refuses_captures() {
         &["--json", "capture", "-c", "sim:0", "-o", "free.png"],
     )
     .success();
+}
+
+/// The mean of a saved 8-bit grayscale PNG, 0..1.
+fn png_mean(path: &Path) -> f64 {
+    let decoder = png::Decoder::new(std::fs::File::open(path).unwrap());
+    let mut reader = decoder.read_info().unwrap();
+    let mut data = vec![0; reader.output_buffer_size()];
+    let info = reader.next_frame(&mut data).unwrap();
+    data.truncate(info.buffer_size());
+    data.iter().map(|&v| f64::from(v)).sum::<f64>() / data.len() as f64 / 255.0
+}
+
+#[test]
+fn frames_are_taken_after_the_last_settings_change() {
+    let home = Home::new("after-change");
+    let _session = home.serve_with("fresh", &["sim:0"], &["--live"]);
+    // A slow stream: the frames being exposed and read out when a setting
+    // changes take a second to pass.
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "AcquisitionFrameRate=2",
+        "ExposureTime=2000",
+    ]);
+    let bright = home.ok(&[
+        "inspect",
+        "-c",
+        "sim:0",
+        "--preview",
+        "none",
+        "--set",
+        "ExposureTime=20000",
+    ]);
+    assert_eq!(bright["after_change"], true, "{bright}");
+    assert!(
+        bright["exposure"]["mean"].as_f64().unwrap() > 0.6,
+        "{bright}"
+    );
+    let dark = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "--set",
+        "ExposureTime=2000",
+        "-o",
+        "dark.png",
+    ]);
+    assert_eq!(dark["after_change"], true, "{dark}");
+    assert!(png_mean(&home.path("dark.png")) < 0.2);
+    // Without a change, the next frame is taken; --fresh lets more pass.
+    let started = std::time::Instant::now();
+    let next = home.ok(&["capture", "-c", "sim:0", "-o", "next.png"]);
+    assert!(next.get("after_change").is_none(), "{next}");
+    let later = home.ok(&["capture", "-c", "sim:0", "--fresh", "2", "-o", "later.png"]);
+    assert!(later.get("after_change").is_none(), "{later}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1000));
+    // A software-triggered frame fired after the change is new at once.
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "TriggerMode=On",
+        "TriggerSource=Software",
+    ]);
+    let started = std::time::Instant::now();
+    let triggered = home.ok(&[
+        "inspect",
+        "-c",
+        "sim:0",
+        "--preview",
+        "none",
+        "--set",
+        "ExposureTime=20000",
+    ]);
+    assert!(
+        triggered["exposure"]["mean"].as_f64().unwrap() > 0.6,
+        "{triggered}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+}
+
+#[test]
+fn a_camera_that_sets_its_own_exposure_settles_before_frames_are_taken() {
+    let home = Home::new("warm-up");
+    // Far too dark, with the camera's own continuous auto exposure.
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "ExposureTime=500",
+        "ExposureAuto=Continuous",
+    ]);
+    let warm = home.ok(&["capture", "-c", "sim:0", "-o", "warm.png"]);
+    assert!(warm["warmup_ms"].as_u64().unwrap() > 0, "{warm}");
+    assert!(warm.get("settled").is_none() && warm.get("warnings").is_none());
+    let mean = png_mean(&home.path("warm.png"));
+    assert!((0.35..0.55).contains(&mean), "{mean}");
+    let inspected = home.ok(&["inspect", "-c", "sim:0", "--preview", "none"]);
+    assert!(inspected["warmup_ms"].is_u64(), "{inspected}");
+    assert_eq!(inspected["verdict"], json!(["ok"]), "{inspected}");
+    // Too short a warm-up for three steady frames says so.
+    let short = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "--warmup",
+        "20ms",
+        "-o",
+        "short.png",
+    ]);
+    assert_eq!(short["settled"], false, "{short}");
+    assert!(short["warnings"][0].as_str().unwrap().contains("--warmup"));
+    let none = home.ok(&["capture", "-c", "sim:0", "--warmup", "0", "-o", "none.png"]);
+    assert!(none.get("warmup_ms").is_none(), "{none}");
+    // A camera with manual exposure needs none.
+    home.ok(&["set", "-c", "sim:0", "ExposureAuto=Off"]);
+    let manual = home.ok(&["capture", "-c", "sim:0", "-o", "manual.png"]);
+    assert!(manual.get("warmup_ms").is_none(), "{manual}");
+}
+
+#[test]
+fn a_camera_keeps_its_settings_between_direct_commands() {
+    let home = Home::new("kept");
+    let direct = |args: &[&str]| home.ok(&[&["--no-session"][..], args].concat());
+    direct(&["set", "-c", "sim:2", "Width=320", "PixelFormat=Mono12"]);
+    let shot = direct(&["capture", "-c", "sim:2", "-o", "kept.png"]);
+    assert_eq!(
+        (shot["width"].clone(), shot["pixel_format"].clone()),
+        (json!(320), json!("Mono12"))
+    );
+    // Options of the selector set up the connection, not the camera.
+    let read = direct(&["get", "-c", "sim:2?drop=0.01", "Width"]);
+    assert_eq!(read["values"]["Width"], 320);
+    // Another camera has its own.
+    assert_eq!(
+        direct(&["get", "-c", "sim:3", "Width"])["values"]["Width"],
+        640
+    );
+}
+
+#[test]
+fn hardware_triggers_wait_as_long_as_asked() {
+    let home = Home::new("line0");
+    let started = std::time::Instant::now();
+    let shots = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0?line0=every:300ms",
+        "--set",
+        "trigger=line0",
+        "-n",
+        "2",
+        "--timeout",
+        "none",
+        "-o",
+        "line/",
+    ]);
+    assert_eq!(shots["count"], 2, "{shots}");
+    assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+    // Auto exposure has nothing to meter between triggers.
+    assert_eq!(
+        home.fails(5, &["auto", "-c", "sim:0?line0=every:300ms"])["code"],
+        "unsupported"
+    );
 }

@@ -3,7 +3,7 @@
 //! and writes the preview, by default to a private folder; this turns the
 //! measurements into a short document with a verdict and a suggested
 //! exposure.
-use super::{Client, Global, args::CamerasArg, args::KeepArg, output::Report};
+use super::{Client, Global, args::CamerasArg, args::KeepArg, millis, output::Report};
 use crate::{
     controls::Assignment,
     inspect::PreviewFormat,
@@ -28,9 +28,15 @@ pub struct InspectArgs {
     /// The preview's longest edge in pixels, 64..2048
     #[arg(long, default_value_t = 768, value_name = "PX", value_parser = clap::value_parser!(u32).range(64..=2048))]
     pub size: u32,
-    /// Frames to let pass before the one measured, 0..10 (1: a frame exposed after this command began)
-    #[arg(long, default_value_t = 1, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=10))]
+    /// Frames to let pass after the first one exposed after the last settings change, 0..9
+    #[arg(long, default_value_t = 0, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub fresh: u32,
+    /// How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer)
+    #[arg(long, value_name = "DUR", value_parser = super::args::duration)]
+    pub timeout: Option<Duration>,
+    /// How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 measures at once
+    #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
+    pub warmup: Duration,
     /// Change settings first, as one atomic change (as set does), then measure; repeatable
     #[arg(long = "set", value_name = "NAME=VALUE")]
     pub settings: Vec<String>,
@@ -51,8 +57,6 @@ fn parse_region(text: &str) -> std::result::Result<[f64; 4], String> {
     Ok(region)
 }
 
-/// How long the frame may take to arrive.
-const WAIT: Duration = Duration::from_secs(5);
 /// Brightness auto exposure aims for, as `auto` does.
 const TARGET: f64 = 0.45;
 /// The clipped share past which a frame says too little to suggest an
@@ -60,6 +64,15 @@ const TARGET: f64 = 0.45;
 const SATURATED: f64 = 0.25;
 
 pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
+    if args
+        .timeout
+        .is_some_and(|wait| wait.is_zero() || millis(wait) > crate::inspect::MAX_WAIT_MS)
+    {
+        return Err(Usage("--timeout must be longer than 0 and at most 10m".into()).into());
+    }
+    if millis(args.warmup) > crate::session::MAX_WARMUP_MS {
+        return Err(Usage("--warmup is at most 60s".into()).into());
+    }
     let settings = args
         .settings
         .iter()
@@ -173,8 +186,9 @@ fn inspect(
     };
     let reply = client
         .call(SessionCommand::Frame {
-            fresh: args.fresh,
-            timeout_ms: super::millis(WAIT),
+            // The worker counts the frame measured too.
+            fresh: args.fresh + 1,
+            timeout_ms: args.timeout.map_or(0, millis),
             max_dimension: if matches!(preview, Preview::None) {
                 0
             } else {
@@ -186,6 +200,7 @@ fn inspect(
                 Preview::File(path) => Some(path.to_string_lossy().into_owned()),
                 _ => None,
             },
+            warmup_ms: Some(millis(args.warmup)),
         })
         .map_err(trigger_hint)?;
     let mut value = document(&info, &reply, verbose);
@@ -196,8 +211,7 @@ fn inspect(
     Ok(value)
 }
 
-/// A trigger timeout says what inspect can do about it: it has no
-/// --timeout of its own.
+/// A trigger timeout says what inspect can do about it.
 fn trigger_hint(error: anyhow::Error) -> anyhow::Error {
     let classified = crate::types::classify(&error);
     if classified.kind != ErrorKind::TriggerTimeout {
@@ -210,8 +224,7 @@ fn trigger_hint(error: anyhow::Error) -> anyhow::Error {
         .unwrap_or("its line")
         .to_owned();
     let mut error = Categorized::new(classified.kind, format!("{error:#}")).hint(format!(
-        "send a trigger on {source} within {}, or inspect with --set trigger=off",
-        super::args::duration_text(WAIT)
+        "send a trigger on {source}, wait longer with --timeout, or inspect with --set trigger=off"
     ));
     error.details = classified.details;
     error.into()
@@ -278,6 +291,15 @@ fn document(info: &Value, reply: &Value, verbose: bool) -> Value {
             value["focus"] = Value::Object(focus.clone());
             value["focus"]["sharpness"] = focus.get("laplacian").cloned().unwrap_or_default();
         }
+    }
+    if reply["after_change"] == true {
+        value["after_change"] = json!(true);
+    }
+    if let Some(ms) = reply["warmup_ms"].as_u64() {
+        value["warmup_ms"] = json!(ms);
+    }
+    if reply["warnings"].is_array() {
+        value["warnings"] = reply["warnings"].clone();
     }
     if verbose {
         value["histogram"] = exposure["histogram16"].clone();
@@ -444,6 +466,18 @@ pub const FIELDS: &[(&str, &str)] = &[
     (
         "preview",
         "string — the preview image's path; absent with --preview none",
+    ),
+    (
+        "after_change",
+        "true — frames exposed before the camera's last settings change were let pass",
+    ),
+    (
+        "warmup_ms",
+        "int — how long a camera that sets its own exposure took to settle after it started",
+    ),
+    (
+        "warnings",
+        "[string] — such as a camera still settling when --warmup ran out (verdict not_settled)",
     ),
     ("histogram", "[16 ints] — with -v: luminance histogram"),
     ("channels", "{red,green,blue} — with -v, for color"),

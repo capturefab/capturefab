@@ -3,7 +3,10 @@ use crate::{
     types::{Backend, CameraInfo, Frame, Transport, TransportStats},
 };
 use anyhow::{Context, Result, ensure};
-use std::{net::Ipv4Addr, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    time::{Duration, Instant},
+};
 
 pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, Vec<String>)> {
     Ok(discover_kinds(
@@ -210,7 +213,31 @@ pub struct Camera {
     /// each TriggerSelector value to fire under, or `None` for a camera
     /// without a selector.
     software_triggers: Option<Vec<Option<String>>>,
+    /// What says which frames may have been exposed before the last
+    /// settings change.
+    epoch: Epoch,
 }
+/// Frames to come from before the last settings change. A change written
+/// while the camera streams reaches the frame whose exposure starts after
+/// it: on a free-running stream the frame being exposed and the one being
+/// read out still carry the old settings, as do the frames of software
+/// triggers fired before the change, and a hardware-triggered frame
+/// exposed before it. A frame of an acquisition started after the change
+/// is always new.
+#[derive(Debug, Default)]
+struct Epoch {
+    /// Frames still to come that may predate the change.
+    stale: u32,
+    /// Until when a hardware-triggered camera's frames may predate it.
+    stale_until: Option<Instant>,
+    /// Software triggers fired whose frames have not come yet.
+    pending: u32,
+    /// Whether the frame `next_frame` returned last may predate it.
+    last_stale: bool,
+}
+/// Frames a free-running stream may deliver after a change that were
+/// exposed, at least in part, before it.
+const STALE_FRAMES: u32 = 2;
 /// Reject malformed known source forms without checking availability or build capabilities.
 /// Bare camera IDs and serials are resolved against discovery results on open.
 pub fn validate_selector_shape(selector: &str) -> Result<()> {
@@ -669,6 +696,7 @@ impl Camera {
             tl_locked: false,
             transferring: false,
             software_triggers: None,
+            epoch: Epoch::default(),
         })
     }
     pub fn features(&mut self) -> Vec<FeatureInfo> {
@@ -827,6 +855,8 @@ impl Camera {
             return Err(error);
         }
         self.streaming = true;
+        // Every frame of a new acquisition is exposed after any change.
+        self.epoch = Epoch::default();
         Ok(())
     }
     /// A camera left in SingleFrame or MultiFrame ends each acquisition by
@@ -897,6 +927,13 @@ impl Camera {
         if frame.wall_ms == 0 {
             frame.wall_ms = crate::scheduling::now_ms();
         }
+        let epoch = &mut self.epoch;
+        epoch.last_stale = epoch.stale > 0
+            || epoch
+                .stale_until
+                .is_some_and(|until| Instant::now() < until);
+        epoch.stale = epoch.stale.saturating_sub(1);
+        epoch.pending = epoch.pending.saturating_sub(1);
         Ok(frame)
     }
     /// Ask for the next frame. A camera whose start trigger is On with a
@@ -904,8 +941,43 @@ impl Camera {
     /// a hardware trigger still waits for its line.
     pub fn request_frame(&mut self) -> Result<()> {
         ensure!(self.streaming, "camera is not streaming");
-        self.trigger_software()?;
+        if self.software_triggered() {
+            self.trigger_software()?;
+            self.epoch.pending = self.epoch.pending.saturating_add(1);
+        }
         self.backend.request_frame()
+    }
+    /// Note that settings were written: until frames exposed after the
+    /// change come, `frame_predates_change` says so of each frame.
+    /// `hardware_trigger` is how long after the change a hardware-triggered
+    /// camera may still deliver a frame exposed before it (its exposure and
+    /// read-out); None for a camera that is not hardware-triggered.
+    pub(crate) fn settings_changed(&mut self, hardware_trigger: Option<Duration>) {
+        if !self.streaming {
+            return;
+        }
+        if let Some(hold) = hardware_trigger {
+            self.epoch.stale_until = Instant::now().checked_add(hold);
+        } else if self.software_triggered() {
+            self.epoch.stale = self.epoch.pending;
+        } else {
+            self.epoch.stale = STALE_FRAMES;
+        }
+    }
+    /// Settings this process emulates for the camera; see
+    /// `Backend::emulated_settings`.
+    pub(crate) fn emulated_settings(&mut self) -> Option<serde_json::Value> {
+        self.backend.emulated_settings()
+    }
+    /// Take back settings another process emulated for the camera.
+    pub(crate) fn restore_settings(&mut self, settings: &serde_json::Value) -> Result<()> {
+        self.software_triggers = None;
+        self.backend.restore_settings(settings)
+    }
+    /// Whether the frame `next_frame` returned last may have been exposed
+    /// before the last settings change.
+    pub(crate) fn frame_predates_change(&self) -> bool {
+        self.epoch.last_stale
     }
     /// Whether the camera sends frames only when software triggered.
     pub fn software_triggered(&mut self) -> bool {

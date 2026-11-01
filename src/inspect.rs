@@ -22,7 +22,9 @@ pub fn default_edge() -> u32 {
 }
 
 pub const MAX_FRESH: u32 = 10;
-pub const MAX_WAIT_MS: u64 = 10_000;
+/// The longest an inspection may wait for its frame: ten minutes, for a
+/// part on a conveyor that triggers the camera.
+pub const MAX_WAIT_MS: u64 = 600_000;
 /// Preview edges a request may ask for; 0 asks for measurements only.
 pub const EDGES: RangeInclusive<u32> = 64..=2048;
 /// The largest encoded preview. About 2 MiB as base64, well inside the
@@ -67,8 +69,8 @@ pub fn validate(
 ) -> Result<()> {
     ensure!(fresh <= MAX_FRESH, "fresh frames must be 0..10");
     ensure!(
-        (1..=MAX_WAIT_MS).contains(&timeout_ms),
-        "inspection wait must be 1..10000 milliseconds"
+        timeout_ms <= MAX_WAIT_MS,
+        "inspection wait must be at most 600000 milliseconds (0: the camera's default)"
     );
     ensure!(
         max_dimension == 0 || EDGES.contains(&max_dimension),
@@ -688,18 +690,19 @@ mod tests {
     fn requests_are_bounded_with_messages_that_never_read_as_timeouts() {
         validate(default_fresh(), default_wait_ms(), default_edge(), None).unwrap();
         validate(0, 1, 0, Some([0.0, 0.0, 1.0, 1.0])).unwrap();
-        validate(10, 10_000, 2048, Some([0.7, 0.7, 0.3, 0.3])).unwrap();
+        validate(10, 600_000, 2048, Some([0.7, 0.7, 0.3, 0.3])).unwrap();
         validate(1, 3000, 64, Some([0.25, 0.5, 0.5, 0.5])).unwrap();
+        // 0: the camera's default wait.
+        validate(1, 0, 64, None).unwrap();
         for (fresh, wait, edge, region, message) in [
             (11, 3000, 1024, None, "fresh frames must be 0..10"),
             (
                 1,
-                0,
+                600_001,
                 1024,
                 None,
-                "inspection wait must be 1..10000 milliseconds",
+                "inspection wait must be at most 600000 milliseconds",
             ),
-            (1, 10_001, 1024, None, "inspection wait"),
             (
                 1,
                 3000,

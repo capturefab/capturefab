@@ -29,7 +29,10 @@ pub(crate) fn preview_dir() -> PathBuf {
 /// What a `frame` request asks for.
 pub(super) struct Request {
     fresh: u32,
+    /// The frame wait asked for; 0 for the camera's default.
+    timeout_ms: u64,
     timeout: Duration,
+    warmup_ms: Option<u64>,
     max_dimension: u32,
     format: PreviewFormat,
     region: Option<[f64; 4]>,
@@ -45,13 +48,16 @@ impl Request {
             format,
             region,
             preview,
+            warmup_ms,
         }) = command.session()
         else {
             return None;
         };
         Some(Self {
             fresh: *fresh,
+            timeout_ms: *timeout_ms,
             timeout: Duration::from_millis(*timeout_ms),
+            warmup_ms: *warmup_ms,
             max_dimension: *max_dimension,
             format: *format,
             region: *region,
@@ -68,6 +74,9 @@ pub(super) struct Waiting {
     /// Frames still to let pass.
     left: u32,
     waited: u32,
+    /// Frames were let pass because they were exposed before the camera's
+    /// last settings change.
+    after_change: bool,
     deadline: Instant,
     reply: Answer,
 }
@@ -81,6 +90,8 @@ struct Job {
     /// `live` for a frame from a stream, `grab` for one acquired for this.
     source: &'static str,
     waited: u32,
+    after_change: bool,
+    warmup: Option<Warmup>,
     notes: Vec<String>,
     reply: Answer,
 }
@@ -144,15 +155,16 @@ pub(super) fn begin(
     camera: &mut Option<Camera>,
     auto: &mut Option<AutoController>,
     envelope: Envelope,
-    request: Request,
+    mut request: Request,
     inspector: &mut Inspector,
     waiting: &mut Vec<Waiting>,
 ) {
-    let deadline = deadline_after(request.timeout);
     let Some(c) = camera.as_mut() else {
         (envelope.reply)(Err(no_camera()));
         return;
     };
+    request.timeout = frame_wait(c, request.timeout_ms);
+    let deadline = deadline_after(request.timeout);
     if c.is_streaming() {
         let cancel = h
             .running
@@ -177,6 +189,7 @@ pub(super) fn begin(
             cancel,
             left: request.fresh.saturating_sub(1),
             waited: 0,
+            after_change: false,
             deadline,
             request,
             reply: envelope.reply,
@@ -185,13 +198,23 @@ pub(super) fn begin(
     }
     let info = c.info.clone();
     let count = request.fresh.max(1);
-    match acquire(h, camera, auto, count, deadline, request.timeout) {
-        Ok((frame, received, settled)) => inspector.inspect(Job {
+    match acquire(
+        h,
+        camera,
+        auto,
+        count,
+        deadline,
+        request.timeout,
+        request.warmup_ms,
+    ) {
+        Ok((frame, received, settled, warmup)) => inspector.inspect(Job {
             frame: Arc::new(frame),
             received,
             camera: info,
             source: "grab",
             waited: count,
+            after_change: false,
+            warmup,
             notes: if settled {
                 Vec::new()
             } else {
@@ -204,9 +227,10 @@ pub(super) fn begin(
     }
 }
 
-/// Acquire `count` frames from a stopped camera, settling auto exposure
-/// first, and stop it again: the last frame, when it came, and whether auto
-/// exposure had settled.
+/// Acquire `count` frames from a stopped camera, warming up one that sets
+/// its own exposure and settling Capturefab's auto exposure first, and stop
+/// it again: the last frame, when it came, whether auto exposure had
+/// settled, and the warm-up.
 pub(super) fn acquire(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
@@ -214,11 +238,17 @@ pub(super) fn acquire(
     count: u32,
     deadline: Instant,
     wait: Duration,
-) -> Result<(Frame, Instant, bool)> {
+    warmup_ms: Option<u64>,
+) -> Result<(Frame, Instant, bool, Option<Warmup>)> {
     let c = camera_mut(camera)?;
     let was_streaming = c.is_streaming();
     c.start()?;
-    let result = (|| -> Result<(Frame, Instant, bool)> {
+    let result = (|| -> Result<(Frame, Instant, bool, Option<Warmup>)> {
+        let warmup = if was_streaming {
+            None
+        } else {
+            warm_up(h, c, auto, warmup_ms)?
+        };
         // A software-triggered camera sends no frames to meter.
         let settled = was_streaming
             || auto.is_none()
@@ -244,7 +274,7 @@ pub(super) fn acquire(
             }
         }
         let (frame, received) = last.context("no frame was asked for")?;
-        Ok((frame, received, settled))
+        Ok((frame, received, settled, warmup))
     })();
     let stopped = if !was_streaming { c.stop() } else { Ok(()) };
     refresh(h, camera, false);
@@ -269,14 +299,21 @@ pub(super) fn serve(
         return keep.then_some(frame);
     }
     let received = Instant::now();
+    // A frame exposed before the camera's last settings change counts for
+    // none of them.
+    let stale = c.frame_predates_change();
     let mut due = Vec::new();
     for item in std::mem::take(waiting) {
-        if item.left == 0 {
+        if item.left == 0 && !stale {
             due.push(item);
             continue;
         }
         let mut item = item;
-        item.left -= 1;
+        if stale {
+            item.after_change = true;
+        } else {
+            item.left -= 1;
+        }
         item.waited += 1;
         let _ = c.request_frame();
         waiting.push(item);
@@ -294,6 +331,8 @@ pub(super) fn serve(
             request: item.request,
             source: "live",
             waited: item.waited + 1,
+            after_change: item.after_change,
+            warmup: None,
             notes: Vec::new(),
             reply: item.reply,
         });
@@ -430,6 +469,16 @@ fn measure(job: &Job) -> Result<Value> {
     }
     if !job.notes.is_empty() {
         reply["settled"] = json!(false);
+    }
+    if job.after_change {
+        reply["after_change"] = json!(true);
+    }
+    if let Some(warmup) = job.warmup {
+        reply["warmup_ms"] = json!(warmup.ms);
+        if !warmup.settled {
+            reply["settled"] = json!(false);
+            reply["warnings"] = json!([unsettled_warning(warmup.ms)]);
+        }
     }
     if let Some(measured) = reply["notes"].as_array_mut() {
         measured.extend(job.notes.iter().cloned().map(Value::from));

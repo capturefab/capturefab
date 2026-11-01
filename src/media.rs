@@ -3193,6 +3193,46 @@ impl Backend for MediaBackend {
         self.reconnect = None;
         Ok(())
     }
+    /// A webcam's video mode, size and rate, and a file's playback speed,
+    /// which FFmpeg is opened with: kept for the next process to open the
+    /// camera as a webcam keeps them until it is unplugged.
+    fn emulated_settings(&mut self) -> Option<serde_json::Value> {
+        if self.native {
+            Some(serde_json::json!({
+                "mode": self.mode.map(|index| self.modes[index].label()),
+                "width": self.width,
+                "height": self.height,
+                "requested_size": self.requested_size,
+                "fps": self.fps,
+            }))
+        } else if self.file() {
+            Some(serde_json::json!({ "paced": self.paced }))
+        } else {
+            None
+        }
+    }
+    fn restore_settings(&mut self, settings: &serde_json::Value) -> Result<()> {
+        if let Some(paced) = settings["paced"].as_bool().filter(|_| self.file()) {
+            return self.write_memory(32, &u32::from(paced).to_le_bytes());
+        }
+        ensure!(self.native, "settings saved for another kind of source");
+        if let Some(index) = settings["mode"]
+            .as_str()
+            .and_then(|label| self.modes.iter().position(|mode| mode.label() == label))
+        {
+            self.write_memory(28, &(index as u32).to_le_bytes())?;
+        }
+        if settings["requested_size"] == true {
+            for (address, key) in [(0, "width"), (4, "height")] {
+                let value = settings[key].as_u64().context("saved size")?;
+                self.write_memory(address, &u32::try_from(value)?.to_le_bytes())?;
+            }
+        }
+        if let Some(fps) = settings["fps"].as_f64() {
+            self.write_memory(20, &fps.to_le_bytes())?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

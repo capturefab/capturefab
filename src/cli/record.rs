@@ -69,6 +69,9 @@ pub struct RecordArgs {
     /// How long to wait for the first frame; none waits for a trigger until stopped
     #[arg(long, default_value = "10s", value_name = "DUR", value_parser = super::args::wait)]
     pub timeout: Wait,
+    /// How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle before recording; 0 records at once
+    #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
+    pub warmup: Duration,
     /// Leave the recording running in a session and print its job once the first frame is encoded
     #[arg(long)]
     pub background: bool,
@@ -167,6 +170,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         context: Default::default(),
         duration_ms: args.duration.map(millis),
         utc_offset_s: Some(crate::naming::local_offset()),
+        warmup_ms: Some(millis(args.warmup)),
         job: None,
         // A recording this command waits for ends when it goes away.
         lease: !args.background,
@@ -479,6 +483,13 @@ impl Recording<'_> {
             value["fps_actual"] = json!((frames as f64 / duration_s * 100.0).round() / 100.0);
         }
         value["fps"] = json!(self.fps);
+        if let Some(ms) = detail["warmup_ms"].as_u64() {
+            value["warmup_ms"] = json!(ms);
+            if detail["settled"] == false {
+                value["settled"] = json!(false);
+                value["warnings"] = json!([crate::engine::unsettled_warning(ms)]);
+            }
+        }
         crate::types::without_nulls(value)
     }
 }
@@ -524,6 +535,15 @@ pub const FIELDS: &[(&str, &str)] = &[
         "duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it",
     ),
     ("finalized", "bool — the file was closed and is complete"),
+    (
+        "warmup_ms",
+        "int — how long a camera that sets its own exposure took to settle before recording",
+    ),
+    (
+        "settled",
+        "false — its exposure was still changing when --warmup ran out (with a warning)",
+    ),
+    ("warnings", "[string]"),
     (
         "job",
         concat!(

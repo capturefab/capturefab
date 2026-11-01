@@ -78,9 +78,15 @@ pub struct CaptureArgs {
     /// Tag the files: {tag:KEY} in -o, and in each image's metadata; repeatable
     #[arg(long = "tag", value_name = "KEY=VALUE", value_parser = crate::context::parse_pair)]
     pub tags: Vec<(String, String)>,
-    /// How long to wait for each frame; none waits for a trigger until stopped
-    #[arg(long, default_value = "5s", value_name = "DUR", value_parser = super::args::wait)]
-    pub timeout: Wait,
+    /// How long to wait for each frame (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped
+    #[arg(long, value_name = "DUR", value_parser = super::args::wait)]
+    pub timeout: Option<Wait>,
+    /// Frames to let pass after the first one exposed after the last settings change, 0..10
+    #[arg(long, default_value_t = 0, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=10))]
+    pub fresh: u32,
+    /// How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 takes frames at once
+    #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
+    pub warmup: Duration,
     /// When a file name without {seq} exists: fail, or number (-0001, -0002, ...)
     #[arg(long, value_enum, default_value_t = crate::naming::OnExists::Fail)]
     pub on_exists: crate::naming::OnExists,
@@ -110,7 +116,9 @@ struct Plan {
     interval_ms: u64,
     /// None: now.
     first_at_ms: Option<u64>,
+    /// 0: the camera's default.
     timeout_ms: u64,
+    warmup_ms: u64,
     settings: Vec<Assignment>,
     context: crate::context::Context,
     /// Absolute, as the caller meant it.
@@ -181,14 +189,18 @@ impl Plan {
             .collect::<Result<Vec<_>>>()?;
         let context = crate::context::from_pairs(&args.tags).map_err(super::input)?;
         let timeout_ms = match args.timeout {
-            Wait::For(wait) if wait.is_zero() => {
+            Some(Wait::For(wait)) if wait.is_zero() => {
                 return Err(
                     Usage("--timeout must be longer than 0; none waits for ever".into()).into(),
                 );
             }
-            Wait::For(wait) => millis(wait).max(1),
-            Wait::Forever => crate::scheduling::MAX_DURATION_MS,
+            Some(Wait::For(wait)) => millis(wait).max(1),
+            Some(Wait::Forever) => crate::scheduling::MAX_DURATION_MS,
+            None => 0,
         };
+        if args.warmup > Duration::from_millis(crate::session::MAX_WARMUP_MS) {
+            return Err(Usage("--warmup is at most 60s".into()).into());
+        }
         let manifest = match args.manifest.as_deref() {
             None => None,
             Some("-") => {
@@ -220,6 +232,7 @@ impl Plan {
             interval_ms: args.every.map(millis).unwrap_or(0),
             first_at_ms,
             timeout_ms,
+            warmup_ms: millis(args.warmup),
             settings,
             context,
             manifest,
@@ -248,6 +261,8 @@ impl Plan {
             context: self.context.clone(),
             utc_offset_s: Some(crate::naming::local_offset()),
             quality,
+            fresh: args.fresh,
+            warmup_ms: Some(self.warmup_ms),
             job: None,
             lease: !args.background,
         }
@@ -338,7 +353,7 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
             ..Route::default()
         }
     }
-    .waiting(args.timeout);
+    .waiting(args.timeout.unwrap_or(Wait::For(DEFAULT_WAIT)));
     let each = |camera: Option<&str>| -> Result<Value> {
         let client = Client::open_with(global, camera, route)?;
         if args.dry_run {
@@ -452,6 +467,8 @@ fn prepare(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<()> {
 
 /// How long a stopped capture may take to finish the shot being saved.
 const STOP_GRACE: Duration = Duration::from_secs(2);
+/// The frame wait of most cameras when none is given.
+const DEFAULT_WAIT: Duration = Duration::from_secs(5);
 
 /// Run the capture job on one camera and wait for it, or leave it running.
 fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
@@ -495,10 +512,10 @@ fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
 /// trigger without a limit is returned as it is after a moment.
 fn started(client: &Client, id: &str, plan: &Plan) -> Result<Value> {
     let begun = Instant::now();
-    let wait = if plan.timeout_ms >= crate::scheduling::MAX_DURATION_MS {
-        Duration::from_secs(2)
-    } else {
-        Duration::from_millis(plan.timeout_ms) + Duration::from_secs(1)
+    let wait = match plan.timeout_ms {
+        crate::scheduling::MAX_DURATION_MS.. => Duration::from_secs(2),
+        0 => DEFAULT_WAIT + Duration::from_millis(plan.warmup_ms) + Duration::from_secs(1),
+        timeout_ms => Duration::from_millis(timeout_ms + plan.warmup_ms) + Duration::from_secs(1),
     };
     let mut seq = 0;
     loop {
@@ -602,7 +619,25 @@ fn result(job: &Value, detail: &Value) -> Value {
     if let Some(truncated) = detail["truncated"].as_u64() {
         value["truncated"] = json!(truncated);
     }
+    freshness(&mut value, detail);
     crate::types::without_nulls(value)
+}
+
+/// What a result says of the frames' freshness, from the worker's account:
+/// `after_change` when frames exposed before the last settings change were
+/// let pass, and a warm-up's time, with a warning when the camera had not
+/// settled.
+fn freshness(value: &mut Value, detail: &Value) {
+    if detail["after_change"] == true {
+        value["after_change"] = json!(true);
+    }
+    if let Some(ms) = detail["warmup_ms"].as_u64() {
+        value["warmup_ms"] = json!(ms);
+        if detail["settled"] == false {
+            value["settled"] = json!(false);
+            value["warnings"] = json!([crate::engine::unsettled_warning(ms)]);
+        }
+    }
 }
 
 fn dry_run(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
@@ -682,7 +717,7 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
             stdout: true,
             ..Route::default()
         }
-        .waiting(args.timeout),
+        .waiting(args.timeout.unwrap_or(Wait::For(DEFAULT_WAIT))),
     )?;
     // A worker of this command is told to end the capture on a signal,
     // which then reports it. A session's capture ends as this command exits
@@ -701,6 +736,8 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         context: plan.context.clone(),
         utc_offset_s: Some(crate::naming::local_offset()),
         quality: args.quality,
+        fresh: args.fresh,
+        warmup_ms: Some(plan.warmup_ms),
         stdout,
     };
     let copied = if client.session().is_some() {
@@ -774,7 +811,7 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     let _ = std::io::stdout().flush();
     let meta = &reply["frame"];
     let camera = client.status()?;
-    let value = crate::types::without_nulls(json!({
+    let mut value = crate::types::without_nulls(json!({
         "camera": crate::media::redact_url(camera["info"]["id"].as_str().unwrap_or_default()),
         "output": "-",
         "bytes": meta["file_bytes"],
@@ -785,6 +822,7 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         "settings": crate::engine::saved::settings(&meta["settings"]),
         "time": meta["wall_ms"].as_u64().map(rfc3339),
     }));
+    freshness(&mut value, &reply);
     // The image owns stdout; the result goes to stderr in one write.
     if global.json && super::output::claim() {
         let _ = super::output::write_json(&super::output::document(value));
@@ -881,6 +919,19 @@ pub const FIELDS: &[(&str, &str)] = &[
         "{exposure_us?,auto_exposure?,gain_db?,gain?,auto_gain?,auto_wb?,fps?,trigger?,black_level?,gamma?,binning?,offset_x?,offset_y?,reverse_x?,reverse_y?} — the camera's settings when the first frame was taken, as the camera has them; trigger: off, or its source (software, line0)",
     ),
     ("time", "string — RFC 3339 time of the first frame"),
+    (
+        "after_change",
+        "true — frames exposed before the camera's last settings change were let pass",
+    ),
+    (
+        "warmup_ms",
+        "int — how long a camera that sets its own exposure took to settle after it started",
+    ),
+    (
+        "settled",
+        "false — its exposure was still changing when --warmup ran out (with a warning)",
+    ),
+    ("warnings", "[string]"),
     ("duration_s", "float — first to last frame, for several"),
     ("output", "\"-\" — with -o -: the image went to stdout"),
     ("bytes", "int — with -o -: the image's size"),

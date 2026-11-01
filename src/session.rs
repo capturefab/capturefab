@@ -149,6 +149,15 @@ pub enum SessionCommand {
         /// JPEG quality 1..100; 90 when unset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<u8>,
+        /// Frames to let pass after the first frame exposed after the
+        /// camera's last settings change.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        fresh: u32,
+        /// How long a camera that sets its own exposure may take to settle
+        /// after it starts, in milliseconds; 0 takes its frames as they
+        /// come, unset waits up to 2 s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warmup_ms: Option<u64>,
         /// With output `-` through a session: the private file, in the
         /// runtime folder's `out`, the image goes to for the client to
         /// stream to its stdout and delete.
@@ -180,6 +189,15 @@ pub enum SessionCommand {
         /// JPEG quality 1..100; 90 when unset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<u8>,
+        /// Frames to let pass after the first frame exposed after the
+        /// camera's last settings change.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        fresh: u32,
+        /// How long a camera that sets its own exposure may take to settle
+        /// after it starts, in milliseconds; 0 takes its frames as they
+        /// come, unset waits up to 2 s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warmup_ms: Option<u64>,
         /// The job's number, which the coordinator assigns so that jobs are
         /// numbered across a session's cameras.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +245,11 @@ pub enum SessionCommand {
         /// exist; the private inspect folder when unset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview: Option<String>,
+        /// How long a camera that sets its own exposure may take to settle
+        /// after it starts, in milliseconds; 0 takes its frames as they
+        /// come, unset waits up to 2 s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warmup_ms: Option<u64>,
     },
     Xml,
     ReadMemory {
@@ -261,6 +284,12 @@ pub enum SessionCommand {
         /// The caller's UTC offset in seconds, for {date} and {time}.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         utc_offset_s: Option<i32>,
+        /// How long a camera that sets its own exposure may take to settle
+        /// after it starts, in milliseconds, before the first frame is
+        /// recorded; 0 records its frames as they come, unset waits up to
+        /// 2 s.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warmup_ms: Option<u64>,
         /// The job's number, which the coordinator assigns.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job: Option<u64>,
@@ -457,9 +486,11 @@ impl SessionCommand {
                 max_dimension,
                 region,
                 preview,
+                warmup_ms,
                 ..
             } => {
                 crate::inspect::validate(*fresh, *timeout_ms, *max_dimension, *region)?;
+                validate_warmup(*warmup_ms)?;
                 if let Some(preview) = preview {
                     ensure!(
                         std::path::Path::new(preview).is_absolute(),
@@ -496,6 +527,8 @@ impl SessionCommand {
                 on_exists,
                 context,
                 utc_offset_s,
+                fresh,
+                warmup_ms,
                 ..
             }
             | Self::Schedule {
@@ -506,9 +539,16 @@ impl SessionCommand {
                 on_exists,
                 context,
                 utc_offset_s,
+                fresh,
+                warmup_ms,
                 ..
             } => {
                 validate_frame_wait(*timeout_ms)?;
+                validate_warmup(*warmup_ms)?;
+                ensure!(
+                    *fresh <= crate::inspect::MAX_FRESH,
+                    "fresh frames must be 0..10"
+                );
                 crate::naming::validate_offset(*utc_offset_s)?;
                 ensure!((1..=100_000).contains(count), "count must be 1..100000");
                 ensure!(
@@ -591,9 +631,11 @@ impl SessionCommand {
                 context,
                 duration_ms,
                 utc_offset_s,
+                warmup_ms,
                 ..
             } => {
                 crate::naming::validate_offset(*utc_offset_s)?;
+                validate_warmup(*warmup_ms)?;
                 // The range `record --for` accepts.
                 ensure!(
                     duration_ms.is_none_or(|duration| {
@@ -623,13 +665,26 @@ impl SessionCommand {
 pub fn default_request_timeout(command: &SessionCommand) -> Duration {
     Duration::from_millis(match command {
         SessionCommand::Capture {
-            count, timeout_ms, ..
-        } => timeout_ms
-            .saturating_mul(u64::from(*count))
+            count,
+            timeout_ms,
+            warmup_ms,
+            fresh,
+            ..
+        } => frame_wait_ms(*timeout_ms)
+            .saturating_mul(u64::from(*count + *fresh))
+            .saturating_add(warmup_ms.unwrap_or(DEFAULT_WARMUP_MS))
             .saturating_add(60_000),
         // Waiting for the camera's turn, or starting a stopped camera and
-        // settling its auto exposure, can outlast the frame wait itself.
-        SessionCommand::Frame { timeout_ms, .. } => timeout_ms.saturating_add(15_000),
+        // settling its exposure, can outlast the frame wait itself.
+        SessionCommand::Frame {
+            timeout_ms,
+            warmup_ms,
+            fresh,
+            ..
+        } => frame_wait_ms(*timeout_ms)
+            .saturating_mul(u64::from(*fresh).max(1))
+            .saturating_add(warmup_ms.unwrap_or(DEFAULT_WARMUP_MS))
+            .saturating_add(15_000),
         // The worker bounds the writes to 90 s; a rollback may take as long,
         // and restarting the stream follows.
         SessionCommand::ApplySetup { .. } => 240_000,
@@ -640,13 +695,33 @@ pub fn default_request_timeout(command: &SessionCommand) -> Duration {
     })
 }
 /// A capture's wait for each frame: up to ten years, which `none` (wait
-/// for a trigger until stopped) asks for.
+/// for a trigger until stopped) asks for, or 0 for the camera's default.
 pub fn validate_frame_wait(timeout_ms: u64) -> Result<()> {
     ensure!(
-        (1..=crate::scheduling::MAX_DURATION_MS).contains(&timeout_ms),
-        "frame wait must be 1 ms to 10 years"
+        timeout_ms <= crate::scheduling::MAX_DURATION_MS,
+        "frame wait must be at most 10 years"
     );
     Ok(())
+}
+/// How long a camera that sets its own exposure may take to settle after
+/// it starts, unless a request says otherwise.
+pub const DEFAULT_WARMUP_MS: u64 = 2_000;
+/// A request's frame wait for its timeouts: as asked, or for the camera's
+/// default (0), a minute, which covers all but very long exposures.
+fn frame_wait_ms(timeout_ms: u64) -> u64 {
+    if timeout_ms == 0 { 60_000 } else { timeout_ms }
+}
+/// The longest warm-up a request may ask for.
+pub const MAX_WARMUP_MS: u64 = 60_000;
+fn validate_warmup(warmup_ms: Option<u64>) -> Result<()> {
+    ensure!(
+        warmup_ms.is_none_or(|ms| ms <= MAX_WARMUP_MS),
+        "warm-up must be at most 60 s"
+    );
+    Ok(())
+}
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 pub fn validate_timeout(timeout_ms: u64) -> Result<()> {
     ensure!(
@@ -2695,28 +2770,34 @@ mod tests {
         let timeout = |json: &str| {
             default_request_timeout(&SessionCommand::from_json_slice(json.as_bytes()).unwrap())
         };
-        // Every frame may wait its full timeout, plus a minute to save.
+        // Every frame may wait its full timeout, after a warm-up of 2 s,
+        // plus a minute to save.
         assert_eq!(
             timeout(
                 r#"{"op":"capture","output":"a.png","count":5,"timeout_ms":10000,"format":"png"}"#
             ),
-            Duration::from_secs(110)
+            Duration::from_secs(112)
         );
         assert_eq!(
             timeout(
-                r#"{"op":"capture","output":"a.png","count":1,"timeout_ms":60000,"format":"png"}"#
+                r#"{"op":"capture","output":"a.png","count":1,"timeout_ms":60000,"format":"png","warmup_ms":0,"fresh":2}"#
             ),
-            Duration::from_secs(120)
+            Duration::from_secs(240)
         );
         assert_eq!(
             timeout(r#"{"op":"apply_setup","name":"bench"}"#),
             Duration::from_secs(240)
         );
         assert_eq!(timeout(r#"{"op":"status"}"#), Duration::from_secs(60));
-        assert_eq!(timeout(r#"{"op":"frame"}"#), Duration::from_secs(18));
+        // A frame after a warm-up of 2 s, or the camera's default wait.
+        assert_eq!(timeout(r#"{"op":"frame"}"#), Duration::from_secs(20));
         assert_eq!(
-            timeout(r#"{"op":"frame","timeout_ms":10000}"#),
+            timeout(r#"{"op":"frame","timeout_ms":10000,"warmup_ms":0}"#),
             Duration::from_secs(25)
+        );
+        assert_eq!(
+            timeout(r#"{"op":"frame","timeout_ms":0}"#),
+            Duration::from_secs(77)
         );
         assert_eq!(
             timeout(r#"{"op":"wait","job":"auto-1","timeout_ms":25000}"#),
@@ -2799,6 +2880,7 @@ mod tests {
             utc_offset_s: None,
             job: None,
             lease: false,
+            warmup_ms: None,
         };
         let max = crate::scheduling::MAX_DURATION_MS;
         for duration in [None, Some(1), Some(500), Some(3_600_000), Some(max)] {
@@ -2908,6 +2990,7 @@ mod tests {
             format,
             region,
             preview,
+            warmup_ms,
         } = SessionCommand::from_json_slice(br#"{"op":"frame"}"#).unwrap()
         else {
             panic!("not a frame")
@@ -2923,6 +3006,7 @@ mod tests {
                 None
             )
         );
+        assert_eq!(warmup_ms, None);
         let full = br#"{"op":"frame","fresh":0,"timeout_ms":50,"max_dimension":0,"format":"png","region":[0.0,0.5,1.0,0.5]}"#;
         let command = SessionCommand::from_json_slice(full).unwrap();
         command.validate().unwrap();
@@ -3002,6 +3086,7 @@ mod tests {
                 format: Default::default(),
                 region: None,
                 preview: None,
+                warmup_ms: None,
             },
             SessionCommand::Frame {
                 fresh: 1,
@@ -3010,6 +3095,7 @@ mod tests {
                 format: Default::default(),
                 region: Some([0.5, 0.5, 0.5, f64::INFINITY]),
                 preview: None,
+                warmup_ms: None,
             },
             SessionCommand::Wait {
                 job: "auto-0".into(),
@@ -3175,6 +3261,7 @@ mod tests {
             format: Default::default(),
             region: None,
             preview: None,
+            warmup_ms: None,
         };
         let running = handle
             .command_turn(Some("camera-a"), &width_command())
@@ -3376,6 +3463,7 @@ mod tests {
                     format: Default::default(),
                     region: None,
                     preview: None,
+                    warmup_ms: None,
                 }
                 .into(),
             )

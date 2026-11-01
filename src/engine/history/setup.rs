@@ -1307,6 +1307,8 @@ mod tests {
             quality: None,
             job: None,
             lease: false,
+            fresh: 0,
+            warmup_ms: None,
         })
         .unwrap();
         let mut narrow = setup.clone();

@@ -49,6 +49,17 @@ pub struct CaptureJob {
     /// The camera's acquisition settings when the first frame was saved.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub settings: serde_json::Map<String, serde_json::Value>,
+    /// Frames were let pass because they were exposed before the camera's
+    /// last settings change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_change: bool,
+    /// How long the first warm-up of a camera that sets its own exposure
+    /// took, when the job started the camera.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warmup_ms: Option<u64>,
+    /// Whether every warm-up settled before its limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled: Option<bool>,
 }
 /// Files a job lists; a longer job keeps counting in `captured`, and its
 /// newest file is `last_file`.

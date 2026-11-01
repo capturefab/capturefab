@@ -25,6 +25,7 @@ use std::{
 #[cfg(test)]
 use crate::session::{FeatureValue, LogEntry};
 use crate::session::{ForwardingProgress, SessionCommand, WorkerSnapshot};
+mod emulated;
 pub(crate) mod events;
 mod history;
 pub(crate) mod inspector;
@@ -195,6 +196,10 @@ pub struct WorkerHandle {
     session: Arc<str>,
     /// The lock of the camera it holds open.
     lock: Arc<Mutex<Option<lock::CameraLock>>>,
+    /// Whether settings it emulates for its camera are kept for the next
+    /// worker (see `emulated`): in worker processes, not in unit tests,
+    /// which share one runtime folder.
+    keeps_settings: bool,
 }
 impl Default for WorkerHandle {
     fn default() -> Self {
@@ -214,7 +219,9 @@ impl WorkerHandle {
     /// its replies and events to `events`, and an image captured to stdout
     /// to `output`.
     pub(crate) fn serving(events: Events, session: String, output: Option<std::fs::File>) -> Self {
-        Self::create(output, crate::logins::Logins::system(), events, &session)
+        let mut handle = Self::unstarted(output, crate::logins::Logins::system(), events, &session);
+        handle.keeps_settings = true;
+        handle.spawn()
     }
     #[cfg(all(test, feature = "keychain"))]
     fn with_logins(logins: crate::logins::Logins) -> Self {
@@ -226,7 +233,11 @@ impl WorkerHandle {
         events: Events,
         session: &str,
     ) -> Self {
-        let handle = Self::unstarted(output, logins, events, session);
+        Self::unstarted(output, logins, events, session).spawn()
+    }
+    /// Start the camera thread.
+    fn spawn(self) -> Self {
+        let handle = self;
         let worker_handle = handle.clone();
         let thread = std::thread::Builder::new()
             .name("capturefab-camera".into())
@@ -271,6 +282,7 @@ impl WorkerHandle {
             logins,
             session: session.into(),
             lock: Arc::default(),
+            keeps_settings: false,
         }
     }
     pub fn snapshot(&self) -> WorkerSnapshot {
@@ -1520,6 +1532,7 @@ fn process_plain(
             context,
             duration_ms,
             utc_offset_s,
+            warmup_ms,
             job,
             ..
         } => {
@@ -1564,7 +1577,15 @@ fn process_plain(
                 Forwarder::new(config)?
             };
             let f_path = f.recording_path().map(|p| absolute_path(&p));
-            camera_mut(camera)?.start()?;
+            let c = camera_mut(camera)?;
+            let was_streaming = c.is_streaming();
+            c.start()?;
+            // A camera that sets its own exposure records once it settled.
+            let warmup = if was_streaming {
+                None
+            } else {
+                warm_up(h, c, auto, warmup_ms)?
+            };
             *forwarder = Some((f, fps));
             if let Some(a) = auto.as_mut() {
                 a.set_forward_fps(Some(fps))?;
@@ -1596,6 +1617,10 @@ fn process_plain(
             }
             let mut value =
                 json!({"forwarding":shown,"forwarding_id":forwarding_id,"since_ms":since_ms});
+            if let Some(warmup) = warmup {
+                value["warmup_ms"] = json!(warmup.ms);
+                value["settled"] = json!(warmup.settled);
+            }
             if let Some(until_ms) = until_ms {
                 value["until_ms"] = json!(until_ms);
             }
@@ -1722,6 +1747,21 @@ fn process_plain(
             };
             *camera = Some(opened);
             *h.lock.lock().unwrap_or_else(|e| e.into_inner()) = lock;
+            // The settings an earlier worker emulated for this camera, as a
+            // real camera keeps its own.
+            if h.keeps_settings
+                && let Some(c) = camera.as_mut()
+                && let Some(saved) = emulated::load(&c.info.id)
+                && let Err(error) = c.restore_settings(&saved)
+            {
+                h.log(
+                    "warn",
+                    format!(
+                        "{} opened with its default settings, not those set before: {error:#}",
+                        crate::media::redact_url(&c.info.id)
+                    ),
+                );
+            }
             drop(login);
             if let Some(address) = remembered {
                 h.logins.touch(&address);
@@ -1897,6 +1937,8 @@ fn process_plain(
             context,
             utc_offset_s,
             quality,
+            fresh,
+            warmup_ms,
             job,
             ..
         } => {
@@ -1958,11 +2000,17 @@ fn process_plain(
                 frame: None,
                 first_ms: None,
                 settings: serde_json::Map::new(),
+                after_change: false,
+                warmup_ms: None,
+                settled: None,
             };
             jobs.push(Scheduled {
                 info: info.clone(),
                 plan: crate::naming::Plan::new(&output, count, &format),
                 timeout_ms,
+                wait: Duration::ZERO,
+                fresh,
+                warmup_ms,
                 format,
                 sync,
                 manifest,
@@ -2031,13 +2079,14 @@ fn process_plain(
             context,
             utc_offset_s,
             quality,
+            fresh,
+            warmup_ms,
             stdout,
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
             if output != "-" {
                 preflight_capture_output(&output, count, &format, on_exists)?;
             }
-            let duration = Duration::from_millis(timeout_ms);
             ensure!((1..=100_000).contains(&count), "count must be 1..100000");
             ensure!(
                 ["png", "jpeg", "raw", "ppm", "pgm"].contains(&format.as_str()),
@@ -2049,6 +2098,7 @@ fn process_plain(
                 "stdout supports one frame only"
             );
             let c = camera_mut(camera)?;
+            let duration = frame_wait(c, timeout_ms);
             let was_streaming = c.is_streaming();
             c.start()?;
             let mut folders = crate::storage::Folders::default();
@@ -2058,6 +2108,12 @@ fn process_plain(
                 // every frame, so a long burst's reply stays small.
                 let mut first_frame = Value::Null;
                 let mut status = None;
+                let mut after_change = false;
+                let warmup = if was_streaming {
+                    None
+                } else {
+                    warm_up(h, c, auto, warmup_ms)?
+                };
                 if !was_streaming
                     && auto.is_some()
                     && (c.software_triggered() || !settle_auto(h, c, auto, duration)?)
@@ -2091,10 +2147,23 @@ fn process_plain(
                                 .candidate(&plan, &input, on_exists)?;
                             Some(path)
                         };
-                        c.request_frame()?;
-                        let frame = match next_frame(h, c, auto, deadline_after(duration))? {
-                            Some(frame) => frame,
-                            None => return Err(frame_wait_error(c, duration)),
+                        // Frames exposed before the last settings change, and
+                        // the first `fresh` after it, are let pass.
+                        let mut skip = if index == 0 { fresh } else { 0 };
+                        let frame = loop {
+                            c.request_frame()?;
+                            let frame = match next_frame(h, c, auto, deadline_after(duration))? {
+                                Some(frame) => frame,
+                                None => return Err(frame_wait_error(c, duration)),
+                            };
+                            h.count_frame(&frame);
+                            if c.frame_predates_change() {
+                                after_change = true;
+                            } else if skip > 0 {
+                                skip -= 1;
+                            } else {
+                                break frame;
+                            }
                         };
                         if index == 0 {
                             status = auto.as_ref().map(|a| a.status().clone());
@@ -2147,7 +2216,6 @@ fn process_plain(
                         if index == 0 {
                             first_frame = metadata;
                         }
-                        h.count_frame(&frame);
                         Ok(())
                     };
                     // The frames already saved stay; say which, keeping the
@@ -2175,6 +2243,13 @@ fn process_plain(
                 }
                 if let Some(status) = status {
                     value["auto"] = json!(status);
+                }
+                if after_change {
+                    value["after_change"] = json!(true);
+                }
+                if let Some(warmup) = warmup {
+                    value["warmup_ms"] = json!(warmup.ms);
+                    value["settled"] = json!(warmup.settled);
                 }
                 Ok(value)
             })();
@@ -2205,7 +2280,14 @@ struct Source {
 struct Scheduled {
     info: crate::scheduling::CaptureJob,
     plan: crate::naming::Plan,
+    /// The frame wait asked for; 0 for the camera's default.
     timeout_ms: u64,
+    /// The frame wait of the frame being requested.
+    wait: Duration,
+    /// Frames still to let pass before the first shot.
+    fresh: u32,
+    /// The longest warm-up after the job starts the camera.
+    warmup_ms: Option<u64>,
     format: String,
     sync: crate::storage::SyncMode,
     /// Where a line for each saved file goes.
@@ -2592,7 +2674,20 @@ fn tick_jobs(
                 if stopped {
                     c.start()?;
                     *started = true;
+                    // Capturefab's auto exposure never runs on a camera that
+                    // sets its own, so the warm-up meters without it.
+                    if let Some(warmup) = warm_up(h, c, &mut None, job.warmup_ms)? {
+                        let warmup = warmup.and(
+                            job.info
+                                .warmup_ms
+                                .zip(job.info.settled)
+                                .map(|(ms, settled)| Warmup { ms, settled }),
+                        );
+                        job.info.warmup_ms = Some(warmup.ms);
+                        job.info.settled = Some(warmup.settled);
+                    }
                 }
+                job.wait = frame_wait(c, job.timeout_ms);
                 job.next = Some(job.allocate(&h.names)?);
                 c.request_frame()?;
                 // Auto exposure warms up a camera the job started, unless it
@@ -2611,14 +2706,14 @@ fn tick_jobs(
                 }
             };
             job.info.status = "running".into();
-            let timeout = Duration::from_millis(job.timeout_ms);
+            let timeout = job.wait;
             job.deadline = Some(deadline_after(timeout));
             job.warm = (auto && warm_up)
                 .then(|| Instant::now() + (timeout / 2).min(Duration::from_secs(3)));
         }
         if job.deadline.is_some_and(|d| Instant::now() >= d) {
             changed = true;
-            let waited = Duration::from_millis(job.timeout_ms);
+            let waited = job.wait;
             let error = match camera.as_mut() {
                 Some(c) => frame_wait_error(c, waited),
                 None => crate::types::frame_timeout("frame timeout"),
@@ -2657,6 +2752,7 @@ fn jobs_changed(h: &WorkerHandle, camera: &mut Option<Camera>, jobs: &mut Vec<Sc
 /// interval instead of holding up acquisition.
 fn shoot(
     h: &WorkerHandle,
+    c: &mut Camera,
     frame: &Frame,
     jobs: &mut [Scheduled],
     settled: bool,
@@ -2665,12 +2761,26 @@ fn shoot(
     let now = crate::scheduling::now_ms();
     let mut saves = Vec::new();
     let mut changed = false;
+    // A frame exposed before the camera's last settings change, or one the
+    // job lets pass, is no shot: the job takes a later one.
+    let stale = c.frame_predates_change();
+    let mut again = false;
     for job in jobs.iter_mut().filter(|j| {
         j.info.active()
             && j.deadline.is_some()
             && j.info.next_at_ms <= now
             && (settled || j.warm.is_none_or(|w| Instant::now() >= w))
     }) {
+        if stale || job.fresh > 0 {
+            if stale {
+                changed |= !job.info.after_change;
+                job.info.after_change = true;
+            } else {
+                job.fresh -= 1;
+            }
+            again = true;
+            continue;
+        }
         changed = true;
         job.deadline = None;
         job.warm = None;
@@ -2714,6 +2824,9 @@ fn shoot(
                 );
             }
         }
+    }
+    if again && let Err(error) = c.request_frame() {
+        h.log("warn", format!("{error:#}"));
     }
     if changed {
         sync_jobs(h, jobs);
@@ -2833,12 +2946,7 @@ pub(crate) fn frame_wait_error(c: &mut Camera, waited: Duration) -> anyhow::Erro
     let wait =
         crate::scheduling::format_duration(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
     match crate::controls::trigger_state(c) {
-        Ok(trigger)
-            if trigger.mode == "On"
-                && trigger.source.as_deref().is_some_and(|source| {
-                    !matches!(source, "Software" | "Freerun" | "FixedRate")
-                }) =>
-        {
+        Ok(trigger) if hardware(&trigger) => {
             let source = trigger.source.clone().unwrap_or_default();
             crate::types::Categorized::new(
                 crate::types::ErrorKind::TriggerTimeout,
@@ -2853,6 +2961,142 @@ pub(crate) fn frame_wait_error(c: &mut Camera, waited: Duration) -> anyhow::Erro
         _ => crate::types::frame_timeout(format!("no frame within {wait}")),
     }
 }
+/// Whether `trigger` waits for a hardware line, not software or a clock.
+fn hardware(trigger: &crate::controls::Trigger) -> bool {
+    trigger.mode == "On"
+        && trigger
+            .source
+            .as_deref()
+            .is_some_and(|source| !matches!(source, "Software" | "Freerun" | "FixedRate"))
+}
+/// What reading a frame out after its exposure may take.
+const READOUT: Duration = Duration::from_millis(100);
+/// Note a settings change on a streaming camera, so frames exposed before
+/// it are not taken for new ones (`Camera::settings_changed`). A
+/// hardware-triggered camera may still deliver such a frame for its
+/// exposure and read-out after the change.
+fn settings_changed(c: &mut Camera) {
+    if !c.is_streaming() {
+        return;
+    }
+    let hold = (c.has("TriggerMode")
+        && crate::controls::trigger_state(c).is_ok_and(|trigger| hardware(&trigger)))
+    .then(|| {
+        crate::controls::frame_timing(c)
+            .0
+            .unwrap_or_default()
+            .saturating_add(READOUT)
+    });
+    c.settings_changed(hold);
+}
+/// The shortest default wait for a frame.
+const FRAME_WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for each frame: `timeout_ms` as asked, or for 0 the
+/// camera's default: 5 s, or three exposures and frame periods when they
+/// take longer.
+fn frame_wait(c: &mut Camera, timeout_ms: u64) -> Duration {
+    if timeout_ms > 0 {
+        return Duration::from_millis(timeout_ms);
+    }
+    let (exposure, fps) = crate::controls::frame_timing(c);
+    let period = fps
+        .and_then(|fps| Duration::try_from_secs_f64(1.0 / fps).ok())
+        .unwrap_or_default();
+    exposure
+        .unwrap_or_default()
+        .saturating_add(period)
+        .saturating_mul(3)
+        .max(FRAME_WAIT)
+}
+
+/// How a camera that sets its own exposure was warmed up after it started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Warmup {
+    pub(crate) ms: u64,
+    /// Whether its brightness held still before the limit.
+    pub(crate) settled: bool,
+}
+impl Warmup {
+    /// This warm-up and an earlier one of the same job: the first one's
+    /// time, settled only when both settled.
+    fn and(self, earlier: Option<Self>) -> Self {
+        earlier.map_or(self, |earlier| Self {
+            ms: earlier.ms,
+            settled: earlier.settled && self.settled,
+        })
+    }
+}
+/// How much brightness may change over the last frames of a warm-up for
+/// the camera to count as settled: 3 %.
+const SETTLED_CHANGE: f32 = 0.03;
+/// Frames whose brightness must hold still.
+const SETTLED_FRAMES: usize = 3;
+/// Whether the camera sets its own exposure, so its first frames after it
+/// starts may be too dark or too bright: webcams and network streams read
+/// through FFmpeg, and cameras whose own auto exposure runs continuously.
+fn sets_own_exposure(c: &mut Camera) -> bool {
+    matches!(crate::camera::kind(&c.info), "webcam" | "stream" | "onvif")
+        || (c.has("ExposureAuto") && c.get("ExposureAuto").is_ok_and(|mode| mode == "Continuous"))
+}
+/// Let a camera that has just started, and sets its own exposure, settle:
+/// drop frames until their brightness changes by less than 3 % over 3
+/// frames, for at most `limit_ms` (2 s when unset; 0 does not wait). None
+/// when there was nothing to wait for.
+fn warm_up(
+    h: &WorkerHandle,
+    c: &mut Camera,
+    auto: &mut Option<AutoController>,
+    limit_ms: Option<u64>,
+) -> Result<Option<Warmup>> {
+    let limit = Duration::from_millis(limit_ms.unwrap_or(crate::session::DEFAULT_WARMUP_MS));
+    // A triggered camera sends nothing to meter between triggers.
+    if limit.is_zero()
+        || c.software_triggered()
+        || (c.has("TriggerMode")
+            && crate::controls::trigger_state(c).is_ok_and(|trigger| hardware(&trigger)))
+        || !sets_own_exposure(c)
+    {
+        return Ok(None);
+    }
+    let began = Instant::now();
+    let deadline = deadline_after(limit);
+    let mut means = VecDeque::with_capacity(SETTLED_FRAMES);
+    let settled = loop {
+        let Some(frame) = next_frame(h, c, auto, deadline)? else {
+            break false;
+        };
+        h.count_frame(&frame);
+        // A frame that cannot be measured cannot say it is unsettled.
+        let Ok(exposure) = crate::frame::exposure(&frame) else {
+            break true;
+        };
+        if means.len() == SETTLED_FRAMES {
+            means.pop_front();
+        }
+        means.push_back(exposure.mean);
+        if means.len() == SETTLED_FRAMES {
+            let (low, high) = means.iter().fold((f32::MAX, 0f32), |(low, high), &mean| {
+                (low.min(mean), high.max(mean))
+            });
+            // Near black, a few levels are a large share.
+            if high - low <= SETTLED_CHANGE * high.max(0.1) {
+                break true;
+            }
+        }
+    };
+    Ok(Some(Warmup {
+        ms: u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
+        settled,
+    }))
+}
+/// The warning a warm-up that ran out of time leaves in a result.
+pub(crate) fn unsettled_warning(warmup_ms: u64) -> String {
+    format!(
+        "the camera's exposure was still changing after {}; frames may be too dark or too bright (raise --warmup)",
+        crate::scheduling::format_duration(warmup_ms)
+    )
+}
+
 /// What a burst that failed part way had already saved:
 /// `saved 2 of 3 frames to DIR (a.png, b.png) before this failed`.
 pub fn saved_before(files: &[String], count: u32) -> String {
@@ -3000,6 +3244,26 @@ fn apply_stops(
         .unwrap_or_else(|e| e.into_inner())
         .extend(waiting);
 }
+/// Keep the settings this worker emulates for its camera for the next
+/// worker to open it, when they changed since `kept`.
+fn keep_settings(h: &WorkerHandle, camera: &mut Option<Camera>, kept: &mut Option<Value>) {
+    if !h.keeps_settings {
+        return;
+    }
+    let Some(c) = camera.as_mut() else {
+        return;
+    };
+    let Some(now) = c.emulated_settings() else {
+        return;
+    };
+    if kept.as_ref() == Some(&now) {
+        return;
+    }
+    match emulated::save(&c.info.id, &now) {
+        Ok(()) => *kept = Some(now),
+        Err(error) => h.log("warn", format!("{error:#}")),
+    }
+}
 fn worker(h: WorkerHandle) {
     let mut saver = saver::Saver::new(h.clone());
     let mut camera: Option<Camera> = None;
@@ -3019,6 +3283,8 @@ fn worker(h: WorkerHandle) {
     let mut settings = AcquisitionCache::default();
     let mut inspector = inspector::Inspector::default();
     let mut waiting: Vec<inspector::Waiting> = Vec::new();
+    // The emulated settings last kept for the next worker.
+    let mut kept: Option<Value> = None;
     while !h.quitting.load(Ordering::Acquire) {
         h.beat();
         let receiving = camera.as_ref().is_some_and(Camera::is_streaming);
@@ -3055,7 +3321,10 @@ fn worker(h: WorkerHandle) {
             }
             if matches!(e.command.session(), Some(SessionCommand::Disconnect)) {
                 settle_saves(&h, &mut saver, &mut jobs);
+                keep_settings(&h, &mut camera, &mut kept);
             }
+            let changes = e.command.changes_settings();
+            let connects = matches!(e.command.session(), Some(SessionCommand::Connect { .. }));
             let result = process(
                 &h,
                 &mut camera,
@@ -3069,6 +3338,13 @@ fn worker(h: WorkerHandle) {
             *h.running.lock().unwrap_or_else(|e| e.into_inner()) = None;
             if let Err(err) = &result {
                 h.log("error", format!("{err:#}"));
+            }
+            // Even a change that failed and was put back wrote the camera.
+            if changes && let Some(c) = camera.as_mut() {
+                settings_changed(c);
+                keep_settings(&h, &mut camera, &mut kept);
+            } else if connects {
+                kept = camera.as_mut().and_then(Camera::emulated_settings);
             }
             (e.reply)(result);
             h.beat();
@@ -3125,7 +3401,7 @@ fn worker(h: WorkerHandle) {
                         settings.invalidate();
                     }
                     let shot =
-                        shoot(&h, &frame, &mut jobs, settled, room).map(|shot| saver::Shot {
+                        shoot(&h, c, &frame, &mut jobs, settled, room).map(|shot| saver::Shot {
                             acquisition: settings.get(c, Instant::now()),
                             ..shot
                         });
@@ -3213,6 +3489,7 @@ fn worker(h: WorkerHandle) {
     let _ = stop_forward(&h, &mut forwarder, &mut auto, Ended::Interrupted);
     end_auto_job(&h, JobStatus::Interrupted);
     let _ = release_auto(&h, &mut auto, &mut camera, true);
+    keep_settings(&h, &mut camera, &mut kept);
     if let Some(mut c) = camera
         && let Err(e) = c.stop()
     {
@@ -3355,6 +3632,8 @@ mod tests {
             quality: None,
             job: None,
             lease: false,
+            fresh: 0,
+            warmup_ms: None,
         };
         let frames = root.join("f-{frame}.raw").to_string_lossy().into_owned();
         handle.request(schedule(frames.clone(), 3, "raw")).unwrap();
@@ -3410,6 +3689,7 @@ mod tests {
             utc_offset_s: None,
             job: None,
             lease: false,
+            warmup_ms: None,
         };
         let mut paths = Vec::new();
         let handles: Vec<_> = (0..2).map(|_| WorkerHandle::new()).collect();
@@ -3442,6 +3722,7 @@ mod tests {
             utc_offset_s: None,
             job: None,
             lease: false,
+            warmup_ms: None,
         }
     }
     #[test]
@@ -3838,6 +4119,8 @@ mod tests {
                 utc_offset_s: None,
                 quality: None,
                 stdout: None,
+                fresh: 0,
+                warmup_ms: None,
             })
             .unwrap();
         assert_eq!(v["context"]["line"], "L1");
@@ -3891,6 +4174,8 @@ mod tests {
             utc_offset_s: None,
             quality: None,
             stdout: None,
+            fresh: 0,
+            warmup_ms: None,
         }
     }
     #[test]
@@ -3965,6 +4250,7 @@ mod tests {
                 utc_offset_s: None,
                 job: None,
                 lease: false,
+                warmup_ms: None,
             })
             .unwrap_err();
         assert!(
@@ -4067,6 +4353,8 @@ mod tests {
                 quality: None,
                 job: None,
                 lease: false,
+                fresh: 0,
+                warmup_ms: None,
             })
             .unwrap();
         assert_eq!(job["job"]["context"]["lot"], "7");
@@ -4134,6 +4422,9 @@ mod tests {
             utc_offset_s: None,
             quality: None,
             reported: false,
+            fresh: 0,
+            wait: Duration::ZERO,
+            warmup_ms: None,
         }
     }
     /// What the saver reports for a shot it wrote to `save.path`.
@@ -4148,6 +4439,18 @@ mod tests {
             wall_ms: 0,
             settings: Default::default(),
         }
+    }
+    #[test]
+    fn frame_waits_default_to_five_seconds_or_three_slow_frames() {
+        let mut c = sim_camera();
+        assert_eq!(frame_wait(&mut c, 0), Duration::from_secs(5));
+        assert_eq!(frame_wait(&mut c, 250), Duration::from_millis(250));
+        c.set("AcquisitionFrameRate", "1").unwrap();
+        c.set("ExposureTime", "1000000").unwrap();
+        assert_eq!(frame_wait(&mut c, 0), Duration::from_secs(6));
+    }
+    fn sim_camera() -> Camera {
+        Camera::open("sim:0", &[], Duration::from_secs(1)).unwrap()
     }
     fn small_frame(id: u64) -> Frame {
         Frame {
@@ -4180,7 +4483,14 @@ mod tests {
                 .get_or_insert(Instant::now() + Duration::from_secs(10));
             let frame = small_frame(id);
             let started = Instant::now();
-            let shot = shoot(&h, &frame, &mut jobs, true, saver.has_room());
+            let shot = shoot(
+                &h,
+                &mut sim_camera(),
+                &frame,
+                &mut jobs,
+                true,
+                saver.has_room(),
+            );
             if let Some(shot) = shot {
                 saver.offer(shot);
             }
@@ -4226,7 +4536,15 @@ mod tests {
         let mut saver = saver::Saver::with(h.clone(), slow);
         let dir = temp_dir("disconnect-saves");
         let mut jobs = vec![armed(1, &dir)];
-        let shot = shoot(&h, &small_frame(1), &mut jobs, true, saver.has_room()).unwrap();
+        let shot = shoot(
+            &h,
+            &mut sim_camera(),
+            &small_frame(1),
+            &mut jobs,
+            true,
+            saver.has_room(),
+        )
+        .unwrap();
         saver.offer(shot);
         assert!(jobs[0].saving);
         settle_saves(&h, &mut saver, &mut jobs);
@@ -4311,7 +4629,7 @@ mod tests {
             .unwrap()
             .next_frame(Duration::from_secs(1))
             .unwrap();
-        assert!(shoot(&h, &frame, &mut jobs, true, true).is_some());
+        assert!(shoot(&h, camera.as_mut().unwrap(), &frame, &mut jobs, true, true).is_some());
         assert!(jobs[0].saving && jobs[0].info.next_at_ms <= crate::scheduling::now_ms());
         // Due again while its shot is saved: the stream keeps running.
         tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
@@ -4362,8 +4680,16 @@ mod tests {
                 .count()
         };
         let wait = Duration::from_secs(1);
-        let (frame, _, _) =
-            inspector::acquire(&h, &mut camera, &mut None, 1, Instant::now() + wait, wait).unwrap();
+        let (frame, _, _, _) = inspector::acquire(
+            &h,
+            &mut camera,
+            &mut None,
+            1,
+            Instant::now() + wait,
+            wait,
+            None,
+        )
+        .unwrap();
         assert_eq!(frame.width, 4);
         assert_eq!(triggers(), 1);
         let dir = temp_dir("software-trigger");
@@ -4389,7 +4715,7 @@ mod tests {
             .unwrap()
             .next_frame(Duration::from_secs(1))
             .unwrap();
-        assert!(shoot(&h, &frame, &mut jobs, false, true).is_some());
+        assert!(shoot(&h, camera.as_mut().unwrap(), &frame, &mut jobs, false, true).is_some());
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4554,6 +4880,7 @@ mod tests {
             format: Default::default(),
             region: None,
             preview: None,
+            warmup_ms: None,
         })
     }
     #[test]
@@ -4619,6 +4946,7 @@ mod tests {
                 format: Default::default(),
                 region: None,
                 preview: None,
+                warmup_ms: None,
             }
             .into(),
             Box::new(move |result| {
@@ -4679,6 +5007,7 @@ mod tests {
                 format: Default::default(),
                 region: None,
                 preview: None,
+                warmup_ms: None,
             })
             .unwrap();
         std::thread::sleep(Duration::from_millis(200));
@@ -4907,6 +5236,8 @@ mod tests {
                 utc_offset_s: None,
                 quality: None,
                 stdout: None,
+                fresh: 0,
+                warmup_ms: None,
             })
             .unwrap();
         assert_eq!(v["frame"]["width"], 128);
@@ -5011,9 +5342,16 @@ mod tests {
             );
             let h = WorkerHandle::new();
             let wait = Duration::from_millis(10);
-            let error =
-                inspector::acquire(&h, &mut camera, &mut None, 1, Instant::now() + wait, wait)
-                    .unwrap_err();
+            let error = inspector::acquire(
+                &h,
+                &mut camera,
+                &mut None,
+                1,
+                Instant::now() + wait,
+                wait,
+                None,
+            )
+            .unwrap_err();
             assert_eq!(crate::cli::error_code(&error).0, "frame_timeout");
             assert_eq!(reads.load(Ordering::Relaxed), expected_reads);
             assert_eq!(h.snapshot().frames, 0, "a late frame is never measured");
@@ -5032,6 +5370,7 @@ mod tests {
             format: Default::default(),
             region: None,
             preview: None,
+            warmup_ms: None,
         };
         let error = run_command(&h, &mut camera, frame).unwrap_err();
         assert_eq!(
