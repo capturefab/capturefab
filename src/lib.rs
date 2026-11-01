@@ -11,22 +11,16 @@ macro_rules! eprintln {
     }};
 }
 
-#[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
-pub mod accel;
 pub mod auto;
 pub mod camera;
 pub mod camera_profile;
 pub mod cli;
-pub mod compatibility;
 pub mod context;
-pub mod destination;
 pub mod doctor;
-pub mod efficiency;
 mod engine;
 pub mod frame;
 pub mod genicam;
 pub mod hint;
-pub mod hubs;
 pub mod inspect;
 pub mod ipc;
 pub mod jpeg;
@@ -36,11 +30,7 @@ pub mod logins;
 pub mod media;
 pub mod naming;
 pub mod network;
-#[cfg(feature = "nvjpeg")]
-pub mod nvjpeg;
 pub mod onvif;
-pub mod resources;
-pub mod scanner;
 pub mod scheduling;
 pub mod scrub;
 pub mod secret_input;
@@ -52,9 +42,4 @@ pub mod storage;
 mod test_cameras;
 pub mod transport;
 pub mod types;
-pub mod updates;
-#[cfg(feature = "vaapi")]
-pub mod vajpeg;
 pub mod volumes;
-#[cfg(all(feature = "videotoolbox", target_os = "macos"))]
-pub mod vtjpeg;

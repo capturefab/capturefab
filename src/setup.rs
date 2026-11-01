@@ -237,25 +237,12 @@ pub struct SavedCamera {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serial: Option<String>,
-    /// Hub cameras only: `hub:NAME/CAMERA`, resolved through the saved hub.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
     #[serde(default)]
     pub kind: crate::camera_profile::CameraKind,
 }
 impl SavedCamera {
     pub fn from_info(info: &CameraInfo) -> Self {
         let kind = info.profile.kind;
-        if info.id.starts_with("hub:") {
-            return Self {
-                transport: info.transport,
-                vendor: info.vendor.clone(),
-                model: info.model.clone(),
-                serial: None,
-                id: Some(info.id.clone()),
-                kind,
-            };
-        }
         if info.transport == Transport::Media {
             // The serial and id of a media source hash its URL, which still
             // identifies the host and path; every webcam index or RTSP URL
@@ -265,7 +252,6 @@ impl SavedCamera {
                 vendor: String::new(),
                 model: info.model.clone(),
                 serial: None,
-                id: None,
                 kind,
             };
         }
@@ -274,7 +260,6 @@ impl SavedCamera {
             vendor: info.vendor.clone(),
             model: info.model.clone(),
             serial: (!info.serial.is_empty()).then(|| info.serial.clone()),
-            id: None,
             kind,
         }
     }
@@ -416,14 +401,6 @@ fn same(a: &str, b: &str) -> bool {
 /// Compare the camera a setup was saved from with a connected one. The
 /// transport is ignored: the same camera may be reached another way.
 pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) {
-    let live_saved = SavedCamera::from_info(live);
-    if saved.id.is_some() || live_saved.id.is_some() {
-        return if saved.id.is_some() && saved.id == live_saved.id {
-            (Match::SameCamera, Vec::new())
-        } else {
-            (Match::OtherModel, vec![other_model_warning(saved, live)])
-        };
-    }
     if saved.transport == Transport::Media || live.transport == Transport::Media {
         return if saved.transport == live.transport && same(&saved.model, &live.model) {
             (
@@ -458,12 +435,8 @@ pub fn matching(saved: &SavedCamera, live: &CameraInfo) -> (Match, Vec<String>) 
 /// The note a preview or restore of another model carries. It names no
 /// flag: RPC callers read it too.
 fn other_model_warning(saved: &SavedCamera, live: &CameraInfo) -> String {
-    let saved = saved.id.clone().unwrap_or_else(|| saved.label());
-    let live = if live.id.starts_with("hub:") {
-        live.id.clone()
-    } else {
-        label(&live.vendor, &live.model)
-    };
+    let saved = saved.label();
+    let live = label(&live.vendor, &live.model);
     format!("Saved from {saved}; this camera is {live}; only settings both share apply.")
 }
 fn article(model: &str) -> String {
@@ -694,11 +667,8 @@ pub fn validate(setup: &Setup) -> Result<()> {
     ] {
         validate_text(what, text)?;
     }
-    for text in [&setup.camera.serial, &setup.camera.id]
-        .into_iter()
-        .flatten()
-    {
-        validate_text("camera identity", text)?;
+    if let Some(serial) = &setup.camera.serial {
+        validate_text("camera identity", serial)?;
     }
     if let Some(auto) = &setup.auto {
         ensure!(
@@ -1838,25 +1808,6 @@ mod tests {
             warnings,
             [
                 "Saved from Basler acA1920-40gm; this camera is FFmpeg RTSP input; only settings both share apply."
-            ]
-        );
-        let hub = CameraInfo {
-            id: "hub:home/camera.front".into(),
-            ..rtsp.clone()
-        };
-        let saved_hub = SavedCamera::from_info(&hub);
-        assert_eq!(saved_hub.id.as_deref(), Some("hub:home/camera.front"));
-        assert_eq!(matching(&saved_hub, &hub).0, Match::SameCamera);
-        let other_hub = CameraInfo {
-            id: "hub:home/camera.back".into(),
-            ..rtsp
-        };
-        let (other, warnings) = matching(&saved_hub, &other_hub);
-        assert_eq!(other, Match::OtherModel);
-        assert_eq!(
-            warnings,
-            [
-                "Saved from hub:home/camera.front; this camera is hub:home/camera.back; only settings both share apply."
             ]
         );
     }

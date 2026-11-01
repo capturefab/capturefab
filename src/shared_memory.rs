@@ -19,8 +19,8 @@
 //! stream that goes quiet (stopped, or a triggered camera between triggers)
 //! still ends on its newest frame.
 //! Consumers rely on:
-//! - Continuous readers (GUI previews, the browser's 250 ms preview poll) keep
-//!   the ring watched and get current frames.
+//! - Continuous readers, which poll the ring again and again, keep it watched
+//!   and get current frames.
 //! - An occasional poller may get a keep-alive frame up to `KEEP_ALIVE` old.
 //!   Take one plainly only where that is acceptable; otherwise `ask` and take
 //!   without watching until a frame offered since arrives
@@ -163,8 +163,6 @@ fn allocate(file: &File, length: u64) -> std::io::Result<()> {
 struct Mapping {
     raw: MmapRaw,
     file: Option<RingFile>,
-    // Dropped after unmapping and releasing any backing file.
-    buffer_lease: Option<crate::resources::buffers::BufferLease>,
 }
 impl Mapping {
     fn atomic(&self, offset: usize) -> &AtomicU32 {
@@ -250,30 +248,6 @@ fn ring_bytes(capacity: usize) -> usize {
     HEADER + SLOTS * (META + capacity)
 }
 impl SharedRing {
-    /// Bytes reserved by this layout, including all three frame slots.
-    pub(crate) fn allocation_bytes(capacity: usize) -> Result<u64> {
-        ensure!(valid_capacity(capacity), "invalid camera buffer capacity");
-        Ok(ring_bytes(capacity) as u64)
-    }
-    /// Bind admission to the mapping itself, including counters that outlive
-    /// a Process or Feed. This must precede sharing the mapping.
-    pub(crate) fn attach_buffer_lease(
-        &mut self,
-        lease: crate::resources::buffers::BufferLease,
-    ) -> Result<()> {
-        ensure!(
-            lease.capacity_bytes() == Self::allocation_bytes(self.capacity)?,
-            "camera buffer reservation does not match its allocation"
-        );
-        let mapping =
-            Arc::get_mut(&mut self.map).context("camera buffer was shared before reservation")?;
-        ensure!(
-            mapping.buffer_lease.is_none(),
-            "camera buffer already has a reservation"
-        );
-        mapping.buffer_lease = Some(lease);
-        Ok(())
-    }
     /// A ring for a new worker: anonymous memory where the platform has it,
     /// otherwise a file in `dir`, which must be private.
     pub fn create(dir: &Path, capacity: usize) -> Result<Self> {
@@ -349,14 +323,7 @@ impl SharedRing {
         Ok(Self::init(raw, Some(file), capacity))
     }
     fn init(raw: MmapRaw, file: Option<RingFile>, capacity: usize) -> Self {
-        let mut ring = Self::new(
-            Arc::new(Mapping {
-                raw,
-                file,
-                buffer_lease: None,
-            }),
-            capacity,
-        );
+        let mut ring = Self::new(Arc::new(Mapping { raw, file }), capacity);
         // New memory and files read as zeros, so every slot starts FREE.
         // Writing slot headers here would commit pages no frame needs yet.
         ring.put(0, MAGIC);
@@ -411,11 +378,7 @@ impl SharedRing {
     }
     fn opened(raw: MmapRaw) -> Result<Self> {
         ensure!(raw.len() >= HEADER, "truncated shared ring");
-        let map = Arc::new(Mapping {
-            raw,
-            file: None,
-            buffer_lease: None,
-        });
+        let map = Arc::new(Mapping { raw, file: None });
         ensure!(map.bytes(0, 8) == MAGIC, "shared ring version mismatch");
         let capacity = usize::try_from(u64::from_le_bytes(map.bytes(8, 8).try_into()?))?;
         // Shared memory may be rounded up to whole pages.
@@ -428,10 +391,6 @@ impl SharedRing {
     /// Let `command` open this ring: append the worker's argument and, for
     /// anonymous memory, have that child, and only it, inherit the descriptor.
     pub fn pass_to(&self, command: &mut std::process::Command) {
-        crate::resources::buffers::clear_inheritance(command);
-        if let Some(lease) = &self.map.buffer_lease {
-            lease.pass_to(command);
-        }
         command.args(self.worker_arg());
         #[cfg(unix)]
         if let Some(fd) = &self.handoff {

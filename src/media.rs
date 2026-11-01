@@ -26,53 +26,10 @@ use std::{
 };
 
 const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/capturefab-ffmpeg.bin"));
-const LICENSE: &str = include_str!(concat!(env!("OUT_DIR"), "/capturefab-ffmpeg-license.txt"));
 const MAX_FRAME: usize = 256 * 1024 * 1024;
 const MAX_LOG: usize = 16 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
-static HWACCEL: OnceLock<String> = OnceLock::new();
-pub fn configure_hwaccel(value: &str) -> Result<()> {
-    validate_hwaccel(value)?;
-    if let Err(value) = HWACCEL.set(value.to_owned()) {
-        ensure!(
-            HWACCEL.get() == Some(&value),
-            "hardware acceleration is already configured for {}; restart the process to select {value}",
-            HWACCEL.get().unwrap()
-        );
-    }
-    Ok(())
-}
-
-pub fn validate_hwaccel(value: &str) -> Result<()> {
-    ensure!(
-        [
-            "auto",
-            "none",
-            "off",
-            "videotoolbox",
-            "cuda",
-            "qsv",
-            "vaapi",
-            "d3d11va",
-            "dxva2",
-            "vulkan",
-            "drm",
-            "opencl"
-        ]
-        .contains(&value),
-        "unsupported hardware acceleration method {value}; use auto, none, videotoolbox, cuda, qsv, vaapi, d3d11va, dxva2, vulkan, drm or opencl"
-    );
-    Ok(())
-}
-pub fn hwaccel() -> String {
-    HWACCEL
-        .get()
-        .cloned()
-        .or_else(|| std::env::var("CAPTUREFAB_HWACCEL").ok())
-        .unwrap_or_else(|| "auto".into())
-}
-
 /// Credential-bearing query names use several case and separator conventions.
 /// Decode the name once, as URL query parsers do, while preserving the original
 /// spelling when the URL is redacted.
@@ -541,11 +498,6 @@ thread_local! {
     static FAKE_FFMPEG: std::cell::RefCell<Option<Arc<Executable>>> =
         const { std::cell::RefCell::new(None) };
 }
-/// Makes `path` this test thread's FFmpeg, or, with `None`, stops.
-#[cfg(all(test, feature = "hubs"))]
-pub(crate) fn set_fake_ffmpeg(path: Option<PathBuf>) {
-    FAKE_FFMPEG.set(path.map(|path| Arc::new(Executable::external(path))));
-}
 pub(crate) fn executable() -> Result<Arc<Executable>> {
     #[cfg(test)]
     if let Some(fake) = FAKE_FFMPEG.with_borrow(Clone::clone) {
@@ -858,53 +810,17 @@ fn sha256_file(path: &std::path::Path) -> Result<String> {
     }
     Ok(format!("{:x}", hash.finalize()))
 }
-/// One of this user's live decoders or software encoders on the host,
-/// counted through lock files in the cache that holders keep locked; a
-/// process that dies releases its slot.
-struct Active {
-    _slot: Option<fs::File>,
-}
-impl Active {
-    const NONE: Self = Self { _slot: None };
-    const SLOTS: usize = 32;
-    /// Claim a slot of `kind`, and count the active ones, this one included.
-    fn claim(kind: &str) -> (Self, usize) {
-        let Some(dir) = crate::ipc::cache_dir()
-            .map(|root| root.join("active"))
-            .filter(|dir| private_dir(dir).is_ok())
-        else {
-            return (Self::NONE, 1);
-        };
-        let mut mine = None;
-        let mut others = 0;
-        for slot in 0..Self::SLOTS {
-            let Ok(file) = lock_file(&dir.join(format!("{kind}-{slot}.lock"))) else {
-                break;
-            };
-            if fs2::FileExt::try_lock_exclusive(&file).is_err() {
-                others += 1;
-            } else if mine.is_none() {
-                mine = Some(file);
-            }
-        }
-        (Self { _slot: mine }, others + 1)
-    }
-}
 fn cores() -> usize {
     crate::types::processing_threads(thread::available_parallelism().map_or(1, |cores| cores.get()))
 }
 /// FFmpeg's default frame threading runs cores + 1 threads per stream, each
-/// holding frames and adding latency; share the cores between live streams.
-fn decoder_threads(cores: usize, streams: usize, efficient: bool) -> usize {
-    if efficient {
-        1
-    } else {
-        (cores / streams.max(1)).clamp(1, 4)
-    }
+/// holding frames and adding latency.
+fn decoder_threads(cores: usize) -> usize {
+    cores.clamp(1, 4)
 }
 /// x264's preset for a recording: faster as the pixel rate per available
-/// core rises, and one step faster in Efficient mode.
-fn x264_preset(width: u32, height: u32, fps: f64, cores: usize, efficient: bool) -> &'static str {
+/// core rises.
+fn x264_preset(width: u32, height: u32, fps: f64, cores: usize) -> &'static str {
     const PRESETS: [&str; 3] = ["veryfast", "superfast", "ultrafast"];
     let per_core = width as f64 * height as f64 * fps / cores.max(1) as f64;
     let step = if per_core <= 12e6 {
@@ -914,63 +830,7 @@ fn x264_preset(width: u32, height: u32, fps: f64, cores: usize, efficient: bool)
     } else {
         2
     };
-    PRESETS[(step + efficient as usize).min(2)]
-}
-/// The configured decoding acceleration. `auto` becomes `none` where it
-/// would find nothing, since trying costs every decoder launch a device set-up.
-fn decode_acceleration(exe: &Executable) -> Result<String> {
-    let acceleration = hwaccel();
-    validate_hwaccel(&acceleration)?;
-    Ok(match acceleration.as_str() {
-        "off" => "none".into(),
-        "auto" if !hwaccel_available(exe) => "none".into(),
-        _ => acceleration,
-    })
-}
-/// ARM Linux boards have nothing the bundled FFmpeg decodes with; other
-/// hosts ask once per boot whether `-hwaccel auto` initializes a device.
-fn hwaccel_available(exe: &Executable) -> bool {
-    if cfg!(all(
-        target_os = "linux",
-        any(target_arch = "aarch64", target_arch = "arm")
-    )) {
-        return false;
-    }
-    let found = probed(
-        exe,
-        |probes| probes.hwaccel,
-        |probes, found| probes.hwaccel = Some(found),
-        || {
-            // One black 64x64 baseline H.264 frame.
-            const CLIP: [u8; 65] = [
-                0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x0a, 0xd9, 0x04, 0x26, 0xc0, 0x44, 0x00,
-                0x00, 0x03, 0x00, 0x04, 0x00, 0x00, 0x03, 0x00, 0x08, 0x3c, 0x48, 0x99, 0x20, 0x00,
-                0x00, 0x00, 0x01, 0x68, 0xcb, 0x83, 0xcb, 0x20, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84,
-                0x05, 0x7f, 0xff, 0xff, 0x0f, 0x45, 0x00, 0x01, 0x42, 0xdf, 0x27, 0x27, 0x27, 0x5d,
-                0x75, 0xd7, 0x5d, 0x75, 0xd7, 0x5d, 0x75, 0xd7, 0x80,
-            ];
-            let args = [
-                "-nostdin",
-                "-hide_banner",
-                "-loglevel",
-                "verbose",
-                "-hwaccel",
-                "auto",
-                "-f",
-                "h264",
-                "-i",
-                "pipe:0",
-                "-f",
-                "null",
-                "-",
-            ]
-            .map(str::to_string);
-            let (_, log, timed_out) = timed_output(exe, &args, &CLIP, Duration::from_secs(5))?;
-            Ok((!timed_out).then(|| log.contains("Using auto hwaccel type")))
-        },
-    );
-    // An FFmpeg that cannot run or finish the probe keeps `auto`.
-    found.ok().flatten().unwrap_or(true)
+    PRESETS[step]
 }
 /// Context for a decoder whose FFmpeg could not be extracted or started,
 /// unlike a source FFmpeg reached and failed on. Callers test for it with
@@ -991,26 +851,7 @@ pub(crate) fn command(exe: &Executable) -> Command {
         cmd.creation_flags(0x08000000);
     }
     cmd.stdin(Stdio::null());
-    // Camera hub secrets may live in this process's environment;
-    // FFmpeg never needs them.
-    for (name, _) in std::env::vars_os() {
-        if is_hub_secret_variable(&name) {
-            cmd.env_remove(name);
-        }
-    }
     cmd
-}
-/// Environment variables that hold camera hub secrets start with this.
-pub(crate) const HUB_SECRET_PREFIX: &str = "CAPTUREFAB_HUB_";
-fn is_hub_secret_variable(name: &std::ffi::OsStr) -> bool {
-    // Windows environment names are case-insensitive, including when the
-    // inherited spelling differs from the saved uppercase variable name.
-    name.to_str().is_some_and(|name| {
-        [HUB_SECRET_PREFIX].iter().any(|expected| {
-            name.get(..expected.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(expected))
-        })
-    })
 }
 fn bounded_output(exe: &Executable, args: &[String], timeout: Duration) -> Result<(bool, String)> {
     let (success, output, _) = timed_output(exe, args, &[], timeout)?;
@@ -1105,24 +946,6 @@ pub(crate) fn ffmpeg_health() -> Result<FfmpegHealth> {
         path: exe.path.display().to_string(),
         version,
     })
-}
-pub fn ffmpeg_info() -> Result<Value> {
-    let exe = executable()?;
-    let (ok, version) = bounded_output(&exe, &["-version".into()], Duration::from_secs(5))?;
-    ensure!(ok, "FFmpeg version query failed");
-    let (_, protocols) = bounded_output(
-        &exe,
-        &["-hide_banner".into(), "-protocols".into()],
-        Duration::from_secs(5),
-    )?;
-    let (_, encoders) = bounded_output(
-        &exe,
-        &["-hide_banner".into(), "-encoders".into()],
-        Duration::from_secs(5),
-    )?;
-    Ok(
-        json!({"embedded":!EMBEDDED.is_empty(),"embedded_bytes":Payload::compressed(EMBEDDED)?.length,"embedded_compressed_bytes":EMBEDDED.len(),"version":version,"protocols":protocols,"encoders":encoders,"license_notice":LICENSE}),
-    )
 }
 /// How long a failed encoder listing is remembered before FFmpeg runs again.
 const ENCODER_RETRY: Duration = Duration::from_secs(60);
@@ -1473,8 +1296,6 @@ struct Decoder {
     /// Why FFmpeg's output ended, formatted once with its log.
     failure: Option<String>,
     status: Option<std::process::ExitStatus>,
-    /// This stream's share of the host's live decoders.
-    _active: Active,
 }
 fn ppm_token(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut token = Vec::new();
@@ -1556,21 +1377,9 @@ impl Decoder {
         let exe = executable().context(FfmpegUnavailable)?;
         let mut cmd = command(&exe);
         cmd.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
-        let configured = |name: &str| options.iter().any(|option| option == name);
-        if !configured("-hwaccel") {
-            let acceleration = decode_acceleration(&exe)?;
-            if acceleration != "none" {
-                cmd.args(["-hwaccel", &acceleration]);
-            }
+        if !options.iter().any(|option| option == "-threads") {
+            cmd.args(["-threads", &decoder_threads(cores()).to_string()]);
         }
-        let active = if configured("-threads") {
-            Active::NONE
-        } else {
-            let (active, streams) = Active::claim("decode");
-            let threads = decoder_threads(cores(), streams, crate::efficiency::efficient());
-            cmd.args(["-threads", &threads.to_string()]);
-            active
-        };
         let input = match native_input(source)? {
             Some((format, input)) => {
                 cmd.args(["-f", format]);
@@ -1684,7 +1493,6 @@ impl Decoder {
             source: source.into(),
             failure: None,
             status: None,
-            _active: active,
         })
     }
     fn next(&mut self, timeout: Duration) -> Result<Frame> {
@@ -2377,7 +2185,7 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
             .any(|text| log.contains(&format!("ioctl(VIDIOC_G_INPUT): {text}")))
     {
         Some(format!(
-            "video capture is not supported by {}, which may be a metadata, codec or ISP node; run capturefab native to list capture nodes",
+            "video capture is not supported by {}, which may be a metadata, codec or ISP node; run capturefab discover to list capture nodes",
             device_name(source)
         ))
     } else if [
@@ -2389,7 +2197,7 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
     .any(|text| lower.contains(text))
     {
         Some(format!(
-            "camera device not found: {}; reconnect the device and run capturefab native to obtain its current locator",
+            "camera device not found: {}; reconnect the device and run capturefab discover to obtain its current locator",
             device_name(source)
         ))
     } else {
@@ -2625,7 +2433,7 @@ fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
     );
     ensure!(
         !(base.ends_with('\\') && query.starts_with('\\')),
-        "write the ? of a DirectShow alternative name as %3F, as capturefab native lists it"
+        "write the ? of a DirectShow alternative name as %3F, as capturefab discover lists it"
     );
     let mut options = NativeOptions::default();
     for pair in query.split('&').filter(|s| !s.is_empty()) {
@@ -3252,29 +3060,6 @@ fn register_range(registers: &[u8], address: u64, length: usize) -> Result<Vec<u
         .context("unknown media register")?
         .to_vec())
 }
-/// Registers of a read-only RGB8 source, such as a camera hub stream.
-#[cfg(feature = "hubs")]
-pub(crate) fn read_only_registers(
-    width: u32,
-    height: u32,
-    running: bool,
-    fps: f64,
-    address: u64,
-    length: usize,
-) -> Result<Vec<u8>> {
-    register_range(
-        &registers(width, height, running, fps, u32::MAX),
-        address,
-        length,
-    )
-}
-/// GenICam XML for a read-only RGB8 source over [`read_only_registers`]:
-/// Width, Height, PixelFormat, PayloadSize and AcquisitionFrameRate are read
-/// only; AcquisitionStart and AcquisitionStop write register 16.
-#[cfg(feature = "hubs")]
-pub(crate) fn read_only_xml() -> String {
-    backend_xml(false, &[], false)
-}
 impl RegisterIo for MediaBackend {
     fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
         let mut registers = [0u8; 36];
@@ -3471,14 +3256,10 @@ pub struct ForwardConfig {
     pub storage: crate::storage::StoragePolicy,
     #[serde(default = "default_recording_cap")]
     pub max_file_bytes: u64,
-    /// A saved destination for local recordings; `output` is then a file
-    /// name inside it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
 }
 impl ForwardConfig {
     /// Validate forwarding settings before starting a process, changing camera
-    /// settings, reserving storage or looking up a saved destination.
+    /// settings or reserving storage.
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.fps.is_finite() && (0.1..=240.0).contains(&self.fps),
@@ -3491,14 +3272,8 @@ impl ForwardConfig {
         }
         validate_bitrate(&self.bitrate)?;
         output_args(&self.output)?;
-        crate::destination::validate_output(self.destination.as_deref(), &self.output)?;
+        crate::naming::validate_output(&self.output)?;
         let recording = recording_output(&self.output)?;
-        if self.destination.is_some() {
-            ensure!(
-                recording.is_some(),
-                "a destination holds recordings; omit --destination for network streams"
-            );
-        }
         // Storage fields remain valid even when a network stream does not use them.
         self.storage.validate()?;
         ensure!(
@@ -3636,8 +3411,6 @@ struct EncoderProcess {
     /// When the recording file was reserved, UTC Unix milliseconds.
     started_ms: u64,
     spawned: Instant,
-    /// This recording's share of the host's software encodes.
-    _active: Active,
 }
 struct EncodedOutput {
     storage: crate::storage::StorageWriter,
@@ -3647,8 +3420,6 @@ pub struct Forwarder {
     config: ForwardConfig,
     process: Option<EncoderProcess>,
     final_stats: ForwardStats,
-    /// The recording's local folder destination.
-    destination: Option<crate::destination::Resolved>,
     /// The recording file, created when its name was picked so no other
     /// writer can take the name before the first frame.
     reserved: Option<crate::storage::StorageWriter>,
@@ -3759,9 +3530,6 @@ struct Probes {
     /// Test encodes by encoder, input and size, such as `h264_nvenc yuv 1920x1080`.
     #[serde(default)]
     encoders: std::collections::BTreeMap<String, Found>,
-    /// Whether any decoding acceleration initialized.
-    #[serde(default)]
-    hwaccel: Option<Found>,
 }
 /// A probe's answer and when it was found, in UTC Unix milliseconds.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -3846,10 +3614,6 @@ fn save_probes(exe: &Executable, probes: &mut Probes) {
     let stored = load_probes(exe);
     probes.boot = boot.to_owned();
     probes.listing = probes.listing.take().or(stored.listing);
-    probes.hwaccel = probes
-        .hwaccel
-        .map(|found| found.newer(stored.hwaccel))
-        .or(stored.hwaccel);
     for (key, found) in stored.encoders {
         let mine = probes.encoders.entry(key).or_insert(found);
         *mine = mine.newer(Some(found));
@@ -3964,19 +3728,19 @@ fn usable(exe: &Executable, encoder: &str, width: u32, height: u32) -> Result<bo
 }
 /// The size probed before a recording's first frame says its real size.
 const PROBE_SIZE: (u32, u32) = (640, 480);
-/// Encoders to try for a codec on this OS: vendor encoders first, then
-/// cross-vendor Vulkan Video, then software.
+/// Encoders to try for a codec on this OS, all in the bundled FFmpeg or on
+/// Jetson: vendor encoders first, then cross-vendor Vulkan Video, then
+/// software. Another FFmpeg's encoders are used with `--encoder`.
 fn encoder_candidates(family: &str) -> Vec<&'static str> {
     match (family, std::env::consts::OS) {
         ("h264", "macos") => vec!["h264_videotoolbox", "libx264"],
-        ("hevc", "macos") => vec!["hevc_videotoolbox", "libx265"],
-        ("av1", "macos") => vec!["libsvtav1", "libaom-av1"],
+        ("hevc", "macos") => vec!["hevc_videotoolbox"],
+        ("av1", "macos") => vec![],
         ("h264", "linux") => vec![
             "h264_nvenc",
             "nvv4l2h264enc",
             "h264_amf",
             "h264_qsv",
-            "h264_vaapi",
             "h264_vulkan",
             "h264_v4l2m2m",
             "libx264",
@@ -3986,20 +3750,15 @@ fn encoder_candidates(family: &str) -> Vec<&'static str> {
             "nvv4l2h265enc",
             "hevc_amf",
             "hevc_qsv",
-            "hevc_vaapi",
             "hevc_vulkan",
             "hevc_v4l2m2m",
-            "libx265",
         ],
         ("av1", "linux") => vec![
             "av1_nvenc",
             "nvv4l2av1enc",
             "av1_amf",
             "av1_qsv",
-            "av1_vaapi",
             "av1_vulkan",
-            "libsvtav1",
-            "libaom-av1",
         ],
         ("h264", "windows") => vec![
             "h264_nvenc",
@@ -4015,20 +3774,11 @@ fn encoder_candidates(family: &str) -> Vec<&'static str> {
             "hevc_amf",
             "hevc_vulkan",
             "hevc_mf",
-            "libx265",
         ],
-        ("av1", "windows") => vec![
-            "av1_nvenc",
-            "av1_qsv",
-            "av1_amf",
-            "av1_vulkan",
-            "av1_mf",
-            "libsvtav1",
-            "libaom-av1",
-        ],
+        ("av1", "windows") => vec!["av1_nvenc", "av1_qsv", "av1_amf", "av1_vulkan", "av1_mf"],
         ("h264", _) => vec!["libx264"],
-        ("hevc", _) => vec!["libx265"],
-        _ => vec!["av1_nvenc", "libsvtav1", "libaom-av1"],
+        ("hevc", _) => vec![],
+        _ => vec!["av1_nvenc"],
     }
 }
 /// Every candidate must be in the FFmpeg build and pass a real test encode
@@ -4672,37 +4422,21 @@ impl RawInput {
     }
 }
 impl Forwarder {
-    pub fn new(mut config: ForwardConfig) -> Result<Self> {
+    pub fn new(config: ForwardConfig) -> Result<Self> {
         config.validate()?;
         check_codec(&config)?;
-        let destination = match config.destination.as_deref() {
-            Some(name) => {
-                ensure!(
-                    recording_output(&config.output)?.is_some(),
-                    "a destination holds recordings, not network streams; omit --destination for {}",
-                    redact_url(&config.output)
-                );
-                let resolved = crate::destination::resolve(Some(name), &config.output)?;
-                config.output = resolved.output.clone();
-                Some(resolved)
-            }
-            None => None,
-        };
         Ok(Self {
             config,
             process: None,
             final_stats: ForwardStats::default(),
-            destination,
             reserved: None,
             failed: None,
         })
     }
-    /// Use an output the caller already resolved against `destination`
-    /// (and named), so the destination is not looked up a second time.
-    /// `reserved` is the already created recording file, if any.
+    /// Use an output the caller already named. `reserved` is the already
+    /// created recording file, if any.
     pub fn with_resolved(
         config: ForwardConfig,
-        destination: Option<crate::destination::Resolved>,
         reserved: Option<crate::storage::StorageWriter>,
     ) -> Result<Self> {
         if let Err(error) = config.validate().and_then(|()| check_codec(&config)) {
@@ -4715,7 +4449,6 @@ impl Forwarder {
             config,
             process: None,
             final_stats: ForwardStats::default(),
-            destination,
             reserved,
             failed: None,
         })
@@ -4745,7 +4478,6 @@ impl Forwarder {
         let fps = self.config.fps.to_string();
         let mut cmd = command(&exe);
         let mut stage = None;
-        let mut active = Active::NONE;
         if let Some(input) = jetson {
             let (fps_numerator, fps_denominator) = jetson_framerate(self.config.fps)?;
             let gop = ((self.config.fps * 2.0).round().max(1.0) as u32).to_string();
@@ -4840,17 +4572,8 @@ impl Forwarder {
             cmd.args(encoder_output_options(&encoder, input));
             cmd.args(["-fps_mode", "vfr"]);
             if matches!(encoder.as_str(), "libx264" | "libx265") {
-                // Concurrent software recordings share the cores.
-                let (claimed, recordings) = Active::claim("encode");
-                active = claimed;
-                let cores = (cores() / recordings).max(1);
-                let preset = x264_preset(
-                    width,
-                    height,
-                    self.config.fps,
-                    cores,
-                    crate::efficiency::efficient(),
-                );
+                let cores = cores();
+                let preset = x264_preset(width, height, self.config.fps, cores);
                 cmd.args(["-preset", preset, "-threads", &cores.to_string()]);
                 if encoder == "libx264" {
                     // Rate control by the frames' times rather than `fps`, so
@@ -4991,7 +4714,6 @@ impl Forwarder {
             encoder,
             started_ms,
             spawned: Instant::now(),
-            _active: active,
         });
         Ok(())
     }
@@ -5188,10 +4910,6 @@ impl Forwarder {
                         codec: self.config.codec.clone(),
                         encoder: process.encoder.clone(),
                         fps: self.config.fps,
-                        destination: self
-                            .destination
-                            .as_ref()
-                            .and_then(|d| d.destination.clone()),
                     };
                     self.final_stats.recording = Some(recorded);
                 })
@@ -5761,53 +5479,6 @@ esac"#,
         camera.stop().unwrap();
     }
     #[test]
-    #[cfg(all(unix, feature = "hubs"))]
-    fn hub_restreams_return_decoder_exits_to_their_pump() {
-        use crate::hubs::pump::{Cx, FrameSession, Next};
-        use crate::types::ErrorKind;
-
-        let fake = Fake::new(
-            "hub-reconnect",
-            r#"case "$*" in *rtsp*) ;; *) exit 0 ;; esac
-echo launch >> "$dir/launches"
-printf 'P6\n2 2\n255\n'
-head -c 12 /dev/zero
-echo 'Error during demuxing: Operation timed out' >&2
-exit 1"#,
-        );
-        let mut backend = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(2)).unwrap();
-        backend.start(12).unwrap();
-        let mut session = crate::hubs::sources::rtsp_session_for_test(backend, "hub:test/live");
-        let cx = Cx::new();
-        let Next::Frame(frame) = session.next(&cx).unwrap() else {
-            panic!("restream did not deliver its first frame");
-        };
-        assert_eq!((frame.width, frame.height), (2, 2));
-
-        let started = Instant::now();
-        let failure = match session.next(&cx) {
-            Err(failure) => failure,
-            Ok(_) => panic!("ended restream did not return its failure"),
-        };
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(failure.kind, ErrorKind::OperationFailed);
-        assert_eq!(failure.message, "the RTSP restream of hub:test/live ended");
-        // An ordinary transient failure takes the pump's reconnect backoff;
-        // it must not run MediaBackend's reconnect loop inside the pump.
-        assert!(!failure.permanent && !failure.quiet);
-        assert_eq!(fake.read("launches").lines().count(), 1);
-
-        cx.cancel.cancel();
-        let started = Instant::now();
-        let cancelled = match session.next(&cx) {
-            Err(failure) => failure,
-            Ok(_) => panic!("cancelled restream kept reading"),
-        };
-        assert_eq!(cancelled.message, "cancelled");
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(fake.read("launches").lines().count(), 1);
-    }
-    #[test]
     fn first_open_failures_explain_ffmpeg_in_one_sentence() {
         let wait = Duration::from_secs(2);
         let source = "rtsp://user:pw@127.0.0.1:1/x";
@@ -6247,38 +5918,13 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
     }
     #[test]
     fn decoders_and_software_encoders_are_sized_to_the_host() {
-        assert_eq!(decoder_threads(16, 1, false), 4);
-        assert_eq!(decoder_threads(8, 3, false), 2);
-        assert_eq!(decoder_threads(4, 6, false), 1);
-        assert_eq!(decoder_threads(16, 1, true), 1);
+        assert_eq!(decoder_threads(16), 4);
+        assert_eq!(decoder_threads(2), 2);
+        assert_eq!(decoder_threads(0), 1);
         // 1080p30 is 62 Mpx/s.
-        assert_eq!(x264_preset(1920, 1080, 30.0, 14, false), "veryfast");
-        assert_eq!(x264_preset(1920, 1080, 30.0, 4, false), "superfast");
-        assert_eq!(x264_preset(1920, 1080, 30.0, 2, false), "ultrafast");
-        assert_eq!(x264_preset(1920, 1080, 30.0, 14, true), "superfast");
-        assert_eq!(x264_preset(3840, 2160, 30.0, 2, true), "ultrafast");
-    }
-    #[test]
-    #[cfg(unix)]
-    fn auto_hwaccel_is_dropped_where_no_device_initializes() {
-        for (log, expected) in [
-            ("", "none"),
-            (
-                "[dec:h264] Using auto hwaccel type videotoolbox with new default device.",
-                "auto",
-            ),
-        ] {
-            let _fake = Fake::new("hwaccel", &format!("cat > /dev/null; echo '{log}' >&2"));
-            let exe = executable().unwrap();
-            let arm_linux = cfg!(all(
-                target_os = "linux",
-                any(target_arch = "aarch64", target_arch = "arm")
-            ));
-            let expected = if arm_linux { "none" } else { expected };
-            if hwaccel() == "auto" {
-                assert_eq!(decode_acceleration(&exe).unwrap(), expected, "{log}");
-            }
-        }
+        assert_eq!(x264_preset(1920, 1080, 30.0, 14), "veryfast");
+        assert_eq!(x264_preset(1920, 1080, 30.0, 4), "superfast");
+        assert_eq!(x264_preset(1920, 1080, 30.0, 2), "ultrafast");
     }
     #[test]
     fn probe_results_persist_for_the_boot_and_ignore_corrupt_files() {
@@ -6371,7 +6017,6 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
-            destination: None,
         }
     }
     #[cfg(unix)]
@@ -6730,19 +6375,6 @@ esac"#
             ),
             "http://cam/cgi?usr=a&PWD=<redacted>&pw=<redacted>&api_key=<redacted>&ApiKey=<redacted>&authSig=<redacted>&sig=<redacted>&signature=<redacted>&stream=main&fps=5"
         );
-    }
-    #[test]
-    fn ffmpeg_never_inherits_hub_secrets() {
-        for name in [
-            "CAPTUREFAB_HUB_TEST_SECRET",
-            "capturefab_hub_test_secret",
-            "Capturefab_Hub_Secret",
-        ] {
-            assert!(is_hub_secret_variable(std::ffi::OsStr::new(name)));
-        }
-        assert!(!is_hub_secret_variable(std::ffi::OsStr::new(
-            "CAPTUREFAB_FFMPEG"
-        )));
     }
     #[test]
     fn query_credentials_are_redacted_across_case_separators_and_percent_encoding() {
@@ -7320,7 +6952,6 @@ esac"#
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
-            destination: None,
         })
         .unwrap();
         for frame in frames {
@@ -7363,7 +6994,6 @@ esac"#
             bitrate: "8M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
-            destination: None,
         })
         .unwrap();
         let (width, height) = (1920usize, 1080usize);
@@ -7462,7 +7092,6 @@ esac"#
             bitrate: "4M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
-            destination: None,
         })
         .unwrap();
         let (width, height) = (1280usize, 720usize);
@@ -7544,7 +7173,6 @@ esac"#
             bitrate: "32M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
-            destination: None,
         })
         .unwrap();
         let mut noise = 123u32;
@@ -7593,7 +7221,6 @@ esac"#
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
-            destination: None,
         })
         .unwrap();
         let frame = Frame {
@@ -7634,7 +7261,6 @@ esac"#
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: 512,
-            destination: None,
         })
         .unwrap();
         let frame = Frame {
@@ -7677,7 +7303,6 @@ esac"#
             bitrate: "8M".into(),
             storage: Default::default(),
             max_file_bytes: limit,
-            destination: None,
         })
         .unwrap();
         // Noise compresses poorly, so the limit comes within seconds.
@@ -7731,8 +7356,6 @@ esac"#
     }
     #[test]
     fn forwarding_configuration_fails_closed() {
-        assert!(validate_hwaccel("cuda").is_ok());
-        assert!(validate_hwaccel("unexpected").is_err());
         let config = ForwardConfig {
             output: "video.mp4".into(),
             codec: "h264".into(),
@@ -7741,7 +7364,6 @@ esac"#
             bitrate: "4M".into(),
             storage: Default::default(),
             max_file_bytes: default_recording_cap(),
-            destination: None,
         };
         assert!(Forwarder::new(config.clone()).is_ok());
         let mut serialized = serde_json::to_value(&config).unwrap();
@@ -8566,7 +8188,7 @@ Error opening input files: Input/output error
             assert_eq!(
                 message,
                 format!(
-                    "video capture is not supported by {node}, which may be a metadata, codec or ISP node; run capturefab native to list capture nodes"
+                    "video capture is not supported by {node}, which may be a metadata, codec or ISP node; run capturefab discover to list capture nodes"
                 )
             );
             assert_eq!(crate::cli::error_code(&anyhow!(message)).1, 5);
@@ -8646,7 +8268,7 @@ Error opening input files: Input/output error
         assert_eq!(
             missing,
             format!(
-                "camera device not found: {by_path}; reconnect the device and run capturefab native to obtain its current locator"
+                "camera device not found: {by_path}; reconnect the device and run capturefab discover to obtain its current locator"
             )
         );
     }
@@ -8784,7 +8406,7 @@ Error opening input files: Input/output error
             "camera is in use by another application"
         );
         let missing = failure("[in#0 @ 0x1] Video device not found").unwrap();
-        assert!(missing.contains("run capturefab native"));
+        assert!(missing.contains("run capturefab discover"));
         assert_eq!(crate::cli::error_code(&anyhow!(missing)).1, 3);
         let stalled = native_failure("", true, "avfoundation:FaceTime HD Camera", timeout).unwrap();
         assert_eq!(

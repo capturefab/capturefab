@@ -585,9 +585,6 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
         vec!["connect", "sim:replay:"],
         vec!["connect", "file:"],
         vec!["select", "file:"],
-        vec!["destination", "remove", "../bad"],
-        vec!["destination", "test", "../bad"],
-        vec!["destination", "add-folder", "../bad", "/tmp"],
     ] {
         let result = cmd(&dir, &[&["--json"][..], args.as_slice()].concat());
         assert_eq!(
@@ -707,18 +704,23 @@ fn live_source_unavailability_keeps_its_operation_category() {
         String::from_utf8_lossy(&result.stdout)
     );
     assert!(!dir.exists());
-    #[cfg(not(feature = "scanner"))]
-    {
-        let result = cmd(
-            &dir,
-            &["--json", "--camera", "scanner:sane:test", "get", "Width"],
-        );
+    // Camera hubs and document scanners are gone; their selectors say what
+    // to use instead.
+    for (camera, hint) in [
+        ("hub:home/camera.front_door", "rtsp://HOST"),
+        ("scanner:sane:test", "not supported"),
+    ] {
+        let result = cmd(&dir, &["--json", "--camera", camera, "get", "Width"]);
         assert_eq!(
             result.status.code(),
-            Some(5),
+            Some(2),
             "{}",
             String::from_utf8_lossy(&result.stdout)
         );
+        let response: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(response["error"]["code"], "usage");
+        let message = response["error"]["message"].as_str().unwrap();
+        assert!(message.contains(hint), "{message}");
         assert!(!dir.exists());
     }
 }
@@ -903,44 +905,6 @@ fn undo_redo_camera_session_contract() {
         camera("sim:1", &["history"])["history"]["undo"],
         "Set Width"
     );
-    #[cfg(all(
-        feature = "scanner",
-        any(target_os = "linux", target_os = "windows", target_os = "macos")
-    ))]
-    {
-        // Scanner settings are local registers; opening and editing an invented
-        // device ID never starts a driver helper or moves a real scanner.
-        let scanner = match std::env::consts::OS {
-            "linux" => "scanner:sane:HISTORY-TEST",
-            "windows" => "scanner:wia:HISTORY-TEST",
-            "macos" => "scanner:ica:HISTORY-TEST",
-            _ => unreachable!(),
-        };
-        session(&["connect", scanner]);
-        camera(scanner, &["set", "ScanResolution=300"]);
-        assert_eq!(camera(scanner, &["undo"])["undone"], "Set ScanResolution");
-        assert_eq!(
-            camera(scanner, &["get", "ScanResolution"])["features"][0]["value"],
-            150
-        );
-        camera(scanner, &["redo"]);
-        assert_eq!(
-            camera(scanner, &["get", "ScanResolution"])["features"][0]["value"],
-            300
-        );
-        for (setting, field, original) in [
-            ("ScanMode=Gray", "ScanMode", "Color"),
-            ("ScanSource=Feeder", "ScanSource", "Default"),
-        ] {
-            camera(scanner, &["set", setting]);
-            camera(scanner, &["undo"]);
-            assert_eq!(
-                camera(scanner, &["get", field])["features"][0]["value"],
-                original
-            );
-        }
-        assert_eq!(camera(scanner, &["status"])["frames"], 0);
-    }
     for action in ["undo", "redo", "history"] {
         let direct = cmd(&dir, &["--json", "--direct", "--camera", "sim:0", action]);
         assert_eq!(direct.status.code(), Some(2));
@@ -1909,16 +1873,8 @@ fn serve_shuts_down_cleanly_on_sigterm_and_sighup() {
         assert!(process_lives(worker));
         // Camera workers have their own process groups, outside terminal signals.
         assert_eq!(unsafe { libc::getpgid(worker) }, worker);
-        json(
-            &dir,
-            &[
-                "--json",
-                "destination",
-                "add-folder",
-                "captures",
-                captures.to_str().unwrap(),
-            ],
-        );
+        std::fs::create_dir_all(&captures).unwrap();
+        let path = captures.join("saved.png");
         json(
             &dir,
             &[
@@ -1929,12 +1885,9 @@ fn serve_shuts_down_cleanly_on_sigterm_and_sighup() {
                 "sim:0",
                 "capture",
                 "-o",
-                "saved.png",
-                "--destination",
-                "captures",
+                path.to_str().unwrap(),
             ],
         );
-        let path = captures.join("saved.png");
         let saved = std::fs::read(&path).unwrap();
         assert!(saved.starts_with(b"\x89PNG"));
         let descriptor = dir.join(format!("{name}.json"));
@@ -2046,7 +1999,7 @@ fn an_idle_serve_and_its_listener_sleep_until_there_is_work() {
 
 /// A terminal sends Ctrl-C, and the shell the SIGHUP of a closed terminal,
 /// to serve's whole process group. Its camera workers are not in it, so serve
-/// still finishes a recording in its selected folder and storage ledger.
+/// still finishes a recording in its folder and storage ledger.
 #[test]
 #[cfg(unix)]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
@@ -2065,16 +2018,8 @@ fn serve_finishes_a_recording_when_its_terminal_signals_the_process_group() {
             &dir,
             &["--json", "--session", name, "set", "Width=64", "Height=64"],
         );
-        json(
-            &dir,
-            &[
-                "--json",
-                "destination",
-                "add-folder",
-                "recordings",
-                recordings.to_str().unwrap(),
-            ],
-        );
+        std::fs::create_dir_all(&recordings).unwrap();
+        let clip = recordings.join("clip.mp4");
         json(
             &dir,
             &[
@@ -2083,9 +2028,7 @@ fn serve_finishes_a_recording_when_its_terminal_signals_the_process_group() {
                 name,
                 "record",
                 "-o",
-                "clip.mp4",
-                "--destination",
-                "recordings",
+                clip.to_str().unwrap(),
                 "--encoder",
                 "libx264",
                 "--fps",
@@ -2121,7 +2064,6 @@ fn serve_finishes_a_recording_when_its_terminal_signals_the_process_group() {
         assert_eq!(storage["files"], 1, "{name}: {storage}");
         assert_eq!(storage["externally_changed_files"], 0, "{name}: {storage}");
         assert_eq!(storage["active_reservations"], 0, "{name}: {storage}");
-        let clip = recordings.join("clip.mp4");
         assert!(std::fs::metadata(&clip).unwrap().len() > 0);
         let ffmpeg = std::env::var("CAPTUREFAB_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
         let decoded = Command::new(ffmpeg)
@@ -2239,15 +2181,15 @@ fn json_env(dir: &PathBuf, env: &[(&str, &str)], args: &[&str]) -> Value {
 }
 
 #[test]
-fn doctor_reports_destination_features() {
-    let dir = temp_root("doctor-destinations");
+fn doctor_reports_build_features_paths_and_checks() {
+    let dir = temp_root("doctor-report");
     let doctor = json(&dir, &["--json", "doctor"]);
     assert!(doctor["host"]["cpu_cores"].as_u64().unwrap() >= 1);
-    assert!(doctor["efficiency"]["efficient"].is_boolean());
-    assert!(matches!(
-        doctor["efficiency"]["setting"].as_str(),
-        Some("auto" | "smooth" | "efficient")
-    ));
+    assert!(doctor.get("efficiency").is_none(), "{doctor}");
+    assert!(
+        doctor["ffmpeg"]["version"].is_string() || doctor["ffmpeg"]["error"].is_string(),
+        "{doctor}"
+    );
     // CAPTUREFAB_SESSION_DIR is both the runtime and the state directory.
     let path = Value::from(dir.to_string_lossy().into_owned());
     for key in ["runtime_directory", "state_directory"] {
@@ -2265,7 +2207,7 @@ fn doctor_reports_destination_features() {
             && matches!(check["level"].as_str(), Some("ok" | "warn"))
             && check["message"].is_string()
     }));
-    for id in ["efficiency", "camera_network", "ffmpeg"] {
+    for id in ["camera_network", "ffmpeg"] {
         assert!(checks.iter().any(|check| check["id"] == id), "{id}");
     }
     // A private session directory raises nothing.
@@ -2292,23 +2234,39 @@ fn doctor_reports_destination_features() {
         doctor["features"]["keychain"].as_bool(),
         Some(cfg!(feature = "keychain"))
     );
-    for removed in ["gui", "wgpu", "ai", "parquet", "embedded_web"] {
+    for removed in [
+        "gui",
+        "wgpu",
+        "ai",
+        "parquet",
+        "embedded_web",
+        "scanner",
+        "nvjpeg",
+        "vaapi",
+        "videotoolbox",
+        "hubs",
+        "updates",
+    ] {
         assert!(doctor["features"].get(removed).is_none(), "{removed}");
     }
-    for (feature, compiled) in [
-        ("hubs", cfg!(feature = "hubs")),
-        ("keychain", cfg!(feature = "keychain")),
-    ] {
-        assert_eq!(
-            doctor["features"][feature].as_bool(),
-            Some(compiled),
-            "{feature}"
-        );
+    for removed in ["scanners", "update_check"] {
+        assert!(doctor.get(removed).is_none(), "{removed}");
     }
+    assert_eq!(
+        doctor["jpeg"]["libjpeg_turbo"].as_bool(),
+        Some(cfg!(feature = "jpeg"))
+    );
     let schema = json(&dir, &["--json", "schema"]);
-    let text = schema.to_string();
-    assert!(text.contains("add-folder"));
-    assert!(schema.get("uploads").is_none());
+    for removed in [
+        "uploads",
+        "hubs",
+        "updates",
+        "scanners",
+        "efficiency",
+        "resources",
+    ] {
+        assert!(schema.get(removed).is_none(), "{removed}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2428,7 +2386,7 @@ fn storage_status_reports_free_space_and_the_schema_its_floor() {
 }
 
 #[test]
-fn doctor_prints_a_checklist_and_follows_the_efficiency_setting() {
+fn doctor_prints_a_checklist() {
     let dir = temp_root("doctor-checklist");
     let out = cmd(&dir, &["doctor"]);
     assert!(out.status.success());
@@ -2438,23 +2396,9 @@ fn doctor_prints_a_checklist_and_follows_the_efficiency_setting() {
         "{text}"
     );
     assert!(text.contains("#host-checks-and-efficiency-mode"), "{text}");
-    let efficient = cmd_env(
-        &dir,
-        &[("CAPTUREFAB_EFFICIENCY", "efficient")],
-        &["--json", "doctor"],
-    );
-    let efficient: Value = serde_json::from_slice(&efficient.stdout).unwrap();
-    assert_eq!(efficient["result"]["efficiency"]["efficient"], true);
-    let flag = cmd_env(
-        &dir,
-        &[("CAPTUREFAB_EFFICIENCY", "efficient")],
-        &["--efficiency", "smooth", "--json", "doctor"],
-    );
-    let flag: Value = serde_json::from_slice(&flag.stdout).unwrap();
-    assert_eq!(
-        flag["result"]["efficiency"],
-        serde_json::json!({"setting":"smooth","efficient":false,"reasons":["set by --efficiency smooth"]})
-    );
+    // Efficiency mode is gone.
+    let flag = cmd(&dir, &["--efficiency", "smooth", "--json", "doctor"]);
+    assert_eq!(flag.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2512,7 +2456,6 @@ fn doctor_measures_the_storage_budget_on_the_capture_folder_disk() {
 fn linux_state_is_written_to_the_configured_state_directory() {
     let root = temp_root("state-dir");
     let (home, run, state) = (root.join("home"), root.join("run"), root.join("state"));
-    let archive = root.join("archive");
     let command = |args: &[&str]| {
         let output = Command::new(env!("CARGO_BIN_EXE_capturefab"))
             .env_remove("CAPTUREFAB_SESSION")
@@ -2534,21 +2477,10 @@ fn linux_state_is_written_to_the_configured_state_directory() {
         );
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone()
     };
-    command(&[
-        "--json",
-        "destination",
-        "add-folder",
-        "archive",
-        archive.to_str().unwrap(),
-    ]);
     command(&["--json", "storage", "configure", "--max-space", "2GiB"]);
     let directory = state.join("capturefab");
-    assert!(directory.join("destinations.json").is_file());
     assert!(directory.join("storage-policy.json").is_file());
-    assert!(!run.join("capturefab/destinations.json").exists());
     assert!(!run.join("capturefab/storage-policy.json").exists());
-    let listed = command(&["--json", "destination", "list"]);
-    assert_eq!(listed["destinations"][0]["name"], "archive");
     let storage = command(&["--json", "storage"]);
     assert_eq!(storage["policy"]["max_bytes"], 2_u64 << 30);
     let doctor = command(&["--json", "doctor"]);
@@ -2993,43 +2925,6 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
         "{slow}"
     );
     assert_eq!(session(&["status"])["streaming"], true);
-}
-
-#[test]
-fn resource_limits_are_automatic_persisted_and_reject_invalid_values_without_cameras() {
-    let root = temp_root("resources");
-    let initial = json(&root, &["--json", "resources"]);
-    assert!(initial["policy"]["cpu_threads"].is_null());
-    assert!(initial["effective"]["cpu_threads"].as_u64().unwrap() >= 1);
-    assert!(initial["effective"]["buffer_bytes"].as_u64().unwrap() >= 512 * 1024 * 1024);
-    let configured = json(
-        &root,
-        &[
-            "--json",
-            "resources",
-            "configure",
-            "--cpu-threads",
-            "2",
-            "--camera-buffers",
-            "1GiB",
-        ],
-    );
-    assert_eq!(configured["policy"]["cpu_threads"], 2);
-    assert_eq!(configured["policy"]["buffer_bytes"], 1024 * 1024 * 1024u64);
-    let invalid = cmd(
-        &root,
-        &["--json", "resources", "configure", "--cpu-threads", "0"],
-    );
-    assert_eq!(invalid.status.code(), Some(2));
-    assert_eq!(
-        json(&root, &["--json", "resources"])["policy"],
-        configured["policy"]
-    );
-    let reset = json(&root, &["--json", "resources", "reset"]);
-    assert!(reset["policy"]["cpu_threads"].is_null());
-    assert!(reset["policy"]["buffer_bytes"].is_null());
-    assert!(reset["policy"].get("upload_bytes_per_second").is_none());
-    let _ = std::fs::remove_dir_all(root);
 }
 
 fn failure(out: &std::process::Output) -> Value {

@@ -1,11 +1,6 @@
-#[cfg(any(
-    feature = "jpeg",
-    feature = "nvjpeg",
-    all(feature = "videotoolbox", target_os = "macos")
-))]
+#[cfg(feature = "jpeg")]
 use capturefab::jpeg;
 use capturefab::{
-    efficiency::{self, Mode},
     frame,
     session::{SessionCommand, SessionHandle},
     shared_memory::SharedRing,
@@ -134,23 +129,6 @@ impl Bench {
     }
 }
 
-fn gui_old(frame: &Frame) -> ([u32; 64], Vec<[u8; 4]>) {
-    let rgb = frame::rgb(frame).unwrap();
-    let mut histogram = [0u32; 64];
-    let stride = (rgb.len() / 3 / 65_536).max(1);
-    for p in rgb.as_chunks::<3>().0.iter().step_by(stride) {
-        histogram[((p[0] as u32 * 54 + p[1] as u32 * 183 + p[2] as u32 * 19) >> 10) as usize] += 1;
-    }
-    (
-        histogram,
-        rgb.as_chunks::<3>()
-            .0
-            .iter()
-            .map(|p| [p[0], p[1], p[2], 255])
-            .collect(),
-    )
-}
-
 fn png(
     rgb: &[u8],
     width: u32,
@@ -188,14 +166,6 @@ fn temp(name: &str) -> PathBuf {
     path
 }
 
-/// `f` run in efficiency mode, as on a small computer.
-fn efficient<T>(f: impl FnOnce() -> T) -> T {
-    efficiency::set(Mode::Efficient);
-    let result = f();
-    efficiency::set(Mode::Smooth);
-    result
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.iter().any(|a| a == "--bench") {
@@ -204,7 +174,6 @@ fn main() {
     let b = Bench {
         filter: args.into_iter().filter(|a| !a.starts_with("--")).collect(),
     };
-    efficiency::set(Mode::Smooth);
     for (width, height) in [(1920, 1200), (640, 480)] {
         for (name, format) in FORMATS {
             let f = frame(width, height, format);
@@ -217,34 +186,6 @@ fn main() {
     }
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
-        b.run(&format!("gui-old/{name}/1920x1200"), f.data.len(), || {
-            gui_old(&f)
-        });
-        b.run(
-            &format!("gui-new/main/{name}/1920x1200"),
-            f.data.len(),
-            || {
-                let (_, _, rgba) = frame::preview_rgba(&f, f.width, f.height).unwrap();
-                (frame::luminance_histogram(&rgba), rgba)
-            },
-        );
-        b.run(
-            &format!("gui-direct/{name}/1920x1200"),
-            f.data.len(),
-            || frame::convert(&f, |[r, g, b]| [r, g, b, 255]).unwrap(),
-        );
-        b.run(
-            &format!("gui-new/tile/{name}/1920x1200"),
-            f.data.len(),
-            || frame::preview_rgba(&f, 640, 480).unwrap(),
-        );
-        efficient(|| {
-            b.run(
-                &format!("gui-efficient/tile/{name}/1920x1200"),
-                f.data.len(),
-                || frame::preview_rgba(&f, 640, 480).unwrap(),
-            )
-        });
         for encoding in ["png", "ppm", "raw"] {
             b.run(
                 &format!("encode/{encoding}/{name}/1920x1200"),
@@ -252,39 +193,6 @@ fn main() {
                 || frame::encode(&f, encoding).unwrap(),
             );
         }
-    }
-    // A large sensor in the main view: converted whole, as at 1:1, against
-    // fitted to a 1600x1000 stage (1500x1000 shown, converted as the main
-    // view does), and as an overview tile.
-    for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
-        let label = format!("/{name}/5472x3648");
-        if ![
-            "gui-new/main",
-            "gui-new/fit",
-            "gui-new/tile",
-            "gui-efficient/tile",
-        ]
-        .iter()
-        .any(|prefix| b.selected(&format!("{prefix}{label}")))
-        {
-            continue;
-        }
-        let f = frame(5472, 3648, format);
-        b.run(&format!("gui-new/main{label}"), f.data.len(), || {
-            frame::preview_rgba(&f, f.width, f.height).unwrap()
-        });
-        let (width, height) = frame::covering(&f, (1500, 1000));
-        b.run(&format!("gui-new/fit{label}"), f.data.len(), || {
-            frame::preview_rgba(&f, width, height).unwrap()
-        });
-        b.run(&format!("gui-new/tile{label}"), f.data.len(), || {
-            frame::preview_rgba(&f, 640, 480).unwrap()
-        });
-        efficient(|| {
-            b.run(&format!("gui-efficient/tile{label}"), f.data.len(), || {
-                frame::preview_rgba(&f, 640, 480).unwrap()
-            })
-        });
     }
     // The stage's scopes on a common 5 MP industrial sensor: the histogram,
     // and focus in the default quarter region and over the whole frame.
@@ -352,56 +260,15 @@ fn main() {
             });
         }
     }
-    // JPEG stills: libjpeg-turbo in process, Apple's JPEG engine, and nvJPEG
-    // through its helper once warm (set CAPTUREFAB_EXECUTABLE to the
-    // capturefab binary).
-    #[cfg(any(
-        feature = "jpeg",
-        feature = "nvjpeg",
-        all(feature = "videotoolbox", target_os = "macos")
-    ))]
+    // JPEG stills: libjpeg-turbo in process.
+    #[cfg(feature = "jpeg")]
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
-        #[cfg(feature = "jpeg")]
         b.run(
             &format!("jpeg/turbo/{name}/1920x1200"),
             f.data.len(),
             || jpeg::software(&jpeg::Raster::new(&f).unwrap()).unwrap(),
         );
-        #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
-        if format != MONO8 {
-            let label = format!("jpeg/videotoolbox/{name}/1920x1200");
-            if jpeg::encode_with_backend(&f).unwrap().1 == jpeg::Backend::VideoToolbox {
-                b.run(&label, f.data.len(), || {
-                    let (bytes, backend) = jpeg::encode_with_backend(&f).unwrap();
-                    assert_eq!(backend, jpeg::Backend::VideoToolbox, "fell back to the CPU");
-                    bytes
-                });
-            } else {
-                println!("{label:<40} unavailable on this host");
-            }
-        }
-        #[cfg(feature = "nvjpeg")]
-        {
-            let label = format!("jpeg/nvjpeg/{name}/1920x1200");
-            if b.selected(&label) {
-                let start = Instant::now();
-                while start.elapsed() < Duration::from_secs(30)
-                    && jpeg::encode_with_backend(&f).unwrap().1 != jpeg::Backend::NvJpeg
-                {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                if jpeg::encode_with_backend(&f).unwrap().1 == jpeg::Backend::NvJpeg {
-                    b.run(&label, f.data.len(), || {
-                        let (bytes, backend) = jpeg::encode_with_backend(&f).unwrap();
-                        assert_eq!(backend, jpeg::Backend::NvJpeg, "fell back to the CPU");
-                        bytes
-                    });
-                } else {
-                    println!("{label:<40} unavailable on this host");
-                }
-            }
-        }
     }
     let data = vec![0x5a; 8 << 20];
     b.run("sha256/8MiB", data.len(), || Sha256::digest(&data));

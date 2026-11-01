@@ -26,7 +26,6 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionKind {
-    Gui,
     Serve,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +98,8 @@ pub struct Server {
 }
 
 /// Session descriptors and their locks, and files that matter only while
-/// the processes using them run, such as scanner and GPU JPEG staging.
+/// the processes using them run, such as frame rings where anonymous shared
+/// memory is unavailable.
 /// CAPTUREFAB_SESSION_DIR overrides it together with the state directory.
 pub fn runtime_dir() -> PathBuf {
     if let Some(dir) = var("CAPTUREFAB_SESSION_DIR") {
@@ -111,7 +111,7 @@ pub fn runtime_dir() -> PathBuf {
     let login = login_runtime_dir().filter(|(_, login)| *login == LoginDir::Usable);
     runtime_dir_in(&var, login.map(|(dir, _)| dir))
 }
-/// What must outlive a reboot: saved destinations, setups and sign-in indexes, and the storage ledger. The Linux runtime directory is a RAM disk
+/// What must outlive a reboot: setups, sign-in indexes and the storage ledger. The Linux runtime directory is a RAM disk
 /// that logout clears, so there they live under XDG_STATE_HOME; elsewhere
 /// the two are one directory.
 pub fn state_dir() -> PathBuf {
@@ -359,7 +359,7 @@ pub fn validate_name(name: &str) -> Result<()> {
     ensure!(
         !matches!(
             lower.as_str(),
-            "storage" | "storage-policy" | "storage-summary" | "destinations" | "uploads" | "hubs"
+            "storage" | "storage-policy" | "storage-summary"
         ),
         "session name is reserved for application bookkeeping; choose a different name"
     );
@@ -472,7 +472,6 @@ fn missing_session_error(name: &str, active: &[Descriptor]) -> anyhow::Error {
 }
 fn kind_name(kind: SessionKind) -> &'static str {
     match kind {
-        SessionKind::Gui => "gui",
         SessionKind::Serve => "serve",
     }
 }
@@ -748,7 +747,7 @@ impl Server {
             path.display()
         );
         // Publish a complete descriptor atomically so discovery never reads a
-        // partially-written JSON file during simultaneous GUI/CLI startup.
+        // partially-written JSON file while another session starts.
         let temp_path = dir.join(format!(".{name}.{}.tmp", &token[..16]));
         let mut options = fs::OpenOptions::new();
         options.write(true).create_new(true);
@@ -1256,8 +1255,7 @@ mod tests {
         let address = "127.0.0.1:1".parse().unwrap();
         let none = missing_session_error("bnech", &[]);
         let bench = test_descriptor("bench", address);
-        let mut lab = test_descriptor("lab", address);
-        lab.kind = SessionKind::Gui;
+        let lab = test_descriptor("lab", address);
         let typo = missing_session_error("bnech", &[bench.clone(), lab.clone()]);
         let unrelated = missing_session_error("factory", &[bench, lab]);
         assert!(
@@ -1266,7 +1264,7 @@ mod tests {
         );
         assert!(
             typo.to_string().contains(
-                "Running sessions: bench (serve), lab (gui); did you mean --session bench?"
+                "Running sessions: bench (serve), lab (serve); did you mean --session bench?"
             ),
             "{typo}"
         );
@@ -1306,9 +1304,10 @@ mod tests {
     fn authenticated_probes_do_not_change_camera_state_or_activity() {
         let dir = TestDir::new();
         let handle = SessionHandle::new();
-        let server = Server::start_in(handle.clone(), "desktop", SessionKind::Gui, &dir.0).unwrap();
+        let server =
+            Server::start_in(handle.clone(), "desktop", SessionKind::Serve, &dir.0).unwrap();
         let descriptor = read_descriptor_in(&dir.0, "desktop").unwrap();
-        assert_eq!(descriptor.kind, SessionKind::Gui);
+        assert_eq!(descriptor.kind, SessionKind::Serve);
         assert!(descriptor_active(&descriptor));
         let mut wrong_token = descriptor.clone();
         wrong_token.token = "f".repeat(64);
@@ -1817,9 +1816,6 @@ mod tests {
         assert!(validate_name("storage-policy").is_err());
         assert!(validate_name("storage-summary").is_err());
         assert!(validate_name("Storage").is_err());
-        assert!(validate_name("destinations").is_err());
-        assert!(validate_name("uploads").is_err());
-        assert!(validate_name("Hubs").is_err());
         assert!(validate_name("com10").is_ok());
         assert!(validate_name("lpt0").is_ok());
     }

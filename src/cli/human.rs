@@ -8,8 +8,6 @@ use std::io::{self, Write};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DeviceList {
     Discover,
-    Native,
-    Scanners,
     Onvif,
 }
 
@@ -44,7 +42,6 @@ fn transport_label(device: &Value) -> String {
     match serde_json::from_value::<Transport>(device["transport"].clone()) {
         Ok(Transport::Media) if screen(device) => "Screen".into(),
         Ok(Transport::Media) if host_device(id) => "Webcam".into(),
-        Ok(Transport::Media) if crate::hubs::is_source(id) => "Hub".into(),
         Ok(transport) => transport.to_string(),
         Err(_) => raw.into(),
     }
@@ -105,7 +102,7 @@ fn camera_row(device: &Value) -> Vec<String> {
         .map(crate::media::redact_url)
         .unwrap_or_default();
     let serial = text(device, "serial");
-    // A serial the ID already spells out (scanner:ica:UUID) adds nothing.
+    // A serial the ID already spells out (usb:VID:PID:SERIAL) adds nothing.
     let serial =
         if text(device, "id").ends_with(serial) || Some(serial) == device["address"].as_str() {
             String::new()
@@ -151,10 +148,6 @@ pub(super) fn write_device_table(
                 "IP cameras: --camera rtsp://HOST/PATH or `capturefab onvif discover`.",
                 "Try the simulator: --camera sim:0 (or discover --simulate).",
             ],
-            DeviceList::Native => &[
-                "No host cameras found. Check that a webcam is attached and that this terminal may use the camera.",
-            ],
-            DeviceList::Scanners => &["No document scanners found."],
             DeviceList::Onvif => &[
                 "No ONVIF devices answered.",
                 "Discovery uses multicast on this subnet; for a camera on another subnet or VLAN, run capturefab onvif resolve http://HOST/onvif/device_service.",
@@ -200,7 +193,7 @@ pub(super) fn write_device_table(
 pub(super) fn next_steps(devices: &[Value], kind: DeviceList) -> Vec<String> {
     let mut hints = Vec::new();
     match kind {
-        DeviceList::Discover | DeviceList::Native => {
+        DeviceList::Discover => {
             let example = devices
                 .iter()
                 .find(|device| text(device, "transport") != "simulator" && !screen(device))
@@ -211,8 +204,7 @@ pub(super) fn next_steps(devices: &[Value], kind: DeviceList) -> Vec<String> {
                     crate::hint::shell_quote(&crate::media::redact_url(text(device, "id")))
                 ));
             }
-            if kind == DeviceList::Discover
-                && !devices.is_empty()
+            if !devices.is_empty()
                 && !devices
                     .iter()
                     .any(|device| matches!(text(device, "transport"), "gig_e" | "usb3"))
@@ -227,14 +219,6 @@ pub(super) fn next_steps(devices: &[Value], kind: DeviceList) -> Vec<String> {
                 hints.push(format!(
                     "Next: capturefab onvif resolve {} --username USER --password PASS",
                     crate::hint::shell_quote(&crate::media::redact_url(text(device, "endpoint")))
-                ));
-            }
-        }
-        DeviceList::Scanners => {
-            if let Some(device) = devices.first() {
-                hints.push(format!(
-                    "Next: capturefab --camera {} capture -o 'scan-{{seq}}.png'",
-                    crate::hint::shell_quote(text(device, "id"))
                 ));
             }
         }
@@ -291,11 +275,11 @@ mod tests {
 
     #[test]
     fn empty_columns_are_dropped_and_long_models_shortened() {
-        let native = [
+        let webcams = [
             json!({"id":"avfoundation:FaceTime HD Camera","name":"FaceTime HD Camera","backend":"avfoundation"}),
             json!({"id":"avfoundation:1","name":"An extraordinarily long capture device name here","backend":"avfoundation"}),
         ];
-        let output = table(&native, DeviceList::Native);
+        let output = table(&webcams, DeviceList::Discover);
         let header = output.lines().next().unwrap();
         assert_eq!(
             header,
@@ -315,20 +299,16 @@ mod tests {
     }
 
     #[test]
-    fn screens_and_scanners_are_labeled() {
+    fn screens_are_labeled_and_serials_in_ids_are_not_repeated() {
         let screen = json!({"id":"avfoundation:Capture screen 0","transport":"media",
             "model":"Capture screen 0","serial":"avfoundation:Capture screen 0"});
-        let scanner = json!({"id":"scanner:sane:epson2:libusb:001:004","transport":"scanner",
-            "model":"Perfection V39","serial":"scanner:sane:epson2:libusb:001:004"});
-        let output = table(&[screen, scanner.clone()], DeviceList::Discover);
+        let output = table(&[screen], DeviceList::Discover);
         assert!(output.contains("Screen"), "{output}");
-        assert!(output.contains("Scanner"), "{output}");
-        assert!(table(&[scanner], DeviceList::Scanners).contains("Perfection V39"));
-        let uuid = "E3248000-80CE-11DB-8000-3C2AF4FA0DE9";
-        let ica = json!({"id":format!("scanner:ica:{uuid}"),"transport":"scanner",
-            "model":"Brother MFC-L2750DW series","serial":uuid});
-        let output = table(&[ica], DeviceList::Discover);
-        assert_eq!(output.matches(uuid).count(), 1, "{output}");
+        let serial = "23015A0042";
+        let usb = json!({"id":format!("usb:2676:ba02:{serial}"),"transport":"usb3",
+            "model":"Industrial camera","serial":serial});
+        let output = table(&[usb], DeviceList::Discover);
+        assert_eq!(output.matches(serial).count(), 1, "{output}");
     }
 
     #[test]
@@ -337,10 +317,6 @@ mod tests {
         assert!(discover.starts_with("No cameras found."), "{discover}");
         assert!(discover.contains("network-scan"), "{discover}");
         assert!(discover.contains("sim:0"), "{discover}");
-        assert_eq!(
-            table(&[], DeviceList::Scanners),
-            "No document scanners found.\n"
-        );
         assert!(table(&[], DeviceList::Onvif).contains("multicast"));
         assert!(next_steps(&[], DeviceList::Discover).is_empty());
     }
@@ -375,7 +351,7 @@ mod tests {
             "{hints:?}"
         );
         assert_eq!(hints.len(), 1, "{hints:?}");
-        let hints = next_steps(&[simulator()], DeviceList::Native);
+        let hints = next_steps(&[simulator()], DeviceList::Discover);
         assert!(hints[0].contains("--camera sim:0 "), "{hints:?}");
     }
 }

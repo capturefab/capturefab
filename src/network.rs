@@ -443,10 +443,6 @@ macro_rules! local_network_text {
 /// genuine causes too, hence "may". Free of the words `cli::error_code`
 /// reads as another category, so the error stays `unavailable`.
 pub const LOCAL_NETWORK_HINT: &str = local_network_text!();
-/// An unreachable reason for errors that carry only static text.
-#[cfg(any(feature = "hubs", test))]
-pub(crate) const NO_ROUTE_LOCAL_NETWORK: &str =
-    concat!("no route to host; ", local_network_text!());
 
 /// [`LOCAL_NETWORK_HINT`] when `error` may come from macOS Local Network
 /// privacy: EHOSTUNREACH on the way to a private, link-local, broadcast or
@@ -1272,7 +1268,9 @@ mod tests {
         );
         // The hint keeps an unreachable error unavailable.
         assert_eq!(
-            crate::cli::error_code(&anyhow::anyhow!("x: {NO_ROUTE_LOCAL_NETWORK}")),
+            crate::cli::error_code(&anyhow::anyhow!(
+                "x: no route to host; {LOCAL_NETWORK_HINT}"
+            )),
             ("unavailable", 3)
         );
         #[cfg(target_os = "macos")]

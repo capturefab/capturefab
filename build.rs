@@ -1,63 +1,4 @@
-use std::{env, fs, io::Write, path::PathBuf, process::Command};
-
-fn build_macos_scanner(out: &std::path::Path, target: &str) {
-    println!("cargo:rerun-if-changed=src/scanner/macos.m");
-    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
-    println!("cargo:rerun-if-env-changed=SDKROOT");
-    if !target.contains("apple-darwin") || env::var_os("CARGO_FEATURE_SCANNER").is_none() {
-        return;
-    }
-    let arch = if target.starts_with("aarch64-") {
-        "arm64"
-    } else if target.starts_with("x86_64-") {
-        "x86_64"
-    } else {
-        panic!("unsupported macOS scanner target: {target}");
-    };
-    // Keep the isolated helper compatible with the same baseline as releases.
-    let minimum = env::var("MACOSX_DEPLOYMENT_TARGET")
-        .unwrap_or_else(|_| if arch == "arm64" { "11.0" } else { "10.15" }.to_string());
-    let mut compiler = Command::new("xcrun");
-    compiler.args([
-        "--sdk",
-        "macosx",
-        "clang",
-        "-arch",
-        arch,
-        "-fobjc-arc",
-        "-O2",
-        "-Wall",
-        "-Wextra",
-        "-Werror",
-        "-framework",
-        "Foundation",
-        "-framework",
-        "ImageCaptureCore",
-        "-framework",
-        "ImageIO",
-        "-framework",
-        "CoreGraphics",
-    ]);
-    compiler.arg(format!("-mmacosx-version-min={minimum}"));
-    // The scanner helper may browse network devices; give its own process the
-    // same privacy usage descriptions as the parent executable.
-    let plist = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
-        .join("assets/Info.plist");
-    compiler.arg(format!(
-        "-Wl,-sectcreate,__TEXT,__info_plist,{}",
-        plist.display()
-    ));
-    if let Some(sdk) = env::var_os("SDKROOT") {
-        compiler.arg("-isysroot").arg(sdk);
-    }
-    let status = compiler
-        .arg("src/scanner/macos.m")
-        .arg("-o")
-        .arg(out.join("capturefab-scanner-ica.bin"))
-        .status()
-        .expect("run xcrun clang to build the macOS scanner helper");
-    assert!(status.success(), "cannot build macOS scanner helper");
-}
+use std::{env, fs, io::Write, path::PathBuf};
 
 fn main() {
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_BINARY");
@@ -73,7 +14,6 @@ fn main() {
         println!("cargo:rerun-if-changed={}", resource.display());
         println!("cargo:rustc-link-arg-bin=capturefab={}", resource.display());
     }
-    build_macos_scanner(&out, &target);
     if target.contains("apple-darwin") {
         let plist =
             PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Cargo manifest directory"))
@@ -125,7 +65,7 @@ fn main() {
         println!("cargo:rerun-if-changed={}", path.display());
         fs::read_to_string(&path).expect("read FFmpeg license notice")
     } else {
-        "Capturefab is MIT-licensed. Bundled FFmpeg runs as a separate executable and is GPLv3 with static x264 (GPLv2-or-later), SRT (MPLv2), OpenSSL (Apache-2.0) and zlib (zlib License). Source archives, licenses and build configuration accompany releases. See capturefab ffmpeg and https://ffmpeg.org/.".to_string()
+        "Capturefab is MIT-licensed. Bundled FFmpeg runs as a separate executable and is GPLv3 with static x264 (GPLv2-or-later), SRT (MPLv2), OpenSSL (Apache-2.0) and zlib (zlib License). Source archives, licenses and build configuration accompany releases. See capturefab doctor and https://ffmpeg.org/.".to_string()
     };
     fs::write(out.join("capturefab-ffmpeg-license.txt"), license)
         .expect("write bundled FFmpeg license");

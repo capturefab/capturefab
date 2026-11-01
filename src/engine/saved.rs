@@ -136,6 +136,4 @@ pub struct RecordedFile {
     pub codec: String,
     pub encoder: String,
     pub fps: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
 }

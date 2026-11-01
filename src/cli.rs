@@ -1,10 +1,8 @@
 mod human;
 pub mod login;
 pub(crate) mod paths;
-mod resources;
 mod setup;
 mod summary;
-pub use resources::ResourcesCommand;
 pub use setup::SetupCommand;
 
 use crate::{
@@ -12,7 +10,7 @@ use crate::{
     session::{ActivityOrigin, ActorKind, SessionActor, SessionCommand, SessionHandle},
 };
 use anyhow::{Context, Result, ensure};
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, builder::TypedValueParser};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::{
     io::{self, Write},
@@ -37,7 +35,7 @@ pub struct Cli {
     /// Emit one versioned JSON result on stdout; diagnostics stay on stderr
     #[arg(long, global = true)]
     pub json: bool,
-    /// Camera/scanner ID, serial, IP, media source, hub:NAME/CAMERA, sim:0, or sim:replay:PATH
+    /// Camera ID, serial, IP, media source, sim:0, or sim:replay:PATH
     #[arg(
         short = 'c',
         long,
@@ -74,29 +72,12 @@ pub struct Cli {
     /// Deadline for a session request, e.g. 30s or 5m (default adapts to capture count)
     #[arg(long, global = true, value_parser = parse_duration_text, help_heading = "Runtime")]
     pub request_timeout: Option<String>,
-    /// Per-frame or transport timeout in milliseconds; physical scans may need 60000
+    /// Per-frame or transport timeout in milliseconds
     #[arg(long,global=true,default_value_t=2000,value_parser=clap::value_parser!(u64).range(1..=60_000))]
     pub timeout_ms: u64,
     /// Include the built-in pattern camera in discovery
     #[arg(long, global = true)]
     pub simulate: bool,
-    /// Decoding acceleration for new direct/serve workers; existing sessions keep their setting
-    #[arg(
-        long,
-        global = true,
-        env = "CAPTUREFAB_HWACCEL",
-        default_value = "auto"
-    )]
-    pub hwaccel: String,
-    /// Efficiency mode for this process and the camera workers it starts (default: CAPTUREFAB_EFFICIENCY, then auto, which is efficient on small or low-power computers)
-    #[arg(
-        long,
-        global = true,
-        value_parser = clap::builder::PossibleValuesParser::new(["auto", "smooth", "efficient"])
-            .map(|mode| mode.parse::<crate::efficiency::Mode>().unwrap_or_default()),
-        help_heading = "Runtime"
-    )]
-    pub efficiency: Option<crate::efficiency::Mode>,
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -178,7 +159,7 @@ fn capture_format(format: Option<ImageFormat>, output: &str, count: u32) -> Resu
 }
 
 /// A CLI path belongs to the caller, even when the worker lives in a session
-/// started from a different directory. Named destinations retain their own base.
+/// started from a different directory.
 fn caller_output(command: &mut SessionCommand) -> Result<()> {
     if matches!(command, SessionCommand::Capture { output, .. } if output == "-") {
         return Ok(());
@@ -266,18 +247,6 @@ impl AutoArgs {
     }
 }
 #[derive(Debug, Subcommand)]
-pub enum DestinationCommand {
-    /// List saved folders
-    List,
-    /// Save a folder on this computer, a removable disk or a mounted drive
-    AddFolder { name: String, path: PathBuf },
-    /// Remove a saved folder from the list without deleting its files
-    Remove { name: String },
-    /// Check that a saved folder is present and writable
-    Test { name: String },
-}
-
-#[derive(Debug, Subcommand)]
 pub enum StorageCommand {
     /// Show global policy, owned files and reservations
     Status,
@@ -289,7 +258,7 @@ pub enum StorageCommand {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Discover GigE Vision, USB3 Vision, ONVIF, host cameras, document scanners and cameras on saved hubs
+    /// Discover GigE Vision, USB3 Vision, ONVIF and host cameras
     #[command(
         visible_aliases=["list","cameras"],
         after_help = "Examples:\n  capturefab discover                      List cameras on this computer and network\n  capturefab discover --simulate           Include the built-in test camera sim:0\n  capturefab --json discover               One versioned JSON result for scripts\n  capturefab --timeout-ms 5000 discover    Wait longer for slow networks"
@@ -297,8 +266,6 @@ pub enum Command {
     Discover,
     /// Inspect GigE interfaces and reachability; tune connected cameras together
     NetworkScan,
-    /// List document scanners using the platform scanner driver
-    Scanners,
     /// Show camera identity and all readable features
     Info,
     /// List GenICam features, including access, values, bounds and units
@@ -339,7 +306,7 @@ pub enum Command {
         after_help = "Examples:\n  capturefab discover                       List camera IDs\n  capturefab connect sim:0                  Connect the test camera\n  capturefab --camera 'avfoundation:HD Pro Webcam C920' connect\n  capturefab connect C920                   A unique model or name match also works"
     )]
     Connect {
-        /// Camera ID, serial, IP, media URI, hub:NAME/CAMERA or sim:0 (default: --camera / CAPTUREFAB_CAMERA)
+        /// Camera ID, serial, IP, media URI or sim:0 (default: --camera / CAPTUREFAB_CAMERA)
         #[arg(value_name = "CAMERA")]
         target: Option<String>,
     },
@@ -403,9 +370,6 @@ pub enum Command {
         /// Bounded maximum size of a local recording file
         #[arg(long, default_value = "512MiB", value_parser = parse_bytes_text)]
         max_file_size: String,
-        /// Saved destination (see `destination list`); --output is then a name inside it
-        #[arg(long)]
-        destination: Option<String>,
         /// When the output file exists: fail (default) or number (-0001, -0002, ...)
         #[arg(long, value_enum, default_value_t = crate::naming::OnExists::Fail)]
         on_exists: crate::naming::OnExists,
@@ -424,10 +388,6 @@ pub enum Command {
         #[command(subcommand)]
         command: OnvifCommand,
     },
-    /// List host-driver cameras (AVFoundation, V4L2, DirectShow)
-    Native,
-    /// Inspect bundled FFmpeg, codecs and supported protocols
-    Ffmpeg,
     /// Capture complete frames to files; existing files are never overwritten
     #[command(
         after_help = "Examples:\n  capturefab -c sim:0 capture -o shot.png\n  capturefab -c sim:0 capture -n 50 --interval 2s -o 'line1/{camera}-{seq}.jpg'\n  capturefab -c sim:0 capture -n 10 -o frames/            A folder of frame-NNNNNN.png files\n  capturefab --direct -c sim:0 capture -o - > frame.png   One image to a pipe or file"
@@ -454,9 +414,6 @@ pub enum Command {
         /// Time between frames, e.g. 10s; count bounds the time lapse
         #[arg(long, value_parser = parse_duration_text)]
         interval: Option<String>,
-        /// Saved destination (see `destination list`); --output is then a name inside it
-        #[arg(long)]
-        destination: Option<String>,
         /// When the output file exists: fail (default) or number (-0001, -0002, ...). {seq} always picks a free number
         #[arg(long, value_enum, default_value_t = crate::naming::OnExists::Fail)]
         on_exists: crate::naming::OnExists,
@@ -475,38 +432,17 @@ pub enum Command {
         #[arg(value_parser = clap::value_parser!(u64).range(1..))]
         id: u64,
     },
-    /// Manage saved folders on this computer, removable disks and mounted drives
-    #[command(visible_alias = "destinations")]
-    Destination {
-        #[command(subcommand)]
-        command: DestinationCommand,
-    },
-    /// Save Home Assistant, Frigate, go2rtc and UniFi Protect servers and open their cameras as hub:NAME/CAMERA
-    #[command(visible_alias = "hubs")]
-    Hub {
-        #[command(subcommand)]
-        command: crate::hubs::command::HubCommand,
-    },
     /// Save user names and passwords for rtsp://, rtsps:// and ONVIF cameras in the OS credential store
     #[command(visible_alias = "logins")]
     Login {
         #[command(subcommand)]
         command: login::LoginCommand,
     },
-    /// List mounted external, removable and network volumes (macOS and Linux omit read-only ones)
-    Volumes,
-    /// Manage CPU and camera-buffer limits; show current resource headroom
-    Resources {
-        #[command(subcommand)]
-        command: Option<ResourcesCommand>,
-    },
     /// Show owned file usage and reserved recording space
     Storage {
         #[command(subcommand)]
         command: Option<StorageCommand>,
     },
-    /// Show connection routes, including mirrorless cameras via HDMI capture devices
-    Compatibility { model: Option<String> },
     /// Show the state of an existing persistent session
     Status,
     /// Run a persistent headless camera session in the foreground
@@ -523,8 +459,6 @@ pub enum Command {
         #[command(flatten)]
         auto: AutoArgs,
     },
-    /// List local sessions
-    Sessions,
     /// Send a SessionCommand JSON object from stdin to an existing session
     Rpc,
     /// Print the GenICam XML from a connected camera
@@ -537,14 +471,10 @@ pub enum Command {
         #[command(subcommand)]
         command: MemoryCommand,
     },
-    /// Check this computer (efficiency mode, session and state folders, GigE and USB limits, storage budget) and print a fix under each warning; --json adds interfaces and compiled capabilities
+    /// Check this computer (session and state folders, FFmpeg, GigE and USB limits, storage budget) and print a fix under each warning; --json adds interfaces and compiled capabilities
     Doctor,
-    /// Print this build's version and what the last update check found; --check asks capturefab.com now
-    Version {
-        /// Read the public release list now (one GET of capturefab.com/releases.json)
-        #[arg(long)]
-        check: bool,
-    },
+    /// Print this build's version
+    Version,
     /// Emit the versioned CLI and session automation contract as JSON
     Schema,
     /// Generate native shell completions (bash, zsh, fish, PowerShell, Elvish)
@@ -949,7 +879,6 @@ fn connect_target(cli: &Cli, target: &Option<String>) -> Result<String> {
 /// Prepare all command arguments before connecting or applying --set/--auto.
 fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
     cli.session_actor()?.validate()?;
-    crate::media::validate_hwaccel(&cli.hwaccel)?;
     if let Some(camera) = &cli.camera {
         crate::session::validate_selector(camera)?;
         if cli.session.is_none() {
@@ -969,39 +898,12 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                 .transpose()?
                 .unwrap_or(0),
         }),
-        Some(Command::Resources { command }) => {
-            resources::prepare(command.as_ref())?;
-            None
-        }
-        Some(Command::Hub { command }) => {
-            crate::hubs::command::prepare(command)?;
-            None
-        }
         Some(Command::Login { command }) => {
             login::prepare(command)?;
             None
         }
         Some(Command::Setup { command }) => {
             setup::prepare(command)?;
-            None
-        }
-        Some(Command::Destination { command }) => {
-            let name = match command {
-                DestinationCommand::List => None,
-                DestinationCommand::AddFolder { name, path } => {
-                    ensure!(
-                        !path.as_os_str().is_empty(),
-                        "destination folder path must be nonempty"
-                    );
-                    Some(name)
-                }
-                DestinationCommand::Remove { name, .. } | DestinationCommand::Test { name, .. } => {
-                    Some(name)
-                }
-            };
-            if let Some(name) = name {
-                crate::destination::validate_name(name)?;
-            }
             None
         }
         Some(Command::Serve { name, .. }) => {
@@ -1071,7 +973,6 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
             at,
             delay,
             interval,
-            destination,
             on_exists,
             context,
             ..
@@ -1114,7 +1015,6 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                         .transpose()?
                         .unwrap_or(0),
                     storage: crate::storage::StoragePolicy::default(),
-                    destination: destination.clone(),
                     on_exists: *on_exists,
                     context: context.clone(),
                 }
@@ -1125,7 +1025,6 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                     timeout_ms: cli.timeout_ms,
                     format: format.name().into(),
                     storage: crate::storage::StoragePolicy::default(),
-                    destination: destination.clone(),
                     on_exists: *on_exists,
                     context,
                 }
@@ -1140,7 +1039,6 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
             bitrate,
             duration,
             max_file_size,
-            destination,
             on_exists,
             context,
             ..
@@ -1162,7 +1060,6 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                     ..Default::default()
                 },
                 max_file_bytes: crate::storage::parse_bytes(max_file_size)?,
-                destination: destination.clone(),
                 on_exists: *on_exists,
                 context,
                 duration_ms,
@@ -1240,7 +1137,6 @@ fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()
             output,
             count,
             format,
-            destination,
             on_exists,
             ..
         }
@@ -1248,24 +1144,19 @@ fn prepare_outputs(cli: &Cli, command: &mut Option<SessionCommand>) -> Result<()
             output,
             count,
             format,
-            destination,
             on_exists,
             ..
         } = command
             && output != "-"
         {
-            let resolved = crate::destination::resolve(destination.as_deref(), output)?;
-            crate::engine::preflight_capture_output(&resolved.output, *count, format, *on_exists)?;
+            crate::engine::preflight_capture_output(output, *count, format, *on_exists)?;
         }
         // A taken recording file fails before any "Recording to" line.
         if let SessionCommand::Forward {
-            output,
-            destination,
-            on_exists,
-            ..
+            output, on_exists, ..
         } = command
         {
-            crate::engine::preflight_recording_output(output, destination.as_deref(), *on_exists)?;
+            crate::engine::preflight_recording_output(output, *on_exists)?;
         }
     }
     Ok(())
@@ -1279,12 +1170,9 @@ impl Drop for Client<'_> {
 }
 
 pub fn run(mut cli: Cli) -> Result<()> {
-    // Hub management never targets a camera. Ignore even a malformed stale
-    // environment selector before path resolution and shape validation.
-    if matches!(
-        cli.command,
-        Some(Command::Hub { .. } | Command::Login { .. })
-    ) {
+    // Sign-in management never targets a camera. Ignore even a malformed
+    // stale environment selector before path resolution and shape validation.
+    if matches!(cli.command, Some(Command::Login { .. })) {
         cli.camera = None;
     }
     if cli.command.is_none() {
@@ -1311,19 +1199,14 @@ pub fn run(mut cli: Cli) -> Result<()> {
     }
     let mut prepared = input(prepare(&cli))?;
     resolve_session(&mut cli)?;
-    // Hub management does not target a camera.
+    // Sign-in management does not target a camera.
     if cli.session.is_none()
-        && !matches!(
-            cli.command,
-            Some(Command::Hub { .. } | Command::Login { .. })
-        )
+        && !matches!(cli.command, Some(Command::Login { .. }))
         && let Some(camera) = &cli.camera
     {
         crate::camera::validate_selector(camera)?;
     }
     prepare_outputs(&cli, &mut prepared)?;
-    input(crate::media::configure_hwaccel(&cli.hwaccel))?;
-    crate::efficiency::configure(cli.efficiency);
     match &cli.command {
         Some(Command::Completions { shell }) => {
             clap_complete::generate(*shell, &mut Cli::command(), "capturefab", &mut io::stdout());
@@ -1337,11 +1220,11 @@ pub fn run(mut cli: Cli) -> Result<()> {
             };
         }
         Some(Command::Doctor) => return output(&cli, doctor()),
-        Some(Command::Version { check }) => {
-            return output(&cli, crate::updates::version_command(*check)?);
-        }
-        Some(Command::Resources { command }) => {
-            return output(&cli, resources::run(command.as_ref())?);
+        Some(Command::Version) => {
+            return output(
+                &cli,
+                json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH}),
+            );
         }
         Some(Command::Storage { command }) => {
             let result = match command {
@@ -1352,18 +1235,8 @@ pub fn run(mut cli: Cli) -> Result<()> {
             };
             return output(&cli, result);
         }
-        Some(Command::Destination { command }) => {
-            return output(&cli, destination_command(command)?);
-        }
         Some(Command::Setup { command }) if !setup::needs_camera(command) => {
             return output(&cli, setup::run_store(command)?);
-        }
-        Some(Command::Hub { command }) => {
-            let result = crate::hubs::command::run(
-                command,
-                std::time::Duration::from_millis(cli.timeout_ms),
-            )?;
-            return output(&cli, result);
         }
         Some(Command::Login { command }) => {
             let result = login::run(
@@ -1373,35 +1246,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             )?;
             return output(&cli, result);
         }
-        Some(Command::Volumes) => {
-            return output(&cli, json!({"volumes": crate::volumes::list()}));
-        }
-        Some(Command::Compatibility { model }) => {
-            return output(&cli, crate::compatibility::guide(model.as_deref()));
-        }
-        Some(Command::Sessions) => {
-            let sessions = ipc::list()?;
-            if let Some((dir, names)) = ipc::sessions_elsewhere() {
-                eprintln!(
-                    "capturefab: these sessions run from {}, where a service started without XDG_RUNTIME_DIR keeps them and this login does not look: {}. `capturefab doctor` shows the fix under runtime_dir.",
-                    dir.display(),
-                    names.join(", ")
-                );
-            }
-            return output(&cli, sessions);
-        }
-        Some(Command::Native) => return output(&cli, crate::media::native_devices()?),
-        Some(Command::Scanners) => {
-            ensure!(
-                cfg!(feature = "scanner"),
-                "scanner support disabled in this build; rebuild with --features scanner"
-            );
-            return output(
-                &cli,
-                json!({"devices":crate::scanner::discover(Duration::from_millis(cli.timeout_ms))?}),
-            );
-        }
-        Some(Command::Ffmpeg) => return output(&cli, crate::media::ffmpeg_info()?),
         Some(Command::Onvif { command }) => {
             let duration = Duration::from_millis(cli.timeout_ms);
             let result = match command {
@@ -1591,7 +1435,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
         Command::Forward {
             output: destination,
             duration,
-            destination: _,
             auto,
             ..
         } => {
@@ -1745,7 +1588,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
             format,
             count,
             settings,
-            destination: _,
             auto,
             ..
         } => {
@@ -1978,18 +1820,20 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         }
         return write_json(&envelope);
     }
-    if matches!(&cli.command, Some(Command::Resources { .. })) {
-        io::stdout().write_all(resources::human(&value).as_bytes())?;
-        return Ok(());
-    }
     if let Some(Command::Setup { command }) = &cli.command {
         return setup::print_human(cli, command, &value);
     }
     let mut out = io::stdout().lock();
     if matches!(&cli.command, Some(Command::Doctor)) {
         crate::doctor::print_checklist(&mut out, &value)?;
-    } else if matches!(&cli.command, Some(Command::Version { .. })) {
-        write!(out, "{}", crate::updates::human(&value))?;
+    } else if matches!(&cli.command, Some(Command::Version)) {
+        writeln!(
+            out,
+            "capturefab {} ({} {})",
+            value["version"].as_str().unwrap_or_default(),
+            value["os"].as_str().unwrap_or_default(),
+            value["arch"].as_str().unwrap_or_default()
+        )?;
     } else if let Some(Command::Serve { name, .. }) = &cli.command {
         writeln!(
             out,
@@ -1999,11 +1843,6 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         writeln!(out, "Ctrl-C stops the session.")?;
     } else if let Some(Command::Login { command }) = &cli.command {
         write!(out, "{}", login::human(command, &value))?;
-    } else if let Some(Command::Hub { command }) = &cli.command {
-        for warning in value["warnings"].as_array().into_iter().flatten() {
-            eprintln!("capturefab: {}", warning.as_str().unwrap_or_default());
-        }
-        write!(out, "{}", crate::hubs::command::human(command, &value))?;
     } else if matches!(&cli.command, Some(Command::Undo | Command::Redo)) {
         let (verb, key) = if matches!(&cli.command, Some(Command::Undo)) {
             ("Undid", "undone")
@@ -2188,8 +2027,6 @@ fn output(cli: &Cli, value: Value) -> Result<()> {
         }
     } else if let Some(devices) = value["devices"].as_array() {
         let kind = match &cli.command {
-            Some(Command::Native) => human::DeviceList::Native,
-            Some(Command::Scanners) => human::DeviceList::Scanners,
             Some(Command::Onvif { .. }) => human::DeviceList::Onvif,
             _ => human::DeviceList::Discover,
         };
@@ -2289,38 +2126,7 @@ fn doctor() -> Value {
 /// What this build supports and where it runs; `doctor` adds the host checks.
 fn build_report() -> Value {
     let interfaces=if_addrs::get_if_addrs().map(|items|items.into_iter().filter_map(|i|match i.addr{if_addrs::IfAddr::V4(a)=>Some(json!({"name":i.name,"ip":a.ip,"netmask":a.netmask,"broadcast":a.broadcast})),_=>None}).collect::<Vec<_>>()).unwrap_or_default();
-    let mut value = json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"usb":cfg!(feature="usb"),"scanner":cfg!(feature="scanner"),"jpeg":cfg!(feature="jpeg"),"nvjpeg":cfg!(feature="nvjpeg"),"vaapi":cfg!(feature="vaapi"),"videotoolbox":cfg!(feature="videotoolbox"),"hubs":cfg!(feature="hubs"),"keychain":cfg!(feature="keychain")},"scanners":crate::scanner::doctor(),"jpeg":jpeg_backends(),"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS USB drivers required; NVIDIA CUDA and nvJPEG, and libva with a JPEG-capable driver, are used when installed; Apple silicon uses its JPEG engine through VideoToolbox. Document scanning uses installed platform scanner drivers (SANE scanimage on Linux).","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}});
-    value["features"]["updates"] = json!(cfg!(feature = "updates"));
-    value["update_check"] = crate::updates::report(
-        &crate::updates::Settings::load(&ipc::state_dir()),
-        &crate::updates::policy(),
-    );
-    value
-}
-/// JPEG encoders available to this build and host, best first.
-fn jpeg_backends() -> Value {
-    #[cfg(feature = "nvjpeg")]
-    let nvjpeg = match crate::nvjpeg::probe() {
-        Ok(status) => json!({"available":true,"status":status}),
-        Err(error) => json!({"available":false,"reason":format!("{error:#}")}),
-    };
-    #[cfg(not(feature = "nvjpeg"))]
-    let nvjpeg = json!({"available":false,"reason":"not compiled in"});
-    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
-    let videotoolbox = match crate::vtjpeg::probe() {
-        Ok(status) => json!({"available":true,"status":status,"formats":"color"}),
-        Err(error) => json!({"available":false,"reason":format!("{error:#}")}),
-    };
-    #[cfg(not(all(feature = "videotoolbox", target_os = "macos")))]
-    let videotoolbox = json!({"available":false,"reason":if cfg!(target_os="macos"){"not compiled in"}else{"macOS only"}});
-    #[cfg(feature = "vaapi")]
-    let vaapi = match crate::vajpeg::probe() {
-        Ok(status) => json!({"available":true,"status":status}),
-        Err(error) => json!({"available":false,"reason":format!("{error:#}")}),
-    };
-    #[cfg(not(feature = "vaapi"))]
-    let vaapi = json!({"available":false,"reason":"not compiled in"});
-    json!({"videotoolbox":videotoolbox,"nvjpeg":nvjpeg,"vaapi":vaapi,"libjpeg_turbo":cfg!(feature="jpeg"),"quality":crate::jpeg::QUALITY})
+    json!({"version":env!("CARGO_PKG_VERSION"),"os":std::env::consts::OS,"arch":std::env::consts::ARCH,"features":{"usb":cfg!(feature="usb"),"jpeg":cfg!(feature="jpeg"),"keychain":cfg!(feature="keychain")},"jpeg":{"libjpeg_turbo":cfg!(feature="jpeg"),"quality":crate::jpeg::QUALITY},"runtime_directory":ipc::runtime_dir(),"state_directory":ipc::state_dir(),"cache_directory":ipc::cache_dir(),"ring_backing":crate::shared_memory::backing(),"interfaces":interfaces,"runtime":"No Aravis, libusb or vendor SDK required. Native OS USB drivers required.","usb_access":if cfg!(target_os="windows"){"USB3 camera interfaces must use WinUSB"}else if cfg!(target_os="linux"){"Read/write permission on camera /dev/bus/usb node required"}else{"IOKit camera interface must be available to userspace"}})
 }
 fn command_schema(command: &clap::Command) -> Value {
     json!({
@@ -2342,7 +2148,7 @@ fn command_schema(command: &clap::Command) -> Value {
     })
 }
 fn schema() -> Value {
-    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"help","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"capture","output":"run-1","count":10,"timeout_ms":2000,"format":"png","destination":"archive"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json; stdout must be a pipe or file, not a terminal","destination":"--destination NAME (or \"destination\" in capture/schedule/forward RPC): -o is a relative name inside a saved folder; see destination list and volumes"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized per camera."});
+    let mut contract = json!({"version":ipc::VERSION,"program":"capturefab","default":"help","json_result":{"version":1,"ok":true,"result":"command-specific JSON"},"json_error":{"version":1,"ok":false,"error":{"code":"category","message":"description"}},"exit_codes":{"0":"success (also closed stdout pipe)","1":"operation or I/O failure","2":"invalid CLI usage","3":"camera/session unavailable","4":"timeout","5":"unsupported feature/format"},"selection":{"direct":"--camera ID|serial|IPv4|sim:0","existing_session":"--session NAME","environment":"CAPTUREFAB_SESSION, CAPTUREFAB_SESSION_DIR"},"limits":{"timeout_ms":[1,60000],"count":[1,100000],"rpc_bytes":1048576,"payload_bytes":268435456},"rpc":{"transport":"authenticated loopback TCP; one newline-delimited request/response per connection","client":"capturefab --session NAME rpc < command.json","command_tag":"op","commands":[{"op":"status"},{"op":"discover","timeout_ms":1000,"simulated":false},{"op":"connect","camera":"sim:0","timeout_ms":2000},{"op":"disconnect"},{"op":"features"},{"op":"get","feature":"Width"},{"op":"set","feature":"ExposureTime","value":"5000"},{"op":"execute","feature":"TriggerSoftware"},{"op":"start"},{"op":"stop"},{"op":"capture","output":"frames","count":10,"timeout_ms":2000,"format":"png"},{"op":"xml"},{"op":"read_memory","address":256,"length":4},{"op":"write_memory","address":256,"data":[0,0,2,128]}]},"capture":{"formats":["png","jpeg","raw","pgm","ppm"],"stdout":"--camera ... capture -n 1 -o - --format raw; no --json; stdout must be a pipe or file, not a terminal"},"writes":"Multiple set assignments apply sequentially; failures may leave earlier assignments applied. Session operations are serialized per camera."});
     contract["exit_codes"]["6"] = json!("storage quota or disk full");
     contract["exit_codes"]["1"] = json!(
         "operation or I/O failure; error.code operation_failed, auth_required or auth_rejected"
@@ -2350,7 +2156,6 @@ fn schema() -> Value {
     contract["error_codes"] = json!({
         "auth_required": "exit 1: a camera asked for a user name and password and none was sent; run `capturefab login add ADDRESS --user USER --password-stdin`",
         "auth_rejected": "exit 1: a camera refused the user name and password that were sent",
-        "note": "hub credential failures stay operation_failed and set the hub's rejected status; see `hub list`",
     });
     contract["rpc"]["connect_sign_in"] = json!({
         "login": {"user": "USER", "password": "PASSWORD"},
@@ -2368,8 +2173,7 @@ fn schema() -> Value {
         "CAPTUREFAB_SESSION",
         "CAPTUREFAB_SESSION_DIR",
         "CAPTUREFAB_CACHE_DIR",
-        "CAPTUREFAB_HWACCEL",
-        "CAPTUREFAB_EFFICIENCY",
+        "CAPTUREFAB_THREADS",
         "CAPTUREFAB_ACTOR",
         "CAPTUREFAB_ACTOR_KIND"
     ]);
@@ -2379,9 +2183,8 @@ fn schema() -> Value {
     contract["capture"]["format_default"] = json!(
         "Known single file/template extension infers png/jpeg/raw/pgm/ppm; sequences to directories and stdout default to png; --format overrides inference, but an explicit format that differs from a png/jpg/jpeg/raw/pgm/ppm extension in the name is a usage error (exit 2; jpg and jpeg are the same)"
     );
-    contract["capture"]["path_base"] = json!(
-        "CLI capture/record/RPC local output paths resolve in the calling terminal; named destination paths remain relative to the destination"
-    );
+    contract["capture"]["path_base"] =
+        json!("CLI capture/record/RPC local output paths resolve in the calling terminal");
     contract["capture"]["paths"] = json!(
         "file, directory (an existing one or a name ending in a separator; continues frame-NNNNNN numbering after the highest existing number) or template; a file name or template whose last component has no extension gets the format's (.png, .jpg, .raw, .pgm, .ppm); with -n above 1 the CLI refuses a name ending in an image extension that is not an existing directory (usage, exit 2: use a template with {seq} or {frame}, or a folder), and an explicit --format contradicting an image extension; RPC capture steps instead save such a sequence into a folder of that name and keep the given name; {seq} picks the next free number; other existing names fail unless on_exists=number. Files are never overwritten."
     );
@@ -2418,7 +2221,7 @@ fn schema() -> Value {
         "channels":"monochrome PNG and PGM are one 8-bit gray channel; color and Bayer PNG are 8-bit RGB"
     });
     contract["capture"]["result"] = json!({
-        "capture":"{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,file_bytes?,wall_ms,settings?,file?}],count,context?,destination?}; bytes is the raw acquired frame size, file_bytes the saved file size (absent for stdout); settings maps the camera's allowlisted acquisition features to their values. A burst that fails part way keeps its saved frames and its error category; the message starts with saved N of M frames to FOLDER (names)",
+        "capture":"{files:[path],frames:[{id,width,height,pixel_format,pixel_format_name,timestamp_ns,bytes,file_bytes?,wall_ms,settings?,file?}],count,context?}; bytes is the raw acquired frame size, file_bytes the saved file size (absent for stdout); settings maps the camera's allowlisted acquisition features to their values. A burst that fails part way keeps its saved frames and its error category; the message starts with saved N of M frames to FOLDER (names)",
         "record":"{forwarding,forwarding_id,since_ms,until_ms?,path?,stopped?}; path is the local recording file; until_ms is the nominal UTC deadline for a timed recording; elapsed time and computer sleep count, and backward clock changes do not extend it; with --duration, stopped is {forwarding:null,by:\"duration\",stats?:{accepted,written,dropped,late,stalled,recording?:{path,bytes,started_ms,ended_ms,encoder}}} when the session ended it on time (stats is absent from a worker that does not report them), else the conditional-stop result",
         "status":"forwarding_id and forwarding_since_ms per camera and at the top level while forwarding, forwarding_until_ms while a timed recording or forward runs, and recording_path (the resolved absolute file; forwarding keeps the requested output) while a local recording runs",
         "conditional_stop":{"rpc":{"op":"stop_forward_if","forwarding_id":"32 lowercase hexadecimal characters"},"behavior":"Stops only the acknowledged forwarding instance. A different current identity is refused without stopping it. Timed CLI fallback uses this form; explicit stop-forward stops the current instance."},
@@ -2452,7 +2255,7 @@ fn schema() -> Value {
     );
     contract["jobs"] = json!({
         "in":"schedule result.job; jobs result.jobs; status jobs and cameras[].jobs",
-        "fields":["id","status","output","count","captured","skipped","retries","first_at_ms","interval_ms","next_at_ms","last_file","error","destination?","context?"],
+        "fields":["id","status","output","count","captured","skipped","retries","first_at_ms","interval_ms","next_at_ms","last_file","error","context?"],
         "status":"One of scheduling.states",
         "next_at_ms":"Follows scheduling.interval",
         "saving":"Scheduled frames are encoded and saved on their own thread, which holds at most two frames, so acquisition, previews, recording and forwarding continue meanwhile.",
@@ -2476,10 +2279,10 @@ fn schema() -> Value {
         "Network streams reconnect after FFmpeg exits, backing off from 1 s to 30 s until the stream stays up for 10 s; frame waits meanwhile time out (exit 4), and five credential rejections (401/403) in a row stop acquisition, while a missing path (404) keeps being retried. Local video files play at their frame rate in live view and recordings unless PlaybackSpeed=Fastest, and captures that start acquisition read them as fast as they ask. Local files and http(s) URLs naming a video file stop with 'Video file finished'."
     );
     contract["selection"]["direct"] = json!(
-        "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:NAME_OR_INDEX[?size=WxH&fps=F]|v4l2:/dev/videoN[?size=WxH&fps=F]|dshow:video=NAME[?size=WxH&fps=F]|onvif:http://HOST[:PORT]/PATH|onvif://[USER:PASS@]HOST[:PORT][/PATH]|hub:NAME/CAMERA[?stream=MODE&fps=F]|scanner:sane:DEVICE|scanner:wia:ID|scanner:ica:UUID"
+        "--camera ID|serial|IPv4|sim:NAME|RTSP/SRT/media URI|avfoundation:NAME_OR_INDEX[?size=WxH&fps=F]|v4l2:/dev/videoN[?size=WxH&fps=F]|dshow:video=NAME[?size=WxH&fps=F]|onvif:http://HOST[:PORT]/PATH|onvif://[USER:PASS@]HOST[:PORT][/PATH]"
     );
     contract["selection"]["matching"] = json!(
-        "An exact ID, serial or address wins; otherwise a bare name opens the one local camera whose model or name (the ID after its kind) equals it, or whose model contains it as whole words, ignoring case (never part of a serial or ID), and stderr names the camera chosen. Hub cameras need their exact selector; several matches fail with exit 3. connect and select take the camera as an argument or from --camera / CAPTUREFAB_CAMERA. Scripts should use IDs from discover."
+        "An exact ID, serial or address wins; otherwise a bare name opens the one local camera whose model or name (the ID after its kind) equals it, or whose model contains it as whole words, ignoring case (never part of a serial or ID), and stderr names the camera chosen; several matches fail with exit 3. connect and select take the camera as an argument or from --camera / CAPTUREFAB_CAMERA. Scripts should use IDs from discover."
     );
     contract["selection"]["existing_session"] =
         json!("--session NAME [--camera ID] targets an existing serve session");
@@ -2488,32 +2291,25 @@ fn schema() -> Value {
     contract["limits"]["shared_memory_slots_per_camera"] = json!(3);
     contract["camera_profiles"] = json!({
         "location":"CameraInfo.profile: discover.devices[], info.camera, status.connected and status.cameras[].info",
-        "kinds":["unknown","area_scan","line_scan","depth","microscope","thermal","document_scanner"],
-        "sources":["unknown","transport","identity","features","device_metadata"],
-        "capabilities":["exposure","gain","roi","binning","frame_rate","line_rate","trigger","encoder","depth_components","depth_range","spatial_calibration","focus","magnification","illumination","temperature","scan_resolution","scan_source"],
+        "kinds":["unknown","area_scan","line_scan","depth","microscope","thermal"],
+        "sources":["unknown","identity","features","device_metadata"],
+        "capabilities":["exposure","gain","roi","binning","frame_rate","line_rate","trigger","encoder","depth_components","depth_range","spatial_calibration","focus","magnification","illumination","temperature"],
         "fields":{
             "kind":"Camera purpose from kinds; independent of its transport",
             "source":"Source of the classification from sources",
             "evidence":"Array of strings explaining the detected kind",
             "capabilities":"Array of advertised control families; FeatureInfo remains authoritative for live availability, access, selectors, choices and limits"
         },
-        "detection":"Discovery may be provisional; connection refines from readable features. Priority: scanner transport, explicit DeviceType/CameraType/SensorType class, explicit Linescan geometry, specialty feature families, remaining declared scan geometry, model identity, conventional image dimensions and frame timing, then unknown. A one-row ROI, high bit depth or vendor name alone does not identify a specialty camera.",
+        "detection":"Discovery may be provisional; connection refines from readable features. Priority: explicit DeviceType/CameraType/SensorType class, explicit Linescan geometry, specialty feature families, remaining declared scan geometry, model identity, conventional image dimensions and frame timing, then unknown. A one-row ROI, high bit depth or vendor name alone does not identify a specialty camera.",
         "simulators":["sim:0","sim:NAME","sim:line[:name]","sim:depth[:name]","sim:microscope[:name]","sim:thermal[:name]","sim:replay:PATH"],
         "measurements":"Raw captures preserve acquired bytes and sample precision without embedded calibration. Keep component, unit, scale, offset and calibration features separately. PNG/JPEG/PGM/PPM and forwarded video are 8-bit visualizations; forwarding carries no measurement calibration or color map.",
-        "auto":"Generic auto exposure is unsupported for line_scan, depth, thermal and document_scanner. Image cameras, including microscopes with suitable advertised controls, retain support.",
+        "auto":"Generic auto exposure is unsupported for line_scan, depth and thermal. Image cameras, including microscopes with suitable advertised controls, retain support.",
         "stream_limits":"Existing transports acquire single rasters. Depth requires a compatible single-component stream; multipart, GenDC, point-cloud payloads and vendor SDK-only access remain unsupported. Detection does not establish hardware compatibility."
     });
     contract["simulation"] = json!({
         "replay":"--camera sim:replay:PATH uses a local simulator with configurable Width, Height and AcquisitionFrameRate",
         "playlist":"A file or one-level directory of supported images/videos. Regular files only, lexicographically sorted by filename, no recursion or symlink traversal; loops until stopped.",
         "timing":"Fixed delivered frame rate; frames are letterboxed to camera dimensions. Frame IDs and timestamps continue across file and playlist boundaries."
-    });
-    contract["scanners"] = json!({"enumeration":"scanners --json or discover --json; transport is scanner","backends":{"linux":"SANE scanimage (installed separately)","windows":"Windows Image Acquisition (WIA)","macos":"ImageCaptureCore (bundled native helper)"},"feature":"scanner; enabled by default","settings":{"ScanResolution":{"default":150,"range":[75,600],"unit":"dpi"},"ScanMode":{"default":"Color","choices":["Color","Gray","Lineart"]},"ScanSource":{"default":"Default","choices":["Default","Flatbed","Feeder"]}},"acquisition":"capture requests one page; count requests successive pages, including feeder pages; connecting/start never scans; forwarding and auto exposure are unsupported","timeout":"Use --timeout-ms 60000 for physical scans. Each page has its own deadline and timeout cancels the helper.","outputs":"Existing capture image formats, destinations and storage quotas; no PDF/OCR conversion","limits":{"frame_bytes":134217728,"shared_ring_default_bytes_per_slot":134217728},"compatibility":"Driver-dependent settings; unsupported resolutions, modes and source names fail without silent fallback. SANE source names vary between drivers."});
-    contract["resources"] = json!({
-        "cli":"resources [status] | configure [--cpu-threads auto|N] [--camera-buffers auto|SIZE] | reset",
-        "defaults":"Automatic: bounded image/codec threads, a shared camera-buffer budget from host RAM, and existing storage quotas. CPU and low-memory pressure reduce parallel work.",
-        "scope":"App-wide local settings in resources.json; new buffers are admitted within budget. Thread changes affect future pixel work and newly started codecs, never restart ongoing recordings.",
-        "status":"policy, effective, host, buffers and storage; unknown readings remain null or report an error"
     });
     contract["storage"] = json!({"default":crate::storage::StoragePolicy::default(),"scope":"All Capturefab-owned capture and recording files across output directories, recorded in this user's state directory. Reservations count toward quota. Existing/unowned/modified files are never deleted.","recording_file_cap_default":crate::media::default_recording_cap(),"recording_cut":"A recording that reaches its maximum file size (storage_full) or fails to write stops, and keeps the video written until then, recorded in the ledger","on_full":["stop","delete-oldest"],"status":"capturefab storage --json","error":"storage_full; exit 6","free_space_floor":crate::storage::FREE_SPACE_FLOOR,"free_bytes":"storage --json reports free space on the disk of the default capture folder (~/Capturefab), or null. Every save must leave free_space_floor bytes free on its own disk, counting what active recordings may still write; delete-oldest removes the oldest owned files on that disk to keep it, except on Windows, and not again on a disk where that freed no space until a save there fits."});
     contract["scheduling"] = json!({"cli":"capture --at RFC3339 | --delay 30s; --interval 10s -n 100","lifetime":"Schedules run while the serve session or direct CLI process remains running; jobs are not persisted across exit.","interval":"First time plus interval times the shots so far: captured, being saved, skipped and retried, so a skipped or retried shot moves the schedule one interval later; zero interval captures consecutive frames. All frames must fall within 10 years. A past first timestamp starts immediately. Durations must resolve to whole milliseconds. Each job has a per-frame transport timeout.","states":["pending","running","complete","cancelled","failed"]});
@@ -2525,11 +2321,11 @@ fn schema() -> Value {
         "lifetime":"History is bounded and lasts while the camera remains connected; a new change clears its redo history.",
         "checkpoints":"Successful reversible commands also return camera_change:{token,camera,label,last_changed_at_us}. replay_camera_change targets that token with undo:true or undo:false; expired tokens and conflicting camera state fail.",
         "conflicts":"Replay checks current camera state before changing it. A conflicting or failed replay reports an error and retains the history entry.",
-        "effects":"Captures, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by camera history. Stopping a stream with schedules or forwarding is also excluded. Scanner settings are reversible; scanner acquisition, including Start and Stop, may move or consume physical pages and cannot be undone or replayed."
+        "effects":"Captures, recordings, schedules, connection changes, arbitrary commands and raw memory writes cannot be reversed by camera history. Stopping a stream with schedules or forwarding is also excluded."
     });
     contract["frame"] = json!({
         "rpc":"{\"op\":\"frame\"} through rpc or IPC on a running session; --camera or the request's camera picks the camera",
-        "behavior":"Read-only: the newest frame of one camera as measurements and a bounded preview. It never saves files, uses storage or changes settings, and runs after commands sent to that camera before it. A stopped camera acquires one frame and stays stopped; document scanners are refused.",
+        "behavior":"Read-only: the newest frame of one camera as measurements and a bounded preview. It never saves files, uses storage or changes settings, and runs after commands sent to that camera before it. A stopped camera acquires one frame and stays stopped.",
         "fields":{"fresh":"0..10 frames acquired after the request, default 1 (2 after a change on real hardware); republishing a held frame does not count; 0 accepts the newest frame","timeout_ms":"1..10000, default 3000","max_dimension":"0 for measurements only, or 64..2048: the preview's longest edge, default 1024","format":"auto (JPEG; PNG in builds without the jpeg feature), jpeg or png","region":"optional normalized [x, y, width, height] crop of the full-resolution frame, also the focus region"},
         "result":{"camera":"camera ID","frame":"{id, seq, width, height, pixel_format, timestamp_ns, age_ms, source: live|grab, waited_frames}","region":"{x, y, width, height, normalized}; Bayer crops widen to whole 2x2 quads","exposure":"{mean, p01, p50, p99, shadows, highlights, histogram16, channels: {red, green, blue} or null}, 0..1; null for depth, thermal and line-scan cameras","auto_meter":"{mean, p99} at native bit depth, or null","focus":"{laplacian, tenengrad, brenner, variance}: compare values for one region of one camera; or null","notes":"advisory text (clipped highlights, crushed shadows, dark or bright mean) and why a measurement is missing","image":"{mime, width, height, bytes, base64}, area-averaged to max_dimension and at most 1.5 MiB; null when max_dimension is 0"},
         "errors":"No frame in time fails with \"no new frame from CAMERA within N (timed out)\" (exit 4); a triggered camera needs TriggerSoftware. A camera that stops streaming fails with its last error."
@@ -2552,27 +2348,16 @@ fn schema() -> Value {
         json!({"op":"replay_camera_change","token":"TOKEN_FROM_CAMERA_CHANGE","undo":true}),
     ]);
     commands.push(json!({"op":"capture","output":"line1/{date}/{camera}-{datetime}-{seq}.png","count":1,"timeout_ms":2000,"format":"png","on_exists":"number","context":{"line":"L1","part":"A-100"}}));
-    contract["efficiency"] = json!({
-        "cli":"--efficiency auto|smooth|efficient (global)",
-        "environment":crate::efficiency::ENV,
-        "precedence":"--efficiency, then CAPTUREFAB_EFFICIENCY, then auto; an unknown CAPTUREFAB_EFFICIENCY value means auto",
-        "auto":"efficient with at most 2 CPU cores, at most 2 GiB of memory, or the OS low-power or battery-saver mode; running on battery alone stays smooth",
-        "scope":"The process that parses it, such as serve or a direct command, and the camera workers it starts, which are told efficient whenever that process resolved efficient; a running session keeps its own setting. In workers, efficient decodes each live stream with one thread and picks a faster libx264 preset; the session polls its workers for status every 500 ms instead of 250 ms while a camera streams or a view watches, and every 2 s instead of 1 s otherwise. Scaled-down previews keep one pixel of each block instead of averaging. Captures and recordings keep every frame in every mode.",
-        "status":"doctor --json efficiency {setting,efficient,reasons}"
-    });
     contract["doctor"] = json!({
-        "host":"{cpu_cores,memory_total,memory_available,on_battery,low_power}; on_battery is reported but never switches efficiency by itself",
-        "efficiency":"{setting:auto|smooth|efficient,efficient,reasons}",
+        "host":"{cpu_cores}",
+        "ffmpeg":"{source:bundled|CAPTUREFAB_FFMPEG,path,version}, or {error} when it does not run",
         "paths":"{runtime,state,cache,temp,working_directory}, each {path,exists,fs_type,ram_backed,total_bytes,free_bytes} (cache is null without a home folder); without exists the facts describe the nearest existing parent",
-        "directories":"runtime_directory holds session descriptors and their locks, scanner and GPU JPEG staging; state_directory holds saved hubs, destinations, setups and sign-in indexes, and the storage ledger; cache_directory holds the extracted FFmpeg and encoder probes. On Linux runtime is $XDG_RUNTIME_DIR/capturefab, else /run/user/<uid>/capturefab when the user lingers (loginctl enable-linger) and that directory is theirs with mode 0700, else ~/.cache/capturefab/sessions, and state is $XDG_STATE_HOME/capturefab or ~/.local/state/capturefab; elsewhere both are one directory. CAPTUREFAB_SESSION_DIR sets both and CAPTUREFAB_CACHE_DIR the cache",
+        "directories":"runtime_directory holds session descriptors and their locks; state_directory holds setups, sign-in indexes and the storage ledger; cache_directory holds the extracted FFmpeg and encoder probes. On Linux runtime is $XDG_RUNTIME_DIR/capturefab, else /run/user/<uid>/capturefab when the user lingers (loginctl enable-linger) and that directory is theirs with mode 0700, else ~/.cache/capturefab/sessions, and state is $XDG_STATE_HOME/capturefab or ~/.local/state/capturefab; elsewhere both are one directory. CAPTUREFAB_SESSION_DIR sets both and CAPTUREFAB_CACHE_DIR the cache",
         "limits":"{rmem_max,usbfs_memory_mb}; null outside Linux",
-        "checks":"[{id,level:ok|warn,message,fix}]; ids include efficiency, runtime_dir, session_storage, private_dirs, camera_network, ffmpeg, receive_buffer, usb_access, storage_budget and updates (an available version, or an unrecognized CAPTUREFAB_UPDATE_CHECK); checks that do not apply are omitted; camera_network is always ok",
-        "update_check":"{compiled,automatic,policy,skipped,last_checked,latest,update_available,last_error}, as version --json; doctor never fetches",
+        "checks":"[{id,level:ok|warn,message,fix}]; ids include runtime_dir, session_storage, private_dirs, camera_network, ffmpeg, receive_buffer, usb_access and storage_budget; checks that do not apply are omitted; camera_network is always ok",
         "ring_backing":"memfd|posix-shm|file: where camera frame rings live; file only on Windows or where anonymous shared memory is unavailable",
         "human":"Plain doctor prints the host summary and one line per check with its fix"
     });
-    contract["hubs"] = crate::hubs::schema_contract();
-    contract["updates"] = crate::updates::schema_contract();
     setup::extend_schema(&mut contract);
     contract
 }
@@ -2738,44 +2523,6 @@ impl TimedRecording {
     }
 }
 
-fn destination_command(command: &DestinationCommand) -> Result<Value> {
-    use crate::destination::{self, Destination, Target};
-    let describe = |saved: &Destination| {
-        let mut value = serde_json::to_value(saved).unwrap_or_default();
-        value["location"] = json!(saved.describe());
-        value
-    };
-    Ok(match command {
-        DestinationCommand::List => {
-            json!({"destinations": destination::list()?.iter().map(describe).collect::<Vec<_>>()})
-        }
-        DestinationCommand::AddFolder { name, path } => {
-            let saved = Destination {
-                name: name.clone(),
-                target: Target::Folder {
-                    path: std::path::absolute(path)?,
-                },
-            };
-            input(saved.validate())?;
-            let Target::Folder { path } = &saved.target;
-            crate::volumes::ensure_present(path)?;
-            std::fs::create_dir_all(path)
-                .with_context(|| format!("cannot create {}", path.display()))?;
-            destination::save(saved.clone())?;
-            json!({"destination":describe(&saved)})
-        }
-        DestinationCommand::Remove { name } => json!({"removed":destination::remove(name)?.name}),
-        DestinationCommand::Test { name } => {
-            let saved = destination::get(name)?;
-            destination::test(&saved)?;
-            json!({"ok":true,"free_bytes":fs2::available_space(saved.local_root()).ok(),"destination":describe(&saved)})
-        }
-    })
-}
-
-/// Run `handler` on Ctrl-C, SIGTERM (`systemctl stop`) or SIGHUP (a closed
-/// terminal). A SIGHUP this process started out ignoring, as under `nohup`,
-/// stays ignored: whoever started it asked it to outlive its terminal.
 pub(crate) fn on_quit_signal(handler: impl FnMut() + Send + 'static) -> Result<()> {
     #[cfg(unix)]
     let hangup_ignored = hangup_ignored();
@@ -3293,7 +3040,6 @@ mod tests {
             next_at_ms: 31,
             last_file: None,
             error: None,
-            destination: Some("archive".into()),
             context: crate::context::Context::from([("line".into(), "L1".into())]),
         };
         let job = serde_json::to_value(job).unwrap();
@@ -3397,7 +3143,6 @@ mod tests {
             ("timeout", 4)
         );
         for failure in [
-            "a document scanner cannot be inspected without scanning a page",
             "sim:0 stopped streaming: Shared frame buffer: frame exceeds shared-memory capacity",
             "grab is reserved for camera workers; use frame to inspect a camera",
             "preview image exceeds the size limit; request a smaller max_dimension",
@@ -3442,9 +3187,7 @@ mod tests {
             ("unsupported", 5)
         );
         assert_eq!(
-            error_code(&anyhow::anyhow!(
-                "GPU JPEG encoding is unsupported in this build"
-            )),
+            error_code(&anyhow::anyhow!("JPEG is unsupported in this build")),
             ("unsupported", 5)
         );
         assert_eq!(
@@ -3460,10 +3203,10 @@ mod tests {
             ("unavailable", 3)
         );
         for unreachable in [
-            "cannot reach hub home at http://10.0.0.9:8123: no route to host",
-            "cannot reach hub home at http://10.0.0.9:8123: network is unreachable",
-            "cannot reach hub home at http://10.0.0.9:8123: host is down",
-            "camera camera.porch on hub home is offline (HTTP 503)",
+            "cannot reach rtsp://10.0.0.9:8554/porch: no route to host",
+            "cannot reach rtsp://10.0.0.9:8554/porch: network is unreachable",
+            "cannot reach rtsp://10.0.0.9:8554/porch: host is down",
+            "camera porch is offline",
         ] {
             assert_eq!(
                 error_code(&anyhow::anyhow!("{unreachable}")),
@@ -3472,7 +3215,7 @@ mod tests {
             );
         }
         // A category set where the error happened wins over words that
-        // happen to appear in a camera or hub name.
+        // happen to appear in a camera name.
         use crate::types::{Categorized, ErrorKind};
         assert_eq!(
             error_code(&Categorized::error(
@@ -3483,7 +3226,7 @@ mod tests {
         );
         assert_eq!(
             error_code(
-                &Categorized::error(ErrorKind::Timeout, "hub not_found did not answer")
+                &Categorized::error(ErrorKind::Timeout, "camera not_found did not answer")
                     .context("connect")
             ),
             ("timeout", 4)
@@ -3491,45 +3234,9 @@ mod tests {
         assert_eq!(
             error_code(&crate::types::error_from_transport(
                 Some("unsupported"),
-                "camera hubs are unavailable".into()
+                "camera feature is unavailable".into()
             )),
             ("unsupported", 5)
-        );
-    }
-    #[test]
-    fn efficiency_flag_parses_known_modes_only() {
-        let parse = |args: &[&str]| Cli::try_parse_from(["capturefab"].iter().chain(args));
-        assert_eq!(parse(&["doctor"]).unwrap().efficiency, None);
-        assert_eq!(
-            parse(&["doctor", "--efficiency", "efficient"])
-                .unwrap()
-                .efficiency,
-            Some(crate::efficiency::Mode::Efficient)
-        );
-        assert_eq!(
-            parse(&["--efficiency", "smooth", "serve"])
-                .unwrap()
-                .efficiency,
-            Some(crate::efficiency::Mode::Smooth)
-        );
-        assert!(parse(&["--efficiency", "turbo", "doctor"]).is_err());
-        let contract = schema();
-        let flag = contract["cli"]["arguments"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|argument| argument["long"] == "efficiency")
-            .unwrap();
-        assert_eq!(flag["choices"], json!(["auto", "smooth", "efficient"]));
-        assert!(
-            contract["selection"]["environment"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("CAPTUREFAB_EFFICIENCY"))
-        );
-        assert_eq!(
-            contract["efficiency"]["environment"],
-            "CAPTUREFAB_EFFICIENCY"
         );
     }
     #[test]

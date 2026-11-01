@@ -146,9 +146,6 @@ pub enum SessionCommand {
         format: String,
         #[serde(default)]
         storage: crate::storage::StoragePolicy,
-        /// A saved folder destination; `output` is then a name inside it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        destination: Option<String>,
         /// What to do when an output name without {seq} exists; fail by default.
         #[serde(default, skip_serializing_if = "crate::naming::OnExists::is_fail")]
         on_exists: crate::naming::OnExists,
@@ -165,9 +162,6 @@ pub enum SessionCommand {
         interval_ms: u64,
         #[serde(default)]
         storage: crate::storage::StoragePolicy,
-        /// A saved folder destination; `output` is then a name inside it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        destination: Option<String>,
         /// What to do when an output name without {seq} exists; fail by default.
         #[serde(default, skip_serializing_if = "crate::naming::OnExists::is_fail")]
         on_exists: crate::naming::OnExists,
@@ -230,9 +224,6 @@ pub enum SessionCommand {
         storage: crate::storage::StoragePolicy,
         #[serde(default = "crate::media::default_recording_cap")]
         max_file_bytes: u64,
-        /// A saved folder destination; `output` is then a name inside it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        destination: Option<String>,
         /// What to do when an output name without {seq} exists; fail by default.
         #[serde(default, skip_serializing_if = "crate::naming::OnExists::is_fail")]
         on_exists: crate::naming::OnExists,
@@ -404,7 +395,7 @@ impl SessionCommand {
         Ok(command)
     }
     /// Validate supplied values before queueing a command or changing a camera.
-    /// Live feature bounds and destination availability are checked again by
+    /// Live feature bounds and output availability are checked again by
     /// their owners when the command executes.
     pub fn validate(&self) -> Result<()> {
         match self {
@@ -435,7 +426,7 @@ impl SessionCommand {
                     validate_login_selector(camera)?;
                 }
                 maximum_cameras()?;
-                frame_capacity(FrameClass::Default)?;
+                frame_capacity()?;
             }
             Self::Select { camera } => validate_selector(camera)?,
             Self::Get { feature } | Self::Execute { feature } | Self::Set { feature, .. } => {
@@ -510,7 +501,6 @@ impl SessionCommand {
                 timeout_ms,
                 format,
                 storage,
-                destination,
                 on_exists,
                 context,
             }
@@ -520,7 +510,6 @@ impl SessionCommand {
                 timeout_ms,
                 format,
                 storage,
-                destination,
                 on_exists,
                 context,
                 ..
@@ -532,7 +521,6 @@ impl SessionCommand {
                     "format must be png, jpeg, raw, pgm or ppm"
                 );
                 storage.validate()?;
-                crate::destination::validate_output(destination.as_deref(), output)?;
                 crate::engine::validate_capture_output(output)?;
                 crate::naming::validate_request(output, *count, *on_exists, context)?;
                 if matches!(self, Self::Schedule { .. }) {
@@ -542,8 +530,8 @@ impl SessionCommand {
                     );
                 } else {
                     ensure!(
-                        output != "-" || (*count == 1 && destination.is_none()),
-                        "stdout output needs one frame and cannot use a destination"
+                        output != "-" || *count == 1,
+                        "stdout output needs one frame"
                     );
                 }
                 if let Self::Schedule {
@@ -570,7 +558,6 @@ impl SessionCommand {
                 bitrate,
                 storage,
                 max_file_bytes,
-                destination,
                 on_exists,
                 context,
                 duration_ms,
@@ -591,7 +578,6 @@ impl SessionCommand {
                     bitrate: bitrate.clone(),
                     storage: storage.clone(),
                     max_file_bytes: *max_file_bytes,
-                    destination: destination.clone(),
                 }
                 .validate()?;
             }
@@ -647,8 +633,6 @@ fn validate_login_selector(camera: &str) -> Result<()> {
         || camera.starts_with("gige:")
         || camera.starts_with("usb:")
         || camera.parse::<std::net::Ipv4Addr>().is_ok()
-        || crate::hubs::is_source(camera)
-        || crate::scanner::is_source(camera)
         || crate::media::is_host_camera(camera)
         || camera.to_ascii_lowercase().starts_with("file:");
     // A bare name may be the ID or serial of a discovered ONVIF camera,
@@ -701,24 +685,9 @@ fn maximum_cameras() -> Result<usize> {
     );
     Ok(maximum)
 }
-/// What a worker's frames look like, which sizes its shared ring.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FrameClass {
-    Default,
-    /// Hub cameras deliver RGB frames of whatever size the server sends;
-    /// 32 MiB slots hold 4096x2160.
-    Hub,
-    Scanner,
-}
-fn frame_capacity(class: FrameClass) -> Result<usize> {
-    let capacity = env_usize(
-        "CAPTUREFAB_FRAME_BYTES",
-        match class {
-            FrameClass::Scanner => 128 * 1024 * 1024,
-            FrameClass::Hub => 32 * 1024 * 1024,
-            FrameClass::Default => DEFAULT_CAPACITY,
-        },
-    )?;
+/// The size of each slot of a worker's shared ring.
+fn frame_capacity() -> Result<usize> {
+    let capacity = env_usize("CAPTUREFAB_FRAME_BYTES", DEFAULT_CAPACITY)?;
     ensure!(
         (4096..=256 * 1024 * 1024).contains(&capacity) && capacity.is_multiple_of(64),
         "CAPTUREFAB_FRAME_BYTES must be 4096..268435456, aligned to 64 bytes"
@@ -1288,14 +1257,11 @@ impl Sent {
         kept
     }
 }
-/// A status request only a coordinator sends its own worker. It carries an
-/// efficiency setting that changed since the worker started, for FFmpeg
-/// decoders it launches later; `full` asks for every field again.
+/// A status request only a coordinator sends its own worker: `full` asks for
+/// every field again.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Refresh {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    efficiency: Option<crate::efficiency::Mode>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     full: bool,
 }
@@ -1384,47 +1350,15 @@ struct Process {
     quiet: bool,
     /// Bumped whenever a reply changes what this worker reports.
     revision: Arc<AtomicU64>,
-    /// The efficiency setting the worker was last given.
-    efficiency: crate::efficiency::Mode,
 }
-// Linux can briefly refuse exec after a newly written helper was closed,
-// including while another process is completing a concurrent fork/exec. No
-// child was started on ETXTBSY, so retry only that error for a bounded time.
-#[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
-pub(crate) fn spawn_helper(
-    command: &mut std::process::Command,
-) -> std::io::Result<std::process::Child> {
-    let deadline = Instant::now() + Duration::from_millis(500);
-    loop {
-        match command.spawn() {
-            Err(error)
-                if cfg!(target_os = "linux")
-                    && error.raw_os_error() == Some(26)
-                    && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            result => return result,
-        }
-    }
-}
-
-/// A camera worker inherits this process's decoding and efficiency settings,
-/// including a `--efficiency` flag or desktop choice it cannot see itself.
-///
-/// It leads a process group of its own, which its FFmpeg and helper
+/// A camera worker leads a process group of its own, which its FFmpeg and helper
 /// processes join. A terminal sends Ctrl-C, and the shell sends the SIGHUP of
 /// a closed terminal, to the whole foreground group: in this one, they would
 /// end a recording before this process could finish it, catalog it and queue
 /// its local save. The worker still exits when told to or when its stdin closes.
-fn worker_command(
-    executable: std::path::PathBuf,
-    efficiency: crate::efficiency::Mode,
-) -> std::process::Command {
+fn worker_command(executable: std::path::PathBuf) -> std::process::Command {
     let mut command = std::process::Command::new(executable);
     command
-        .env("CAPTUREFAB_HWACCEL", crate::media::hwaccel())
-        .env(crate::efficiency::ENV, efficiency.name())
         .arg("__worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1445,33 +1379,25 @@ fn worker_command(
 }
 
 impl Process {
-    fn spawn(class: FrameClass, revision: Arc<AtomicU64>) -> Result<Self> {
-        let capacity = frame_capacity(class)?;
+    fn spawn(revision: Arc<AtomicU64>) -> Result<Self> {
+        let capacity = frame_capacity()?;
         let dir = crate::ipc::runtime_dir();
         crate::ipc::ensure_private_dir(&dir)?;
         // Ring files are left behind only when a process dies; clear them
         // before this coordinator's first camera.
         static SWEEP: std::sync::Once = std::sync::Once::new();
         SWEEP.call_once(|| crate::shared_memory::sweep(&dir));
-        let lease = crate::resources::buffers::reserve(SharedRing::allocation_bytes(capacity)?)?;
-        let mut ring = SharedRing::create(&dir, capacity)?;
-        ring.attach_buffer_lease(lease)?;
+        let ring = SharedRing::create(&dir, capacity)?;
         let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
             .map(std::path::PathBuf::from)
             .unwrap_or(std::env::current_exe()?);
-        let efficiency = crate::efficiency::for_workers();
-        let mut command = worker_command(executable, efficiency);
+        let mut command = worker_command(executable);
         ring.pass_to(&mut command);
         let child = command.spawn().context("launch camera capture process")?;
-        Self::attach(child, ring, revision, efficiency)
+        Self::attach(child, ring, revision)
     }
-    /// Take over a worker started with `ring` and `efficiency`.
-    fn attach(
-        mut child: Child,
-        mut ring: SharedRing,
-        revision: Arc<AtomicU64>,
-        efficiency: crate::efficiency::Mode,
-    ) -> Result<Self> {
+    /// Take over a worker started with `ring`.
+    fn attach(mut child: Child, mut ring: SharedRing, revision: Arc<AtomicU64>) -> Result<Self> {
         ring.passed();
         let input = child.stdin.take().context("worker stdin")?;
         let output = BufReader::new(child.stdout.take().context("worker stdout")?);
@@ -1485,7 +1411,6 @@ impl Process {
             reply: Vec::new(),
             quiet: false,
             revision,
-            efficiency,
         })
     }
     fn call(&mut self, command: SessionCommand) -> Result<Value> {
@@ -1496,19 +1421,15 @@ impl Process {
         let status = matches!(command, SessionCommand::Status);
         self.round_trip(&command, status, false)
     }
-    /// Ask for the worker's status, giving it the coordinator's efficiency
-    /// setting when that changed.
-    fn refresh(&mut self, efficiency: crate::efficiency::Mode) -> Result<()> {
-        let request = Refresh {
-            efficiency: (efficiency != self.efficiency).then_some(efficiency),
-            full: self.report.resync,
-        };
-        if request == Refresh::default() {
-            self.exchange(SessionCommand::Status)?;
-        } else {
+    /// Ask for the worker's status, every field again after a reply could
+    /// not be read.
+    fn refresh(&mut self) -> Result<()> {
+        if self.report.resync {
             self.report.resync = false;
-            self.round_trip(&json!({ "refresh": request }), true, request.full)?;
-            self.efficiency = efficiency;
+            let request = Refresh { full: true };
+            self.round_trip(&json!({ "refresh": request }), true, true)?;
+        } else {
+            self.exchange(SessionCommand::Status)?;
         }
         Ok(())
     }
@@ -1743,13 +1664,12 @@ const SLOW: u8 = 1;
 const QUICK: u8 = 2;
 /// The status poller polls workers briefly while a camera streams or
 /// someone watches, longer otherwise, and waits to be woken while no camera
-/// is connected. Efficiency mode halves the rate.
-fn poll_pace(workers: bool, quick: bool, efficient: bool) -> (u8, Option<Duration>) {
-    let scale = if efficient { 2 } else { 1 };
+/// is connected.
+fn poll_pace(workers: bool, quick: bool) -> (u8, Option<Duration>) {
     match (workers, quick) {
         (false, _) => (PARKED, None),
-        (true, true) => (QUICK, Some(STATUS_POLL * scale)),
-        (true, false) => (SLOW, Some(STATUS_POLL_IDLE * scale)),
+        (true, true) => (QUICK, Some(STATUS_POLL)),
+        (true, false) => (SLOW, Some(STATUS_POLL_IDLE)),
     }
 }
 #[derive(Clone)]
@@ -1825,7 +1745,7 @@ impl SessionHandle {
                 .cameras
                 .iter()
                 .any(|camera| camera.streaming);
-        let (pace, wait) = poll_pace(workers, quick, crate::efficiency::efficient());
+        let (pace, wait) = poll_pace(workers, quick);
         self.inner.pace.store(pace, Ordering::Relaxed);
         wait
     }
@@ -1914,10 +1834,9 @@ impl SessionHandle {
         if workers.is_empty() {
             return;
         }
-        let efficiency = crate::efficiency::for_workers();
         for (id, w) in workers {
             let Ok(mut p) = w.try_lock() else { continue };
-            if p.refresh(efficiency).is_err() && p.child.try_wait().ok().flatten().is_some() {
+            if p.refresh().is_err() && p.child.try_wait().ok().flatten().is_some() {
                 self.inner.activity.cancel_jobs(
                     Some(&id),
                     Some(p.child.id()),
@@ -1941,9 +1860,6 @@ impl SessionHandle {
         // The poller may have just seen no workers, at whatever pace.
         self.wake();
     }
-    /// The worker already showing hub camera `camera`, if any. One camera
-    /// has one worker, so asking for it with other options is refused rather
-    /// than replacing the stream others are using.
     /// The ONVIF address of a discovered or connected ONVIF camera named by
     /// its ID or serial; any other selector unchanged.
     fn onvif_alias(&self, camera: String) -> String {
@@ -1961,42 +1877,6 @@ impl SessionHandle {
             })
             .map(|device| device.id.clone())
             .unwrap_or(camera)
-    }
-    fn connected_hub_camera(&self, camera: &str) -> Result<Option<Value>> {
-        if !crate::hubs::is_source(camera) {
-            return Ok(None);
-        }
-        // Kind validation canonicalizes identifiers too (UniFi camera IDs
-        // are case-insensitive hex). Compare that identity before spawning
-        // so aliases cannot replace an already connected camera's worker.
-        let (_, selector) = crate::hubs::resolve(camera)?;
-        let id = selector.id();
-        let Some((_, worker)) = self.workers().into_iter().find(|(key, _)| *key == id) else {
-            return Ok(None);
-        };
-        let p = worker.lock().unwrap_or_else(|e| e.into_inner());
-        let info = p
-            .report
-            .snapshot
-            .connected
-            .clone()
-            .context("worker has no camera")?;
-        let address = info.address.clone().unwrap_or_else(|| info.id.clone());
-        if address != selector.address() {
-            let options = address
-                .split_once('?')
-                .map_or("default options".to_owned(), |(_, options)| {
-                    options.replace('&', ", ")
-                });
-            return Err(crate::types::Categorized::error(
-                crate::types::ErrorKind::Unavailable,
-                format!(
-                    "{id} is already connected ({options}); disconnect it before connecting with other options"
-                ),
-            ));
-        }
-        self.edit_state().active_camera = Some(info.id.clone());
-        Ok(Some(json!({"connected":info,"worker_pid":p.child.id()})))
     }
     fn workers(&self) -> Vec<(String, Arc<Mutex<Process>>)> {
         self.inner
@@ -2818,11 +2698,8 @@ impl SessionHandle {
                     (1..=60000).contains(&timeout_ms),
                     "timeout must be 1..60000 milliseconds"
                 );
-                let (devices, warnings) = crate::camera::discover_with(
-                    Duration::from_millis(timeout_ms),
-                    simulated,
-                    true,
-                )?;
+                let (devices, warnings) =
+                    crate::camera::discover(Duration::from_millis(timeout_ms), simulated)?;
                 self.edit_state().devices = devices.clone();
                 let mut log = locked(&self.inner.log);
                 if log.discovery_warnings != warnings {
@@ -2845,40 +2722,18 @@ impl SessionHandle {
                     .connecting
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                // A discovered hub camera named by its serial opens by its
-                // address, so the worker never has to list hubs.
-                let camera = if crate::hubs::is_source(&camera) {
-                    camera
-                } else {
-                    self.inner
-                        .state
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .devices
-                        .iter()
-                        .find(|device| {
-                            crate::hubs::is_source(&device.id)
-                                && (device.serial == camera || device.id == camera)
-                        })
-                        .map(|device| device.address.clone().unwrap_or_else(|| device.id.clone()))
-                        .unwrap_or(camera)
-                };
                 // A discovered ONVIF camera named by its serial or ID opens
                 // by its ONVIF address, which is what a sign-in is saved
                 // under.
                 let camera = self.onvif_alias(camera);
                 // A unique loose name ("C920") among cached cameras becomes
                 // that camera's ID, so connected workers see one identity.
-                // Hub cameras never match.
                 let camera = self.loose_camera(camera);
                 if login.is_some() && crate::logins::key(&camera).is_err() {
                     return Err(crate::types::Usage(
                         "sign-in is supported for rtsp://, rtsps:// and onvif: cameras".into(),
                     )
                     .into());
-                }
-                if let Some(connected) = self.connected_hub_camera(&camera)? {
-                    return Ok(connected);
                 }
                 if let Ok(w) = self.target(Some(&camera)) {
                     let p = w.lock().unwrap_or_else(|e| e.into_inner());
@@ -2897,26 +2752,7 @@ impl SessionHandle {
                     self.workers().len() < maximum,
                     "camera limit reached ({maximum}); disconnect a camera or increase CAPTUREFAB_MAX_CAMERAS"
                 );
-                let scanner = crate::scanner::is_source(&camera)
-                    || self
-                        .inner
-                        .state
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .devices
-                        .iter()
-                        .any(|device| {
-                            device.transport == crate::types::Transport::Scanner
-                                && (device.id == camera || device.serial == camera)
-                        });
-                let class = if scanner {
-                    FrameClass::Scanner
-                } else if crate::hubs::is_source(&camera) {
-                    FrameClass::Hub
-                } else {
-                    FrameClass::Default
-                };
-                let mut p = Process::spawn(class, self.inner.revision.clone())?;
+                let mut p = Process::spawn(self.inner.revision.clone())?;
                 let result = p.call(SessionCommand::Connect {
                     camera,
                     timeout_ms,
@@ -3047,10 +2883,6 @@ impl SessionHandle {
                 .context("worker has no camera")?;
             (info, p.report.snapshot.streaming, p.feed.clone())
         };
-        ensure!(
-            info.transport != crate::types::Transport::Scanner,
-            "a document scanner cannot be inspected without scanning a page"
-        );
         let start = feed.counters.acquired_sequence();
         // A stopped camera acquires one frame, which is new by definition.
         let (source, fresh, notes) = if streaming {
@@ -3284,12 +3116,7 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
     unsafe {
         libc::signal(libc::SIGTTOU, libc::SIG_IGN);
     }
-    let lease = crate::resources::buffers::inherited()?;
-    let mut ring = SharedRing::open(ring)?;
-    if let Some(lease) = lease {
-        ring.attach_buffer_lease(lease)?;
-    }
-    let ring = Arc::new(Mutex::new(ring));
+    let ring = Arc::new(Mutex::new(SharedRing::open(ring)?));
     let handle = crate::engine::WorkerHandle::with_ring(ring);
     let result = (|| -> Result<()> {
         let input = std::io::stdin();
@@ -3313,11 +3140,6 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
             let result = match WorkerRequest::read(&data)? {
                 WorkerRequest::Shutdown => break,
                 WorkerRequest::Refresh(refresh) => {
-                    if let Some(mode) = refresh.efficiency {
-                        // The coordinator's choice outranks the one this
-                        // worker started with.
-                        crate::efficiency::configure(Some(mode));
-                    }
                     if refresh.full {
                         sent = Sent::default();
                     }
@@ -3340,8 +3162,8 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
                     crate::types::error_transport_code(&e),
                 ),
             };
-            // Hub secrets this worker holds never leave it, even in text a
-            // dependency produced.
+            // Camera passwords this worker holds never leave it, even in text
+            // a dependency produced.
             let scrub = |text: &mut String| {
                 if let std::borrow::Cow::Owned(clean) = crate::scrub::scrub(text) {
                     *text = clean;
@@ -3400,47 +3222,25 @@ mod tests {
     use super::*;
     use crate::shared_memory::Published;
     #[test]
-    fn workers_are_told_this_process_efficiency_setting() {
-        let command = worker_command("capturefab".into(), crate::efficiency::for_workers());
-        let env = |name: &str| {
-            command
-                .get_envs()
-                .find(|(key, _)| *key == name)
-                .and_then(|(_, value)| value)
-                .map(|value| value.to_string_lossy().into_owned())
-        };
-        // Resolved here: efficient whenever this process is, otherwise the
-        // setting, which the worker then resolves on the same host.
-        assert_eq!(
-            env(crate::efficiency::ENV).as_deref(),
-            Some(crate::efficiency::for_workers().name())
-        );
-        assert_eq!(
-            env("CAPTUREFAB_HWACCEL").as_deref(),
-            Some(crate::media::hwaccel().as_str())
-        );
+    fn workers_start_in_the_hidden_worker_mode() {
+        let command = worker_command("capturefab".into());
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [std::ffi::OsStr::new("__worker")]
         );
     }
     #[test]
-    fn loose_names_resolve_to_one_local_camera_id_never_a_hub() {
+    fn loose_names_resolve_to_one_local_camera_id() {
         let handle = SessionHandle::new();
         let mut webcam = crate::transport::simulator::info_named("sim:0");
         webcam.id = "avfoundation:HD Pro Webcam C920".into();
         webcam.model = "HD Pro Webcam C920".into();
         webcam.serial = webcam.id.clone();
-        let mut hub = crate::transport::simulator::info_named("sim:1");
-        hub.id = "hub:home/camera.front_door".into();
-        hub.model = "Front door".into();
-        hub.serial = "home/camera.front_door".into();
-        handle.inner.state.write().unwrap().devices = vec![webcam, hub];
+        handle.inner.state.write().unwrap().devices = vec![webcam];
         assert_eq!(
             handle.loose_camera("c920".into()),
             "avfoundation:HD Pro Webcam C920"
         );
-        // A hub camera keeps its exact selector.
         assert_eq!(handle.loose_camera("front door".into()), "front door");
         assert_eq!(handle.loose_camera("sim:3".into()), "sim:3");
         handle.shutdown();
@@ -3633,7 +3433,6 @@ mod tests {
             bitrate: "4M".into(),
             storage: Default::default(),
             max_file_bytes: crate::media::default_recording_cap(),
-            destination: None,
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms,
@@ -4799,10 +4598,7 @@ mod tests {
             request(json!({"op":"status"})).unwrap(),
             WorkerRequest::Command(command) if matches!(*command, SessionCommand::Status)
         ));
-        let refresh = Refresh {
-            efficiency: Some(crate::efficiency::Mode::Efficient),
-            full: true,
-        };
+        let refresh = Refresh { full: true };
         let WorkerRequest::Refresh(read) = request(json!({ "refresh": refresh })).unwrap() else {
             panic!("not a refresh")
         };
@@ -4884,20 +4680,9 @@ mod tests {
     }
     #[test]
     fn workers_are_polled_often_only_while_watched_or_streaming() {
-        assert_eq!(poll_pace(false, true, false), (PARKED, None));
-        assert_eq!(poll_pace(true, true, false), (QUICK, Some(STATUS_POLL)));
-        assert_eq!(
-            poll_pace(true, false, false),
-            (SLOW, Some(STATUS_POLL_IDLE))
-        );
-        assert_eq!(
-            poll_pace(true, false, true),
-            (SLOW, Some(Duration::from_secs(2)))
-        );
-        assert_eq!(
-            poll_pace(true, true, true),
-            (QUICK, Some(Duration::from_millis(500)))
-        );
+        assert_eq!(poll_pace(false, true), (PARKED, None));
+        assert_eq!(poll_pace(true, true), (QUICK, Some(STATUS_POLL)));
+        assert_eq!(poll_pace(true, false), (SLOW, Some(STATUS_POLL_IDLE)));
         let handle = SessionHandle::new();
         assert!(!handle.watching(), "nobody has looked yet");
         handle.request(SessionCommand::Status).unwrap();
@@ -4921,13 +4706,12 @@ mod tests {
         println!("test worker ready");
         // `SharedRing::pass_to` adds the ring last.
         run_worker(&std::env::args_os().last().unwrap()).unwrap();
-        println!("test worker efficient {}", crate::efficiency::efficient());
     }
-    /// A camera worker run by this test binary, started with `efficiency`.
+    /// A camera worker run by this test binary.
     #[cfg(unix)]
-    fn test_worker(efficiency: crate::efficiency::Mode) -> Process {
+    fn test_worker() -> Process {
         let ring = SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
-        let mut command = worker_command(std::env::current_exe().unwrap(), efficiency);
+        let mut command = worker_command(std::env::current_exe().unwrap());
         command
             .args([
                 "--exact",
@@ -4937,7 +4721,7 @@ mod tests {
             .env(TEST_WORKER, "1");
         ring.pass_to(&mut command);
         let child = command.spawn().unwrap();
-        let mut worker = Process::attach(child, ring, Arc::default(), efficiency).unwrap();
+        let mut worker = Process::attach(child, ring, Arc::default()).unwrap();
         // Past what the test harness prints first.
         let mut line = String::new();
         while !line.ends_with("test worker ready\n") {
@@ -4950,16 +4734,16 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn worker_error_categories_survive_status_deltas() {
-        let mut worker = test_worker(crate::efficiency::for_workers());
+        let mut worker = test_worker();
         worker.exchange(SessionCommand::Status).unwrap();
         assert!(worker.quiet);
         for _ in 0..2 {
-            // The camera name mentions timeout, but the malformed option is
-            // a usage error. Its type must survive the worker pipe alongside
+            // The selector mentions timeout, but naming a camera hub is a
+            // usage error. Its type must survive the worker pipe alongside
             // the unchanged snapshot's kept fields.
             let error = worker
                 .call(SessionCommand::connect(
-                    "hub:merge-test/camera.timeout?invalid=1".into(),
+                    "hub:merge-test/camera.timeout".into(),
                     100,
                 ))
                 .unwrap_err();
@@ -4987,37 +4771,9 @@ mod tests {
         assert!(reaches(PARKED), "no worker: the poller parks");
         // As if it had just seen no workers, but not yet said so.
         handle.inner.pace.store(QUICK, Ordering::Relaxed);
-        let worker = test_worker(crate::efficiency::for_workers());
+        let worker = test_worker();
         handle.add_worker("cam".into(), worker);
         assert!(reaches(SLOW), "the poller polls the new worker");
-        handle.shutdown();
-    }
-    #[test]
-    #[cfg(unix)]
-    fn running_workers_follow_the_coordinator_efficiency() {
-        use crate::efficiency::Mode;
-        use std::io::Read;
-        // Started the other way, so only a refresh can bring it in line.
-        let efficient = crate::efficiency::efficient();
-        let started = if efficient {
-            Mode::Smooth
-        } else {
-            Mode::Efficient
-        };
-        let handle = SessionHandle::new();
-        handle.add_worker("cam".into(), test_worker(started));
-        handle.refresh_workers();
-        let worker = handle.inner.workers.write().unwrap().remove("cam").unwrap();
-        let mut worker = worker.lock().unwrap();
-        assert_eq!(worker.efficiency, crate::efficiency::for_workers());
-        worker.input.write_all(b"{\"shutdown\":true}\n").unwrap();
-        let mut rest = String::new();
-        worker.output.read_to_string(&mut rest).unwrap();
-        assert!(
-            rest.contains(&format!("test worker efficient {efficient}\n")),
-            "{rest}"
-        );
-        drop(worker);
         handle.shutdown();
     }
     #[test]

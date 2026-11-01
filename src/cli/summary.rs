@@ -136,9 +136,6 @@ pub(super) fn capture_summary(value: &Value) -> String {
             out
         }
     };
-    if let Some(destination) = value["destination"].as_str() {
-        out.push_str(&format!("Destination: {destination}\n"));
-    }
     if let Some(context) = value["context"].as_object().filter(|tags| !tags.is_empty()) {
         let tags = context
             .iter()
@@ -536,7 +533,7 @@ mod tests {
         let files = (1..=3)
             .map(|i| format!("out/frame-00000{i}.png"))
             .collect::<Vec<_>>();
-        let three = json!({"files":files,"frames":files.iter().map(|f| frame(f)).collect::<Vec<_>>(),"destination":"bench","context":{"line":"L1"}});
+        let three = json!({"files":files,"frames":files.iter().map(|f| frame(f)).collect::<Vec<_>>(),"context":{"line":"L1"}});
         let text = capture_summary(&three);
         let sep = std::path::MAIN_SEPARATOR;
         assert!(
@@ -545,10 +542,7 @@ mod tests {
             )),
             "{text}"
         );
-        assert!(
-            text.contains("Destination: bench\nTags: line=L1\n"),
-            "{text}"
-        );
+        assert!(text.contains("\nTags: line=L1\n"), "{text}");
         let many = (1..=25)
             .map(|i| format!("out/f-{i:02}.jpg"))
             .collect::<Vec<_>>();

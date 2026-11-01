@@ -1324,7 +1324,6 @@ mod tests {
             first_at_ms: crate::scheduling::now_ms() + 60_000,
             interval_ms: 0,
             storage: Default::default(),
-            destination: None,
             on_exists: Default::default(),
             context: Default::default(),
         })

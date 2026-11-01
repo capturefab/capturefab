@@ -2,9 +2,9 @@
 //! onvif: cameras. Passwords live only in the OS credential store (service
 //! [`KEYCHAIN_SERVICE`], account `USER@ADDRESS`); the index of which
 //! addresses have one (`camera-logins.json` in the state directory) never
-//! holds a secret. As with hubs, the worker that opens the camera is the
-//! process that reads the saved password, and only after a camera answered
-//! with a sign-in request is one ever sent.
+//! holds a secret. The worker that opens the camera is the process that
+//! reads the saved password, and only after a camera answered with a
+//! sign-in request is one ever sent.
 //!
 //! The address a sign-in is saved under is normalized by [`key`]: scheme,
 //! host and port are compared case-insensitively with the default port made

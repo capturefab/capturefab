@@ -97,8 +97,8 @@ jobs:
       - name: Disk image packaging (real hdiutil)
         if: runner.os == 'macOS'
         run: python3 -m unittest discover -s scripts -p test_release.py -k RealDiskImage -v
-      # Which accelerators this runner exposes; informational, never fails.
-      - name: Report hardware acceleration
+      # What this build reports on the runner; informational, never fails.
+      - name: Report build features
         if: ${{ !cancelled() }}
         shell: bash
         env:
@@ -131,9 +131,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
-      # Builds without optional features keep compiling, alone and with hubs.
+      # Builds without optional features keep compiling, alone and with each one.
       - run: cargo check --locked --no-default-features
-      - run: cargo check --locked --no-default-features --features hubs
+      - run: cargo check --locked --no-default-features --features usb
+      - run: cargo check --locked --no-default-features --features keychain
 
   site:
     name: Site and release scripts

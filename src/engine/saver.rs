@@ -26,7 +26,6 @@ pub(super) struct Save {
     pub(super) plan: crate::naming::Plan,
     pub(super) on_exists: crate::naming::OnExists,
     pub(super) format: String,
-    pub(super) resolved: crate::destination::Resolved,
     pub(super) storage: crate::storage::StoragePolicy,
     pub(super) context: crate::context::Context,
 }
@@ -143,10 +142,7 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<String> {
         &input,
         save.on_exists,
         save.path.clone(),
-        |path| {
-            save.resolved.contain(path)?;
-            crate::storage::save_bytes(&bytes, path, &save.storage)
-        },
+        |path| crate::storage::save_bytes(&bytes, path, &save.storage),
     )
     .with_context(|| format!("save {}", save.path.display()))?;
     report_image(

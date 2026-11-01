@@ -573,28 +573,20 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
             output,
             count,
             format,
-            destination,
             ..
         } => (
             "capture",
-            format!(
-                "Capture {count} {format} frame(s) → {}",
-                output_label(output, destination)
-            ),
+            format!("Capture {count} {format} frame(s) → {output}"),
         ),
         Schedule {
             output,
             count,
             format,
-            destination,
             interval_ms,
             ..
         } => (
             "schedule",
-            format!(
-                "Schedule {count} {format} frame(s), every {interval_ms} ms → {}",
-                output_label(output, destination)
-            ),
+            format!("Schedule {count} {format} frame(s), every {interval_ms} ms → {output}"),
         ),
         Jobs => ("jobs", "Read capture jobs".into()),
         CancelJob { id } => ("cancel_job", format!("Cancel capture job {id}")),
@@ -615,7 +607,6 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
         Forward {
             output,
             codec,
-            destination,
             duration_ms,
             ..
         } => (
@@ -630,18 +621,12 @@ fn describe(command: &SessionCommand) -> (&'static str, String) {
                 duration_ms
                     .map(|ms| format!(" for {}", crate::scheduling::format_duration(ms)))
                     .unwrap_or_default(),
-                output_label(output, destination)
+                output
             ),
         ),
         StopForward | StopForwardIf { .. } => {
             ("stop_forward", "Stop forwarding / recording".into())
         }
-    }
-}
-fn output_label(output: &str, destination: &Option<String>) -> String {
-    match destination {
-        Some(destination) => format!("{destination} / {output}"),
-        None => output.into(),
     }
 }
 fn result_detail(value: &Value, files: &[String], file_count: usize) -> Option<String> {
@@ -854,7 +839,6 @@ mod tests {
             next_at_ms: 1,
             last_file: None,
             error: None,
-            destination: None,
             context: Default::default(),
         };
         schedule.finish(&Ok(json!({"job":job,"worker_pid":42})));
@@ -1146,7 +1130,7 @@ mod tests {
     }
     #[test]
     fn forward_labels_say_what_they_record_and_for_how_long() {
-        let forward = |output: &str, destination: Option<&str>, duration_ms| {
+        let forward = |output: &str, duration_ms| {
             let activity = Arc::new(Activity::default());
             let command = SessionCommand::Forward {
                 output: output.into(),
@@ -1156,7 +1140,6 @@ mod tests {
                 bitrate: "4M".into(),
                 storage: Default::default(),
                 max_file_bytes: crate::media::default_recording_cap(),
-                destination: destination.map(Into::into),
                 on_exists: Default::default(),
                 context: Default::default(),
                 duration_ms,
@@ -1167,15 +1150,15 @@ mod tests {
             label
         };
         assert_eq!(
-            forward("line1/run.mp4", None, Some(3_600_000)),
+            forward("line1/run.mp4", Some(3_600_000)),
             "Record h264 for 1 h → line1/run.mp4"
         );
         assert_eq!(
-            forward("run.mkv", Some("archive"), Some(90_000)),
-            "Record h264 for 1 min 30 s → archive / run.mkv"
+            forward("run.mkv", Some(90_000)),
+            "Record h264 for 1 min 30 s → run.mkv"
         );
-        assert_eq!(forward("run.mkv", None, None), "Record h264 → run.mkv");
-        let stream = forward("rtsp://user:secret@nvr/live", None, Some(30_000));
+        assert_eq!(forward("run.mkv", None), "Record h264 → run.mkv");
+        let stream = forward("rtsp://user:secret@nvr/live", Some(30_000));
         assert!(
             stream.starts_with("Forward h264 for 30 s → rtsp://"),
             "{stream}"

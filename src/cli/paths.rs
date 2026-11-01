@@ -35,25 +35,14 @@ pub(crate) fn resolve_selector(selector: &mut String, base: &Path) -> Result<()>
     Ok(())
 }
 
-/// Resolve a command's relative local outputs against `base`. Named
-/// destination outputs keep their own base; stream URLs are untouched.
+/// Resolve a command's relative local outputs against `base`; stream URLs
+/// are untouched.
 pub(crate) fn resolve_outputs(command: &mut SessionCommand, base: &Path) -> Result<()> {
     match command {
-        SessionCommand::Capture {
-            output,
-            destination: None,
-            ..
+        SessionCommand::Capture { output, .. } | SessionCommand::Schedule { output, .. } => {
+            resolve_path(output, base)
         }
-        | SessionCommand::Schedule {
-            output,
-            destination: None,
-            ..
-        } => resolve_path(output, base),
-        SessionCommand::Forward {
-            output,
-            destination: None,
-            ..
-        } if crate::media::is_recording(output) => {
+        SessionCommand::Forward { output, .. } if crate::media::is_recording(output) => {
             // `file:relative.mkv` is a local path, while `file:///...` and
             // `file://localhost/...` are already absolute file URLs.
             if let Some((scheme, path)) = output.split_once(':')

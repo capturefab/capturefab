@@ -3,7 +3,6 @@
 //! the capture disk, each turned into a check with a copyable fix.
 #![allow(unsafe_code)]
 
-use crate::efficiency::{self, Mode, Resolved};
 use crate::ipc::LoginDir;
 use crate::media::FfmpegHealth;
 use crate::network::{InterfaceKind, NetworkInterface};
@@ -131,10 +130,9 @@ struct UsbCamera {
 
 /// What the checks look at, gathered once.
 struct Facts {
-    efficiency: Resolved,
     /// Where sessions are found, with their short-lived files.
     runtime: Place,
-    /// Settings, saved destinations and the storage ledger.
+    /// Settings, saved setups and the storage ledger.
     state: Place,
     /// CAPTUREFAB_SESSION_DIR chose both.
     session_dir_set: bool,
@@ -195,7 +193,6 @@ impl Facts {
                 .then(|| crate::media::ffmpeg_health().map_err(|error| format!("{error:#}"))),
             ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG").is_some(),
             private_dirs,
-            efficiency: efficiency::current(),
             budget,
             used,
             runtime: Place::of(crate::ipc::runtime_dir()),
@@ -226,8 +223,16 @@ impl Facts {
 /// and the checks.
 pub fn add_host(report: &mut Value) {
     let facts = Facts::gather(true);
-    report["host"] = json!(efficiency::host());
-    report["efficiency"] = json!(facts.efficiency);
+    report["host"] = json!({
+        "cpu_cores": std::thread::available_parallelism().map_or(1, |cores| cores.get()),
+    });
+    report["ffmpeg"] = match &facts.ffmpeg {
+        Some(Ok(health)) => {
+            json!({"source": health.source, "path": health.path, "version": health.version})
+        }
+        Some(Err(error)) => json!({ "error": error }),
+        None => Value::Null,
+    };
     report["paths"] = json!({
         "runtime": facts.runtime,
         "state": facts.state,
@@ -236,13 +241,7 @@ pub fn add_host(report: &mut Value) {
         "working_directory": facts.working_directory,
     });
     report["limits"] = json!(facts.limits);
-    let mut checks = checks(&facts);
-    checks.extend(
-        crate::updates::doctor_notes()
-            .into_iter()
-            .map(|(message, fix)| Check::warn("updates", message, fix)),
-    );
-    report["checks"] = json!(checks);
+    report["checks"] = json!(checks(&facts));
 }
 
 /// For `serve`: one line naming what `doctor` warns about.
@@ -271,22 +270,6 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
         text(&report["arch"])
     )];
     summary.push(format!("{} CPU cores", host["cpu_cores"]));
-    if let Some(total) = host["memory_total"].as_u64() {
-        summary.push(match host["memory_available"].as_u64() {
-            Some(free) => format!(
-                "{} memory, {} available",
-                human_bytes(total),
-                human_bytes(free)
-            ),
-            None => format!("{} memory", human_bytes(total)),
-        });
-    }
-    if host["on_battery"] == true {
-        summary.push("on battery".into());
-    }
-    if host["low_power"] == true {
-        summary.push("low-power mode".into());
-    }
     writeln!(out, "{}", summary.join(" · "))?;
     for check in report["checks"].as_array().into_iter().flatten() {
         writeln!(
@@ -301,7 +284,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     }
     writeln!(
         out,
-        "More: {GUIDE}. See also network-scan and ffmpeg; --json adds features, scanners, JPEG encoders and interfaces."
+        "More: {GUIDE}. See also network-scan; --json adds features, FFmpeg, JPEG and interfaces."
     )?;
     if report["os"] == "linux" {
         writeln!(out, "Running it as a service: {LINE_COMPUTER}")?;
@@ -310,7 +293,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
 }
 
 fn checks(facts: &Facts) -> Vec<Check> {
-    let mut checks = vec![efficiency_check(&facts.efficiency)];
+    let mut checks = Vec::new();
     checks.extend(
         facts
             .missed_runtime_dir
@@ -345,33 +328,11 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks
 }
 
-fn efficiency_check(resolved: &Resolved) -> Check {
-    let mode = if resolved.efficient {
-        "Efficient"
-    } else {
-        "Smooth"
-    };
-    let why = if resolved.reasons.is_empty() {
-        "auto found no constraint".to_owned()
-    } else {
-        resolved.reasons.join(", ")
-    };
-    let mut check = Check::ok("efficiency", format!("{mode} mode: {why}."));
-    if resolved.efficient && resolved.setting == Mode::Auto {
-        check.fix = Some(
-            "To stay smooth anyway, use --efficiency smooth or CAPTUREFAB_EFFICIENCY=smooth."
-                .into(),
-        );
-    }
-    check
-}
-
 /// Without XDG_RUNTIME_DIR, Capturefab uses the login's runtime directory
 /// for a lingering user, so a service and an SSH shell find the same
 /// sessions. Otherwise logind removes it at logout, taking a service's
 /// session with it, so Capturefab falls back to disk. Frame rings are
-/// anonymous memory either way, but the nvJPEG and VA-API helpers' staging
-/// buffers are files there (`accel`).
+/// anonymous memory either way.
 fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place) -> Check {
     let dir = login.display();
     let runtime = runtime.path.display();
@@ -383,7 +344,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
             "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
         ),
         format!(
-            "{fix} Settings, destinations and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
+            "{fix} Settings, saved setups and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
         ),
     )
 }
@@ -463,7 +424,7 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
         return Check::ok(
             "session_storage",
             format!(
-                "Settings, saved destinations and the storage ledger are in {}.",
+                "Settings, saved setups and the storage ledger are in {}.",
                 state.described()
             ),
         );
@@ -471,12 +432,12 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
     let mut check = Check::ok(
         "session_storage",
         format!(
-            "Settings, saved destinations and the storage ledger are in memory in {} and are cleared at reboot.",
+            "Settings, saved setups and the storage ledger are in memory in {} and are cleared at reboot.",
             state.described()
         ),
     );
     check.fix = Some(if session_dir_set {
-        "To keep them, unset CAPTUREFAB_SESSION_DIR. A folder on disk keeps them too, but JPEG captures encoded by nvJPEG or VA-API then pass their pixels through a mapped file there.".into()
+        "To keep them, unset CAPTUREFAB_SESSION_DIR.".into()
     } else if cfg!(target_os = "linux") {
         "To keep them, point XDG_STATE_HOME at a folder on disk.".into()
     } else {
@@ -1051,7 +1012,7 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.message,
-            "Settings, saved destinations and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
+            "Settings, saved setups and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
         );
         assert_eq!(check.fix, None);
         // Memory is only ever chosen, so it informs rather than warns, with
@@ -1062,8 +1023,7 @@ mod tests {
         assert!(chosen.message.contains("(tmpfs)"), "{}", chosen.message);
         assert!(chosen.message.contains("cleared at reboot"));
         let fix = chosen.fix.unwrap();
-        assert!(fix.starts_with("To keep them, unset CAPTUREFAB_SESSION_DIR."));
-        assert!(fix.contains("nvJPEG or VA-API"), "{fix}");
+        assert_eq!(fix, "To keep them, unset CAPTUREFAB_SESSION_DIR.");
         let fix = session_check(&memory, false).fix.unwrap();
         assert!(
             fix.contains(if cfg!(target_os = "linux") {
@@ -1399,29 +1359,6 @@ mod tests {
     }
 
     #[test]
-    fn efficiency_checks_explain_themselves() {
-        let auto = Resolved {
-            setting: Mode::Auto,
-            efficient: true,
-            reasons: vec!["2 CPU cores".into()],
-        };
-        let check = efficiency_check(&auto);
-        assert_eq!(
-            (check.level, check.message.as_str()),
-            (Level::Ok, "Efficient mode: 2 CPU cores.")
-        );
-        assert!(check.fix.unwrap().contains("--efficiency smooth"));
-        let auto_smooth = Resolved {
-            setting: Mode::Auto,
-            efficient: false,
-            reasons: Vec::new(),
-        };
-        let smooth = efficiency_check(&auto_smooth);
-        assert_eq!(smooth.message, "Smooth mode: auto found no constraint.");
-        assert_eq!(smooth.fix, None);
-    }
-
-    #[test]
     fn places_describe_their_file_system() {
         assert_eq!(file_system_name(0x0102_1994), "tmpfs");
         assert_eq!(file_system_name(0x1234), "0x1234");
@@ -1440,9 +1377,9 @@ mod tests {
     fn checklist_prints_one_line_per_check_with_fixes() {
         let report = json!({
             "version":"0.2.2","os":"linux","arch":"aarch64",
-            "host":{"cpu_cores":4,"memory_total":4_u64 << 30,"memory_available":3_u64 << 30,"on_battery":false,"low_power":false},
+            "host":{"cpu_cores":4},
             "checks":[
-                Check::ok("efficiency", "Smooth mode: auto found no constraint.".into()),
+                Check::ok("ffmpeg", "FFmpeg 8.0 (bundled) runs; webcams, RTSP/SRT, files and recording use it.".into()),
                 receive_buffer_check(212_992),
             ],
         });
@@ -1450,11 +1387,11 @@ mod tests {
         print_checklist(&mut out, &report).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "Capturefab 0.2.2 on linux aarch64 · 4 CPU cores");
         assert_eq!(
-            lines[0],
-            "Capturefab 0.2.2 on linux aarch64 · 4 CPU cores · 4.00 GiB memory, 3.00 GiB available"
+            lines[1],
+            "ok    FFmpeg 8.0 (bundled) runs; webcams, RTSP/SRT, files and recording use it."
         );
-        assert_eq!(lines[1], "ok    Smooth mode: auto found no constraint.");
         assert!(lines[2].starts_with("warn  net.core.rmem_max is 208.0 KiB"));
         assert!(lines[3].starts_with("      Fix: sudo sysctl -w"));
         assert!(
@@ -1462,7 +1399,7 @@ mod tests {
             "{text}"
         );
         // What plain doctor no longer prints, so the docs' pointers still work.
-        assert!(lines[4].contains("scanners, JPEG"), "{text}");
+        assert!(lines[4].contains("FFmpeg, JPEG"), "{text}");
         // Linux hosts also get the service guide that walks through these fixes.
         assert!(lines[5].ends_with("/docs/line-computer.md"), "{text}");
         assert_eq!(lines.len(), 6);

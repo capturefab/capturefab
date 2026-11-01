@@ -775,7 +775,6 @@ pub(super) fn process(
         camera_mut(camera)?.validate_set(feature, value)?;
     }
     let busy = forwarder.is_some() || jobs.iter().any(|job| job.info.active());
-    let scanner = camera.as_ref().is_some_and(Camera::is_scanner);
     match &command {
         SessionCommand::Undo => return replay(h, camera, auto, None, true, busy),
         SessionCommand::Redo => return replay(h, camera, auto, None, false, busy),
@@ -799,24 +798,20 @@ pub(super) fn process(
         }
         _ => {}
     }
-    let eligible =
-        matches!(
-            command,
-            SessionCommand::Set { .. }
-                | SessionCommand::SetMany { .. }
-                | SessionCommand::Auto { .. }
-                | SessionCommand::Manual { .. }
-                | SessionCommand::ApplySetup { .. }
-        ) || !busy && !scanner && matches!(command, SessionCommand::Start | SessionCommand::Stop);
+    let eligible = matches!(
+        command,
+        SessionCommand::Set { .. }
+            | SessionCommand::SetMany { .. }
+            | SessionCommand::Auto { .. }
+            | SessionCommand::Manual { .. }
+            | SessionCommand::ApplySetup { .. }
+    ) || !busy && matches!(command, SessionCommand::Start | SessionCommand::Stop);
     if !eligible {
         let boundary = matches!(
             command,
             SessionCommand::Connect { .. } | SessionCommand::Disconnect
         );
         let unavailable = match &command {
-            SessionCommand::Start | SessionCommand::Stop if scanner => Some(
-                "Scanner acquisition may move or consume a document; it cannot be undone or replayed safely.",
-            ),
             SessionCommand::Execute { .. } => {
                 Some("Camera commands may have irreversible effects and cannot be replayed safely.")
             }
@@ -1357,7 +1352,6 @@ mod tests {
             first_at_ms: crate::scheduling::now_ms() + 60_000,
             interval_ms: 0,
             storage: Default::default(),
-            destination: None,
             on_exists: Default::default(),
             context: Default::default(),
         })

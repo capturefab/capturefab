@@ -160,7 +160,6 @@ fn kind_name(kind: CameraKind) -> &'static str {
         CameraKind::Depth => "depth",
         CameraKind::Microscope => "microscope",
         CameraKind::Thermal => "thermal",
-        CameraKind::DocumentScanner => "document_scanner",
     }
 }
 

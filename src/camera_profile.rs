@@ -15,7 +15,6 @@ pub enum CameraKind {
     Depth,
     Microscope,
     Thermal,
-    DocumentScanner,
 }
 
 impl CameraKind {
@@ -33,7 +32,6 @@ impl CameraKind {
             Self::Depth => "Depth",
             Self::Microscope => "Microscope",
             Self::Thermal => "Thermal",
-            Self::DocumentScanner => "Document scanner",
         }
     }
 
@@ -55,9 +53,6 @@ impl CameraKind {
             Self::Thermal => {
                 "Capture thermal measurements. Configure radiometric output and temperature calibration."
             }
-            Self::DocumentScanner => {
-                "Capture a page on demand. Choose scan resolution, color mode and paper source."
-            }
         }
     }
 }
@@ -73,7 +68,6 @@ impl std::fmt::Display for CameraKind {
 pub enum DetectionSource {
     #[default]
     Unknown,
-    Transport,
     Identity,
     Features,
     DeviceMetadata,
@@ -83,7 +77,6 @@ impl std::fmt::Display for DetectionSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Unknown => "Not reported",
-            Self::Transport => "Source transport",
             Self::Identity => "Camera identity",
             Self::Features => "Camera features",
             Self::DeviceMetadata => "Device metadata",
@@ -112,8 +105,6 @@ pub enum CameraCapability {
     Magnification,
     Illumination,
     Temperature,
-    ScanResolution,
-    ScanSource,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -145,7 +136,6 @@ fn metadata_kind(value: &str) -> Option<CameraKind> {
         | "timeofflight" | "tof" | "stereo" => Some(CameraKind::Depth),
         "microscope" | "microscopecamera" | "microscopy" => Some(CameraKind::Microscope),
         "thermal" | "thermalcamera" | "thermalimager" | "radiometric" => Some(CameraKind::Thermal),
-        "documentscanner" | "scanner" => Some(CameraKind::DocumentScanner),
         _ => None,
     }
 }
@@ -261,18 +251,6 @@ fn capabilities(features: &[FeatureInfo]) -> Vec<CameraCapability> {
                 ],
                 &["TemperatureLinear", "TemperatureRange", "Radiometric"],
             ),
-        ),
-        (
-            ScanResolution,
-            capability(
-                features,
-                &["ScanResolution", "ScanResolutionX", "ScanResolutionY"],
-                &[],
-            ),
-        ),
-        (
-            ScanSource,
-            capability(features, &["ScanSource", "ScanDuplex", "ScanPageSize"], &[]),
         ),
     ]
     .into_iter()
@@ -394,13 +372,6 @@ pub fn detect(info: &CameraInfo, features: &[FeatureInfo]) -> CameraProfile {
         evidence,
         capabilities: capabilities.clone(),
     };
-    if info.transport == crate::types::Transport::Scanner {
-        return profile(
-            CameraKind::DocumentScanner,
-            DetectionSource::Transport,
-            vec!["Document scanner transport".into()],
-        );
-    }
     let declared = declared_kind(features, &["DeviceType", "CameraType", "SensorType"]);
     // Device class is authoritative. Scan geometry is less specific: depth
     // and microscope cameras commonly use an area sensor.
@@ -638,19 +609,13 @@ mod tests {
         let features = [
             f("DeviceType", json!("Transmitter")),
             f("ExposureTime", json!(1000)),
-            f("ScanSource", json!("Flatbed")),
+            f("Width", json!(640)),
         ];
         let p = detect(&camera("Generic"), &features);
         assert_eq!(p.kind, CameraKind::Unknown);
         assert!(p.supports(CameraCapability::Exposure));
-        assert!(p.supports(CameraCapability::ScanSource));
+        assert!(p.supports(CameraCapability::Roi));
         assert!(!p.supports(CameraCapability::DepthRange));
-        let mut scanner = camera("Thermal camera");
-        scanner.transport = Transport::Scanner;
-        assert_eq!(
-            detect(&scanner, &features).kind,
-            CameraKind::DocumentScanner
-        );
     }
 
     #[test]

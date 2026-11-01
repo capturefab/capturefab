@@ -8,32 +8,13 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "hubs", "updates", "keychain"]
+default = ["usb", "jpeg", "keychain"]
 usb = ["dep:nusb"]
-# Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
-# Drivers run in disposable helper processes, never in the camera worker.
-scanner = []
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
-# NVIDIA nvJPEG/CUDA, loaded at runtime in an isolated helper process; no SDK at build time.
-nvjpeg = ["dep:libloading"]
-# VA-API hardware JPEG (Intel iHD and other drivers), libva loaded at runtime in
-# an isolated helper process; libjpeg-turbo verifies its output at start-up.
-vaapi = ["dep:libloading", "jpeg"]
-# OS credential store (Keychain / Credential Manager / Secret Service) shared by
-# saved camera sign-ins and camera hubs.
+# OS credential store (Keychain / Credential Manager / Secret Service) for
+# saved camera sign-ins.
 keychain = ["dep:keyring"]
-# New-version checks: a GET of the public releases.json over HTTPS with the
-# OS certificate store.
-updates = ["dep:ureq"]
-# Camera hubs (Home Assistant, Frigate, go2rtc, UniFi Protect): a hand-rolled
-# HTTP/1.1 client with rustls (ring; the OS trust store or a pinned certificate)
-# in the camera worker, JPEG/PNG decoded there with libjpeg-turbo and png, and
-# RTSP restreams through FFmpeg. Secrets come from the environment, or from the
-# OS credential store when `keychain` is also enabled.
-hubs = ["jpeg", "dep:rustls", "dep:rustls-platform-verifier"]
-# Apple's hardware JPEG engine through VideoToolbox (system frameworks; no-op off macOS).
-videotoolbox = []
 
 [dependencies]
 anyhow = "1"
@@ -60,26 +41,21 @@ fs2 = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
-libloading = { version = "0.8", optional = true }
-ureq = { version = "3.4", optional = true, default-features = false, features = ["rustls", "platform-verifier"] }
 keyring = { version = "4.2", optional = true }
 zeroize = "1"
-# TLS for camera hubs: ring only (no aws-lc-rs, so no C toolchain or cmake).
-rustls = { version = "0.23.45", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
-rustls-platform-verifier = { version = "0.7.1", optional = true }
 
-# ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
-# SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
-# Drive types and labels for the capture destination's volume list.
+# Share modes for the frame ring's backing file.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Power", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
-# Host facts for doctor and efficiency mode (sysctl, statfs, access), and
-# anonymous shared memory for frame rings (memfd_create, shm_open) with
-# descriptor inheritance by camera workers.
+# Host facts for doctor (sysctl, statfs, access), and anonymous shared memory
+# for frame rings (memfd_create, shm_open) with descriptor inheritance by
+# camera workers.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
+# SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
 

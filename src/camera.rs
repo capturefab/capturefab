@@ -6,33 +6,15 @@ use anyhow::{Context, Result, ensure};
 use std::{net::Ipv4Addr, time::Duration};
 
 pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, Vec<String>)> {
-    discover_with(timeout, simulated, false)
-}
-
-/// Discover cameras, adding cameras on saved hubs when `hubs` is set. Only
-/// the session coordinator lists hubs; camera workers never contact them.
-pub fn discover_with(
-    timeout: Duration,
-    simulated: bool,
-    hubs: bool,
-) -> Result<(Vec<CameraInfo>, Vec<String>)> {
     let mut devices = Vec::new();
     let mut warnings = Vec::new();
-    let (gige, onvif, native, scanners, hub_cameras) = std::thread::scope(|s| {
+    let (gige, onvif, native) = std::thread::scope(|s| {
         let g = s.spawn(|| crate::transport::gige::discover(timeout));
         let o = s.spawn(|| crate::onvif::camera_infos(timeout));
         let n = s.spawn(|| crate::media::native_devices_with_timeout(timeout));
-        let d = s.spawn(|| crate::scanner::discover(timeout));
-        let h = hubs.then(|| s.spawn(|| crate::hubs::discovered(timeout)));
-        (
-            g.join(),
-            o.join(),
-            n.join(),
-            d.join(),
-            h.map(|h| h.join().unwrap_or_default()),
-        )
+        (g.join(), o.join(), n.join())
     });
-    for (label, result) in [("GigE", gige), ("ONVIF", onvif), ("Scanner", scanners)] {
+    for (label, result) in [("GigE", gige), ("ONVIF", onvif)] {
         match result {
             Ok(Ok(v)) => devices.extend(v),
             Ok(Err(e)) => warnings.push(format!("{label} discovery: {e:#}")),
@@ -70,12 +52,6 @@ pub fn discover_with(
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
     devices.dedup_by(|a, b| a.id == b.id);
-    // Hub cameras come after local ones, so they never push USB or GigE
-    // cameras off the welcome screen.
-    if let Some((hub_devices, hub_warnings)) = hub_cameras {
-        devices.extend(hub_devices);
-        warnings.extend(hub_warnings);
-    }
     for info in &mut devices {
         info.profile = crate::camera_profile::detect(info, &[]);
     }
@@ -136,12 +112,19 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
             discovered_id || address.parse::<Ipv4Addr>().is_ok(),
             "GigE selector needs an IPv4 address or a discovered ID, for example gige:192.168.1.10"
         );
-    } else if crate::scanner::is_source(selector) {
-        crate::scanner::validate_selector_shape(selector)?;
+    } else if prefixed(selector, "hub:") {
+        return Err(crate::types::Usage(format!(
+            "'{}' names a camera hub, which Capturefab no longer opens; use the camera's RTSP stream from the hub instead, for example rtsp://HOST:8554/CAMERA from Frigate or go2rtc",
+            crate::media::redact_url(selector)
+        ))
+        .into());
+    } else if prefixed(selector, "scanner:") {
+        return Err(crate::types::Usage(
+            "document scanners are not supported; capture from a camera instead".into(),
+        )
+        .into());
     } else if crate::onvif::is_source(selector) {
         crate::onvif::validate_source_shape(selector)?;
-    } else if crate::hubs::is_source(selector) {
-        crate::hubs::validate_shape(selector)?;
     } else if crate::media::is_url_source(selector) || selector.contains("://") {
         crate::media::validate_source_shape(selector)?;
     } else if malformed_ipv4(selector) {
@@ -151,6 +134,13 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+/// `selector` starts with `prefix`, ignoring ASCII case.
+fn prefixed(selector: &str, prefix: &str) -> bool {
+    selector
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
 }
 
 /// How a bare selector (no `sim:`, `gige:`, URL or other explicit form)
@@ -177,17 +167,13 @@ pub fn is_explicit_selector(selector: &str) -> bool {
         || selector.starts_with("gige:")
         || selector.parse::<Ipv4Addr>().is_ok()
         || selector.contains("://")
-        || crate::scanner::is_source(selector)
         || crate::onvif::is_source(selector)
-        || crate::hubs::is_source(selector)
         || crate::media::is_source(selector)
 }
 
 /// Resolve a bare selector against discovered cameras. Exact ID, serial or
 /// address wins; otherwise a unique case-insensitive model or name match,
-/// then a unique run of whole model words. Hub cameras keep their exact selectors only, so
-/// a loose name can never reach a hub's permission checks under another
-/// identity.
+/// then a unique run of whole model words.
 pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
     let exact: Vec<_> = known
         .iter()
@@ -205,10 +191,6 @@ pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
         return Resolution::NotFound;
     }
     let wanted = selector.to_lowercase();
-    let local: Vec<_> = known
-        .iter()
-        .filter(|d| !crate::hubs::is_source(&d.id))
-        .collect();
     let suffix = |d: &CameraInfo| {
         d.id.split_once(':')
             .map_or(d.id.as_str(), |(_, rest)| rest)
@@ -224,16 +206,16 @@ pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
             matches.iter().map(|(info, _)| (*info).clone()).collect(),
         )),
     };
-    let equal = local
+    let equal = known
         .iter()
         .filter_map(|d| {
             if d.model.to_lowercase() == wanted {
-                Some((*d, "model"))
+                Some((d, "model"))
             } else if suffix(d) == wanted
                 || d.id.to_lowercase() == wanted
                 || d.serial.to_lowercase() == wanted
             {
-                Some((*d, "name"))
+                Some((d, "name"))
             } else {
                 None
             }
@@ -244,21 +226,19 @@ pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
     }
     // Then whole words of a model (`C920` in `HD Pro Webcam C920`), never
     // part of a word, an ID or a serial: a partial or stale serial must not
-    // open another camera. A scanner needs its model in full, because a
-    // feeder consumes paper.
+    // open another camera.
     let words = wanted.split_whitespace().collect::<Vec<_>>();
     if wanted.chars().count() < 3 || words.is_empty() {
         return Resolution::NotFound;
     }
-    let partial = local
+    let partial = known
         .iter()
-        .filter(|d| !crate::scanner::is_source(&d.id))
         .filter(|d| {
             let model = d.model.to_lowercase();
             let model = model.split_whitespace().collect::<Vec<_>>();
             model.windows(words.len()).any(|window| window == words)
         })
-        .map(|d| (*d, "model"))
+        .map(|d| (d, "model"))
         .collect();
     pick(partial).unwrap_or(Resolution::NotFound)
 }
@@ -384,12 +364,8 @@ pub fn validate_selector(selector: &str) -> Result<()> {
     validate_selector_shape(selector)?;
     if let Some(source) = crate::transport::simulator::replay_source(selector) {
         crate::transport::simulator::replay::source_files(source)?;
-    } else if crate::scanner::is_source(selector) {
-        crate::scanner::info(selector)?;
     } else if crate::onvif::is_source(selector) {
         crate::onvif::validate_source(selector)?;
-    } else if crate::hubs::is_source(selector) {
-        crate::hubs::validate(selector)?;
     } else if (crate::media::is_source(selector) || selector.contains("://"))
         && !crate::onvif::is_source(selector)
     {
@@ -415,19 +391,8 @@ impl Camera {
             let (info, backend) = crate::onvif::connect_with(selector, login, timeout)?;
             return Self::from_backend(info, backend);
         }
-        if crate::hubs::is_source(selector) {
-            let (info, backend) = crate::hubs::connect(selector, timeout)?;
-            return Self::from_backend(info, backend);
-        }
         let info = if selector.starts_with("sim:") {
             crate::transport::simulator::info_named(selector)
-        } else if crate::scanner::is_source(selector) {
-            known
-                .iter()
-                .find(|d| d.id == selector && d.transport == Transport::Scanner)
-                .cloned()
-                .map(Ok)
-                .unwrap_or_else(|| crate::scanner::info(selector))?
         } else if crate::media::is_source(selector) {
             crate::media::info(selector)?
         } else if let Ok(ip) = selector
@@ -447,17 +412,9 @@ impl Camera {
         };
         let backend: Box<dyn Backend> = match info.transport {
             Transport::Simulator => crate::transport::simulator::open(&info.id, timeout)?,
-            Transport::Scanner => crate::scanner::open(&info)?,
             Transport::Media => {
                 if crate::onvif::is_source(&info.id) {
                     let (info, backend) = crate::onvif::connect_with(&info.id, login, timeout)?;
-                    return Self::from_backend(info, backend);
-                }
-                // A hub camera opened by its serial keeps the options its
-                // discovered address carries.
-                if crate::hubs::is_source(&info.id) {
-                    let address = info.address.as_deref().unwrap_or(&info.id);
-                    let (info, backend) = crate::hubs::connect(address, timeout)?;
                     return Self::from_backend(info, backend);
                 }
                 if crate::media::is_source(selector) {
@@ -863,9 +820,6 @@ impl Camera {
             }
             _ => fired,
         }
-    }
-    pub fn is_scanner(&self) -> bool {
-        self.info.transport == Transport::Scanner
     }
     pub fn stop(&mut self) -> Result<()> {
         if !self.streaming {
@@ -1515,11 +1469,6 @@ pub(crate) mod tests {
                 "avfoundation:Capture screen 0",
             ),
             device("gige:02007f000001", "Virtual GigE camera", "SIM7F000001"),
-            device(
-                "hub:home/camera.front_door",
-                "Front door",
-                "home/camera.front_door",
-            ),
         ]
     }
     fn open_error(selector: &str, known: &[CameraInfo]) -> anyhow::Error {
@@ -1580,19 +1529,11 @@ pub(crate) mod tests {
         let mut known = known();
         known.push(device("usb:2676:ba02:23015", "Industrial camera", "23015"));
         known.push(device(
-            "scanner:ica:E3248000-80CE-11DB-8000-3C2AF4FA0DE9",
-            "Brother MFC-L2750DW series",
+            "onvif:http://192.0.2.7:80/onvif/device_service",
+            "Lobby PTZ camera",
             "E3248000-80CE-11DB-8000-3C2AF4FA0DE9",
         ));
-        for selector in [
-            "2301",
-            "ba02:2301",
-            "E3248",
-            "e3248000",
-            "cam",
-            "webca",
-            "Brother",
-        ] {
+        for selector in ["2301", "ba02:2301", "E3248", "e3248000", "cam", "webca"] {
             assert_eq!(
                 resolve_selector(selector, &known),
                 Resolution::NotFound,
@@ -1600,19 +1541,21 @@ pub(crate) mod tests {
             );
         }
         assert!(matches!(
-            resolve_selector("brother mfc-l2750dw series", &known),
-            Resolution::Loose { info, .. } if info.id.starts_with("scanner:")
+            resolve_selector("lobby ptz camera", &known),
+            Resolution::Loose { info, .. } if info.id.starts_with("onvif:")
         ));
     }
 
     #[test]
-    fn hub_cameras_are_never_matched_loosely() {
-        let known = known();
-        assert_eq!(resolve_selector("front door", &known), Resolution::NotFound);
-        assert!(matches!(
-            resolve_selector("home/camera.front_door", &known),
-            Resolution::Exact(info) if info.id.starts_with("hub:")
-        ));
+    fn hub_and_scanner_selectors_are_usage_errors_with_a_way_forward() {
+        for selector in ["hub:home/camera.front_door", "HUB:x/y"] {
+            let error = validate_selector_shape(selector).unwrap_err();
+            assert_eq!(crate::cli::error_code(&error), ("usage", 2));
+            assert!(error.to_string().contains("rtsp://HOST"), "{error:#}");
+        }
+        let error = validate_selector("scanner:sane:device").unwrap_err();
+        assert_eq!(crate::cli::error_code(&error), ("usage", 2));
+        assert!(error.to_string().contains("not supported"), "{error:#}");
     }
 
     #[test]
@@ -1717,13 +1660,6 @@ pub(crate) mod tests {
         );
         validate_selector_shape(&source).unwrap();
         assert!(validate_selector(&source).is_err());
-        for source in [
-            "scanner:sane:device",
-            "scanner:wia:device",
-            "scanner:ica:device",
-        ] {
-            validate_selector_shape(source).unwrap();
-        }
     }
 
     #[test]

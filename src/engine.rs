@@ -794,8 +794,7 @@ fn finish_timed_forward_at(
         })
     });
 }
-/// Pick a free name for a recording template under its destination and
-/// create the file, moving to the next free name when another writer (another
+/// Pick a free name for a recording template and create the file, moving to the next free name when another writer (another
 /// camera's worker) took it first.
 fn name_recording(
     h: &WorkerHandle,
@@ -803,13 +802,9 @@ fn name_recording(
     camera: &str,
     on_exists: crate::naming::OnExists,
     context: &crate::context::Context,
-) -> Result<(
-    PathBuf,
-    crate::destination::Resolved,
-    crate::storage::StorageWriter,
-)> {
-    let resolved = crate::destination::resolve(config.destination.as_deref(), &config.output)?;
-    let local = crate::media::local_file_path(&resolved.output)?;
+) -> Result<(PathBuf, crate::storage::StorageWriter)> {
+    crate::naming::validate_output(&config.output)?;
+    let local = crate::media::local_file_path(&config.output)?;
     let local = local
         .to_str()
         .context("recording path must be valid UTF-8")?
@@ -832,11 +827,10 @@ fn name_recording(
         .candidate(&plan, &input, on_exists)?;
     let (path, writer) =
         crate::naming::save_named(&h.names, &plan, &input, on_exists, first, |path| {
-            resolved.contain(path)?;
             check_parents(path)?;
             crate::storage::create_writer(path, &config.storage, config.max_file_bytes)
         })?;
-    Ok((path, resolved, writer))
+    Ok((path, writer))
 }
 fn absolute_path(path: &std::path::Path) -> String {
     std::path::absolute(path)
@@ -1027,10 +1021,6 @@ fn enter_auto(
     balance: Option<f64>,
 ) -> Result<Value> {
     let c = camera_mut(camera)?;
-    ensure!(
-        !c.is_scanner(),
-        "scanner auto exposure is unsupported; configure scan settings with set"
-    );
     let explicit = match auto.as_mut() {
         Some(controller) => {
             if let Some(balance) = balance {
@@ -1073,10 +1063,6 @@ fn process_plain(
             let duration = timeout(timeout_ms)?;
             let deadline = Instant::now() + duration;
             let c = camera_mut(camera)?;
-            ensure!(
-                !c.is_scanner(),
-                "a document scanner cannot be inspected without scanning a page"
-            );
             let was_streaming = c.is_streaming();
             c.start()?;
             // Capture without a file, name or log line: the frame only
@@ -1168,15 +1154,10 @@ fn process_plain(
             bitrate,
             storage,
             max_file_bytes,
-            destination,
             on_exists,
             context,
             duration_ms,
         } => {
-            ensure!(
-                !camera_mut(camera)?.is_scanner(),
-                "scanner forwarding is unsupported; use capture for document scans"
-            );
             ensure!(
                 forwarder.is_none(),
                 "forwarding is already active; stop-forward first"
@@ -1194,7 +1175,6 @@ fn process_plain(
                     ]
                 })
                 .collect();
-            let f_destination = destination.clone();
             let mut config = ForwardConfig {
                 output: output.clone(),
                 codec,
@@ -1203,26 +1183,19 @@ fn process_plain(
                 bitrate,
                 storage,
                 max_file_bytes,
-                destination,
             };
             let named = crate::media::is_recording(&output)
                 && (crate::naming::has_placeholder(&output) || !on_exists.is_fail());
             let f = if named {
                 config.validate()?;
                 let label = crate::naming::camera_label(&camera_mut(camera)?.info);
-                let (path, resolved, reserved) =
-                    name_recording(h, &config, &label, on_exists, &context)?;
+                let (path, reserved) = name_recording(h, &config, &label, on_exists, &context)?;
                 config.output = path.to_string_lossy().into_owned();
-                config.destination = None;
-                Forwarder::with_resolved(
-                    config,
-                    resolved.destination.is_some().then_some(resolved),
-                    Some(reserved),
-                )?
+                Forwarder::with_resolved(config, Some(reserved))?
             } else {
                 // Refuse a taken file now, not after this reply looks like
                 // success; the writer still refuses it atomically.
-                preflight_recording_output(&output, config.destination.as_deref(), on_exists)?;
+                preflight_recording_output(&output, on_exists)?;
                 Forwarder::new(config)?
             };
             let f_path = f.recording_path().map(|p| absolute_path(&p));
@@ -1266,7 +1239,6 @@ fn process_plain(
                     Some(crate::scheduling::RecordingMeta {
                         path,
                         since_ms,
-                        destination: f_destination,
                         context,
                     });
             }
@@ -1312,10 +1284,8 @@ fn process_plain(
                 .iter()
                 .any(|d| d.id == selector || d.serial == selector)
                 && !selector.starts_with("sim:")
-                && !crate::scanner::is_source(&selector)
                 && !crate::media::is_source(&selector)
                 && !crate::onvif::is_source(&selector)
-                && !crate::hubs::is_source(&selector)
                 && !crate::camera::needs_no_discovery(&selector)
                 && selector
                     .trim_start_matches("gige:")
@@ -1527,14 +1497,12 @@ fn process_plain(
             first_at_ms,
             interval_ms,
             storage,
-            destination,
             on_exists,
             context,
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
-            let resolved = crate::destination::resolve(destination.as_deref(), &output)?;
-            preflight_capture_output(&resolved.output, count, &format, on_exists)?;
-            validate_schedule_outputs(&resolved.output, count, &format, on_exists, jobs)?;
+            preflight_capture_output(&output, count, &format, on_exists)?;
+            validate_schedule_outputs(&output, count, &format, on_exists, jobs)?;
             storage.validate()?;
             ensure!(
                 output != "-",
@@ -1550,8 +1518,7 @@ fn process_plain(
             let info = crate::scheduling::CaptureJob {
                 id: *next_job,
                 status: "pending".into(),
-                output: resolved.output.clone(),
-                destination: resolved.destination.clone(),
+                output: output.clone(),
                 count,
                 captured: 0,
                 skipped: 0,
@@ -1566,8 +1533,7 @@ fn process_plain(
             *next_job = next_job.checked_add(1).context("job ID exhausted")?;
             jobs.push(Scheduled {
                 info: info.clone(),
-                plan: crate::naming::Plan::new(&resolved.output, count, &format),
-                resolved,
+                plan: crate::naming::Plan::new(&output, count, &format),
                 timeout_ms,
                 format,
                 storage,
@@ -1623,23 +1589,13 @@ fn process_plain(
             timeout_ms,
             format,
             storage,
-            destination,
             on_exists,
             context,
         } => {
-            ensure!(
-                output != "-" || destination.is_none(),
-                "stdout output cannot use a destination"
-            );
-            let resolved = if output == "-" {
-                crate::destination::resolve(None, &output)?
-            } else {
-                crate::destination::resolve(destination.as_deref(), &output)?
-            };
             validate_capture(&output, count, timeout_ms, &format)?;
             storage.validate()?;
             if output != "-" {
-                preflight_capture_output(&resolved.output, count, &format, on_exists)?;
+                preflight_capture_output(&output, count, &format, on_exists)?;
             }
             let duration = timeout(timeout_ms)?;
             ensure!((1..=100_000).contains(&count), "count must be 1..100000");
@@ -1653,13 +1609,6 @@ fn process_plain(
                 "stdout supports one frame only"
             );
             let c = camera_mut(camera)?;
-            ensure!(
-                !c.is_scanner()
-                    || !jobs
-                        .iter()
-                        .any(|job| job.info.active() && job.deadline.is_some()),
-                "scanner is busy with a scheduled scan; wait for it to finish or cancel the capture job first"
-            );
             let was_streaming = c.is_streaming();
             c.start()?;
             let result = (|| -> Result<Value> {
@@ -1676,7 +1625,7 @@ fn process_plain(
                     );
                 }
                 let label = crate::naming::camera_label(&c.info);
-                let plan = crate::naming::Plan::new(&resolved.output, count, &format);
+                let plan = crate::naming::Plan::new(&output, count, &format);
                 let mut settings = acquisition(c);
                 for index in 0..count {
                     let mut step = || -> Result<()> {
@@ -1697,7 +1646,6 @@ fn process_plain(
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .candidate(&plan, &input, on_exists)?;
-                            resolved.contain(&path)?;
                             Some(path)
                         };
                         c.request_frame()?;
@@ -1734,10 +1682,7 @@ fn process_plain(
                                 &input,
                                 on_exists,
                                 first.clone(),
-                                |path| {
-                                    resolved.contain(path)?;
-                                    crate::storage::save_bytes(&bytes, path, &storage)
-                                },
+                                |path| crate::storage::save_bytes(&bytes, path, &storage),
                             )
                             .with_context(|| format!("save {}", first.display()))?;
                             let file = path.to_string_lossy().into_owned();
@@ -1766,23 +1711,13 @@ fn process_plain(
                 if !context.is_empty() {
                     value["context"] = json!(context);
                 }
-                if let Some(name) = &resolved.destination {
-                    value["destination"] = json!(name);
-                }
                 if let Some(status) = status {
                     value["auto"] = json!(status);
                 }
                 Ok(value)
             })();
-            // A scanner's pending helper must be cancelled on a failed scan,
-            // even if the caller had already armed acquisition with start.
-            let scanner = c.is_scanner();
-            let stopped = if !was_streaming || scanner {
-                c.stop()
-            } else {
-                Ok(())
-            };
-            refresh(h, camera, scanner);
+            let stopped = if !was_streaming { c.stop() } else { Ok(()) };
+            refresh(h, camera, false);
             let value = result?;
             stopped?;
             h.log("info", format!("Captured {count} frame(s)"));
@@ -1793,7 +1728,6 @@ fn process_plain(
 
 struct Scheduled {
     info: crate::scheduling::CaptureJob,
-    resolved: crate::destination::Resolved,
     plan: crate::naming::Plan,
     timeout_ms: u64,
     format: String,
@@ -1809,7 +1743,7 @@ struct Scheduled {
     saving: bool,
 }
 impl Scheduled {
-    /// Pick the next frame's name: a free one, inside the destination.
+    /// Pick the next frame's name: a free one.
     fn allocate(
         &self,
         names: &Mutex<crate::naming::Namer>,
@@ -1820,7 +1754,6 @@ impl Scheduled {
             &self.input(now),
             self.on_exists,
         )?;
-        self.resolved.contain(&path)?;
         Ok((path, now))
     }
     fn input(&self, now: chrono::DateTime<chrono::Local>) -> crate::naming::NameInput<'_> {
@@ -1842,7 +1775,6 @@ impl Scheduled {
             plan: self.plan.clone(),
             on_exists: self.on_exists,
             format: self.format.clone(),
-            resolved: self.resolved.clone(),
             storage: self.storage.clone(),
             context: self.info.context.clone(),
         }
@@ -1920,11 +1852,7 @@ pub fn preflight_capture_output(
 /// Refuse a recording to a fixed local file name that is taken, or whose
 /// parent is not a folder, before an encoder starts. Streams, templates and
 /// --on-exists number pick or need no free name here.
-pub fn preflight_recording_output(
-    output: &str,
-    destination: Option<&str>,
-    on_exists: crate::naming::OnExists,
-) -> Result<()> {
+pub fn preflight_recording_output(output: &str, on_exists: crate::naming::OnExists) -> Result<()> {
     if !crate::media::is_recording(output)
         || !on_exists.is_fail()
         || crate::naming::has_placeholder(output)
@@ -1932,10 +1860,10 @@ pub fn preflight_recording_output(
         return Ok(());
     }
     // A malformed output is reported by the forwarder with its own wording.
-    let Ok(resolved) = crate::destination::resolve(destination, output) else {
+    if crate::naming::validate_output(output).is_err() {
         return Ok(());
-    };
-    let Ok(path) = crate::media::local_file_path(&resolved.output) else {
+    }
+    let Ok(path) = crate::media::local_file_path(output) else {
         return Ok(());
     };
     crate::naming::check_free(&path)?;
@@ -2114,9 +2042,6 @@ fn tick_jobs(
                     c.start()?;
                     *started = true;
                 }
-                if c.is_scanner() {
-                    *started = true;
-                }
                 job.next = Some(job.allocate(&h.names)?);
                 c.request_frame()?;
                 // Auto exposure warms up a camera the job started, unless it
@@ -2169,13 +2094,11 @@ fn tick_jobs(
         jobs_changed(h, camera, jobs);
     }
 }
-/// Publish changed jobs. Scanners also read their features again, since a
-/// scan changes them.
+/// Publish changed jobs.
 fn jobs_changed(h: &WorkerHandle, camera: &mut Option<Camera>, jobs: &mut Vec<Scheduled>) {
     trim_jobs(jobs);
     sync_jobs(h, jobs);
-    let scanner = camera.as_ref().is_some_and(Camera::is_scanner);
-    refresh(h, camera, scanner);
+    refresh(h, camera, false);
 }
 /// Shoot the frame for every job due now: the saver encodes and writes its
 /// own copy. Without `room` the saver is full, and due jobs skip to their next
@@ -2335,24 +2258,6 @@ fn transient(error: &anyhow::Error) -> bool {
         })
 }
 
-fn fail_scanner_jobs(h: &WorkerHandle, jobs: &mut [Scheduled], error: &anyhow::Error) {
-    let error = format!("{error:#}");
-    for job in jobs
-        .iter_mut()
-        .filter(|job| job.info.active() && job.deadline.is_some())
-    {
-        job.info.status = "failed".into();
-        job.info.error = Some(error.clone());
-        job.deadline = None;
-        job.warm = None;
-        h.log(
-            "error",
-            format!("Capture job {} failed: {error}", job.info.id),
-        );
-    }
-    sync_jobs(h, jobs);
-}
-
 /// What a burst that failed part way had already saved:
 /// `saved 2 of 3 frames to DIR (a.png, b.png) before this failed`.
 pub fn saved_before(files: &[String], count: u32) -> String {
@@ -2461,10 +2366,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
     // register round trip per feature, which a fast schedule cannot spare.
     let mut settings = AcquisitionCache::default();
     while !h.cancelled() {
-        let receiving = camera.as_ref().is_some_and(|c| {
-            c.is_streaming()
-                && (!c.is_scanner() || jobs.iter().any(|j| j.info.active() && j.deadline.is_some()))
-        });
+        let receiving = camera.as_ref().is_some_and(Camera::is_streaming);
         let envelope = if receiving {
             rx.try_recv().ok()
         } else {
@@ -2522,11 +2424,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
         h.flush_ring();
         sync_stream(&h, &camera);
         sync_forwarding_progress(&h, &forwarder, &mut progress_sampler, Instant::now());
-        let scheduled_scan = jobs.iter().any(|j| j.info.active() && j.deadline.is_some());
-        if let Some(c) = camera
-            .as_mut()
-            .filter(|c| c.is_streaming() && (!c.is_scanner() || scheduled_scan))
-        {
+        if let Some(c) = camera.as_mut().filter(|c| c.is_streaming()) {
             let asked = Instant::now();
             match c.next_frame(Duration::from_millis(100)) {
                 Ok(frame) => {
@@ -2538,8 +2436,7 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
                         controller.observe(&frame, Instant::now());
                     }
                     let settled = auto.as_ref().is_none_or(AutoController::converged);
-                    // A scanned page is never skipped: it waits for room.
-                    let room = c.is_scanner() || saver.has_room();
+                    let room = saver.has_room();
                     if !settled {
                         // Auto exposure is still moving the camera.
                         settings.invalidate();
@@ -2595,16 +2492,6 @@ fn worker(h: WorkerHandle, rx: Receiver<Option<Envelope>>) {
                     None => {
                         consecutive_errors += 1;
                         h.counters.dropped.fetch_add(1, Ordering::Relaxed);
-                        if c.is_scanner() {
-                            // Scanner errors are terminal for the requested
-                            // page: the backend has already discarded its
-                            // helper, so another poll cannot produce it.
-                            fail_scanner_jobs(&h, &mut jobs, &e);
-                            let _ = c.stop();
-                            scheduled_stream = false;
-                            refresh(&h, &mut camera, true);
-                            continue;
-                        }
                         if consecutive_errors == 1 {
                             h.log("warn", format!("{e:#}"));
                         }
@@ -2732,7 +2619,7 @@ mod tests {
         assert!(!timed_out(&ended.context("read rtsp://camera/live")));
         assert!(timed_out(&FrameWait.into()));
         assert!(timed_out(
-            &anyhow::Error::from(FrameWait).context("hub:home/camera.timeout")
+            &anyhow::Error::from(FrameWait).context("rtsp://camera.timeout/live")
         ));
         assert!(timed_out(&Categorized::error(
             ErrorKind::Timeout,
@@ -2740,7 +2627,7 @@ mod tests {
         )));
         assert!(!timed_out(&Categorized::error(
             ErrorKind::Unavailable,
-            "camera camera.timeout on hub home is offline (HTTP 503)"
+            "camera camera.timeout is offline"
         )));
         // Backends that predate the typed errors keep their meaning.
         assert!(timed_out(&anyhow::anyhow!("frame timeout")));
@@ -2768,7 +2655,6 @@ mod tests {
             first_at_ms: crate::scheduling::now_ms() + 60_000,
             interval_ms: 1000,
             storage: Default::default(),
-            destination: None,
             on_exists: Default::default(),
             context: Default::default(),
         };
@@ -2821,7 +2707,6 @@ mod tests {
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: 1 << 20,
-            destination: None,
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms: None,
@@ -2852,7 +2737,6 @@ mod tests {
             bitrate: "1M".into(),
             storage: Default::default(),
             max_file_bytes: 8 << 20,
-            destination: None,
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms,
@@ -3371,7 +3255,6 @@ mod tests {
                 timeout_ms: 1000,
                 format: "raw".into(),
                 storage: Default::default(),
-                destination: None,
                 on_exists: Default::default(),
                 context: Default::default(),
             })
@@ -3412,7 +3295,6 @@ mod tests {
                 timeout_ms: 1000,
                 format: "raw".into(),
                 storage: Default::default(),
-                destination: None,
                 on_exists: Default::default(),
                 context: Default::default(),
             })
@@ -3493,7 +3375,6 @@ mod tests {
                 timeout_ms: 1000,
                 format: "raw".into(),
                 storage: Default::default(),
-                destination: None,
                 on_exists: Default::default(),
                 context: context.clone(),
             })
@@ -3544,7 +3425,6 @@ mod tests {
             timeout_ms: 1000,
             format: "raw".into(),
             storage: Default::default(),
-            destination: None,
             on_exists,
             context: Default::default(),
         }
@@ -3620,7 +3500,6 @@ mod tests {
                 bitrate: "4M".into(),
                 storage: Default::default(),
                 max_file_bytes: 1 << 20,
-                destination: None,
                 on_exists: Default::default(),
                 context: Default::default(),
                 duration_ms: None,
@@ -3715,7 +3594,6 @@ mod tests {
                 first_at_ms: 0,
                 interval_ms: 10,
                 storage: Default::default(),
-                destination: None,
                 on_exists: Default::default(),
                 context: crate::context::Context::from([("lot".into(), "7".into())]),
             })
@@ -3756,7 +3634,6 @@ mod tests {
                 id,
                 status: "running".into(),
                 output: output.clone(),
-                destination: None,
                 count: 2,
                 captured: 0,
                 skipped: 0,
@@ -3768,7 +3645,6 @@ mod tests {
                 error: None,
                 context: Default::default(),
             },
-            resolved: crate::destination::resolve(None, &output).unwrap(),
             plan: crate::naming::Plan::new(&output, 2, "raw"),
             timeout_ms: 1000,
             format: "raw".into(),
@@ -3986,11 +3862,11 @@ mod tests {
                 .count()
         };
         let grabbed =
-            scanner_command(&h, &mut camera, SessionCommand::Grab { timeout_ms: 1000 }).unwrap();
+            run_command(&h, &mut camera, SessionCommand::Grab { timeout_ms: 1000 }).unwrap();
         assert_eq!(grabbed["frame"]["width"], 4);
         assert_eq!(triggers(), 1);
         let dir = temp_dir("software-trigger");
-        let captured = scanner_command(
+        let captured = run_command(
             &h,
             &mut camera,
             capture_to(&dir.join("shots"), 2, crate::naming::OnExists::Fail),
@@ -4034,7 +3910,7 @@ mod tests {
         let get =
             |camera: &mut Option<Camera>, name: &str| camera.as_mut().unwrap().get(name).unwrap();
         // A grouped write records every configuration value.
-        scanner_command(
+        run_command(
             &h,
             &mut camera,
             SessionCommand::SetMany {
@@ -4045,20 +3921,20 @@ mod tests {
             },
         )
         .unwrap();
-        scanner_command(&h, &mut camera, set("ReverseX", "true")).unwrap();
+        run_command(&h, &mut camera, set("ReverseX", "true")).unwrap();
         // Started outside the history, as a capture or schedule may leave it.
         camera.as_mut().unwrap().start().unwrap();
         assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
         // The lock is acquisition state, never a value to set or restore.
         //TMP
         assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
-        scanner_command(&h, &mut camera, SessionCommand::Undo).unwrap();
+        run_command(&h, &mut camera, SessionCommand::Undo).unwrap();
         assert_eq!(get(&mut camera, "ReverseX"), false);
-        scanner_command(&h, &mut camera, SessionCommand::Undo).unwrap();
+        run_command(&h, &mut camera, SessionCommand::Undo).unwrap();
         assert_eq!(get(&mut camera, "Width"), 640);
         assert!(camera.as_ref().unwrap().is_streaming());
         assert_eq!(get(&mut camera, "TLParamsLocked"), 1);
-        scanner_command(&h, &mut camera, SessionCommand::Stop).unwrap();
+        run_command(&h, &mut camera, SessionCommand::Stop).unwrap();
         assert_eq!(get(&mut camera, "TLParamsLocked"), 0);
         h.shutdown();
     }
@@ -4174,28 +4050,6 @@ mod tests {
             .min()
             .unwrap();
         assert!(fastest < Duration::from_millis(30), "{fastest:?}");
-    }
-    #[test]
-    fn numbered_scanner_capture_uses_one_page() {
-        let h = WorkerHandle::new();
-        let (mut camera, requests, _) = scanner(Duration::ZERO);
-        let dir = temp_dir("scanner-number");
-        let path = dir.join("document.raw");
-        std::fs::write(&path, b"existing document").unwrap();
-        let v = scanner_command(
-            &h,
-            &mut camera,
-            capture_to(&path, 1, crate::naming::OnExists::Number),
-        )
-        .unwrap();
-        assert_eq!(
-            v["files"][0].as_str().unwrap(),
-            dir.join("document-0001.raw").to_str().unwrap()
-        );
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
-        assert_eq!(std::fs::read(&path).unwrap(), b"existing document");
-        h.shutdown();
-        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn capture_paths() {
@@ -4482,7 +4336,6 @@ mod tests {
                 timeout_ms: 6000,
                 format: "raw".into(),
                 storage: Default::default(),
-                destination: None,
                 on_exists: Default::default(),
                 context: Default::default(),
             })
@@ -4518,79 +4371,7 @@ mod tests {
         }
     }
 
-    struct DemandScanner {
-        simulator: crate::transport::simulator::Simulator,
-        requests: Arc<AtomicU64>,
-        stops: Arc<AtomicU64>,
-        ready: Option<Instant>,
-        latency: Duration,
-    }
-    impl crate::types::RegisterIo for DemandScanner {
-        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
-            self.simulator.read_memory(address, length)
-        }
-        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
-            self.simulator.write_memory(address, data)
-        }
-    }
-    impl crate::types::Backend for DemandScanner {
-        fn xml(&mut self) -> Result<String> {
-            self.simulator.xml()
-        }
-        fn start(&mut self, payload: usize) -> Result<()> {
-            self.simulator.start(payload)
-        }
-        fn request_frame(&mut self) -> Result<()> {
-            if self.ready.is_none() {
-                self.requests.fetch_add(1, Ordering::Relaxed);
-                self.ready = Some(Instant::now() + self.latency);
-            }
-            Ok(())
-        }
-        fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
-            let Some(ready) = self.ready else {
-                anyhow::bail!("frame timeout; no scan requested");
-            };
-            let wait = ready.saturating_duration_since(Instant::now());
-            if wait > timeout {
-                std::thread::sleep(timeout);
-                anyhow::bail!("frame timeout");
-            }
-            std::thread::sleep(wait);
-            let frame = self.simulator.next_frame(timeout)?;
-            self.ready = None;
-            Ok(frame)
-        }
-        fn stop(&mut self) -> Result<()> {
-            self.stops.fetch_add(1, Ordering::Relaxed);
-            self.ready = None;
-            self.simulator.stop()
-        }
-    }
-    fn scanner(latency: Duration) -> (Option<Camera>, Arc<AtomicU64>, Arc<AtomicU64>) {
-        let requests = Arc::new(AtomicU64::new(0));
-        let stops = Arc::new(AtomicU64::new(0));
-        let mut info = crate::transport::simulator::info();
-        info.transport = crate::types::Transport::Scanner;
-        (
-            Some(
-                Camera::from_backend(
-                    info,
-                    Box::new(DemandScanner {
-                        simulator: Default::default(),
-                        requests: requests.clone(),
-                        stops: stops.clone(),
-                        ready: None,
-                        latency,
-                    }),
-                )
-                .unwrap(),
-            ),
-            requests,
-            stops,
-        )
-    }
-    fn scanner_command(
+    fn run_command(
         h: &WorkerHandle,
         camera: &mut Option<Camera>,
         command: SessionCommand,
@@ -4659,8 +4440,8 @@ mod tests {
                 .unwrap(),
             );
             let h = WorkerHandle::new();
-            let error = scanner_command(&h, &mut camera, SessionCommand::Grab { timeout_ms: 10 })
-                .unwrap_err();
+            let error =
+                run_command(&h, &mut camera, SessionCommand::Grab { timeout_ms: 10 }).unwrap_err();
             assert_eq!(error.to_string(), GRAB_TIMEOUT);
             assert_eq!(reads.load(Ordering::Relaxed), expected_reads);
             assert!(
@@ -4671,31 +4452,10 @@ mod tests {
             h.shutdown();
         }
     }
-    fn scanner_capture(timeout_ms: u64) -> SessionCommand {
-        SessionCommand::Capture {
-            output: "-".into(),
-            count: 1,
-            timeout_ms,
-            format: "raw".into(),
-            storage: Default::default(),
-            destination: None,
-            on_exists: Default::default(),
-            context: Default::default(),
-        }
-    }
-
     #[test]
-    fn grab_refuses_scanners_and_frames_belong_to_the_coordinator() {
+    fn frames_belong_to_the_coordinator() {
         let h = WorkerHandle::new();
-        let (mut camera, requests, _) = scanner(Duration::ZERO);
-        let error = scanner_command(&h, &mut camera, SessionCommand::Grab { timeout_ms: 1000 })
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "a document scanner cannot be inspected without scanning a page"
-        );
-        assert_eq!(requests.load(Ordering::Relaxed), 0);
-        assert!(!camera.as_ref().unwrap().is_streaming());
+        let mut camera = Some(Camera::open("sim:0", &[], Duration::from_secs(1)).unwrap());
         let frame = SessionCommand::Frame {
             fresh: 1,
             timeout_ms: 1000,
@@ -4703,302 +4463,10 @@ mod tests {
             format: Default::default(),
             region: None,
         };
-        let error = scanner_command(&h, &mut camera, frame).unwrap_err();
+        let error = run_command(&h, &mut camera, frame).unwrap_err();
         assert_eq!(error.to_string(), "frames belong to the coordinator");
         h.shutdown();
     }
-
-    #[test]
-    fn scanner_capture_requests_one_page_across_timeout_polls() {
-        let h = WorkerHandle::new();
-        let (mut camera, requests, stops) = scanner(Duration::from_millis(220));
-        camera.as_mut().unwrap().start().unwrap();
-        assert!(
-            camera
-                .as_mut()
-                .unwrap()
-                .next_frame(Duration::from_millis(1))
-                .is_err()
-        );
-        assert_eq!(
-            requests.load(Ordering::Relaxed),
-            0,
-            "start only arms the scanner"
-        );
-        let result = scanner_command(&h, &mut camera, scanner_capture(1000)).unwrap();
-        assert_eq!(result["count"], 1);
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
-        assert_eq!(stops.load(Ordering::Relaxed), 1);
-        assert!(!camera.as_ref().unwrap().is_streaming());
-        assert_eq!(h.snapshot().frames, 1);
-        h.shutdown();
-    }
-
-    #[test]
-    fn scanner_capture_timeout_cancels_an_already_armed_scan() {
-        let h = WorkerHandle::new();
-        let (mut camera, requests, stops) = scanner(Duration::from_secs(1));
-        camera.as_mut().unwrap().start().unwrap();
-        let error = scanner_command(&h, &mut camera, scanner_capture(1)).unwrap_err();
-        assert!(error.to_string().contains("timeout"));
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
-        assert_eq!(stops.load(Ordering::Relaxed), 1);
-        assert!(!camera.as_ref().unwrap().is_streaming());
-        assert_eq!(h.snapshot().frames, 0);
-        h.shutdown();
-    }
-
-    #[test]
-    fn scanner_acquisition_has_no_replayable_checkpoint_or_redo_page() {
-        let h = WorkerHandle::new();
-        let (mut camera, requests, stops) = scanner(Duration::ZERO);
-        let started = scanner_command(&h, &mut camera, SessionCommand::Start).unwrap();
-        assert!(started.get("camera_change").is_none());
-        assert!(
-            started["history_unavailable"]
-                .as_str()
-                .unwrap()
-                .contains("document")
-        );
-        let stopped = scanner_command(&h, &mut camera, SessionCommand::Stop).unwrap();
-        assert!(stopped.get("camera_change").is_none());
-        assert!(scanner_command(&h, &mut camera, SessionCommand::Undo).is_err());
-        assert!(scanner_command(&h, &mut camera, SessionCommand::Redo).is_err());
-        // Scanner settings remain ordinary reversible configuration edits.
-        scanner_command(
-            &h,
-            &mut camera,
-            SessionCommand::Set {
-                feature: "Width".into(),
-                value: "128".into(),
-            },
-        )
-        .unwrap();
-        scanner_command(&h, &mut camera, SessionCommand::Undo).unwrap();
-        assert_eq!(camera.as_mut().unwrap().get("Width").unwrap(), 640);
-        scanner_command(&h, &mut camera, SessionCommand::Redo).unwrap();
-        assert_eq!(camera.as_mut().unwrap().get("Width").unwrap(), 128);
-        assert_eq!(requests.load(Ordering::Relaxed), 0);
-        assert_eq!(stops.load(Ordering::Relaxed), 1);
-        h.shutdown();
-    }
-
-    #[test]
-    fn existing_scanner_output_fails_without_consuming_a_page() {
-        let h = WorkerHandle::new();
-        let (mut camera, requests, _) = scanner(Duration::ZERO);
-        let dir = std::env::temp_dir().join(format!(
-            "capturefab-scanner-output-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        let path = dir.join("document.png");
-        std::fs::write(&path, b"existing document").unwrap();
-        let mut command = scanner_capture(1000);
-        if let SessionCommand::Capture { output, format, .. } = &mut command {
-            *output = path.to_string_lossy().into_owned();
-            *format = "png".into();
-        }
-        let error = scanner_command(&h, &mut camera, command.clone()).unwrap_err();
-        assert!(error.to_string().contains("output already exists"));
-        assert_eq!(requests.load(Ordering::Relaxed), 0);
-        assert_eq!(h.snapshot().frames, 0);
-        assert_eq!(std::fs::read(&path).unwrap(), b"existing document");
-        #[cfg(unix)]
-        {
-            std::fs::remove_file(&path).unwrap();
-            std::os::unix::fs::symlink(dir.join("missing-document.png"), &path).unwrap();
-            let error = scanner_command(&h, &mut camera, command).unwrap_err();
-            assert!(error.to_string().contains("output already exists"));
-            assert_eq!(requests.load(Ordering::Relaxed), 0);
-            assert!(
-                std::fs::symlink_metadata(&path)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink()
-            );
-        }
-        std::fs::remove_dir_all(&dir).unwrap();
-        h.shutdown();
-    }
-
-    #[test]
-    fn scheduled_scanner_requests_once_and_cancels_on_deadline() {
-        let h = WorkerHandle::new();
-        let (mut camera, requests, stops) = scanner(Duration::from_secs(1));
-        let now = crate::scheduling::now_ms();
-        let mut jobs = vec![Scheduled {
-            plan: crate::naming::Plan::File("scan.png".into()),
-            camera: "camera".into(),
-            on_exists: Default::default(),
-            next: None,
-            saving: false,
-            info: crate::scheduling::CaptureJob {
-                id: 1,
-                status: "pending".into(),
-                output: "scan.png".into(),
-                destination: None,
-                count: 1,
-                captured: 0,
-                skipped: 0,
-                retries: 0,
-                first_at_ms: now,
-                interval_ms: 0,
-                next_at_ms: now,
-                last_file: None,
-                error: None,
-                context: Default::default(),
-            },
-            resolved: crate::destination::resolve(None, "scan.png").unwrap(),
-            timeout_ms: 1000,
-            format: "png".into(),
-            storage: Default::default(),
-            deadline: None,
-            warm: None,
-        }];
-        let mut started = false;
-        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
-        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
-        assert_eq!(jobs[0].info.status, "running");
-        jobs[0].deadline = Some(Instant::now() - Duration::from_millis(1));
-        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
-        assert_eq!(jobs[0].info.status, "failed");
-        assert_eq!(stops.load(Ordering::Relaxed), 1);
-        assert!(!camera.as_ref().unwrap().is_streaming());
-        h.shutdown();
-    }
-
-    #[test]
-    fn explicit_capture_does_not_consume_a_scheduled_scan() {
-        let h = WorkerHandle::new();
-        let (mut camera, requests, stops) = scanner(Duration::from_millis(220));
-        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next_job, mut started) = (1, false);
-        process(
-            &h,
-            &mut camera,
-            &mut forwarder,
-            &mut auto,
-            &mut jobs,
-            &mut next_job,
-            &mut started,
-            SessionCommand::Schedule {
-                output: "scan.png".into(),
-                count: 1,
-                timeout_ms: 1000,
-                format: "png".into(),
-                first_at_ms: crate::scheduling::now_ms(),
-                interval_ms: 0,
-                storage: Default::default(),
-                destination: None,
-                on_exists: Default::default(),
-                context: Default::default(),
-            },
-        )
-        .unwrap();
-        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
-        let deadline = jobs[0].deadline;
-        let error = process(
-            &h,
-            &mut camera,
-            &mut forwarder,
-            &mut auto,
-            &mut jobs,
-            &mut next_job,
-            &mut started,
-            scanner_capture(1000),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("busy with a scheduled scan"));
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
-        assert_eq!(stops.load(Ordering::Relaxed), 0);
-        assert!(camera.as_ref().unwrap().is_streaming());
-        assert_eq!(jobs[0].info.status, "running");
-        assert_eq!(jobs[0].deadline, deadline);
-        assert_eq!(jobs[0].info.captured, 0);
-        assert_eq!(h.snapshot().frames, 0);
-        // The scheduled page is still pending; rejecting the direct capture
-        // must neither consume it nor ask the scanner for a replacement page.
-        let page = camera
-            .as_mut()
-            .unwrap()
-            .next_frame(Duration::from_secs(1))
-            .unwrap();
-        assert_eq!(page.id, 1);
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
-        h.shutdown();
-    }
-
-    #[test]
-    fn scheduled_scanner_failure_preserves_diagnostics_and_future_jobs() {
-        let h = WorkerHandle::new();
-        let (mut camera, requests, _) = scanner(Duration::from_secs(1));
-        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next_job, mut started) = (1, false);
-        let now = crate::scheduling::now_ms();
-        for (index, first_at_ms) in [now, now, now + 60_000].into_iter().enumerate() {
-            process(
-                &h,
-                &mut camera,
-                &mut forwarder,
-                &mut auto,
-                &mut jobs,
-                &mut next_job,
-                &mut started,
-                SessionCommand::Schedule {
-                    output: format!("scan-{index}/"),
-                    count: 2,
-                    timeout_ms: 1000,
-                    format: "png".into(),
-                    first_at_ms,
-                    interval_ms: 60_000,
-                    storage: Default::default(),
-                    destination: None,
-                    on_exists: Default::default(),
-                    context: Default::default(),
-                },
-            )
-            .unwrap();
-        }
-        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
-        assert_eq!(
-            requests.load(Ordering::Relaxed),
-            1,
-            "due jobs share one scan"
-        );
-        assert_eq!(jobs[0].info.status, "running");
-        assert_eq!(jobs[1].info.status, "running");
-        assert_eq!(jobs[2].info.status, "pending");
-        // A driver rejects the requested page before its deadline. Keep the
-        // real failure in every waiting job instead of later timing out.
-        let error = anyhow::anyhow!("unsupported scanner source: document feeder unavailable")
-            .context("scanner acquisition failed");
-        fail_scanner_jobs(&h, &mut jobs, &error);
-        for job in &jobs[..2] {
-            assert_eq!(job.info.status, "failed");
-            assert_eq!(
-                job.info.error.as_deref(),
-                Some(
-                    "scanner acquisition failed: unsupported scanner source: document feeder unavailable"
-                )
-            );
-            assert!(job.deadline.is_none());
-            assert_eq!(job.info.captured, 0);
-        }
-        assert_eq!(jobs[2].info.status, "pending");
-        assert!(jobs[2].info.error.is_none());
-        assert!(jobs[2].deadline.is_none());
-        assert_eq!(h.snapshot().jobs[0].error, jobs[0].info.error);
-        tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, false);
-        assert!(!camera.as_ref().unwrap().is_streaming());
-        h.shutdown();
-    }
-
     #[test]
     fn disconnect_reverts_auto_mode_changes() {
         use crate::types::{Backend, RegisterIo};

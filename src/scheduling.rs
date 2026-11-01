@@ -24,8 +24,6 @@ pub struct CaptureJob {
     pub next_at_ms: u64,
     pub last_file: Option<String>,
     pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context: crate::context::Context,
 }
@@ -41,8 +39,6 @@ pub struct RecordingMeta {
     pub path: String,
     /// UTC Unix milliseconds.
     pub since_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context: crate::context::Context,
 }
