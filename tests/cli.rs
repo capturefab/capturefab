@@ -1528,7 +1528,7 @@ fn ring_files(dir: &PathBuf) -> Vec<PathBuf> {
 
 #[test]
 fn unread_streams_report_no_losses_and_keep_frames_off_disk() {
-    let root = temp_root("ring-viewerless");
+    let root = temp_root("ring-unread");
     let dir = root.join("sessions");
     std::fs::create_dir_all(&root).unwrap();
     let _fixture = Fixture {
@@ -2741,6 +2741,81 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
         "{slow}"
     );
     assert_eq!(session(&["status"])["cameras"][0]["streaming"], true);
+}
+
+/// A capture schedule starts a stopped camera and stops it again when done,
+/// with no command in between. The last status the session saw still says
+/// streaming, but an inspection afterwards grabs a frame instead of waiting
+/// for live frames that never come.
+#[test]
+fn rpc_frame_grabs_once_a_schedule_has_stopped_the_stream() {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    let root = temp_root("frame-after-schedule");
+    let dir = root.join("sessions");
+    let cwd = root.join("server");
+    let shots = root.join("shots");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let _fixture = Fixture {
+        child: serve_at(&dir, &cwd, "schedule-frame"),
+        dir: root.clone(),
+    };
+    let session = |args: &[&str]| {
+        json(
+            &dir,
+            &[&["--json", "--session", "schedule-frame"], args].concat(),
+        )
+    };
+    session(&["connect", "sim:0"]);
+    let output = shots.join("x-{seq}.ppm");
+    // Shots due back to back keep the stream on until the last is saved.
+    session(&[
+        "capture",
+        "-o",
+        output.to_str().unwrap(),
+        "-n",
+        "5",
+        "--interval",
+        "1ms",
+    ]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while session(&["status"])["cameras"][0]["streaming"] != true {
+        assert!(Instant::now() < deadline, "the schedule never streamed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Watch the files rather than status, which would ask the worker.
+    while std::fs::read_dir(&shots).map_or(0, |files| files.count()) < 5 {
+        assert!(Instant::now() < deadline, "the schedule did not finish");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_secs(1));
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+        .env_remove("CAPTUREFAB_SESSION")
+        .env_remove("CAPTUREFAB_CAMERA")
+        .env("CAPTUREFAB_SESSION_DIR", &dir)
+        .env("CAPTUREFAB_CACHE_DIR", test_cache())
+        .args(["--json", "--session", "schedule-frame", "rpc"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"op":"frame","max_dimension":0}"#)
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let frame: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{frame}");
+    assert_eq!(frame["result"]["frame"]["source"], "grab", "{frame}");
+    assert_eq!(
+        session(&["status"])["cameras"][0]["streaming"],
+        false,
+        "a grab leaves the camera stopped"
+    );
 }
 
 fn failure(out: &std::process::Output) -> Value {

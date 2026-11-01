@@ -108,8 +108,8 @@ pub fn redact_url(url: &str) -> String {
         result = format!("{path}?{params}");
     }
     // RTMP publishes use the path after the application name as a stream
-    // key. Redact it here as well as in tool output so worker status,
-    // activity and FFmpeg diagnostics never expose a typed stream password.
+    // key. Redact it here so worker status, session logs and FFmpeg
+    // diagnostics never expose a typed stream password.
     if let Some((protocol, rest)) = result.split_once("://")
         && (protocol.eq_ignore_ascii_case("rtmp") || protocol.eq_ignore_ascii_case("rtmps"))
         && let Some(path) = rest.find('/')

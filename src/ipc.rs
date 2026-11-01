@@ -78,7 +78,6 @@ impl Drop for ClientSlot {
 }
 const MAX_CLIENTS: usize = 16;
 pub struct Server {
-    pub name: String,
     path: PathBuf,
     token: String,
     address: SocketAddr,
@@ -790,7 +789,6 @@ impl Server {
             }
         };
         Ok(Self {
-            name: name.into(),
             path,
             token,
             address,

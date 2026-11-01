@@ -23,9 +23,9 @@
 //!   and get current frames.
 //! - An occasional poller may get a keep-alive frame up to `KEEP_ALIVE` old.
 //!   Take one plainly only where that is acceptable; otherwise `ask` and take
-//!   without watching until a frame offered since arrives
-//!   (`SessionHandle::fresh_frame_for`). An ask publishes the next frame, or
-//!   the held one, without making the ring count as watched.
+//!   without watching until a frame offered since arrives, as frame
+//!   inspections do (`SessionHandle::await_frame`). An ask publishes the next
+//!   frame, or the held one, without making the ring count as watched.
 //! - Frames a command captured are forced in, so a capture's own frame is the
 //!   newest one published (`capture -o -`).
 //! - A frame larger than a slot is replaced by a downscaled RGB8 preview

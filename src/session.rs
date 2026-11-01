@@ -1254,6 +1254,9 @@ impl Drop for CommandTurn {
 const MAX_PENDING: usize = 32;
 /// How often a frame inspection looks for a new frame in a camera's ring.
 const FRAME_POLL: Duration = Duration::from_millis(5);
+/// How often a waiting frame inspection asks an idle worker whether its
+/// camera still streams.
+const STREAM_CHECK: Duration = Duration::from_millis(250);
 /// Each inspection may hold a full-resolution frame and its conversions.
 const MAX_INSPECTIONS: usize = 8;
 #[derive(Clone)]
@@ -1494,6 +1497,7 @@ impl SessionHandle {
                 crate::media::redact_url(&id)
             )
         })?;
+        let mut checked = Instant::now();
         loop {
             if Instant::now() >= deadline {
                 return Ok(None);
@@ -1521,7 +1525,11 @@ impl SessionHandle {
                 return Ok(None);
             }
             ensure!(!self.is_shutting_down(), "session is shutting down");
-            if let Some(error) = self.stopped_streaming(&id) {
+            let ask = now.duration_since(checked) >= STREAM_CHECK;
+            if ask {
+                checked = now;
+            }
+            if let Some(error) = self.stopped_streaming(&id, ask) {
                 anyhow::bail!(
                     "{} stopped streaming{}",
                     crate::media::redact_url(&id),
@@ -1532,10 +1540,11 @@ impl SessionHandle {
             std::thread::sleep(FRAME_POLL.min(deadline - now));
         }
     }
-    /// Some(last error) when camera `id`'s worker last reported that it is
-    /// not streaming. None while it streams, and while it is busy, since its
-    /// report then may be out of date.
-    fn stopped_streaming(&self, id: &str) -> Option<Option<String>> {
+    /// Some(last error) when camera `id`'s worker reports that it is not
+    /// streaming, asking it first when `ask`: nothing else polls an idle
+    /// worker, and a stream can end on its own. None while it streams, and
+    /// while it is busy, since its report then may be out of date.
+    fn stopped_streaming(&self, id: &str, ask: bool) -> Option<Option<String>> {
         let w = self
             .inner
             .workers
@@ -1543,7 +1552,10 @@ impl SessionHandle {
             .unwrap_or_else(PoisonError::into_inner)
             .get(id)
             .cloned()?;
-        let p = w.try_lock().ok()?;
+        let mut p = w.try_lock().ok()?;
+        if ask {
+            let _ = p.refresh();
+        }
         (!p.report.streaming).then(|| p.report.last_error.clone())
     }
     fn feed(&self, id: &str) -> Option<Arc<Feed>> {
@@ -2049,7 +2061,10 @@ impl SessionHandle {
         let deadline = Instant::now() + timeout;
         let w = self.target(target)?;
         let (info, streaming, feed) = {
-            let p = locked(&w);
+            let mut p = locked(&w);
+            // The cached report may predate a stream that ended on its own,
+            // such as one a finished schedule started.
+            let _ = p.refresh();
             let info = p.report.connected.clone().context("worker has no camera")?;
             (info, p.report.streaming, p.feed.clone())
         };
@@ -3373,6 +3388,27 @@ mod tests {
             assert_eq!(crate::types::error_transport_code(&error), Some("usage"));
             worker.refresh().unwrap();
         }
+    }
+    /// Nothing polls an idle worker, so its cached report can still say
+    /// streaming after its stream ended on its own; a frame wait asks again.
+    #[test]
+    #[cfg(unix)]
+    fn frame_waits_notice_a_stream_that_ended_since_the_last_report() {
+        let mut worker = test_worker();
+        worker
+            .call(SessionCommand::connect("sim:0".into(), 1000))
+            .unwrap();
+        assert!(!worker.report.streaming);
+        worker.report.streaming = true;
+        let handle = SessionHandle::new();
+        handle.add_worker("sim:0".into(), worker);
+        let asked = Instant::now();
+        let error = handle
+            .await_frame("sim:0", 0, 1, asked + Duration::from_secs(10))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "sim:0 stopped streaming");
+        assert!(asked.elapsed() < Duration::from_secs(2), "{error}");
+        handle.shutdown();
     }
     #[test]
     fn frame_feeds_track_ring_sequence_and_wait_for_fresh_frames() {
