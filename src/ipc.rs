@@ -1381,18 +1381,27 @@ fn send_request(
         timeout,
     )
 }
-/// Requests in flight for a command a shell runs, by the command, so the
-/// shell can close those of a command it stops waiting for: the session
-/// then cancels what only that command waited for, as it does when a
-/// command's process exits.
+/// Requests in flight by their owner, a command a shell runs or one that
+/// stops waiting for its own, so it can close those it no longer waits
+/// for: the session then cancels what only they waited for, as it does
+/// when a command's process exits.
 static OWNED: std::sync::Mutex<Vec<(u64, u64, TcpStream)>> = std::sync::Mutex::new(Vec::new());
 static NEXT_OWNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static NEXT_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 thread_local! {
     static OWNER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+/// An owner for requests that close together.
+pub fn new_owner() -> u64 {
+    NEXT_OWNER.fetch_add(1, Ordering::Relaxed)
 }
 /// Requests this thread sends from now on belong to `owner`.
 pub fn own_requests(owner: u64) {
     OWNER.with(|cell| cell.set(owner));
+}
+/// The owner of the requests this thread sends, 0 for none.
+pub fn requests_owner() -> u64 {
+    OWNER.with(std::cell::Cell::get)
 }
 /// Close the connections of `owner`'s requests in flight.
 pub fn close_requests(owner: u64) {

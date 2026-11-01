@@ -7,7 +7,7 @@ use super::{
     args::{CamerasArg, KeepArg, Wait},
     jobs, millis,
     output::Report,
-    signals, term,
+    signals,
 };
 use crate::{
     controls::Assignment,
@@ -102,6 +102,8 @@ pub struct CaptureArgs {
     /// Leave the capture running in a session and print its job at once
     #[arg(long)]
     pub background: bool,
+    #[command(flatten)]
+    pub progress: super::jobs::ProgressArg,
     #[command(flatten)]
     pub keep: KeepArg,
     /// Show the camera, files, settings and timing; capture nothing
@@ -374,6 +376,8 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
             shoot(&client, &args, &plan)
         }
     };
+    // Each camera's thread is part of this command, as a shell sees it.
+    let lineage = signals::Lineage::here();
     let results = if cameras.len() == 1 {
         vec![each(cameras[0])]
     } else if !args.dry_run && !args.background {
@@ -385,6 +389,7 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
                 .map(|(index, camera)| {
                     let (args, plan, together) = (&args, &plan, &together);
                     scope.spawn(move || {
+                        lineage.enter();
                         shoot_together(index, *camera, global, route, args, plan, together)
                     })
                 })
@@ -402,7 +407,12 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
         std::thread::scope(|scope| {
             let threads = cameras
                 .iter()
-                .map(|camera| scope.spawn(move || each(*camera)))
+                .map(|camera| {
+                    scope.spawn(move || {
+                        lineage.enter();
+                        each(*camera)
+                    })
+                })
                 .collect::<Vec<_>>();
             threads
                 .into_iter()
@@ -721,18 +731,18 @@ fn run_job(
     // time, and nothing after them starts.
     client.stop_on_signal(&id);
     let began = Instant::now();
-    let shown = term::activity("capturing…");
+    let mut shown = jobs::Progress::new("capturing…", args.progress);
     let mut seq = 0;
     let mut stopping: Option<Instant> = None;
     loop {
         let wait = match stopping {
             Some(since) => STOP_GRACE.saturating_sub(since.elapsed()),
-            None => jobs::wait_step(Duration::from_secs(25)),
+            None => shown.step(Duration::from_secs(25)),
         };
         let reply = client.wait_job(&id, seq, wait.max(Duration::from_millis(1)))?;
         seq = reply["seq"].as_u64().unwrap_or(seq);
         let (job, detail) = (&reply["job"], &reply["detail"]);
-        shown.progress(jobs::progress(job, began));
+        shown.show(job, began);
         if jobs::ended(job) {
             let mut value = finished(
                 job,

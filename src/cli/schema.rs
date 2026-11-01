@@ -101,14 +101,17 @@ fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
         "shell" => &[
             (
                 "lines",
-                "one per command run, in order: its result, or {error}, as that command prints with --json; then the exit code of the first failure",
+                "input: one command a line on stdin (blank and # lines skipped), or each -e; output: one line per command run, in order, its result or {error} as that command prints it (NDJSON with --json); the exit code is the first failure's",
             ),
             ("use", "{camera?} — the default camera"),
             (
                 "cameras",
                 "{cameras:[{id,state:connecting|connected|failed,default?,session?,error?}]}",
             ),
-            ("help", "{help} — the text"),
+            (
+                "help",
+                "{help} — the text of help COMMAND, or of a line's --help",
+            ),
         ],
         "auto" => super::auto::FIELDS,
         "jobs" | "jobs list" => super::jobs::LIST_FIELDS,
@@ -303,13 +306,25 @@ fn errors(command: &str) -> &'static [&'static str] {
             "unavailable",
             "timeout",
         ],
-        "inspect" | "watch" => &[
+        "inspect" => &[
             "frame_timeout",
             "trigger_timeout",
             "exists",
             "storage_full",
             "feature_not_found",
             "out_of_range",
+            "camera_not_found",
+            "camera_ambiguous",
+            "camera_busy",
+            "disconnected",
+            "session_not_found",
+            "unavailable",
+            "timeout",
+        ],
+        "watch" => &[
+            "frame_timeout",
+            "trigger_timeout",
+            "storage_full",
             "camera_not_found",
             "camera_ambiguous",
             "camera_busy",
@@ -539,7 +554,7 @@ fn overview() -> Value {
             "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
             "routing": "--session NAME, else a session holding the camera, else the auto session, open 60s after last use (--keep DUR); --keep 0 or --no-session: a worker of the command",
             "jobs": "capture/record block until done; --background prints a job instead (jobs wait ID). Ctrl-C: capture exits 130 with details.files; open-ended record ends normally",
-            "streams": "watch and shell print one JSON line per measurement or command (NDJSON)",
+            "streams": "NDJSON: watch a line per measurement, shell per command; capture, record, jobs wait --progress: stderr lines {progress:{job,state,saved,planned?,elapsed_s,left_s?,…}}",
             "results": "snake_case keys; units in names (exposure_us); times RFC 3339 UTC; lists bounded with truncated",
             "credentials": "never printed; URLs are redacted",
             "describe": "capturefab schema COMMAND: arguments, result fields and errors"
@@ -580,7 +595,17 @@ fn command(name: &str) -> Result<Value> {
         value["effect_with"] = with;
     }
     let mut errors = vec!["usage", "failed"];
-    errors.extend(self::errors(name));
+    match name {
+        // Each line reports the reasons of the command it runs, and a
+        // signal interrupts the run.
+        "shell" => errors.extend(
+            ErrorKind::ALL
+                .iter()
+                .map(|kind| kind.code().0)
+                .filter(|code| !matches!(*code, "usage" | "failed")),
+        ),
+        _ => errors.extend(self::errors(name)),
+    }
     value["errors"] = json!(errors);
     if let Some(fields) = fields(name) {
         value["result"] = Value::Object(

@@ -9,6 +9,7 @@ use std::{
     sync::{
         Condvar, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
+        mpsc::RecvTimeoutError,
     },
     time::{Duration, Instant},
 };
@@ -81,6 +82,8 @@ struct Entry {
 }
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+/// The command running, as a shell runs it, was given `-q`.
+static HUSHED: AtomicBool = AtomicBool::new(false);
 static LINE: Mutex<Line> = Mutex::new(Line {
     stack: Vec::new(),
     next: 0,
@@ -106,7 +109,13 @@ pub(crate) fn enable(quiet: bool) {
 /// Whether the status line is shown: a command that reports progress
 /// asks for it often enough to keep its clock moving.
 pub(crate) fn live() -> bool {
-    ENABLED.load(Ordering::Acquire)
+    ENABLED.load(Ordering::Acquire) && !HUSHED.load(Ordering::Acquire)
+}
+
+/// Whether the command a shell runs now was given `-q`, which silences
+/// its status line as it would the process's.
+pub(crate) fn hush(quiet: bool) {
+    HUSHED.store(quiet, Ordering::Release);
 }
 
 impl Line {
@@ -156,15 +165,20 @@ fn status_text(text: &str, age: Duration, progress: bool, cols: u16) -> String {
     if !progress && age >= Duration::from_secs(1) {
         let _ = write!(line, " {}s", age.as_secs());
     }
+    fit(&line, cols)
+}
+
+/// `text`, a line without escapes, cut to fit `cols` columns without
+/// wrapping: what is cut ends in `…`.
+pub(crate) fn fit(text: &str, cols: u16) -> String {
     let room = usize::from(cols.max(2)) - 1;
-    if line.chars().count() > room {
-        line = line
-            .chars()
-            .take(room.saturating_sub(1))
-            .collect::<String>()
-            + "…";
+    if text.chars().count() <= room {
+        return text.to_owned();
     }
-    line
+    text.chars()
+        .take(room.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
 fn ticker() {
@@ -192,7 +206,7 @@ pub(crate) struct Activity {
 
 /// Name what this command is doing now, such as "connecting to sim:0…".
 pub(crate) fn activity(text: impl Into<String>) -> Activity {
-    if !ENABLED.load(Ordering::Acquire) {
+    if !live() {
         return Activity { id: 0 };
     }
     let mut line = line();
@@ -332,6 +346,33 @@ pub(crate) fn pick(
         }
     }
     Ok(None)
+}
+
+/// `pick`, the answer read on a thread of its own so that `stopped`, a
+/// signal, ends the wait at once with an `Interrupted` error; the thread
+/// is left waiting for a line no one reads.
+pub(crate) fn pick_until<I: BufRead>(
+    cameras: Vec<String>,
+    input: impl FnOnce() -> I + Send + 'static,
+    mut output: impl Write + Send + 'static,
+    stopped: &dyn Fn() -> bool,
+) -> io::Result<Option<usize>> {
+    let (sender, answer) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("capturefab-pick".into())
+        .spawn(move || {
+            let _ = sender.send(pick(&cameras, &mut input(), &mut output));
+        })?;
+    loop {
+        match answer.recv_timeout(Duration::from_millis(50)) {
+            Ok(picked) => return picked,
+            Err(RecvTimeoutError::Timeout) if stopped() => {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -991,5 +1032,34 @@ mod tests {
         assert!(!may_pick(false, false, true));
         assert!(!may_pick(false, true, false));
         assert!(!can_pick(true));
+    }
+
+    /// Input that has no line yet, until its sender goes.
+    struct Silent(std::sync::mpsc::Receiver<()>);
+    impl io::Read for Silent {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_signal_stops_the_picker_without_a_camera() {
+        let cameras = || vec!["gige:a".to_owned(), "u3v:b".to_owned()];
+        let picked = pick_until(cameras(), || "2\n".as_bytes(), io::sink(), &|| false);
+        assert_eq!(picked.unwrap(), Some(1));
+        // Ctrl-C while the prompt waits: no camera, at once, though no line
+        // came, nor would Enter pick the first one afterwards.
+        let (_typing, silent) = std::sync::mpsc::channel();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let began = Instant::now();
+        let stopped = pick_until(
+            cameras(),
+            move || io::BufReader::new(Silent(silent)),
+            io::sink(),
+            &|| asked.fetch_add(1, Ordering::Relaxed) >= 2,
+        );
+        assert_eq!(stopped.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(began.elapsed() < Duration::from_secs(5));
     }
 }

@@ -76,6 +76,8 @@ pub struct RecordArgs {
     #[arg(long)]
     pub background: bool,
     #[command(flatten)]
+    pub progress: super::jobs::ProgressArg,
+    #[command(flatten)]
     pub keep: KeepArg,
 }
 
@@ -378,7 +380,8 @@ impl Recording<'_> {
     fn wait(&self) -> Result<Value> {
         let duration = self.args.duration;
         self.client.stop_on_signal(&self.job);
-        let shown = super::term::activity(format!("recording {}…", self.output));
+        let mut shown =
+            super::jobs::Progress::new(format!("recording {}…", self.output), self.args.progress);
         let mut seq = 0;
         let mut stopping: Option<Instant> = None;
         let mut armed = true;
@@ -388,11 +391,11 @@ impl Recording<'_> {
                 None if armed && self.first_frame_wait().is_some() => self.first_frame_left(),
                 None => Duration::from_secs(25),
             };
-            let wait = super::jobs::wait_step(wait.min(Duration::from_secs(25)));
+            let wait = shown.step(wait.min(Duration::from_secs(25)));
             let (now, job, detail) = self.next(seq, wait)?;
             seq = now;
             if !armed || job["state"] != "armed" {
-                shown.progress(super::jobs::progress(&job, self.started));
+                shown.show(&job, self.started);
             }
             armed = job["state"] == "armed";
             let signal = signals::interrupted();

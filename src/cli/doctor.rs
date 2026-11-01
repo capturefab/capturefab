@@ -10,7 +10,10 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ("version", "string — Capturefab version"),
     ("os", "string"),
     ("arch", "string"),
-    ("features", "{usb,jpeg,keychain} — what this build includes"),
+    (
+        "features",
+        "{usb,jpeg,keychain,shell} — what this build includes",
+    ),
     (
         "dirs",
         "{runtime,state,cache,inspect} — runtime: sessions; state: presets, sign-ins; cache: FFmpeg; inspect: previews",

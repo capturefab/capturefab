@@ -885,6 +885,11 @@ impl Client {
     pub fn local(&self) -> Option<&SessionHandle> {
         self.local.as_ref()
     }
+    /// Whether the camera stays open once this command ends: in a session,
+    /// or in the workers a shell holds.
+    pub fn outlives(&self) -> bool {
+        self.session.is_some() || self.shared
+    }
     /// The pipe this command's worker writes an image captured to stdout
     /// to, once.
     pub fn take_stdout(&mut self) -> Option<std::io::PipeReader> {
@@ -1064,7 +1069,7 @@ fn default_camera(out: Output) -> Result<String> {
                 .into(),
         ),
         _ => {
-            if let Some(index) = pick_camera(out, &devices) {
+            if let Some(index) = pick_camera(out, &devices)? {
                 return Ok(devices[index].id.clone());
             }
             Err(Categorized::new(
@@ -1079,10 +1084,16 @@ fn default_camera(out: Output) -> Result<String> {
 
 /// Which of `devices` the person at this terminal picks, when someone is
 /// there to ask: never for JSON, scripts or a shell's commands, which have
-/// `use`.
-fn pick_camera(out: Output, devices: &[crate::types::CameraInfo]) -> Option<usize> {
+/// `use`. Ctrl-C at the prompt is `interrupted`, also for a command that
+/// took signals over, which would otherwise wait on.
+fn pick_camera(out: Output, devices: &[crate::types::CameraInfo]) -> Result<Option<usize>> {
     if !term::can_pick(out.json) || signals::in_shell() {
-        return None;
+        return Ok(None);
+    }
+    let interrupted = || Categorized::error(ErrorKind::Interrupted, "interrupted");
+    // Ctrl-C while looking for cameras: no one wants to pick one now.
+    if signals::interrupted() {
+        return Err(interrupted());
     }
     let labels = devices
         .iter()
@@ -1100,13 +1111,19 @@ fn pick_camera(out: Output, devices: &[crate::types::CameraInfo]) -> Option<usiz
         .collect::<Vec<_>>();
     term::before_output();
     let _paused = term::pause();
-    term::pick(
-        &labels,
-        &mut std::io::stdin().lock(),
-        &mut std::io::stderr(),
-    )
-    .ok()
-    .flatten()
+    match term::pick_until(
+        labels,
+        || std::io::stdin().lock(),
+        std::io::stderr(),
+        &signals::interrupted,
+    ) {
+        Ok(picked) => Ok(picked),
+        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+            crate::eprintln!();
+            Err(interrupted())
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 impl Cli {

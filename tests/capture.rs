@@ -4,7 +4,7 @@ mod support;
 
 use serde_json::{Value, json};
 use std::path::Path;
-use support::cli::Home;
+use support::cli::{Home, Run};
 
 /// The result keys that say when, not what.
 fn without_timing(mut value: Value) -> Value {
@@ -1081,4 +1081,75 @@ fn wide_samples_keep_their_bits_or_say_they_did_not() {
     assert_eq!(sidecar["bytes"], bytes.len());
     assert!(sidecar["frame_id"].is_u64() && sidecar["device_ts_ns"].is_u64());
     assert!(sidecar["time"].is_string() && sidecar["settings"]["exposure_us"].is_f64());
+}
+
+/// --progress reports how far a capture is on stderr, one JSON line a
+/// change, without a terminal; so does jobs wait for a job left running.
+#[test]
+fn progress_lines_say_how_far_a_capture_is() {
+    let progress = |stderr: &str| -> Vec<Value> {
+        stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|line| line.get("progress").is_some())
+            .collect()
+    };
+    let home = Home::new("progress");
+    let args = [
+        "--json",
+        "capture",
+        "-c",
+        "sim:0",
+        "-n",
+        "4",
+        "--every",
+        "300ms",
+        "--progress",
+        "-o",
+        "lapse/",
+    ];
+    let run = home.run(&args);
+    let result = run.success();
+    assert_eq!(result["count"], 4);
+    let lines = progress(&run.stderr);
+    assert!(!lines.is_empty(), "{}", run.stderr);
+    let last = &lines.last().unwrap()["progress"];
+    assert_eq!(last["camera"], "sim:0");
+    assert_eq!(last["planned"], 4);
+    assert!(last["elapsed_s"].is_number(), "{last}");
+    assert!(last["job"].is_string(), "{last}");
+    let mut saved = 0;
+    for line in &lines {
+        let now = line["progress"]["saved"].as_u64().unwrap();
+        assert!(now >= saved, "{}", run.stderr);
+        saved = now;
+    }
+    // Without it, stderr carries no such lines.
+    let quiet = home.run(&args[..args.len() - 3]);
+    assert!(progress(&quiet.stderr).is_empty(), "{}", quiet.stderr);
+    // A job left running reports as it is waited for.
+    let started = Run::of_output(
+        home.warm_command()
+            .args([
+                "--json",
+                "capture",
+                "-c",
+                "sim:1",
+                "-n",
+                "4",
+                "--every",
+                "300ms",
+                "--background",
+                "-o",
+                "later/",
+            ])
+            .output()
+            .unwrap(),
+        &["capture"],
+    )
+    .success();
+    let id = started["job"]["id"].as_str().unwrap();
+    let waited = home.run(&["--json", "jobs", "wait", id, "--progress"]);
+    assert_eq!(waited.success()["job"]["state"], "done");
+    assert!(!progress(&waited.stderr).is_empty(), "{}", waited.stderr);
 }

@@ -148,10 +148,18 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
     let value = if cameras.len() == 1 {
         each(cameras[0])?
     } else {
+        // Each camera's thread is part of this command: a shell's Ctrl-C
+        // stops what it waits for too.
+        let lineage = super::signals::Lineage::here();
         let results = std::thread::scope(|scope| {
             let threads = cameras
                 .iter()
-                .map(|camera| scope.spawn(move || each(*camera)))
+                .map(|camera| {
+                    scope.spawn(move || {
+                        lineage.enter();
+                        each(*camera)
+                    })
+                })
                 .collect::<Vec<_>>();
             threads
                 .into_iter()

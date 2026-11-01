@@ -176,6 +176,30 @@ pub fn end() {
     RUNNING.store(0, Ordering::Release);
 }
 
+/// What a thread a command starts carries over from the command: its
+/// scope, and the owner of its session requests. A signal then interrupts
+/// the thread with the command, and what it waits for closes with the
+/// command's requests.
+#[derive(Debug, Clone, Copy)]
+pub struct Lineage {
+    scope: u64,
+    owner: u64,
+}
+impl Lineage {
+    /// This thread's.
+    pub fn here() -> Self {
+        Self {
+            scope: SCOPE.with(Cell::get),
+            owner: crate::ipc::requests_owner(),
+        }
+    }
+    /// Run on this thread as part of that command.
+    pub fn enter(self) {
+        enter(self.scope);
+        crate::ipc::own_requests(self.owner);
+    }
+}
+
 /// A signal arrived: what the process, or the shell, does about it. Runs
 /// on the watcher thread, never in the signal handler itself.
 fn arrived() {

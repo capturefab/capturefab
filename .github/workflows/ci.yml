@@ -130,6 +130,7 @@ jobs:
       - run: cargo check --locked --no-default-features --features usb
       - run: cargo check --locked --no-default-features --features jpeg
       - run: cargo check --locked --no-default-features --features keychain
+      - run: cargo check --locked --no-default-features --features shell
 
   site:
     name: Site and release scripts

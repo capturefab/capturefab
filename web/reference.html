@@ -173,6 +173,7 @@
 <tr><td><code>--manifest</code></td><td>Append one JSON line per saved file (path, time, size, SHA-256, settings, tags) to this file</td><td>—</td></tr>
 <tr><td><code>--sync</code></td><td>file: each file reaches the disk before it is reported; none: skip that, for scratch captures</td><td>file, none</td></tr>
 <tr><td><code>--background</code></td><td>Leave the capture running in a session and print its job at once</td><td>false</td></tr>
+<tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>false</td></tr>
 <tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 <tr><td><code>--dry-run</code></td><td>Show the camera, files, settings and timing; capture nothing</td><td>false</td></tr>
 </tbody></table></div>
@@ -191,6 +192,7 @@
 <tr><td><code>--timeout</code></td><td>How long to wait for the first frame; none waits for a trigger until stopped</td><td>10s</td></tr>
 <tr><td><code>--warmup</code></td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle before recording; 0 records at once</td><td>2s</td></tr>
 <tr><td><code>--background</code></td><td>Leave the recording running in a session and print its job once the first frame is encoded</td><td>false</td></tr>
+<tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>false</td></tr>
 <tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-inspect"><code>capturefab inspect</code></h3>
@@ -246,6 +248,7 @@
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>ID</code></td><td>A job ID such as auto-1</td><td>Required</td></tr>
 <tr><td><code>--timeout</code></td><td>How long to wait; none waits until the job ends</td><td>none</td></tr>
+<tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>false</td></tr>
 </tbody></table></div>
 <h3 id="command-session"><code>capturefab session</code></h3>
 <p>Sessions keep cameras open between commands: start, stop, status, list. A session started in the background ends after its idle time with no requests and no running jobs; its output goes to a log in the state folder.</p>

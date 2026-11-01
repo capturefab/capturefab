@@ -260,6 +260,7 @@ pub fn report() -> Value {
             "usb": cfg!(feature = "usb"),
             "jpeg": cfg!(feature = "jpeg"),
             "keychain": cfg!(feature = "keychain"),
+            "shell": cfg!(feature = "shell"),
         },
         "dirs": {
             "inspect": runtime.join("inspect"),

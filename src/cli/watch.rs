@@ -71,13 +71,17 @@ pub fn run(global: &Global, args: WatchArgs) -> Result<Option<Report>> {
             let _ = sender.send(Wake::Signal);
         });
     }
+    // The measurements' requests, which Ctrl-C closes: a session then
+    // cancels the one waiting for a frame. In a shell they are the
+    // command's.
+    if crate::ipc::requests_owner() == 0 {
+        crate::ipc::own_requests(crate::ipc::new_owner());
+    }
     let client = Arc::new(Client::open_with(
         global,
         args.camera.camera.as_deref(),
         args.keep.route(),
     )?);
-    // The measurements say what this is doing: no status line under them.
-    let _paused = term::pause();
     let live = !global.json && term::stdout_is_tty() && term::escapes();
     let graphics = if args.show && live {
         term::graphics()
@@ -86,6 +90,7 @@ pub fn run(global: &Global, args: WatchArgs) -> Result<Option<Report>> {
     };
     let streaming = client.status()?["streaming"] == true;
     let started = !streaming && client.call(SessionCommand::Start).is_ok();
+    let mut paused = None;
     let watched = Watch {
         client: &client,
         args: &args,
@@ -93,19 +98,32 @@ pub fn run(global: &Global, args: WatchArgs) -> Result<Option<Report>> {
         graphics,
         sender,
         wakes,
+        paused: &mut paused,
     }
     .run();
-    if started && !signals::interrupted() {
-        super::inspect::stop_unless_busy(&client)?;
-    } else if started {
-        // A signal may have left a measurement waiting for its frame: stop
-        // once it has its answer, in the background.
-        let client = client.clone();
-        let _ = std::thread::Builder::new()
-            .name("capturefab-watch-stop".into())
-            .spawn(move || super::inspect::stop_unless_busy(&client));
+    let interrupted = signals::interrupted();
+    if interrupted {
+        // A measurement may wait for a frame no one will see: closing its
+        // request lets the session cancel it, and Stop need not wait.
+        crate::ipc::close_requests(crate::ipc::requests_owner());
     }
-    watched.map(|()| None)
+    // What this started streaming stops, Ctrl-C being how watch usually
+    // ends: before this exits, as a session would stream on. A worker of
+    // this command alone ends with it.
+    let stopped = if !started {
+        Ok(())
+    } else if interrupted {
+        if client.outlives() {
+            let _ = super::inspect::stop_unless_busy(&client);
+        }
+        Ok(())
+    } else {
+        super::inspect::stop_unless_busy(&client)
+    };
+    drop(paused);
+    watched?;
+    stopped?;
+    Ok(None)
 }
 
 enum Wake {
@@ -128,6 +146,8 @@ struct Watch<'a> {
     graphics: Option<term::Graphics>,
     sender: mpsc::Sender<Wake>,
     wakes: mpsc::Receiver<Wake>,
+    /// The status line kept off a terminal the measurements show on.
+    paused: &'a mut Option<term::Paused>,
 }
 
 impl Watch<'_> {
@@ -141,6 +161,13 @@ impl Watch<'_> {
         let edge = self.graphics.map_or(0, |graphics| {
             term::preview_edge(graphics, box_size.0, box_size.1)
         });
+        // Until the first measurement shows, the status line says what
+        // this waits for; from then on the measurements say it, and a
+        // status line would only get in their way on a terminal.
+        let camera = crate::media::redact_url(info["camera"].as_str().unwrap_or("the camera"));
+        let mut waiting = Some(term::activity(format!(
+            "waiting for a frame from {camera}…"
+        )));
         for index in 0u32.. {
             if signals::interrupted() {
                 break;
@@ -163,8 +190,11 @@ impl Watch<'_> {
             let preview = sample.frame["image"]["path"]
                 .as_str()
                 .map(std::path::PathBuf::from);
+            if waiting.take().is_some() && term::stdout_is_tty() {
+                *self.paused = Some(term::pause());
+            }
             match &mut view {
-                Some(view) => view.draw(&line, preview.as_deref(), box_size)?,
+                Some(view) => view.draw(&line, preview.as_deref())?,
                 None => output::write_json(&output::document(line))?,
             }
             // The preview was for this view alone.
@@ -190,9 +220,11 @@ impl Watch<'_> {
     }
 
     /// Ask for the next measurement on a thread of its own, which a signal
-    /// does not wait for.
+    /// does not wait for: its requests are this command's, which the
+    /// signal closes.
     fn request(&self, edge: u32, settings: bool) {
         let (client, sender) = (self.client.clone(), self.sender.clone());
+        let lineage = signals::Lineage::here();
         let frame = SessionCommand::Frame {
             fresh: 1,
             timeout_ms: self.args.timeout.map_or(0, super::millis),
@@ -207,6 +239,11 @@ impl Watch<'_> {
             .spawn({
                 let sender = sender.clone();
                 move || {
+                    lineage.enter();
+                    // A signal just now has no one waiting for this.
+                    if signals::interrupted() {
+                        return;
+                    }
                     let sample = (|| {
                         let frame = client.call(frame)?;
                         let status = client.status()?;
@@ -284,19 +321,28 @@ impl View {
             id: 0x6366_0000 | (std::process::id() & 0xffff),
         }
     }
-    fn draw(
-        &mut self,
-        line: &Value,
-        preview: Option<&std::path::Path>,
-        (cols, rows): (u16, u16),
-    ) -> Result<()> {
+    /// Draw `line` over the last block. Each row is cut to the terminal's
+    /// width, as it is now: a row that wrapped would take two lines, and
+    /// the next block would start one too low.
+    fn draw(&mut self, line: &Value, preview: Option<&std::path::Path>) -> Result<()> {
+        let width = term::size().map_or(80, |(cols, _)| cols);
+        let block = self.block(line, preview, width);
+        let mut out = std::io::stdout().lock();
+        out.write_all(block.as_bytes())?;
+        out.flush()?;
+        Ok(())
+    }
+    /// What draws `line` over the last block on a terminal `width`
+    /// columns wide.
+    fn block(&mut self, line: &Value, preview: Option<&std::path::Path>, width: u16) -> String {
+        let (cols, rows) = term::picture_box(TEXT_ROWS + 2);
         let mut block = String::new();
         if self.rows > 0 {
             let _ = write!(block, "\x1b[{}A\r", self.rows);
         }
         let lines = text(line);
         for row in &lines {
-            let _ = writeln!(block, "\x1b[2K{row}");
+            let _ = writeln!(block, "\x1b[2K{}", term::fit(row, width));
         }
         let mut drawn = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         if let (Some(graphics), Some(preview)) = (self.graphics, preview)
@@ -306,19 +352,16 @@ impl View {
             block.push_str(&picture.text);
             drawn += picture.rows;
         }
-        let _ = writeln!(
-            block,
-            "\x1b[2KCtrl-C stops · {}",
+        let stops = format!(
+            "Ctrl-C stops · {}",
             term::clock(Duration::from_secs_f64(line["t"].as_f64().unwrap_or(0.0)))
         );
+        let _ = writeln!(block, "\x1b[2K{}", term::fit(&stops, width));
         drawn += 1;
         // A shorter block than the last leaves nothing of it below.
         block.push_str("\x1b[J");
         self.rows = drawn;
-        let mut out = std::io::stdout().lock();
-        out.write_all(block.as_bytes())?;
-        out.flush()?;
-        Ok(())
+        block
     }
     fn finish(self) {
         let _ = std::io::stdout().flush();
@@ -478,6 +521,21 @@ mod tests {
         );
         assert_eq!(rows[2], "focus     sharpness 12.5  best 14.0 at 0.0s");
         assert_eq!(rows[3], "settings  exposure 10ms  gain 0 dB");
+        // At a narrow terminal no row wraps, so each redraw goes up by as
+        // many rows as the last one took.
+        let mut view = View::new(None);
+        let first = view.block(&line, None, 40);
+        let drawn = first.matches('\n').count();
+        assert_eq!(usize::from(view.rows), drawn);
+        for row in first.split('\n') {
+            let shown = row.trim_start_matches("\x1b[2K").trim_end_matches("\x1b[J");
+            assert!(shown.chars().count() < 40, "{shown:?}");
+        }
+        let second = view.block(&line, None, 40);
+        assert!(
+            second.starts_with(&format!("\x1b[{drawn}A\r")),
+            "{second:?}"
+        );
         assert_eq!(exposure_text(1500.0), "1.5ms");
         assert_eq!(exposure_text(250.0), "250us");
         assert_eq!(exposure_text(2_500_000.0), "2.5s");

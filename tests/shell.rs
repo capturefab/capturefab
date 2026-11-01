@@ -127,6 +127,24 @@ fn commands_as_arguments_run_instead_of_stdin() {
     let help = home.run(&["shell", "-e", "info --help"]);
     assert_eq!(help.code, Some(0));
     assert!(help.stdout.contains("Examples:"), "{}", help.stdout);
+    // With --json it is a line like any result, as the help built-in's.
+    let help = home.run_stdin(
+        "get --help\nhelp get\nget Width\n",
+        &["shell", "-c", "sim:0", "--json"],
+    );
+    assert_eq!(help.code, Some(0), "{}", help.stderr);
+    let results = lines(&help);
+    assert_eq!(results.len(), 3, "{}", help.stdout);
+    for result in &results[..2] {
+        assert!(
+            result["help"]
+                .as_str()
+                .unwrap()
+                .contains("Usage: capturefab get"),
+            "{result}"
+        );
+    }
+    assert_eq!(results[2]["values"]["Width"], 640);
 }
 
 #[test]
@@ -271,108 +289,243 @@ fn a_signal_stops_the_command_and_the_run() {
     assert_eq!(error["error"]["code"], "interrupted");
 }
 
+/// The shell on a terminal of its own: what it shows, and keys typed at it.
+#[cfg(unix)]
+struct Pty {
+    master: std::fs::File,
+    child: std::process::Child,
+    screen: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+#[cfg(unix)]
+impl Pty {
+    fn spawn(mut command: std::process::Command) -> Self {
+        use std::os::{fd::FromRawFd, unix::process::CommandExt};
+        let (master, slave) = {
+            let (mut master, mut slave) = (0, 0);
+            // SAFETY: openpty writes two descriptors this test owns.
+            let opened = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(opened, 0);
+            // SAFETY: openpty made both descriptors; each File owns one.
+            unsafe {
+                (
+                    std::fs::File::from_raw_fd(master),
+                    std::fs::File::from_raw_fd(slave),
+                )
+            }
+        };
+        command
+            .env("TERM", "xterm-256color")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(slave.try_clone().unwrap())
+            .stderr(slave);
+        // SAFETY: setsid and ioctl are async-signal-safe; the terminal
+        // becomes the child's, so Ctrl-C reaches it as SIGINT.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        drop(command);
+        let screen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        {
+            let screen = screen.clone();
+            let mut reader = master.try_clone().unwrap();
+            std::thread::spawn(move || {
+                let mut buffer = [0u8; 4096];
+                while let Ok(count) = std::io::Read::read(&mut reader, &mut buffer) {
+                    if count == 0 {
+                        break;
+                    }
+                    screen
+                        .lock()
+                        .unwrap()
+                        .push_str(&String::from_utf8_lossy(&buffer[..count]));
+                }
+            });
+        }
+        Self {
+            master,
+            child,
+            screen,
+        }
+    }
+    /// Where the screen is now: what `wait_for` looks after.
+    fn mark(&self) -> usize {
+        self.screen.lock().unwrap().len()
+    }
+    /// Wait for `text` after `mark`.
+    fn wait_for(&self, mark: usize, text: &str, within: Duration) {
+        let deadline = Instant::now() + within;
+        loop {
+            let shown = self.screen.lock().unwrap().clone();
+            if shown.get(mark..).is_some_and(|after| after.contains(text)) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "no {text:?} in\n{shown}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    fn type_in(&mut self, keys: &[u8]) {
+        std::io::Write::write_all(&mut self.master, keys).unwrap();
+    }
+    /// Run `line` and wait for `text` in what it shows: how long it took.
+    fn run(&mut self, line: &str, text: &str, within: Duration) -> Duration {
+        let (mark, asked) = (self.mark(), Instant::now());
+        self.type_in(format!("{line}\r").as_bytes());
+        self.wait_for(mark, text, within);
+        asked.elapsed()
+    }
+    /// Start `line`, then press Ctrl-C while it waits, and wait for `text`
+    /// after that.
+    fn interrupt(&mut self, line: &str, text: &str) {
+        self.type_in(format!("{line}\r").as_bytes());
+        std::thread::sleep(Duration::from_millis(700));
+        let mark = self.mark();
+        self.type_in(b"\x03");
+        self.wait_for(mark, text, Duration::from_secs(5));
+    }
+    fn exit(mut self) -> Option<i32> {
+        self.type_in(b"exit\r");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(Instant::now() < deadline, "the shell did not exit");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
 /// At a terminal, Ctrl-C stops the command running, not the shell, and
 /// the camera is free for the next command at once.
 #[cfg(unix)]
 #[test]
 fn ctrl_c_at_a_terminal_stops_the_command_not_the_shell() {
-    use std::{
-        io::Write,
-        os::{fd::FromRawFd, unix::process::CommandExt},
-    };
     let home = Home::new("shell-pty");
-    let (mut master, slave) = {
-        let (mut master, mut slave) = (0, 0);
-        // SAFETY: openpty writes two descriptors this test owns.
-        let opened = unsafe {
-            libc::openpty(
-                &mut master,
-                &mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            )
-        };
-        assert_eq!(opened, 0);
-        // SAFETY: openpty made both descriptors; each File owns one.
-        unsafe {
-            (
-                std::fs::File::from_raw_fd(master),
-                std::fs::File::from_raw_fd(slave),
-            )
-        }
-    };
     let mut command = home.command();
-    command
-        .args(["shell", "-c", "sim:0"])
-        .env("TERM", "xterm-256color")
-        .stdin(slave.try_clone().unwrap())
-        .stdout(slave.try_clone().unwrap())
-        .stderr(slave);
-    // SAFETY: setsid and ioctl are async-signal-safe; the terminal becomes
-    // the child's, so Ctrl-C reaches it as SIGINT.
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn().unwrap();
-    drop(command);
-    let screen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    {
-        let screen = screen.clone();
-        let mut reader = master.try_clone().unwrap();
-        std::thread::spawn(move || {
-            let mut buffer = [0u8; 4096];
-            while let Ok(count) = std::io::Read::read(&mut reader, &mut buffer) {
-                if count == 0 {
-                    break;
-                }
-                screen
-                    .lock()
-                    .unwrap()
-                    .push_str(&String::from_utf8_lossy(&buffer[..count]));
-            }
-        });
-    }
-    let wait_for = |text: &str, within: Duration| {
-        let deadline = Instant::now() + within;
-        loop {
-            let shown = screen.lock().unwrap().clone();
-            if let Some(at) = shown.rfind(text) {
-                return at;
-            }
-            assert!(Instant::now() < deadline, "no {text:?} in\n{shown}");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    };
-    wait_for("sim:0", Duration::from_secs(10));
-    master.write_all(b"set trigger=line0\r").unwrap();
-    wait_for("TriggerMode[FrameStart]: Off", Duration::from_secs(10));
-    master
-        .write_all(b"inspect --preview none --timeout 1m\r")
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(700));
-    master.write_all(b"\x03").unwrap();
-    wait_for("interrupted", Duration::from_secs(5));
+    command.args(["shell", "-c", "sim:0"]);
+    let mut shell = Pty::spawn(command);
+    shell.wait_for(0, "sim:0", Duration::from_secs(10));
+    shell.run(
+        "set trigger=line0",
+        "TriggerMode[FrameStart]: Off",
+        Duration::from_secs(10),
+    );
+    shell.interrupt("inspect --preview none --timeout 1m", "interrupted");
     // The camera is not left waiting for the inspection's frame.
-    let asked = Instant::now();
-    master.write_all(b"get Width\r").unwrap();
-    wait_for("Width = 640", Duration::from_secs(5));
-    assert!(asked.elapsed() < Duration::from_secs(5));
-    master.write_all(b"exit\r").unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break status;
-        }
-        assert!(Instant::now() < deadline, "the shell did not exit");
-        std::thread::sleep(Duration::from_millis(20));
+    let took = shell.run("get Width", "Width = 640", Duration::from_secs(5));
+    assert!(took < Duration::from_secs(5));
+    assert_eq!(shell.exit(), Some(0));
+}
+
+/// Progress shows at a terminal while a burst saves, unless the line
+/// says -q.
+#[cfg(unix)]
+#[test]
+fn quiet_lines_show_no_progress() {
+    let home = Home::new("shell-pty-quiet");
+    let mut command = home.command();
+    command.args(["shell", "-c", "sim:0"]);
+    let mut shell = Pty::spawn(command);
+    shell.wait_for(0, "sim:0", Duration::from_secs(10));
+    let shown = |shell: &mut Pty, line: &str| {
+        let mark = shell.mark();
+        shell.run(line, "Saved 4 frames", Duration::from_secs(20));
+        shell.screen.lock().unwrap()[mark..].to_owned()
     };
+    let loud = shown(&mut shell, "capture -n 4 --every 250ms -o loud/");
+    assert!(loud.contains("saved ·"), "{loud}");
+    let quiet = shown(&mut shell, "capture -q -n 4 --every 250ms -o quiet/");
+    assert!(!quiet.contains("saved ·"), "{quiet}");
+    assert_eq!(shell.exit(), Some(0));
+}
+
+/// Ctrl-C in a shell whose cameras are in a session stops what every
+/// thread of the command waits for: a camera of a several-camera
+/// inspection, or watch's measurement, takes the next command at once;
+/// and watch stops the stream it started.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_in_a_shell_frees_session_cameras_at_once() {
+    let home = Home::new("shell-pty-session");
+    let mut command = home.warm_command();
+    command.args(["shell", "-c", "sim:3"]);
+    let mut shell = Pty::spawn(command);
+    shell.wait_for(0, "sim:3", Duration::from_secs(10));
+    for camera in ["sim:3", "sim:4"] {
+        shell.run(
+            &format!("set -c {camera} trigger=line0"),
+            "TriggerMode[FrameStart]: Off",
+            Duration::from_secs(10),
+        );
+    }
+    shell.interrupt(
+        "inspect -c sim:3 -c sim:4 --preview none --timeout 1m",
+        "interrupted",
+    );
+    let took = shell.run("set -c sim:4 trigger=off", "Off", Duration::from_secs(5));
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    // Ctrl-C ends watch normally, its measurement waiting for a frame,
+    // which it says it waits for meanwhile.
+    let mark = shell.mark();
+    shell.type_in(b"watch --timeout 1m\r");
+    shell.wait_for(
+        mark,
+        "waiting for a frame from sim:3",
+        Duration::from_secs(5),
+    );
+    let mark = shell.mark();
+    shell.type_in(b"\x03");
+    shell.wait_for(mark, "sim:3> ", Duration::from_secs(5));
+    let took = shell.run("set trigger=off", "Off", Duration::from_secs(5));
+    assert!(took < Duration::from_secs(3), "{took:?}");
+    assert_eq!(shell.exit(), Some(0));
+    let status = home.ok(&["session", "status", "auto"]);
+    for camera in status["cameras"].as_array().unwrap() {
+        assert_eq!(camera["state"], "idle", "{status}");
+    }
+}
+
+/// Ctrl-C, how watch usually ends, stops the stream it started in the
+/// session before watch exits: the camera does not stream on.
+#[cfg(unix)]
+#[test]
+fn ctrl_c_ends_watch_and_its_stream() {
+    use std::{
+        io::{BufRead, BufReader},
+        process::Stdio,
+    };
+    let home = Home::new("watch-signal");
+    let mut child = home
+        .warm_command()
+        .args(["watch", "-c", "sim:2", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    stdout.read_line(&mut first).unwrap();
+    assert!(first.contains("\"t\""), "{first}");
+    let status = support::cli::signal_and_wait(&mut child, libc::SIGINT);
     assert_eq!(status.code(), Some(0));
+    let status = home.ok(&["session", "status", "auto"]);
+    assert_eq!(status["cameras"][0]["id"], "sim:2", "{status}");
+    assert_eq!(status["cameras"][0]["state"], "idle", "{status}");
 }
 
 #[test]
@@ -400,8 +553,21 @@ fn watch_prints_one_measurement_a_line_without_a_terminal() {
         assert!(result["frames"].as_u64().unwrap() >= 1);
         assert!(result.get("error").is_none());
     }
-    // Every key is one schema documents.
-    let documented = home.ok(&["schema", "watch"])["result"].clone();
+    // Every key is one schema documents, and so is every error it gives;
+    // a shell's lines give any command's, and interrupted.
+    let schema = home.ok(&["schema", "watch"]);
+    let errors = |schema: &Value| -> Vec<String> {
+        serde_json::from_value(schema["errors"].clone()).unwrap()
+    };
+    for code in ["exists", "feature_not_found", "out_of_range", "interrupted"] {
+        assert!(!errors(&schema).iter().any(|error| error == code), "{code}");
+    }
+    let shell = home.ok(&["schema", "shell"]);
+    for code in ["feature_not_found", "out_of_range", "interrupted", "exists"] {
+        assert!(errors(&shell).iter().any(|error| error == code), "{code}");
+    }
+    assert!(shell["result"]["lines"].as_str().unwrap().contains("stdin"));
+    let documented = schema["result"].clone();
     for result in &results {
         for key in result.as_object().unwrap().keys() {
             assert!(

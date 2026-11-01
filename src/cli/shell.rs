@@ -218,10 +218,16 @@ struct Known {
     notices: Vec<String>,
 }
 
+/// How long a prompt waits for cameras still connecting: one that is ready
+/// by then is shown ready, a prompt not being redrawn once it is.
+const SETTLE: Duration = Duration::from_millis(100);
+
 /// A camera the shell connected, by the selector it was named with.
 struct Held {
     selector: String,
     state: Connection,
+    /// The person was told it is connecting.
+    told: bool,
     /// The session it is held in, and how long that is kept after use;
     /// none for the shell's own workers.
     session: Option<String>,
@@ -247,15 +253,80 @@ impl Known {
             .iter_mut()
             .find(|held| held.selector == selector)
     }
+    /// The selector of the camera `name` names: one the shell holds, also
+    /// by the name it shows for it, without a password; else `name`.
+    fn named(&self, name: String) -> String {
+        let mut shown = self.cameras.iter().filter(|held| {
+            held.selector == name || crate::media::redact_url(&held.selector) == name
+        });
+        match (shown.next(), shown.next()) {
+            (Some(held), None) => held.selector.clone(),
+            _ => name,
+        }
+    }
     /// Say `notice` before the next prompt.
     fn notice(&mut self, notice: String) {
         self.notices.push(notice);
+    }
+    /// What to say before a prompt: what connections said since the last
+    /// one, and which cameras are still connecting, once each.
+    fn pending(&mut self) -> Vec<String> {
+        let mut said = std::mem::take(&mut self.notices);
+        for held in &mut self.cameras {
+            if matches!(held.state, Connection::Connecting) && !held.told {
+                held.told = true;
+                said.push(format!(
+                    "connecting to {}…",
+                    crate::media::redact_url(&held.selector)
+                ));
+            }
+        }
+        said
+    }
+    /// The prompt: the default camera, and whether it failed to connect.
+    /// One still connecting is not said to be, as the prompt would go on
+    /// saying so once it is ready; a line above says it instead.
+    fn prompt(&self) -> String {
+        let Some(camera) = &self.default else {
+            return "capturefab> ".into();
+        };
+        let shown = crate::media::redact_url(camera);
+        match self.cameras.iter().find(|held| held.selector == *camera) {
+            Some(Held {
+                state: Connection::Failed(_),
+                ..
+            }) => format!("{shown} (not connected)> "),
+            _ => format!("{shown}> "),
+        }
+    }
+    /// The cameras completion offers, as commands name them: without the
+    /// passwords in their URLs, which the shell never shows. A command
+    /// finds the camera by that name as it finds any connected one.
+    #[cfg(feature = "shell")]
+    fn offered(&self) -> Vec<String> {
+        self.cameras
+            .iter()
+            .map(|held| crate::media::redact_url(&held.selector))
+            .collect()
     }
 }
 
 impl Shared {
     fn known(&self) -> MutexGuard<'_, Known> {
         locked(&self.known)
+    }
+    /// Wait up to `within` for the cameras still connecting.
+    fn settle(&self, within: Duration) {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline
+            && self
+                .known()
+                .cameras
+                .iter()
+                .any(|held| matches!(held.state, Connection::Connecting))
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
     /// Connect `selector` in the background, where commands will use it;
     /// a camera already connected or connecting is left alone.
@@ -272,6 +343,7 @@ impl Shared {
             known.cameras.push(Held {
                 selector: selector.clone(),
                 state: Connection::Connecting,
+                told: false,
                 session: None,
                 keep: None,
                 #[cfg(feature = "shell")]
@@ -392,11 +464,7 @@ impl Shared {
             .default
             .as_deref()
             .and_then(|selector| known.cameras.iter().find(|held| held.selector == selector));
-        let mut cameras = known
-            .cameras
-            .iter()
-            .map(|held| held.selector.clone())
-            .collect::<Vec<_>>();
+        let mut cameras = known.offered();
         for session in crate::ipc::sessions() {
             cameras.extend(session.cameras.into_iter().map(|camera| camera.id));
         }
@@ -499,10 +567,14 @@ impl Shell {
             );
         }
         loop {
-            for notice in std::mem::take(&mut self.shared.known().notices) {
+            self.shared.settle(SETTLE);
+            let (said, prompt) = {
+                let mut known = self.shared.known();
+                (known.pending(), known.prompt())
+            };
+            for notice in said {
                 crate::eprintln!("{notice}");
             }
-            let prompt = self.prompt();
             let read = {
                 let _paused = term::pause();
                 reader.read(&prompt)
@@ -537,25 +609,6 @@ impl Shell {
             }
         }
         0
-    }
-
-    fn prompt(&self) -> String {
-        let known = self.shared.known();
-        let Some(camera) = &known.default else {
-            return "capturefab> ".into();
-        };
-        let shown = crate::media::redact_url(camera);
-        match known.cameras.iter().find(|held| held.selector == *camera) {
-            Some(Held {
-                state: Connection::Connecting,
-                ..
-            }) => format!("{shown} (connecting…)> "),
-            Some(Held {
-                state: Connection::Failed(_),
-                ..
-            }) => format!("{shown} (not connected)> "),
-            _ => format!("{shown}> "),
-        }
     }
 
     /// Run one line.
@@ -677,10 +730,19 @@ impl Shell {
     }
 
     /// Report a line clap could not parse, or print the help it asked for:
-    /// the exit code.
+    /// the exit code. With --json the help is a line like any result, as
+    /// `help` prints it.
     fn clap_failure(&self, error: &clap::Error, json: bool, words: &[String]) -> i32 {
         use clap::error::ErrorKind as Clap;
         if matches!(error.kind(), Clap::DisplayHelp | Clap::DisplayVersion) {
+            if json {
+                let text = error.render().to_string();
+                let out = super::output::Output {
+                    json,
+                    ..self.global.output()
+                };
+                return out.print(Report::json(json!({ "help": text })));
+            }
             term::before_output();
             let _ = error.print();
             return 0;
@@ -700,14 +762,17 @@ impl Shell {
     /// behind.
     fn run(&mut self, cli: Cli, label: String) -> i32 {
         let out = cli.global.output();
+        // -q on the line silences the status line, as it would alone.
+        term::hush(cli.global.quiet);
         let scope = signals::begin();
+        let owner = crate::ipc::new_owner();
         let sender = self.sender.clone();
         let spawned = std::thread::Builder::new()
             .name("capturefab-command".into())
             .stack_size(8 << 20)
             .spawn(move || {
                 signals::enter(scope);
-                crate::ipc::own_requests(scope);
+                crate::ipc::own_requests(owner);
                 let activity = (label != "login add").then(|| term::activity(format!("{label}…")));
                 let result = super::run(cli);
                 drop(activity);
@@ -715,6 +780,7 @@ impl Shell {
             });
         if let Err(error) = spawned {
             signals::end();
+            term::hush(false);
             return out.print_error(&anyhow::Error::new(error).context("start the command"));
         }
         let exit = loop {
@@ -732,7 +798,7 @@ impl Shell {
                     // It does not stop on its own: what only it waits for
                     // is cancelled, the rest finishes in the background,
                     // and what it says then is not shown.
-                    crate::ipc::close_requests(scope);
+                    crate::ipc::close_requests(owner);
                     term::forget();
                     let error = Categorized::error(ErrorKind::Interrupted, "interrupted");
                     break out.print_error(&error);
@@ -743,6 +809,7 @@ impl Shell {
         };
         signals::end();
         term::forget();
+        term::hush(false);
         let _ = io::stdout().flush();
         exit
     }
@@ -758,6 +825,7 @@ impl Shell {
             }
             [camera] => match super::caller_selector(camera) {
                 Ok(selector) => {
+                    let selector = self.shared.known().named(selector);
                     self.shared.known().default = Some(selector.clone());
                     self.shared.connect(selector.clone());
                     Some(selector)
@@ -1265,5 +1333,73 @@ mod tests {
         ] {
             assert!(refused(&parsed(line)).is_none(), "{line}");
         }
+    }
+
+    /// A prompt is not redrawn, so it never says a camera is connecting:
+    /// a line above it does, once, and the outcome follows.
+    #[test]
+    fn the_prompt_says_nothing_that_goes_stale() {
+        let held = |selector: &str, state| Held {
+            selector: selector.into(),
+            state,
+            told: false,
+            session: None,
+            keep: None,
+            #[cfg(feature = "shell")]
+            completion: complete::Cache::default(),
+        };
+        let mut known = Known::default();
+        assert_eq!(known.prompt(), "capturefab> ");
+        known.default = Some("rtsp://admin:secret@cam/live".into());
+        known
+            .cameras
+            .push(held("rtsp://admin:secret@cam/live", Connection::Connecting));
+        known.cameras.push(held("sim:1", Connection::Ready));
+        assert_eq!(known.prompt(), "rtsp://<redacted>@cam/live> ");
+        assert_eq!(
+            known.pending(),
+            ["connecting to rtsp://<redacted>@cam/live…"]
+        );
+        assert!(known.pending().is_empty(), "said once");
+        known.cameras[0].state = Connection::Failed("refused".into());
+        known.notice("rtsp://<redacted>@cam/live: refused".into());
+        assert_eq!(
+            known.prompt(),
+            "rtsp://<redacted>@cam/live (not connected)> "
+        );
+        assert_eq!(known.pending(), ["rtsp://<redacted>@cam/live: refused"]);
+    }
+
+    /// The shell shows cameras without their passwords, also where Tab
+    /// lists them, and takes that name back for the camera.
+    #[cfg(feature = "shell")]
+    #[test]
+    fn completion_offers_cameras_without_their_passwords() {
+        let url = "rtsp://admin:secret@cam/live";
+        let mut known = Known::default();
+        known.cameras.push(Held {
+            selector: url.into(),
+            state: Connection::Ready,
+            told: false,
+            session: None,
+            keep: None,
+            completion: complete::Cache::default(),
+        });
+        let hints = complete::Hints {
+            cameras: known.offered(),
+            ..complete::Hints::default()
+        };
+        let tree = Cli::tree();
+        for line in ["use ", "use rt", "info -c ", "get --camera rtsp"] {
+            let (_, candidates) = complete::complete(&tree, line, &hints);
+            assert!(!candidates.is_empty(), "{line}");
+            for candidate in candidates {
+                assert!(!candidate.contains("secret"), "{line}: {candidate}");
+            }
+        }
+        let shown = crate::media::redact_url(url);
+        assert_eq!(known.named(shown), url);
+        assert_eq!(known.named(url.into()), url);
+        assert_eq!(known.named("sim:0".into()), "sim:0");
     }
 }
