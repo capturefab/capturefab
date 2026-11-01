@@ -21,7 +21,7 @@ class SearchIndexTests(unittest.TestCase):
     def test_indexes_rendered_guides_code_and_captions(self):
         with tempfile.TemporaryDirectory() as temp:
             web = Path(temp)
-            self.write(web, '''<article data-doc-section id="capture" data-doc-title="Capture frames" data-doc-category="Getting started" data-doc-tags="simulator, --destination">
+            self.write(web, '''<article data-doc-section id="capture" data-doc-title="Capture frames" data-doc-category="Getting started" data-doc-tags="simulator, --keep">
               <h2>Capture <em>frames</em></h2><p class="doc-summary">Save &amp; inspect an image.</p>
               <pre><code>capturefab --camera sim:0 capture -o first.png</code></pre>
               <figure><img src="capture.png" alt="Preview"><figcaption>Crop around the capture controls.</figcaption></figure>
@@ -30,7 +30,7 @@ class SearchIndexTests(unittest.TestCase):
             document = search.index(web)["documents"][0]
             self.assertEqual(document["title"], "Capture frames")
             self.assertEqual(document["summary"], "Save & inspect an image.")
-            self.assertEqual(document["tags"], ["simulator", "--destination"])
+            self.assertEqual(document["tags"], ["simulator", "--keep"])
             self.assertIn("--camera sim:0 capture -o first.png", document["body"])
             self.assertIn("Crop around the capture controls.", document["body"])
             for excluded in ("Copy", "Decorative text", "unsearchable"):

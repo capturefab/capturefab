@@ -38,7 +38,8 @@ jobs:
         with:
           cache-on-failure: true
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-features --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
 
   test:
     name: Test on ${{ matrix.os }}
@@ -93,10 +94,11 @@ jobs:
           cache-on-failure: true
       # Every test binary runs, so one failure does not hide the rest.
       - run: cargo test --locked --no-fail-fast
-      # The real hdiutil path, before the Release workflow depends on it.
-      - name: Disk image packaging (real hdiutil)
-        if: runner.os == 'macOS'
-        run: python3 -m unittest discover -s scripts -p test_release.py -k RealDiskImage -v
+      # The command reference is generated from this binary's schema; the
+      # committed snapshot must match it.
+      - name: Command reference matches the CLI
+        if: matrix.os == 'ubuntu-24.04'
+        run: python3 scripts/site-reference.py --check --binary target/debug/capturefab
       # What this build reports on the runner; informational, never fails.
       - name: Report build features
         if: ${{ !cancelled() }}

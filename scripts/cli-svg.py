@@ -12,8 +12,8 @@ ROOT = Path(__file__).resolve().parents[1]
 COMMANDS = [
     ['list', '--kind', 'sim'],
     ['get', '-c', 'sim:0', 'Width', 'Height', 'PixelFormat'],
-    ['set', '-c', 'sim:0', 'exposure=5ms', 'gain=6'],
-    ['capture', '-c', 'sim:0', '-o', 'frame.png'],
+    ['inspect', '-c', 'sim:0', '--set', 'exposure=5ms', '--preview', 'none'],
+    ['capture', '-c', 'sim:0', '-n', '3', '-o', 'frames/{seq}.png'],
 ]
 WIDTH, FONT, LINE, PAD, BAR = 1200, 15, 22, 28, 40
 COLUMNS = int((WIDTH - 2 * PAD) / (FONT * 0.6))
@@ -22,7 +22,8 @@ def simulated_only(discovered):
     return all(row.startswith('sim:') for row in discovered.splitlines()[1:])
 
 def transcript(binary):
-    with tempfile.TemporaryDirectory(prefix='capturefab-cli-svg-') as temp:
+    # A short folder keeps the printed paths of saved files within the image width.
+    with tempfile.TemporaryDirectory(prefix='cf-', dir='/tmp' if Path('/tmp').is_dir() else None) as temp:
         env = {k: v for k, v in os.environ.items() if not k.startswith('CAPTUREFAB_')}
         env['CAPTUREFAB_SESSION_DIR'] = str(Path(temp) / 'sessions')
         env['CAPTUREFAB_CACHE_DIR'] = str(Path(temp) / 'cache')
@@ -51,7 +52,7 @@ def render(lines):
         else:
             rows.append(f'<text x="{PAD}" y="{y}" xml:space="preserve" fill="#98989f">{escape(line)}</text>')
     return f'''<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{height(lines)}" viewBox="0 0 {WIDTH} {height(lines)}" role="img" aria-labelledby="title">
-<title id="title">capturefab discovery, configuration, and capture commands against the built-in simulator</title>
+<title id="title">capturefab commands against the built-in simulator: list cameras, read features, change exposure and measure the result, capture a burst</title>
 <rect width="{WIDTH}" height="{height(lines)}" rx="12" fill="#1e1e20"/>
 <path d="M0 12a12 12 0 0 1 12-12h{WIDTH - 24}a12 12 0 0 1 12 12v{BAR - 12}h-{WIDTH}z" fill="#29292c"/>
 <circle cx="24" cy="20" r="6" fill="#3b3b40"/><circle cx="44" cy="20" r="6" fill="#3b3b40"/><circle cx="64" cy="20" r="6" fill="#3b3b40"/>

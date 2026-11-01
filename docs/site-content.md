@@ -45,28 +45,22 @@ They supplement general STE vocabulary; they do not exempt ordinary prose from t
 
 | Term or family | Meaning and source |
 | --- | --- |
-| capture, frame, preview | Acquire an image, an acquired image unit, and its displayed view; `src/engine.rs`, `src/frame.rs`, GUI preview code. |
-| save, file, filename, path, directory | Software output and filesystem concepts used by the CLI and Capture inspector. |
-| select, click, focus, field, checkbox, inspector | Software interface actions and controls. Preserve exact labels from `src/gui/`. |
-| session, worker, headless, CLI, RPC, JSON | Local automation and process terms; `src/session/` and installed `schema`/`--help`. |
-| folder, drive, destination, retention | Local file storage terms; destination and storage implementations. |
-| stream, streaming, forwarding, recording, encoder, bitrate | Media operations or control names. Use nouns; avoid progressive verb phrases. |
-| exposure, gain, histogram, focus region, calibration | Camera and image-measurement terms. Availability depends on the source. |
+| capture, frame, preview | Acquire an image, an acquired image unit, and the small JPEG `inspect` writes; `src/engine.rs`, `src/frame.rs`, `src/inspect.rs`. |
+| save, file, filename, path, directory, template | Output and filesystem concepts of `capture`, `record` and `-o`. |
+| session, worker, job, CLI, JSON, schema | Local automation and process terms; `src/session.rs`, `src/ipc.rs` and the installed `schema`/`--help`. |
+| preset, user set | A settings document on this computer, and the camera's own saved settings. |
+| stream, streaming, recording, encoder, bitrate | Media operations or option names. Use nouns; avoid progressive verb phrases. |
+| exposure, gain, histogram, focus, sharpness, region, calibration | Camera and image-measurement terms. Availability depends on the source. |
 | GigE Vision, USB3 Vision, GenICam, ONVIF, FFmpeg | Exact protocol, specification or product names. |
-| data fields, environment variables, filenames and UI labels | Literal identifiers. Do not change spelling to satisfy general word substitutions. |
+| data fields, error codes, environment variables, filenames | Literal identifiers. Do not change spelling to satisfy general word substitutions. |
 
 ## Evidence and audit limits
 
-The content pass shortened documentation sentences, separated procedural actions and removed repeated descriptions.
-It retained command examples, section anchors and limits.
-It added archive extraction, actual executable names, operating system floors and camera-profile limits.
-Those changes use `scripts/release.py`, `docs/release.md`, `docs/camera-compatibility.md` and the current GUI implementation as evidence.
-
 Sentence counts are an editorial aid, not a complete STE validation.
-A full dictionary-by-dictionary language review has not been completed.
 No certification or universal camera-compatibility claim is made.
-Screenshots and recordings must identify simulator data and their development build provenance.
-A development screenshot does not establish behavior in every published release.
+Do not publish camera test results or compatibility claims while the software develops quickly.
+Examples must come from the CLI: run them against the simulator (`-c sim:0`) with isolated
+`CAPTUREFAB_SESSION_DIR` and `CAPTUREFAB_CACHE_DIR` folders before publishing them.
 
 After a documentation edit, regenerate `web/search-index.json` with `python3 scripts/docs-search.py`.
 Run its `--check` mode, `node scripts/test-docs-search.js` and `python3 scripts/test-site.py`.
@@ -74,44 +68,27 @@ Render the pages on desktop and mobile before publication.
 
 ## Documentation coverage
 
-The public documentation has three entry points:
+The public documentation has these entry points:
 
+- `web/index.html`: what Capturefab is, installation and examples.
 - `web/docs.html`: setup and task guides.
-- `web/desktop.html`: desktop settings, controls, analytics and browser operation.
-- `web/reference.html`: CLI commands, options, tools and session RPC operations.
+- `web/reference.html`: every command, option, result field, exit code and error code.
+- `web/agents.md` and `web/llms.txt`: instructions and an index for AI agents.
+- `web/guides/`: the user guides in `docs/`, published by `scripts/site-guides.py`.
 
-Search indexes every HTML page with `data-doc-section` articles. Each article must
-have a unique local anchor, matching title and heading, and a summary.
+`web/reference.html` is generated, never edited by hand. `scripts/site-reference.py --binary
+target/debug/capturefab` records the binary's `schema`, `schema COMMAND` and `-h` examples in
+`docs/cli-schema.json` and writes the page from it; without `--binary` it writes the page from
+that snapshot. `python3 scripts/test-site.py` fails when the page differs from the snapshot, and
+CI fails when the snapshot differs from the built binary. Every command, option and result field
+is therefore documented by construction.
 
-Run `python3 scripts/docs-coverage.py` to audit the current source. Add `--json`
-for a machine-readable report. The normal site check runs this audit too.
-The checked-in inventories are `docs/cli-coverage.json` and
-`docs/desktop-coverage.json`.
+Search indexes every HTML page with `data-doc-section` articles. Each article must have a unique
+local anchor, matching title and heading, and a summary. Landing-page CLI examples must also
+appear in a `docs.html` example, so the task guides keep them current.
 
-The audit compares every visible command and declared alias, registered tool,
-public session RPC operation, keyboard action and HTTP route with its guide.
-It checks CLI option and positional-argument spellings, including shared options.
-It also verifies the source terms and explanatory targets for the desktop
-feature inventory. The RPC `grab` operation and hidden CLI commands are internal.
-Feature-gated public commands remain included, so the docs cover supported builds.
-
-For a new feature, add instructions, expected results and applicable limits.
-Then update its inventory entry and regenerate search. For a removed feature,
-remove obsolete instructions and mappings. Source comparison detects new commands,
-tools, RPC operations, keyboard actions and routes automatically. New controls
-outside these registries must also be added to the desktop feature inventory.
-
-A passing audit establishes full coverage of these source interfaces and the
-reviewed feature inventory. It does not establish hardware compatibility or prove
-that every sentence is accurate. Review behavior, options and examples against
-the source. The documentation follows the current source tree; an installed
-release can expose fewer features. Its `--help` and `schema --json` identify its
-available interface.
-
-The release follow-up also covers Apple Intelligence.
-Local-model requirements, image limits and usage reporting come from
-`src/assistant/foundation_models.*`, `provider.rs`, `vision.rs` and `settings.rs`.
-
-The current destination contract contains folder destinations only.
-Use mounted network folders for remote file storage. Keep stream forwarding
-and AI-provider requests distinct from captured-file storage in public copy.
+For a new feature, add instructions, expected results and applicable limits to the task guides,
+regenerate the reference and search, and update `web/agents.md` when agents should use it. For a
+removed feature, remove its instructions. A passing check does not establish hardware
+compatibility or prove that every sentence is accurate; review behavior and examples against the
+binary.

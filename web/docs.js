@@ -1,4 +1,4 @@
-/* Local documentation search, section navigation and screenshot zoom. No remote dependencies. */
+/* Local documentation search, section navigation and image zoom. No remote dependencies. */
 (() => {
   'use strict';
 
@@ -264,7 +264,7 @@
       label.append(element('span', 'search-label', 'Feature, task or command'));
       searchInput = element('input', 'search-input');
       searchInput.id = 'site-search-query'; searchInput.type = 'search';
-      searchInput.placeholder = 'Search exposure, folders, --destination…';
+      searchInput.placeholder = 'Search exposure, triggers, --keep…';
       searchInput.autocomplete = 'off'; searchInput.spellcheck = false;
       label.append(searchInput);
       const status = element('p', 'search-status');
@@ -354,9 +354,9 @@
     event.preventDefault();
     if (!screenshotDialog) {
       screenshotDialog = element('dialog', 'screenshot-dialog');
-      screenshotDialog.setAttribute('aria-label', 'App screenshot');
+      screenshotDialog.setAttribute('aria-label', 'Enlarged image');
       const close = element('button', 'search-close', 'Close');
-      close.type = 'button'; close.setAttribute('aria-label', 'Close screenshot');
+      close.type = 'button'; close.setAttribute('aria-label', 'Close the enlarged image');
       close.addEventListener('click', () => screenshotDialog.close());
       screenshotImage = element('img', 'screenshot-dialog-image');
       screenshotCaption = element('p', 'screenshot-dialog-caption'); screenshotCaption.id = 'screenshot-dialog-caption';
