@@ -25,6 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// The FFmpeg build.rs embedded, compressed; empty when the build has none.
 const EMBEDDED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/capturefab-ffmpeg.bin"));
 const LICENSE: &str = include_str!(concat!(env!("OUT_DIR"), "/capturefab-ffmpeg-license.txt"));
 const MAX_FRAME: usize = 256 * 1024 * 1024;
@@ -427,7 +428,7 @@ impl<'a> Payload<'a> {
             raw: false,
         })
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn raw(bytes: &'a [u8], digest: &str) -> Self {
         Self {
             bytes,
@@ -504,18 +505,118 @@ thread_local! {
     static PUSH_RACE: std::cell::Cell<Option<fn(&WriterQueue)>> =
         const { std::cell::Cell::new(None) };
 }
+/// Where the FFmpeg this process runs comes from, in the order they are
+/// tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FfmpegSource {
+    /// CAPTUREFAB_FFMPEG names it.
+    Override,
+    /// Built into this executable, and extracted to the cache on first use.
+    Bundled,
+    /// An `ffmpeg` in the folder that holds this executable.
+    NextToExecutable,
+    /// The first `ffmpeg` on PATH.
+    Path,
+}
+impl FfmpegSource {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Override => "CAPTUREFAB_FFMPEG",
+            Self::Bundled => "bundled",
+            Self::NextToExecutable => "next_to_executable",
+            Self::Path => "path",
+        }
+    }
+}
+/// The FFmpeg to run: CAPTUREFAB_FFMPEG, else the one built in, else one
+/// beside this executable, else one on PATH. None of them is `ffmpeg_missing`.
 pub(crate) fn executable() -> Result<Arc<Executable>> {
+    resolve().map(|(exe, _)| exe)
+}
+fn resolve() -> Result<(Arc<Executable>, FfmpegSource)> {
     #[cfg(test)]
     if let Some(fake) = FAKE_FFMPEG.with_borrow(Clone::clone) {
-        return Ok(fake);
+        return Ok((fake, FfmpegSource::Override));
     }
     if let Some(path) = std::env::var_os("CAPTUREFAB_FFMPEG") {
         ensure!(
             !path.is_empty(),
             "CAPTUREFAB_FFMPEG must be an executable path"
         );
-        return Ok(Arc::new(Executable::external(PathBuf::from(path))));
+        return Ok((
+            Arc::new(Executable::external(PathBuf::from(path))),
+            FfmpegSource::Override,
+        ));
     }
+    if bundled() {
+        return Ok((extracted()?, FfmpegSource::Bundled));
+    }
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf));
+    match installed(beside.as_deref(), std::env::var_os("PATH").as_deref()) {
+        Some((path, source)) => Ok((Arc::new(Executable::external(path)), source)),
+        None => Err(ffmpeg_missing()),
+    }
+}
+fn ffmpeg_missing() -> anyhow::Error {
+    Categorized::new(
+        ErrorKind::FfmpegMissing,
+        "this build has no FFmpeg built in, and none is next to capturefab or on PATH",
+    )
+    .hint(ffmpeg_hint())
+    .into()
+}
+/// An FFmpeg installed beside the executable, in `beside`, or else in a
+/// folder of `path` (PATH). Relative PATH entries are skipped: they would
+/// run whatever the working folder holds.
+fn installed(
+    beside: Option<&std::path::Path>,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<(PathBuf, FfmpegSource)> {
+    let runnable = |file: &std::path::Path| {
+        let Ok(meta) = fs::metadata(file) else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        meta.is_file()
+    };
+    if let Some(file) = beside.map(|dir| dir.join(FFMPEG_NAME))
+        && runnable(&file)
+    {
+        return Some((file, FfmpegSource::NextToExecutable));
+    }
+    std::env::split_paths(path?)
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(FFMPEG_NAME))
+        .find(|file| runnable(file))
+        .map(|file| (file, FfmpegSource::Path))
+}
+/// Whether this build has FFmpeg built in.
+pub(crate) fn bundled() -> bool {
+    !EMBEDDED.is_empty()
+}
+/// What to do about a missing FFmpeg, on this OS.
+pub(crate) fn ffmpeg_hint() -> String {
+    let install = if cfg!(target_os = "macos") {
+        "`brew install ffmpeg`"
+    } else if cfg!(windows) {
+        "`winget install Gyan.FFmpeg`"
+    } else {
+        "your package manager, such as `sudo apt install ffmpeg`"
+    };
+    format!(
+        "install FFmpeg with {install}, put it next to capturefab, or set CAPTUREFAB_FFMPEG to an FFmpeg executable; Capturefab release downloads have it built in"
+    )
+}
+/// The built-in FFmpeg, extracted once to the user's cache, or to a private
+/// temporary folder where the cache cannot run programs.
+fn extracted() -> Result<Arc<Executable>> {
     let payload = Payload::compressed(EMBEDDED)?;
     let mut extracted = EXECUTABLE
         .get_or_init(Default::default)
@@ -576,7 +677,7 @@ fn runs(exe: &Executable) -> bool {
 /// written once, under a lock, to a new file that is renamed into place;
 /// an existing copy is checked against the digest before this process
 /// first runs it.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn cached_copy(root: &std::path::Path, bytes: &[u8], digest: &str) -> Result<Executable> {
     cached_payload(root, &Payload::raw(bytes, digest))
 }
@@ -925,7 +1026,7 @@ pub(crate) fn license_notice() -> &'static str {
 /// Which FFmpeg this process would run, and whether it starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FfmpegHealth {
-    /// "bundled", or "CAPTUREFAB_FFMPEG" for an override.
+    /// Where it was found: [`FfmpegSource::name`].
     pub source: &'static str,
     pub path: String,
     /// FFmpeg's first `-version` line, such as `ffmpeg version 7.1 ...`.
@@ -934,12 +1035,7 @@ pub(crate) struct FfmpegHealth {
 /// Run FFmpeg's `-version` with a 3 s deadline, for `doctor`. Extracting
 /// the bundled copy goes to the cache directory, as for any first use.
 pub(crate) fn ffmpeg_health() -> Result<FfmpegHealth> {
-    let source = if std::env::var_os("CAPTUREFAB_FFMPEG").is_some() {
-        "CAPTUREFAB_FFMPEG"
-    } else {
-        "bundled"
-    };
-    let exe = executable()?;
+    let (exe, source) = resolve()?;
     let (ok, output) = bounded_output(&exe, &["-version".into()], Duration::from_secs(3))
         .with_context(|| format!("cannot run {}", exe.path.display()))?;
     let version = output.lines().next().unwrap_or_default().trim().to_owned();
@@ -954,7 +1050,7 @@ pub(crate) fn ffmpeg_health() -> Result<FfmpegHealth> {
         }
     );
     Ok(FfmpegHealth {
-        source,
+        source: source.name(),
         path: exe.path.display().to_string(),
         version,
     })
@@ -2382,7 +2478,7 @@ fn network_failure(
 }
 /// A longer timeout in milliseconds to suggest, while one up to the 60 s
 /// limit is left to try: double the wait, and at least 10 s. The advice
-/// names the CLI flag in parentheses, after words the desktop reads too.
+/// names the flag in parentheses, after words any caller reads.
 fn longer_wait(timeout: Duration) -> Option<u128> {
     let current = timeout.as_millis();
     let suggested = (current * 2).clamp(10_000, 60_000);
@@ -2524,7 +2620,7 @@ struct MediaBackend {
     /// PlaybackSpeed asks for every frame as fast as it decodes.
     paced: bool,
     /// Whether this acquisition's first frame was asked for on demand, by a
-    /// capture, rather than taken by a live view; unknown until then.
+    /// capture, rather than taken from a running stream; unknown until then.
     on_demand: Option<bool>,
     /// A capture asked a paced file for frames while the frame it opened
     /// with was still there: that frame is taken, and the file starts again
@@ -3238,7 +3334,7 @@ impl Backend for MediaBackend {
         self.running = true;
         Ok(())
     }
-    /// A capture that asks for frames before a live view takes any reads a
+    /// A capture that asks for frames before a stream takes any reads a
     /// paced file as fast as it asks, like frames from a triggered camera;
     /// the file starts again unpaced. Its first frame is the one it opened
     /// with when that is still there, so one frame needs one FFmpeg.
@@ -5178,6 +5274,7 @@ mod tests {
         }
     }
     const PAYLOAD: &[u8] = b"#!/bin/sh\necho stand-in for FFmpeg\n";
+    #[cfg(unix)]
     fn digest(bytes: &[u8]) -> String {
         use sha2::Digest;
         format!("{:x}", sha2::Sha256::digest(bytes))
@@ -5261,6 +5358,47 @@ mod tests {
         assert!(Payload::compressed(&good[..header]).is_err());
         assert!(Payload::compressed(b"invalid").is_err());
         fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    #[cfg(unix)]
+    fn ffmpeg_is_found_next_to_the_executable_then_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temp_dir("installed");
+        let [beside, unrelated, plain, bin] =
+            ["beside", "unrelated", "plain", "bin"].map(|name| base.join(name));
+        for (dir, mode) in [(&beside, 0o755), (&plain, 0o644), (&bin, 0o755)] {
+            fs::create_dir_all(dir).unwrap();
+            let file = dir.join(FFMPEG_NAME);
+            fs::write(&file, PAYLOAD).unwrap();
+            fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        fs::create_dir_all(&unrelated).unwrap();
+        // A relative entry and a file that cannot run are passed over.
+        let path = std::env::join_paths([std::path::Path::new("beside"), &unrelated, &plain, &bin])
+            .unwrap();
+        assert_eq!(
+            installed(Some(&beside), Some(&path)),
+            Some((beside.join(FFMPEG_NAME), FfmpegSource::NextToExecutable))
+        );
+        assert_eq!(
+            installed(Some(&unrelated), Some(&path)),
+            Some((bin.join(FFMPEG_NAME), FfmpegSource::Path))
+        );
+        assert_eq!(installed(Some(&unrelated), None), None);
+        fs::remove_dir_all(base).unwrap();
+    }
+    #[test]
+    fn a_missing_ffmpeg_is_typed_and_says_how_to_get_one() {
+        for error in [
+            ffmpeg_missing(),
+            ffmpeg_missing().context(FfmpegUnavailable),
+            anyhow!("No such file or directory").context(FfmpegUnavailable),
+        ] {
+            let classified = crate::types::classify(&error);
+            assert_eq!(classified.kind.code(), ("ffmpeg_missing", 3), "{error:#}");
+            let hint = classified.hint.unwrap();
+            assert!(hint.contains("CAPTUREFAB_FFMPEG"), "{hint}");
+        }
     }
     #[test]
     #[cfg(unix)]
@@ -5861,7 +5999,7 @@ for i in 1 2 3; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
         assert_eq!(launches.len(), 2, "{launches:?}");
         assert!(paced(launches[0]) && !paced(launches[1]), "{launches:?}");
         camera.stop().unwrap();
-        // Captures during a live view keep its pace.
+        // Captures while it streams keep its pace.
         camera.start(12).unwrap();
         camera.next_frame(Duration::from_secs(2)).unwrap();
         camera.request_frame().unwrap();
@@ -6391,7 +6529,7 @@ esac"#
         assert!(info("concat:secret|other").is_err());
         assert!(info("rtsp://camera/live\n-x").is_err());
         // Vendor and signed-URL credentials (Foscam pwd, Blue Iris pw,
-        // Home Assistant authSig, API keys) never reach logs either.
+        // authSig, API keys) never reach logs either.
         assert_eq!(
             redact_url(
                 "http://cam/cgi?usr=a&PWD=b&pw=c&api_key=d&ApiKey=e&authSig=f&sig=g&signature=h&stream=main&fps=5"

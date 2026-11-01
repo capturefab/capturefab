@@ -181,13 +181,22 @@ class ReleaseTests(unittest.TestCase):
             args = SimpleNamespace(version=release.version(), target='aarch64-unknown-linux-gnu', os='linux', arch='aarch64',
                                    ffmpeg_bundle=temp / 'bundle', binary=None, repackage=False, output=temp / 'out')
             with mock.patch.object(release, 'run', side_effect=run), \
-                    mock.patch.object(release, 'package', return_value={}), mock.patch.object(release, 'media_sources', return_value=source):
+                    mock.patch.object(release, 'package', return_value={}), mock.patch.object(release, 'media_sources', return_value=source), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                # Without the bundle's FFmpeg, nothing is built.
+                with self.assertRaisesRegex(RuntimeError, 'build\\(s\\) failed'):
+                    release.build(args)
+                self.assertEqual(builds, [])
+                report = json.loads((temp / 'out' / 'build-linux-aarch64.json').read_text())
+                self.assertIn('releases embed the FFmpeg', report['failures'][0]['error'])
+                (temp / 'bundle' / 'bin').mkdir(parents=True)
+                (temp / 'bundle' / 'bin' / 'ffmpeg').write_bytes(b'ffmpeg')
                 release.build(args)
             self.assertEqual(len(builds), 1)
             command, env = builds[0]
             self.assertNotIn('--features', command)
             self.assertNotIn('--no-default-features', command)
-            self.assertIn('CAPTUREFAB_FFMPEG_BINARY', env)
+            self.assertEqual(env['CAPTUREFAB_FFMPEG_BINARY'], str((temp / 'bundle' / 'bin' / 'ffmpeg').resolve()))
 
     def test_linux_packages_carry_the_udev_rule_and_licenses(self):
         with tempfile.TemporaryDirectory() as temp:

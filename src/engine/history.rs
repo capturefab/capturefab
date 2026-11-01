@@ -390,10 +390,6 @@ pub(super) fn process(
     command: WorkerCommand,
 ) -> Result<Value> {
     command.validate()?;
-    #[cfg(test)]
-    if let WorkerCommand::Set { feature, value } = &command {
-        camera_mut(camera)?.validate_set(feature, value)?;
-    }
     match command.session() {
         // Reading and comparing switch selectors only to read, and restore them.
         Some(SessionCommand::ReadSetup) => return setup::read(h, camera_mut(camera)?, auto),
@@ -413,11 +409,8 @@ pub(super) fn process(
         _ => {}
     }
     // A change that may write several values is one change: what it would
-    // replace is read first, and a failure puts every value back. A single
-    // Set writes several only when it ends auto mode.
+    // replace is read first, and a failure puts every value back.
     let atomic = match &command {
-        #[cfg(test)]
-        WorkerCommand::Set { feature, .. } => auto.as_ref().is_some_and(|a| a.manages(feature)),
         #[cfg(test)]
         WorkerCommand::SetMany { .. } => true,
         WorkerCommand::Session(
@@ -469,8 +462,6 @@ pub(super) fn process(
                     .map(|row| row.address.feature.as_str())
             })
             .collect(),
-        #[cfg(test)]
-        WorkerCommand::Set { feature, .. } => vec![feature.as_str()],
         #[cfg(test)]
         WorkerCommand::SetMany { values } => {
             values.iter().map(|value| value.feature.as_str()).collect()
@@ -640,11 +631,7 @@ mod tests {
         h
     }
     fn get(h: &WorkerHandle, feature: &str) -> Value {
-        h.request(WorkerCommand::Get {
-            feature: feature.into(),
-        })
-        .unwrap()["value"]
-            .clone()
+        h.value(feature)
     }
     fn set_many(h: &WorkerHandle, values: &[(&str, &str)]) -> Result<Value> {
         h.request(WorkerCommand::SetMany {
@@ -686,13 +673,7 @@ mod tests {
         })
         .unwrap();
         let exposure = get(&h, "ExposureTime");
-        assert!(
-            h.request(WorkerCommand::Set {
-                feature: "ExposureTime".into(),
-                value: "0".into()
-            })
-            .is_err()
-        );
+        assert!(h.set_value("ExposureTime", "0").is_err());
         assert_eq!(h.snapshot().auto.unwrap().balance, 0.3);
         assert_eq!(get(&h, "ExposureTime"), exposure);
         h.shutdown();
@@ -1009,13 +990,19 @@ mod tests {
             .unwrap();
             (walks.load(Ordering::Relaxed) - before, result)
         };
-        let set = |feature: &str, value: &str| WorkerCommand::Set {
-            feature: feature.into(),
-            value: value.into(),
+        let set = |feature: &str, value: &str| -> WorkerCommand {
+            SessionCommand::SetValues {
+                values: vec![
+                    crate::controls::Assignment::parse(&format!("{feature}={value}")).unwrap(),
+                ],
+                dry_run: false,
+            }
+            .into()
         };
         let (count, result) = walked(&mut camera, set("Width", "128"));
         assert_eq!(count, 0);
-        assert_eq!(result, json!({"name":"Width","value":128}));
+        assert_eq!(result["changed"][0]["name"], "Width", "{result}");
+        assert_eq!(result["changed"][0]["to"], 128, "{result}");
         // A grouped edit checkpoints what it writes and the features coupled
         // with it, not every feature.
         let (count, result) = walked(
@@ -1032,15 +1019,7 @@ mod tests {
         );
         assert_eq!(count, 0);
         assert_eq!(result["values"][1], json!({"name":"Height","value":192}));
-        let values = vec![crate::controls::Assignment::parse("ExposureTime=4000").unwrap()];
-        let (count, result) = walked(
-            &mut camera,
-            SessionCommand::SetValues {
-                values,
-                dry_run: false,
-            }
-            .into(),
-        );
+        let (count, result) = walked(&mut camera, set("ExposureTime", "4000"));
         assert_eq!(count, 0);
         assert_eq!(result["changed"][0]["name"], "ExposureTime", "{result}");
         assert_eq!(walked(&mut camera, SessionCommand::Start.into()).0, 0);

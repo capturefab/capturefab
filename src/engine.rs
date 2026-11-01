@@ -339,6 +339,25 @@ impl WorkerHandle {
             .recv()
             .context("camera worker stopped")?
     }
+    /// Write one feature as `set` does, for tests.
+    #[cfg(test)]
+    pub(crate) fn set_value(&self, feature: &str, value: &str) -> Result<Value> {
+        self.request(SessionCommand::SetValues {
+            values: vec![crate::controls::Assignment::parse(&format!(
+                "{feature}={value}"
+            ))?],
+            dry_run: false,
+        })
+    }
+    /// Read one feature as `get` does, for tests.
+    #[cfg(test)]
+    pub(crate) fn value(&self, feature: &str) -> Value {
+        self.request(SessionCommand::GetValues {
+            names: vec![crate::controls::Name::parse(feature).unwrap()],
+        })
+        .unwrap()["values"][feature]
+            .clone()
+    }
     /// Queue `command` as request `id`, answered through `reply`. A request
     /// that is refused is handed back with why.
     pub(crate) fn queue_request(
@@ -1217,18 +1236,6 @@ impl Acquisition {
             }
         }
     }
-    /// Whether the camera's own auto exposure, gain or white balance was on,
-    /// so its values may differ on the next frame.
-    fn firmware_auto(&self) -> bool {
-        ["ExposureAuto", "GainAuto", "BalanceWhiteAuto"]
-            .iter()
-            .any(|name| {
-                self.settings
-                    .get(*name)
-                    .and_then(Value::as_str)
-                    .is_some_and(|mode| !mode.eq_ignore_ascii_case("off"))
-            })
-    }
 }
 
 fn acquisition(c: &mut Camera) -> Acquisition {
@@ -1528,56 +1535,10 @@ fn process_plain(
         WorkerCommand::OptimizeNetwork { bytes_per_second } => {
             return optimize_network(h, camera, forwarder, auto, jobs, bytes_per_second);
         }
-        #[cfg(test)]
-        WorkerCommand::Get { feature } => {
-            return Ok(json!({"name":feature,"value":camera_mut(camera)?.get(&feature)?}));
-        }
-        #[cfg(test)]
-        WorkerCommand::Set { feature, value } => {
-            camera_mut(camera)?.validate_set(&feature, &value)?;
-            let switched = auto.as_ref().is_some_and(|a| a.manages(&feature));
-            if switched {
-                release_auto(h, auto, camera, false)?;
-                h.log(
-                    "info",
-                    format!("Switched to manual mode because {feature} was set"),
-                );
-            } else if let Some(a) = auto.as_mut() {
-                a.invalidate();
-            }
-            camera_mut(camera)?.set(&feature, &value)?;
-            let result = camera_mut(camera)?.get(&feature)?;
-            refresh(h, camera);
-            h.log("info", format!("Set {feature} = {value}"));
-            let mut reply = json!({"name":feature,"value":result});
-            if switched {
-                reply["auto"] = Value::Null;
-            }
-            return Ok(reply);
-        }
         // The rollback checkpoint records each write; see `set_many`.
         #[cfg(test)]
         WorkerCommand::SetMany { values } => {
             return set_many(h, camera, auto, &values, |_, _| Ok(()));
-        }
-        #[cfg(test)]
-        WorkerCommand::Execute { feature } => {
-            if auto.is_some() && matches!(feature.as_str(), "UserSetLoad" | "UserSetDefault") {
-                release_auto(h, auto, camera, false)?;
-                h.log(
-                    "info",
-                    format!("Switched to manual mode because {feature} was executed"),
-                );
-            } else if let Some(a) = auto.as_mut() {
-                a.invalidate();
-            }
-            camera_mut(camera)?.execute(&feature)?;
-            refresh(h, camera);
-            return Ok(json!({"executed":feature}));
-        }
-        #[cfg(test)]
-        WorkerCommand::Features => {
-            return Ok(json!({"features":camera_mut(camera)?.features()}));
         }
         #[cfg(test)]
         WorkerCommand::StopForward => {
@@ -1599,7 +1560,6 @@ fn process_plain(
         | SessionCommand::ApplySetup { .. } => {
             anyhow::bail!("saved setups are read and restored before plain commands")
         }
-        SessionCommand::Discover { .. } => anyhow::bail!("discovery belongs to the coordinator"),
         SessionCommand::NetworkScan { .. } => {
             anyhow::bail!("network scan belongs to the coordinator")
         }
@@ -1808,10 +1768,10 @@ fn process_plain(
                         login = Some(saved);
                         remembered = Some(key.address.clone());
                     }
-                    crate::logins::Remembered::Missing { .. } => h.log(
+                    crate::logins::Remembered::Missing { user } => h.log(
                         "warn",
                         format!(
-                            "the saved sign-in for {} is missing from the OS credential store",
+                            "the saved sign-in of {user} for {} is missing from the OS credential store",
                             crate::logins::short(&key.address)
                         ),
                     ),
@@ -3960,21 +3920,8 @@ fn worker(h: WorkerHandle) {
 }
 
 #[cfg(test)]
-#[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn camera_auto_features_refresh_settings_every_frame() {
-        let mut settings = Acquisition::default();
-        settings
-            .settings
-            .insert("ExposureAuto".into(), json!("Off"));
-        assert!(!settings.firmware_auto());
-        settings
-            .settings
-            .insert("GainAuto".into(), json!("Continuous"));
-        assert!(settings.firmware_auto());
-    }
     #[test]
     fn a_recordings_first_written_frame_is_told_at_once() {
         let written = |written| crate::media::ForwardStats {
@@ -4420,8 +4367,8 @@ mod tests {
         finish_timed_forward(&h, &mut forwarder, &mut None, u64::MAX);
         assert!(forwarder.is_some(), "a forward without a duration runs on");
         run(&mut camera, &mut forwarder, WorkerCommand::StopForward).unwrap();
-        // At its end time the worker ends a timed forward as stop-forward
-        // does, and says so in the step that clears it.
+        // At its end time the worker ends a timed forward as a stop does,
+        // and says so in the step that clears it.
         let reply = run(
             &mut camera,
             &mut forwarder,
@@ -4558,25 +4505,9 @@ mod tests {
         let h = WorkerHandle::new();
         h.request(SessionCommand::connect("sim:0".into(), 100))
             .unwrap();
-        h.request(WorkerCommand::Set {
-            feature: "Width".into(),
-            value: "128".into(),
-        })
-        .unwrap();
-        assert_eq!(
-            h.request(WorkerCommand::Get {
-                feature: "Width".into()
-            })
-            .unwrap()["value"],
-            128
-        );
-        assert!(
-            h.request(WorkerCommand::Set {
-                feature: "Width".into(),
-                value: "1".into()
-            })
-            .is_err()
-        );
+        h.set_value("Width", "128").unwrap();
+        assert_eq!(h.value("Width"), 128);
+        assert!(h.set_value("Width", "1").is_err());
         let dir = temp_dir("simulator-acquisition");
         let v = h
             .request(capture_to(&dir.join("one.raw"), 1, Default::default()))
@@ -5556,11 +5487,7 @@ mod tests {
             ("Height", "128"),
             ("ExposureTime", exposure),
         ] {
-            h.request(WorkerCommand::Set {
-                feature: feature.into(),
-                value: value.into(),
-            })
-            .unwrap();
+            h.set_value(feature, value).unwrap();
         }
     }
     fn auto(h: &WorkerHandle, balance: Option<f64>) -> Result<Value> {
@@ -5573,11 +5500,7 @@ mod tests {
         })
     }
     fn set(h: &WorkerHandle, feature: &str, value: &str) {
-        h.request(WorkerCommand::Set {
-            feature: feature.into(),
-            value: value.into(),
-        })
-        .unwrap();
+        h.set_value(feature, value).unwrap();
     }
     /// Inspect the camera's next frame, measurements only.
     fn inspect(h: &WorkerHandle, fresh: u32) -> Result<Value> {
@@ -5895,18 +5818,11 @@ mod tests {
         assert_eq!(auto(&h, None).unwrap()["auto"]["balance"], 0.25);
         assert!(auto(&h, Some(f64::NAN)).is_err());
         assert_eq!(h.snapshot().auto.unwrap().balance, 0.25);
-        let set = |feature: &str, value: &str| {
-            h.request(WorkerCommand::Set {
-                feature: feature.into(),
-                value: value.into(),
-            })
-            .unwrap()
-        };
-        assert!(set("Width", "128").get("auto").is_none());
+        let set = |feature: &str, value: &str| h.set_value(feature, value).unwrap();
+        set("Width", "128");
         assert!(h.snapshot().auto.is_some());
         let manual = set("ExposureTime", "5000");
-        assert!(manual.get("auto").is_some_and(Value::is_null));
-        assert_eq!(manual["value"], 5000.0);
+        assert_eq!(manual["changed"][0]["to"], 5000.0, "{manual}");
         assert!(h.snapshot().auto.is_none());
         assert_eq!(
             h.request(SessionCommand::Manual { revert: false }).unwrap(),

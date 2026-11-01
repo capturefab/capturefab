@@ -8,16 +8,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, Vec<String>)> {
-    Ok(discover_kinds(
-        timeout,
-        Kinds {
-            sim: simulated,
-            ..Kinds::all()
-        },
-    ))
-}
-
 /// The transports a discovery searches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Kinds {
@@ -1105,7 +1095,7 @@ impl Camera {
         Ok(())
     }
     /// A camera left in SingleFrame or MultiFrame ends each acquisition by
-    /// itself after a frame or a few, which would freeze live view and fail
+    /// itself after a frame or a few, which would stall a stream and fail
     /// later captures: switch it to Continuous, before TLParamsLocked can
     /// lock the mode. The camera keeps the new mode after stop.
     fn acquire_continuously(&mut self) -> Result<()> {
@@ -2233,7 +2223,13 @@ pub(crate) mod tests {
             "opening must not poll unrelated exposure registers"
         );
         assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
-        assert!(camera.info.profile.supports(CameraCapability::Exposure));
+        assert!(
+            camera
+                .info
+                .profile
+                .capabilities
+                .contains(&CameraCapability::Exposure)
+        );
         assert!(!camera.features().iter().any(|f| f.name == "DeviceScanType"));
         assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
         assert_eq!(camera.info.profile.source, DetectionSource::DeviceMetadata);
@@ -2275,7 +2271,13 @@ pub(crate) mod tests {
         let info = crate::transport::simulator::info();
         let mut camera = Camera::from_backend(info, Box::new(Fixture(xml))).unwrap();
         assert_eq!(camera.info.profile.kind, CameraKind::AreaScan);
-        assert!(!camera.info.profile.supports(CameraCapability::LineRate));
+        assert!(
+            !camera
+                .info
+                .profile
+                .capabilities
+                .contains(&CameraCapability::LineRate)
+        );
         camera.features();
         assert_eq!(camera.info.profile.kind, CameraKind::AreaScan);
     }

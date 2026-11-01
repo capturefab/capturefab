@@ -257,8 +257,13 @@ pub fn runtime_dir() -> PathBuf {
     if cfg!(test) {
         return test_dir();
     }
-    let login = login_runtime_dir().filter(|(_, login)| *login == LoginDir::Usable);
-    runtime_dir_in(&var, login.map(|(dir, _)| dir))
+    #[cfg(target_os = "linux")]
+    let login = login_runtime_dir()
+        .filter(|(_, login)| *login == LoginDir::Usable)
+        .map(|(dir, _)| dir);
+    #[cfg(not(target_os = "linux"))]
+    let login = None;
+    runtime_dir_in(&var, login)
 }
 /// What must outlive a reboot: setups, sign-in indexes and sessions' jobs. The Linux runtime directory is a RAM disk
 /// that logout clears, so there they live under XDG_STATE_HOME; elsewhere
@@ -360,7 +365,7 @@ fn cache_dir_in(var: &impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
 }
 /// Whether a process without XDG_RUNTIME_DIR can keep its sessions in the
 /// login's runtime directory, /run/user/<uid>, where logins look for them.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg(any(target_os = "linux", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginDir {
     /// This user's alone, and kept from boot to shutdown for a lingering user.
@@ -392,15 +397,13 @@ fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
     static LOGIN: std::sync::OnceLock<(PathBuf, LoginDir)> = std::sync::OnceLock::new();
     let login = LOGIN.get_or_init(|| {
         let uid = effective_uid();
-        // Integration tests stand in for the user's real one.
-        let dir = var("CAPTUREFAB_LOGIN_RUNTIME_DIR_TEST")
-            .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+        let dir = PathBuf::from(format!("/run/user/{uid}"));
         let login = LoginDir::of(&dir, uid, lingers(uid));
         (dir, login)
     });
     Some(login.clone())
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
     None
 }
@@ -439,6 +442,7 @@ fn user_name(uid: u32) -> Option<std::ffi::OsString> {
 }
 /// The login runtime directory that runtime_dir() passed over for a folder
 /// on disk, where logins look for sessions instead, and why.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn missed_runtime_dir() -> Option<(PathBuf, LoginDir)> {
     if cfg!(test)
         || var("CAPTUREFAB_SESSION_DIR").is_some()
@@ -453,6 +457,7 @@ pub(crate) fn missed_runtime_dir() -> Option<(PathBuf, LoginDir)> {
 /// keeps its sessions instead, with the login runtime directory it passes
 /// over and why. An SSH login on a line computer would otherwise see no sign
 /// of a service whose sessions it cannot find.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn service_runtime_dir() -> Option<(PathBuf, PathBuf, LoginDir)> {
     if cfg!(test)
         || var("CAPTUREFAB_SESSION_DIR").is_some()
@@ -466,6 +471,7 @@ pub(crate) fn service_runtime_dir() -> Option<(PathBuf, PathBuf, LoginDir)> {
 }
 /// The responsive sessions in `service_runtime_dir`, which this login's
 /// commands do not find, and that folder.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn sessions_elsewhere() -> Option<(PathBuf, Vec<String>)> {
     let (dir, ..) = service_runtime_dir()?;
     let names: Vec<String> = descriptors_in(&dir)
@@ -477,6 +483,7 @@ pub(crate) fn sessions_elsewhere() -> Option<(PathBuf, Vec<String>)> {
     (!names.is_empty()).then_some((dir, names))
 }
 /// A host without logind, such as a container, has no logins to miss.
+#[cfg(any(target_os = "linux", test))]
 fn missed(login: Option<(PathBuf, LoginDir)>, logind: bool) -> Option<(PathBuf, LoginDir)> {
     login.filter(|(_, login)| logind && *login != LoginDir::Usable)
 }
@@ -553,25 +560,47 @@ pub fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 /// A real directory that only this user can enter. One another user owns,
 /// such as a squatted /tmp or /dev/shm name, is refused even if private.
+/// A refusal is `permission_denied`, with what fixes it as the hint.
 pub(crate) fn check_private_dir(path: &Path) -> Result<()> {
+    let refused = |message: String, hint: String| -> anyhow::Error {
+        crate::types::Categorized::new(crate::types::ErrorKind::PermissionDenied, message)
+            .hint(hint)
+            .into()
+    };
     let m = fs::symlink_metadata(path)?;
-    ensure!(
-        m.is_dir() && !m.file_type().is_symlink(),
-        "session directory must be a real directory"
-    );
+    if !m.is_dir() || m.file_type().is_symlink() {
+        return Err(refused(
+            format!(
+                "session directory {} must be a real directory",
+                path.display()
+            ),
+            "set CAPTUREFAB_SESSION_DIR to a folder of your own, such as one `mktemp -d` makes"
+                .into(),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        ensure!(
-            m.uid() == effective_uid(),
-            "session directory {} belongs to another user",
-            path.display()
-        );
-        ensure!(
-            m.mode() & 0o077 == 0,
-            "session directory must be private (chmod 700 {})",
-            path.display()
-        );
+        if m.uid() != effective_uid() {
+            return Err(refused(
+                format!(
+                    "session directory {} belongs to another user",
+                    path.display()
+                ),
+                "set CAPTUREFAB_SESSION_DIR to a folder of your own, such as one `mktemp -d` makes"
+                    .into(),
+            ));
+        }
+        if m.mode() & 0o077 != 0 {
+            let dir = crate::hint::shell_quote(&path.display().to_string());
+            return Err(refused(
+                format!(
+                    "session directory {} must be private, but its group or others may enter it",
+                    path.display()
+                ),
+                format!("chmod 700 {dir}"),
+            ));
+        }
     }
     Ok(())
 }
@@ -632,21 +661,26 @@ pub fn read_descriptor(name: &str) -> Result<Descriptor> {
         if !error.is::<MissingSession>() {
             return error;
         }
-        let absent = |dir: &Path| {
-            descriptor_path_in(dir, name).is_ok_and(|path| fs::symlink_metadata(path).is_err())
-        };
-        match service_runtime_dir() {
-            Some((service, ..)) if service != dir && absent(&dir) && !absent(&service) => {
-                crate::types::Categorized::error(
+        #[cfg(any(target_os = "linux", test))]
+        {
+            let absent = |dir: &Path| {
+                descriptor_path_in(dir, name).is_ok_and(|path| fs::symlink_metadata(path).is_err())
+            };
+            if let Some((service, ..)) = service_runtime_dir()
+                && service != dir
+                && absent(&dir)
+                && !absent(&service)
+            {
+                return crate::types::Categorized::error(
                     crate::types::ErrorKind::SessionNotFound,
                     format!(
                         "{error}; a session named {name} is in {}, where a service started without XDG_RUNTIME_DIR keeps it and this login does not look: `capturefab doctor` shows the fix under runtime_dir",
                         service.display()
                     ),
-                )
+                );
             }
-            _ => missing_session_error(name, &active_sessions().unwrap_or_default()),
         }
+        missing_session_error(name, &active_sessions().unwrap_or_default())
     })
 }
 fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
@@ -1164,10 +1198,6 @@ impl Server {
     /// The descriptor as published now.
     pub fn descriptor(&self) -> Descriptor {
         Shared::locked(&self.shared.descriptor).clone()
-    }
-    /// Republish the cameras `h` holds.
-    pub fn publish(&self, h: &SessionHandle) {
-        self.shared.publish(h.held_cameras());
     }
     /// Block until the session should end: a signal, `session stop`, or its
     /// idle time passed with no request and no job running. `jobs_running`
@@ -1789,6 +1819,23 @@ mod tests {
         }
         let dir = TestDir::new();
         ensure_private_dir(&dir.0.join("a/b")).unwrap();
+        // A folder others may enter is refused with the command that fixes it.
+        use std::os::unix::fs::PermissionsExt;
+        let shared = dir.0.join("shared folder");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = check_private_dir(&shared).unwrap_err();
+        let classified = crate::types::classify(&error);
+        assert_eq!(classified.kind.code(), ("permission_denied", 3));
+        assert_eq!(
+            classified.hint.as_deref(),
+            Some(format!("chmod 700 '{}'", shared.display()).as_str())
+        );
+        let file = dir.0.join("file");
+        fs::write(&file, b"").unwrap();
+        let classified = crate::types::classify(&check_private_dir(&file).unwrap_err());
+        assert_eq!(classified.kind.code(), ("permission_denied", 3));
+        assert!(classified.hint.unwrap().contains("CAPTUREFAB_SESSION_DIR"));
     }
 
     #[test]
@@ -1847,8 +1894,8 @@ mod tests {
         let dir = TestDir::new();
         let handle = SessionHandle::new();
         let server =
-            Server::start_in(handle.clone(), "desktop", SessionKind::Serve, &dir.0, None).unwrap();
-        let descriptor = read_descriptor_in(&dir.0, "desktop").unwrap();
+            Server::start_in(handle.clone(), "bench", SessionKind::Serve, &dir.0, None).unwrap();
+        let descriptor = read_descriptor_in(&dir.0, "bench").unwrap();
         assert_eq!(descriptor.kind, SessionKind::Serve);
         assert!(descriptor_active(&descriptor));
         let mut wrong_token = descriptor.clone();
@@ -1867,7 +1914,7 @@ mod tests {
         assert!(snapshot.logs.is_empty());
         assert!(snapshot.cameras.is_empty());
         drop(server);
-        assert!(!descriptor_path_in(&dir.0, "desktop").unwrap().exists());
+        assert!(!descriptor_path_in(&dir.0, "bench").unwrap().exists());
         handle.shutdown();
     }
     #[test]

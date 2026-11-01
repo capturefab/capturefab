@@ -1209,16 +1209,6 @@ impl Store {
             name: shown.unwrap_or_else(|| name.into()),
         })
     }
-    /// Save a setup document from a file, optionally under another name.
-    pub fn import(&self, path: &Path, rename: Option<&str>, replace: bool) -> Result<Setup> {
-        let mut setup = read_file(path)?;
-        if let Some(name) = rename {
-            validate_name(name)?;
-            setup.name = name.into();
-        }
-        self.save(&setup, replace)?;
-        Ok(setup)
-    }
 }
 
 /// Replace a setup name in `apply_setup` or `setup_diff` with the saved
@@ -1261,6 +1251,15 @@ pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session
 mod tests {
     use super::*;
     use crate::session::SessionCommand;
+
+    /// What `preset import` does: read a document and save it under `name`.
+    fn import(store: &Store, path: &Path, name: &str, replace: bool) -> Result<Setup> {
+        let mut setup = read_file(path)?;
+        validate_name(name)?;
+        setup.name = name.into();
+        store.save(&setup, replace)?;
+        Ok(setup)
+    }
 
     #[test]
     fn transport_persistence_and_file_features_are_managed() {
@@ -1797,15 +1796,14 @@ mod tests {
         let file = dir.join("bench.json");
         let original = setup("bench");
         fs::write(&file, serde_json::to_vec_pretty(&original).unwrap()).unwrap();
-        let copy = store.import(&file, Some("copy"), false).unwrap();
+        let copy = import(&store, &file, "copy", false).unwrap();
         assert_eq!(copy.name, "copy");
         assert!(
-            store
-                .import(&file, Some("copy"), false)
+            import(&store, &file, "copy", false)
                 .unwrap_err()
                 .is::<NameTaken>()
         );
-        assert!(store.import(&file, Some("con"), false).is_err());
+        assert!(import(&store, &file, "con", false).is_err());
         fs::write(&file, vec![b' '; MAX_SETUP_BYTES + 1]).unwrap();
         assert!(format!("{:#}", read_file(&file).unwrap_err()).contains("256 KiB"));
         let _ = fs::remove_dir_all(&dir);
@@ -1930,14 +1928,12 @@ mod tests {
         );
         // The suggested import, quoted, makes the copy a setup of its own.
         let message = error.to_string();
-        let import = format!(
+        let suggested = format!(
             "capturefab preset import {} --name other --replace",
             crate::hint::shell_quote(&store.dir().join("other.json").display().to_string())
         );
-        assert!(message.contains(&import), "{message}");
-        store
-            .import(&store.dir().join("other.json"), Some("other"), true)
-            .unwrap();
+        assert!(message.contains(&suggested), "{message}");
+        import(&store, &store.dir().join("other.json"), "other", true).unwrap();
         assert_eq!(store.get("other").unwrap().name, "other");
         assert!(
             store
@@ -2112,7 +2108,7 @@ mod tests {
         let store = Store::at(dir.join("setups"));
         let path = store.save(&big, false).unwrap();
         assert_eq!(
-            store.import(&path, Some("again"), false).unwrap().values,
+            import(&store, &path, "again", false).unwrap().values,
             big.values
         );
         assert_eq!(store.get("again").unwrap().skipped, big.skipped);

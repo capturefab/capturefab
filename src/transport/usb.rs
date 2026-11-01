@@ -225,6 +225,26 @@ fn access_error(
     }
 }
 
+/// The error for an open or claim the OS refused: [`access_error`]'s words
+/// with the OS's own after them for whoever debugs it, and on Linux the
+/// udev rule that fixes a refused permission as its hint.
+fn refusal(
+    stage: Stage,
+    kind: nusb::ErrorKind,
+    detail: &dyn std::fmt::Display,
+    name: &str,
+    node: Option<&str>,
+    os: &str,
+) -> anyhow::Error {
+    let (category, message) = access_error(stage, kind, name, node, os);
+    let error = Categorized::new(category, format!("{message} (USB: {detail})"));
+    if kind == nusb::ErrorKind::PermissionDenied && os == "linux" {
+        error.hint(crate::doctor::usb_access_fix()).into()
+    } else {
+        error.into()
+    }
+}
+
 /// The camera as errors name it after "USB3 Vision camera": its product
 /// string, or without one its USB IDs, which tell cameras apart.
 fn display_name(product: Option<&str>, vendor_id: u16, product_id: u16) -> String {
@@ -275,23 +295,14 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         let name = name.clone();
         let node = node.clone();
         move |error: nusb::Error| {
-            let (kind, message) = access_error(
+            refusal(
                 stage,
                 error.kind(),
+                &error,
                 &name,
                 node.as_deref(),
                 std::env::consts::OS,
-            );
-            // The OS's own words stay on the line for whoever debugs it.
-            let message = format!("{message} (USB: {error})");
-            // On Linux the udev rule fixes it, on a line of its own.
-            let message =
-                if error.kind() == nusb::ErrorKind::PermissionDenied && cfg!(target_os = "linux") {
-                    crate::doctor::with_usb_access_fix(message)
-                } else {
-                    message
-                };
-            Categorized::error(kind, message)
+            )
         }
     };
     let device = device_info.open().wait().map_err(refused(Stage::Open))?;
@@ -1398,17 +1409,34 @@ mod tests {
             access_error(Stage::Open, Usb::PermissionDenied, "acA", node, "linux");
         let error = Categorized::error(kind, message).context("connect usb:2676:ba02:1");
         assert_eq!(crate::cli::error_code(&error), ("permission_denied", 3));
-        // The refusal keeps doctor's wording.
-        let (_, message) = access_error(
+        // On Linux the udev rule doctor writes is the hint, and it survives
+        // the trip from the worker to the CLI.
+        let error = refusal(
             Stage::Open,
             Usb::PermissionDenied,
+            &"Permission denied",
             "acA",
-            Some("/dev/bus/usb/002/003"),
+            node,
             "linux",
         );
-        let doctor =
-            crate::doctor::usb_access_error("acA", std::path::Path::new("/dev/bus/usb/002/003"));
-        assert_eq!(format!("{doctor:#}").lines().next(), Some(message.as_str()));
+        let rebuilt =
+            crate::types::error_from_tag(crate::types::error_tag(&error), format!("{error:#}"));
+        let classified = crate::types::classify(&rebuilt);
+        assert_eq!(classified.kind.code(), ("permission_denied", 3));
+        assert_eq!(classified.hint, Some(crate::doctor::usb_access_fix()));
+        assert!(
+            format!("{rebuilt:#}").ends_with("(USB: Permission denied)"),
+            "{rebuilt:#}"
+        );
+        let elsewhere = refusal(
+            Stage::Open,
+            Usb::PermissionDenied,
+            &"Permission denied",
+            "acA",
+            None,
+            "macos",
+        );
+        assert_eq!(crate::types::classify(&elsewhere).hint, None);
     }
     #[test]
     fn cameras_without_a_product_string_are_named_by_usb_ids() {

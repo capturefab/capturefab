@@ -14,7 +14,9 @@ use std::{
 
 /// The lock of an open camera, released when dropped or when its worker
 /// exits however it exits.
-pub(crate) struct CameraLock(#[allow(dead_code)] std::fs::File);
+pub(crate) struct CameraLock {
+    _file: std::fs::File,
+}
 
 /// Whether a camera is a device one process at a time owns. Streams, files
 /// and the simulator are read by as many as ask.
@@ -71,7 +73,7 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
     let _ = file.rewind();
     let _ = file.write_all(owner.to_string().as_bytes());
     let _ = file.flush();
-    Ok(Some(CameraLock(file)))
+    Ok(Some(CameraLock { _file: file }))
 }
 
 /// `camera_busy` for the camera `info` names, which the worker `owner`

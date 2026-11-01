@@ -1788,13 +1788,7 @@ pub(crate) fn bits(pixel_format: &str) -> Option<u32> {
     if pixel_format.starts_with("0x") {
         return None;
     }
-    let digits = pixel_format
-        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
-        .chars()
-        .rev()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>();
-    digits.chars().rev().collect::<String>().parse().ok()
+    crate::frame::name_bits(pixel_format)
 }
 
 /// The camera's exposure time and frame rate, when it has them: what its

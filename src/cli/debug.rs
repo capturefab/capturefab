@@ -82,11 +82,6 @@ fn hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Commands `debug rpc` refuses: discover, which `list` performs.
-fn public(command: &SessionCommand) -> bool {
-    !matches!(command, SessionCommand::Discover { .. })
-}
-
 pub fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
     Ok(Some(match command {
         DebugCommand::Xml { camera, output } => {
@@ -170,12 +165,6 @@ pub fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
             command
                 .validate()
                 .map_err(|error| Usage(format!("{error:#}")))?;
-            if !public(&command) {
-                return Err(Usage(
-                    "debug rpc does not take that command; see capturefab schema debug rpc".into(),
-                )
-                .into());
-            }
             if matches!(&command, SessionCommand::Capture { output, .. } if output == "-") {
                 return Err(Usage("debug rpc captures need an output file".into()).into());
             }
@@ -218,10 +207,5 @@ mod tests {
         assert!(hex("0").is_err());
         assert!(hex("💡").is_err());
         assert_eq!(parse_address("0x100").unwrap(), 256);
-        assert!(!public(&SessionCommand::Discover {
-            timeout_ms: 1,
-            simulated: true
-        }));
-        assert!(public(&SessionCommand::Status));
     }
 }

@@ -727,8 +727,13 @@ def build(args):
             if args.binary:
                 binary = Path(args.binary).resolve()
             else:
+                # A build without FFmpeg still succeeds, finding one at run
+                # time; a release must carry its own.
+                ffmpeg = Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')
+                if not ffmpeg.is_file():
+                    raise ValueError(f'{ffmpeg} is missing: releases embed the FFmpeg scripts/build-ffmpeg.sh builds')
                 command = ['cargo', 'build', '--locked', '--release', '--target', args.target]
-                env = dict(os.environ, CAPTUREFAB_FFMPEG_BINARY=str((Path(args.ffmpeg_bundle) / 'bin' / ('ffmpeg.exe' if args.os == 'windows' else 'ffmpeg')).resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
+                env = dict(os.environ, CAPTUREFAB_FFMPEG_BINARY=str(ffmpeg.resolve()), CAPTUREFAB_FFMPEG_LICENSE=str((Path(args.ffmpeg_bundle) / 'licenses/NOTICE.txt').resolve()))
                 run(command, cwd=ROOT, env=env)
                 binary = (ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / args.target / 'release' / ('capturefab.exe' if args.os == 'windows' else 'capturefab')).resolve()
             assets.append(package(args, binary))

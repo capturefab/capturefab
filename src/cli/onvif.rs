@@ -12,7 +12,7 @@ use std::time::Duration;
 pub enum OnvifCommand {
     /// List an ONVIF camera's profiles and their RTSP stream URIs
     #[command(
-        after_help = "Examples:\n  capturefab onvif resolve cam.local\n  capturefab onvif resolve http://10.0.0.9/onvif/device_service --profile Profile_1\n  capturefab login add onvif://cam.local --user admin --password-stdin   (save its sign-in first)"
+        after_help = "Examples:\n  capturefab onvif resolve cam.local\n  capturefab onvif resolve http://10.0.0.9/onvif/device_service --profile Profile_1\n  capturefab login add onvif://cam.local --user admin --password-stdin   # save its sign-in first"
     )]
     Resolve {
         /// HOST[:PORT], http://HOST/onvif/device_service, or onvif://HOST

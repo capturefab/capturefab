@@ -28,10 +28,6 @@ use worker::{Signal, Worker};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SessionCommand {
-    Discover {
-        timeout_ms: u64,
-        simulated: bool,
-    },
     /// Inspect all GigE paths; with `tune`, apply bandwidth sharing to the
     /// connected cameras together.
     NetworkScan {
@@ -296,8 +292,8 @@ pub enum SessionCommand {
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         context: crate::context::Context,
         /// Stop after this many milliseconds. The camera's worker ends the
-        /// recording or stream itself, as stop-forward would, so it ends on
-        /// time even when the client that started it has gone.
+        /// recording itself, as stopping its job would, so it ends on time
+        /// even when the client that started it has gone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration_ms: Option<u64>,
         /// The caller's UTC offset in seconds, for {date} and {time}.
@@ -318,6 +314,7 @@ pub enum SessionCommand {
     },
 }
 /// One feature assignment of `SetMany`.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FeatureValue {
@@ -459,7 +456,7 @@ impl SessionCommand {
     /// their owners when the command executes.
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Discover { timeout_ms, .. } | Self::NetworkScan { timeout_ms, .. } => {
+            Self::NetworkScan { timeout_ms, .. } => {
                 validate_timeout(*timeout_ms)?;
             }
             Self::Connect {
@@ -1744,9 +1741,7 @@ impl SessionHandle {
             return None;
         }
         let target = match command {
-            SessionCommand::Discover { .. } | SessionCommand::NetworkScan { .. } => {
-                CommandTarget::Discovery
-            }
+            SessionCommand::NetworkScan { .. } => CommandTarget::Discovery,
             SessionCommand::Connect { camera, .. } => CommandTarget::Camera(self.camera_id(camera)),
             _ => CommandTarget::Camera(self.camera_id(target?)),
         };
@@ -1791,9 +1786,7 @@ impl SessionHandle {
         let target = target.or_else(|| {
             if matches!(
                 &command,
-                SessionCommand::Connect { .. }
-                    | SessionCommand::Discover { .. }
-                    | SessionCommand::NetworkScan { .. }
+                SessionCommand::Connect { .. } | SessionCommand::NetworkScan { .. }
             ) {
                 None
             } else {
@@ -1878,10 +1871,6 @@ impl SessionHandle {
                 timeout_ms,
             } => self.wait_job(&job, after_seq, Duration::from_millis(timeout_ms)),
             SessionCommand::StopJob { job } => self.stop_job(&job),
-            SessionCommand::Discover {
-                timeout_ms,
-                simulated,
-            } => self.discover(Duration::from_millis(timeout_ms), simulated),
             SessionCommand::Connect {
                 camera,
                 timeout_ms,
@@ -2441,21 +2430,9 @@ impl SessionHandle {
             }
         }
     }
-    /// Search for cameras. Each transport searches on a thread of its own,
-    /// left behind when it overruns, so one that hangs never holds up the
-    /// session: what the others found is kept, with a warning.
-    fn discover(&self, timeout: Duration, simulated: bool) -> Result<Value> {
-        ensure!(
-            (1..=60_000).contains(&timeout.as_millis()),
-            "timeout must be 1..60000 milliseconds"
-        );
-        let (devices, warnings) = crate::camera::discover(timeout, simulated)?;
-        *self.edit_devices() = devices.clone();
-        for warning in &warnings {
-            self.note("warn", warning.clone());
-        }
-        Ok(json!({"devices":devices,"warnings":warnings}))
-    }
+    /// Check the network paths of the GigE cameras that answer and those
+    /// this session holds; with `tune`, give each connected camera its share
+    /// of the interface it streams on.
     fn scan_network(&self, timeout: Duration, tune: bool) -> Result<Value> {
         let before = self.snapshot();
         let active: Vec<_> = before
@@ -2702,9 +2679,6 @@ impl SessionHandle {
         if let Some(watchdog) = locked(&self.inner.watchdog).take() {
             let _ = watchdog.join();
         }
-    }
-    pub fn is_shutting_down(&self) -> bool {
-        self.inner.quitting.load(Ordering::Relaxed)
     }
     /// Cancel every camera's request in progress, such as a capture to
     /// stdout: it ends at its next frame wait.
@@ -3418,9 +3392,9 @@ mod tests {
         for turn in [&alias, &disconnect, &connect] {
             assert!(Arc::ptr_eq(&set.order, &turn.order));
         }
-        let discover = SessionCommand::Discover {
+        let discover = SessionCommand::NetworkScan {
             timeout_ms: 1000,
-            simulated: true,
+            tune: false,
         };
         let first_discovery = handle.command_turn(None, &discover).unwrap();
         let second_discovery = handle.command_turn(None, &discover).unwrap();

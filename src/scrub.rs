@@ -4,10 +4,8 @@
 //! resolves is registered here, and text that leaves the process (worker
 //! replies, CLI errors) has each registered literal replaced. Errors are
 //! worded without secrets in the first place; this only catches what a
-//! dependency might echo. URL credentials in errors and structured results
-//! are redacted by [`redact_error`] and [`redact_value`], and in free text
-//! such as log lines by [`redact_urls`].
-use serde_json::Value;
+//! dependency might echo. URL credentials in free text such as log lines
+//! and job errors are redacted by [`redact_urls`].
 use std::{
     borrow::Cow,
     cmp::Reverse,
@@ -114,23 +112,6 @@ pub fn active() -> bool {
         .is_empty()
 }
 
-/// `message` with every string in `known` that carries URL credentials
-/// replaced by its redacted form, longest first, so an error that quotes a
-/// command's own camera or output shows no secret even where it is not a URL.
-pub fn redact_error(message: &str, known: &Value) -> String {
-    let mut values = Vec::new();
-    collect_strings(known, &mut values);
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    let mut message = message.to_owned();
-    for value in values {
-        let redacted = crate::media::redact_url(&value);
-        if redacted != value {
-            message = message.replace(&value, &redacted);
-        }
-    }
-    message
-}
-
 /// `text` with the credentials of every URL in it redacted, including in
 /// diagnostics that name several sources.
 pub fn redact_urls(text: &str) -> String {
@@ -165,33 +146,9 @@ pub fn redact_urls(text: &str) -> String {
         .collect()
 }
 
-fn collect_strings(value: &Value, strings: &mut Vec<String>) {
-    match value {
-        Value::String(value) => strings.push(value.clone()),
-        Value::Array(values) => values
-            .iter()
-            .for_each(|value| collect_strings(value, strings)),
-        Value::Object(fields) => fields
-            .values()
-            .for_each(|value| collect_strings(value, strings)),
-        _ => {}
-    }
-}
-
-/// Redact URL credentials in every string of `value`, in place.
-pub fn redact_value(value: &mut Value) {
-    match value {
-        Value::String(value) => *value = crate::media::redact_url(value),
-        Value::Array(values) => values.iter_mut().for_each(redact_value),
-        Value::Object(fields) => fields.values_mut().for_each(redact_value),
-        _ => {}
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     #[test]
     fn registered_secrets_are_replaced_and_short_values_ignored() {
         register("short");
@@ -253,20 +210,5 @@ mod tests {
             "{text}"
         );
         assert_eq!(redact_urls("no address here\n"), "no address here\n");
-    }
-
-    #[test]
-    fn credentials_are_redacted_wherever_a_known_string_appears() {
-        let known = json!({"camera":"rtsp://user:secret@cam/live","steps":[{"output":"clip.mp4"}]});
-        let message = redact_error(
-            "cannot open rtsp://user:secret@cam/live for clip.mp4",
-            &known,
-        );
-        assert!(!message.contains("secret"), "{message}");
-        assert!(message.contains("clip.mp4"), "{message}");
-        let mut value = known.clone();
-        redact_value(&mut value);
-        assert!(!value.to_string().contains("secret"), "{value}");
-        assert_eq!(value["steps"][0]["output"], "clip.mp4");
     }
 }

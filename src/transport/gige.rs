@@ -820,7 +820,7 @@ struct GigE {
 }
 
 /// Acquire camera control. An independent heartbeat keeps the connection alive
-/// even while the GUI is idle or waiting for an external trigger.
+/// even while the camera is idle or waiting for an external trigger.
 pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     let ip: Ipv4Addr = info
         .address

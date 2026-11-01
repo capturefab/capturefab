@@ -179,6 +179,7 @@ pub fn write_json(value: &Value) -> io::Result<()> {
 }
 
 /// The reason and exit code `error` reports with, from its typed causes.
+#[cfg(test)]
 pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     classify(error).kind.code()
 }

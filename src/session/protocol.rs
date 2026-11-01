@@ -29,21 +29,13 @@ pub(crate) const MAX_REQUEST: usize = 1024 * 1024;
 pub(crate) enum WorkerCommand {
     /// Apply this camera's share of the GigE bandwidth a network scan planned.
     OptimizeNetwork { bytes_per_second: u64 },
-    /// Single-feature reads and writes, which unit tests drive the camera
-    /// thread with; no coordinator sends them.
-    #[cfg(test)]
-    Get { feature: String },
-    #[cfg(test)]
-    Set { feature: String, value: String },
     /// Write several features in order as one camera change: a failure
-    /// restores every value. Tests drive the rollback checkpoints with it.
+    /// restores every value, and every value an earlier write moved. Tests
+    /// drive the rollback checkpoints with it; no coordinator sends it.
     #[cfg(test)]
     SetMany { values: Vec<super::FeatureValue> },
-    #[cfg(test)]
-    Execute { feature: String },
-    #[cfg(test)]
-    Features,
-    /// End the camera's recording or forward, as a stop of its job does.
+    /// End the camera's recording or forward, as a stop of its job does,
+    /// for tests that run commands without the worker loop.
     #[cfg(test)]
     StopForward,
     #[serde(untagged)]
@@ -73,10 +65,6 @@ impl WorkerCommand {
                 Ok(())
             }
             #[cfg(test)]
-            Self::Get { feature } | Self::Execute { feature } | Self::Set { feature, .. } => {
-                super::validate_feature(feature)
-            }
-            #[cfg(test)]
             Self::SetMany { values } => {
                 ensure!(
                     (1..=super::MAX_SET_MANY).contains(&values.len()),
@@ -88,7 +76,7 @@ impl WorkerCommand {
                 Ok(())
             }
             #[cfg(test)]
-            Self::Features | Self::StopForward => Ok(()),
+            Self::StopForward => Ok(()),
             Self::Session(command) => command.validate(),
         }
     }
@@ -97,7 +85,7 @@ impl WorkerCommand {
     pub(crate) fn changes_settings(&self) -> bool {
         match self {
             #[cfg(test)]
-            Self::Set { .. } | Self::SetMany { .. } | Self::Execute { .. } => true,
+            Self::SetMany { .. } => true,
             Self::Session(command) => matches!(
                 command,
                 SessionCommand::SetValues { dry_run: false, .. }
@@ -254,10 +242,14 @@ mod tests {
             serde_json::from_str::<Input>(&line).unwrap()
         };
         assert!(matches!(
-            run(WorkerCommand::Features),
+            run(WorkerCommand::OptimizeNetwork {
+                bytes_per_second: 1000
+            }),
             Input::Run {
                 id: 3,
-                command: WorkerCommand::Features
+                command: WorkerCommand::OptimizeNetwork {
+                    bytes_per_second: 1000
+                }
             }
         ));
         assert!(matches!(
@@ -274,7 +266,10 @@ mod tests {
             json!({"op": "shutdown"})
         );
         // An internal operation never parses as a public command.
-        assert!(SessionCommand::from_json_slice(br#"{"op":"features"}"#).is_err());
+        assert!(
+            SessionCommand::from_json_slice(br#"{"op":"optimize_network","bytes_per_second":1}"#)
+                .is_err()
+        );
         assert!(serde_json::from_str::<Input>(r#"{"op":"run","id":1}"#).is_err());
     }
 
@@ -287,14 +282,16 @@ mod tests {
         assert!(WorkerCommand::from(set(false)).changes_settings());
         assert!(!WorkerCommand::from(set(true)).changes_settings());
         assert!(!WorkerCommand::from(SessionCommand::Info).changes_settings());
-        assert!(!WorkerCommand::Features.changes_settings());
         assert!(
-            WorkerCommand::Set {
-                feature: "Width".into(),
-                value: "320".into()
+            !WorkerCommand::OptimizeNetwork {
+                bytes_per_second: 1000
             }
             .changes_settings()
         );
+        let exec = SessionCommand::Exec {
+            name: crate::controls::Name::parse("TriggerSoftware").unwrap(),
+        };
+        assert!(WorkerCommand::from(exec).changes_settings());
     }
 
     #[test]

@@ -1,6 +1,3 @@
-// Removed in S8 after the dead-code sweep.
-#![allow(dead_code)]
-
 /// Diagnostics on stderr that never panic. std's `eprintln!` panics when
 /// writing fails, as it does with EIO once the terminal hangs up, which is
 /// SIGHUP's usual cause: shutdown would then stop halfway. This one drops the
@@ -82,7 +79,7 @@ pub mod testing {
         pub use crate::inspect::{PreviewFormat, inspect, measure};
     }
     pub mod jpeg {
-        pub use crate::jpeg::{Raster, insert_com, software, well_formed};
+        pub use crate::jpeg::{Raster, insert_com, software};
     }
     pub mod session {
         pub use crate::session::{SessionCommand, SessionHandle};

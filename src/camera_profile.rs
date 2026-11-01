@@ -115,12 +115,6 @@ pub struct CameraProfile {
     pub capabilities: Vec<CameraCapability>,
 }
 
-impl CameraProfile {
-    pub fn supports(&self, capability: CameraCapability) -> bool {
-        self.capabilities.contains(&capability)
-    }
-}
-
 fn normalized(text: &str) -> String {
     text.chars()
         .filter(char::is_ascii_alphanumeric)
@@ -471,7 +465,7 @@ mod tests {
         let p = detect(&camera("Thermal microscope camera"), &features);
         assert_eq!(p.kind, CameraKind::Depth);
         assert_eq!(p.source, DetectionSource::DeviceMetadata);
-        assert!(p.supports(CameraCapability::LineRate));
+        assert!(p.capabilities.contains(&CameraCapability::LineRate));
     }
 
     #[test]
@@ -613,9 +607,9 @@ mod tests {
         ];
         let p = detect(&camera("Generic"), &features);
         assert_eq!(p.kind, CameraKind::Unknown);
-        assert!(p.supports(CameraCapability::Exposure));
-        assert!(p.supports(CameraCapability::Roi));
-        assert!(!p.supports(CameraCapability::DepthRange));
+        assert!(p.capabilities.contains(&CameraCapability::Exposure));
+        assert!(p.capabilities.contains(&CameraCapability::Roi));
+        assert!(!p.capabilities.contains(&CameraCapability::DepthRange));
     }
 
     #[test]

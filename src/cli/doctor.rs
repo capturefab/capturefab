@@ -17,14 +17,14 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "ffmpeg",
-        "{source:bundled|CAPTUREFAB_FFMPEG,path,version} or {error}",
+        "{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version} or {error} — FFmpeg is looked for in that order",
     ),
 ];
 pub const LICENSES_FIELDS: &[(&str, &str)] = &[
     ("capturefab", "string — Capturefab's MIT license"),
     (
         "ffmpeg",
-        "string — the bundled FFmpeg's GPL notice and license texts",
+        "string — the bundled FFmpeg's GPL notice and license texts, or a note that this build has none",
     ),
 ];
 
@@ -39,6 +39,6 @@ const LICENSE: &str = include_str!("../../LICENSE");
 
 pub fn licenses() -> Report {
     let ffmpeg = crate::media::license_notice();
-    let text = format!("Capturefab\n\n{LICENSE}\n\nBundled FFmpeg\n\n{ffmpeg}\n");
+    let text = format!("Capturefab\n\n{LICENSE}\n\nFFmpeg\n\n{ffmpeg}\n");
     Report::json(json!({"capturefab": LICENSE, "ffmpeg": ffmpeg})).text(text)
 }

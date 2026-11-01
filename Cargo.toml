@@ -3,7 +3,7 @@ name = "capturefab"
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Rust camera workbench for GenICam GigE Vision and USB3 Vision"
+description = "Camera capture command-line tool for people, scripts and AI agents: GigE Vision, USB3 Vision, GenICam, webcams and streams"
 license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
@@ -20,10 +20,10 @@ keychain = ["dep:keyring"]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
-serde = { version = "1", features = ["derive", "rc"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 roxmltree = "0.20"
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zip = { version = "2.4", default-features = false, features = ["deflate-flate2", "flate2"] }
 png = "0.17"
 if-addrs = "0.13"
 socket2 = { version = "0.6", features = ["all"] }

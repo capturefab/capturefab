@@ -53,7 +53,7 @@ More: capturefab --help, capturefab COMMAND --help";
     version,
     about = "Camera capture for people and agents: list, configure, capture and record cameras.",
     long_about = "Camera capture for people and agents: list, configure, capture and record cameras.\n\nWith --json every command prints exactly one JSON document on stdout: the result when it exits 0, {\"error\":{code,message,hint?,details?}} otherwise. Exit codes: 0 ok, 1 failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage full, 130 interrupted. `capturefab schema` describes every command, its arguments, results and errors.",
-    after_help = "Examples:\n  capturefab list --kind sim\n  capturefab info -c sim:0\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab --json get -c sim:0 ExposureTime TriggerMode[FrameStart]",
+    after_help = "Examples:\n  capturefab list --kind sim\n  capturefab info -c sim:0\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab --json get -c sim:0 ExposureTime 'TriggerMode[FrameStart]'",
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -143,17 +143,17 @@ pub enum Command {
     Features(camera::FeaturesArgs),
     /// Read features or controls in one call
     #[command(
-        after_help = "Examples:\n  capturefab get -c sim:0 ExposureTime Gain\n  capturefab get -c sim:0 exposure trigger roi\n  capturefab get -c sim:0 TriggerMode[FrameStart]\n  capturefab get -c sim:0 -c sim:1 Width"
+        after_help = "Examples:\n  capturefab get -c sim:0 ExposureTime Gain\n  capturefab get -c sim:0 exposure trigger roi\n  capturefab get -c sim:0 'TriggerMode[FrameStart]'\n  capturefab get -c sim:0 -c sim:1 Width"
     )]
     Get(camera::GetArgs),
     /// Change features or controls as one atomic change; a failure restores every value
     #[command(
-        after_help = "Examples:\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab set -c sim:0 ExposureTime=10ms Width=640\n  capturefab set -c sim:0 TriggerMode[FrameStart]=On trigger=line0:rising\n  capturefab set -c sim:0 roi=0,0,320,240 --dry-run"
+        after_help = "Examples:\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab set -c sim:0 ExposureTime=10ms Width=640\n  capturefab set -c sim:0 'TriggerMode[FrameStart]=On' trigger=line0:rising\n  capturefab set -c sim:0 roi=0,0,320,240 --dry-run"
     )]
     Set(camera::SetArgs),
     /// Run a command feature, such as UserSetSave[UserSet1]
     #[command(
-        after_help = "Examples:\n  capturefab exec -c sim:0 TriggerSoftware[FrameStart]\n  capturefab exec -c gige:00c0df123456 UserSetSave[UserSet1]"
+        after_help = "Examples:\n  capturefab exec -c sim:0 'TriggerSoftware[FrameStart]'\n  capturefab exec -c gige:00c0df123456 'UserSetSave[UserSet1]'"
     )]
     Exec(camera::ExecArgs),
     /// Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites
@@ -179,7 +179,7 @@ pub enum Command {
     /// Saved camera settings (host-side, portable between cameras of a model)
     #[command(
         subcommand,
-        after_help = "A preset lives on this computer and can be applied to any camera of the model; a user set (exec UserSetSave[UserSet1], or preset apply --persist) lives in the camera.\n\nExamples:\n  capturefab preset save bench -c sim:0\n  capturefab preset apply bench -c sim:0 --dry-run\n  capturefab preset list"
+        after_help = "A preset lives on this computer and can be applied to any camera of the model; a user set (exec 'UserSetSave[UserSet1]', or preset apply --persist) lives in the camera.\n\nExamples:\n  capturefab preset save bench -c sim:0\n  capturefab preset apply bench -c sim:0 --dry-run\n  capturefab preset list"
     )]
     Preset(preset::PresetCommand),
     /// Captures and recordings running in sessions: list, stop, wait

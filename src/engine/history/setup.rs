@@ -1193,18 +1193,10 @@ mod tests {
         h
     }
     fn get(h: &WorkerHandle, feature: &str) -> Value {
-        h.request(WorkerCommand::Get {
-            feature: feature.into(),
-        })
-        .unwrap()["value"]
-            .clone()
+        h.value(feature)
     }
     fn set(h: &WorkerHandle, feature: &str, value: &str) {
-        h.request(WorkerCommand::Set {
-            feature: feature.into(),
-            value: value.into(),
-        })
-        .unwrap();
+        h.set_value(feature, value).unwrap();
     }
     fn saved(h: &WorkerHandle, name: &str) -> Setup {
         let reading =

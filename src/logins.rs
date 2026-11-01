@@ -1,6 +1,6 @@
 //! Camera sign-ins: user names and passwords for rtsp://, rtsps:// and
 //! onvif: cameras. Passwords live only in the OS credential store (service
-//! [`KEYCHAIN_SERVICE`], account `USER@ADDRESS`); the index of which
+//! `capturefab-camera`, account `USER@ADDRESS`); the index of which
 //! addresses have one (`camera-logins.json` in the state directory) never
 //! holds a secret. The worker that opens the camera is the process that
 //! reads the saved password, and only after a camera answered with a
@@ -17,12 +17,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 use zeroize::Zeroizing;
 
-pub const KEYCHAIN_SERVICE: &str = "capturefab-camera";
+#[cfg(all(feature = "keychain", not(test)))]
+const KEYCHAIN_SERVICE: &str = "capturefab-camera";
 const INDEX: &str = "camera-logins.json";
 const LOCK: &str = "camera-logins.lock";
 const MAX_FILE: usize = 1 << 20;
@@ -386,7 +387,7 @@ impl Store for SystemStore {
     }
 }
 
-/// A store in memory, for tests and screenshots.
+/// A store in memory, for tests.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MemoryStore {
@@ -516,9 +517,6 @@ impl Logins {
             dir,
             store: can_remember().then_some(store),
         }
-    }
-    pub fn dir(&self) -> &Path {
-        &self.dir
     }
     fn path(&self) -> PathBuf {
         self.dir.join(INDEX)
@@ -970,7 +968,7 @@ mod tests {
             secrets.values().next().unwrap().as_str(),
             "v1:longer-password"
         );
-        let bytes = fs::read(logins.dir().join(INDEX)).unwrap();
+        let bytes = fs::read(logins.index_path()).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(
             !text.contains("longer-password") && text.contains("viewer"),
@@ -979,7 +977,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(logins.dir().join(INDEX))
+            let mode = fs::metadata(logins.index_path())
                 .unwrap()
                 .permissions()
                 .mode();
@@ -1014,8 +1012,8 @@ mod tests {
             )
             .unwrap();
         // A directory where the index belongs makes the rename fail.
-        fs::remove_file(logins.dir().join(INDEX)).unwrap();
-        fs::create_dir(logins.dir().join(INDEX)).unwrap();
+        fs::remove_file(logins.index_path()).unwrap();
+        fs::create_dir(logins.index_path()).unwrap();
         assert!(
             logins
                 .save(
@@ -1028,7 +1026,7 @@ mod tests {
             store.secrets.lock().unwrap()[&account("admin", address)].as_str(),
             "v1:first-password"
         );
-        fs::remove_dir(logins.dir().join(INDEX)).unwrap();
+        fs::remove_dir(logins.index_path()).unwrap();
         assert!(
             logins
                 .save("rtsp://new:554/", &CameraLogin::new("u", "x").unwrap())

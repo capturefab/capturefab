@@ -3,6 +3,7 @@
 //! have, each turned into a check with a copyable fix.
 #![allow(unsafe_code)]
 
+#[cfg(any(target_os = "linux", test))]
 use crate::ipc::LoginDir;
 use crate::media::FfmpegHealth;
 use crate::network::{InterfaceKind, NetworkInterface};
@@ -15,24 +16,20 @@ use std::{
 };
 
 /// Where the checks are explained.
-const GUIDE: &str = concat!(
-    env!("CARGO_PKG_REPOSITORY"),
-    "#host-checks-and-efficiency-mode"
-);
+const GUIDE: &str = "https://capturefab.com/docs.html#doctor";
 /// Running Capturefab as a Linux service, with these fixes in context.
-const LINE_COMPUTER: &str = concat!(
-    env!("CARGO_PKG_REPOSITORY"),
-    "/blob/main/docs/line-computer.md"
-);
+const LINE_COMPUTER: &str = "https://capturefab.com/guides/line-computer.md";
 /// The udev rule Linux archives ship in share/udev/rules.d, and the fix for
 /// `usb_access` writes: the logged-in seat user and the plugdev group may
 /// open any device with a USB3 Vision interface (class ef/05/00).
 /// The first rule imports usb_id, which sets ID_USB_INTERFACES, as not every
 /// distribution has by the time rules sorted at 70 run.
+#[cfg(any(feature = "usb", test))]
 const UDEV_RULES: [&str; 2] = [
     r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", IMPORT{builtin}="usb_id""#,
     r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ef0500:*", MODE="0660", GROUP="plugdev", TAG+="uaccess""#,
 ];
+#[cfg(any(feature = "usb", test))]
 const UDEV_RULE_FILE: &str = "70-capturefab-usb3vision.rules";
 /// Room for two frames of a 16 MiB GigE camera; the value the GigE transport
 /// already suggests when its receive buffer comes up short.
@@ -122,7 +119,7 @@ pub struct Limits {
 }
 
 /// Only Linux reads these from sysfs.
-#[cfg_attr(not(all(target_os = "linux", feature = "usb")), allow(dead_code))]
+#[cfg(any(all(target_os = "linux", feature = "usb"), test))]
 #[derive(Debug, Clone, PartialEq)]
 struct UsbCamera {
     name: String,
@@ -133,6 +130,7 @@ struct UsbCamera {
 /// What the checks look at, gathered once.
 struct Facts {
     /// Where sessions are found, with their short-lived files.
+    #[cfg(any(target_os = "linux", test))]
     runtime: Place,
     /// Presets, saved sign-ins and sessions' jobs.
     state: Place,
@@ -140,11 +138,14 @@ struct Facts {
     session_dir_set: bool,
     /// `/run/user/<uid>` when the runtime directory fell back to disk
     /// without it, and why.
+    #[cfg(any(target_os = "linux", test))]
     missed_runtime_dir: Option<(PathBuf, LoginDir)>,
     /// From a login that has XDG_RUNTIME_DIR: where a service without it
     /// keeps sessions instead.
+    #[cfg(any(target_os = "linux", test))]
     service_runtime_dir: Option<ServiceDir>,
     limits: Limits,
+    #[cfg(any(all(target_os = "linux", feature = "usb"), test))]
     usb: Vec<UsbCamera>,
     /// Where captures go without -o: this folder.
     captures: Place,
@@ -169,6 +170,7 @@ struct Facts {
 /// Where a service started without XDG_RUNTIME_DIR keeps sessions, out of
 /// this login's sight, the login runtime directory it passes over and why,
 /// and the sessions running there.
+#[cfg(any(target_os = "linux", test))]
 struct ServiceDir {
     dir: PathBuf,
     login: PathBuf,
@@ -216,11 +218,14 @@ impl Facts {
                 .then(|| crate::media::ffmpeg_health().map_err(|error| format!("{error:#}"))),
             ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG").is_some(),
             private_dirs,
+            #[cfg(any(target_os = "linux", test))]
             runtime: Place::of(crate::ipc::runtime_dir()),
             state: Place::of(state),
             session_dir_set: std::env::var_os("CAPTUREFAB_SESSION_DIR")
                 .is_some_and(|dir| !dir.is_empty()),
+            #[cfg(any(target_os = "linux", test))]
             missed_runtime_dir: crate::ipc::missed_runtime_dir(),
+            #[cfg(any(target_os = "linux", test))]
             service_runtime_dir: crate::ipc::service_runtime_dir().map(|(dir, login, why)| {
                 let running = crate::ipc::sessions_elsewhere()
                     .map(|(_, names)| names)
@@ -233,6 +238,7 @@ impl Facts {
                 }
             }),
             limits: limits(),
+            #[cfg(any(all(target_os = "linux", feature = "usb"), test))]
             usb: usb_cameras(),
             captures,
             floor,
@@ -323,12 +329,14 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
 
 fn checks(facts: &Facts) -> Vec<Check> {
     let mut checks = Vec::new();
+    #[cfg(any(target_os = "linux", test))]
     checks.extend(
         facts
             .missed_runtime_dir
             .as_ref()
             .map(|(dir, login)| runtime_dir_check(dir, *login, &facts.runtime, &facts.state)),
     );
+    #[cfg(any(target_os = "linux", test))]
     checks.extend(facts.service_runtime_dir.as_ref().map(|service| {
         service_runtime_dir_check(
             &service.dir,
@@ -345,10 +353,11 @@ fn checks(facts: &Facts) -> Vec<Check> {
         facts
             .ffmpeg
             .as_ref()
-            .map(|health| ffmpeg_check(health, facts.ffmpeg_overridden, cfg!(debug_assertions))),
+            .map(|health| ffmpeg_check(health, facts.ffmpeg_overridden, crate::media::bundled())),
     );
     checks.extend(leftovers_check(&facts.leftovers));
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
+    #[cfg(any(all(target_os = "linux", feature = "usb"), test))]
     checks.extend(usb_check(&facts.usb));
     checks.extend(free_space_check(&facts.captures, &facts.floor));
     checks
@@ -358,6 +367,7 @@ fn checks(facts: &Facts) -> Vec<Check> {
 /// for a lingering user, so a service and an SSH shell find the same
 /// sessions. Otherwise logind removes it at logout, taking a service's
 /// session with it, so Capturefab falls back to disk.
+#[cfg(any(target_os = "linux", test))]
 fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place) -> Check {
     let dir = login.display();
     let runtime = runtime.path.display();
@@ -378,6 +388,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
 /// XDG_RUNTIME_DIR: a service started without it keeps its sessions in
 /// `service` instead, out of this login's sight. A warning once such a
 /// session runs, otherwise a note, as most logins never start a service.
+#[cfg(any(target_os = "linux", test))]
 fn service_runtime_dir_check(
     service: &Path,
     login: &Path,
@@ -414,6 +425,7 @@ fn service_runtime_dir_check(
 
 /// Why the login runtime directory cannot hold a service's sessions, and
 /// the fix.
+#[cfg(any(target_os = "linux", test))]
 fn login_dir_problem(login: &Path, why: LoginDir) -> (String, String) {
     let dir = login.display();
     let uid = login
@@ -595,9 +607,9 @@ fn camera_network_check(interfaces: &[NetworkInterface]) -> Check {
 }
 
 /// Whether FFmpeg, which every webcam, stream, file and recording goes
-/// through, starts. `dev` is a development build, which embeds whatever
-/// `scripts/build-ffmpeg.sh` left.
-fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, dev: bool) -> Check {
+/// through, starts, and where it was found. `bundled` is a build with
+/// FFmpeg built in.
+fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, bundled: bool) -> Check {
     match health {
         Ok(health) => {
             let named = match health
@@ -608,10 +620,11 @@ fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, dev: bo
                 Some(version) => format!("FFmpeg {version}"),
                 None => "FFmpeg".into(),
             };
-            let from = if health.source == "bundled" {
-                "bundled".to_owned()
-            } else {
-                format!("{}={}", health.source, health.path)
+            let from = match health.source {
+                "bundled" => "bundled".to_owned(),
+                "next_to_executable" => format!("next to capturefab: {}", health.path),
+                "path" => format!("on PATH: {}", health.path),
+                source => format!("{source}={}", health.path),
             };
             Check::ok(
                 "ffmpeg",
@@ -625,11 +638,14 @@ fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, dev: bo
                 error.trim_end_matches('.')
             ),
             if overridden {
-                "Set CAPTUREFAB_FFMPEG to the absolute path of an FFmpeg executable, or unset it to use the bundled one.".into()
-            } else if dev {
-                "Run scripts/build-ffmpeg.sh and rebuild, or set CAPTUREFAB_FFMPEG to an FFmpeg executable.".into()
-            } else {
+                "Set CAPTUREFAB_FFMPEG to the absolute path of an FFmpeg executable, or unset it to use the one Capturefab finds.".into()
+            } else if bundled {
                 "Reinstall Capturefab from https://capturefab.com/downloads.html, or set CAPTUREFAB_FFMPEG to an FFmpeg executable.".into()
+            } else {
+                let hint = crate::media::ffmpeg_hint();
+                let mut fix = hint[..1].to_uppercase() + &hint[1..];
+                fix.push('.');
+                fix
             },
         ),
     }
@@ -659,6 +675,7 @@ fn receive_buffer_check(rmem_max: u64) -> Check {
     }
 }
 
+#[cfg(any(all(target_os = "linux", feature = "usb"), test))]
 fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
     if cameras.is_empty() {
         return None;
@@ -688,6 +705,7 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
 /// The paste-ready command that gives this user read/write access to USB3
 /// Vision cameras through the shipped udev rule. It uses sudo, so it is only
 /// ever shown or copied, never run.
+#[cfg(any(feature = "usb", test))]
 pub fn usb_access_fix() -> String {
     // One rule for the USB3 Vision class covers every camera plugged in
     // later. The note is a shell comment, so the whole line still pastes
@@ -696,42 +714,6 @@ pub fn usb_access_fix() -> String {
         "printf '%s\\n' '{}' '{}' | sudo tee /etc/udev/rules.d/{UDEV_RULE_FILE} >/dev/null && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add  # services also need their user in the plugdev group; see {LINE_COMPUTER}",
         UDEV_RULES[0], UDEV_RULES[1]
     )
-}
-
-/// How the error for a USB3 Vision camera this user may not open or claim
-/// starts (see `transport::usb`).
-pub const USB_ACCESS_DENIED: &str = "No permission to";
-
-/// `message` with [`usb_access_fix`] on a line of its own (see
-/// [`fix_line`]), so a caller can offer it on its own.
-pub fn with_usb_access_fix(message: impl std::fmt::Display) -> String {
-    format!("{message}\n{FIX_PREFIX}{}", usb_access_fix())
-}
-
-/// The error for a USB3 Vision camera Linux refused to open, at usbfs
-/// `node`, as `transport::usb` reports it: permission denied, carrying the
-/// fix.
-pub fn usb_access_error(name: &str, node: &Path) -> anyhow::Error {
-    crate::types::Categorized::error(
-        crate::types::ErrorKind::PermissionDenied,
-        with_usb_access_fix(format!(
-            "{USB_ACCESS_DENIED} open USB3 Vision camera {name} ({}). Run `capturefab doctor` for the udev rule that fixes it.",
-            node.display()
-        )),
-    )
-}
-
-/// What starts the line of an error message that carries a paste-ready fix,
-/// as `doctor` prints it; see [`fix_line`].
-pub const FIX_PREFIX: &str = "Fix: ";
-
-/// The fix an error message carries on a line of its own, if any.
-pub fn fix_line(message: &str) -> Option<&str> {
-    message
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix(FIX_PREFIX))
-        .map(str::trim)
-        .filter(|fix| !fix.is_empty())
 }
 
 /// Whether this user lacks read/write access to the usbfs `node`
@@ -903,7 +885,7 @@ fn usb_cameras() -> Vec<UsbCamera> {
         })
         .collect()
 }
-#[cfg(not(all(target_os = "linux", feature = "usb")))]
+#[cfg(all(test, not(all(target_os = "linux", feature = "usb"))))]
 fn usb_cameras() -> Vec<UsbCamera> {
     Vec::new()
 }
@@ -1051,7 +1033,10 @@ mod tests {
             "{fix}"
         );
         assert!(!fix.contains("export XDG_RUNTIME_DIR"), "{fix}");
-        assert!(fix.ends_with("/docs/line-computer.md"), "{fix}");
+        assert!(
+            fix.ends_with("https://capturefab.com/guides/line-computer.md"),
+            "{fix}"
+        );
         // A lingering service that started before logind made the directory
         // needs only to wait for it.
         let early = runtime_dir_check(login, LoginDir::Missing, &runtime, &state);
@@ -1161,7 +1146,7 @@ mod tests {
         );
         assert!(fix.contains("udevadm trigger"), "{fix}");
         assert!(
-            fix.ends_with("  # services also need their user in the plugdev group; see https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md"),
+            fix.ends_with("  # services also need their user in the plugdev group; see https://capturefab.com/guides/line-computer.md"),
             "{fix}"
         );
         // Pasted into a shell, it parses as commands; `sh -n` reads without running.
@@ -1230,7 +1215,7 @@ mod tests {
             path: "/home/pi/.cache/capturefab/ffmpeg-0123/ffmpeg".into(),
             version: "ffmpeg version 7.1.1 Copyright (c) 2000-2025 the FFmpeg developers".into(),
         });
-        let check = ffmpeg_check(&bundled, false, false);
+        let check = ffmpeg_check(&bundled, false, true);
         assert_eq!(
             (check.level, check.message.as_str()),
             (
@@ -1247,6 +1232,15 @@ mod tests {
             ffmpeg_check(&chosen, true, false).message,
             "FFmpeg n7.0 (CAPTUREFAB_FFMPEG=/opt/ffmpeg/bin/ffmpeg) runs; webcams, RTSP/SRT, files and recording use it."
         );
+        let found = Ok(FfmpegHealth {
+            source: "path",
+            path: "/usr/bin/ffmpeg".into(),
+            version: "ffmpeg version 6.1.1-3ubuntu5".into(),
+        });
+        assert_eq!(
+            ffmpeg_check(&found, false, false).message,
+            "FFmpeg 6.1.1-3ubuntu5 (on PATH: /usr/bin/ffmpeg) runs; webcams, RTSP/SRT, files and recording use it."
+        );
         let missing =
             Err("cannot launch FFmpeg: No such file or directory (os error 2)".to_owned());
         let check = ffmpeg_check(&missing, true, false);
@@ -1260,13 +1254,13 @@ mod tests {
             ffmpeg_check(&missing, false, true)
                 .fix
                 .unwrap()
-                .starts_with("Run scripts/build-ffmpeg.sh")
-        );
-        assert!(
-            ffmpeg_check(&missing, false, false)
-                .fix
-                .unwrap()
                 .starts_with("Reinstall Capturefab")
+        );
+        let fix = ffmpeg_check(&missing, false, false).fix.unwrap();
+        assert!(fix.starts_with("Install FFmpeg with "), "{fix}");
+        assert!(
+            fix.contains("CAPTUREFAB_FFMPEG") && fix.ends_with('.'),
+            "{fix}"
         );
     }
 
@@ -1312,41 +1306,6 @@ mod tests {
             .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
             .collect();
         assert_eq!(rules, UDEV_RULES);
-        // doctor and the USB open error offer the same command.
-        assert_eq!(
-            fix_line(&with_usb_access_fix("x")),
-            Some(usb_access_fix().as_str())
-        );
-    }
-
-    #[test]
-    fn a_refused_camera_is_permission_denied_and_keeps_its_fix_across_processes() {
-        let error = usb_access_error("acA1920-155um", Path::new("/dev/bus/usb/002/003"));
-        assert_eq!(crate::cli::error_code(&error).1, 3);
-        let code = crate::types::error_transport_code(&error);
-        assert_eq!(code, Some("permission_denied"));
-        // As a worker reply carries it to the coordinator and the CLI.
-        let rebuilt =
-            crate::types::error_from_tag(crate::types::error_tag(&error), format!("{error:#}"));
-        assert_eq!(crate::cli::error_code(&rebuilt).1, 3);
-        let message = format!("{rebuilt:#}");
-        assert_eq!(
-            message.lines().next(),
-            Some(
-                "No permission to open USB3 Vision camera acA1920-155um (/dev/bus/usb/002/003). Run `capturefab doctor` for the udev rule that fixes it."
-            )
-        );
-        assert_eq!(fix_line(&message), Some(usb_access_fix().as_str()));
-    }
-
-    #[test]
-    fn a_fix_line_is_read_back_from_an_error_message() {
-        assert_eq!(fix_line("camera busy"), None);
-        assert_eq!(
-            fix_line("connect: no access\nFix: sudo true"),
-            Some("sudo true")
-        );
-        assert_eq!(fix_line("no access\nFix:   "), None);
     }
 
     #[test]
@@ -1389,13 +1348,16 @@ mod tests {
         assert!(lines[2].starts_with("warn  net.core.rmem_max is 208.0 KiB"));
         assert!(lines[3].starts_with("      Fix: sudo sysctl -w"));
         assert!(
-            lines[4].contains("#host-checks-and-efficiency-mode"),
+            lines[4].contains("https://capturefab.com/docs.html#doctor"),
             "{text}"
         );
         // What plain doctor leaves to --json.
         assert!(lines[4].contains("features, folders and FFmpeg"), "{text}");
         // Linux hosts also get the service guide that walks through these fixes.
-        assert!(lines[5].ends_with("/docs/line-computer.md"), "{text}");
+        assert!(
+            lines[5].ends_with("https://capturefab.com/guides/line-computer.md"),
+            "{text}"
+        );
         assert_eq!(lines.len(), 6);
         let mut out = Vec::new();
         let mut mac = report.clone();

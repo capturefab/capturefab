@@ -120,6 +120,7 @@ pub fn software_quality(_: &Raster, _: i32) -> Result<Vec<u8>> {
 }
 
 /// A complete baseline JPEG: SOI, a frame header with the expected size, EOI.
+#[cfg(test)]
 pub fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
     if bytes.len() < 4 || bytes[..2] != [0xFF, 0xD8] || bytes[bytes.len() - 2..] != [0xFF, 0xD9] {
         return false;

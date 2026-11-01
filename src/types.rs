@@ -300,13 +300,13 @@ impl ErrorKind {
             Self::StorageFull => (
                 "storage_full",
                 6,
-                "disk full or below CAPTUREFAB_MIN_FREE; details path, free_bytes if known",
+                "disk full or below CAPTUREFAB_MIN_FREE; details {path,free_bytes?}",
             ),
             Self::Incomplete => ("incomplete", 1, "fewer results than requested; see details"),
             Self::Interrupted => (
                 "interrupted",
                 130,
-                "stopped by a signal (130 SIGINT, 143 SIGTERM, 129 SIGHUP); details hold partial results",
+                "stopped by a signal (see exit_codes); details hold partial results",
             ),
         }
     }
@@ -489,7 +489,11 @@ pub fn classify(error: &anyhow::Error) -> Classified {
         .is_some();
     for cause in error.chain() {
         if ffmpeg && !cause.is::<Categorized>() {
-            return plain(ErrorKind::FfmpegMissing);
+            return Classified {
+                kind: ErrorKind::FfmpegMissing,
+                hint: Some(crate::media::ffmpeg_hint()),
+                details: None,
+            };
         }
         if let Some(categorized) = cause.downcast_ref::<Categorized>() {
             return Classified {
@@ -517,7 +521,16 @@ pub fn classify(error: &anyhow::Error) -> Classified {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             use std::io::ErrorKind as Io;
             match io.kind() {
-                Io::StorageFull | Io::QuotaExceeded => return plain(ErrorKind::StorageFull),
+                Io::StorageFull | Io::QuotaExceeded => {
+                    return Classified {
+                        kind: ErrorKind::StorageFull,
+                        hint: Some(format!(
+                            "free some space or write to another folder; {} sets how much Capturefab leaves free",
+                            crate::storage::MIN_FREE_ENV
+                        )),
+                        details: None,
+                    };
+                }
                 Io::TimedOut => return plain(ErrorKind::Timeout),
                 Io::PermissionDenied => return plain(ErrorKind::PermissionDenied),
                 Io::ConnectionRefused
@@ -764,7 +777,9 @@ mod tests {
         assert_eq!(classified.kind, ErrorKind::Exists);
         assert_eq!(classified.details.unwrap()["path"], "/tmp/x.png");
         let full = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull));
-        assert_eq!(classify(&full).kind.code(), ("storage_full", 6));
+        let classified = classify(&full);
+        assert_eq!(classified.kind.code(), ("storage_full", 6));
+        assert!(classified.hint.unwrap().contains("CAPTUREFAB_MIN_FREE"));
         assert_eq!(
             classify(&anyhow::Error::from(FrameWait)).kind,
             ErrorKind::FrameTimeout

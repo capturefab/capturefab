@@ -563,8 +563,8 @@ pub(crate) fn explain_gige_unreachable(
             adapter_summary(adapter)
         );
     }
-    // The subnet leads: it is the likely cause, and the desktop's one-line
-    // slot shows only the start.
+    // The subnet leads: it is the likely cause, and a one-line summary shows
+    // only the start.
     format!(
         "No network adapter on this computer shares {ip}'s subnet ({listed}), and no GigE Vision camera answered there within {waited}. Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or {SCAN_ADVICE}."
     )
@@ -983,7 +983,7 @@ pub(crate) fn bytes_per_second_scale(unit: Option<&str>, default_multiplier: f64
     })
 }
 
-/// Plain name for an adapter type, shared by the CLI and the desktop dialog.
+/// Plain name for an adapter type.
 pub fn kind_label(kind: InterfaceKind) -> &'static str {
     match kind {
         InterfaceKind::Wired => "Wired Ethernet",

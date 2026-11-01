@@ -8,7 +8,6 @@ use serde_json::{Value, json};
 use std::{
     cell::RefCell,
     collections::{BTreeMap, BTreeSet},
-    io::{Cursor, Read},
 };
 
 const MAX_XML: usize = 32 * 1024 * 1024;
@@ -66,53 +65,6 @@ pub struct FeatureInfo {
     pub inc: Option<f64>,
     pub choices: Vec<String>,
     pub error: Option<String>,
-}
-
-impl FeatureInfo {
-    /// Check a draft against the displayed metadata. The camera checks its live
-    /// constraints again before writing, since selectors and limits can change.
-    pub fn validate_input(&self, text: &str) -> Result<()> {
-        let value = input_value(&self.name, &self.kind, text)?;
-        match self.kind.as_str() {
-            "Enumeration" => ensure!(
-                self.choices.iter().any(|choice| choice == text),
-                "{} must be one of: {}",
-                self.name,
-                self.choices.join(", ")
-            ),
-            "StringReg" => ensure!(
-                !text.contains('\0'),
-                "{} cannot contain a NUL character",
-                self.name
-            ),
-            "String" => {}
-            "Boolean" => {}
-            _ => {
-                // FeatureInfo uses floats for its display bounds. A rounded
-                // large integer limit must not reject a valid 64-bit value.
-                let exact_bound = |bound: Option<f64>| {
-                    bound
-                        .filter(|v| !integer_kind(&self.kind) || v.abs() < (1u64 << 53) as f64)
-                        .map(|v| json!(v))
-                };
-                validate_numeric(
-                    &self.name,
-                    &self.kind,
-                    &value,
-                    exact_bound(self.min),
-                    exact_bound(self.max),
-                    if integer_kind(&self.kind)
-                        && self.min.is_some_and(|v| v.abs() >= (1u64 << 53) as f64)
-                    {
-                        None
-                    } else {
-                        exact_bound(self.inc)
-                    },
-                )?;
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -2248,7 +2200,9 @@ fn literal(s: &str) -> Result<Value> {
     Ok(json!(n))
 }
 /// Decode a raw XML file or an in-memory ZIP, without writing device-provided paths.
+#[cfg(any(feature = "usb", test))]
 pub fn decode_xml(data: &[u8]) -> Result<String> {
+    use std::io::{Cursor, Read};
     ensure!(data.len() <= MAX_XML, "GenICam file exceeds 32 MiB limit");
     let bytes = if data.starts_with(b"PK\x03\x04") {
         let mut archive = zip::ZipArchive::new(Cursor::new(data)).context("invalid GenICam ZIP")?;
@@ -2768,6 +2722,7 @@ fn bits(v: f64) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
     #[test]
     fn image_geometry_and_format_are_locked_while_streaming() {
         for name in [
@@ -3570,8 +3525,7 @@ mod tests {
             .find(|f| f.name == "Level")
             .unwrap();
         assert_eq!(feature.inc, Some(0.1));
-        assert!(feature.validate_input("0.300000001").is_ok());
-        assert!(feature.validate_input("1.1").is_err());
+        m.validate_set(&mut io, "Level", "0.300000001").unwrap();
     }
     #[test]
     fn preflight_does_not_mutate_values_and_allows_temporary_auto_locks() {
@@ -3590,7 +3544,6 @@ mod tests {
             .find(|f| f.name == "Level")
             .unwrap();
         assert!(!feature.writable);
-        feature.validate_input("6").unwrap();
         assert!(io.bytes.is_empty());
         assert!(m.set(&mut io, "Level", "6").is_err());
         assert!(m.validate_set(&mut io, "Level", "5").is_err());

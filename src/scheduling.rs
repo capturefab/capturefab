@@ -170,19 +170,6 @@ pub fn count_for(duration_ms: u64, interval_ms: u64) -> Result<u32> {
     );
     frame_count(duration_ms.div_ceil(interval_ms))
 }
-/// The frame count of a schedule whose first frame is at `first_at_ms`, with
-/// frames `interval_ms` apart until `end_at_ms`: every frame at or before the
-/// end, so an end exactly on a frame includes that frame.
-pub fn count_until(first_at_ms: u64, interval_ms: u64, end_at_ms: u64) -> Result<u32> {
-    ensure!(
-        (1..=MAX_DURATION_MS).contains(&interval_ms),
-        "interval must be 1ms..10 years"
-    );
-    let span = end_at_ms
-        .checked_sub(first_at_ms)
-        .context("schedule end must not be before its first frame")?;
-    frame_count((span / interval_ms).saturating_add(1))
-}
 fn frame_count(count: u64) -> Result<u32> {
     ensure!(
         (1..=100_000).contains(&count),
@@ -248,16 +235,6 @@ mod tests {
                 .to_string()
                 .contains("needs 1000000 frames")
         );
-        // Hourly from 09:00 until 17:00 includes the 17:00 frame.
-        let first = 1_000_000;
-        assert_eq!(count_until(first, hour, first + 8 * hour).unwrap(), 9);
-        assert_eq!(count_until(first, hour, first + 9 * hour - 1).unwrap(), 9);
-        assert_eq!(count_until(first, hour, first).unwrap(), 1);
-        assert_eq!(count_until(first, 1, first + 99_999).unwrap(), 100_000);
-        assert!(count_until(first, 1, first + 100_000).is_err());
-        assert!(count_until(first, 0, first + hour).is_err());
-        assert!(count_until(first, hour, first - 1).is_err());
-        assert!(count_until(0, 1, u64::MAX).is_err());
     }
     #[test]
     fn durations_read_in_exact_units() {

@@ -610,13 +610,14 @@ fn text(value: &Value) -> String {
         );
     }
     if let Some(suggest) = value.get("suggest") {
+        let camera = crate::hint::shell_quote(value["camera"].as_str().unwrap_or_default());
         let _ = writeln!(
             text,
             "  suggest {:+} EV{}",
             suggest["ev"].as_f64().unwrap_or(0.0),
             suggest["exposure_us"]
                 .as_f64()
-                .map(|us| format!(": capturefab set exposure={}us", us.round()))
+                .map(|us| format!(": capturefab set -c {camera} exposure={}us", us.round()))
                 .unwrap_or_default()
         );
     }
@@ -731,6 +732,25 @@ mod tests {
         assert_eq!(suggested["ev"], -4.0);
         assert_eq!(suggested["exposure_us"], 62500.0);
         assert_eq!(suggested["limited_by"], "clipped");
+    }
+
+    #[test]
+    fn the_suggested_command_names_its_camera_ready_to_paste() {
+        let inspected = |camera: &str| {
+            text(&json!({
+                "camera": camera,
+                "frame": {"width": 64, "height": 48, "pixel_format": "Mono8"},
+                "verdict": ["dark"],
+                "suggest": {"ev": 2.0, "exposure_us": 1500.0},
+            }))
+        };
+        assert!(
+            inspected("sim:0").contains("suggest +2 EV: capturefab set -c sim:0 exposure=1500us\n")
+        );
+        assert!(
+            inspected("avfoundation:HD Camera")
+                .contains("capturefab set -c 'avfoundation:HD Camera' exposure=1500us")
+        );
     }
 
     #[test]

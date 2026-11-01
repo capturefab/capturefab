@@ -46,8 +46,7 @@ const SMALL_QUALITY: i32 = 92;
 /// `SCALE_STEPS` times.
 const SCALE: f64 = 0.8;
 const SCALE_STEPS: i32 = 3;
-/// Clipping above this share of samples is called out, as on the desktop
-/// histogram.
+/// Clipping above this share of samples is called out.
 pub(crate) const CLIP_WARN: f64 = 0.005;
 /// Mean brightness outside this range is called out.
 pub(crate) const DARK: f64 = 0.25;
@@ -97,8 +96,7 @@ pub fn validate(
 }
 
 /// A normalized `[x, y, width, height]` region in pixels of a `width` ×
-/// `height` frame, as the desktop focus region maps it, clamped to the frame
-/// and at least one pixel on each side.
+/// `height` frame, clamped to the frame and at least one pixel on each side.
 pub fn region_pixels(region: [f64; 4], width: u32, height: u32) -> [u32; 4] {
     let (w, h) = (f64::from(width), f64::from(height));
     let x = ((region[0] * w).round().max(0.0) as u32).min(width.saturating_sub(1));
@@ -409,26 +407,6 @@ impl Serialize for EncodedImage {
     }
 }
 
-/// A preview of `frame` whose longest edge is at most `max_dimension`, or
-/// None for 0 and for formats that cannot be decoded. Pixels are averaged
-/// over each output pixel's area, so detail blends instead of aliasing.
-/// Monochrome stays gray. A preview larger than `MAX_IMAGE_BYTES` is encoded
-/// again at lower JPEG quality, then smaller, before giving up.
-pub fn render(
-    frame: &Frame,
-    max_dimension: u32,
-    format: PreviewFormat,
-) -> Result<Option<EncodedImage>> {
-    render_within(
-        frame,
-        max_dimension,
-        format,
-        cfg!(feature = "jpeg"),
-        MAX_IMAGE_BYTES,
-        false,
-    )
-}
-
 /// The first JPEG quality for a preview of a `width` × `height` source:
 /// higher for a region crop of at most `SMALL_EDGE` pixels, whatever the
 /// preview's size. A downscaled whole frame is not a crop.
@@ -457,6 +435,11 @@ fn jpeg_preview(format: PreviewFormat, jpeg_available: bool) -> Result<bool> {
     })
 }
 
+/// A preview of `frame` whose longest edge is at most `max_dimension`, or
+/// None for 0 and for formats that cannot be decoded. Pixels are averaged
+/// over each output pixel's area, so detail blends instead of aliasing.
+/// Monochrome stays gray. A preview larger than `limit` is encoded again at
+/// lower JPEG quality, then smaller, before giving up.
 fn render_within(
     frame: &Frame,
     max_dimension: u32,
@@ -668,6 +651,22 @@ mod tests {
     const MONO12: u32 = 0x0110_0005;
     const BAYER_RG8: u32 = 0x0108_0009;
     const COORD3D_C16: u32 = 0x0110_00b8;
+
+    /// A preview as this build makes it, within the inspection limit.
+    fn render(
+        frame: &Frame,
+        max_dimension: u32,
+        format: PreviewFormat,
+    ) -> Result<Option<EncodedImage>> {
+        render_within(
+            frame,
+            max_dimension,
+            format,
+            cfg!(feature = "jpeg"),
+            MAX_IMAGE_BYTES,
+            false,
+        )
+    }
 
     fn frame(pixel_format: u32, width: u32, height: u32, data: Vec<u8>) -> Frame {
         Frame {

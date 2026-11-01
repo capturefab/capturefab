@@ -799,7 +799,7 @@ fn schema_describes_every_command_and_its_results() {
     ] {
         assert!(codes.contains(code), "{code}");
     }
-    assert!(schema.to_string().len() < 9000, "the overview stays small");
+    assert!(schema.to_string().len() < 9500, "the overview stays small");
 }
 
 /// The top-level keys a command prints are the ones `schema COMMAND`
@@ -1351,7 +1351,13 @@ fn doctor_and_licenses() {
             .unwrap()
             .starts_with("MIT License")
     );
-    assert!(licenses["ffmpeg"].as_str().unwrap().contains("GPL"));
+    // A build with FFmpeg built in names its license; others say they
+    // have none.
+    let notice = licenses["ffmpeg"].as_str().unwrap();
+    assert!(
+        notice.contains("GPL") || notice.contains("no FFmpeg built in"),
+        "{notice}"
+    );
 }
 
 #[test]
@@ -1601,6 +1607,22 @@ fn doctor_says_how_to_make_shared_folders_private() {
             .unwrap()
             .starts_with(&format!("chmod 700 {}", home.sessions.display())),
         "{private}"
+    );
+    // A camera command that must keep its camera in a session says the
+    // same; the warm default instead opens the camera for itself.
+    assert_eq!(
+        home.warm(&["--json", "get", "-c", "sim:0", "Width"])
+            .success()["values"]["Width"],
+        640
+    );
+    let error = home
+        .run(&["--json", "get", "-c", "sim:0", "Width", "--keep", "1m"])
+        .failure(3);
+    assert_eq!(error["code"], "permission_denied", "{error}");
+    assert_eq!(
+        error["hint"],
+        format!("chmod 700 {}", home.sessions.display()),
+        "{error}"
     );
 }
 

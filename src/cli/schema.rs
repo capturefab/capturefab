@@ -54,6 +54,22 @@ const EFFECTS: &[(&str, &str)] = &[
     ("licenses", "read"),
 ];
 
+/// Flags that widen a command's effect: inspect, capture and record with
+/// `--set` or `--auto` change the camera first, and so does network with
+/// `--tune`.
+const EFFECT_WITH: &[(&str, &[(&str, &str)])] = &[
+    (
+        "capture",
+        &[("--set", "camera_write"), ("--auto", "camera_write")],
+    ),
+    (
+        "record",
+        &[("--set", "camera_write"), ("--auto", "camera_write")],
+    ),
+    ("inspect", &[("--set", "camera_write")]),
+    ("network", &[("--tune", "camera_write")]),
+];
+
 /// A saved preset document, as `preset show` prints it.
 const PRESET_DOCUMENT: &[(&str, &str)] = &[
     ("version", "int — document version"),
@@ -158,7 +174,7 @@ fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
         ],
         "schema" => &[
             ("contract_version", "int"),
-            ("commands", "[{name,summary,effect}]"),
+            ("commands", "[{name,summary,effect,effect_with?}]"),
             ("conventions", "{...}"),
             ("grammars", "{selector,name,duration,template}"),
             ("exit_codes", "{code: meaning}"),
@@ -382,6 +398,21 @@ fn effect(name: &str) -> &'static str {
         .map_or("disruptive", |(_, effect)| effect)
 }
 
+/// The effect each widening flag of `name` gives it, if it has any.
+fn effect_with(name: &str) -> Option<Value> {
+    EFFECT_WITH
+        .iter()
+        .find(|(command, _)| *command == name)
+        .map(|(_, flags)| {
+            Value::Object(
+                flags
+                    .iter()
+                    .map(|(flag, effect)| ((*flag).to_owned(), json!(effect)))
+                    .collect(),
+            )
+        })
+}
+
 fn arg_type(arg: &clap::Arg) -> &'static str {
     use clap::ArgAction;
     if matches!(arg.get_action(), ArgAction::SetTrue | ArgAction::SetFalse) {
@@ -464,7 +495,12 @@ fn overview() -> Value {
     let commands = commands()
         .iter()
         .map(|(name, command)| {
-            json!({"name": name, "summary": summary(command), "effect": effect(name)})
+            let mut entry =
+                json!({"name": name, "summary": summary(command), "effect": effect(name)});
+            if let Some(with) = effect_with(name) {
+                entry["effect_with"] = with;
+            }
+            entry
         })
         .collect::<Vec<_>>();
     let exit_codes = json!({
@@ -524,6 +560,9 @@ fn command(name: &str) -> Result<Value> {
         "effect": effect(name),
         "args": arguments(command),
     });
+    if let Some(with) = effect_with(name) {
+        value["effect_with"] = with;
+    }
     let mut errors = vec!["usage", "failed"];
     errors.extend(self::errors(name));
     value["errors"] = json!(errors);
@@ -574,6 +613,32 @@ mod tests {
                 "{command} is gone"
             );
         }
+        // A widening flag is one of its command's own, and widens it.
+        let rank = |effect: &str| {
+            ["read", "file_write", "camera_write", "disruptive"]
+                .iter()
+                .position(|known| *known == effect)
+                .unwrap()
+        };
+        for (name, flags) in EFFECT_WITH {
+            let (_, command) = commands()
+                .into_iter()
+                .find(|(candidate, _)| candidate == name)
+                .unwrap();
+            for (flag, effect) in *flags {
+                assert!(
+                    command
+                        .get_arguments()
+                        .any(|arg| arg.get_long() == flag.strip_prefix("--")),
+                    "{name} has no {flag}"
+                );
+                assert!(rank(effect) > rank(super::effect(name)), "{name} {flag}");
+            }
+        }
+        assert_eq!(
+            super::command("capture").unwrap()["effect_with"]["--set"],
+            "camera_write"
+        );
     }
 
     #[test]
@@ -608,8 +673,8 @@ mod tests {
     fn the_overview_stays_small_and_lists_every_reason() {
         let overview = overview();
         let text = overview.to_string();
-        // About 1.5k tokens at four characters a token.
-        assert!(text.len() < 9000, "{} bytes", text.len());
+        // About 9 KB, some 2.3k tokens at four characters a token.
+        assert!(text.len() < 9500, "{} bytes", text.len());
         assert_eq!(
             overview["errors"].as_array().unwrap().len(),
             ErrorKind::ALL.len()

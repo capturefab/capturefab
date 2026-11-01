@@ -1646,12 +1646,6 @@ fn open_stream<T>(
     .context("could not open any ONVIF stream profile")
 }
 
-pub fn connect(
-    source: &str,
-    timeout: Duration,
-) -> Result<(crate::types::CameraInfo, Box<dyn crate::types::Backend>)> {
-    connect_with(source, None, timeout)
-}
 /// Open an ONVIF camera, with a sign-in given beside its address. Sign-in
 /// errors always name the ONVIF address, never a stream URI it reported,
 /// since the ONVIF address is what a sign-in is saved under.
@@ -2783,7 +2777,7 @@ mod tests {
         let timeout = Duration::from_secs(2);
         // No credentials: auth_required, naming the ONVIF address.
         let (address, server) = answer(vec![challenge.clone()]);
-        let error = connect(&format!("onvif://{address}"), timeout)
+        let error = connect_with(&format!("onvif://{address}"), None, timeout)
             .err()
             .unwrap();
         server.join().unwrap();
@@ -2831,8 +2825,9 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
-        let error = connect(
+        let error = connect_with(
             &format!("onvif:http://{here}/onvif/device_service"),
+            None,
             timeout,
         )
         .err()
