@@ -217,29 +217,29 @@ impl ErrorKind {
     }
     fn describe(self) -> (&'static str, i32, &'static str) {
         match self {
-            Self::OperationFailed => ("failed", 1, "the operation failed; see message"),
-            Self::Usage => ("usage", 2, "invalid arguments or input; fix the command"),
+            Self::OperationFailed => ("failed", 1, "the operation failed"),
+            Self::Usage => ("usage", 2, "invalid arguments or input"),
             Self::InvalidDuration => (
                 "invalid_duration",
                 2,
-                "a duration needs a unit: 250ms, 2s, 1.5s, 5m, 1h30m",
+                "not a valid duration (see grammars.duration)",
             ),
             Self::FeatureNotFound => (
                 "feature_not_found",
                 2,
-                "no such feature or control; details.did_you_mean lists close names",
+                "no such feature or control; see details.did_you_mean",
             ),
             Self::OutOfRange => (
                 "out_of_range",
                 2,
-                "value outside the feature's range; details {feature,value,min,max,inc,nearest,unit}",
+                "outside the feature's range; details {feature,value,min,max,inc,nearest,unit}",
             ),
-            Self::InvalidChoice => ("invalid_choice", 2, "value is not one of details.choices"),
+            Self::InvalidChoice => ("invalid_choice", 2, "not one of details.choices"),
             Self::NotWritable => ("not_writable", 2, "the feature is read-only"),
             Self::FeatureLocked => (
                 "feature_locked",
                 1,
-                "another setting locks the feature now; details.locked_by names it",
+                "another setting locks the feature now; see details.locked_by",
             ),
             Self::CameraAmbiguous => (
                 "camera_ambiguous",
@@ -254,19 +254,11 @@ impl ErrorKind {
             Self::CameraBusy => (
                 "camera_busy",
                 3,
-                "another process or job holds the camera; details.held_by names it when known",
+                "another process or job holds the camera; details.held_by when known",
             ),
-            Self::PermissionDenied => (
-                "permission_denied",
-                3,
-                "the operating system refused access; see hint",
-            ),
+            Self::PermissionDenied => ("permission_denied", 3, "the OS refused access; see hint"),
             Self::Disconnected => ("disconnected", 3, "the camera went away"),
-            Self::WorkerCrashed => (
-                "worker_crashed",
-                3,
-                "the camera worker process ended unexpectedly",
-            ),
+            Self::WorkerCrashed => ("worker_crashed", 3, "the camera worker process died"),
             Self::SessionNotFound => ("session_not_found", 3, "no running session has that name"),
             Self::FfmpegMissing => ("ffmpeg_missing", 3, "FFmpeg could not be found or started"),
             Self::Unavailable => (
@@ -277,25 +269,21 @@ impl ErrorKind {
             Self::AuthRequired => (
                 "auth_required",
                 3,
-                "the camera needs a user name and password; run login add",
+                "the camera needs a sign-in; run login add",
             ),
-            Self::AuthRejected => (
-                "auth_rejected",
-                3,
-                "the camera refused the user name and password",
-            ),
+            Self::AuthRejected => ("auth_rejected", 3, "the camera refused the sign-in"),
             Self::FrameTimeout => ("frame_timeout", 4, "no frame arrived in time"),
             Self::TriggerTimeout => (
                 "trigger_timeout",
                 4,
-                "a triggered camera received no trigger in time; details.trigger",
+                "a triggered camera got no trigger in time; details.trigger",
             ),
             Self::Timeout => ("timeout", 4, "the operation did not finish in time"),
             Self::Unsupported => ("unsupported", 5, "the camera or this build cannot do that"),
             Self::Exists => (
                 "exists",
                 1,
-                "the output exists and is never overwritten; details.path",
+                "the output exists (never overwritten); details.path",
             ),
             Self::StorageFull => (
                 "storage_full",
@@ -306,7 +294,7 @@ impl ErrorKind {
             Self::Interrupted => (
                 "interrupted",
                 130,
-                "stopped by a signal (see exit_codes); details hold partial results",
+                "stopped by a signal; details hold partial results",
             ),
         }
     }

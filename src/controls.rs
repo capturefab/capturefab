@@ -2383,6 +2383,64 @@ mod tests {
         assert!(format!("{error:#}").contains("set twice"), "{error:#}");
     }
 
+    /// Bank A of Setting holds 10 and bank B 11, with A selected. Strobe
+    /// looks writable, but the device refuses every write of it.
+    const BANKS: &str = concat!(
+        "<Enumeration Name='BankSelector'><EnumEntry Name='A'><Value>0</Value></EnumEntry><EnumEntry Name='B'><Value>1</Value></EnumEntry><Value>0</Value><pSelected>Setting</pSelected></Enumeration>",
+        "<Integer Name='Setting'><pIndex>BankSelector</pIndex><pValueIndexed Index='0'>AValue</pValueIndexed><pValueIndexed Index='1'>BValue</pValueIndexed></Integer>",
+        "<Integer Name='AValue'><Value>10</Value></Integer><Integer Name='BValue'><Value>11</Value></Integer>",
+        "<Integer Name='Strobe'><pValue>StrobeReg</pValue></Integer><IntReg Name='StrobeReg'><Address>0x00</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg>",
+    );
+
+    #[test]
+    fn a_failed_change_restores_every_bank_it_wrote() {
+        use crate::camera::tests::{Device, device_camera};
+        let mut camera = device_camera(Device::new(BANKS));
+        let banks = |camera: &mut Camera| {
+            let names =
+                ["BankSelector", "Setting[A]", "Setting[B]"].map(|name| Name::parse(name).unwrap());
+            Value::Object(get(camera, &names).unwrap())
+        };
+        let initial = banks(&mut camera);
+        assert_eq!(
+            initial,
+            json!({"BankSelector":"A","Setting[A]":10,"Setting[B]":11})
+        );
+        let restored = |camera: &mut Camera, values: &[&str]| {
+            let values = values.iter().map(|value| assign(value)).collect::<Vec<_>>();
+            let error = set(camera, &values, false).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("every value written was restored"),
+                "{error:#}"
+            );
+            crate::types::classify(&error).details.unwrap()["rollback"].clone()
+        };
+        // A value written at the bank an earlier assignment selects is put
+        // back at that bank.
+        assert_eq!(
+            restored(&mut camera, &["BankSelector=B", "Setting=99", "Strobe=1"]),
+            json!({"restored":["Setting[B]"],"failed":[]})
+        );
+        assert_eq!(banks(&mut camera), initial);
+        // So is one written directly to the feature a bank reads.
+        assert_eq!(
+            restored(&mut camera, &["BValue=42", "Setting=20", "Strobe=1"]),
+            json!({"restored":["Setting[A]","BValue"],"failed":[]})
+        );
+        assert_eq!(banks(&mut camera), initial);
+        // Success writes every bank and keeps the selection.
+        set(
+            &mut camera,
+            &[assign("Setting[A]=20"), assign("Setting[B]=99")],
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            banks(&mut camera),
+            json!({"BankSelector":"A","Setting[A]":20,"Setting[B]":99})
+        );
+    }
+
     #[test]
     fn a_dry_run_refuses_what_the_change_would_refuse() {
         let mut camera = sim();

@@ -29,15 +29,6 @@ pub(crate) const MAX_REQUEST: usize = 1024 * 1024;
 pub(crate) enum WorkerCommand {
     /// Apply this camera's share of the GigE bandwidth a network scan planned.
     OptimizeNetwork { bytes_per_second: u64 },
-    /// Write several features in order as one camera change: a failure
-    /// restores every value, and every value an earlier write moved. Tests
-    /// drive the rollback checkpoints with it; no coordinator sends it.
-    #[cfg(test)]
-    SetMany { values: Vec<super::FeatureValue> },
-    /// End the camera's recording or forward, as a stop of its job does,
-    /// for tests that run commands without the worker loop.
-    #[cfg(test)]
-    StopForward,
     #[serde(untagged)]
     Session(SessionCommand),
 }
@@ -64,19 +55,6 @@ impl WorkerCommand {
                 );
                 Ok(())
             }
-            #[cfg(test)]
-            Self::SetMany { values } => {
-                ensure!(
-                    (1..=super::MAX_SET_MANY).contains(&values.len()),
-                    "set_many takes 1..32 feature values"
-                );
-                for value in values {
-                    super::validate_feature(&value.feature)?;
-                }
-                Ok(())
-            }
-            #[cfg(test)]
-            Self::StopForward => Ok(()),
             Self::Session(command) => command.validate(),
         }
     }
@@ -84,8 +62,6 @@ impl WorkerCommand {
     /// leave the camera half-configured.
     pub(crate) fn changes_settings(&self) -> bool {
         match self {
-            #[cfg(test)]
-            Self::SetMany { .. } => true,
             Self::Session(command) => matches!(
                 command,
                 SessionCommand::SetValues { dry_run: false, .. }

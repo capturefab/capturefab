@@ -238,22 +238,6 @@ fn capture(
     })
 }
 
-/// Add what a write of `feature` is about to replace, at the banks selected
-/// now, to the checkpoint taken before a SetMany: an earlier value of the
-/// same SetMany may have switched a selector to a bank it did not read.
-#[cfg(test)]
-fn extend(camera: &mut Camera, before: &mut Configuration, feature: &str) -> Result<()> {
-    for address in addresses(camera, feature, &|_| false)? {
-        if let std::collections::btree_map::Entry::Vacant(entry) = before.values.entry(address) {
-            // The address names the banks selected now: nothing switches.
-            let value = read_at(camera, entry.key())
-                .with_context(|| format!("read {feature} for rollback"))?;
-            entry.insert(value);
-        }
-    }
-    Ok(())
-}
-
 fn set_exact(camera: &mut Camera, address: &Address, target: &Value) -> Result<()> {
     addressed(camera, address, |camera| {
         // A value an earlier write hid (an enumeration entry gated by
@@ -410,16 +394,14 @@ pub(super) fn process(
     }
     // A change that may write several values is one change: what it would
     // replace is read first, and a failure puts every value back.
-    let atomic = match &command {
-        #[cfg(test)]
-        WorkerCommand::SetMany { .. } => true,
-        WorkerCommand::Session(
+    let atomic = matches!(
+        command.session(),
+        Some(
             SessionCommand::Auto { .. }
-            | SessionCommand::Manual { .. }
-            | SessionCommand::ApplySetup { .. },
-        ) => true,
-        _ => false,
-    };
+                | SessionCommand::Manual { .. }
+                | SessionCommand::ApplySetup { .. }
+        )
+    );
     if !atomic {
         return process_plain(
             h,
@@ -462,29 +444,16 @@ pub(super) fn process(
                     .map(|row| row.address.feature.as_str())
             })
             .collect(),
-        #[cfg(test)]
-        WorkerCommand::SetMany { values } => {
-            values.iter().map(|value| value.feature.as_str()).collect()
-        }
         _ => Vec::new(),
     };
     let apply_setup = matches!(command.session(), Some(SessionCommand::ApplySetup { .. }));
-    #[cfg(test)]
-    let together = apply_setup || matches!(command, WorkerCommand::SetMany { .. });
-    #[cfg(not(test))]
-    let together = apply_setup;
     let mut before = match capture(c, auto, &written) {
         Ok(before) => before,
         // Its values must be restorable together, so it writes none.
-        Err(error) if together => {
-            return Err(error.context(format!(
-                "{} changed nothing: the values it would replace could not be read",
-                if apply_setup {
-                    "apply_setup"
-                } else {
-                    "set_many"
-                }
-            )));
+        Err(error) if apply_setup => {
+            return Err(error.context(
+                "apply_setup changed nothing: the values it would replace could not be read",
+            ));
         }
         // A write-only control is still useful; such a change goes ahead
         // without a checkpoint to roll back to.
@@ -503,13 +472,6 @@ pub(super) fn process(
     };
     let mut restart = false;
     let result = match &command {
-        // Each write first records the bank it is about to change.
-        #[cfg(test)]
-        WorkerCommand::SetMany { values } => {
-            super::set_many(h, camera, auto, values, |camera, feature| {
-                extend(camera, &mut before, feature)
-            })
-        }
         // A streaming camera locks its geometry: stop it once, write, and
         // start it again after success or the rollback below.
         WorkerCommand::Session(SessionCommand::ApplySetup {
@@ -633,33 +595,6 @@ mod tests {
     fn get(h: &WorkerHandle, feature: &str) -> Value {
         h.value(feature)
     }
-    fn set_many(h: &WorkerHandle, values: &[(&str, &str)]) -> Result<Value> {
-        h.request(WorkerCommand::SetMany {
-            values: values
-                .iter()
-                .map(|(feature, value)| crate::session::FeatureValue {
-                    feature: (*feature).into(),
-                    value: (*value).into(),
-                })
-                .collect(),
-        })
-    }
-
-    #[test]
-    fn a_failed_set_many_restores_every_value_it_wrote() {
-        let h = connected();
-        let (exposure, width) = (get(&h, "ExposureTime"), get(&h, "Width"));
-        // The second value is out of range after the first was written.
-        assert!(set_many(&h, &[("ExposureTime", "5000"), ("Width", "99999")]).is_err());
-        assert_eq!(get(&h, "ExposureTime"), exposure);
-        assert_eq!(get(&h, "Width"), width);
-        let changed = set_many(&h, &[("ExposureTime", "5000"), ("Width", "256")]).unwrap();
-        assert_eq!(changed["values"][0]["name"], "ExposureTime");
-        assert_eq!(changed["values"][0]["value"].as_f64(), Some(5000.0));
-        assert_eq!(changed["values"][1], json!({"name":"Width","value":256}));
-        assert_eq!(get(&h, "Width"), 256);
-        h.shutdown();
-    }
 
     #[test]
     fn failed_managed_write_does_not_leave_auto_disabled() {
@@ -676,111 +611,6 @@ mod tests {
         assert!(h.set_value("ExposureTime", "0").is_err());
         assert_eq!(h.snapshot().auto.unwrap().balance, 0.3);
         assert_eq!(get(&h, "ExposureTime"), exposure);
-        h.shutdown();
-    }
-
-    struct Banks;
-    impl crate::types::RegisterIo for Banks {
-        fn read_memory(&mut self, _: u64, length: usize) -> Result<Vec<u8>> {
-            Ok(vec![0; length])
-        }
-        fn write_memory(&mut self, _: u64, _: &[u8]) -> Result<()> {
-            Ok(())
-        }
-    }
-    impl crate::types::Backend for Banks {
-        fn xml(&mut self) -> Result<String> {
-            Ok(concat!("<RegisterDescription><Category Name='Root'><pFeature>BankSelector</pFeature><pFeature>Setting</pFeature></Category>",
-                "<Enumeration Name='BankSelector'><EnumEntry Name='A'><Value>0</Value></EnumEntry><EnumEntry Name='B'><Value>1</Value></EnumEntry><Value>0</Value><pSelected>Setting</pSelected></Enumeration>",
-                "<Integer Name='Setting'><pIndex>BankSelector</pIndex><pValueIndexed Index='0'>AValue</pValueIndexed><pValueIndexed Index='1'>BValue</pValueIndexed></Integer>",
-                "<Integer Name='AValue'><Value>10</Value></Integer><Integer Name='BValue'><Value>11</Value></Integer></RegisterDescription>").into())
-        }
-        fn start(&mut self, _: usize) -> Result<()> {
-            Ok(())
-        }
-        fn next_frame(&mut self, _: Duration) -> Result<Frame> {
-            anyhow::bail!("no frames")
-        }
-        fn stop(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn a_failed_set_many_restores_every_bank_it_selects() {
-        let h = WorkerHandle::new();
-        let mut camera = Some(
-            Camera::from_backend(crate::transport::simulator::info(), Box::new(Banks)).unwrap(),
-        );
-        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, JobStream::default());
-        let mut run = |camera: &mut Option<Camera>, command| {
-            process(
-                &h,
-                camera,
-                &mut forwarder,
-                &mut auto,
-                &mut jobs,
-                &mut next,
-                &mut scheduled,
-                command,
-            )
-        };
-        let many = |values: &[(&str, &str)]| WorkerCommand::SetMany {
-            values: values
-                .iter()
-                .map(|(feature, value)| crate::session::FeatureValue {
-                    feature: (*feature).into(),
-                    value: (*value).into(),
-                })
-                .collect(),
-        };
-        // Bank A holds 10 and bank B 11; A is selected.
-        let banks = |camera: &mut Option<Camera>| {
-            let camera = camera.as_mut().unwrap();
-            let selected = camera.get("BankSelector").unwrap();
-            let mut values = Vec::new();
-            for bank in ["A", "B"] {
-                camera.set("BankSelector", bank).unwrap();
-                values.push(camera.get("Setting").unwrap());
-            }
-            camera
-                .set("BankSelector", selected.as_str().unwrap())
-                .unwrap();
-            (selected, values)
-        };
-        let initial = (json!("A"), vec![json!(10), json!(11)]);
-        assert_eq!(banks(&mut camera), initial);
-        // A failure after switching banks restores the bank it wrote too.
-        assert!(
-            run(
-                &mut camera,
-                many(&[("BankSelector", "B"), ("Setting", "99"), ("Setting", "x")]),
-            )
-            .is_err()
-        );
-        assert_eq!(banks(&mut camera), initial);
-        // So does one after writing an unlisted feature directly.
-        assert!(
-            run(
-                &mut camera,
-                many(&[("BValue", "42"), ("Setting", "20"), ("Setting", "x")])
-            )
-            .is_err()
-        );
-        assert_eq!(banks(&mut camera), initial);
-        // Success writes every bank, even with the selector put back.
-        run(
-            &mut camera,
-            many(&[
-                ("Setting", "20"),
-                ("BankSelector", "B"),
-                ("Setting", "99"),
-                ("BankSelector", "A"),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(banks(&mut camera), (json!("A"), vec![json!(20), json!(99)]));
         h.shutdown();
     }
 
@@ -836,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_set_many_restores_values_an_earlier_write_moved() {
+    fn a_failed_preset_restores_values_an_earlier_write_moved() {
         let state = Arc::new(Mutex::new(CoupledState {
             width: 640,
             offset: 100,
@@ -849,16 +679,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let many = |values: &[(&str, &str)]| WorkerCommand::SetMany {
-            values: values
-                .iter()
-                .map(|(feature, value)| crate::session::FeatureValue {
-                    feature: (*feature).into(),
-                    value: (*value).into(),
-                })
-                .collect(),
-        };
-        let mut run = |command| {
+        let mut run = |command: SessionCommand| {
             process(
                 &h,
                 &mut camera,
@@ -867,17 +688,36 @@ mod tests {
                 &mut Vec::new(),
                 &mut 1,
                 &mut JobStream::default(),
-                command,
+                command.into(),
             )
         };
-        // Width 1000 moves OffsetX to 24, and OffsetX 100 no longer fits.
-        let error = run(many(&[("Width", "1000"), ("OffsetX", "100")])).unwrap_err();
+        let reading = serde_json::from_value(run(SessionCommand::ReadSetup).unwrap()).unwrap();
+        let saved = crate::setup::from_read("geometry", None, reading).unwrap();
+        let preset = |width: u32, offset: u32| {
+            let mut setup = saved.clone();
+            for value in &mut setup.values {
+                let number = match value.feature.as_str() {
+                    "Width" => width,
+                    "OffsetX" => offset,
+                    _ => continue,
+                };
+                value.value = crate::setup::Scalar::Number(number.into());
+            }
+            SessionCommand::ApplySetup {
+                name: None,
+                setup: Some(setup),
+                allow_other_model: false,
+                strict: false,
+            }
+        };
+        // Width 1000 moves OffsetX to 24, and OffsetX 110 no longer fits.
+        let error = run(preset(1000, 110)).unwrap_err();
         assert!(
             format!("{error:#}").contains("offset outside image bounds"),
             "{error:#}"
         );
         assert_eq!(coupled_values(&state), (640, 100));
-        run(many(&[("Width", "1000"), ("OffsetX", "20")])).unwrap();
+        run(preset(1000, 20)).unwrap();
         assert_eq!(coupled_values(&state), (1000, 20));
         h.shutdown();
     }
@@ -990,35 +830,46 @@ mod tests {
             .unwrap();
             (walks.load(Ordering::Relaxed) - before, result)
         };
-        let set = |feature: &str, value: &str| -> WorkerCommand {
+        let set_values = |values: &[&str]| -> WorkerCommand {
             SessionCommand::SetValues {
-                values: vec![
-                    crate::controls::Assignment::parse(&format!("{feature}={value}")).unwrap(),
-                ],
+                values: values
+                    .iter()
+                    .map(|value| crate::controls::Assignment::parse(value).unwrap())
+                    .collect(),
                 dry_run: false,
             }
             .into()
         };
+        let set = |feature: &str, value: &str| set_values(&[&format!("{feature}={value}")]);
         let (count, result) = walked(&mut camera, set("Width", "128"));
         assert_eq!(count, 0);
         assert_eq!(result["changed"][0]["name"], "Width", "{result}");
         assert_eq!(result["changed"][0]["to"], 128, "{result}");
-        // A grouped edit checkpoints what it writes and the features coupled
-        // with it, not every feature.
+        // So does a change of several values.
+        let (count, result) = walked(&mut camera, set_values(&["Width=256", "Height=192"]));
+        assert_eq!(count, 0);
+        assert_eq!(result["changed"][1]["name"], "Height", "{result}");
+        assert_eq!(result["changed"][1]["to"], 192, "{result}");
+        // A preset's checkpoint reads what it writes and the features
+        // coupled with it, not every feature.
+        let reading =
+            serde_json::from_value(walked(&mut camera, SessionCommand::ReadSetup.into()).1)
+                .unwrap();
+        let mut preset = crate::setup::from_read("geometry", None, reading).unwrap();
+        preset.values.retain(|value| value.feature == "Width");
+        preset.values[0].value = crate::setup::Scalar::Number(320.into());
         let (count, result) = walked(
             &mut camera,
-            WorkerCommand::SetMany {
-                values: [("Width", "256"), ("Height", "192")]
-                    .into_iter()
-                    .map(|(feature, value)| crate::session::FeatureValue {
-                        feature: feature.into(),
-                        value: value.into(),
-                    })
-                    .collect(),
-            },
+            SessionCommand::ApplySetup {
+                name: None,
+                setup: Some(preset),
+                allow_other_model: false,
+                strict: false,
+            }
+            .into(),
         );
         assert_eq!(count, 0);
-        assert_eq!(result["values"][1], json!({"name":"Height","value":192}));
+        assert_eq!(result["applied"], 1, "{result}");
         let (count, result) = walked(&mut camera, set("ExposureTime", "4000"));
         assert_eq!(count, 0);
         assert_eq!(result["changed"][0]["name"], "ExposureTime", "{result}");
@@ -1033,27 +884,35 @@ mod tests {
         let hidden = Arc::new(AtomicBool::new(false));
         let h = WorkerHandle::new();
         let mut camera = walked(&Arc::default(), &hidden);
-        assert!(camera.as_mut().unwrap().get("Height").is_ok());
+        let mut run = |command: SessionCommand| {
+            process(
+                &h,
+                &mut camera,
+                &mut None,
+                &mut None,
+                &mut Vec::new(),
+                &mut 1,
+                &mut JobStream::default(),
+                command.into(),
+            )
+        };
+        let reading = serde_json::from_value(run(SessionCommand::ReadSetup).unwrap()).unwrap();
+        let mut preset = crate::setup::from_read("width", None, reading).unwrap();
+        preset.values.retain(|value| value.feature == "Width");
+        preset.values[0].value = crate::setup::Scalar::Number(128.into());
         hidden.store(true, Ordering::Relaxed);
-        let result = process(
-            &h,
-            &mut camera,
-            &mut None,
-            &mut None,
-            &mut Vec::new(),
-            &mut 1,
-            &mut JobStream::default(),
-            WorkerCommand::SetMany {
-                values: vec![crate::session::FeatureValue {
-                    feature: "Width".into(),
-                    value: "128".into(),
-                }],
-            },
-        )
+        let result = run(SessionCommand::ApplySetup {
+            name: None,
+            setup: Some(preset),
+            allow_other_model: false,
+            strict: false,
+        })
         .unwrap();
         // Height, coupled with Width, cannot be read now: the checkpoint
         // skips it instead of refusing the change.
-        assert_eq!(result["values"][0], json!({"name":"Width","value":128}));
+        assert_eq!(result["applied"], 1, "{result}");
+        drop(run);
+        assert_eq!(camera.as_mut().unwrap().get("Width").unwrap(), 128);
         h.shutdown();
     }
 }

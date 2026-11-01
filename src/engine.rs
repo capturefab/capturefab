@@ -23,8 +23,8 @@ use std::{
 };
 
 #[cfg(test)]
-use crate::session::{FeatureValue, LogEntry};
-use crate::session::{ForwardingProgress, SessionCommand, WorkerSnapshot};
+use crate::session::LogEntry;
+use crate::session::{SessionCommand, WorkerSnapshot};
 mod emulated;
 pub(crate) mod events;
 mod history;
@@ -721,66 +721,11 @@ fn settle_auto(
     Ok(true)
 }
 
-/// Write `values` in order, each as Set would: later values may depend on
-/// earlier ones (a selector, then the value it selects). `checkpoint` runs
-/// just before each write, with the bank that write changes selected, so
-/// the rollback checkpoint can record the value it replaces.
-#[cfg(test)]
-fn set_many(
-    h: &WorkerHandle,
-    camera: &mut Option<Camera>,
-    auto: &mut Option<AutoController>,
-    values: &[FeatureValue],
-    mut checkpoint: impl FnMut(&mut Camera, &str) -> Result<()>,
-) -> Result<Value> {
-    let mut switched = false;
-    let written = (|| -> Result<Vec<Value>> {
-        let mut written = Vec::with_capacity(values.len());
-        for FeatureValue { feature, value } in values {
-            camera_mut(camera)?.validate_set(feature, value)?;
-            if auto.as_ref().is_some_and(|a| a.manages(feature)) {
-                release_auto(h, auto, camera, false)?;
-                switched = true;
-                h.log(
-                    "info",
-                    format!("Switched to manual mode because {feature} was set"),
-                );
-            } else if let Some(a) = auto.as_mut() {
-                a.invalidate();
-            }
-            let c = camera_mut(camera)?;
-            checkpoint(c, feature)?;
-            c.set(feature, value)?;
-            written.push(json!({"name":feature,"value":c.get(feature)?}));
-        }
-        Ok(written)
-    })();
-    refresh(h, camera);
-    let written = written?;
-    h.log(
-        "info",
-        format!(
-            "Set {}",
-            values
-                .iter()
-                .map(|v| format!("{} = {}", v.feature, v.value))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    );
-    let mut reply = json!({"values":written});
-    if switched {
-        reply["auto"] = Value::Null;
-    }
-    Ok(reply)
-}
-
 /// Note a line the worker logged: an error becomes its `last_error`, and
 /// tests keep the line.
 fn push_log(s: &mut WorkerSnapshot, level: &str, message: String) {
     if level == "error" {
         s.last_error = Some(message.clone());
-        s.last_error_tag = None;
     }
     #[cfg(test)]
     {
@@ -794,15 +739,39 @@ fn push_log(s: &mut WorkerSnapshot, level: &str, message: String) {
 
 const FORWARD_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
-fn compact_forwarding(id: String, stats: &crate::media::ForwardStats) -> ForwardingProgress {
-    ForwardingProgress {
-        id,
-        accepted: stats.accepted,
-        written: stats.written,
-        dropped: stats.dropped,
-        late: stats.late,
-        stalled: stats.stalled,
-        recording: None,
+/// The delivery counters a recording or forward's job reports as progress.
+#[derive(Debug, Clone, Copy)]
+struct ForwardingProgress {
+    accepted: u64,
+    written: u64,
+    dropped: u64,
+    late: u64,
+    stalled: bool,
+}
+impl ForwardingProgress {
+    fn of(stats: &crate::media::ForwardStats) -> Self {
+        Self {
+            accepted: stats.accepted,
+            written: stats.written,
+            dropped: stats.dropped,
+            late: stats.late,
+            stalled: stats.stalled,
+        }
+    }
+    /// The job's progress event: these counters, and the file a local
+    /// recording writes.
+    fn event(&self, path: Option<String>) -> Value {
+        let mut value = json!({
+            "accepted": self.accepted,
+            "written": self.written,
+            "dropped": self.dropped,
+            "late": self.late,
+            "stalled": self.stalled,
+        });
+        if let Some(path) = path {
+            value["path"] = json!(path);
+        }
+        value
     }
 }
 #[derive(Default)]
@@ -834,7 +803,7 @@ impl ForwardProgressSampler {
         if !due && self.written {
             return None;
         }
-        let progress = compact_forwarding(id.into(), &stats());
+        let progress = ForwardingProgress::of(&stats());
         if !due && progress.written == 0 {
             return None;
         }
@@ -844,6 +813,8 @@ impl ForwardProgressSampler {
         Some(progress)
     }
 }
+/// Tell the job of the running recording or forward how it is going, as
+/// often as `sampler` allows.
 fn sync_forwarding_progress(
     h: &WorkerHandle,
     forwarder: &Option<(Forwarder, f64)>,
@@ -862,24 +833,8 @@ fn sync_forwarding_progress(
     let progress = sampler.sample(id, now, || {
         forwarder.as_ref().expect("active forwarder").0.stats()
     });
-    if let Some(progress) = progress {
-        if let Some(job) = job {
-            let mut value = json!({
-                "accepted": progress.accepted,
-                "written": progress.written,
-                "dropped": progress.dropped,
-                "late": progress.late,
-                "stalled": progress.stalled,
-            });
-            if let Some(path) = path {
-                value["path"] = json!(path);
-            }
-            h.events.progress(job, value);
-        }
-        let mut state = h.state.write().unwrap_or_else(|error| error.into_inner());
-        if state.forwarding_id.as_deref() == Some(&progress.id) {
-            state.forwarding_progress = Some(progress);
-        }
+    if let (Some(progress), Some(job)) = (progress, job) {
+        h.events.progress(job, progress.event(path));
     }
 }
 
@@ -925,14 +880,13 @@ fn forward_failed(
 ) {
     if error.is::<crate::storage::MaxSize>() {
         let _ = end_forward(h, forwarder, auto, Ended::MaxSize, None, |_| {
-            Some(("info", format!("Recording ended: {error:#}"), None))
+            Some(("info", format!("Recording ended: {error:#}")))
         });
         return;
     }
     let message = format!("Forwarding stopped: {error:#}");
-    let tag = crate::types::error_tag(&error);
     let _ = end_forward(h, forwarder, auto, Ended::Failed, Some(&error), |_| {
-        Some(("error", message, tag))
+        Some(("error", message))
     });
 }
 /// Stop forwarding; the stopped forwarder's final counters, if one ran.
@@ -944,9 +898,8 @@ fn stop_forward(
 ) -> Result<Option<crate::media::ForwardStats>> {
     end_forward(h, forwarder, auto, ended, None, |_| None)
 }
-/// How a forward ended, for its log line: a level, a message and, for an
-/// error, its reason.
-type ForwardEnd = (&'static str, String, Option<crate::types::ErrorTag>);
+/// How a forward ended, for its log line: a level and a message.
+type ForwardEnd = (&'static str, String);
 /// Stop the forward, and log the line `report` makes of how it ended (a
 /// level and message) in the same step that clears the forwarding state: a
 /// status never shows the forward gone without the error it ended with, nor
@@ -966,16 +919,14 @@ fn end_forward(
         h.log("warn", format!("Auto mode after the recording: {error:#}"));
     }
     let meta = h.recording.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let (id, job, since_ms, until_ms) = {
+    let (job, since_ms, until_ms) = {
         let state = h.state.read().unwrap_or_else(|e| e.into_inner());
         (
-            state.forwarding_id.clone(),
             state.forwarding_job,
             state.forwarding_since_ms,
             state.forwarding_until_ms,
         )
     };
-    let mut final_progress = None;
     let mut summary = json!({"ended": ended.name()});
     let mut local = false;
     let stopped = match forwarder.take() {
@@ -1002,19 +953,6 @@ fn end_forward(
             }
             summary["accepted"] = json!(stats.accepted);
             summary["encoder"] = json!(stats.encoder);
-            final_progress = id.map(|id| ForwardingProgress {
-                recording: stats
-                    .recording
-                    .as_ref()
-                    .map(|file| crate::session::FinishedRecording {
-                        path: absolute_path(std::path::Path::new(&file.path)),
-                        bytes: file.bytes,
-                        started_ms: file.started_ms,
-                        ended_ms: file.ended_ms,
-                        encoder: file.encoder.clone(),
-                    }),
-                ..compact_forwarding(id, &stats)
-            });
             // A finished file is reported even when stopping reported an error.
             if let Some(file) = stats.recording.clone() {
                 let path = absolute_path(std::path::Path::new(&file.path));
@@ -1072,19 +1010,13 @@ fn end_forward(
         });
     }
     // Last: whoever sees the forward gone (a client waiting out a timed
-    // recording, say) finds its file finished and reported.
+    // recording, say) finds its file finished, saved and its job ended.
     let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
-    if let Some((level, message, tag)) = report(&stopped) {
+    if let Some((level, message)) = report(&stopped) {
         drop(s);
         h.events.log(level, &message);
         s = h.state.write().unwrap_or_else(|e| e.into_inner());
         push_log(&mut s, level, message);
-        if level == "error" {
-            s.last_error_tag = tag;
-        }
-    }
-    if let Some(progress) = final_progress {
-        s.forwarding_progress = Some(progress);
     }
     s.forwarding = None;
     s.forwarding_id = None;
@@ -1138,12 +1070,8 @@ fn finish_timed_forward_at(
     let length = crate::scheduling::format_duration(duration_ms);
     let _ = end_forward(h, forwarder, auto, Ended::Duration, None, |stopped| {
         Some(match stopped {
-            Ok(_) => ("info", format!("{what} finished after {length}"), None),
-            Err(e) => (
-                "error",
-                format!("{what} stopped after {length}: {e:#}"),
-                crate::types::error_tag(e),
-            ),
+            Ok(_) => ("info", format!("{what} finished after {length}")),
+            Err(e) => ("error", format!("{what} stopped after {length}: {e:#}")),
         })
     });
 }
@@ -1535,16 +1463,6 @@ fn process_plain(
         WorkerCommand::OptimizeNetwork { bytes_per_second } => {
             return optimize_network(h, camera, forwarder, auto, jobs, bytes_per_second);
         }
-        // The rollback checkpoint records each write; see `set_many`.
-        #[cfg(test)]
-        WorkerCommand::SetMany { values } => {
-            return set_many(h, camera, auto, &values, |_, _| Ok(()));
-        }
-        #[cfg(test)]
-        WorkerCommand::StopForward => {
-            let stats = stop_forward(h, forwarder, auto, Ended::Stopped)?;
-            return Ok(json!({"forwarding":null,"stats":stats}));
-        }
         WorkerCommand::Session(command) => command,
     };
     match command {
@@ -1653,10 +1571,6 @@ fn process_plain(
                 s.forwarding = Some(shown.clone());
                 s.forwarding_id = Some(forwarding_id.clone());
                 s.forwarding_job = job;
-                s.forwarding_progress = Some(ForwardingProgress {
-                    id: forwarding_id.clone(),
-                    ..ForwardingProgress::default()
-                });
                 s.forwarding_since_ms = Some(since_ms);
                 s.forwarding_until_ms = until_ms;
                 // `forwarding` keeps the requested output; this is the file it named.
@@ -1821,10 +1735,6 @@ fn process_plain(
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
                     .last_error = None;
-                h.state
-                    .write()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .forwarding_progress = None;
             }
             // A capture soon after takes the frame it opened with.
             scheduled_stream.rest_at = Some(Instant::now() + MEDIA_LINGER);
@@ -3568,13 +3478,10 @@ fn apply_stops(
             }
         } else if forwarding == Some(job) {
             let _ = end_forward(h, forwarder, auto, Ended::Stopped, None, |stopped| {
-                stopped.as_ref().err().map(|e| {
-                    (
-                        "error",
-                        format!("Recording stopped: {e:#}"),
-                        crate::types::error_tag(e),
-                    )
-                })
+                stopped
+                    .as_ref()
+                    .err()
+                    .map(|e| ("error", format!("Recording stopped: {e:#}")))
             });
         } else if auto_job == Some(job) {
             end_auto_job(h, JobStatus::Cancelled);
@@ -3995,12 +3902,11 @@ mod tests {
                 .is_some()
         );
         assert_eq!(calls.get(), 2);
-        assert_eq!(
+        // A replacement is told at once.
+        assert!(
             sampler
                 .sample(Some("replacement"), now + Duration::from_millis(251), stats)
-                .unwrap()
-                .id,
-            "replacement"
+                .is_some()
         );
         assert!(
             sampler
@@ -4008,11 +3914,9 @@ mod tests {
                 .is_none()
         );
         assert_eq!(calls.get(), 3);
-        let encoded = serde_json::to_string(&first).unwrap();
-        assert!(
-            !encoded.contains("encoder")
-                && !encoded.contains("error")
-                && !encoded.contains("recording")
+        assert_eq!(
+            first.event(Some("/clips/a.mkv".into())),
+            json!({"accepted":100,"written":91,"dropped":8,"late":7,"stalled":true,"path":"/clips/a.mkv"})
         );
     }
 
@@ -4142,7 +4046,7 @@ mod tests {
         assert!(paths[0].ends_with("rec-0001.mkv"), "{paths:?}");
         assert!(paths[1].ends_with("rec-0002.mkv"), "{paths:?}");
         for h in handles {
-            let _ = h.request(WorkerCommand::StopForward);
+            let _ = h.request(SessionCommand::Stop);
             h.shutdown();
         }
         let _ = std::fs::remove_dir_all(root);
@@ -4270,7 +4174,7 @@ mod tests {
             clock.anchor + Duration::from_secs(10),
         );
         assert!(forwarder.is_some());
-        run(&mut camera, &mut forwarder, WorkerCommand::StopForward).unwrap();
+        run(&mut camera, &mut forwarder, SessionCommand::Stop.into()).unwrap();
         h.shutdown();
     }
 
@@ -4318,19 +4222,18 @@ mod tests {
         let connect = || SessionCommand::connect("sim:0".into(), 100);
         run(&mut camera, &mut forwarder, connect().into()).unwrap();
         let hour = Some(3_600_000);
-        // Stop-forward, stop and disconnect each clear the end time.
+        // A stop of its job, stop and disconnect each clear the end time.
         for (name, stop) in [
-            ("stop-forward", WorkerCommand::StopForward),
-            ("stop", SessionCommand::Stop.into()),
-            ("disconnect", SessionCommand::Disconnect.into()),
+            ("stop-job", None),
+            ("stop", Some(SessionCommand::Stop)),
+            ("disconnect", Some(SessionCommand::Disconnect)),
         ] {
             let output = root.join(format!("{name}.mkv"));
-            let reply = run(
-                &mut camera,
-                &mut forwarder,
-                timed_forward(&output, hour).into(),
-            )
-            .unwrap();
+            let mut forward = timed_forward(&output, hour);
+            if let SessionCommand::Forward { job, .. } = &mut forward {
+                *job = Some(1);
+            }
+            let reply = run(&mut camera, &mut forwarder, forward.into()).unwrap();
             let since = reply["since_ms"].as_u64().unwrap();
             assert_eq!(reply["until_ms"].as_u64(), Some(since + 3_600_000));
             let snapshot = h.snapshot();
@@ -4339,7 +4242,15 @@ mod tests {
                 (Some(since), Some(since + 3_600_000)),
                 "{name}"
             );
-            run(&mut camera, &mut forwarder, stop).unwrap();
+            match stop {
+                Some(stop) => {
+                    run(&mut camera, &mut forwarder, stop.into()).unwrap();
+                }
+                None => {
+                    h.stop_job(1);
+                    apply_stops(&h, &mut camera, &mut forwarder, &mut None, &mut Vec::new());
+                }
+            }
             let snapshot = h.snapshot();
             assert!(forwarder.is_none(), "{name}");
             assert_eq!(
@@ -4366,7 +4277,7 @@ mod tests {
         assert_eq!(h.snapshot().forwarding_until_ms, None);
         finish_timed_forward(&h, &mut forwarder, &mut None, u64::MAX);
         assert!(forwarder.is_some(), "a forward without a duration runs on");
-        run(&mut camera, &mut forwarder, WorkerCommand::StopForward).unwrap();
+        run(&mut camera, &mut forwarder, SessionCommand::Stop.into()).unwrap();
         // At its end time the worker ends a timed forward as a stop does,
         // and says so in the step that clears it.
         let reply = run(
@@ -4437,7 +4348,7 @@ mod tests {
             snapshot.forwarding.as_deref(),
             Some(template.to_string_lossy().as_ref())
         );
-        run(&mut camera, &mut forwarder, WorkerCommand::StopForward).unwrap();
+        run(&mut camera, &mut forwarder, SessionCommand::Stop.into()).unwrap();
         assert_eq!(h.snapshot().recording_path, None);
         // A network forward names no file.
         let target = Path::new("udp://127.0.0.1:9");
@@ -4448,7 +4359,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(h.snapshot().recording_path, None);
-        run(&mut camera, &mut forwarder, WorkerCommand::StopForward).unwrap();
+        run(&mut camera, &mut forwarder, SessionCommand::Stop.into()).unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
     #[test]
@@ -4492,11 +4403,9 @@ mod tests {
             ended.logs
         );
         assert_eq!(ended.last_error, None);
-        // Nothing is left to stop.
-        assert_eq!(
-            h.request(WorkerCommand::StopForward).unwrap()["forwarding"],
-            Value::Null
-        );
+        // Nothing is left to stop: stopping saves no second file.
+        h.request(SessionCommand::Stop).unwrap();
+        assert!(h.take_saved().is_empty());
         h.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }

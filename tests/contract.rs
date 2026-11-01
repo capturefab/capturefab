@@ -799,7 +799,7 @@ fn schema_describes_every_command_and_its_results() {
     ] {
         assert!(codes.contains(code), "{code}");
     }
-    assert!(schema.to_string().len() < 9500, "the overview stays small");
+    assert!(schema.to_string().len() < 9000, "the overview stays small");
 }
 
 /// The top-level keys a command prints are the ones `schema COMMAND`

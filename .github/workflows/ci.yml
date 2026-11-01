@@ -31,9 +31,6 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
-      - uses: ./.github/actions/setup-ffmpeg
-        with:
-          runner-image: ubuntu-24.04
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
@@ -125,15 +122,13 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 10
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends nasm
-      - uses: ./.github/actions/setup-ffmpeg
-        with:
-          runner-image: ubuntu-24.04
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
       # Builds without optional features keep compiling, alone and with each one.
       - run: cargo check --locked --no-default-features
       - run: cargo check --locked --no-default-features --features usb
+      - run: cargo check --locked --no-default-features --features jpeg
       - run: cargo check --locked --no-default-features --features keychain
 
   site:

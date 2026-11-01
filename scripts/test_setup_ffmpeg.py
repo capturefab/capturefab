@@ -99,7 +99,7 @@ class FfmpegSetupTests(unittest.TestCase):
                 self.assertEqual((self.root / 'runtime call').read_text().strip(),
                                  '-hide_banner -version')
                 self.assertEqual((self.root / 'github env').read_text().splitlines()[-1],
-                                 f'CAPTUREFAB_FFMPEG_BINARY={self.root}/ffmpeg-bundle/bin/ffmpeg{suffix}')
+                                 f'CAPTUREFAB_FFMPEG={self.root}/ffmpeg-bundle/bin/ffmpeg{suffix}')
 
     def test_unusable_bundle_fails_before_exporting_it_to_cargo(self):
         for system, suffix in (('Linux', ''), ('macOS', ''), ('Windows', '.exe')):

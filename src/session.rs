@@ -313,16 +313,8 @@ pub enum SessionCommand {
         lease: bool,
     },
 }
-/// One feature assignment of `SetMany`.
-#[cfg(test)]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FeatureValue {
-    pub feature: String,
-    pub value: String,
-}
-/// Most values one `SetMany` or `SetValues` writes.
-pub const MAX_SET_MANY: usize = 32;
+/// Most values one `SetValues` writes.
+pub const MAX_SET_VALUES: usize = 32;
 /// Most names one `GetValues` reads.
 pub const MAX_NAMES: usize = 64;
 /// Deserialize JSON control messages without accepting ignored fields on
@@ -484,9 +476,9 @@ impl SessionCommand {
                 }
             }
             Self::SetValues { values, .. } => {
-                if !(1..=MAX_SET_MANY).contains(&values.len()) {
+                if !(1..=MAX_SET_VALUES).contains(&values.len()) {
                     return Err(crate::types::Usage(format!(
-                        "set writes 1..{MAX_SET_MANY} values at once"
+                        "set writes 1..{MAX_SET_VALUES} values at once"
                     ))
                     .into());
                 }
@@ -957,29 +949,6 @@ fn frames_lost(worker: &WorkerSnapshot) -> u64 {
         .map_or(0, |t| t.incomplete_frames + t.lost_frames);
     worker.dropped.saturating_add(transport)
 }
-/// Compact delivery counters for one exact recording or forward. Final
-/// counters remain visible after it stops; the next forward replaces them.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForwardingProgress {
-    pub id: String,
-    pub accepted: u64,
-    pub written: u64,
-    pub dropped: u64,
-    pub late: u64,
-    pub stalled: bool,
-    /// The finished local file, once a recording that wrote one stops.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recording: Option<FinishedRecording>,
-}
-/// Where a stopped recording's file is and how much it holds.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FinishedRecording {
-    pub path: String,
-    pub bytes: u64,
-    pub started_ms: u64,
-    pub ended_ms: u64,
-    pub encoder: String,
-}
 
 /// A camera worker's state, which its status request returns: its camera,
 /// stream and recording. Its log and jobs stay in the worker; jobs and log
@@ -995,9 +964,6 @@ pub struct WorkerSnapshot {
     pub dropped: u64,
     pub fps: f64,
     pub last_error: Option<String>,
-    /// The reason of `last_error`, when it had a typed one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_error_tag: Option<crate::types::ErrorTag>,
     /// The newest lines logged, and how many in all, for tests: log lines
     /// reach the coordinator as events.
     #[cfg(test)]
@@ -1014,8 +980,6 @@ pub struct WorkerSnapshot {
     /// The session job of the recording or forward.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarding_job: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub forwarding_progress: Option<ForwardingProgress>,
     /// The absolute file a local recording writes, with its template
     /// expanded; unset for network forwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3012,7 +2976,7 @@ mod tests {
         assert!(SessionCommand::from_json_slice(br#"{"op":"status"} {}"#).is_err());
     }
     #[test]
-    fn frame_and_set_many_have_strict_shapes_and_documented_defaults() {
+    fn frame_and_set_values_have_strict_shapes_and_documented_defaults() {
         let SessionCommand::Frame {
             fresh,
             timeout_ms,
@@ -3060,25 +3024,17 @@ mod tests {
                 "{invalid}"
             );
         }
-        let values = |count: usize| WorkerCommand::SetMany {
+        let values = |count: usize| SessionCommand::SetValues {
             values: (0..count)
-                .map(|i| FeatureValue {
-                    feature: if i % 2 == 0 {
-                        "BalanceRatioSelector"
-                    } else {
-                        "BalanceRatio"
-                    }
-                    .into(),
-                    value: i.to_string(),
-                })
+                .map(|i| crate::controls::Assignment::parse(&format!("Gain[Tap{i}]=1")).unwrap())
                 .collect(),
+            dry_run: false,
         };
-        // The same feature may repeat: selectors address several banks.
-        values(MAX_SET_MANY).validate().unwrap();
-        for invalid in [values(0), values(MAX_SET_MANY + 1)] {
+        values(MAX_SET_VALUES).validate().unwrap();
+        for invalid in [values(0), values(MAX_SET_VALUES + 1)] {
             assert_eq!(
                 invalid.validate().unwrap_err().to_string(),
-                "set_many takes 1..32 feature values"
+                "set writes 1..32 values at once"
             );
         }
     }

@@ -519,7 +519,7 @@ fn overview() -> Value {
         "contract_version": CONTRACT_VERSION,
         "commands": commands,
         "conventions": {
-            "json": "--json (or CAPTUREFAB_JSON=1): exactly one single-line document on stdout. Exit 0: the result. Non-zero: {\"error\":{code,message,hint?,details?}}; code is a specific reason (errors), the exit code its category. No null values; warnings ≤10",
+            "json": "--json (or CAPTUREFAB_JSON=1): one line on stdout, the result on exit 0, else {\"error\":{code,message,hint?,details?}}: code is the reason (see errors), the exit code its category. No nulls; warnings ≤10",
             "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION), --no-session (overrides it); before or after the command",
             "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
             "routing": "--session NAME, else a session holding the camera, else the auto session, open 60s after last use (--keep DUR); --keep 0 or --no-session: a worker of the command",
@@ -673,8 +673,8 @@ mod tests {
     fn the_overview_stays_small_and_lists_every_reason() {
         let overview = overview();
         let text = overview.to_string();
-        // About 9 KB, some 2.3k tokens at four characters a token.
-        assert!(text.len() < 9500, "{} bytes", text.len());
+        // Under 9 KB, some 2.2k tokens at four characters a token.
+        assert!(text.len() < 9000, "{} bytes", text.len());
         assert_eq!(
             overview["errors"].as_array().unwrap().len(),
             ErrorKind::ALL.len()
