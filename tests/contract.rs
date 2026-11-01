@@ -66,6 +66,18 @@ fn argument_errors_are_usage_documents_and_help_stays_text() {
     );
     let error = home.fails(2, &["list", "--kind", "usb"]);
     assert!(error["details"]["valid_values"].as_array().unwrap().len() >= 5);
+    // Missing pieces are named in the message itself.
+    let error = home.fails(2, &["get", "-c", "sim:0"]);
+    assert_eq!(error["message"], "missing required argument: <NAME>...");
+    let error = home.fails(2, &["--session", "bench", "preset"]);
+    assert_eq!(error["details"]["kind"], "missing_subcommand");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("capturefab preset needs a subcommand: save, list, show, apply, rm"),
+        "{error}"
+    );
     // Removed global flags and commands are argument errors now.
     for args in [
         &["--camera", "sim:0", "info"][..],
@@ -291,6 +303,23 @@ fn reasons_say_what_went_wrong_with_details() {
         home.fails(2, &["get", "-c", "sim:0", "Width[FrameStart]"])["code"],
         "usage"
     );
+    // A command has no value to read.
+    let command = home.fails(2, &["get", "-c", "sim:0", "TriggerSoftware"]);
+    assert!(
+        command["message"]
+            .as_str()
+            .unwrap()
+            .contains("run it with exec"),
+        "{command}"
+    );
+    // What was read before a camera failed goes with the error.
+    let partial = home.fails(3, &["get", "-c", "sim:0", "-c", "sim0", "Width"]);
+    assert_eq!(partial["code"], "camera_not_found");
+    assert_eq!(partial["details"]["cameras"][0]["camera"], "sim:0");
+    assert_eq!(partial["details"]["cameras"][0]["values"]["Width"], 640);
+    assert!(partial["details"]["candidates"].is_array());
+    let table = home.run(&["features", "-c", "sim:0", "--all"]).stdout;
+    assert!(!table.contains("null"), "{table}");
     assert!(!home.sessions.join("cameras").exists());
 }
 
@@ -355,21 +384,20 @@ fn set_is_one_atomic_change() {
     let _session = home.serve("atomic", &["sim:0"]);
     let on = |args: &[&str]| home.ok(&[&["--session", "atomic"][..], args].concat());
     let width = || on(&["get", "Width"])["values"]["Width"].clone();
-    // The second value fails when written: the first is put back.
-    let failed = home.fails(
-        2,
-        &["--session", "atomic", "set", "Width=128", "Height=5000"],
-    );
-    assert_eq!(failed["code"], "out_of_range");
-    assert_eq!(failed["details"]["rollback"]["restored"], json!(["Width"]));
-    assert_eq!(failed["details"]["rollback"]["failed"], json!([]));
-    assert!(
-        failed["message"]
-            .as_str()
-            .unwrap()
-            .ends_with("every value written was restored"),
-        "{failed}"
-    );
+    // A value no other write of the change can bring into range fails
+    // before anything is written, and a dry run says so too.
+    for dry_run in [&[][..], &["--dry-run"]] {
+        let failed = home.fails(
+            2,
+            &[
+                &["--session", "atomic", "set", "Width=128", "Height=5000"][..],
+                dry_run,
+            ]
+            .concat(),
+        );
+        assert_eq!(failed["code"], "out_of_range", "{failed}");
+        assert_eq!(failed["details"]["max"], 1080.0, "{failed}");
+    }
     assert_eq!(width(), 640);
     // A dry run checks and plans, and writes nothing.
     let plan = on(&["set", "Width=256", "exposure=2ms", "--dry-run"]);
@@ -401,6 +429,18 @@ fn set_is_one_atomic_change() {
     );
     assert_eq!(locked["code"], "feature_locked");
     assert_eq!(locked["details"]["locked_by"], "ExposureAuto");
+    let planned = home.fails(
+        1,
+        &[
+            "--session",
+            "atomic",
+            "set",
+            "ExposureAuto=Once",
+            "ExposureTime=4000",
+            "--dry-run",
+        ],
+    );
+    assert_eq!(planned["code"], "feature_locked");
     assert_eq!(
         on(&["get", "ExposureTime"])["values"]["ExposureTime"],
         3000.0
@@ -452,6 +492,67 @@ fn sessions_are_used_when_they_hold_the_camera() {
 }
 
 #[test]
+fn session_commands_act_only_on_the_camera_named() {
+    let home = Home::new("named-target");
+    let _bench = home.serve("bench", &["sim:0"]);
+    // A camera the session does not hold is refused, not swapped for its
+    // only one.
+    for command in [&["disconnect"][..], &["stop"], &["status"], &["jobs"]] {
+        let error = home.fails(
+            3,
+            &[&["--session", "bench"][..], command, &["-c", "sim:9"]].concat(),
+        );
+        assert_eq!(error["code"], "camera_not_found", "{command:?}");
+        assert_eq!(error["details"]["candidates"][0]["id"], "sim:0");
+    }
+    let status = home.ok(&["--session", "bench", "status"]);
+    assert_eq!(status["cameras"][0]["info"]["id"], "sim:0");
+    home.ok(&["--session", "bench", "disconnect", "-c", "sim:0"]);
+    // With none left, a command for the only camera has none to act on.
+    let none = home.fails(3, &["--session", "bench", "stop"]);
+    assert_eq!(none["code"], "camera_not_found");
+}
+
+#[test]
+fn an_environment_session_yields_to_no_session_and_binary_stdout() {
+    let home = Home::new("env-session");
+    let _first = home.serve("first", &[]);
+    let env = [("CAPTUREFAB_SESSION", "first")];
+    // --no-session overrides CAPTUREFAB_SESSION; the session stays empty.
+    let run = home.run_env(
+        &env,
+        &["--json", "--no-session", "get", "-c", "sim:env", "Width"],
+    );
+    assert_eq!(run.success()["values"]["Width"], 640);
+    let run = home.run_env(&env, &["--json", "status"]);
+    assert!(run.success()["cameras"].as_array().unwrap().is_empty());
+    // Both typed is a contradiction.
+    let error = home.fails(2, &["--session", "first", "--no-session", "list"]);
+    assert_eq!(error["code"], "usage");
+    // Binary stdout comes from a worker of this command.
+    let run = home.run_env(
+        &env,
+        &[
+            "capture",
+            "-c",
+            "sim:stdout",
+            "-o",
+            "-",
+            "--format",
+            "raw",
+            "--set",
+            "Width=64",
+            "--set",
+            "Height=64",
+        ],
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    assert_eq!(run.raw.len(), 4096);
+    let run = home.run_env(&env, &["--json", "status"]);
+    assert!(run.success()["cameras"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn debug_rpc_takes_public_commands_only() {
     let home = Home::new("rpc");
     for request in [
@@ -459,6 +560,9 @@ fn debug_rpc_takes_public_commands_only() {
         r#"{"op":"status","op":"start"}"#,
         r#"{"op":"grab","timeout_ms":100}"#,
         r#"{"op":"optimize_network","bytes_per_second":1000}"#,
+        r#"{"op":"set","feature":"Width","value":"320"}"#,
+        r#"{"op":"features"}"#,
+        r#"{"op":"discover","timeout_ms":100,"simulated":true}"#,
     ] {
         let run = home.run_stdin(request, &["--json", "--session", "missing", "debug", "rpc"]);
         assert_eq!(run.failure(2)["code"], "usage", "{request}");
@@ -575,6 +679,7 @@ fn results_carry_only_documented_keys() {
             "preset export",
             &["preset", "export", "bench", "-o", preset],
         ),
+        ("preset export", &["preset", "export", "bench"]),
         ("preset rm", &["preset", "rm", "bench"]),
         ("preset import", &["preset", "import", preset]),
         ("login list", &["login", "list"]),
@@ -582,6 +687,7 @@ fn results_carry_only_documented_keys() {
         ("licenses", &["licenses"]),
         ("schema", &["schema"]),
         ("network", &["network", "--timeout", "100ms"]),
+        ("completions", &["completions", "zsh"]),
         ("debug xml", &["debug", "xml", "-c", "sim:0"]),
         ("debug read", &["debug", "read", "-c", "sim:0", "0x100"]),
     ];
@@ -589,13 +695,58 @@ fn results_carry_only_documented_keys() {
         let result = home.ok(args);
         let words = command.split(' ').collect::<Vec<_>>();
         let documented = home.ok(&[&["schema"][..], &words].concat())["result"].clone();
-        for key in result.as_object().unwrap().keys() {
-            assert!(
-                documented.get(key).is_some(),
-                "{command}: {key} is not in schema {command}"
-            );
+        for (key, value) in result.as_object().unwrap() {
+            let Some(meaning) = documented.get(key) else {
+                panic!("{command}: {key} is not in schema {command}");
+            };
+            // Rows: every key of every row is named in `[{a,b?,c:…}]`.
+            let meaning = meaning.as_str().unwrap();
+            let (Some(row), Some(rows)) = (meaning.strip_prefix("[{"), value.as_array()) else {
+                continue;
+            };
+            let names = row_keys(row);
+            for row in rows.iter().filter_map(Value::as_object) {
+                for field in row.keys() {
+                    assert!(
+                        names.contains(field.as_str()),
+                        "{command}: {key}[].{field} is not in {meaning}"
+                    );
+                }
+            }
         }
     }
+}
+
+/// The field names of a documented row, `a,b?,c:{x,y},d:x|y}]`, leaving
+/// nested shapes out.
+fn row_keys(row: &str) -> BTreeSet<&str> {
+    let mut names = BTreeSet::new();
+    let (mut depth, mut start, mut naming) = (0, 0, true);
+    for (index, c) in row.char_indices() {
+        match c {
+            '{' | '[' => depth += 1,
+            '}' | ']' if depth == 0 => {
+                if naming {
+                    names.insert(&row[start..index]);
+                }
+                break;
+            }
+            '}' | ']' => depth -= 1,
+            ':' | '?' if depth == 0 && naming => {
+                names.insert(&row[start..index]);
+                naming = false;
+            }
+            ',' if depth == 0 => {
+                if naming {
+                    names.insert(&row[start..index]);
+                }
+                start = index + 1;
+                naming = true;
+            }
+            _ => {}
+        }
+    }
+    names.into_iter().map(str::trim).collect()
 }
 
 #[test]
@@ -608,6 +759,10 @@ fn every_new_command_shows_examples() {
         &["get"],
         &["set"],
         &["exec"],
+        &["preset"],
+        &["login"],
+        &["onvif"],
+        &["debug"],
         &["preset", "save"],
         &["preset", "list"],
         &["preset", "show"],
@@ -670,7 +825,8 @@ fn presets_save_preview_and_restore() {
     let saved = rate();
     on(&["set", "AcquisitionLineRate=500"]);
     // A taken name is refused before any camera is read.
-    let taken = home.fails(2, &["preset", "save", "line", "-c", "gige:192.0.2.1"]);
+    let taken = home.fails(1, &["preset", "save", "line", "-c", "gige:192.0.2.1"]);
+    assert_eq!(taken["code"], "exists", "{taken}");
     assert!(
         taken["message"].as_str().unwrap().contains("--replace"),
         "{taken}"
@@ -707,6 +863,13 @@ fn presets_save_preview_and_restore() {
     );
     on(&["preset", "rm", "line"]);
     assert_eq!(on(&["preset", "import", file])["preset"]["name"], "line");
+    let taken = home.fails(1, &["preset", "import", file]);
+    assert_eq!(taken["code"], "exists", "{taken}");
+    assert!(taken["details"]["path"].is_string(), "{taken}");
+    // Without -o, export prints the document itself.
+    let exported = home.ok(&["preset", "export", "line"]);
+    assert_eq!(exported["name"], "line");
+    assert!(exported["values"].is_array());
     // A value this camera lacks: strict refuses, before and during apply.
     let mut document: Value =
         serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
@@ -740,6 +903,62 @@ fn presets_save_preview_and_restore() {
 }
 
 #[test]
+fn preset_apply_refuses_before_changing_and_keeps_reasons() {
+    let home = Home::new("preset-reasons");
+    let _session = home.serve("reasons", &["sim:0"]);
+    let on = |args: &[&str]| home.ok(&[&["--session", "reasons"][..], args].concat());
+    on(&["preset", "save", "p1"]);
+    on(&["set", "ExposureTime=2000", "Gain=5"]);
+    // The simulator has no user sets: --persist is refused up front, in a
+    // dry run too, and nothing changes.
+    for flags in [&["--dry-run"][..], &[]] {
+        let error = home.fails(
+            5,
+            &[
+                &["--session", "reasons", "preset", "apply", "p1", "--persist"][..],
+                flags,
+            ]
+            .concat(),
+        );
+        assert_eq!(error["code"], "unsupported", "{error}");
+    }
+    assert_eq!(
+        on(&["get", "ExposureTime"])["values"]["ExposureTime"],
+        2000.0
+    );
+    // A saved value that does not fit fails with its own reason, and what
+    // was written is put back.
+    let mut document = on(&["preset", "show", "p1"]);
+    for value in document["values"].as_array_mut().unwrap() {
+        if value["feature"] == "Height" {
+            value["value"] = json!(5000);
+        }
+    }
+    let file = home.path("bad.json");
+    std::fs::write(&file, serde_json::to_vec(&document).unwrap()).unwrap();
+    let error = home.fails(
+        2,
+        &[
+            "--session",
+            "reasons",
+            "preset",
+            "apply",
+            "--file",
+            file.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(error["code"], "out_of_range", "{error}");
+    assert!(
+        error["details"]["rollback"]["restored"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("Gain")),
+        "{error}"
+    );
+    assert_eq!(on(&["get", "Gain"])["values"]["Gain"], 5.0);
+}
+
+#[test]
 fn doctor_and_licenses() {
     let home = Home::new("doctor");
     let doctor = home.ok(&["doctor"]);
@@ -765,6 +984,24 @@ fn doctor_and_licenses() {
         Some(cfg!(feature = "keychain"))
     );
     assert!(doctor["ffmpeg"]["source"].is_string() || doctor["ffmpeg"]["error"].is_string());
+    assert!(checks.iter().all(|check| check["name"] != "leftover_state"));
+    // Files version 0.5 left behind, with the command that removes them.
+    std::fs::create_dir_all(home.sessions.join("assistant")).unwrap();
+    std::fs::write(home.sessions.join("gui.prefs.json"), "{}").unwrap();
+    let doctor = home.ok(&["doctor"]);
+    let leftovers = doctor["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "leftover_state")
+        .cloned()
+        .unwrap_or_else(|| panic!("{doctor}"));
+    assert_eq!(leftovers["status"], "warn");
+    let fix = leftovers["fix"].as_str().unwrap();
+    assert!(
+        fix.contains("gui.prefs.json") && fix.contains("assistant"),
+        "{fix}"
+    );
     let missing = home.path("missing-ffmpeg");
     let broken = home
         .run_env(
@@ -917,6 +1154,12 @@ fn network_is_read_only_unless_asked_to_tune() {
     assert!(scan["time"].is_string());
     assert!(scan.get("scanned_at_ms").is_none());
     assert_eq!(home.fails(2, &["network", "-c", "sim:0"])["code"], "usage");
+    // CAPTUREFAB_CAMERA is for camera commands; the checks stay read-only.
+    let run = home.run_env(
+        &[("CAPTUREFAB_CAMERA", "sim:0")],
+        &["--json", "network", "--timeout", "100ms"],
+    );
+    assert!(run.success()["interfaces"].is_array());
     let text = home.run(&["network", "--timeout", "100ms"]);
     assert_eq!(text.code, Some(0));
 }
@@ -930,6 +1173,70 @@ fn unreachable_cameras_say_what_to_try() {
     assert!(
         message.contains("127.0.0.1") && message.contains("sim:0"),
         "{message}"
+    );
+    // ONVIF hosts that do not resolve or refuse are unavailable too.
+    for host in ["nonexistent.invalid", "127.0.0.1:1"] {
+        let error = home.fails(3, &["onvif", "resolve", host, "--timeout", "2s"]);
+        assert_eq!(error["code"], "unavailable", "{host}: {error}");
+    }
+    // A capture to an external drive that is not mounted.
+    if cfg!(target_os = "macos") {
+        let error = home.fails(
+            3,
+            &[
+                "capture",
+                "-c",
+                "sim:0",
+                "-o",
+                "/Volumes/capturefab-missing-4f1c/x.png",
+            ],
+        );
+        assert_eq!(error["code"], "unavailable", "{error}");
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_file_describes_itself_as_a_file() {
+    let home = Home::new("file-info");
+    let clip = home.path("clip.mkv");
+    let ffmpeg = std::env::var("CAPTUREFAB_FFMPEG").unwrap_or_else(|_| "ffmpeg".into());
+    let made = std::process::Command::new(ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x48:rate=5",
+        ])
+        .args(["-frames:v", "3"])
+        .arg(&clip)
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let info = home.ok(&["--no-session", "info", "-c", "clip.mkv"]);
+    assert_eq!(info["kind"], "file", "{info}");
+    assert_eq!(info["pixel_format"], "RGB8", "{info}");
+    assert_eq!(info["bits"], 8, "{info}");
+    assert_eq!(info["controls"]["format"]["value"], "RGB8", "{info}");
+    let values = home.ok(&["--no-session", "get", "-c", "clip.mkv", "format"]);
+    assert_eq!(values["values"]["format"], "RGB8");
+    let error = home.fails(
+        5,
+        &["--no-session", "set", "-c", "clip.mkv", "exposure=5ms"],
+    );
+    assert_eq!(error["code"], "unsupported");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("a file via FFmpeg"),
+        "{error}"
     );
 }
 

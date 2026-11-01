@@ -462,12 +462,12 @@ fn resolve(camera: &mut Camera, name: &Name) -> Result<Target> {
 
 /// Why a control is missing on this camera, for exit 5.
 fn unsupported(camera: &Camera, control: &str, what: &str) -> anyhow::Error {
-    let source = match camera.info.transport {
-        Transport::Media if crate::onvif::is_source(&camera.info.id) => {
-            "an ONVIF stream via FFmpeg"
-        }
-        Transport::Media if crate::media::is_host_camera(&camera.info.id) => "a webcam via FFmpeg",
-        Transport::Media => "a stream or file via FFmpeg",
+    let source = match (camera.info.transport, crate::camera::kind(&camera.info)) {
+        (Transport::Media, "onvif") => "an ONVIF stream via FFmpeg",
+        (Transport::Media, "webcam") => "a webcam via FFmpeg",
+        (Transport::Media, "screen") => "a screen capture via FFmpeg",
+        (Transport::Media, "stream") => "a stream via FFmpeg",
+        (Transport::Media, _) => "a file via FFmpeg",
         _ => camera.info.model.as_str(),
     };
     Categorized::new(
@@ -841,6 +841,32 @@ fn plan(camera: &mut Camera, values: &[Assignment]) -> Result<Vec<Write>> {
             });
         }
     }
+    // A feature named without a bank is written at the bank in effect where
+    // the command names it: the selector value an earlier assignment sets,
+    // else the current one. Its `from`, the unchanged check and the check
+    // for a feature set twice then all read the bank it really writes.
+    for index in 0..writes.len() {
+        if !writes[index].target.bank.is_empty() {
+            continue;
+        }
+        let feature = writes[index].target.feature.clone();
+        let mut bank = Vec::new();
+        for selector in real_selectors(camera, &feature) {
+            let earlier = writes[..index]
+                .iter()
+                .rev()
+                .find(|earlier| earlier.target.feature == selector)
+                .map(|earlier| earlier.value.clone());
+            match earlier.or_else(|| camera.get(&selector).ok().map(|value| text(&value))) {
+                Some(value) => bank.push((selector, value)),
+                None => {
+                    bank.clear();
+                    break;
+                }
+            }
+        }
+        writes[index].target.bank = bank;
+    }
     // The same feature at the same bank twice is a mistake, except the
     // offsets an ROI moves out of the way and back.
     for (index, write) in writes.iter().enumerate() {
@@ -895,6 +921,15 @@ fn plan(camera: &mut Camera, values: &[Assignment]) -> Result<Vec<Write>> {
     });
     order(camera, &mut writes);
     Ok(writes)
+}
+
+/// The features `values` would write, in order, autos switched off to
+/// unlock a value included.
+pub(crate) fn written(camera: &mut Camera, values: &[Assignment]) -> Result<Vec<String>> {
+    Ok(plan(camera, values)?
+        .into_iter()
+        .map(|write| write.target.feature)
+        .collect())
 }
 
 fn order(camera: &mut Camera, writes: &mut Vec<Write>) {
@@ -1015,10 +1050,123 @@ fn wanted_json(current: Option<&Value>, wanted: &str) -> Value {
     }
 }
 
+/// Whether earlier writes of a change unlock a feature that is locked now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Unlock {
+    No,
+    /// A write that can unlock it, to a value whose effect only writing
+    /// shows.
+    Maybe,
+    /// Its auto switched off.
+    Yes,
+}
+
+fn unlock(camera: &Camera, feature: &str, earlier: &[Write]) -> Unlock {
+    earlier
+        .iter()
+        .filter(|other| {
+            other.target.feature != feature
+                && camera.lock_released_by(feature, &[&other.target.feature])
+        })
+        .map(|other| {
+            if !other.target.feature.ends_with("Auto") {
+                Unlock::Maybe
+            } else if matches!(
+                other.value.trim().to_ascii_lowercase().as_str(),
+                "off" | "false" | "0"
+            ) {
+                Unlock::Yes
+            } else {
+                Unlock::No
+            }
+        })
+        .max()
+        .unwrap_or(Unlock::No)
+}
+
+/// Whether an earlier write of the change can move this feature's range:
+/// the image geometry, or exposure and frame rate, which bound each other.
+fn range_moved(feature: &str, earlier: &[Write]) -> bool {
+    let any = |names: &[&str]| {
+        earlier
+            .iter()
+            .any(|other| names.contains(&other.target.feature.as_str()))
+    };
+    (COUPLED.contains(&feature) && any(&COUPLED))
+        || (EXPOSURE.contains(&feature) && any(&FRAME_RATE))
+        || (FRAME_RATE.contains(&feature) && any(&EXPOSURE))
+}
+
+/// The most a geometry value can be whatever else the change writes: the
+/// sensor size, else WidthMax/HeightMax unless the change bins or decimates
+/// that axis, else a maximum the XML fixes.
+fn outer_max(camera: &mut Camera, feature: &str, earlier: &[Write]) -> Option<f64> {
+    let mut read = |name: &str| {
+        camera
+            .has(name)
+            .then(|| camera.get(name).ok()?.as_f64())
+            .flatten()
+    };
+    let axis = match feature {
+        "Width" | "OffsetX" => Some(("SensorWidth", "WidthMax", "Horizontal")),
+        "Height" | "OffsetY" => Some(("SensorHeight", "HeightMax", "Vertical")),
+        _ => None,
+    };
+    if let Some((sensor, max, axis)) = axis {
+        if let Some(sensor) = read(sensor) {
+            return Some(sensor);
+        }
+        let scaled = earlier.iter().any(|other| {
+            let other = other.target.feature.as_str();
+            other.ends_with(axis)
+                && (other.starts_with("Binning") || other.starts_with("Decimation"))
+        });
+        if !scaled && let Some(max) = read(max) {
+            return Some(max);
+        }
+    }
+    camera.static_max(feature)
+}
+
+fn out_of_range(named: &str, value: &str, min: Option<f64>, max: Option<f64>) -> anyhow::Error {
+    let limit = match (min, max) {
+        (Some(min), Some(max)) => format!("{}..{}", number_text(min), number_text(max)),
+        (Some(min), None) => format!("at least {}", number_text(min)),
+        (None, Some(max)) => format!("at most {}", number_text(max)),
+        (None, None) => String::new(),
+    };
+    Categorized::new(
+        ErrorKind::OutOfRange,
+        format!("{named} cannot be {value}: it takes {limit}"),
+    )
+    .details(json!({"feature": named, "value": value, "min": min, "max": max}))
+    .into()
+}
+
+/// A value inside the feature's current range, checked without the lock
+/// that an earlier write of the change releases.
+fn within_range(camera: &mut Camera, named: &str, feature: &str, value: &str) -> Result<()> {
+    let Ok(number) = value.trim().parse::<f64>() else {
+        return Ok(());
+    };
+    let bounds = camera.bounds(feature).unwrap_or_default();
+    if bounds.min.is_some_and(|min| number < min) || bounds.max.is_some_and(|max| number > max) {
+        return Err(out_of_range(named, value, bounds.min, bounds.max));
+    }
+    Ok(())
+}
+
 /// Check a write against the live node map without writing: the feature is
 /// writable now (or the change unlocks it first), and the value is in range
-/// or one of the choices. `earlier` are the writes before it.
-fn check(camera: &mut Camera, write: &Write, earlier: &[Write], streaming: bool) -> Result<()> {
+/// or one of the choices. `earlier` are the writes before it. A check that
+/// only the writes before it can decide is a warning: `set` checks again as
+/// it writes.
+fn check(
+    camera: &mut Camera,
+    write: &Write,
+    earlier: &[Write],
+    streaming: bool,
+) -> Result<Option<String>> {
     let feature = write.target.feature.as_str();
     let named = write.target.key(camera);
     if camera.static_access(feature) == "ro" {
@@ -1040,44 +1188,53 @@ fn check(camera: &mut Camera, write: &Write, earlier: &[Write], streaming: bool)
         .details(json!({"feature": named}))
         .into());
     }
-    let unlocked_earlier = earlier.iter().any(|other| {
-        other.target.feature != feature
-            && camera.lock_released_by(feature, &[&other.target.feature])
-    });
-    let coupled = COUPLED.contains(&feature)
-        && earlier
-            .iter()
-            .any(|other| COUPLED.contains(&other.target.feature.as_str()));
+    let unlock = unlock(camera, feature, earlier);
     let value = write.value.clone();
     let checked = with_bank(camera, &write.target.bank, |camera| {
-        if !unlocked_earlier && camera.is_locked(feature) {
-            let owner = camera.lock_owner(feature);
-            let mut locked =
-                Categorized::new(ErrorKind::FeatureLocked, format!("{named} is locked"))
-                    .details(json!({"feature": named, "locked_by": owner}));
-            if let Some(owner) = &owner {
-                locked = locked.hint(format!(
-                    "set {owner} in the same command so it unlocks {feature} first"
-                ));
+        if camera.is_locked(feature) {
+            match unlock {
+                Unlock::No => {
+                    let owner = camera.lock_owner(feature);
+                    let mut locked =
+                        Categorized::new(ErrorKind::FeatureLocked, format!("{named} is locked"))
+                            .details(json!({"feature": named, "locked_by": owner}));
+                    if let Some(owner) = &owner {
+                        locked = locked.hint(format!(
+                            "set {owner} to Off in the same command so it unlocks {feature} first"
+                        ));
+                    }
+                    return Err(locked.into());
+                }
+                Unlock::Maybe => {
+                    return Ok(Some(format!(
+                        "{named} is locked now; set checks {value} once the writes before it run"
+                    )));
+                }
+                Unlock::Yes => return within_range(camera, &named, feature, &value).map(|()| None),
             }
-            return Err(locked.into());
         }
-        camera.validate_set(feature, &value)
+        camera.validate_set(feature, &value).map(|()| None)
     });
     match checked {
-        Ok(()) => Ok(()),
-        // Another write of this change may move these bounds or unlock it;
-        // the write itself checks again.
         Err(error)
-            if (coupled || unlocked_earlier)
-                && matches!(
-                    crate::types::classify(&error).kind,
-                    ErrorKind::OutOfRange | ErrorKind::FeatureLocked
-                ) =>
+            if range_moved(feature, earlier)
+                && crate::types::classify(&error).kind == ErrorKind::OutOfRange =>
         {
-            Ok(())
+            // Another write of this change may move these bounds; the
+            // write itself checks again. A value past what no write can
+            // move fails now.
+            if let Ok(number) = value.trim().parse::<f64>()
+                && let Some(max) = outer_max(camera, feature, earlier)
+                && number > max
+            {
+                return Err(out_of_range(&named, &value, None, Some(max)));
+            }
+            Ok(Some(format!(
+                "{named}={value} is outside its current range; set checks it again after the writes before it"
+            )))
         }
         Err(error) => Err(with_unit(camera, feature, error)),
+        checked => checked,
     }
 }
 
@@ -1118,6 +1275,8 @@ pub struct SetResult {
     pub plan: Option<Vec<Change>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub dry_run: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 impl SetResult {
     /// Top-level keys and what they mean, for `schema set`.
@@ -1132,6 +1291,10 @@ impl SetResult {
             "[{name,from,to}] — with --dry-run: the writes in order, none made",
         ),
         ("dry_run", "true — with --dry-run"),
+        (
+            "warnings",
+            "[string] — with --dry-run: checks only the writes themselves can decide (a value another write of the change may unlock or bring into range)",
+        ),
     ];
 }
 
@@ -1143,8 +1306,9 @@ pub(crate) fn set(camera: &mut Camera, values: &[Assignment], dry_run: bool) -> 
     let streaming = camera.is_streaming();
     let mut rows = Vec::with_capacity(writes.len());
     let mut pending = Vec::with_capacity(writes.len());
+    let mut warnings = Vec::new();
     for (index, write) in writes.iter().enumerate() {
-        check(camera, write, &writes[..index], streaming)?;
+        warnings.extend(check(camera, write, &writes[..index], streaming)?);
         let from = write.target.read(camera).ok();
         // A write that changes nothing is left out, unless an earlier write
         // of the change may move it (an offset that returns to its value).
@@ -1171,6 +1335,7 @@ pub(crate) fn set(camera: &mut Camera, values: &[Assignment], dry_run: bool) -> 
             changed: None,
             plan: Some(rows),
             dry_run: true,
+            warnings,
         });
     }
     let mut written: Vec<(Target, Value)> = Vec::new();
@@ -1209,6 +1374,7 @@ pub(crate) fn set(camera: &mut Camera, values: &[Assignment], dry_run: bool) -> 
         changed: Some(changed),
         plan: None,
         dry_run: false,
+        warnings: Vec::new(),
     })
 }
 
@@ -1262,6 +1428,9 @@ pub(crate) fn get(camera: &mut Camera, names: &[Name]) -> Result<serde_json::Map
             continue;
         }
         let target = resolve(camera, name)?;
+        if camera.node_kind(&target.feature) == Some("Command") {
+            return Err(usage(format!("{name} is a command; run it with exec")));
+        }
         let value = target
             .read(camera)
             .with_context(|| format!("read {name}"))?;
@@ -1304,7 +1473,7 @@ fn control_value(camera: &mut Camera, control: &str) -> Result<Value> {
             if !camera.has("PixelFormat") {
                 return Err(unsupported(camera, control, "pixel format"));
             }
-            camera.get("PixelFormat")?
+            json!(pixel_format(camera)?)
         }
         "roi" => {
             let mut part = |feature: &str| -> Result<i64> {
@@ -1536,8 +1705,30 @@ fn string(camera: &mut Camera, names: &[&str]) -> Option<String> {
     })
 }
 
+/// PixelFormat by its PFNC name, also where the node is an integer PFNC
+/// code (FFmpeg sources); a code without a name reads as hex.
+fn pixel_format(camera: &mut Camera) -> Result<String> {
+    Ok(match camera.get("PixelFormat")? {
+        Value::Number(code) => {
+            let code = code
+                .as_u64()
+                .and_then(|code| u32::try_from(code).ok())
+                .context("PixelFormat is not a PFNC code")?;
+            match crate::frame::pixel_format_name(code) {
+                "Unknown" => format!("0x{code:08x}"),
+                name => name.to_owned(),
+            }
+        }
+        value => text(&value),
+    })
+}
+
 /// Bits per sample of a PFNC pixel format name: Mono12p is 12, RGB8 is 8.
+/// None for a hex code.
 pub(crate) fn bits(pixel_format: &str) -> Option<u32> {
+    if pixel_format.starts_with("0x") {
+        return None;
+    }
     let digits = pixel_format
         .trim_end_matches(|c: char| c.is_ascii_alphabetic())
         .chars()
@@ -1548,7 +1739,11 @@ pub(crate) fn bits(pixel_format: &str) -> Option<u32> {
 }
 
 pub(crate) fn info(camera: &mut Camera) -> Info {
-    let pixel_format = string(camera, &["PixelFormat"]);
+    let pixel_format = camera
+        .has("PixelFormat")
+        .then(|| pixel_format(camera).ok())
+        .flatten()
+        .filter(|format| !format.trim().is_empty());
     let exposure = first_present(camera, &EXPOSURE);
     let exposure_us = exposure.and_then(|feature| {
         let unit = camera.feature_unit(feature).unwrap_or("us").to_owned();
@@ -2032,6 +2227,132 @@ mod tests {
         );
         let error = set(&mut camera, &[assign("PayloadSize=5")], false).unwrap_err();
         assert_eq!(crate::types::classify(&error).kind, ErrorKind::NotWritable);
+    }
+
+    /// Width with a fixed maximum, and Height whose maximum a register
+    /// the XML does not name sets, as on cameras where it follows other
+    /// settings.
+    const GEOMETRY: &str = r#"<Integer Name="Width"><pValue>WidthReg</pValue><Min>16</Min><Max>1920</Max></Integer><IntReg Name="WidthReg"><Address>0x64</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Integer Name="Height"><pValue>HeightReg</pValue><Min>16</Min><pMax>HeightLimit</pMax></Integer><IntReg Name="HeightReg"><Address>0x68</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><IntReg Name="HeightLimit"><Address>0x6c</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
+
+    #[test]
+    fn a_value_only_the_writes_can_check_is_a_warning_then_rolled_back() {
+        use crate::camera::tests::{Device, device_camera};
+        let device = Device::new(GEOMETRY)
+            .with(0x64, 640)
+            .with(0x68, 480)
+            .with(0x6c, 480);
+        let mut camera = device_camera(device);
+        let values = [assign("Width=128"), assign("Height=1000")];
+        // Width may move Height's maximum, so a dry run cannot decide it.
+        let plan = set(&mut camera, &values, true).unwrap();
+        assert_eq!(plan.plan.unwrap().len(), 2);
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        assert!(
+            plan.warnings[0].starts_with("Height=1000"),
+            "{:?}",
+            plan.warnings
+        );
+        // Writing shows it does not fit: Width is put back.
+        let error = set(&mut camera, &values, false).unwrap_err();
+        let classified = crate::types::classify(&error);
+        assert_eq!(classified.kind, ErrorKind::OutOfRange);
+        assert_eq!(
+            classified.details.unwrap()["rollback"],
+            json!({"restored":["Width"],"failed":[]})
+        );
+        assert_eq!(camera.get("Width").unwrap(), 640);
+        // Past a maximum the XML fixes, it fails before writing.
+        let error = set(
+            &mut camera,
+            &[assign("Height=100"), assign("Width=5000")],
+            true,
+        )
+        .unwrap_err();
+        let details = crate::types::classify(&error).details.unwrap();
+        assert_eq!(details["max"], 1920.0);
+        assert!(details.get("rollback").is_none());
+    }
+
+    #[test]
+    fn a_feature_without_a_bank_is_written_at_the_bank_selected_before_it() {
+        let mut camera = sim();
+        set(&mut camera, &[assign("TriggerMode[FrameStart]=On")], false).unwrap();
+        set(
+            &mut camera,
+            &[assign("TriggerSelector=AcquisitionStart")],
+            false,
+        )
+        .unwrap();
+        let changed = set(
+            &mut camera,
+            &[
+                assign("TriggerSelector=FrameStart"),
+                assign("TriggerMode=Off"),
+            ],
+            false,
+        )
+        .unwrap()
+        .changed
+        .unwrap();
+        let names = changed.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["TriggerMode[FrameStart]", "TriggerSelector"]);
+        let read = |camera: &mut Camera, name: &str| {
+            get(camera, &[Name::parse(name).unwrap()]).unwrap()[name].clone()
+        };
+        assert_eq!(read(&mut camera, "TriggerMode[FrameStart]"), "Off");
+        assert_eq!(read(&mut camera, "TriggerSelector"), "FrameStart");
+        // The same register named twice, with and without its bank.
+        let error = set(
+            &mut camera,
+            &[
+                assign("TriggerMode=On"),
+                assign("TriggerMode[FrameStart]=Off"),
+            ],
+            true,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("set twice"), "{error:#}");
+    }
+
+    #[test]
+    fn a_dry_run_refuses_what_the_change_would_refuse() {
+        let mut camera = sim();
+        // An auto left on keeps the value it drives locked.
+        camera.set("ExposureAuto", "Once").unwrap();
+        let error = set(
+            &mut camera,
+            &[assign("ExposureAuto=Once"), assign("ExposureTime=3000")],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).kind,
+            ErrorKind::FeatureLocked
+        );
+        // Switched off in the same change, the value is checked in full.
+        let error = set(
+            &mut camera,
+            &[assign("ExposureAuto=Off"), assign("ExposureTime=5000000")],
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(crate::types::classify(&error).kind, ErrorKind::OutOfRange);
+        let plan = set(
+            &mut camera,
+            &[assign("ExposureAuto=Off"), assign("ExposureTime=3000")],
+            true,
+        )
+        .unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        // Geometry beyond what any write of the change can allow.
+        camera.set("ExposureAuto", "Off").unwrap();
+        for values in [
+            [assign("Width=128"), assign("Height=5000")],
+            [assign("PixelFormat=RGB8"), assign("Width=99999")],
+        ] {
+            let error = set(&mut camera, &values, true).unwrap_err();
+            assert_eq!(crate::types::classify(&error).kind, ErrorKind::OutOfRange);
+        }
     }
 
     #[test]

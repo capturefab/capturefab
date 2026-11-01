@@ -1,6 +1,7 @@
 //! ONVIF WS-Discovery and Media1/Media2 profile/RTSP URI resolution.
 //! SOAP uses bounded HTTP requests, WS UsernameToken PasswordDigest, and HTTP
 //! Basic/Digest authentication. HTTPS SOAP is rejected explicitly.
+use crate::types::{Categorized, ErrorKind};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use md5::{Digest, Md5};
@@ -506,17 +507,37 @@ impl Write for DeadlineStream {
 }
 fn open_tcp(url: &HttpUrl, timeout: Duration) -> Result<DeadlineStream> {
     validate_timeout(timeout)?;
+    // A host that does not resolve or answer is unavailable, whatever words
+    // the OS uses for it.
+    let unavailable = |error: anyhow::Error| -> anyhow::Error {
+        if crate::types::classify(&error).kind == ErrorKind::OperationFailed {
+            Categorized::new(ErrorKind::Unavailable, format!("{error:#}"))
+                .hint("check the address and that the camera is on this network")
+                .into()
+        } else {
+            error
+        }
+    };
     let addresses = (url.host.as_str(), url.port)
         .to_socket_addrs()
-        .context("cannot resolve ONVIF host")?
+        .map_err(|error| {
+            unavailable(anyhow::Error::new(error).context("cannot resolve ONVIF host"))
+        })?
         .collect::<Vec<_>>();
-    ensure!(!addresses.is_empty(), "ONVIF host resolved to no addresses");
+    if addresses.is_empty() {
+        return Err(unavailable(anyhow!("ONVIF host resolved to no addresses")));
+    }
     let deadline = Instant::now() + timeout;
     let mut last = None;
     let mut stream = None;
     for address in addresses {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        ensure!(!remaining.is_zero(), "ONVIF connection timed out");
+        if remaining.is_zero() {
+            return Err(Categorized::error(
+                ErrorKind::Timeout,
+                "ONVIF connection timed out",
+            ));
+        }
         match TcpStream::connect_timeout(&address, remaining) {
             Ok(s) => {
                 stream = Some(s);
@@ -525,12 +546,12 @@ fn open_tcp(url: &HttpUrl, timeout: Duration) -> Result<DeadlineStream> {
             Err(e) => last = Some(e),
         }
     }
-    let stream = stream.ok_or_else(|| {
-        anyhow!(
-            "cannot connect to ONVIF service: {}",
-            last.map(|e| e.to_string()).unwrap_or_default()
-        )
-    })?;
+    let Some(stream) = stream else {
+        let error = last.map_or_else(|| anyhow!("no address answered"), anyhow::Error::new);
+        return Err(unavailable(
+            error.context("cannot connect to ONVIF service"),
+        ));
+    };
     let remaining = deadline
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(1));
@@ -1709,6 +1730,27 @@ pub fn camera_infos(timeout: Duration) -> Result<Vec<crate::types::CameraInfo>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hosts_that_do_not_answer_are_unavailable() {
+        let code = |url: &str, timeout| {
+            let error = open_tcp(&parse_url(url).unwrap(), timeout)
+                .err()
+                .expect("no ONVIF service answers there");
+            crate::cli::output::error_code(&error)
+        };
+        // A port nothing listens on, and a name that never resolves.
+        let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = refused.local_addr().unwrap().port();
+        drop(refused);
+        assert_eq!(
+            code(&format!("http://127.0.0.1:{port}/"), Duration::from_secs(2)),
+            ("unavailable", 3)
+        );
+        assert_eq!(
+            code("http://nonexistent.invalid/", Duration::from_secs(2)),
+            ("unavailable", 3)
+        );
+    }
     #[test]
     fn discovery_ignores_prefix_variations() {
         let xml = "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery' xmlns:a='http://schemas.xmlsoap.org/ws/2004/08/addressing'><s:Body><d:ProbeMatches><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:test</a:Address></a:EndpointReference><d:XAddrs>http://192.168.1.3/onvif/device_service http://host/service</d:XAddrs><d:Scopes>onvif://www.onvif.org/name/Camera</d:Scopes></d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>";

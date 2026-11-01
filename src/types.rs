@@ -306,6 +306,23 @@ impl std::fmt::Display for Categorized {
 }
 impl std::error::Error for Categorized {}
 
+/// `error` with `extra` merged into its details, keeping its reason and
+/// hint: partial work of a failed command goes there.
+pub fn with_details(error: anyhow::Error, extra: serde_json::Value) -> anyhow::Error {
+    let classified = classify(&error);
+    let mut details = match classified.details {
+        Some(serde_json::Value::Object(details)) => serde_json::Value::Object(details),
+        Some(other) => serde_json::json!({ "cause": other }),
+        None => serde_json::json!({}),
+    };
+    if let (Some(details), serde_json::Value::Object(extra)) = (details.as_object_mut(), extra) {
+        details.extend(extra);
+    }
+    let mut categorized = Categorized::new(classified.kind, format!("{error:#}")).details(details);
+    categorized.hint = classified.hint;
+    categorized.into()
+}
+
 /// `value` without null object members, at any depth.
 pub fn without_nulls(value: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
@@ -490,16 +507,6 @@ pub fn error_from_tag(tag: Option<ErrorTag>, message: String) -> anyhow::Error {
         None => anyhow::Error::msg(message),
     }
 }
-/// Rebuild an error received with only its reason code.
-pub fn error_from_transport(code: Option<&str>, message: String) -> anyhow::Error {
-    error_from_tag(
-        code.map(|code| ErrorTag {
-            code: code.into(),
-            ..Default::default()
-        }),
-        message,
-    )
-}
 
 /// Most a duration may be: ten years.
 const MAX_DURATION: Duration = Duration::from_secs(315_576_000);
@@ -629,9 +636,15 @@ mod tests {
             assert_eq!(error_tag(&rebuilt), error_tag(&error));
             assert_eq!(format!("{rebuilt:#}"), format!("{error:#}"));
         }
-        let range = error_tag(&error_from_transport(Some("out_of_range"), "x".into()));
+        let tag = |code: &str| {
+            Some(ErrorTag {
+                code: code.into(),
+                ..Default::default()
+            })
+        };
+        let range = error_tag(&error_from_tag(tag("out_of_range"), "x".into()));
         assert_eq!(range.unwrap().code, "out_of_range");
-        assert!(error_transport_code(&error_from_transport(Some("bogus"), "x".into())).is_none());
+        assert!(error_transport_code(&error_from_tag(tag("bogus"), "x".into())).is_none());
     }
 
     #[test]

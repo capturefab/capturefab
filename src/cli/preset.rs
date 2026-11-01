@@ -245,6 +245,12 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
                 crate::controls::Name::parse(user_set)?;
             }
             let client = Client::open(global, camera.camera.as_deref())?;
+            // A camera that cannot keep the preset is refused before
+            // anything changes.
+            let persisting = persist
+                .as_deref()
+                .map(|user_set| check_persist(&client, user_set))
+                .transpose()?;
             let inline = name.is_none().then(|| setup.clone());
             let mut diff = client.call(SessionCommand::SetupDiff {
                 setup: inline.clone(),
@@ -268,6 +274,9 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             }
             if dry_run {
                 diff["dry_run"] = json!(true);
+                if let Some(persisting) = persisting {
+                    diff["persist"] = persisting;
+                }
                 let mut text = Vec::new();
                 write_diff(&mut text, &diff, "Would change")?;
                 return Ok(Report::json(renamed(diff)).text(String::from_utf8_lossy(&text)));
@@ -279,7 +288,13 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
                 strict,
             })?;
             if let Some(user_set) = persist {
-                result["persisted"] = persist_user_set(&client, &user_set)?;
+                // The preset is on the camera now; say so beside the error.
+                result["persisted"] = persist_user_set(&client, &user_set).map_err(|error| {
+                    crate::types::with_details(
+                        error,
+                        json!({"applied": result["applied"], "changes": result["changes"]}),
+                    )
+                })?;
             }
             let mut text = Vec::new();
             write_applied(&mut text, &result)?;
@@ -291,6 +306,64 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             }
             Ok(Report::json(renamed(result)).text(String::from_utf8_lossy(&text)))
         }
+    }
+}
+
+/// Check that the camera can save its settings in `user_set` and start
+/// with it: UserSetSave, a UserSetSelector entry and a power-on default.
+/// What `--persist` will write.
+fn check_persist(client: &Client, user_set: &str) -> Result<Value> {
+    let list = client.call(SessionCommand::FeatureList {
+        filter: crate::controls::FeatureFilter {
+            pattern: Some("UserSet".into()),
+            all: true,
+            category: None,
+        },
+    })?;
+    let rows = list["features"].as_array().cloned().unwrap_or_default();
+    let row = |name: &str| rows.iter().find(|row| row["name"] == name);
+    let choices = |row: &Value| -> Vec<String> {
+        row["choices"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|choice| choice.as_str().map(str::to_owned))
+            .collect()
+    };
+    let unsupported = |what: String| -> anyhow::Error {
+        Categorized::new(
+            ErrorKind::Unsupported,
+            format!("{what}, so --persist cannot keep the preset in it"),
+        )
+        .hint("apply without --persist; the preset stays saved on this computer")
+        .into()
+    };
+    if row("UserSetSave").is_none() {
+        return Err(unsupported("this camera has no UserSetSave".into()));
+    }
+    let Some(selector) = row("UserSetSelector") else {
+        return Err(unsupported("this camera has no UserSetSelector".into()));
+    };
+    let sets = choices(selector);
+    if !sets.iter().any(|set| set == user_set) {
+        return Err(Categorized::new(
+            ErrorKind::InvalidChoice,
+            format!(
+                "{user_set} is not one of this camera's user sets: {}",
+                sets.join(", ")
+            ),
+        )
+        .details(json!({"feature": "UserSetSelector", "value": user_set, "choices": sets}))
+        .into());
+    }
+    let default = ["UserSetDefault", "UserSetDefaultSelector"]
+        .into_iter()
+        .find(|name| row(name).is_some_and(|row| choices(row).iter().any(|c| c == user_set)));
+    match default {
+        Some(default) => Ok(json!({"user_set": user_set, "default": default})),
+        None => Err(unsupported(format!(
+            "this camera cannot start with {user_set} (no UserSetDefault entry for it)"
+        ))),
     }
 }
 
@@ -461,6 +534,10 @@ pub const APPLY_FIELDS: &[(&str, &str)] = &[
     ("auto_changed", "bool"),
     ("restarted_stream", "bool"),
     ("persisted", "{user_set,default} — with --persist"),
+    (
+        "persist",
+        "{user_set,default} — with --dry-run --persist: the user set it would save",
+    ),
 ];
 
 /// A setup file given on the command line: a newer document is
@@ -482,10 +559,14 @@ fn document_input<T>(result: Result<T>) -> Result<T> {
 }
 
 fn taken(error: anyhow::Error) -> anyhow::Error {
-    if error.is::<setups::NameTaken>() {
-        Usage(error.to_string()).into()
-    } else {
-        error
+    match error.downcast_ref::<setups::NameTaken>() {
+        Some(taken) => {
+            crate::types::Categorized::new(crate::types::ErrorKind::Exists, taken.to_string())
+                .hint("pass --replace to overwrite it")
+                .details(json!({"name": taken.name, "path": taken.path}))
+                .into()
+        }
+        None => error,
     }
 }
 

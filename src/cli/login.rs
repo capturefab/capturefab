@@ -16,7 +16,7 @@ pub enum LoginCommand {
         after_help = "Examples:\n  printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin\n  CAPTUREFAB_CAMERA_PASSWORD=secret capturefab login add onvif://cam.local --user admin"
     )]
     Add {
-        /// A credential-free rtsp://, rtsps://, onvif:http://… or onvif://HOST address, or with --session the ID or serial of a discovered ONVIF camera
+        /// A credential-free rtsp://, rtsps://, onvif:http://… or onvif://HOST address
         address: String,
         /// Camera user name
         #[arg(long)]

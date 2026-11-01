@@ -992,7 +992,7 @@ pub fn native_devices_with_timeout(timeout: Duration) -> Result<Value> {
         let (_, listing, timed_out) = timed_output(&exe, &args, &[], timeout)?;
         ensure!(
             !timed_out,
-            "native camera discovery timed out after {} s; check camera permissions and host drivers, or retry with a larger --timeout-ms",
+            "native camera discovery timed out after {} s; check camera permissions and host drivers, or retry with a longer list --timeout",
             timeout.as_secs_f64()
         );
         ensure!(
@@ -2055,8 +2055,7 @@ fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
         _ => (dshow_modes(&log), Vec::new()),
     }
 }
-/// How a host camera's connect error begins when the system refused access;
-/// `cli::error_code` reads it.
+/// How a host camera's connect error begins when the system refused access.
 pub const CAMERA_ACCESS_DENIED: &str = "camera access denied";
 
 fn native_failure(
@@ -2280,7 +2279,10 @@ fn network_failure(
             format!(
                 "No reply from {at} ({url}). Check it is on this network and streaming{}.",
                 longer_wait(timeout)
-                    .map(|ms| format!(", or retry with a longer timeout (--timeout-ms {ms})"))
+                    .map(|ms| format!(
+                        ", or retry with a longer wait (capture and record take --timeout {}s)",
+                        ms / 1000
+                    ))
                     .unwrap_or_default()
             ),
             Some(said),
@@ -2296,7 +2298,10 @@ fn network_failure(
                 timeout.as_secs_f64(),
                 longer_wait(timeout).map_or_else(
                     || "check it is on this network and streaming".to_owned(),
-                    |ms| format!("retry with a longer timeout (--timeout-ms {ms})")
+                    |ms| format!(
+                        "retry with a longer wait (capture and record take --timeout {}s)",
+                        ms / 1000
+                    )
                 )
             ),
             None,
@@ -2372,7 +2377,7 @@ fn native_source(source: &str) -> Result<(String, Option<NativeOptions>)> {
     );
     ensure!(
         !(base.ends_with('\\') && query.starts_with('\\')),
-        "write the ? of a DirectShow alternative name as %3F, as capturefab discover lists it"
+        "write the ? of a DirectShow alternative name as %3F, as capturefab list shows it"
     );
     let mut options = NativeOptions::default();
     for pair in query.split('&').filter(|s| !s.is_empty()) {
@@ -5375,7 +5380,7 @@ esac"#,
         assert_eq!(code, "timeout");
         assert_eq!(
             message,
-            "No video arrived from 10.255.255.1 within 2 s (rtsp://<redacted>@10.255.255.1/stream). It may be unreachable or slow to send its first frame; retry with a longer timeout (--timeout-ms 10000)."
+            "No video arrived from 10.255.255.1 within 2 s (rtsp://<redacted>@10.255.255.1/stream). It may be unreachable or slow to send its first frame; retry with a longer wait (capture and record take --timeout 10s)."
         );
         // A connect that timed out says the host did not reply.
         let (code, message) = explained(
@@ -5385,7 +5390,7 @@ esac"#,
         );
         assert_eq!(code, "timeout");
         assert!(
-            message.starts_with("No reply from 10.255.255.1 (rtsp://10.255.255.1/stream). Check it is on this network and streaming, or retry with a longer timeout (--timeout-ms 10000). (FFmpeg: Connection to tcp://10.255.255.1:554 failed: Operation timed out)"),
+            message.starts_with("No reply from 10.255.255.1 (rtsp://10.255.255.1/stream). Check it is on this network and streaming, or retry with a longer wait (capture and record take --timeout 10s). (FFmpeg: Connection to tcp://10.255.255.1:554 failed: Operation timed out)"),
             "{message}"
         );
         // A longer wait is suggested only while one is left to try.

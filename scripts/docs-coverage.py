@@ -16,7 +16,9 @@ from urllib.parse import unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 # Worker-only operations that `debug rpc` refuses: acquisition is documented
 # by public Frame, and network tuning by NetworkScan.
-INTERNAL_RPC = {"Grab", "OptimizeNetwork"}
+# Worker-internal operations, and the single-value ones `debug rpc` refuses
+# until the wire protocol drops them.
+INTERNAL_RPC = {"Grab", "OptimizeNetwork", "Get", "Set", "SetMany", "Execute", "Features", "Discover"}
 RAW_STRING = re.compile(r'(?:br|r)(#*)"')
 CHAR = re.compile(r"'(?:\\.|[^'\\\n])'")
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
@@ -224,7 +226,8 @@ def command_paths(root, with_arguments=False):
             raise ValueError(f"cannot resolve {'subcommand enum' if kind == 'enum' else 'argument struct'} {typename} from {current}")
         return matches[0], name
 
-    result = {"help"}
+    # clap adds a help subcommand unless the root disables it.
+    result = set() if "disable_help_subcommand = true" in source(root / "src/cli.rs") else {"help"}
     arguments = {}
 
     def fields_arguments(fields, path, ancestors):

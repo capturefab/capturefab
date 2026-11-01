@@ -489,12 +489,12 @@ fn adapter_summary(interface: &NetworkInterface) -> String {
 }
 
 /// The advice a GigE connect error ends with when no adapter shares the
-/// camera's subnet. The desktop shows its Scan network button instead.
-pub(crate) const SCAN_ADVICE: &str = "run `capturefab network-scan`";
+/// camera's subnet.
+pub(crate) const SCAN_ADVICE: &str = "run `capturefab network`";
 
 /// What to do when the GigE Vision camera typed as `ip` did not answer within
 /// `waited`, or `refused` its control port, using this computer's adapters
-/// the way `network-scan` does.
+/// the way `capturefab network` does.
 pub(crate) fn explain_gige_unreachable(
     ip: Ipv4Addr,
     interfaces: &[NetworkInterface],
@@ -967,7 +967,7 @@ fn health_label(health: NetworkHealth) -> &'static str {
     }
 }
 
-/// The readable `network-scan` summary for a terminal. Report warnings are
+/// The readable `capturefab network` summary for a terminal. Report warnings are
 /// diagnostics, so callers print `scan.warnings` to stderr themselves.
 pub fn write_human(scan: &NetworkScan, out: &mut impl std::io::Write) -> std::io::Result<()> {
     writeln!(out, "Adapters")?;
@@ -1124,7 +1124,7 @@ mod tests {
         );
         assert_eq!(
             elsewhere,
-            "No network adapter on this computer shares 192.168.77.5's subnet (en1 192.168.68.56/22, Wi-Fi), and no GigE Vision camera answered there within 2 s. Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or run `capturefab network-scan`."
+            "No network adapter on this computer shares 192.168.77.5's subnet (en1 192.168.68.56/22, Wi-Fi), and no GigE Vision camera answered there within 2 s. Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or run `capturefab network`."
         );
         // A /22 covers the camera: the adapter is named with the next steps.
         let near = explain_gige_unreachable(

@@ -50,6 +50,19 @@ fn addressed<T>(
     crate::controls::with_bank(camera, &address.selectors, action)
 }
 
+/// How results name a value: `Feature`, or `Feature[Selector=Value,...]`.
+fn address_name(address: &Address) -> String {
+    if address.selectors.is_empty() {
+        return address.feature.clone();
+    }
+    let bank = address
+        .selectors
+        .iter()
+        .map(|(selector, value)| format!("{selector}={value}"))
+        .collect::<Vec<_>>();
+    format!("{}[{}]", address.feature, bank.join(","))
+}
+
 /// Read the value at `address` for a checkpoint. A bank hidden by
 /// `pIsAvailable` reads as `null`: it holds no value to restore, and a
 /// restore writes nothing there, while the setting that hides it is
@@ -380,7 +393,7 @@ pub(super) fn process(
             return Ok(setup::report(&plan, &c.info));
         }
         SessionCommand::SetupDiff { .. } | SessionCommand::ApplySetup { setup: None, .. } => {
-            anyhow::bail!("setup names are resolved by the session coordinator")
+            anyhow::bail!("preset names are resolved by the session coordinator")
         }
         _ => {}
     }
@@ -533,6 +546,19 @@ pub(super) fn process(
         Err(error) => error,
     };
     let fields = before.values.keys().cloned().collect::<Vec<_>>();
+    // What a failed preset wrote, for the rollback its error reports.
+    let mut written = Vec::new();
+    if matches!(command, SessionCommand::ApplySetup { .. }) {
+        let camera = camera_mut(camera)?;
+        for address in &fields {
+            let saved = &before.values[address];
+            if !saved.is_null()
+                && read_at(camera, address).is_ok_and(|now| !setup::close(&now, saved, None))
+            {
+                written.push(address_name(address));
+            }
+        }
+    }
     let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
     let rollback = restore(camera_mut(camera)?, auto, &before, &fields, switch_auto);
     let restarted = restart.then(|| camera_mut(camera).and_then(Camera::start));
@@ -545,9 +571,16 @@ pub(super) fn process(
         None => String::new(),
     };
     if let Err(rollback_error) = rollback {
-        return Err(error.context(format!(
+        let error = error.context(format!(
             "failed command rollback: {rollback_error:#}{restart_note}"
-        )));
+        ));
+        if matches!(command, SessionCommand::ApplySetup { .. }) {
+            return Err(crate::types::with_details(
+                error,
+                json!({"rollback": {"restored": [], "failed": [{"error": format!("{rollback_error:#}")}]}}),
+            ));
+        }
+        return Err(error);
     }
     // The context keeps the cause's category for the exit code.
     if let SessionCommand::ApplySetup {
@@ -555,10 +588,14 @@ pub(super) fn process(
         ..
     } = &command
     {
-        return Err(error.context(format!(
-            "Restoring setup {} failed; every value was put back{restart_note}",
+        let error = error.context(format!(
+            "Restoring preset {} failed; every value was put back{restart_note}",
             document.name
-        )));
+        ));
+        return Err(crate::types::with_details(
+            error,
+            json!({"rollback": {"restored": written, "failed": []}}),
+        ));
     }
     if let Some(Err(_)) = restarted {
         return Err(error.context(restart_note.trim_start_matches("; ").to_owned()));

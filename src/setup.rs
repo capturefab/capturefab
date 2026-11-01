@@ -318,7 +318,7 @@ pub enum FileStatus {
     NewerVersion,
 }
 
-/// One row of `setup list`. A file the store cannot read is listed under
+/// One row of `preset list`. A file the store cannot read is listed under
 /// its file name with `status` and `reason`, and no camera, date or values,
 /// so it can be seen and deleted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -516,7 +516,7 @@ pub fn sort_values(values: &mut [SetupValue]) {
 /// Setup names make their file names, so they avoid names some file
 /// systems reserve.
 pub fn validate_name(name: &str) -> Result<()> {
-    const RULE: &str = "Setup names are 1-64 letters, digits, '.', '-' and '_', cannot start or end with '.', and cannot be a reserved Windows name such as con or nul";
+    const RULE: &str = "Preset names are 1-64 letters, digits, '.', '-' and '_', cannot start or end with '.', and cannot be a reserved Windows name such as con or nul";
     // The character set first: the reserved-name check below slices bytes.
     ensure!(
         !name.is_empty()
@@ -545,11 +545,11 @@ pub fn validate_name(name: &str) -> Result<()> {
 pub fn validate_note(note: &str) -> Result<()> {
     ensure!(
         note.chars().count() <= MAX_NOTE,
-        "a setup note is at most {MAX_NOTE} characters"
+        "a preset note is at most {MAX_NOTE} characters"
     );
     ensure!(
         !note.chars().any(char::is_control),
-        "a setup note cannot contain control characters such as line breaks or escapes"
+        "a preset note cannot contain control characters such as line breaks or escapes"
     );
     Ok(())
 }
@@ -574,7 +574,7 @@ fn validate_bank(feature: &str, bank: &Bank) -> Result<()> {
     );
     ensure!(
         !managed_name(&bank.selector),
-        "{} is managed by Capturefab and cannot address a setup value",
+        "{} is managed by Capturefab and cannot address a preset value",
         bank.selector
     );
     validate_text(&format!("{} value", bank.selector), &bank.value)
@@ -590,16 +590,16 @@ pub fn validate(setup: &Setup) -> Result<()> {
     }
     ensure!(
         !setup.values.is_empty(),
-        "setup {} has no values to restore",
+        "preset {} has no values to restore",
         setup.name
     );
     ensure!(
         setup.values.len() <= MAX_SETUP_VALUES,
-        "a setup holds at most {MAX_SETUP_VALUES} values"
+        "a preset holds at most {MAX_SETUP_VALUES} values"
     );
     ensure!(
         setup.skipped.len() <= MAX_SKIPPED,
-        "a setup records at most {MAX_SKIPPED} skipped values"
+        "a preset records at most {MAX_SKIPPED} skipped values"
     );
     for (what, text) in [
         ("saved_at", &setup.saved_at),
@@ -622,7 +622,7 @@ pub fn validate(setup: &Setup) -> Result<()> {
         crate::session::validate_feature(&value.feature)?;
         ensure!(
             !managed_name(&value.feature),
-            "Capturefab manages {}; a setup cannot restore it",
+            "Capturefab manages {}; a preset cannot restore it",
             value.feature
         );
         if let Scalar::String(text) = &value.value {
@@ -667,7 +667,7 @@ pub fn validate(setup: &Setup) -> Result<()> {
     }
     ensure!(
         stored_bytes(setup)?.len() <= MAX_SETUP_BYTES,
-        "a setup is at most 256 KiB"
+        "a preset is at most 256 KiB"
     );
     Ok(())
 }
@@ -687,7 +687,7 @@ impl std::fmt::Display for NewerVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "setup version {} was written by a newer Capturefab; this one reads version 1",
+            "preset version {} was written by a newer Capturefab; this one reads version 1",
             self.0
         )
     }
@@ -700,7 +700,7 @@ fn check_version(version: u64) -> Result<()> {
     }
     ensure!(
         version == 1,
-        "setup version {version} is not supported; this Capturefab reads version 1"
+        "preset version {version} is not supported; this Capturefab reads version 1"
     );
     Ok(())
 }
@@ -709,8 +709,11 @@ fn check_version(version: u64) -> Result<()> {
 /// `setup show NAME --json` prints, `{"version":1,"ok":true,"result":DOCUMENT}`,
 /// is accepted too, so its output can be imported or applied as is.
 pub fn parse(bytes: &[u8]) -> Result<Setup> {
-    ensure!(bytes.len() <= MAX_SETUP_BYTES, "a setup is at most 256 KiB");
-    let value = serde_json::from_slice(bytes).context("not a valid setup document")?;
+    ensure!(
+        bytes.len() <= MAX_SETUP_BYTES,
+        "a preset is at most 256 KiB"
+    );
+    let value = serde_json::from_slice(bytes).context("not a valid preset document")?;
     from_value(value)
 }
 
@@ -724,36 +727,14 @@ pub fn from_value(value: serde_json::Value) -> Result<Setup> {
 }
 
 /// `from_value` without `validate`, which session commands run later.
-fn document(value: serde_json::Value) -> Result<Setup> {
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Envelope {
-        version: u32,
-        ok: bool,
-        result: serde_json::Value,
-    }
-    let document = if value.get("ok").is_some() {
-        match serde_json::from_value::<Envelope>(value) {
-            Ok(Envelope {
-                version: 1,
-                ok: true,
-                result,
-            }) => result,
-            _ => bail!(
-                "not a valid setup document: pass the setup itself or the whole output of a successful capturefab setup show NAME --json (version 1, ok true)"
-            ),
-        }
-    } else {
-        value
-    };
+fn document(document: serde_json::Value) -> Result<Setup> {
     if let Some(version) = document.get("version").and_then(serde_json::Value::as_u64) {
         check_version(version)?;
     }
-    serde_json::from_value(document).context("not a valid setup document")
+    serde_json::from_value(document).context("not a valid preset document")
 }
 
-/// Deserialize an inline `setup` field, as `from_value` reads it: either
-/// the document or the `setup show NAME --json` envelope around it. The
+/// Deserialize an inline `setup` field, as `from_value` reads it. The
 /// command's `validate` checks its values.
 pub fn deserialize_inline<'de, D>(deserializer: D) -> Result<Option<Setup>, D::Error>
 where
@@ -770,7 +751,7 @@ where
 
 /// Read and validate a setup file, reading at most `MAX_SETUP_BYTES`.
 pub fn read_file(path: &Path) -> Result<Setup> {
-    parse(&read_bytes(path)?).with_context(|| format!("read setup {}", path.display()))
+    parse(&read_bytes(path)?).with_context(|| format!("read preset {}", path.display()))
 }
 
 /// Read a file in the store. A note with control characters, which older
@@ -779,7 +760,7 @@ pub fn read_file(path: &Path) -> Result<Setup> {
 fn read_stored(path: &Path) -> Result<Setup> {
     let bytes = read_bytes(path)?;
     let mut setup =
-        document(serde_json::from_slice(&bytes).context("not a valid setup document")?)?;
+        document(serde_json::from_slice(&bytes).context("not a valid preset document")?)?;
     if let Some(note) = &mut setup.note {
         *note = note
             .chars()
@@ -800,7 +781,7 @@ fn read_bytes(path: &Path) -> Result<Vec<u8>> {
         .with_context(|| format!("read {}", path.display()))?;
     ensure!(
         bytes.len() <= MAX_SETUP_BYTES,
-        "{} is larger than 256 KiB; it is not a setup",
+        "{} is larger than 256 KiB; it is not a preset",
         file_name(path)
     );
     Ok(bytes)
@@ -819,7 +800,7 @@ pub fn from_read(name: &str, note: Option<String>, mut reading: Reading) -> Resu
     if reading.values.is_empty() {
         return Err(Categorized::error(
             ErrorKind::Unsupported,
-            "This camera has no settings a setup can save.",
+            "This camera has no settings a preset can save.",
         ));
     }
     sort_values(&mut reading.values);
@@ -864,7 +845,7 @@ fn fit_skipped(setup: &mut Setup, mut dropped: usize) -> Result<()> {
         return Err(Categorized::error(
             ErrorKind::Unsupported,
             format!(
-                "This camera's {} settings do not fit in one setup (at most {} KiB).",
+                "This camera's {} settings do not fit in one preset (at most {} KiB).",
                 setup.values.len(),
                 MAX_SETUP_BYTES / 1024
             ),
@@ -919,12 +900,14 @@ pub struct NameTaken {
     pub name: String,
     /// Why the existing file is not a usable setup, if it is not.
     pub problem: Option<&'static str>,
+    /// The file that holds it.
+    pub path: PathBuf,
 }
 impl std::fmt::Display for NameTaken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "A setup named {} exists{}; pass --replace to overwrite it",
+            "A preset named {} exists{}; pass --replace to overwrite it",
             self.name,
             self.problem
                 .map(|problem| format!(" but {problem}"))
@@ -946,7 +929,7 @@ impl std::fmt::Display for Misnamed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} holds a setup named {}, not {}",
+            "{} holds a preset named {}, not {}",
             self.file, self.holds, self.name
         )
     }
@@ -1060,7 +1043,7 @@ impl Store {
     fn read_named(&self, path: &Path, name: &str) -> Result<Setup> {
         if self.path(name).file_name() != path.file_name() {
             bail!(
-                "{} has capital letters; Capturefab names setup files in lower case. Rename it to {}.json",
+                "{} has capital letters; Capturefab names preset files in lower case. Rename it to {}.json",
                 file_name(path),
                 name.to_ascii_lowercase()
             );
@@ -1092,7 +1075,7 @@ impl Store {
             return Categorized::error(
                 ErrorKind::Unsupported,
                 format!(
-                    "Setup {name} was saved by a newer Capturefab ({:#}); update Capturefab to use it",
+                    "Preset {name} was saved by a newer Capturefab ({:#}); update Capturefab to use it",
                     error.root_cause()
                 ),
             );
@@ -1100,17 +1083,17 @@ impl Store {
         let quoted = crate::hint::shell_quote(name);
         let hint = if let Some(misnamed) = error.downcast_ref::<Misnamed>() {
             format!(
-                "{misnamed}. Save it under this name with: capturefab setup import {} --name {quoted} --replace, or remove the copy with: capturefab setup delete {quoted}",
+                "{misnamed}. Save it under this name with: capturefab preset import {} --name {quoted} --replace, or remove the copy with: capturefab preset rm {quoted}",
                 crate::hint::shell_quote(&path.display().to_string())
             )
         } else {
             format!(
-                "{error:#}. Save the camera again with: capturefab --camera ID setup save {quoted} --replace, or remove it with: capturefab setup delete {quoted}"
+                "{error:#}. Save the camera again with: capturefab preset save {quoted} -c ID --replace, or remove it with: capturefab preset rm {quoted}"
             )
         };
         Categorized::error(
             ErrorKind::Unavailable,
-            format!("Setup {name} cannot be read: {hint}"),
+            format!("Preset {name} cannot be read: {hint}"),
         )
     }
     fn missing(&self, name: &str) -> anyhow::Error {
@@ -1120,7 +1103,7 @@ impl Store {
             .unwrap_or_default();
         Categorized::error(
             ErrorKind::Unavailable,
-            format!("No saved setup named {name}.{suggestion} See capturefab setup list"),
+            format!("No saved preset named {name}.{suggestion} See capturefab preset list"),
         )
     }
     /// Whether `name` can be saved: refuses a taken name unless `replace`,
@@ -1136,6 +1119,7 @@ impl Store {
                     Ok(existing) => NameTaken {
                         name: existing.name,
                         problem: None,
+                        path: path.clone(),
                     },
                     Err(error) => NameTaken {
                         name: name.to_owned(),
@@ -1144,6 +1128,7 @@ impl Store {
                         } else {
                             "cannot be read"
                         }),
+                        path: path.clone(),
                     },
                 };
                 return Err(taken.into());
@@ -1151,7 +1136,7 @@ impl Store {
         } else {
             ensure!(
                 self.files()?.len() < MAX_SETUPS,
-                "{MAX_SETUPS} setups are saved; delete one first (capturefab setup delete NAME)"
+                "{MAX_SETUPS} presets are saved; remove one first (capturefab preset rm NAME)"
             );
         }
         Ok(())
@@ -1170,7 +1155,7 @@ impl Store {
         let file_name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .context("setup file name")?;
+            .context("preset file name")?;
         let temp = self
             .dir
             .join(format!(".{file_name}.{}.tmp", std::process::id()));
@@ -1183,7 +1168,10 @@ impl Store {
         }
         let result = (|| -> Result<()> {
             let bytes = stored_bytes(setup)?;
-            ensure!(bytes.len() <= MAX_SETUP_BYTES, "a setup is at most 256 KiB");
+            ensure!(
+                bytes.len() <= MAX_SETUP_BYTES,
+                "a preset is at most 256 KiB"
+            );
             let _ = fs::remove_file(&temp);
             let mut output = options.open(&temp)?;
             output.write_all(&bytes)?;
@@ -1241,7 +1229,7 @@ pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session
         match (name, setup) {
             (_, Some(setup)) => Ok(Some(setup)),
             (Some(name), None) => Store::session().get(name).map(Some),
-            (None, None) => bail!("name a setup or pass one inline"),
+            (None, None) => bail!("name a preset or pass one inline"),
         }
     };
     Ok(match command {
@@ -1351,7 +1339,7 @@ mod tests {
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "capturefab-setup-{name}-{}-{}",
+            "capturefab-preset-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1426,7 +1414,7 @@ mod tests {
             &"x".repeat(65),
         ] {
             let error = validate_name(bad).unwrap_err().to_string();
-            assert!(error.starts_with("Setup names are"), "{bad}: {error}");
+            assert!(error.starts_with("Preset names are"), "{bad}: {error}");
         }
     }
 
@@ -1445,31 +1433,13 @@ mod tests {
             parse(&serde_json::to_vec(&json).unwrap()).unwrap_err()
         );
         assert!(error.contains("version 2"), "{error}");
-        // The --json envelope of setup show is accepted; its document is
-        // still strict, and a failed envelope is not.
+        // Only the document itself: not the old {version,ok,result} output.
         let envelope = serde_json::json!({"version":1,"ok":true,"result":setup});
-        assert_eq!(
-            parse(&serde_json::to_vec(&envelope).unwrap()).unwrap(),
-            setup
-        );
-        for bad in [
-            serde_json::json!({"version":1,"ok":false,"result":setup}),
-            serde_json::json!({"version":2,"ok":true,"result":setup}),
-            serde_json::json!({"version":1,"ok":true,"result":setup,"extra":1}),
-        ] {
-            assert!(parse(&serde_json::to_vec(&bad).unwrap()).is_err(), "{bad}");
-        }
-        let mut inner = serde_json::to_value(&setup).unwrap();
-        inner["extra"] = serde_json::json!(1);
         let error = format!(
             "{:#}",
-            parse(
-                &serde_json::to_vec(&serde_json::json!({"version":1,"ok":true,"result":inner}))
-                    .unwrap()
-            )
-            .unwrap_err()
+            parse(&serde_json::to_vec(&envelope).unwrap()).unwrap_err()
         );
-        assert!(error.contains("not a valid setup document"), "{error}");
+        assert!(error.contains("not a valid preset document"), "{error}");
         for bad in [
             serde_json::json!([1]),
             serde_json::json!({"a":1}),
@@ -1492,10 +1462,9 @@ mod tests {
         ] {
             let mut setup = setup("bench");
             setup.values[1] = value("ExposureTime", serde_json::json!(float));
-            let envelope = serde_json::json!({"version":1,"ok":true,"result":setup});
             for bytes in [
                 serde_json::to_vec_pretty(&setup).unwrap(),
-                serde_json::to_vec(&envelope).unwrap(),
+                serde_json::to_vec(&setup).unwrap(),
             ] {
                 let parsed = parse(&bytes).unwrap();
                 let Scalar::Number(number) = &parsed.values[1].value else {
@@ -1745,7 +1714,7 @@ mod tests {
         assert!(taken.is::<NameTaken>());
         assert_eq!(
             taken.to_string(),
-            "A setup named bench exists; pass --replace to overwrite it"
+            "A preset named bench exists; pass --replace to overwrite it"
         );
         // The same refusal, before any camera is read; replace passes.
         let early = store.check_free("Bench", false).unwrap_err();
@@ -1766,7 +1735,7 @@ mod tests {
         );
         assert_eq!(
             missing.to_string(),
-            "No saved setup named bnch. Did you mean BENCH? See capturefab setup list"
+            "No saved preset named bnch. Did you mean BENCH? See capturefab preset list"
         );
         store.remove("Bench").unwrap();
         assert!(store.list().unwrap().is_empty());
@@ -1786,7 +1755,7 @@ mod tests {
             fs::write(store.dir().join(format!("s{index}.json")), b"{}").unwrap();
         }
         let full = store.check_free("new", false).unwrap_err();
-        assert!(full.to_string().contains("setups are saved; delete one"));
+        assert!(full.to_string().contains("presets are saved; remove one"));
         // An existing name can still be replaced.
         store.check_free("s1", true).unwrap();
         let _ = fs::remove_dir_all(store.dir());
@@ -1876,7 +1845,7 @@ mod tests {
             crate::types::error_transport_code(&error),
             Some("unavailable")
         );
-        assert!(format!("{error:#}").contains("setup delete broken"));
+        assert!(format!("{error:#}").contains("preset rm broken"));
         let list = store.list().unwrap();
         let rows = list
             .iter()
@@ -1905,11 +1874,11 @@ mod tests {
         assert!(taken.is::<NameTaken>());
         assert_eq!(
             taken.to_string(),
-            "A setup named broken exists but cannot be read; pass --replace to overwrite it"
+            "A preset named broken exists but cannot be read; pass --replace to overwrite it"
         );
         assert_eq!(
             store.save(&setup("future"), false).unwrap_err().to_string(),
-            "A setup named future exists but was saved by a newer Capturefab; pass --replace to overwrite it"
+            "A preset named future exists but was saved by a newer Capturefab; pass --replace to overwrite it"
         );
         assert_eq!(
             store.remove("broken").unwrap(),
@@ -1957,12 +1926,12 @@ mod tests {
         let taken = store.save(&setup("other"), false).unwrap_err();
         assert_eq!(
             taken.to_string(),
-            "A setup named other exists but cannot be read; pass --replace to overwrite it"
+            "A preset named other exists but cannot be read; pass --replace to overwrite it"
         );
         // The suggested import, quoted, makes the copy a setup of its own.
         let message = error.to_string();
         let import = format!(
-            "capturefab setup import {} --name other --replace",
+            "capturefab preset import {} --name other --replace",
             crate::hint::shell_quote(&store.dir().join("other.json").display().to_string())
         );
         assert!(message.contains(&import), "{message}");
@@ -2006,7 +1975,7 @@ mod tests {
         }
         assert_eq!(store.list().unwrap().len(), MAX_SETUPS);
         let full = format!("{:#}", store.save(&setup("one-more"), false).unwrap_err());
-        assert!(full.contains("setups are saved"), "{full}");
+        assert!(full.contains("presets are saved"), "{full}");
         let _ = fs::remove_dir_all(store.dir());
     }
 
@@ -2034,11 +2003,11 @@ mod tests {
         };
         assert_eq!(
             reason("other"),
-            "other.json holds a setup named bench, not other"
+            "other.json holds a preset named bench, not other"
         );
         assert_eq!(
             reason("Shelf"),
-            "Shelf.json has capital letters; Capturefab names setup files in lower case. Rename it to shelf.json"
+            "Shelf.json has capital letters; Capturefab names preset files in lower case. Rename it to shelf.json"
         );
         let _ = fs::remove_dir_all(temp("long"));
         let _ = fs::remove_dir_all(&deep);
@@ -2177,37 +2146,19 @@ mod tests {
     }
 
     #[test]
-    fn inline_setups_accept_the_show_envelope() {
+    fn inline_presets_are_the_document_itself() {
         let bench = setup("bench");
         let bare = serde_json::json!({"op":"apply_setup","setup":bench});
-        let wrapped = serde_json::json!({
-            "op":"apply_setup",
-            "setup":{"version":1,"ok":true,"result":bench}
-        });
         let parse_command =
             |json: &serde_json::Value| SessionCommand::from_json_slice(json.to_string().as_bytes());
-        let expected = parse_command(&bare).unwrap();
-        assert_eq!(
-            serde_json::to_value(parse_command(&wrapped).unwrap()).unwrap(),
-            serde_json::to_value(&expected).unwrap()
+        parse_command(&bare).unwrap();
+        let wrapped = serde_json::json!({"version":1,"ok":true,"result":bench});
+        let error =
+            parse_command(&serde_json::json!({"op":"apply_setup","setup":wrapped})).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("not a valid preset document"),
+            "{error:#}"
         );
-        let diff = serde_json::json!({
-            "op":"setup_diff",
-            "setup":{"version":1,"ok":true,"result":bench}
-        });
-        assert!(parse_command(&diff).is_ok());
-        for bad in [
-            serde_json::json!({"version":1,"ok":false,"result":bench}),
-            serde_json::json!({"version":2,"ok":true,"result":bench}),
-            serde_json::json!({"version":1,"ok":true,"result":bench,"extra":1}),
-        ] {
-            let error =
-                parse_command(&serde_json::json!({"op":"apply_setup","setup":bad})).unwrap_err();
-            assert!(
-                format!("{error:#}").contains("setup show NAME --json"),
-                "{error:#}"
-            );
-        }
         let mut newer = serde_json::to_value(&bench).unwrap();
         newer["version"] = serde_json::json!(2);
         newer["lens"] = serde_json::json!(1);
@@ -2234,7 +2185,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "This camera has no settings a setup can save."
+            "This camera has no settings a preset can save."
         );
     }
 }

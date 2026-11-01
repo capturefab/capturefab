@@ -2,7 +2,7 @@
 use crate::{
     genicam::FeatureInfo,
     shared_memory::{DEFAULT_CAPACITY, FrameMeta, RingCounters, SharedRing},
-    types::{CameraInfo, Frame},
+    types::{CameraInfo, Categorized, ErrorKind, Frame},
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -945,6 +945,27 @@ impl FrameFeed {
         }
     }
 }
+/// A camera worker that exited while the session still held it.
+fn worker_crashed(status: std::process::ExitStatus) -> anyhow::Error {
+    #[cfg(unix)]
+    let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+    #[cfg(not(unix))]
+    let signal: Option<i32> = None;
+    Categorized::new(
+        ErrorKind::WorkerCrashed,
+        format!("camera worker exited ({status})"),
+    )
+    .hint("disconnect and reconnect the camera")
+    .details(json!({"exit": status.code(), "signal": signal}))
+    .into()
+}
+
+/// The connected cameras an error offers instead, with credentials redacted.
+fn candidates<'a>(ids: impl Iterator<Item = &'a String>) -> Vec<Value> {
+    ids.map(|id| json!({"id": crate::media::redact_url(id)}))
+        .collect()
+}
+
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1052,10 +1073,9 @@ impl Process {
     }
     /// Send one command and keep the reply's snapshot.
     fn call(&mut self, command: SessionCommand) -> Result<Value> {
-        ensure!(
-            self.child.try_wait()?.is_none(),
-            "camera worker exited; disconnect and reconnect"
-        );
+        if let Some(status) = self.child.try_wait()? {
+            return Err(worker_crashed(status));
+        }
         serde_json::to_writer(&mut self.input, &command)?;
         self.input.write_all(b"\n")?;
         self.input.flush()?;
@@ -1065,6 +1085,16 @@ impl Process {
             .by_ref()
             .take(16 * 1024 * 1024 + 1)
             .read_until(b'\n', &mut data)?;
+        if data.is_empty() {
+            // The pipe closes as the worker dies; give the exit a moment to
+            // be reaped so the error can say how it ended.
+            for _ in 0..20 {
+                if let Some(status) = self.child.try_wait()? {
+                    return Err(worker_crashed(status));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         ensure!(
             data.len() <= 16 * 1024 * 1024 && data.last() == Some(&b'\n'),
             "camera worker exited or sent an invalid response"
@@ -1445,11 +1475,21 @@ impl SessionHandle {
         let mut ids = workers.keys();
         match (ids.next(), ids.next()) {
             (Some(id), None) => Ok(id.clone()),
-            (None, _) => anyhow::bail!("no camera connected; use connect"),
-            (Some(_), Some(_)) => Err(crate::types::Usage(format!(
-                "{} cameras are connected; name one with --camera ID",
-                workers.len()
-            ))
+            (None, _) => Err(Categorized::new(
+                ErrorKind::CameraNotFound,
+                "no camera connected in this session",
+            )
+            .hint("name one with -c CAMERA")
+            .details(json!({"candidates": []}))
+            .into()),
+            (Some(_), Some(_)) => Err(Categorized::new(
+                ErrorKind::CameraAmbiguous,
+                format!(
+                    "{} cameras are connected; name one with -c CAMERA",
+                    workers.len()
+                ),
+            )
+            .details(json!({"candidates": candidates(workers.keys())}))
             .into()),
         }
     }
@@ -1472,7 +1512,15 @@ impl SessionHandle {
                 return Ok(w.clone());
             }
         }
-        anyhow::bail!("camera '{id}' not connected in this session")
+        Err(Categorized::new(
+            ErrorKind::CameraNotFound,
+            format!(
+                "camera '{}' not connected in this session",
+                crate::media::redact_url(&id)
+            ),
+        )
+        .details(json!({"candidates": candidates(workers.keys())}))
+        .into())
     }
     /// The frame a capture just published, for binary stdout. Only a
     /// session of one camera, as a direct capture is, has one. A downscaled
@@ -2434,6 +2482,19 @@ mod tests {
     use super::*;
     use crate::shared_memory::Published;
     #[test]
+    #[cfg(unix)]
+    fn a_killed_worker_is_reported_as_crashed() {
+        let status = std::process::Command::new("sh")
+            .args(["-c", "kill -9 $$"])
+            .status()
+            .unwrap();
+        let error = worker_crashed(status);
+        assert_eq!(crate::cli::error_code(&error), ("worker_crashed", 3));
+        let details = crate::types::classify(&error).details.unwrap();
+        assert_eq!(details["signal"], 9);
+        assert!(details.get("exit").is_none(), "{details}");
+    }
+    #[test]
     fn workers_start_in_the_hidden_worker_mode() {
         let command = worker_command("capturefab".into());
         assert_eq!(
@@ -2651,9 +2712,7 @@ mod tests {
             );
         }
         // `record --duration 500ms` has always worked and must keep working.
-        forward(Some(crate::scheduling::parse_duration("500ms").unwrap()))
-            .validate()
-            .unwrap();
+        forward(Some(500)).validate().unwrap();
     }
     fn cached_camera(id: &str, frames: u64) -> CameraSnapshot {
         CameraSnapshot {

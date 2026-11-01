@@ -1263,10 +1263,12 @@ fn process_plain(
             login,
             saved_login,
         } => {
-            ensure!(
-                camera.is_none(),
-                "a camera is already connected; disconnect first"
-            );
+            if camera.is_some() {
+                return Err(crate::types::Categorized::error(
+                    crate::types::ErrorKind::CameraBusy,
+                    "a camera is already connected; disconnect first",
+                ));
+            }
             let duration = timeout(timeout_ms)?;
             // Each worker opens one camera, so it has discovered nothing yet.
             let mut known = Vec::new();
@@ -1452,14 +1454,27 @@ fn process_plain(
             if !dry_run {
                 // Writing a value Capturefab's auto mode manages ends it, as
                 // set always has; any other write changes what it measures.
-                let managed = auto.as_ref().is_some_and(|a| {
-                    values.iter().any(|value| {
-                        a.manages(&value.name)
-                            || matches!(value.name.as_str(), "exposure" | "gain" | "fps")
-                    })
-                });
+                // Decided by the features the change writes, so a control
+                // (auto_exposure is ExposureAuto) counts like its feature,
+                // and a camera auto never runs beside this one. Planning
+                // also refuses invalid values, which leave auto mode as it
+                // was.
+                let managed = match auto.as_ref() {
+                    Some(a) => {
+                        let written = crate::controls::written(camera_mut(camera)?, &values)?;
+                        written.iter().any(|feature| {
+                            a.manages(feature)
+                                || matches!(
+                                    feature.as_str(),
+                                    "ExposureAuto" | "GainAuto" | "BalanceWhiteAuto"
+                                )
+                        }) || values
+                            .iter()
+                            .any(|value| matches!(value.name.as_str(), "exposure" | "gain" | "fps"))
+                    }
+                    None => false,
+                };
                 if managed {
-                    // Invalid values leave auto mode as it was.
                     crate::controls::set(camera_mut(camera)?, &values, true)?;
                     release_auto(h, auto, camera, false)?;
                     h.log(
@@ -4349,6 +4364,19 @@ mod tests {
             h.request(SessionCommand::Manual { revert: false }).unwrap(),
             json!({"auto": null})
         );
+        // Turning on the camera's own auto, by control or by feature, ends
+        // auto mode too.
+        for value in ["auto_exposure=once", "ExposureAuto=Once"] {
+            set("ExposureAuto", "Off");
+            auto(&h, Some(0.5)).unwrap();
+            let values = vec![crate::controls::Assignment::parse(value).unwrap()];
+            h.request(SessionCommand::SetValues {
+                values,
+                dry_run: false,
+            })
+            .unwrap();
+            assert!(h.snapshot().auto.is_none(), "{value}");
+        }
         h.shutdown();
     }
 

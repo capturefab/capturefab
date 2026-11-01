@@ -183,14 +183,14 @@ fn job_count(job: &Value) -> String {
 /// What a session prints when it accepts a scheduled capture.
 pub(super) fn job_scheduled(job: &Value, camera: Option<&str>, session: &str) -> String {
     let camera_flag = camera
-        .map(|camera| format!(" --camera {}", crate::hint::shell_quote(camera)))
+        .map(|camera| format!(" -c {}", crate::hint::shell_quote(camera)))
         .unwrap_or_default();
     let on = camera
         .map(|camera| format!(" on {camera}"))
         .unwrap_or_default();
     let session = crate::hint::shell_quote(session);
     format!(
-        "Scheduled job {}{on}: {} every {} → {}\nWatch: capturefab --session {session} jobs   Cancel: capturefab --session {session}{camera_flag} cancel {}\n",
+        "Scheduled job {}{on}: {} every {} → {}\nWatch: capturefab --session {session} jobs   Cancel: capturefab --session {session} cancel {}{camera_flag}\n",
         job["id"],
         job_count(job),
         interval(job["interval_ms"].as_u64().unwrap_or(0)),
@@ -260,7 +260,7 @@ pub(super) fn jobs_table(jobs: &[Value], session: Option<&str>, now_ms: u64) -> 
             .map(|session| format!(" in session {session}"))
             .unwrap_or_default();
         return format!(
-            "No capture jobs{place}. Schedule one with: capturefab {flag}--camera ID capture -n 10 --interval 1s -o 'frame-{{seq}}.png'\n"
+            "No capture jobs{place}. Schedule one with: capturefab {flag}capture -c ID -n 10 --interval 1s -o 'frame-{{seq}}.png'\n"
         );
     }
     let mut out = format!(
@@ -348,43 +348,6 @@ pub(super) fn storage_summary(value: &Value) -> String {
         out.push_str(&format!("Ledger: {ledger}\n"));
     }
     out.push_str("Use storage --json for full details.\n");
-    out
-}
-
-/// `sim:0 · Capturefab Pattern camera · serial SIM0 · simulator · area_scan`
-/// and the camera's capabilities.
-pub(super) fn info_header(camera: &Value) -> String {
-    let mut parts = vec![crate::media::redact_url(text(camera, "id"))];
-    let name = format!("{} {}", text(camera, "vendor"), text(camera, "model"));
-    if !name.trim().is_empty() {
-        parts.push(name.trim().to_owned());
-    }
-    if !text(camera, "serial").is_empty() {
-        parts.push(format!("serial {}", text(camera, "serial")));
-    }
-    if !text(camera, "transport").is_empty() {
-        parts.push(text(camera, "transport").to_owned());
-    }
-    if let Some(address) = camera["address"]
-        .as_str()
-        .filter(|address| !address.is_empty())
-    {
-        parts.push(crate::media::redact_url(address));
-    }
-    if let Some(kind) = camera["profile"]["kind"].as_str() {
-        parts.push(kind.to_owned());
-    }
-    let mut out = parts.join(" · ");
-    out.push('\n');
-    let capabilities = camera["profile"]["capabilities"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    if !capabilities.is_empty() {
-        out.push_str(&format!("Capabilities: {}\n", capabilities.join(", ")));
-    }
     out
 }
 
@@ -483,10 +446,10 @@ pub(super) fn forward_started(
         "Streaming"
     };
     let camera = camera
-        .map(|camera| format!(" --camera {}", crate::hint::shell_quote(camera)))
+        .map(|camera| format!(" -c {}", crate::hint::shell_quote(camera)))
         .unwrap_or_default();
     format!(
-        "{verb} to {shown} in session {session}. Stop it with: capturefab --session {}{camera} stop-forward\n",
+        "{verb} to {shown} in session {session}. Stop it with: capturefab --session {} stop-forward{camera}\n",
         crate::hint::shell_quote(session)
     )
 }
@@ -578,7 +541,10 @@ mod tests {
             scheduled.contains("capturefab --session bench jobs"),
             "{scheduled}"
         );
-        assert!(scheduled.contains("--camera sim:0 cancel 1"), "{scheduled}");
+        assert!(
+            scheduled.contains("capturefab --session bench cancel 1 -c sim:0"),
+            "{scheduled}"
+        );
         let table = jobs_table(std::slice::from_ref(&job), Some("bench"), 10_000);
         assert!(table.starts_with("ID    STATUS"), "{table}");
         assert!(table.contains("2/3") && table.contains("in 1s"), "{table}");
@@ -648,14 +614,5 @@ mod tests {
         assert_eq!(numbered_name("out/clip.mp4"), "out/clip-{seq}.mp4");
         assert_eq!(numbered_name("out.d/noext"), "out.d/noext-{seq}");
         assert!(exists_hint("x.png").contains("--on-exists number"));
-    }
-
-    #[test]
-    fn info_header_names_the_camera_on_one_line() {
-        let camera = json!({"id":"sim:0","vendor":"Capturefab","model":"Pattern camera","serial":"SIM0","transport":"simulator","address":null,"profile":{"kind":"area_scan","capabilities":["exposure","gain"]}});
-        assert_eq!(
-            info_header(&camera),
-            "sim:0 · Capturefab Pattern camera · serial SIM0 · simulator · area_scan\nCapabilities: exposure, gain\n"
-        );
     }
 }

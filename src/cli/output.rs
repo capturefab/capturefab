@@ -149,8 +149,9 @@ pub fn json_requested(args: &[std::ffi::OsString]) -> bool {
 }
 
 /// The `--json` error for an argument-parsing failure: clap's first line as
-/// the message, and what an agent needs to fix it as `details`.
-pub fn clap_error(error: &clap::Error) -> Value {
+/// the message, and what an agent needs to fix it as `details`. `group` is
+/// the command and its subcommands when one is missing.
+pub fn clap_error(error: &clap::Error, group: Option<(String, Vec<String>)>) -> Value {
     use clap::error::{ContextKind, ContextValue, ErrorKind as Clap};
     let rendered = error.render().to_string();
     let message = rendered
@@ -158,7 +159,10 @@ pub fn clap_error(error: &clap::Error) -> Value {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .unwrap_or("invalid usage");
-    let message = message.strip_prefix("error: ").unwrap_or(message);
+    let mut message = message
+        .strip_prefix("error: ")
+        .unwrap_or(message)
+        .to_owned();
     let kind = match error.kind() {
         Clap::InvalidValue => "invalid_value".to_owned(),
         Clap::UnknownArgument => "unknown_argument".to_owned(),
@@ -214,6 +218,23 @@ pub fn clap_error(error: &clap::Error) -> Value {
     let valid = strings(ContextKind::ValidValue);
     if !valid.is_empty() {
         details["valid_values"] = json!(valid);
+    }
+    // clap's own first line ends at a colon here, or is the group's help.
+    match error.kind() {
+        Clap::MissingRequiredArgument => {
+            let missing = strings(ContextKind::InvalidArg);
+            if !missing.is_empty() {
+                message = format!("missing required argument: {}", missing.join(", "));
+                details["missing"] = json!(missing);
+            }
+        }
+        Clap::MissingSubcommand | Clap::DisplayHelpOnMissingArgumentOrSubcommand => {
+            if let Some((command, subcommands)) = group {
+                message = format!("{command} needs a subcommand: {}", subcommands.join(", "));
+                details["valid_values"] = json!(subcommands);
+            }
+        }
+        _ => {}
     }
     if let Some(usage) = strings(ContextKind::Usage).first() {
         let usage = usage.trim();

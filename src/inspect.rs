@@ -58,8 +58,7 @@ pub enum PreviewFormat {
     Png,
 }
 
-/// Check an inspection request. The messages avoid the words that classify
-/// errors as timeouts, so a bad value exits as a usage error.
+/// Check an inspection request.
 pub fn validate(
     fresh: u32,
     timeout_ms: u64,

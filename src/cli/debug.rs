@@ -82,11 +82,20 @@ fn hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Commands `debug rpc` refuses: worker-internal ones.
+/// Commands `debug rpc` refuses: worker-internal ones, and the old
+/// single-value reads and writes that get_values, set_values, exec and
+/// feature_list replace (set_values is the one ordered, atomic write).
 fn public(command: &SessionCommand) -> bool {
     !matches!(
         command,
-        SessionCommand::Grab { .. } | SessionCommand::OptimizeNetwork { .. }
+        SessionCommand::Grab { .. }
+            | SessionCommand::OptimizeNetwork { .. }
+            | SessionCommand::Get { .. }
+            | SessionCommand::Set { .. }
+            | SessionCommand::SetMany { .. }
+            | SessionCommand::Execute { .. }
+            | SessionCommand::Features
+            | SessionCommand::Discover { .. }
     )
 }
 
@@ -185,7 +194,10 @@ pub fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
                 .validate()
                 .map_err(|error| Usage(format!("{error:#}")))?;
             if !public(&command) {
-                return Err(Usage("that command belongs to camera workers".into()).into());
+                return Err(Usage(
+                    "debug rpc does not take that command; see capturefab schema debug rpc".into(),
+                )
+                .into());
             }
             if matches!(&command, SessionCommand::Capture { output, .. } if output == "-") {
                 return Err(Usage("debug rpc captures need an output file".into()).into());
@@ -230,6 +242,11 @@ mod tests {
         assert!(hex("💡").is_err());
         assert_eq!(parse_address("0x100").unwrap(), 256);
         assert!(!public(&SessionCommand::Grab { timeout_ms: 1 }));
+        assert!(!public(&SessionCommand::Set {
+            feature: "Width".into(),
+            value: "320".into()
+        }));
+        assert!(!public(&SessionCommand::Features));
         assert!(public(&SessionCommand::Status));
     }
 }

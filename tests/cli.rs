@@ -416,11 +416,15 @@ fn network_scan_preserves_active_non_gige_streams() {
     assert!(report["cameras"].is_array());
     assert!(report.get("warnings").is_none_or(Value::is_array));
     assert!(report["time"].is_string());
-    assert!(report["cameras"].as_array().unwrap().iter().all(
-        |camera| camera["camera"]["transport"] == "gig_e"
-            && camera["active"] == false
-            && camera["tuning"].is_null()
-    ));
+    assert!(
+        report["cameras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|camera| camera["camera"]["kind"] == "gige"
+                && camera["active"] == false
+                && camera["tuning"].is_null())
+    );
     let after = json(&dir, &["--json", "--session", "network-ci", "status"]);
     let (after, before) = (&after["cameras"][0], &before["cameras"][0]);
     assert_eq!(after["info"]["id"], before["info"]["id"]);
@@ -2144,9 +2148,9 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
     let before = session(&["get", "ExposureTime", "Gain"]);
     let value = |name: &str| before["values"][name].to_string();
     let changed = ok(
-        r#"{"op":"set_many","values":[{"feature":"ExposureTime","value":"40000"},{"feature":"Gain","value":"0"}]}"#,
+        r#"{"op":"set_values","values":[{"name":"ExposureTime","value":"40000"},{"name":"Gain","value":"0"}]}"#,
     );
-    assert_eq!(changed["values"][0]["name"], "ExposureTime");
+    assert_eq!(changed["changed"][0]["name"], "ExposureTime");
     let bright = ok(r#"{"op":"frame","max_dimension":0}"#);
     assert!(
         bright["exposure"]["highlights"].as_f64().unwrap() > 0.2,

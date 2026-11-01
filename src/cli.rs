@@ -76,19 +76,32 @@ pub struct Global {
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
     /// Use this running session (`serve --name NAME`)
-    #[arg(
-        long,
-        global = true,
-        value_name = "NAME",
-        env = "CAPTUREFAB_SESSION",
-        conflicts_with = "no_session"
-    )]
+    #[arg(long, global = true, value_name = "NAME", env = "CAPTUREFAB_SESSION")]
     pub session: Option<String>,
     /// Never use a running session: open the camera in a worker of this command
     #[arg(long, global = true)]
     pub no_session: bool,
+    /// The session came from CAPTUREFAB_SESSION, not --session: a default
+    /// that --no-session and binary stdout override.
+    #[arg(skip)]
+    pub session_from_env: bool,
 }
 impl Global {
+    /// Let `--no-session` override a CAPTUREFAB_SESSION default; both typed
+    /// is a mistake.
+    pub fn settle_session(&mut self, typed: bool) -> Result<()> {
+        if self.session.is_some() && self.no_session {
+            if typed {
+                return Err(Usage(
+                    "--session and --no-session contradict each other; pass one".into(),
+                )
+                .into());
+            }
+            self.session = None;
+        }
+        self.session_from_env = self.session.is_some() && !typed;
+        Ok(())
+    }
     pub fn output(&self) -> Output {
         Output {
             json: self.json,
@@ -134,15 +147,24 @@ pub enum Command {
     )]
     Exec(camera::ExecArgs),
     /// Saved camera settings (host-side, portable between cameras of a model)
-    #[command(subcommand)]
+    #[command(
+        subcommand,
+        after_help = "A preset lives on this computer and can be applied to any camera of the model; a user set (exec UserSetSave[UserSet1], or preset apply --persist) lives in the camera.\n\nExamples:\n  capturefab preset save bench -c sim:0\n  capturefab preset apply bench -c sim:0 --dry-run\n  capturefab preset list"
+    )]
     Preset(preset::PresetCommand),
     #[command(flatten)]
     Legacy(legacy::LegacyCommand),
     /// Save camera sign-ins for rtsp:// and ONVIF cameras in the OS credential store
-    #[command(subcommand)]
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin\n  capturefab login list\n  capturefab login rm rtsp://cam.local/stream"
+    )]
     Login(login::LoginCommand),
     /// Resolve an ONVIF camera's RTSP streams
-    #[command(subcommand)]
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  capturefab onvif resolve cam.local\n  capturefab onvif resolve cam.local --profile Profile_1"
+    )]
     Onvif(onvif::OnvifCommand),
     /// Check GigE network paths; --tune applies bandwidth sharing to cameras
     #[command(
@@ -166,7 +188,10 @@ pub enum Command {
     )]
     Completions { shell: clap_complete::Shell },
     /// Protocol tools: GenICam XML, raw registers, one session request
-    #[command(subcommand)]
+    #[command(
+        subcommand,
+        after_help = "Examples:\n  capturefab debug xml -c sim:0 > camera.xml\n  capturefab debug read -c sim:0 0x100 4\n  echo '{\"op\":\"status\"}' | capturefab --session bench debug rpc"
+    )]
     Debug(debug::DebugCommand),
     /// Print Capturefab's license and the bundled FFmpeg's license notice
     #[command(after_help = "Examples:\n  capturefab licenses\n  capturefab --json licenses")]
@@ -182,11 +207,15 @@ pub fn main() -> i32 {
         Ok(matches) => matches,
         Err(error) => return clap_failure(&error, json),
     };
-    let cli = match Cli::from_arg_matches(&matches) {
+    let mut cli = match Cli::from_arg_matches(&matches) {
         Ok(cli) => cli,
         Err(error) => return clap_failure(&error.format(&mut command), json),
     };
     let out = cli.global.output();
+    let typed = matches.value_source("session") == Some(clap::parser::ValueSource::CommandLine);
+    if let Err(error) = cli.global.settle_session(typed) {
+        return out.error(&error);
+    }
     match run(cli) {
         Ok(Some(report)) => out.result(report),
         Ok(None) => 0,
@@ -201,11 +230,40 @@ fn clap_failure(error: &clap::Error, json: bool) -> i32 {
         return 0;
     }
     if json {
-        let _ = output::write_json(&output::clap_error(error));
+        let _ = output::write_json(&output::clap_error(error, missing_subcommand()));
     } else {
         let _ = error.print();
     }
     2
+}
+
+/// The deepest command group the arguments name, with its subcommands:
+/// what a missing-subcommand error lists.
+fn missing_subcommand() -> Option<(String, Vec<String>)> {
+    let mut command = Cli::tree();
+    let mut path = vec!["capturefab".to_owned()];
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--session" {
+            args.next();
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        match command.find_subcommand(&arg) {
+            Some(sub) => {
+                path.push(sub.get_name().to_owned());
+                command = sub.clone();
+            }
+            None => break,
+        }
+    }
+    let subcommands = command
+        .get_subcommands()
+        .filter(|sub| !sub.is_hide_set())
+        .map(|sub| sub.get_name().to_owned())
+        .collect::<Vec<_>>();
+    (!subcommands.is_empty()).then(|| (path.join(" "), subcommands))
 }
 
 /// Run a parsed command. `None` when it printed its own output.
@@ -238,13 +296,22 @@ pub fn run(mut cli: Cli) -> Result<Option<Report>> {
         Command::Doctor => doctor::doctor(global),
         Command::Schema { command } => schema::run(global, &command)?,
         Command::Completions { shell } => {
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "capturefab",
-                &mut std::io::stdout(),
-            );
-            return Ok(None);
+            if !global.json {
+                clap_complete::generate(
+                    shell,
+                    &mut Cli::command(),
+                    "capturefab",
+                    &mut std::io::stdout(),
+                );
+                return Ok(None);
+            }
+            // One document in JSON mode: the script as a string.
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "capturefab", &mut script);
+            Report::json(json!({
+                "shell": shell.to_string(),
+                "script": String::from_utf8_lossy(&script),
+            }))
         }
         Command::Debug(command) => return debug::run(global, command),
         Command::Licenses => doctor::licenses(),
@@ -524,7 +591,6 @@ mod tests {
         }
         for args in [
             &["capturefab", "--camera", "sim:0", "info"][..],
-            &["capturefab", "--session", "a", "--no-session", "info"],
             &["capturefab", "discover"],
             &["capturefab", "version"],
             &["capturefab", "setup", "list"],
@@ -534,6 +600,29 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn no_session_overrides_only_an_environment_session() {
+        let global = |session: Option<&str>, no_session| Global {
+            session: session.map(str::to_owned),
+            no_session,
+            ..Global::default()
+        };
+        let mut env = global(Some("bench"), true);
+        env.settle_session(false).unwrap();
+        assert_eq!(env.session, None);
+        let mut typed = global(Some("bench"), true);
+        assert_eq!(
+            error_code(&typed.settle_session(true).unwrap_err()),
+            ("usage", 2)
+        );
+        let mut default = global(Some("bench"), false);
+        default.settle_session(false).unwrap();
+        assert!(default.session_from_env);
+        let mut flag = global(Some("bench"), false);
+        flag.settle_session(true).unwrap();
+        assert!(!flag.session_from_env);
     }
 
     #[test]

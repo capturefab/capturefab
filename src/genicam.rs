@@ -432,6 +432,11 @@ impl NodeMap {
         }
         "rw"
     }
+    /// A maximum the feature's declaration fixes as a number, which no
+    /// other setting can move.
+    pub(crate) fn static_max(&self, name: &str) -> Option<f64> {
+        literal(self.nodes.get(name)?.prop("Max")?).ok()?.as_f64()
+    }
     /// The node's GenICam kind, such as `Float` or `IntReg`.
     pub(crate) fn kind(&self, name: &str) -> Option<&str> {
         self.nodes.get(name).map(|node| node.kind.as_str())

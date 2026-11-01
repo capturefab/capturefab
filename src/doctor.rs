@@ -135,7 +135,7 @@ struct UsbCamera {
 struct Facts {
     /// Where sessions are found, with their short-lived files.
     runtime: Place,
-    /// Settings, saved setups and the storage ledger.
+    /// Presets, saved sign-ins and the storage ledger.
     state: Place,
     /// CAPTUREFAB_SESSION_DIR chose both.
     session_dir_set: bool,
@@ -151,7 +151,6 @@ struct Facts {
     /// Bytes counted against the budget, reservations included; None while
     /// the ledger's usage is unknown.
     used: Option<u64>,
-    working_directory: Place,
     /// The default capture folder's disk, where `storage --json` measures.
     captures: Place,
     /// IPv4 adapters, for the full report only: `serve`'s warnings never
@@ -162,6 +161,9 @@ struct Facts {
     ffmpeg: Option<Result<FfmpegHealth, String>>,
     /// CAPTUREFAB_FFMPEG chose FFmpeg.
     ffmpeg_overridden: bool,
+    /// Files in the state directory that version 0.5 wrote and nothing
+    /// reads any more.
+    leftovers: Vec<PathBuf>,
     /// The runtime or state directory, where it exists but sessions would
     /// refuse it, and why.
     private_dirs: Vec<(PathBuf, String)>,
@@ -190,7 +192,13 @@ impl Facts {
                 private_dirs.push((dir, format!("{error:#}")));
             }
         }
+        let leftovers = LEFTOVERS
+            .iter()
+            .map(|name| state.join(name))
+            .filter(|path| path.symlink_metadata().is_ok())
+            .collect();
         Self {
+            leftovers,
             interfaces: report.then(|| crate::network::interfaces().unwrap_or_default()),
             ffmpeg: report
                 .then(|| crate::media::ffmpeg_health().map_err(|error| format!("{error:#}"))),
@@ -216,7 +224,6 @@ impl Facts {
             }),
             limits: limits(),
             usb: usb_cameras(),
-            working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
             captures: capture_place(),
         }
     }
@@ -329,6 +336,7 @@ fn checks(facts: &Facts) -> Vec<Check> {
             .as_ref()
             .map(|health| ffmpeg_check(health, facts.ffmpeg_overridden, cfg!(debug_assertions))),
     );
+    checks.extend(leftovers_check(&facts.leftovers));
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
     checks.extend(
@@ -355,7 +363,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
             "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
         ),
         format!(
-            "{fix} Settings, saved setups and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
+            "{fix} Presets, saved sign-ins and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
         ),
     )
 }
@@ -435,7 +443,7 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
         return Check::ok(
             "session_storage",
             format!(
-                "Settings, saved setups and the storage ledger are in {}.",
+                "Presets, saved sign-ins and the storage ledger are in {}.",
                 state.described()
             ),
         );
@@ -443,7 +451,7 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
     let mut check = Check::ok(
         "session_storage",
         format!(
-            "Settings, saved setups and the storage ledger are in memory in {} and are cleared at reboot.",
+            "Presets, saved sign-ins and the storage ledger are in memory in {} and are cleared at reboot.",
             state.described()
         ),
     );
@@ -455,6 +463,48 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
         "To keep them, set CAPTUREFAB_SESSION_DIR to a folder on disk.".into()
     });
     check
+}
+
+/// What version 0.5 kept in the state directory for the desktop app,
+/// hubs, destinations, the assistant, resource limits and update checks.
+const LEFTOVERS: [&str; 12] = [
+    "gui.prefs.json",
+    "hubs.json",
+    "hubs.lock",
+    "destinations.json",
+    "destinations.lock",
+    "assistant.json",
+    "assistant.lock",
+    "assistant",
+    "resources.json",
+    "resources.lock",
+    "updates.json",
+    "updates.lock",
+];
+
+/// Leftovers of version 0.5, with the command that removes them.
+fn leftovers_check(leftovers: &[PathBuf]) -> Option<Check> {
+    if leftovers.is_empty() {
+        return None;
+    }
+    let names = leftovers
+        .iter()
+        .map(|path| crate::hint::shell_quote(&path.display().to_string()))
+        .collect::<Vec<_>>();
+    let fix = if cfg!(windows) {
+        format!("Remove-Item -Recurse -Force {}", names.join(","))
+    } else {
+        format!("rm -r {}", names.join(" "))
+    };
+    Some(Check::warn(
+        "leftover_state",
+        format!(
+            "{} file{} from Capturefab 0.5 that nothing reads any more (desktop, hubs, destinations, assistant or update settings).",
+            leftovers.len(),
+            if leftovers.len() == 1 { "" } else { "s" }
+        ),
+        fix,
+    ))
 }
 
 /// A runtime or state directory that sessions refuse to use.
@@ -1024,7 +1074,7 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.message,
-            "Settings, saved setups and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
+            "Presets, saved sign-ins and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
         );
         assert_eq!(check.fix, None);
         // Memory is only ever chosen, so it informs rather than warns, with
@@ -1239,7 +1289,7 @@ mod tests {
         assert_eq!(none.fix, None);
         assert!(
             none.message.starts_with("No wired Ethernet adapter is up.")
-                && !none.message.contains("network-scan"),
+                && !none.message.contains("capturefab network"),
             "{}",
             none.message
         );
@@ -1348,7 +1398,8 @@ mod tests {
         let code = crate::types::error_transport_code(&error);
         assert_eq!(code, Some("permission_denied"));
         // As a worker reply carries it to the coordinator and the CLI.
-        let rebuilt = crate::types::error_from_transport(code, format!("{error:#}"));
+        let rebuilt =
+            crate::types::error_from_tag(crate::types::error_tag(&error), format!("{error:#}"));
         assert_eq!(crate::cli::error_code(&rebuilt).1, 3);
         let message = format!("{rebuilt:#}");
         assert_eq!(

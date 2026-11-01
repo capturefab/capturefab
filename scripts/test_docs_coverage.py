@@ -70,12 +70,13 @@ class SourceParserTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             write(root, "src/session.rs", '''enum SessionCommand {
-                SetMany { values: Vec<String> },
+                SetValues { values: Vec<String> },
                 ReplayCameraChange { token: String },
                 #[serde(rename = "special")] DifferentName,
                 Grab { timeout_ms: u64 },
+                SetMany { values: Vec<String> },
             }''')
-            self.assertEqual(coverage.rpc_names(root), {"set_many", "replay_camera_change", "special"})
+            self.assertEqual(coverage.rpc_names(root), {"set_values", "replay_camera_change", "special"})
 
     def test_unterminated_source_fails_closed(self):
         for source in ['/* no end', 'r##"no end', '"no end']:
@@ -123,6 +124,11 @@ class SourceParserTests(unittest.TestCase):
             write(root, "src/cli/camera.rs", 'pub struct ListArgs { #[arg(long)] kind: String }')
             commands, arguments = coverage.command_paths(root, with_arguments=True)
             self.assertEqual(commands, {"help", "preset", "preset save", "preset list", "capture", "list"})
+            # Without clap's help subcommand there is none to document.
+            source = (root / "src/cli.rs").read_text(encoding="utf-8")
+            write(root, "src/cli.rs", "#[command(disable_help_subcommand = true)]\n" + source)
+            commands = coverage.command_paths(root)
+            self.assertNotIn("help", commands)
             self.assertEqual(arguments["preset"], set())
             self.assertEqual(arguments["preset save"], {"NAME"})
             self.assertEqual(arguments["capture"], {"-o"})

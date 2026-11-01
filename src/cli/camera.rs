@@ -192,6 +192,7 @@ pub fn info(global: &Global, args: InfoArgs) -> Result<Report> {
 
 fn shown(value: &Value) -> String {
     match value {
+        Value::Null => String::new(),
         Value::String(text) => text.clone(),
         Value::Number(number) => {
             let text = number.to_string();
@@ -377,7 +378,17 @@ pub fn get(global: &Global, args: GetArgs) -> Result<Report> {
     let mut cameras = Vec::new();
     let mut text = String::new();
     for camera in &args.cameras.cameras {
-        let value = read(Some(camera))?;
+        let value = match read(Some(camera)) {
+            Ok(value) => value,
+            // The cameras already read go with the error.
+            Err(error) if !cameras.is_empty() => {
+                return Err(crate::types::with_details(
+                    error,
+                    json!({ "cameras": cameras }),
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         let _ = writeln!(text, "{}:", value["camera"].as_str().unwrap_or(camera));
         for line in lines(&value).lines() {
             let _ = writeln!(text, "  {line}");
@@ -432,6 +443,9 @@ pub fn set(global: &Global, args: SetArgs) -> Result<Report> {
             row.get("from").map(shown).unwrap_or_else(|| "?".into()),
             row.get("to").map(shown).unwrap_or_else(|| "?".into())
         );
+    }
+    for warning in value["warnings"].as_array().into_iter().flatten() {
+        let _ = writeln!(text, "Note: {}", shown(warning));
     }
     Ok(Report::json(value).text(text))
 }

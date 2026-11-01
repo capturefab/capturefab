@@ -454,6 +454,10 @@ impl LegacyClient {
                         Duration::from_secs(60),
                     )?;
                     client.target = result["connected"]["id"].as_str().map(str::to_owned);
+                } else {
+                    // The session refuses a camera it does not hold rather
+                    // than acting on its only one.
+                    client.target = Some(selector.to_owned());
                 }
             } else if needs_target && state["cameras"].as_array().is_some_and(|c| !c.is_empty()) {
                 client.target = Some(super::only_camera(name, &state)?);
@@ -493,12 +497,16 @@ fn legacy_session(global: &Global, command: &LegacyCommand) -> Result<Option<Str
     {
         return Ok(None);
     }
-    if let Some(session) = &global.session {
+    if let Some(session) = global.session.as_ref().filter(|_| !global.session_from_env) {
         return Ok(Some(session.clone()));
     }
-    // Binary stdout belongs to a worker of this command.
+    // Binary stdout belongs to a worker of this command, also when
+    // CAPTUREFAB_SESSION names a session for the others.
     if matches!(command, LegacyCommand::Capture { output, .. } if output == "-") {
         return Ok(None);
+    }
+    if let Some(session) = &global.session {
+        return Ok(Some(session.clone()));
     }
     let sessions = ipc::active_sessions()?;
     match sessions.as_slice() {

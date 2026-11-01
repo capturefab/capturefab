@@ -81,7 +81,7 @@ fn unreadable(h: &WorkerHandle, feature: &str, at: &[Bank], error: &anyhow::Erro
     };
     h.log(
         "warn",
-        format!("Setup: could not read {feature}{place}: {error:#}"),
+        format!("Preset: could not read {feature}{place}: {error:#}"),
     );
     let timed_out = crate::types::error_transport_code(error) == Some("timeout")
         || format!("{error:#}")
@@ -233,7 +233,7 @@ pub(super) fn read(
                 skipped.push(skip(
                     &name,
                     Vec::new(),
-                    "addressed by selectors a setup cannot use",
+                    "addressed by selectors a preset cannot use",
                 ));
                 break;
             }
@@ -264,7 +264,7 @@ pub(super) fn read(
                             at,
                         });
                     }
-                    None => skipped.push(skip(&name, at, "not a value a setup can hold")),
+                    None => skipped.push(skip(&name, at, "not a value a preset can hold")),
                 },
                 Ok(BankRead::ReadOnly) => quiet.push(skip(&name, at, "read-only")),
                 Ok(BankRead::Unavailable) => quiet.push(skip(&name, at, "not available")),
@@ -421,7 +421,7 @@ impl Plan {
             return Err(Categorized::error(
                 ErrorKind::Unsupported,
                 format!(
-                    "Setup {} cannot be applied strictly; nothing changed. Not applicable: {}",
+                    "Preset {} cannot be applied strictly; nothing changed. Not applicable: {}",
                     self.name,
                     failing.join(", ")
                 ),
@@ -461,7 +461,7 @@ pub(super) fn close(current: &Value, target: &Value, inc: Option<f64>) -> bool {
 }
 
 /// What a value that is unavailable now says in the diff.
-const LATER: &str = "applies only if earlier changes in this setup enable it";
+const LATER: &str = "applies only if earlier changes in this preset enable it";
 
 fn row(
     camera: &mut Camera,
@@ -501,13 +501,13 @@ fn row(
     }
     let kind = camera.node_kind(feature).unwrap_or_default().to_owned();
     if crate::setup::managed(feature, None, Some(&kind)) {
-        set(&mut row, Status::Refused, "not allowed in a setup".into());
+        set(&mut row, Status::Refused, "not allowed in a preset".into());
         return row;
     }
     let selectors = camera.selectors(feature);
     for bank in &value.at {
         if managed_name(&bank.selector) || !bank.selector.ends_with("Selector") {
-            set(&mut row, Status::Refused, "not allowed in a setup".into());
+            set(&mut row, Status::Refused, "not allowed in a preset".into());
             return row;
         }
         if !camera.has(&bank.selector) {
@@ -551,7 +551,7 @@ fn row(
                 set(
                     &mut row,
                     Status::Skipped,
-                    format!("set by {flag} = {mode} in this setup"),
+                    format!("set by {flag} = {mode} in this preset"),
                 );
                 return row;
             }
@@ -632,7 +632,7 @@ fn row(
             &mut row,
             Status::Invalid,
             format!(
-                "{feature} holds a {} on this camera, but the setup has a {}",
+                "{feature} holds a {} on this camera, but the preset has a {}",
                 number_kind(&current),
                 number_kind(&target)
             ),
@@ -673,7 +673,7 @@ fn row(
         if below || above {
             let limit = |limit: Option<f64>| limit.map_or("?".into(), |l| l.to_string());
             row.warning = Some(format!(
-                "outside the current limits ({}..{}); restoring fails and puts every value back unless earlier changes in this setup widen them",
+                "outside the current limits ({}..{}); restoring fails and puts every value back unless earlier changes in this preset widen them",
                 limit(bounds.min),
                 limit(bounds.max)
             ));
@@ -766,7 +766,7 @@ pub(super) fn plan(
         restarts_stream,
         blocked: (restarts_stream && !holders.is_empty()).then(|| {
             format!(
-                "Stop {} first: this setup changes {}.",
+                "Stop {} first: this preset changes {}.",
                 holders.join(" and "),
                 locked.join(", ")
             )
@@ -816,7 +816,7 @@ fn outcome(plan: &Plan, info: &crate::types::CameraInfo, unavailable: &BTreeSet<
                 entry["status"] = json!(status.as_str());
                 entry["saved"] = row.saved.to_value();
                 entry["reason"] =
-                    json!("still not available after the other changes in this setup");
+                    json!("still not available after the other changes in this preset");
                 not_applied.push(entry);
             }
             Status::Same => {
@@ -927,6 +927,9 @@ pub(super) fn restore_ordered(
     let total = targets.len();
     let mut pending = targets.iter().collect::<Vec<_>>();
     let mut errors = Vec::new();
+    // The typed error of each write that failed in the last pass, so the
+    // change fails with its reason (out_of_range, feature_locked, ...).
+    let mut causes: BTreeMap<Address, anyhow::Error> = BTreeMap::new();
     let mut written = BTreeSet::new();
     for pass in 1..=total.clamp(2, 4) {
         if pending.is_empty() {
@@ -941,20 +944,25 @@ pub(super) fn restore_ordered(
             h.log(
                 "info",
                 format!(
-                    "Restoring setup {name}: pass {pass}, {} values left",
+                    "Restoring preset {name}: pass {pass}, {} values left",
                     pending.len()
                 ),
             );
         }
         let settled = total - pending.len();
         let mut failures = BTreeMap::new();
+        causes.clear();
         for (count, (address, target)) in pending.iter().map(|t| (&t.0, &t.1)).enumerate() {
-            ensure!(
-                Instant::now() < deadline,
-                "setup restore exceeded {} s after {} of {total} values",
-                limit.as_secs(),
-                settled + count
-            );
+            if Instant::now() >= deadline {
+                return Err(crate::types::Categorized::error(
+                    crate::types::ErrorKind::Timeout,
+                    format!(
+                        "preset restore exceeded {} s after {} of {total} values",
+                        limit.as_secs(),
+                        settled + count
+                    ),
+                ));
+            }
             let result = addressed(camera, address, |camera| {
                 // A current value an earlier write hid can still be replaced.
                 if let Ok(current) = camera.get(&address.feature)
@@ -972,6 +980,7 @@ pub(super) fn restore_ordered(
                 Ok(false) => {}
                 Err(error) => {
                     failures.insert(address.clone(), format!("{error:#}"));
+                    causes.insert(address.clone(), error);
                 }
             }
         }
@@ -1016,15 +1025,46 @@ pub(super) fn restore_ordered(
         true
     });
     errors.retain(|(address, _)| !unavailable.contains(address));
-    ensure!(
-        pending.is_empty(),
-        "could not restore setup values: {}",
-        errors
+    if !pending.is_empty() {
+        let message = format!(
+            "could not restore preset values: {}",
+            errors
+                .iter()
+                .map(|(_, error)| error.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        let failures = errors
             .iter()
-            .map(|(_, error)| error.as_str())
-            .collect::<Vec<_>>()
-            .join("; ")
-    );
+            .map(|(address, error)| {
+                json!({
+                    "feature": address.feature,
+                    "at": (!address.selectors.is_empty()).then(|| bank_text(&banks(address))),
+                    "error": error,
+                })
+            })
+            .collect::<Vec<_>>();
+        // The first write's own reason and details, the rest beside them.
+        let first = errors
+            .iter()
+            .find_map(|(address, _)| causes.remove(address));
+        let classified = first.as_ref().map(crate::types::classify);
+        let mut details = classified
+            .as_ref()
+            .and_then(|classified| classified.details.clone())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        details["failures"] = json!(failures);
+        let mut error = crate::types::Categorized::new(
+            classified
+                .as_ref()
+                .map_or(crate::types::ErrorKind::OperationFailed, |c| c.kind),
+            message,
+        )
+        .details(details);
+        error.hint = classified.and_then(|classified| classified.hint);
+        return Err(error.into());
+    }
     Ok(Restored {
         written,
         unavailable,
@@ -1089,7 +1129,7 @@ pub(super) fn apply(
         release_auto(h, auto, camera, false)?;
         h.log(
             "info",
-            format!("Switched to manual mode to restore setup {}", setup.name),
+            format!("Switched to manual mode to restore preset {}", setup.name),
         );
     } else if let Some(controller) = auto.as_mut() {
         controller.invalidate();
@@ -1100,7 +1140,7 @@ pub(super) fn apply(
         return Err(Categorized::error(
             ErrorKind::Unsupported,
             format!(
-                "Setup {} cannot be applied strictly: {} stayed unavailable after the other changes",
+                "Preset {} cannot be applied strictly: {} stayed unavailable after the other changes",
                 setup.name,
                 restored
                     .unavailable
@@ -1138,7 +1178,7 @@ pub(super) fn apply(
     h.log(
         "info",
         format!(
-            "Restored setup {}: {applied} changed{}",
+            "Restored preset {}: {applied} changed{}",
             setup.name,
             auto_change
                 .words()
@@ -1273,7 +1313,7 @@ mod tests {
         let blocked = diff(&h, &narrow).unwrap();
         assert_eq!(
             blocked["blocked"],
-            "Stop scheduled captures first: this setup changes Width."
+            "Stop scheduled captures first: this preset changes Width."
         );
         let error = apply(&h, &narrow).unwrap_err();
         assert_eq!(
@@ -1406,14 +1446,25 @@ mod tests {
         );
         let error = apply(&h, &setup).unwrap_err();
         assert!(
-            format!("{error:#}").contains("could not restore setup values"),
+            format!("{error:#}").contains("could not restore preset values"),
             "{error:#}"
         );
-        assert_eq!(
-            error.to_string(),
-            "Restoring setup bench failed; every value was put back"
+        assert!(
+            error
+                .to_string()
+                .starts_with("Restoring preset bench failed; every value was put back: "),
+            "{error}"
         );
-        assert_eq!(crate::cli::error_code(&error).0, "failed");
+        // The write's own reason, with what was put back.
+        assert_eq!(crate::cli::error_code(&error), ("out_of_range", 2));
+        let details = crate::types::classify(&error).details.unwrap();
+        assert_eq!(details["feature"], "Width", "{details}");
+        assert_eq!(details["failures"][0]["feature"], "Width", "{details}");
+        let restored = details["rollback"]["restored"].as_array().unwrap();
+        assert!(
+            restored.contains(&json!("Gain")) && restored.contains(&json!("ExposureTime")),
+            "{details}"
+        );
         assert_eq!(get(&h, "Gain").as_f64(), Some(5.0));
         assert_eq!(get(&h, "ExposureTime").as_f64(), Some(7000.0));
         assert_eq!(get(&h, "Width"), 640);
@@ -1429,9 +1480,11 @@ mod tests {
             }
         }
         let error = apply(&h, &gain).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "Restoring setup bench failed; every value was put back; the stream was restarted"
+        assert!(
+            error.to_string().starts_with(
+                "Restoring preset bench failed; every value was put back; the stream was restarted: "
+            ),
+            "{error}"
         );
         assert!(h.snapshot().streaming);
         assert_eq!(get(&h, "Width"), 320);
@@ -1476,7 +1529,7 @@ mod tests {
                 .logs
                 .iter()
                 .any(|l| l.message
-                    == "Restored setup auto: 0 changed; auto exposure on (balance 0.25)"),
+                    == "Restored preset auto: 0 changed; auto exposure on (balance 0.25)"),
             "{:?}",
             h.snapshot().logs
         );
@@ -1786,7 +1839,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "setup restore exceeded 0 s after 0 of 1 values"
+            "preset restore exceeded 0 s after 0 of 1 values"
         );
         assert_eq!(rig.c().get("TriggerMode").unwrap(), "Off");
         rig.h.shutdown();
@@ -2108,7 +2161,7 @@ mod tests {
             source["warning"]
                 .as_str()
                 .unwrap()
-                .contains("applies only if earlier changes in this setup enable it")
+                .contains("applies only if earlier changes in this preset enable it")
         );
         let format = change(&preview, "PixelFormat").unwrap();
         assert_eq!(
@@ -2165,7 +2218,7 @@ mod tests {
         assert_eq!(applied["not_applied"][0]["feature"], "LineSource");
         assert_eq!(
             applied["not_applied"][0]["reason"],
-            "still not available after the other changes in this setup"
+            "still not available after the other changes in this preset"
         );
         // A symbol or feature the camera does not have stays not applicable.
         let mut unknown = setup.clone();
@@ -2281,7 +2334,7 @@ mod tests {
         assert_eq!(row["status"], "skipped");
         assert_eq!(
             row["reason"],
-            "set by ExposureAuto = Continuous in this setup"
+            "set by ExposureAuto = Continuous in this preset"
         );
         rig.h.shutdown();
     }

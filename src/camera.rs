@@ -109,12 +109,13 @@ pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<
 /// `webcam`, `screen` (a screen or Desk View capture), `onvif`, `stream`,
 /// `file` or `sim`.
 pub fn kind(info: &CameraInfo) -> &'static str {
+    let source = media_source(info);
     match info.transport {
         Transport::GigE => "gige",
         Transport::Usb3 => "u3v",
         Transport::Simulator => "sim",
-        Transport::Media if crate::onvif::is_source(&info.id) => "onvif",
-        Transport::Media if crate::media::is_host_camera(&info.id) => {
+        Transport::Media if crate::onvif::is_source(source) => "onvif",
+        Transport::Media if crate::media::is_host_camera(source) => {
             let name = info.model.to_ascii_lowercase();
             if name.starts_with("capture screen") || name.contains("desk view") {
                 "screen"
@@ -122,8 +123,17 @@ pub fn kind(info: &CameraInfo) -> &'static str {
                 "webcam"
             }
         }
-        Transport::Media if info.id.contains("://") => "stream",
+        Transport::Media if source.contains("://") => "stream",
         Transport::Media => "file",
+    }
+}
+
+/// What an FFmpeg source reads: a listed device's ID, or for an opened
+/// source (ID `media:HASH`) the redacted selector it was opened with.
+pub fn media_source(info: &CameraInfo) -> &str {
+    match &info.address {
+        Some(address) if info.id.starts_with("media:") => address,
+        _ => &info.id,
     }
 }
 
@@ -353,8 +363,8 @@ fn simulator_typo(selector: &str) -> Option<String> {
         .then(|| format!("sim:{digits}"))
 }
 
-/// `Pattern camera`, the simulator's model, which discovery lists only
-/// with `--simulate`.
+/// `Pattern camera`, the simulator's model, which `list` shows only with
+/// `--kind sim`.
 fn simulator_model(selector: &str) -> Option<String> {
     selector
         .trim()
@@ -680,6 +690,9 @@ impl Camera {
     pub(crate) fn static_access(&self, name: &str) -> &'static str {
         self.nodes.static_access(name)
     }
+    pub(crate) fn static_max(&self, name: &str) -> Option<f64> {
+        self.nodes.static_max(name)
+    }
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
         ensure!(name != TL_PARAMS_LOCKED, "{TL_PARAMS_LOCKED_MESSAGE}");
         self.software_triggers = None;
@@ -991,6 +1004,24 @@ pub(crate) mod tests {
     use super::*;
     use crate::camera_profile::{CameraCapability, CameraKind, DetectionSource};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn opened_media_sources_keep_their_kind() {
+        let clip = std::env::temp_dir().join(format!("capturefab-kind-{}.mkv", std::process::id()));
+        std::fs::write(&clip, b"").unwrap();
+        for (selector, kind) in [
+            ("avfoundation:0", "webcam"),
+            ("v4l2:/dev/video0", "webcam"),
+            ("rtsp://user:secret@camera.local/live", "stream"),
+            ("http://camera.local/snapshot.jpg", "stream"),
+            (clip.to_str().unwrap(), "file"),
+        ] {
+            let info = crate::media::info(selector).unwrap();
+            assert!(info.id.starts_with("media:"), "{selector}");
+            assert_eq!(super::kind(&info), kind, "{selector}");
+        }
+        let _ = std::fs::remove_file(&clip);
+    }
 
     const PAYLOAD: u64 = 0x00;
     const ACQUISITION_START: u64 = 0x04;

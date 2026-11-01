@@ -1,7 +1,7 @@
 //! A guard against writing to an external volume that is not mounted: an
 //! unplugged drive's mount point is otherwise just an empty directory on the
 //! system disk.
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::path::{Component, Path, PathBuf};
 
 /// Decode the octal escapes fstab uses for spaces and tabs.
@@ -176,10 +176,15 @@ fn present_in(path: &Path, declared: &[PathBuf]) -> Result<()> {
     #[cfg(not(unix))]
     let present = root.is_dir();
     if !present {
-        bail!(
-            "external volume {} is not mounted; reconnect it or choose another destination",
-            root.display()
-        );
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::Unavailable,
+            format!(
+                "external volume {} is not mounted; reconnect it or choose another destination",
+                root.display()
+            ),
+        )
+        .details(serde_json::json!({"path": root}))
+        .into());
     }
     Ok(())
 }
@@ -250,6 +255,7 @@ mod tests {
         let declared = [point.clone()];
         let error = present_in(&point.join("captures/a.png"), &declared).unwrap_err();
         assert!(error.to_string().contains("is not mounted"), "{error}");
+        assert_eq!(crate::cli::output::error_code(&error), ("unavailable", 3));
         present_in(Path::new("/tmp/capturefab/a.png"), &declared).unwrap();
         std::fs::remove_dir_all(&point).unwrap();
         if cfg!(target_os = "linux") {

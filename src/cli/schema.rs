@@ -57,6 +57,18 @@ const EFFECTS: &[(&str, &str)] = &[
     ("licenses", "read"),
 ];
 
+/// A saved preset document, as `preset show` prints it.
+const PRESET_DOCUMENT: &[(&str, &str)] = &[
+    ("version", "int — document version"),
+    ("name", "string"),
+    ("saved_at", "string — RFC 3339"),
+    ("note", "string"),
+    ("camera", "{transport,vendor,model,serial?,kind}"),
+    ("auto", "{balance} — Capturefab auto mode, when saved on"),
+    ("values", "[{feature,value,at?:[{selector,value}]}]"),
+    ("skipped", "[{feature,at?,reason}]"),
+];
+
 /// Result fields of the commands that have a typed contract.
 fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
     Some(match command {
@@ -78,23 +90,31 @@ fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
             ("dir", "string — the folder that holds presets"),
             (
                 "presets",
-                "[{name,saved_at,values,camera,note?,status?,reason?}]",
+                "[{name,transport?,vendor,model,serial?,saved_at,values,note?,status?:unreadable|newer_version,reason?}] — values is a count",
             ),
         ],
-        "preset show" => &[
-            ("version", "int — document version"),
-            ("name", "string"),
-            ("saved_at", "string — RFC 3339"),
-            ("note", "string"),
-            ("camera", "{transport,vendor,model,serial?,kind}"),
-            ("auto", "{balance} — Capturefab auto mode, when saved on"),
-            ("values", "[{feature,value,at?:[{selector,value}]}]"),
-            ("skipped", "[{feature,at?,reason}]"),
-        ],
+        "preset show" => PRESET_DOCUMENT,
         "preset rm" => &[("removed", "string — the preset's name")],
         "preset export" => &[
             ("preset", "string — with -o: the preset's name"),
             ("path", "string — with -o: the file written"),
+            (
+                "version",
+                "int — without -o: the document itself, as preset show prints it",
+            ),
+            ("name", "string — without -o"),
+            ("saved_at", "string — without -o"),
+            ("note", "string — without -o"),
+            (
+                "camera",
+                "{transport,vendor,model,serial?,kind} — without -o",
+            ),
+            ("auto", "{balance} — without -o"),
+            (
+                "values",
+                "[{feature,value,at?:[{selector,value}]}] — without -o",
+            ),
+            ("skipped", "[{feature,at?,reason}] — without -o"),
         ],
         "login list" => &[
             ("logins", "[{address,user,saved_at}] — never passwords"),
@@ -120,6 +140,13 @@ fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
         ],
         "debug read" => &[("address", "int"), ("hex", "string — the bytes read")],
         "debug write" => &[("address", "int"), ("written", "int — bytes")],
+        "completions" => &[
+            ("shell", "string — with --json"),
+            (
+                "script",
+                "string — with --json: the completion script; without it, the script alone",
+            ),
+        ],
         "schema" => &[
             ("contract_version", "int"),
             ("commands", "[{name,summary,effect}]"),
@@ -188,6 +215,10 @@ fn errors(command: &str) -> &'static [&'static str] {
         ],
         "preset apply" => &[
             "unsupported",
+            "out_of_range",
+            "invalid_choice",
+            "not_writable",
+            "feature_locked",
             "camera_not_found",
             "camera_busy",
             "unavailable",
@@ -368,7 +399,7 @@ fn overview() -> Value {
         "commands": commands,
         "conventions": {
             "json": "--json (or CAPTUREFAB_JSON=1): exactly one single-line document on stdout. Exit 0: the result. Non-zero: {\"error\":{code,message,hint?,details?}}; code is a specific reason (errors), the exit code its category. No null values; warnings ≤10",
-            "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION), --no-session; before or after the command",
+            "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION, which --no-session overrides), --no-session; before or after the command",
             "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
             "routing": "A camera command uses --session NAME, else a running session that holds the camera, else a worker of its own; --no-session forces its own",
             "results": "snake_case keys; units in names (exposure_us); times RFC 3339 UTC; lists bounded with truncated",
