@@ -230,13 +230,19 @@ fn link_metadata() -> HashMap<String, LinkMetadata> {
 fn bounded_output(program: &str, arguments: &[&str]) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // A session started without a console would otherwise open one for it.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut output = String::new();

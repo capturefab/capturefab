@@ -431,7 +431,8 @@ impl Shared {
             self.kill();
         }
     }
-    fn kill(&self) {
+    /// End the process and everything it started.
+    pub(super) fn kill(&self) {
         let mut child = locked(&self.child);
         if matches!(child.try_wait(), Ok(Some(_))) {
             return;

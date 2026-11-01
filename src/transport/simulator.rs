@@ -31,6 +31,9 @@ pub fn open(selector: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
     if let Some(source) = replay_source(selector) {
         replay::open(source, 640, 480, 30.0, timeout)
     } else {
+        if let Some(delay) = test_hook(selector, "connect=after:") {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
         Ok(Box::new(Simulator::for_selector(selector)))
     }
 }
@@ -198,6 +201,12 @@ pub struct Simulator {
 }
 /// The frame count of a selector's `?panic=after:N`, when test hooks are on.
 fn panic_after(selector: &str) -> Option<u64> {
+    test_hook(selector, "panic=after:")
+}
+/// The number after `prefix` in a selector's options, when test hooks are
+/// on: `?panic=after:N` frames, or `?connect=after:MS`, which makes opening
+/// the camera take that long.
+fn test_hook(selector: &str, prefix: &str) -> Option<u64> {
     if std::env::var_os("CAPTUREFAB_TEST_HOOKS").is_none_or(|hooks| hooks != "1") {
         return None;
     }
@@ -205,7 +214,7 @@ fn panic_after(selector: &str) -> Option<u64> {
         .split_once('?')?
         .1
         .split('&')
-        .find_map(|option| option.strip_prefix("panic=after:")?.parse().ok())
+        .find_map(|option| option.strip_prefix(prefix)?.parse().ok())
 }
 impl Default for Simulator {
     fn default() -> Self {

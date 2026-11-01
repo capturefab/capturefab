@@ -82,9 +82,7 @@ fn hex(s: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-/// Commands `debug rpc` refuses: worker-internal ones, and the old
-/// single-value reads and writes that get_values, set_values, exec and
-/// feature_list replace (set_values is the one ordered, atomic write).
+/// Commands `debug rpc` refuses: discover, which `list` performs.
 fn public(command: &SessionCommand) -> bool {
     !matches!(command, SessionCommand::Discover { .. })
 }

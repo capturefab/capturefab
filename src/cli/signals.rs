@@ -3,9 +3,10 @@
 //! finishes its own work on a signal (capture, record, serve) takes them
 //! over; any other exits at once with `interrupted`, leaving its camera
 //! worker to finish the request in hand and close. A second signal always
-//! exits at once, with an `interrupted` error unless the command already
-//! printed its document. The first signal sets the exit code: 130 for
-//! SIGINT, 143 for SIGTERM, 129 for SIGHUP.
+//! exits at once, ending the camera workers this process started with
+//! everything they started, with an `interrupted` error unless the command
+//! already printed its document. The first signal sets the exit code: 130
+//! for SIGINT, 143 for SIGTERM, 129 for SIGHUP.
 use super::output::Output;
 use anyhow::Result;
 use std::sync::{
@@ -20,6 +21,8 @@ static SIGNAL: AtomicI32 = AtomicI32::new(0);
 /// Set by commands that end their own work on a signal.
 static GRACEFUL: AtomicBool = AtomicBool::new(false);
 static HANDLERS: Mutex<Vec<Handler>> = Mutex::new(Vec::new());
+/// Run on a second signal, before the process exits.
+static KILLERS: Mutex<Vec<Handler>> = Mutex::new(Vec::new());
 static OUTPUT: OnceLock<Output> = OnceLock::new();
 
 const SIGINT: i32 = 2;
@@ -51,6 +54,16 @@ pub fn on_signal(handler: impl FnMut() + Send + 'static) {
         .push(Box::new(handler));
 }
 
+/// Run `killer` on a second signal, just before the process exits: what
+/// ends the camera workers this process started, which lead process
+/// groups of their own and so never see the terminal's signal.
+pub fn on_second(killer: impl FnMut() + Send + 'static) {
+    KILLERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(Box::new(killer));
+}
+
 /// Handle signals for this invocation, reporting with `out`.
 pub fn install(out: Output) -> Result<()> {
     if OUTPUT.set(out).is_err() {
@@ -80,6 +93,10 @@ fn first() {
 /// A second signal: give up at once, with the error document unless the
 /// command printed its own.
 fn second() -> ! {
+    let killers = std::mem::take(&mut *KILLERS.lock().unwrap_or_else(|e| e.into_inner()));
+    for mut killer in killers {
+        killer();
+    }
     let out = OUTPUT.get().copied().unwrap_or_default();
     let error = crate::types::Categorized::error(
         crate::types::ErrorKind::Interrupted,

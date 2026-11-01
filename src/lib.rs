@@ -72,8 +72,8 @@ pub mod testing {
     }
     pub mod frame {
         pub use crate::frame::{
-            MAX_META, convert, encode, encode_with_meta, exposure, gray8, pixel_format_name, rgb,
-            rgba, sharpness,
+            MAX_META, encode, encode_with_meta, exposure, gray8, pixel_format_name, rgb, rgba,
+            sharpness,
         };
     }
     pub mod inspect {

@@ -577,8 +577,9 @@ fn status(global: &Global, name: Option<String>) -> Result<Report> {
             "  {}  {}{}",
             camera["id"].as_str().unwrap_or_default(),
             camera["state"].as_str().unwrap_or_default(),
-            camera["error"]
+            camera["error"]["message"]
                 .as_str()
+                .or(camera["last_error"].as_str())
                 .map(|error| format!("  last error: {error}"))
                 .unwrap_or_default()
         );
@@ -614,14 +615,47 @@ fn camera_state(camera: &Value) -> Value {
     if let Some(frames) = camera["frames"].as_u64().filter(|frames| *frames > 0) {
         value["frames"] = json!(frames);
         value["dropped"] = json!(camera["dropped"].as_u64().unwrap_or(0));
+        value["lost"] = json!(camera["lost"].as_u64().unwrap_or(0));
+        if let Some(incomplete) = camera["incomplete"].as_u64() {
+            value["incomplete"] = json!(incomplete);
+        }
     }
-    if let Some(error) = camera["last_error"].as_str() {
-        value["error"] = json!(crate::scrub::redact_urls(error));
+    // Why the worker is gone, or could not answer: its reason, and for a
+    // crash its exit, signal and last lines of stderr.
+    if let Some(error) = camera["error"].as_object() {
+        let mut shown = json!({
+            "code": error.get("code").and_then(Value::as_str).unwrap_or("failed"),
+            "message": crate::scrub::redact_urls(
+                error.get("message").and_then(Value::as_str).unwrap_or_default()
+            ),
+        });
+        if let Some(hint) = error.get("hint").and_then(Value::as_str) {
+            shown["hint"] = json!(crate::scrub::redact_urls(hint));
+        }
+        if let Some(details) = error.get("details").filter(|details| details.is_object()) {
+            let mut details = details.clone();
+            redact_texts(&mut details);
+            shown["details"] = details;
+        }
+        value["error"] = shown;
+    } else if let Some(error) = camera["last_error"].as_str() {
+        value["last_error"] = json!(crate::scrub::redact_urls(error));
     }
     if let Some(config) = camera["config_state"].as_str() {
         value["config_state"] = json!(config);
     }
     value
+}
+
+/// Redact URL credentials in every string of `value`, wherever in the text
+/// they appear, as in a worker's stderr lines.
+fn redact_texts(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = crate::scrub::redact_urls(text),
+        Value::Array(values) => values.iter_mut().for_each(redact_texts),
+        Value::Object(fields) => fields.values_mut().for_each(redact_texts),
+        _ => {}
+    }
 }
 
 fn list() -> Result<Report> {
@@ -680,7 +714,7 @@ pub const STATUS_FIELDS: &[(&str, &str)] = &[
     ("uptime_s", "int"),
     (
         "cameras",
-        "[{id,state:idle|streaming|recording|error,error?,config_state?:unknown,frames?,dropped?,jobs:[job]}] — job as jobs lists it; error: the camera's worker exited, and the next command on the camera starts another; config_state unknown: it exited during a settings change, until settings are written again",
+        "[{id,state:idle|streaming|recording|error,error?:{code,message,hint?,details?:{exit?,signal?,stderr_tail?}},last_error?,config_state?:unknown,frames?,dropped?,lost?,incomplete?,jobs:[job]}] — job as jobs lists it; error: the camera's worker exited (code worker_crashed, with its exit status or signal and last lines of stderr) or did not answer, and the next command on the camera starts another; last_error: the worker's last logged error; lost: frames lost on the way, incomplete: frames the transport received incomplete, where it can tell; config_state unknown: it exited during a settings change, until settings are written again",
     ),
 ];
 pub const LIST_FIELDS: &[(&str, &str)] =

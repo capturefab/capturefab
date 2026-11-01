@@ -661,9 +661,6 @@ fn probe_identity(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
     Ok(info)
 }
 
-/// Confirm a camera's unicast control path, without acquiring control or
-/// changing any register. Broadcast discovery alone does not prove reachability.
-/// All three reads share one deadline, including retries and pending ACKs.
 /// How long the camera at `info` keeps the control privilege of a
 /// controller that went silent: its heartbeat timeout, which anyone may read.
 pub fn heartbeat_timeout(info: &CameraInfo, timeout: Duration) -> Result<Duration> {
@@ -678,6 +675,9 @@ pub fn heartbeat_timeout(info: &CameraInfo, timeout: Duration) -> Result<Duratio
         control.read_register(HEARTBEAT_TIMEOUT)?,
     )))
 }
+/// Confirm a camera's unicast control path, without acquiring control or
+/// changing any register. Broadcast discovery alone does not prove reachability.
+/// All three reads share one deadline, including retries and pending ACKs.
 pub fn probe_network(ip: Ipv4Addr, timeout: Duration) -> Result<Ipv4Addr> {
     ensure!(
         !ip.is_unspecified() && !ip.is_multicast() && ip != Ipv4Addr::BROADCAST,

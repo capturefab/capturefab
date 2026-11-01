@@ -698,7 +698,12 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         }
         .waiting(args.timeout),
     )?;
-    signals::take_over();
+    // A worker of this command is told to end the capture on a signal,
+    // which then reports it. A session's capture ends as this command exits
+    // on the signal: the session cancels it when the connection closes.
+    if client.session().is_none() {
+        signals::take_over();
+    }
     prepare(&client, args, plan)?;
     let request = |stdout: Option<String>| SessionCommand::Capture {
         output: "-".into(),
@@ -714,6 +719,12 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     };
     let copied = if client.session().is_some() {
         let file = stdout_file()?;
+        signals::on_signal({
+            let file = file.clone();
+            move || {
+                let _ = std::fs::remove_file(&file);
+            }
+        });
         let reply = client.call(request(Some(file.to_string_lossy().into_owned())));
         let copied = reply.as_ref().ok().map(|_| {
             std::fs::File::open(&file)

@@ -367,6 +367,253 @@ fn a_panicking_worker_is_reported_with_its_last_words() {
     assert!(started.elapsed() < Duration::from_secs(5));
     let camera = &home.ok(&["session", "status", "panic"])["cameras"][0];
     assert_eq!(camera["state"], "error", "{camera}");
+    let error = &camera["error"];
+    assert_eq!(error["code"], "worker_crashed", "{camera}");
+    assert!(
+        error["details"]["stderr_tail"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|line| line.as_str().unwrap().contains("simulated camera fault")),
+        "{camera}"
+    );
+}
+
+/// A session told to stop while a camera connects stops all the same: the
+/// camera that connects as the shutdown runs is refused and its worker
+/// ended, not kept for no one. Here the shutdown runs a while because
+/// another camera's worker was stopped.
+#[cfg(unix)]
+#[test]
+fn a_session_stops_while_a_camera_connects() {
+    let home = Home::new("fault-late");
+    let mut command = home.command();
+    command.env("CAPTUREFAB_TEST_HOOKS", "1");
+    let mut session = home.serve_in(&mut command, "late", &["sim:1"], &[]);
+    let stuck = worker_pid(&home, "late");
+    let connecting = home
+        .command()
+        .env("CAPTUREFAB_TEST_HOOKS", "1")
+        .args([
+            "--json",
+            "--session",
+            "late",
+            "get",
+            "-c",
+            "sim:0?connect=after:2000",
+            "Width",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+    send(stuck, libc::SIGSTOP);
+    send(session.child.id() as i32, libc::SIGTERM);
+    let output = connecting.wait_with_output().unwrap();
+    let error = &document(&output)["error"];
+    assert_eq!(output.status.code(), Some(3), "{error}");
+    assert!(
+        error["message"].as_str().unwrap().contains("shutting down"),
+        "{error}"
+    );
+    // Only the stopped worker is left while the shutdown waits for it.
+    let children = std::process::Command::new("pgrep")
+        .args(["-P", &session.child.id().to_string()])
+        .output()
+        .unwrap();
+    let left = String::from_utf8_lossy(&children.stdout)
+        .lines()
+        .map(|pid| pid.trim().parse::<i32>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(left, [stuck]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while session.child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the session did not stop");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!support::cli::process_lives(stuck));
+}
+
+/// A client killed while it waits for a capture that saves nothing, as on
+/// a camera waiting for a trigger, is noticed when it goes: the job is
+/// stopped once its lease runs out, ten seconds later.
+#[cfg(unix)]
+#[test]
+fn a_killed_client_of_a_quiet_capture_is_noticed_when_it_goes() {
+    let home = Home::new("fault-quiet");
+    let _session = home.serve("quiet", &["sim:0"]);
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "TriggerMode=On",
+        "TriggerSource=Line0",
+    ]);
+    let mut child = home
+        .command()
+        .args([
+            "--json",
+            "capture",
+            "-c",
+            "sim:0",
+            "-o",
+            "shot.png",
+            "--timeout",
+            "none",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        home.ok(&["jobs"])["jobs"][0]["state"].as_str(),
+        Some("armed" | "running")
+    ) {
+        assert!(Instant::now() < deadline, "no job started");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let killed = Instant::now();
+    loop {
+        let jobs = home.ok(&["jobs"]);
+        if jobs["jobs"][0]["state"] == "cancelled" {
+            break;
+        }
+        assert!(
+            killed.elapsed() < Duration::from_secs(16),
+            "the job ran on: {jobs}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        killed.elapsed() >= Duration::from_secs(5),
+        "not before the lease"
+    );
+}
+
+/// SIGINT to a capture to stdout through a session ends it at once, and the
+/// camera is free for the session's next command.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_session_capture_to_stdout_frees_the_camera() {
+    let home = Home::new("fault-stdout");
+    let _session = home.serve("held", &["sim:0"]);
+    home.ok(&[
+        "set",
+        "-c",
+        "sim:0",
+        "TriggerMode=On",
+        "TriggerSource=Line0",
+    ]);
+    let image = std::fs::File::create(home.path("image")).unwrap();
+    let mut child = home
+        .command()
+        .args([
+            "--json",
+            "capture",
+            "-c",
+            "sim:0",
+            "-o",
+            "-",
+            "--timeout",
+            "none",
+        ])
+        .stdout(image)
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+    let asked = Instant::now();
+    let status = support::cli::signal_and_wait(&mut child, libc::SIGINT);
+    assert_eq!(status.code(), Some(130));
+    assert!(asked.elapsed() < Duration::from_secs(3));
+    let asked = Instant::now();
+    assert_eq!(
+        home.ok(&["get", "-c", "sim:0", "Width"])["values"]["Width"],
+        640
+    );
+    assert!(asked.elapsed() < Duration::from_secs(5));
+    let out = home.sessions.join("out");
+    let left = std::fs::read_dir(&out)
+        .map(|entries| entries.count())
+        .unwrap_or(0);
+    assert_eq!(left, 0, "the private file is deleted");
+}
+
+/// A second signal ends the camera workers of the command, and what they
+/// started, with it: they lead process groups of their own, which the
+/// terminal's signal never reaches. Here the worker is opening its camera,
+/// which takes seconds, and would finish that before it exits.
+#[cfg(unix)]
+#[test]
+fn a_second_signal_ends_the_workers_at_once() {
+    let home = Home::new("fault-twice");
+    let mut child = home
+        .command()
+        .env("CAPTUREFAB_TEST_HOOKS", "1")
+        .args([
+            "--json",
+            "capture",
+            "-c",
+            "sim:0?connect=after:8000",
+            "-o",
+            "shot.png",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let worker = loop {
+        let children = std::process::Command::new("pgrep")
+            .args(["-P", &child.id().to_string()])
+            .output()
+            .unwrap();
+        if let Some(pid) = String::from_utf8_lossy(&children.stdout).lines().next() {
+            break pid.trim().parse::<i32>().unwrap();
+        }
+        assert!(Instant::now() < deadline, "no worker started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    send(child.id() as i32, libc::SIGINT);
+    std::thread::sleep(Duration::from_millis(200));
+    let status = support::cli::signal_and_wait(&mut child, libc::SIGINT);
+    assert_eq!(status.code(), Some(130));
+    let ended = Instant::now();
+    while group_lives(worker) {
+        assert!(
+            ended.elapsed() < Duration::from_secs(2),
+            "the worker's group outlived the command"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A blocking capture on more cameras than a session holds long waits for
+/// saves every frame of every camera: the waits past that limit are short.
+#[cfg(unix)]
+#[test]
+fn a_capture_on_more_cameras_than_long_waits_saves_every_frame() {
+    let home = Home::new("fault-many");
+    let cameras = (0..13)
+        .map(|index| format!("sim:{index}"))
+        .collect::<Vec<_>>();
+    let selectors = cameras.iter().map(String::as_str).collect::<Vec<_>>();
+    let _session = home.serve("many", &selectors);
+    let mut args = vec!["--json", "capture"];
+    for camera in &selectors {
+        args.extend(["-c", camera]);
+    }
+    args.extend(["-n", "2", "--every", "2s", "-o", "shots/{camera}-{seq}.png"]);
+    let run = home.run(&args);
+    let result = run.success();
+    assert_eq!(result["cameras"].as_array().unwrap().len(), 13, "{result}");
+    assert_eq!(files_in(&home.path("shots")).len(), 26);
 }
 
 /// The jobs of a session that died read as lost, with what they saved.

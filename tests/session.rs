@@ -396,8 +396,12 @@ fn a_dead_worker_fails_its_jobs() {
     // The camera is in error until the session stops.
     let camera = &home.ok(&["session", "status", "dead"])["cameras"][0];
     assert_eq!(camera["state"], "error", "{camera}");
+    assert_eq!(camera["error"]["code"], "worker_crashed", "{camera}");
     assert!(
-        camera["error"].as_str().unwrap().contains("exited"),
+        camera["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("exited"),
         "{camera}"
     );
 }

@@ -22,6 +22,8 @@ pub(crate) const LEASE: Duration = Duration::from_secs(10);
 pub(crate) const MAX_WAIT_MS: u64 = 25_000;
 /// How often the book is saved while only counts change.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
+/// How often a wait looks whether its waiter went away.
+const WATCH: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -188,13 +190,6 @@ impl Job {
             }
         }
         detail
-    }
-    /// The error a failed job ends its command with.
-    pub(crate) fn failure(&self) -> anyhow::Error {
-        match &self.error {
-            Some(error) => super::protocol::from_wire(error),
-            None => anyhow::anyhow!("the job failed"),
-        }
     }
     fn touch(&mut self) {
         self.seq += 1;
@@ -488,8 +483,16 @@ impl JobBook {
         Some(found)
     }
     /// Job `number` once it changed after `after_seq` or ended, or as it is
-    /// when `wait` ends. A wait keeps a waited-for job's lease.
-    pub(super) fn wait(&self, number: u64, after_seq: u64, wait: Duration) -> Option<(u64, Job)> {
+    /// when `wait` ends, or once `gone` says its waiter went away. A wait
+    /// keeps a waited-for job's lease; the lease runs out `LEASE` after the
+    /// last wait ends.
+    pub(super) fn wait(
+        &self,
+        number: u64,
+        after_seq: u64,
+        wait: Duration,
+        gone: &dyn Fn() -> bool,
+    ) -> Option<(u64, Job)> {
         let deadline = Instant::now() + wait;
         let mut book = self.lock();
         if let Some(lease) = book.find(number)?.lease.as_mut() {
@@ -506,9 +509,16 @@ impl JobBook {
             }
             book = self
                 .changed
-                .wait_timeout(book, deadline - now)
+                .wait_timeout(book, (deadline - now).min(WATCH))
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
+            // Looked at without the book, which the workers' events need.
+            drop(book);
+            let left = gone();
+            book = self.lock();
+            if left {
+                break;
+            }
         }
         let job = book.find(number)?;
         if let Some(lease) = job.lease.as_mut() {
@@ -677,15 +687,20 @@ mod tests {
     fn waits_return_on_a_change_or_the_end_and_keep_the_lease() {
         let book = std::sync::Arc::new(JobBook::new("bench"));
         let number = book.start(JobKind::Record, "sim:0", None, true);
-        let (seq, job) = book.wait(number, 0, Duration::from_millis(10)).unwrap();
+        let here = || false;
+        let (seq, job) = book
+            .wait(number, 0, Duration::from_millis(10), &here)
+            .unwrap();
         assert_eq!(job.state, JobState::Armed);
         let started = Instant::now();
-        let (later, _) = book.wait(number, seq, Duration::from_millis(50)).unwrap();
+        let (later, _) = book
+            .wait(number, seq, Duration::from_millis(50), &here)
+            .unwrap();
         assert_eq!(later, seq);
         assert!(started.elapsed() >= Duration::from_millis(50));
         let waiter = {
             let book = book.clone();
-            std::thread::spawn(move || book.wait(number, seq, Duration::from_secs(5)))
+            std::thread::spawn(move || book.wait(number, seq, Duration::from_secs(5), &|| false))
         };
         std::thread::sleep(Duration::from_millis(20));
         book.event(&Output::Progress {
@@ -695,6 +710,40 @@ mod tests {
         let (_, job) = waiter.join().unwrap().unwrap();
         assert_eq!(job.state, JobState::Running);
         assert!(book.abandoned().is_empty(), "a wait renews the lease");
+    }
+
+    #[test]
+    fn a_wait_whose_client_left_ends_and_starts_the_lease() {
+        let book = std::sync::Arc::new(JobBook::new("bench"));
+        let number = book.start(JobKind::Capture, "sim:0", Some(1), true);
+        let left = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let (book, left) = (book.clone(), left.clone());
+            std::thread::spawn(move || {
+                let gone = || left.load(std::sync::atomic::Ordering::Acquire);
+                book.wait(number, 1, Duration::from_secs(25), &gone)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            book.lock()
+                .find(number)
+                .unwrap()
+                .lease
+                .as_ref()
+                .unwrap()
+                .waiters,
+            1
+        );
+        let asked = Instant::now();
+        left.store(true, std::sync::atomic::Ordering::Release);
+        let (_, job) = waiter.join().unwrap().unwrap();
+        assert!(asked.elapsed() < Duration::from_secs(1));
+        assert!(!job.state.ended());
+        let mut book = book.lock();
+        let lease = book.find(number).unwrap().lease.clone().unwrap();
+        assert_eq!(lease.waiters, 0);
+        assert!(lease.until > Instant::now() + LEASE - Duration::from_secs(1));
     }
 
     #[test]

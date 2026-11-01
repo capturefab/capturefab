@@ -230,6 +230,7 @@ fn capture(
 /// Add what a write of `feature` is about to replace, at the banks selected
 /// now, to the checkpoint taken before a SetMany: an earlier value of the
 /// same SetMany may have switched a selector to a bank it did not read.
+#[cfg(test)]
 fn extend(camera: &mut Camera, before: &mut Configuration, feature: &str) -> Result<()> {
     for address in addresses(camera, feature, &|_| false)? {
         if let std::collections::btree_map::Entry::Vacant(entry) = before.values.entry(address) {
@@ -354,13 +355,15 @@ fn restore(
     Ok(())
 }
 
-/// Publish the camera after a rollback: its features and auto mode.
+/// Publish the camera after a rollback: its features and auto mode. A
+/// rollback to manual mode ends continuous auto exposure.
 fn publish(h: &WorkerHandle, camera: &mut Option<Camera>, auto: &Option<AutoController>) {
     refresh(h, camera, true);
     if let Some(controller) = auto {
         publish_auto(h, controller);
     } else {
         h.state.write().unwrap_or_else(|e| e.into_inner()).auto = None;
+        end_auto_job(h, JobStatus::Done);
     }
 }
 
@@ -376,6 +379,7 @@ pub(super) fn process(
     command: WorkerCommand,
 ) -> Result<Value> {
     command.validate()?;
+    #[cfg(test)]
     if let WorkerCommand::Set { feature, value } = &command {
         camera_mut(camera)?.validate_set(feature, value)?;
     }
@@ -401,9 +405,11 @@ pub(super) fn process(
     // replace is read first, and a failure puts every value back. A single
     // Set writes several only when it ends auto mode.
     let atomic = match &command {
+        #[cfg(test)]
         WorkerCommand::Set { feature, .. } => auto.as_ref().is_some_and(|a| a.manages(feature)),
-        WorkerCommand::SetMany { .. }
-        | WorkerCommand::Session(
+        #[cfg(test)]
+        WorkerCommand::SetMany { .. } => true,
+        WorkerCommand::Session(
             SessionCommand::Auto { .. }
             | SessionCommand::Manual { .. }
             | SessionCommand::ApplySetup { .. },
@@ -452,17 +458,23 @@ pub(super) fn process(
                     .map(|row| row.address.feature.as_str())
             })
             .collect(),
+        #[cfg(test)]
         WorkerCommand::Set { feature, .. } => vec![feature.as_str()],
+        #[cfg(test)]
         WorkerCommand::SetMany { values } => {
             values.iter().map(|value| value.feature.as_str()).collect()
         }
         _ => Vec::new(),
     };
     let apply_setup = matches!(command.session(), Some(SessionCommand::ApplySetup { .. }));
+    #[cfg(test)]
+    let together = apply_setup || matches!(command, WorkerCommand::SetMany { .. });
+    #[cfg(not(test))]
+    let together = apply_setup;
     let mut before = match capture(h, c, auto, &written) {
         Ok(before) => before,
         // Its values must be restorable together, so it writes none.
-        Err(error) if apply_setup || matches!(command, WorkerCommand::SetMany { .. }) => {
+        Err(error) if together => {
             return Err(error.context(format!(
                 "{} changed nothing: the values it would replace could not be read",
                 if apply_setup {
@@ -490,6 +502,7 @@ pub(super) fn process(
     let mut restart = false;
     let result = match &command {
         // Each write first records the bank it is about to change.
+        #[cfg(test)]
         WorkerCommand::SetMany { values } => {
             super::set_many(h, camera, auto, values, |camera, feature| {
                 extend(camera, &mut before, feature)

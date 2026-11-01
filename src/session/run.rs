@@ -207,21 +207,11 @@ fn read_requests(handle: &WorkerHandle, events: &Events) -> Result<()> {
     }
 }
 
-/// Reply to request `id`. Camera passwords this worker holds never leave
-/// it, even in text a dependency produced.
+/// Reply to request `id`.
 fn answer(events: &Events, id: u64, result: Result<Value>) {
     let (ok, result, error) = match result {
         Ok(result) => (true, Some(result), None),
-        Err(error) => {
-            let mut wire = protocol::wire_error(&error);
-            if crate::scrub::active() {
-                let text = wire.to_string();
-                if let std::borrow::Cow::Owned(clean) = crate::scrub::scrub(&text) {
-                    wire = serde_json::from_str(&clean).unwrap_or(wire);
-                }
-            }
-            (false, None, Some(wire))
-        }
+        Err(error) => (false, None, Some(protocol::wire_error(&error))),
     };
     events.emit(Output::Reply {
         id,
@@ -231,9 +221,7 @@ fn answer(events: &Events, id: u64, result: Result<Value>) {
     });
 }
 
-/// Write the outbox's lines, numbered, until it closes. A line too long for
-/// the pipe is never written: a reply becomes an error, anything else is
-/// dropped with a note on stderr.
+/// Write the outbox's lines, numbered, until it closes.
 fn write_lines(mut output: std::fs::File, events: &Events) {
     let mut seq = 0u64;
     loop {
@@ -242,36 +230,9 @@ fn write_lines(mut output: std::fs::File, events: &Events) {
             Next::Idle => continue,
             Next::Closed => return,
         };
-        let mut data = match serde_json::to_vec(&LineRef { seq, output: &line }) {
-            Ok(data) => data,
-            Err(error) => {
-                crate::eprintln!("capturefab worker: cannot encode a line: {error}");
-                continue;
-            }
+        let Some(mut data) = encode(seq, &line) else {
+            continue;
         };
-        if data.len() >= MAX_LINE {
-            let Output::Reply { id, .. } = line else {
-                crate::eprintln!("capturefab worker: dropped a {} byte line", data.len());
-                continue;
-            };
-            let error = crate::types::Categorized::error(
-                crate::types::ErrorKind::OperationFailed,
-                format!(
-                    "the reply is larger than the {} MiB a reply may be",
-                    MAX_LINE / (1024 * 1024)
-                ),
-            );
-            data = serde_json::to_vec(&LineRef {
-                seq,
-                output: &Output::Reply {
-                    id,
-                    ok: false,
-                    result: None,
-                    error: Some(protocol::wire_error(&error)),
-                },
-            })
-            .unwrap_or_default();
-        }
         data.push(b'\n');
         if output
             .write_all(&data)
@@ -282,6 +243,74 @@ fn write_lines(mut output: std::fs::File, events: &Events) {
             return;
         }
         seq += 1;
+    }
+}
+
+/// Line `seq` as written, without its newline. Camera passwords this worker
+/// holds never leave it, even in text a dependency produced: every string
+/// of every line is scrubbed, replies, log lines and job ends alike. A line
+/// too long for the pipe is never written: a reply becomes an error,
+/// anything else is dropped with a note on stderr.
+fn encode(seq: u64, line: &Output) -> Option<Vec<u8>> {
+    let encoded = if crate::scrub::active() {
+        serde_json::to_value(LineRef { seq, output: line }).and_then(|mut value| {
+            scrub_strings(&mut value);
+            serde_json::to_vec(&value)
+        })
+    } else {
+        serde_json::to_vec(&LineRef { seq, output: line })
+    };
+    let data = match encoded {
+        Ok(data) => data,
+        Err(error) => {
+            crate::eprintln!("capturefab worker: cannot encode a line: {error}");
+            return None;
+        }
+    };
+    if data.len() < MAX_LINE {
+        return Some(data);
+    }
+    let Output::Reply { id, .. } = line else {
+        crate::eprintln!("capturefab worker: dropped a {} byte line", data.len());
+        return None;
+    };
+    let error = crate::types::Categorized::error(
+        crate::types::ErrorKind::OperationFailed,
+        format!(
+            "the reply is larger than the {} MiB a reply may be",
+            MAX_LINE / (1024 * 1024)
+        ),
+    );
+    serde_json::to_vec(&LineRef {
+        seq,
+        output: &Output::Reply {
+            id: *id,
+            ok: false,
+            result: None,
+            error: Some(protocol::wire_error(&error)),
+        },
+    })
+    .ok()
+}
+
+/// Remove registered secrets from every string in `value`, keys included.
+fn scrub_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            if let std::borrow::Cow::Owned(clean) = crate::scrub::scrub(text) {
+                *text = clean;
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(scrub_strings),
+        Value::Object(fields) => {
+            let mut clean = serde_json::Map::new();
+            for (key, mut value) in std::mem::take(fields) {
+                scrub_strings(&mut value);
+                clean.insert(crate::scrub::scrub(&key).into_owned(), value);
+            }
+            *fields = clean;
+        }
+        _ => {}
     }
 }
 
@@ -327,14 +356,23 @@ mod platform {
     use anyhow::Result;
     use std::os::windows::io::FromRawHandle;
 
-    /// The pipe the coordinator passed as handle `handle`.
+    /// The pipe the coordinator passed as handle `handle`. It is made
+    /// uninheritable first, so FFmpeg never holds it: the image's reader
+    /// would wait for FFmpeg to exit to see its end.
     pub(super) fn inherited(handle: u64) -> Result<std::fs::File> {
+        let handle = handle as usize as HANDLE;
         // SAFETY: the coordinator made this pipe handle inheritable for this
         // process alone to write one image to and close.
-        Ok(unsafe { std::fs::File::from_raw_handle(handle as usize as _) })
+        unsafe {
+            SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+            Ok(std::fs::File::from_raw_handle(handle as _))
+        }
     }
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE},
+        Foundation::{
+            CloseHandle, DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE, HANDLE_FLAG_INHERIT,
+            SetHandleInformation,
+        },
         System::{
             Console::{GetStdHandle, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE, SetStdHandle},
             Threading::GetCurrentProcess,
@@ -390,5 +428,61 @@ mod tests {
         assert!(parse(&["--session"]).is_err());
         assert!(parse(&["--output-fd", "x"]).is_err());
         assert!(parse(&["fd:5"]).is_err());
+    }
+
+    #[test]
+    fn no_line_carries_a_registered_password() {
+        let secret = "worker-line-secret-7d1f";
+        crate::scrub::register(secret);
+        let lines = [
+            Output::Log {
+                level: "error".into(),
+                message: format!("rtsp open failed: {secret}"),
+            },
+            Output::Reply {
+                id: 3,
+                ok: true,
+                result: Some(json!({"last_error": format!("auth {secret}"), "logs": [secret]})),
+                error: None,
+            },
+            Output::JobEnd {
+                job: 2,
+                status: protocol::JobStatus::Failed,
+                error: Some(json!({"message": format!("Recording stopped: {secret}")})),
+                summary: json!({ secret: 1 }),
+            },
+        ];
+        for (seq, line) in lines.iter().enumerate() {
+            let data = encode(seq as u64, line).unwrap();
+            let text = String::from_utf8(data).unwrap();
+            assert!(!text.contains(secret), "{text}");
+            assert!(text.contains("<redacted>"), "{text}");
+            let read: protocol::Line = serde_json::from_str(&text).unwrap();
+            assert_eq!(read.seq, seq as u64);
+        }
+    }
+
+    #[test]
+    fn a_reply_too_long_for_the_pipe_becomes_an_error() {
+        let huge = Output::Reply {
+            id: 9,
+            ok: true,
+            result: Some(json!("x".repeat(MAX_LINE))),
+            error: None,
+        };
+        let read: protocol::Line = serde_json::from_slice(&encode(4, &huge).unwrap()).unwrap();
+        assert!(matches!(
+            read.output,
+            Output::Reply {
+                id: 9,
+                ok: false,
+                ..
+            }
+        ));
+        let log = Output::Log {
+            level: "warn".into(),
+            message: "x".repeat(MAX_LINE),
+        };
+        assert!(encode(5, &log).is_none());
     }
 }

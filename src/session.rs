@@ -885,16 +885,15 @@ pub struct WorkerSnapshot {
     pub dropped: u64,
     pub fps: f64,
     pub last_error: Option<String>,
-    /// When the worker last logged an error, UTC Unix milliseconds, so the
-    /// same error logged again can be told from the one before.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error_logged_ms: Option<u64>,
     /// The reason of `last_error`, when it had a typed one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error_tag: Option<crate::types::ErrorTag>,
+    /// The newest lines logged, and how many in all, for tests: log lines
+    /// reach the coordinator as events.
+    #[cfg(test)]
     #[serde(skip)]
     pub logs: Vec<LogEntry>,
-    /// Lines logged in all.
+    #[cfg(test)]
     #[serde(skip)]
     pub logged: u64,
     #[serde(default)]
@@ -1068,6 +1067,32 @@ impl Flight {
     }
 }
 
+/// A caller's hold on its request: cancelling it ends the request in the
+/// worker that runs it, or before it starts.
+#[derive(Default)]
+struct Cancel {
+    cancelled: AtomicBool,
+    running: Mutex<Option<(Arc<Worker>, u64)>>,
+}
+impl Cancel {
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel)
+            && let Some((worker, id)) = locked(&self.running).as_ref()
+        {
+            worker.cancel(*id);
+        }
+    }
+    /// The request is `id` of `worker` now.
+    fn running(&self, worker: &Arc<Worker>, id: u64) {
+        *locked(&self.running) = Some((worker.clone(), id));
+        if self.cancelled.load(Ordering::Acquire) {
+            worker.cancel(id);
+        }
+    }
+}
+/// How often a request run for a client looks whether the client is gone.
+const CLIENT_WATCH: Duration = Duration::from_millis(250);
+
 struct Coordinator {
     /// The name job IDs start with.
     name: String,
@@ -1096,6 +1121,8 @@ struct Coordinator {
     /// The write end of the pipe the next worker writes an image captured
     /// to stdout to, which `stdout_pipe` made.
     output: Mutex<Option<std::io::PipeWriter>>,
+    /// Every worker started, connected yet or not, for `killer`.
+    spawned: Mutex<Vec<Weak<worker::Shared>>>,
 }
 /// Holds one of the bounded command slots; released even if the command panics.
 /// Frame inspections count against their own bound, so observing never
@@ -1264,6 +1291,7 @@ impl SessionHandle {
                 jobs,
                 watchdog: Mutex::new(None),
                 output: Mutex::new(None),
+                spawned: Mutex::default(),
             }),
         };
         let weak = Arc::downgrade(&handle.inner);
@@ -1476,10 +1504,64 @@ impl SessionHandle {
         .into())
     }
     pub fn submit(&self, c: SessionCommand) -> Result<Reply> {
-        self.submit_target(None, c)
+        self.submit_target(None, c, None)
     }
     pub fn submit_to(&self, camera: &str, c: SessionCommand) -> Result<Reply> {
-        self.submit_target(Some(camera.to_owned()), c)
+        self.submit_target(Some(camera.to_owned()), c, None)
+    }
+    /// Run `command` for a client of the session, on `camera` when given,
+    /// while `gone` tells whether that client went away. A job wait then
+    /// ends at once, so the job's lease runs out from then. An inspection
+    /// or a capture to stdout, whose only product is its reply, is
+    /// cancelled in its worker; other commands carry on, as they do when a
+    /// client stops waiting for them.
+    pub fn request_for(
+        &self,
+        camera: Option<&str>,
+        command: SessionCommand,
+        gone: &dyn Fn() -> bool,
+    ) -> Result<Value> {
+        let caller_only = matches!(
+            &command,
+            SessionCommand::Frame { .. }
+                | SessionCommand::Capture {
+                    stdout: Some(_),
+                    ..
+                }
+        );
+        if let SessionCommand::Wait {
+            job,
+            after_seq,
+            timeout_ms,
+        } = &command
+        {
+            command.validate()?;
+            if let Some(camera) = camera {
+                validate_selector(camera)?;
+            }
+            if self.inner.quitting.load(Ordering::Relaxed) {
+                return Err(stopping());
+            }
+            return self.wait_job_while(job, *after_seq, Duration::from_millis(*timeout_ms), gone);
+        }
+        let cancel = caller_only.then(|| Arc::new(Cancel::default()));
+        let reply = self.submit_target(camera.map(str::to_owned), command, cancel.clone())?;
+        let Some(cancel) = cancel else {
+            return reply.recv().context("coordinator stopped")?;
+        };
+        loop {
+            match reply.recv_timeout(CLIENT_WATCH) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if gone() {
+                        cancel.cancel();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("coordinator stopped")
+                }
+            }
+        }
     }
     /// Resolve aliases from cached identities, without waiting for a busy
     /// worker. All names for one camera share an ordering gate.
@@ -1563,7 +1645,12 @@ impl SessionHandle {
             });
         Some(order.reserve())
     }
-    fn submit_target(&self, target: Option<String>, command: SessionCommand) -> Result<Reply> {
+    fn submit_target(
+        &self,
+        target: Option<String>,
+        command: SessionCommand,
+        cancel: Option<Arc<Cancel>>,
+    ) -> Result<Reply> {
         command.validate()?;
         if let Some(camera) = &target {
             validate_selector(camera)?;
@@ -1575,7 +1662,7 @@ impl SessionHandle {
         // turn or an action slot.
         if inline(&command) {
             let (tx, rx) = mpsc::channel();
-            let _ = tx.send(self.process(target.as_deref(), command));
+            let _ = tx.send(self.process(target.as_deref(), command, None));
             return Ok(rx);
         }
         let inspection = matches!(command, SessionCommand::Frame { .. });
@@ -1611,8 +1698,9 @@ impl SessionHandle {
                 } else {
                     // The worker never reads the state directory: a named
                     // setup is loaded here, off the caller's thread.
-                    crate::setup::resolve(command)
-                        .and_then(|command| h.process(target.as_deref(), command))
+                    crate::setup::resolve(command).and_then(|command| {
+                        h.process(target.as_deref(), command, cancel.as_deref())
+                    })
                 };
                 // An inspection's failure is its caller's to report; a slow
                 // or triggered camera must not fill the session log.
@@ -1634,7 +1722,12 @@ impl SessionHandle {
             .recv()
             .context("coordinator stopped")?
     }
-    fn process(&self, target: Option<&str>, command: SessionCommand) -> Result<Value> {
+    fn process(
+        &self,
+        target: Option<&str>,
+        command: SessionCommand,
+        cancel: Option<&Cancel>,
+    ) -> Result<Value> {
         match command {
             SessionCommand::NetworkScan { timeout_ms, tune } => {
                 self.scan_network(Duration::from_millis(timeout_ms), tune)
@@ -1701,7 +1794,15 @@ impl SessionHandle {
                     SessionCommand::SetValues { dry_run: false, .. }
                         | SessionCommand::ApplySetup { .. }
                 );
-                let result = self.worker_of(&held)?.call(command)?;
+                let worker = self.worker_of(&held)?;
+                let result = match cancel {
+                    Some(cancel) => {
+                        let (id, reply) = worker.submit(command.into())?;
+                        cancel.running(&worker, id);
+                        worker.wait(&reply)
+                    }
+                    None => worker.call(command),
+                }?;
                 if let Some(live) = live {
                     held.live.store(live, Ordering::Release);
                 }
@@ -1760,7 +1861,16 @@ impl SessionHandle {
         if held.live.load(Ordering::Acquire) {
             worker.call(SessionCommand::Start)?;
         }
-        *held.worker.write().unwrap_or_else(PoisonError::into_inner) = Some(worker.clone());
+        {
+            let mut current = held.worker.write().unwrap_or_else(PoisonError::into_inner);
+            // As in connect_new: a shutdown has already taken this camera.
+            if self.inner.quitting.load(Ordering::Acquire) {
+                drop(current);
+                worker.close();
+                return Err(stopping());
+            }
+            *current = Some(worker.clone());
+        }
         *locked(&held.crash) = None;
         self.note(
             "info",
@@ -1780,7 +1890,7 @@ impl SessionHandle {
     }
     fn spawn_worker(&self) -> Result<Worker> {
         let weak = Arc::downgrade(&self.inner);
-        Worker::spawn(
+        let worker = Worker::spawn(
             &worker::Options {
                 verbose: self.inner.verbose,
                 session: self.inner.name.clone(),
@@ -1791,7 +1901,29 @@ impl SessionHandle {
                     SessionHandle { inner }.on_signal(shared, signal);
                 }
             }),
-        )
+        )?;
+        let mut spawned = locked(&self.inner.spawned);
+        spawned.retain(|shared| shared.strong_count() > 0);
+        spawned.push(Arc::downgrade(worker.shared()));
+        Ok(worker)
+    }
+    /// What ends every worker of this coordinator and everything they
+    /// started, at once and without finishing anything: for a process about
+    /// to exit on a second signal. It holds the coordinator weakly.
+    pub fn killer(&self) -> impl FnMut() + Send + 'static {
+        let coordinator = Arc::downgrade(&self.inner);
+        move || {
+            let Some(inner) = coordinator.upgrade() else {
+                return;
+            };
+            let spawned = locked(&inner.spawned)
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect::<Vec<_>>();
+            for shared in spawned {
+                shared.kill();
+            }
+        }
     }
     /// A worker's event, or its exit.
     fn on_signal(&self, shared: &worker::Shared, signal: Signal) {
@@ -1959,6 +2091,13 @@ impl SessionHandle {
             .cameras
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        // A shutdown that began meanwhile has taken the cameras already; it
+        // would never end this worker.
+        if self.inner.quitting.load(Ordering::Acquire) {
+            drop(cameras);
+            worker.close();
+            return Err(stopping());
+        }
         if let Some(existing) = cameras.get(&info.id).cloned() {
             // Another name for a camera connected meanwhile: keep the
             // worker clients already use.
@@ -2103,12 +2242,33 @@ impl SessionHandle {
     /// Wait for `job` to change after `after_seq`, or end: `{seq, job,
     /// detail}`.
     pub(crate) fn wait_job(&self, job: &str, after_seq: u64, wait: Duration) -> Result<Value> {
+        self.wait_job_while(job, after_seq, wait, &|| false)
+    }
+    /// A leased capture job of one frame on `camera` that no worker runs,
+    /// for tests of waiting.
+    #[cfg(test)]
+    pub(crate) fn test_job(&self, camera: &str) -> String {
+        let number = self
+            .inner
+            .jobs
+            .start(JobKind::Capture, camera, Some(1), true);
+        format!("{}-{number}", self.inner.name)
+    }
+    /// `wait_job` for a client, which ends early once `gone` says the
+    /// client went away.
+    fn wait_job_while(
+        &self,
+        job: &str,
+        after_seq: u64,
+        wait: Duration,
+        gone: &dyn Fn() -> bool,
+    ) -> Result<Value> {
         let number = self.job_number(job)?;
         let wait = wait.min(Duration::from_millis(jobs::MAX_WAIT_MS));
         let (seq, found) = self
             .inner
             .jobs
-            .wait(number, after_seq, wait)
+            .wait(number, after_seq, wait, gone)
             .ok_or_else(|| self.no_job(job))?;
         Ok(json!({
             "seq": seq,
@@ -2146,6 +2306,7 @@ impl SessionHandle {
                     number,
                     seq,
                     deadline.saturating_duration_since(Instant::now()),
+                    &|| false,
                 )
                 .ok_or_else(|| self.no_job(job))?;
             seq = now;
@@ -2454,13 +2615,8 @@ fn watch(coordinator: Weak<Coordinator>) {
         let Some(inner) = coordinator.upgrade() else {
             return;
         };
-        if inner.quitting.load(Ordering::Acquire)
-            && inner
-                .cameras
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty()
-        {
+        // The shutdown ends the workers and saves the book itself.
+        if inner.quitting.load(Ordering::Acquire) {
             return;
         }
         let handle = SessionHandle { inner };

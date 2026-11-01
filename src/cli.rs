@@ -541,6 +541,7 @@ impl Client {
         };
         crate::camera::validate_selector(&selector)?;
         let local = SessionHandle::direct(out.verbose);
+        signals::on_second(local.killer());
         let stdout = route.stdout.then(|| local.stdout_pipe()).transpose()?;
         let client = Self {
             out,

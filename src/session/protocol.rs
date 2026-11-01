@@ -28,27 +28,23 @@ pub(crate) const MAX_REQUEST: usize = 1024 * 1024;
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WorkerCommand {
     /// Apply this camera's share of the GigE bandwidth a network scan planned.
-    OptimizeNetwork {
-        bytes_per_second: u64,
-    },
-    /// Single-feature reads and writes the setup rollback and tests use.
-    Get {
-        feature: String,
-    },
-    Set {
-        feature: String,
-        value: String,
-    },
+    OptimizeNetwork { bytes_per_second: u64 },
+    /// Single-feature reads and writes, which unit tests drive the camera
+    /// thread with; no coordinator sends them.
+    #[cfg(test)]
+    Get { feature: String },
+    #[cfg(test)]
+    Set { feature: String, value: String },
     /// Write several features in order as one camera change: a failure
-    /// restores every value.
-    SetMany {
-        values: Vec<super::FeatureValue>,
-    },
-    Execute {
-        feature: String,
-    },
+    /// restores every value. Tests drive the rollback checkpoints with it.
+    #[cfg(test)]
+    SetMany { values: Vec<super::FeatureValue> },
+    #[cfg(test)]
+    Execute { feature: String },
+    #[cfg(test)]
     Features,
-    /// End the camera's recording or forward.
+    /// End the camera's recording or forward, as a stop of its job does.
+    #[cfg(test)]
     StopForward,
     #[serde(untagged)]
     Session(SessionCommand),
@@ -76,9 +72,11 @@ impl WorkerCommand {
                 );
                 Ok(())
             }
+            #[cfg(test)]
             Self::Get { feature } | Self::Execute { feature } | Self::Set { feature, .. } => {
                 super::validate_feature(feature)
             }
+            #[cfg(test)]
             Self::SetMany { values } => {
                 ensure!(
                     (1..=super::MAX_SET_MANY).contains(&values.len()),
@@ -89,6 +87,7 @@ impl WorkerCommand {
                 }
                 Ok(())
             }
+            #[cfg(test)]
             Self::Features | Self::StopForward => Ok(()),
             Self::Session(command) => command.validate(),
         }
@@ -97,6 +96,7 @@ impl WorkerCommand {
     /// leave the camera half-configured.
     pub(crate) fn changes_settings(&self) -> bool {
         match self {
+            #[cfg(test)]
             Self::Set { .. } | Self::SetMany { .. } | Self::Execute { .. } => true,
             Self::Session(command) => matches!(
                 command,

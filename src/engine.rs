@@ -22,7 +22,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::session::{FeatureValue, ForwardingProgress, LogEntry, SessionCommand, WorkerSnapshot};
+#[cfg(test)]
+use crate::session::{FeatureValue, LogEntry};
+use crate::session::{ForwardingProgress, SessionCommand, WorkerSnapshot};
 pub(crate) mod events;
 mod history;
 pub(crate) mod inspector;
@@ -34,6 +36,7 @@ pub(crate) mod saved;
 mod saver;
 use events::Events;
 use history::process;
+#[cfg(test)]
 type Reply = Receiver<Result<Value>>;
 /// Where a request's answer goes.
 type Answer = Box<dyn FnOnce(Result<Value>) + Send>;
@@ -300,6 +303,9 @@ impl WorkerHandle {
     pub(crate) fn take_events(&self) -> Vec<Output> {
         self.events.drain()
     }
+    /// Queue `command` and the receiver its answer comes to, as a worker's
+    /// stdin reader does, for tests.
+    #[cfg(test)]
     pub fn submit(&self, command: impl Into<WorkerCommand>) -> Result<Reply> {
         let (reply, rx) = mpsc::channel();
         self.queue_request(
@@ -312,6 +318,7 @@ impl WorkerHandle {
         .map_err(|(error, _)| error)?;
         Ok(rx)
     }
+    #[cfg(test)]
     pub fn request(&self, command: impl Into<WorkerCommand>) -> Result<Value> {
         self.submit(command)?
             .recv()
@@ -607,6 +614,11 @@ fn next_frame(
 ) -> Result<Option<Frame>> {
     loop {
         h.beat();
+        // A worker shutting down ends a wait as its session does, not as a
+        // signal to its caller would.
+        if h.quitting.load(Ordering::Acquire) {
+            return Err(crate::session::stopping());
+        }
         if h.cancelled() {
             return Err(interrupted("capture interrupted"));
         }
@@ -664,6 +676,7 @@ fn settle_auto(
 /// earlier ones (a selector, then the value it selects). `checkpoint` runs
 /// just before each write, with the bank that write changes selected, so
 /// the rollback checkpoint can record the value it replaces.
+#[cfg(test)]
 fn set_many(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
@@ -713,18 +726,20 @@ fn set_many(
     Ok(reply)
 }
 
-/// Add a line to the worker's log; an error also becomes its `last_error`.
+/// Note a line the worker logged: an error becomes its `last_error`, and
+/// tests keep the line.
 fn push_log(s: &mut WorkerSnapshot, level: &str, message: String) {
-    let entry = LogEntry::now(level, message);
     if level == "error" {
-        s.last_error = Some(entry.message.clone());
-        s.error_logged_ms = Some(entry.unix_ms);
+        s.last_error = Some(message.clone());
         s.last_error_tag = None;
     }
-    s.logs.push(entry);
-    s.logged += 1;
-    if s.logs.len() > 200 {
-        s.logs.remove(0);
+    #[cfg(test)]
+    {
+        s.logs.push(LogEntry::now(level, message));
+        s.logged += 1;
+        if s.logs.len() > 200 {
+            s.logs.remove(0);
+        }
     }
 }
 
@@ -1398,9 +1413,11 @@ fn process_plain(
         WorkerCommand::OptimizeNetwork { bytes_per_second } => {
             return optimize_network(h, camera, forwarder, auto, jobs, bytes_per_second);
         }
+        #[cfg(test)]
         WorkerCommand::Get { feature } => {
             return Ok(json!({"name":feature,"value":camera_mut(camera)?.get(&feature)?}));
         }
+        #[cfg(test)]
         WorkerCommand::Set { feature, value } => {
             camera_mut(camera)?.validate_set(&feature, &value)?;
             let switched = auto.as_ref().is_some_and(|a| a.manages(&feature));
@@ -1424,9 +1441,11 @@ fn process_plain(
             return Ok(reply);
         }
         // The rollback checkpoint records each write; see `set_many`.
+        #[cfg(test)]
         WorkerCommand::SetMany { values } => {
             return set_many(h, camera, auto, &values, |_, _| Ok(()));
         }
+        #[cfg(test)]
         WorkerCommand::Execute { feature } => {
             if auto.is_some() && matches!(feature.as_str(), "UserSetLoad" | "UserSetDefault") {
                 release_auto(h, auto, camera, false)?;
@@ -1441,10 +1460,12 @@ fn process_plain(
             refresh(h, camera, true);
             return Ok(json!({"executed":feature}));
         }
+        #[cfg(test)]
         WorkerCommand::Features => {
             refresh(h, camera, true);
             return Ok(json!({"features":h.snapshot().features}));
         }
+        #[cfg(test)]
         WorkerCommand::StopForward => {
             let stats = stop_forward(h, forwarder, auto, Ended::Stopped)?;
             return Ok(json!({"forwarding":null,"stats":stats}));
@@ -1948,6 +1969,8 @@ fn process_plain(
                 None => crate::auto::hold(c),
             };
             h.state.write().unwrap_or_else(|e| e.into_inner()).auto = None;
+            // Continuous auto exposure ended with auto mode.
+            end_auto_job(h, JobStatus::Done);
             refresh(h, camera, true);
             released?;
             h.log("info", "Manual mode".into());
@@ -4573,33 +4596,98 @@ mod tests {
         h.shutdown();
     }
     #[test]
+    fn manual_mode_ends_continuous_auto_exposure() {
+        let h = WorkerHandle::new();
+        connect(&h, "1000");
+        h.request(SessionCommand::Auto {
+            balance: None,
+            continuous: true,
+            job: Some(7),
+        })
+        .unwrap();
+        let ended = |h: &WorkerHandle| {
+            h.take_events()
+                .into_iter()
+                .filter_map(|line| match line {
+                    Output::JobEnd { job, status, .. } => Some((job, status)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(ended(&h).is_empty());
+        h.request(SessionCommand::Manual { revert: false }).unwrap();
+        assert_eq!(ended(&h), [(7, JobStatus::Done)]);
+        // Nothing is left to end at shutdown.
+        h.shutdown();
+        assert!(ended(&h).is_empty());
+    }
+    #[test]
+    fn a_shutdown_ends_a_frame_wait_as_the_session_stopping() {
+        let h = WorkerHandle::new();
+        connect(&h, "1000");
+        // A hardware trigger that never fires, on a stopped camera.
+        set(&h, "TriggerMode", "On");
+        set(&h, "TriggerSource", "Line0");
+        let reply = h
+            .submit(SessionCommand::Frame {
+                fresh: 1,
+                timeout_ms: 10_000,
+                max_dimension: 0,
+                format: Default::default(),
+                region: None,
+                preview: None,
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let asked = Instant::now();
+        let stopper = {
+            let h = h.clone();
+            std::thread::spawn(move || h.shutdown())
+        };
+        let error = reply
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap_err();
+        assert!(asked.elapsed() < Duration::from_secs(3));
+        assert!(crate::session::is_stopping(&error), "{error:#}");
+        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+        stopper.join().unwrap();
+    }
+    #[test]
     fn failed_inspections_leave_the_log_and_last_error_alone() {
         let h = WorkerHandle::new();
-        let logs = h.snapshot().logs.len();
+        let errors = |h: &WorkerHandle| {
+            h.take_events()
+                .into_iter()
+                .filter_map(|line| match line {
+                    Output::Log { level, message } if level == "error" => Some(message),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        errors(&h);
         // Without a camera, an inspection fails like a missed frame would.
         assert!(inspect(&h, 1).is_err());
-        let snapshot = h.snapshot();
-        assert_eq!(snapshot.logs.len(), logs);
-        assert!(snapshot.last_error.is_none() && snapshot.error_logged_ms.is_none());
-        // Other failures are still the worker's to log, each with its time.
+        assert!(errors(&h).is_empty());
+        assert!(h.snapshot().last_error.is_none());
+        // Other failures are still the worker's to log, each time.
         let get = || {
-            h.request(WorkerCommand::Get {
-                feature: "Width".into(),
+            h.request(SessionCommand::GetValues {
+                names: vec![crate::controls::Name::parse("Width").unwrap()],
             })
         };
         assert!(get().is_err());
-        let first = h.snapshot();
-        assert_eq!(
-            (first.logs.len(), first.logged),
-            (logs + 1, logs as u64 + 1)
+        let logged = errors(&h);
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains("no camera connected"), "{logged:?}");
+        assert!(
+            h.snapshot()
+                .last_error
+                .unwrap()
+                .contains("no camera connected")
         );
-        assert!(first.last_error.unwrap().contains("no camera connected"));
-        let logged_ms = first.error_logged_ms.unwrap();
-        assert_eq!(logged_ms, first.logs.last().unwrap().unix_ms);
-        // The same error again is told apart by its time.
-        std::thread::sleep(Duration::from_millis(2));
         assert!(get().is_err());
-        assert!(h.snapshot().error_logged_ms.unwrap() > logged_ms);
+        assert_eq!(errors(&h).len(), 1);
         h.shutdown();
     }
     #[test]

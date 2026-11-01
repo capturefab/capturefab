@@ -87,6 +87,7 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
             return Err(error);
         }
     };
+    signals::on_second(handle.killer());
     let started = (|| -> Result<ipc::Server> {
         // Cameras connect before the session is announced: one that fails
         // ends it, as the person who named it asked for all of them.
