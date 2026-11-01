@@ -429,9 +429,9 @@ def check_image_provenance(root, pages, errors):
         path = manifest_path.parent / str(entry.get("file", ""))
         source = manifest_path.parent / str(entry.get("derived_from", ""))
         if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != entry.get("sha256"):
-            errors.append(f"images/docs/{entry.get('file')}: missing or modified derived image; run scripts/docs-screenshots.py --derive-only")
+            errors.append(f"images/docs/{entry.get('file')}: missing or modified derived image; it no longer matches images/docs/manifest.json")
         elif not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != entry.get("derived_from_sha256"):
-            errors.append(f"images/docs/{entry.get('file')}: its source {entry.get('derived_from')} changed; run scripts/docs-screenshots.py --derive-only")
+            errors.append(f"images/docs/{entry.get('file')}: its source {entry.get('derived_from')} changed since images/docs/manifest.json recorded it")
     for name, page in pages.items():
         for srcset, width, height, priority, src in page.srcsets:
             for candidate in filter(None, (part.strip() for part in srcset.split(","))):
@@ -571,68 +571,6 @@ def check_modules(root, errors):
             for match in PAGE_RELATIVE.finditer(text):
                 call = re.sub(r"\s+", " ", match[1])
                 errors.append(f"{name}: {call}() with a literal URL resolves against the page; pass new URL('./…', import.meta.url)")
-
-
-class TryLaunchers(HTMLParser):
-    """The markup app.js expects for "Try with your webcam"."""
-
-    def __init__(self):
-        super().__init__()
-        self.launchers = []
-        self.notes = []
-        self.statuses = set()
-        self.scripts = []
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        if "data-try-launch" in attrs:
-            self.launchers.append((tag, attrs))
-        if "data-try-note" in attrs:
-            self.notes.append((tag, attrs))
-        if attrs.get("role") == "status" and attrs.get("id"):
-            self.statuses.add(attrs["id"])
-        if tag == "script":
-            self.scripts.append(attrs.get("src", ""))
-
-
-def check_try_launchers(root, errors):
-    """Launchers stay hidden until app.js finds that the workbench can load, and each
-    names the role="status" element where app.js reports why it could not start."""
-    for path in sorted(root.glob("*.html")):
-        page = TryLaunchers()
-        page.feed(path.read_text(encoding="utf-8"))
-        if (page.launchers or page.notes) and "app.js" not in page.scripts:
-            errors.append(f"{path.name}: in-browser launchers need app.js")
-        for tag, attrs in page.launchers:
-            if tag != "button" or attrs.get("type") != "button" or "hidden" not in attrs:
-                errors.append(f"{path.name}: a data-try-launch element must be <button type=\"button\" hidden>")
-            if attrs.get("data-try-launch") not in ("", None, "welcome"):
-                errors.append(f"{path.name}: data-try-launch is empty or \"welcome\", not {attrs.get('data-try-launch')!r}")
-            if attrs.get("aria-describedby") not in page.statuses:
-                errors.append(f"{path.name}: a launcher's aria-describedby must name a role=\"status\" element")
-        for tag, attrs in page.notes:
-            if "hidden" not in attrs:
-                errors.append(f"{path.name}: a data-try-note <{tag}> must start hidden")
-
-
-def check_try_build(repo, errors):
-    """The committed in-browser WebAssembly matches its manifest and the web-try sources."""
-    path = Path(__file__).with_name("build-try.py")
-    if not path.is_file():
-        errors.append("in-browser try: scripts/build-try.py is missing, so web/try/capturefab.wasm cannot be verified")
-        return
-    try:
-        spec = importlib.util.spec_from_file_location("build_try", path)
-        build = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(build)
-        problems = build.check_manifest(repo)
-    except (Exception, SystemExit) as error:  # A broken checker fails the site check with its reason.
-        errors.append(f"in-browser try: scripts/build-try.py cannot verify web/try/capturefab.wasm: {type(error).__name__}: {error}")
-        return
-    if not isinstance(problems, list) or not all(isinstance(problem, str) for problem in problems):
-        errors.append(f"in-browser try: scripts/build-try.py check_manifest returned {type(problems).__name__}, not a list of messages")
-        return
-    errors.extend(f"in-browser try: {problem}" for problem in problems)
 
 
 def check_svgs(root, errors):
@@ -995,7 +933,6 @@ def validate(root=ROOT):
     check_landing(root, errors)
     check_unused_css(root, errors)
     check_modules(root, errors)
-    check_try_launchers(root, errors)
     check_svgs(root, errors)
     for path in sorted(root.rglob("*.css")):
         css = path.read_text(encoding="utf-8")
@@ -1019,8 +956,6 @@ def validate(root=ROOT):
 def main():
     errors, versions = validate()
     check_installer_runs(errors)
-    # Needs the web-try sources beside web/, so it is not part of validate(root).
-    check_try_build(ROOT.parent, errors)
     guides = subprocess.run([sys.executable, str(Path(__file__).with_name("site-guides.py")), "--check"], capture_output=True, text=True)
     if guides.returncode:
         errors.append(guides.stderr.strip() or "web/guides is stale; run scripts/site-guides.py")
@@ -1034,7 +969,7 @@ def main():
         errors.append(f"cannot validate documentation coverage: {error}")
     if errors:
         sys.exit("\n".join(errors))
-    print(f"Static site validated; installers checked and run against a local release, source-based documentation coverage, accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, the in-browser WebAssembly build against its sources, resolvable module paths, no remote runtime dependencies.")
+    print(f"Static site validated; installers checked and run against a local release, source-based documentation coverage, accessible recorded videos and posters, light/dark color contrast, current documentation search, {len(versions)} releases, downloads page and Atom feed, resolvable module paths, no remote runtime dependencies.")
 
 
 if __name__ == "__main__":

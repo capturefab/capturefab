@@ -6,13 +6,14 @@
 use crate::types::{
     Backend, CameraInfo, Categorized, Frame, RegisterIo, Transport, TransportStats,
 };
+use crate::xml_cache;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::{Cursor, ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 const GVCP_PORT: u16 = 3956;
 const DISCOVERY: u16 = 0x0002;
@@ -30,6 +31,11 @@ const PENDING_TIMEOUT: u32 = 0x0958;
 const HEARTBEAT_TIMEOUT: u32 = 0x0938;
 const TIMESTAMP_HIGH: u32 = 0x093c;
 const TIMESTAMP_LOW: u32 = 0x0940;
+/// Timestamp control (bit 30 latches the clock) and the latched value.
+const TIMESTAMP_CONTROL: u32 = 0x0944;
+const TIMESTAMP_LATCH: u32 = 0x0000_0002;
+const TIMESTAMP_VALUE_HIGH: u32 = 0x0948;
+const TIMESTAMP_VALUE_LOW: u32 = 0x094c;
 const STREAM_CAPABILITY: u32 = 0x092c;
 const STREAM_PORT: u32 = 0x0d00;
 const STREAM_PACKET_SIZE: u32 = 0x0d04;
@@ -54,6 +60,9 @@ const RESEND_ROUNDS: u8 = 3;
 const RESEND_RUNS: usize = 32;
 const RESEND_BUDGET: f64 = 4096.0;
 const TRAVERSAL: Duration = Duration::from_secs(10);
+/// The most packets taken in at once when settings change: a 64 MiB
+/// receive buffer of 1500-byte packets.
+const MAX_TAKEN_IN: usize = 50_000;
 
 fn be16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
@@ -71,6 +80,11 @@ fn be64(bytes: &[u8], offset: usize) -> u64 {
             .try_into()
             .expect("checked packet"),
     )
+}
+/// A tick count of the camera's clock in nanoseconds.
+fn ticks_ns(ticks: u64, frequency: u64) -> u64 {
+    ((u128::from(ticks) * 1_000_000_000) / u128::from(frequency.max(1))).min(u128::from(u64::MAX))
+        as u64
 }
 fn bounded_timeout(timeout: Duration) -> Duration {
     timeout.clamp(Duration::from_millis(1), Duration::from_secs(30))
@@ -226,6 +240,14 @@ fn interface_pinned_socket(_index: u32, _name: &str) -> Option<UdpSocket> {
 /// default-route network, and cameras whose address does not match the
 /// interface's subnet (which ignore directed broadcasts) are still listed.
 pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
+    discover_until(timeout, &mut |_| false)
+}
+/// `discover`, telling `found` of each camera as it answers; it returns at
+/// once, with what answered so far, when `found` says that was the one.
+pub fn discover_until(
+    timeout: Duration,
+    found: &mut dyn FnMut(&CameraInfo) -> bool,
+) -> Result<Vec<CameraInfo>> {
     let deadline = Instant::now() + bounded_timeout(timeout);
     let request = command_packet(DISCOVERY, 0xffff, 0x11, &[]);
     let mut sockets = Vec::new();
@@ -324,7 +346,11 @@ pub fn discover(timeout: Duration) -> Result<Vec<CameraInfo>> {
                             continue;
                         }
                         if let Ok(info) = discovery_info(ack.payload, *source.ip()) {
+                            let wanted = !cameras.contains_key(&info.id) && found(&info);
                             cameras.insert(info.id.clone(), info);
+                            if wanted {
+                                return Ok(cameras.into_values().collect());
+                            }
                         }
                     }
                     Ok(_) => {}
@@ -661,6 +687,20 @@ fn probe_identity(ip: Ipv4Addr, timeout: Duration) -> Result<CameraInfo> {
     Ok(info)
 }
 
+/// How long the camera at `info` keeps the control privilege of a
+/// controller that went silent: its heartbeat timeout, which anyone may read.
+pub fn heartbeat_timeout(info: &CameraInfo, timeout: Duration) -> Result<Duration> {
+    let ip: Ipv4Addr = info
+        .address
+        .as_deref()
+        .context("GigE camera has no address")?
+        .parse()
+        .context("invalid camera IPv4 address")?;
+    let mut control = Control::connect(SocketAddrV4::new(ip, GVCP_PORT), timeout)?;
+    Ok(Duration::from_millis(u64::from(
+        control.read_register(HEARTBEAT_TIMEOUT)?,
+    )))
+}
 /// Confirm a camera's unicast control path, without acquiring control or
 /// changing any register. Broadcast discovery alone does not prove reachability.
 /// All three reads share one deadline, including retries and pending ACKs.
@@ -774,10 +814,13 @@ struct GigE {
     stats: TransportStats,
     stream: Option<Stream>,
     xml_cache: Option<String>,
+    /// The key of the XML read from the disk cache, while it may still turn
+    /// out wrong.
+    xml_key: Option<String>,
 }
 
 /// Acquire camera control. An independent heartbeat keeps the connection alive
-/// even while the GUI is idle or waiting for an external trigger.
+/// even while the camera is idle or waiting for an external trigger.
 pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
     let ip: Ipv4Addr = info
         .address
@@ -801,10 +844,13 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         SocketAddr::V4(address) => *address.ip(),
         _ => unreachable!(),
     };
-    ensure!(
-        control.read_register(CONTROL_PRIVILEGE)? & 3 == 0,
-        "camera is controlled by another application; disconnect it first"
-    );
+    if control.read_register(CONTROL_PRIVILEGE)? & 3 != 0 {
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::CameraBusy,
+            "camera is controlled by another application; disconnect it first",
+        )
+        .into());
+    }
     control
         .write_register(CONTROL_PRIVILEGE, 2)
         .context("acquiring camera controller privilege")?;
@@ -889,6 +935,7 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         stats: TransportStats::default(),
         stream: None,
         xml_cache: None,
+        xml_key: None,
     })
 }
 
@@ -918,8 +965,21 @@ impl Backend for GigE {
             let result = (|| -> Result<String> {
                 let url = fixed_text(&self.read_memory(url_address, 512)?);
                 let local = parse_local_url(&url)?;
+                // The URL (a SHA-1 in its query where the device gives one),
+                // the vendor, model and device version, and the end of the
+                // file name the XML on disk.
+                let identity = self.read_memory(0x48, 0x60)?;
+                let tail = xml_cache::TAIL.min(local.length);
+                let end = self.read_memory(local.address + (local.length - tail) as u64, tail)?;
+                let key = xml_cache::key(&[url.as_bytes(), &identity, &end]);
+                if let Some(xml) = xml_cache::load(&key) {
+                    self.xml_key = Some(key);
+                    return Ok(xml);
+                }
                 let data = self.read_memory(local.address, local.length)?;
-                decode_xml(&local.name, data)
+                let xml = decode_xml(&local.name, data)?;
+                xml_cache::store(&key, &xml);
+                Ok(xml)
             })();
             match result {
                 Ok(xml) => {
@@ -934,6 +994,13 @@ impl Backend for GigE {
             }
         }
         bail!("unable to load camera GenICam XML: {}", errors.join("; "))
+    }
+    fn forget_xml(&mut self) -> bool {
+        self.xml_cache = None;
+        self.xml_key
+            .take()
+            .inspect(|key| xml_cache::forget(key))
+            .is_some()
     }
     fn start(&mut self, payload_size: usize) -> Result<()> {
         self.heartbeat.check()?;
@@ -1252,6 +1319,27 @@ impl Backend for GigE {
                 .clone(),
         )
     }
+    fn buffered_frames(&mut self) -> u32 {
+        let camera = IpAddr::V4(self.camera_ip);
+        self.stream
+            .as_mut()
+            .map_or(0, |stream| stream.take_in(camera))
+    }
+    fn device_time_ns(&mut self) -> Option<u64> {
+        if self.timestamp_frequency == 0 || self.stream.is_none() {
+            return None;
+        }
+        let mut control = self.control.lock().ok()?;
+        control
+            .write_register(TIMESTAMP_CONTROL, TIMESTAMP_LATCH)
+            .ok()?;
+        let high = control.read_register(TIMESTAMP_VALUE_HIGH).ok()?;
+        let low = control.read_register(TIMESTAMP_VALUE_LOW).ok()?;
+        Some(ticks_ns(
+            (u64::from(high) << 32) | u64::from(low),
+            self.timestamp_frequency,
+        ))
+    }
 }
 impl Drop for GigE {
     fn drop(&mut self) {
@@ -1558,6 +1646,34 @@ impl Stream {
                 self.timeout
             }
         }
+    }
+    /// Take in every packet that already arrived from `camera`, keeping the
+    /// frames they complete for `next_frame`, which returns them first.
+    /// Returns how many frames it holds that `next_frame` has not returned,
+    /// whole or in part: the socket's buffer can hold several.
+    fn take_in(&mut self, camera: IpAddr) -> u32 {
+        if self.socket.set_nonblocking(true).is_ok() {
+            for _ in 0..MAX_TAKEN_IN {
+                match self.socket.recv_from(&mut self.buffer) {
+                    Ok((length, source)) if source.ip() == camera && source != self.gvcp => {
+                        // The frame it completes, kept in turn; a packet in
+                        // error leaves its frame incomplete, as it would on
+                        // its way to `next_frame`.
+                        if let Ok(Some(frame)) = self
+                            .assembler
+                            .push_at(&self.buffer[..length], Instant::now())
+                        {
+                            self.assembler.ready.push_front(frame);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = self.socket.set_nonblocking(false);
+            self.flush();
+        }
+        u32::try_from(self.assembler.ready.len() + self.assembler.frames.len()).unwrap_or(u32::MAX)
     }
     fn flush(&mut self) {
         for (block, extended, first, last) in self.assembler.requests.drain(..) {
@@ -2272,22 +2388,17 @@ impl Assembler {
         if let Some(bytes) = swapped {
             data.chunks_exact_mut(bytes).for_each(<[u8]>::reverse);
         }
-        let timestamp_ns = if self.timestamp_frequency == 0 {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                .min(u64::MAX as u128) as u64
-        } else {
-            ((leader.timestamp as u128 * 1_000_000_000) / self.timestamp_frequency as u128)
-                .min(u64::MAX as u128) as u64
-        };
+        // Without its tick frequency the camera's clock cannot be read as
+        // nanoseconds; the host time of the frame still says when it came.
+        let device_ts_ns = (self.timestamp_frequency != 0)
+            .then(|| ticks_ns(leader.timestamp, self.timestamp_frequency));
         self.ready.push_back(Frame {
             id: frame.block,
             width: leader.width,
             height,
             pixel_format: leader.pixel_format,
-            timestamp_ns,
+            device_ts_ns,
+            wall_ms: 0,
             data,
         });
     }
@@ -3090,7 +3201,7 @@ mod tests {
             let first = gvsp(id, 1, 3, extended, &[1, 2, 3, 4, 5, 6, 7, 8]);
             let frame = assembler.push(&first).unwrap().unwrap();
             assert_eq!(frame.data, (1..=16).collect::<Vec<_>>());
-            assert_eq!(frame.timestamp_ns, 1_234_000_000);
+            assert_eq!(frame.device_ts_ns, Some(1_234_000_000));
             assert_eq!(frame.id, id);
             assert!(assembler.push(&first).unwrap().is_none());
         }
@@ -4235,6 +4346,35 @@ mod tests {
             (stats.resend_requested, stats.incomplete_frames),
             (before, 0)
         );
+    }
+    #[test]
+    fn frames_waiting_in_the_socket_are_taken_in_and_the_clock_latched() {
+        let (fake, mut gige) = streaming(|camera| {
+            camera.registers.insert(GVCP_CAPABILITY, 0x4);
+            camera.registers.insert(TIMESTAMP_VALUE_HIGH, 1);
+            camera.registers.insert(TIMESTAMP_VALUE_LOW, 500);
+        });
+        fake.send(1, false, &[]);
+        fake.send(2, false, &[]);
+        // The third is still being read out.
+        fake.send(3, false, &[4, 5, 6, 7]);
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(gige.buffered_frames(), 3);
+        for id in 1..=2 {
+            assert_eq!(gige.next_frame(Duration::from_millis(100)).unwrap().id, id);
+        }
+        // Read at a 1 GHz tick, as the camera told at connect.
+        gige.timestamp_frequency = 1_000_000_000;
+        assert_eq!(gige.device_time_ns(), Some((1 << 32) + 500));
+        assert!(
+            fake.camera
+                .lock()
+                .unwrap()
+                .register_writes
+                .contains(&(TIMESTAMP_CONTROL, TIMESTAMP_LATCH))
+        );
+        gige.timestamp_frequency = 0;
+        assert_eq!(gige.device_time_ns(), None);
     }
     #[test]
     fn an_idle_stream_sleeps_until_the_timeout_and_polls_a_frame_in_flight() {

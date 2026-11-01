@@ -135,42 +135,9 @@ capturefab --session bench --camera sim:0 cancel 1 --json
 capturefab --session bench --camera sim:0 stop-forward --json
 ```
 
-## Start from an example
+## Timed recordings
 
-The [example files](../examples/workflows) validate offline. Download them, or run from the
-extracted source folder, and pass their paths. Copy them to your own working directory and
-edit camera selectors and output names before applying to hardware.
-
-| File | Workflow |
-| --- | --- |
-| [single-capture.json](../examples/workflows/single-capture.json) | Configure an area-scan simulator and save one PNG |
-| [multi-camera-timelapse.json](../examples/workflows/multi-camera-timelapse.json) | Configure two simulators and schedule 60 frames each at 10-second intervals, with separate outputs and storage limits |
-| [scanner-feeder.json](../examples/workflows/scanner-feeder.json) | Configure resolution, grayscale and feeder mode, then save five pages with a 60-second deadline per page |
-| [start-recording.json](../examples/workflows/start-recording.json) | Start local H.264 recording with a 64 MiB file cap and a 512 MiB requested storage ceiling |
-| [stop-recording.json](../examples/workflows/stop-recording.json) | Finish that recording, then stop its camera acquisition |
-| [timed-recording.json](../examples/workflows/timed-recording.json) | Record a numbered H.264 file for one minute; the session ends it, so it needs no stop file |
-| [plant-line.json](../examples/workflows/plant-line.json) | Open a dataset, add a note and save one tagged, numbered capture |
-
-```sh
-capturefab workflow validate examples/workflows/multi-camera-timelapse.json --json
-capturefab --session bench workflow apply examples/workflows/multi-camera-timelapse.json --json
-```
-
-Timelapse jobs begin immediately (`first_at_ms: 0`) and run independently on the
-two cameras; this does not synchronize their exposures. Their outputs are under
-`examples/workflows/captures/` unless you copy the workflow elsewhere. Inspect
-each camera's `jobs`; previews can keep running after the last frame.
-
-For feeder scans, replace every `scanner:sane:DEVICE` in the example with the full
-ID from `capturefab scanners --json`. Windows IDs use `scanner:wia:ID`; macOS uses
-`scanner:ica:UUID`. Actual DPI, mode and feeder availability depend on the driver;
-inspect `features` before applying. Connecting does not scan; the capture step
-requests the pages. No PDF assembly or OCR is included.
-
-The recording start/stop files are separate because workflow commands execute
-without a delay. Applying them consecutively finishes the recording immediately.
-Apply the stop file when ready, give the `forward` step a `duration_ms` as
-timed-recording.json does, or use a timed CLI recording:
+A timed CLI recording finishes on its own, so it needs no separate stop:
 
 ```sh
 capturefab --session bench --camera sim:recording record -o video/run-2.mkv --duration 30s --max-file-size 64MiB --json

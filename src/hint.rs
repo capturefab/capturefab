@@ -1,5 +1,4 @@
 //! Small text helpers for human hints: typo distance and shell quoting.
-//! Always compiled, so builds without the window share them.
 
 /// Case-insensitive Levenshtein distance, counted in characters.
 pub fn edit_distance(left: &str, right: &str) -> usize {

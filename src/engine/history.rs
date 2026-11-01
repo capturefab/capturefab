@@ -1,13 +1,10 @@
-//! Camera checkpoints live beside the owner of the hardware. Values are read
-//! before and after a successful command, never inferred from a UI snapshot.
+//! Rollback checkpoints for camera changes that write several values: what
+//! a change would replace is read from the camera first, never inferred
+//! from a cached snapshot, and a failure writes it all back.
 use super::*;
-use crate::session::{CameraHistoryEntry, CameraHistoryStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 mod setup;
-
-const LIMIT: usize = 200;
-static LIFETIME: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Address {
@@ -21,139 +18,12 @@ struct Configuration {
     auto: Option<AutoController>,
 }
 
-#[derive(Clone)]
-enum Checkpoint {
-    Stream {
-        before: bool,
-        after: bool,
-    },
-    Configuration {
-        before: Box<Configuration>,
-        after: Box<Configuration>,
-        fields: Vec<Address>,
-    },
-}
-
-#[derive(Clone)]
-struct Change {
-    token: String,
-    camera: String,
-    label: String,
-    applied: bool,
-    created_at_ms: u64,
-    last_changed_at_us: u64,
-    feature: Option<String>,
-    kind: String,
-    checkpoint: Checkpoint,
-}
-
-pub(super) struct Journal {
-    generation: String,
-    next: u64,
-    changes: Vec<Change>,
-}
-
-impl Default for Journal {
-    fn default() -> Self {
-        Self {
-            generation: format!(
-                "{}-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos(),
-                LIFETIME.fetch_add(1, Ordering::Relaxed)
-            ),
-            next: 1,
-            changes: Vec::new(),
-        }
-    }
-}
-
-impl Journal {
-    fn status(&self) -> CameraHistoryStatus {
-        CameraHistoryStatus {
-            undo: self
-                .changes
-                .iter()
-                .filter(|c| c.applied)
-                .max_by_key(|c| c.last_changed_at_us)
-                .map(|c| c.label.clone()),
-            redo: self
-                .changes
-                .iter()
-                .filter(|c| !c.applied)
-                .max_by_key(|c| c.last_changed_at_us)
-                .map(|c| c.label.clone()),
-            entries: self
-                .changes
-                .iter()
-                .map(|change| CameraHistoryEntry {
-                    token: change.token.clone(),
-                    label: change.label.clone(),
-                    applied: change.applied,
-                    created_at_ms: change.created_at_ms,
-                    last_changed_at_us: change.last_changed_at_us,
-                    feature: change.feature.clone(),
-                    kind: change.kind.clone(),
-                    setting_changes: match &change.checkpoint {
-                        Checkpoint::Stream { .. } => 0,
-                        Checkpoint::Configuration { fields, .. } => {
-                            u32::try_from(fields.len()).unwrap_or(u32::MAX).max(1)
-                        }
-                    },
-                })
-                .collect(),
-        }
-    }
-
-    fn record(
-        &mut self,
-        camera: String,
-        label: String,
-        kind: String,
-        feature: Option<String>,
-        checkpoint: Checkpoint,
-    ) -> Value {
-        // A new successful edit branches the timeline. Failed commands never
-        // enter here and therefore leave redo available.
-        self.changes.retain(|change| change.applied);
-        let token = format!("{}-{}", self.generation, self.next);
-        self.next += 1;
-        let event_time = now_us();
-        self.changes.push(Change {
-            token: token.clone(),
-            camera: camera.clone(),
-            label: label.clone(),
-            created_at_ms: event_time / 1000,
-            last_changed_at_us: event_time,
-            feature,
-            kind,
-            applied: true,
-            checkpoint,
-        });
-        if self.changes.len() > LIMIT {
-            self.changes.remove(0);
-        }
-        json!({"token":token,"camera":camera,"label":label,"last_changed_at_us":event_time})
-    }
-}
-
 fn text(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
         Value::Number(number) if number.is_f64() => number.as_f64().unwrap().to_string(),
         value => value.to_string(),
     }
-}
-
-fn now_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros()
-        .min(u64::MAX as u128) as u64
 }
 
 fn auto_policy(auto: &Option<AutoController>) -> Option<f64> {
@@ -170,36 +40,27 @@ fn evolving(auto: &Option<AutoController>, feature: &str) -> bool {
 }
 
 /// Temporarily address a selected bank, then restore the user's selection on
-/// both success and failure. Selector switches themselves are never replayed
-/// as command features.
+/// both success and failure. Selector switches made only to reach a bank are
+/// never recorded as changes.
 fn addressed<T>(
     camera: &mut Camera,
     address: &Address,
     action: impl FnOnce(&mut Camera) -> Result<T>,
 ) -> Result<T> {
-    let mut originals = Vec::new();
-    let result = (|| {
-        for (selector, value) in &address.selectors {
-            let old = camera.get(selector)?;
-            if text(&old) != *value {
-                originals.push((selector.clone(), old));
-                camera.set(selector, value)?;
-            }
-        }
-        action(camera)
-    })();
-    let mut restoration = Vec::new();
-    for (selector, original) in originals.into_iter().rev() {
-        if let Err(error) = camera.set(&selector, &text(&original)) {
-            restoration.push(format!("{selector}: {error:#}"));
-        }
+    crate::controls::with_bank(camera, &address.selectors, action)
+}
+
+/// How results name a value: `Feature`, or `Feature[Selector=Value,...]`.
+fn address_name(address: &Address) -> String {
+    if address.selectors.is_empty() {
+        return address.feature.clone();
     }
-    ensure!(
-        restoration.is_empty(),
-        "could not restore selectors: {}",
-        restoration.join("; ")
-    );
-    result
+    let bank = address
+        .selectors
+        .iter()
+        .map(|(selector, value)| format!("{selector}={value}"))
+        .collect::<Vec<_>>();
+    format!("{}[{}]", address.feature, bank.join(","))
 }
 
 /// Read the value at `address` for a checkpoint. A bank hidden by
@@ -226,7 +87,7 @@ fn read_at(camera: &mut Camera, address: &Address) -> Result<Value> {
 struct TooManyBanks(String);
 impl std::fmt::Display for TooManyBanks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "too many selected banks for {} undo", self.0)
+        write!(f, "too many selected banks to checkpoint {}", self.0)
     }
 }
 impl std::error::Error for TooManyBanks {}
@@ -246,7 +107,7 @@ fn addresses(
     for selector in selectors {
         let current = camera
             .get(&selector)
-            .with_context(|| format!("read {selector} for undo"))?;
+            .with_context(|| format!("read {selector} for rollback"))?;
         let mut choices = vec![text(&current)];
         if banks(&selector) {
             for choice in camera.choices(&selector).unwrap_or_default() {
@@ -275,67 +136,76 @@ fn addresses(
     Ok(addresses)
 }
 
-/// Read the configuration values a command may change. The names come from
-/// the last feature walk, which every edit ends with, so an edit does not
-/// walk every feature again; the values are read now.
-/// `all` includes every configuration value; `written` requires each named
-/// feature, including controls absent from the feature tree.
+/// Features written together: changing one can change what the others
+/// allow (an offset its width, binning the width, the pixel format the
+/// size), so a checkpoint of one holds all of them.
+const COUPLED: [&[&str]; 2] = [
+    &[
+        "OffsetX",
+        "OffsetY",
+        "Width",
+        "Height",
+        "BinningHorizontal",
+        "BinningVertical",
+        "DecimationHorizontal",
+        "DecimationVertical",
+        "PixelFormat",
+    ],
+    &[
+        "AcquisitionFrameRate",
+        "AcquisitionFrameRateEnable",
+        "ExposureTime",
+    ],
+];
+
+/// Read the configuration values a command may change, now, and only
+/// those: the features it writes with the rest of their coupled group, what
+/// auto mode manages, and the exposure, gain and white-balance features an
+/// auto mode it ends may have locked. Every gain and white-balance bank is
+/// included, since auto can change them; any other feature stays at its
+/// current bank. Never a walk of every feature, which on GigE is hundreds
+/// of round trips. `written` requires each named feature, including
+/// controls absent from the feature tree.
 fn capture(
-    h: &WorkerHandle,
     camera: &mut Camera,
     auto: &Option<AutoController>,
-    all: bool,
     written: &[&str],
 ) -> Result<Configuration> {
-    let mut walked = h
-        .state
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .features
-        .iter()
-        .filter(|feature| feature.value.is_some())
-        .map(|feature| feature.name.clone())
-        .collect::<Vec<_>>();
-    if walked.is_empty() {
-        walked = camera
-            .features()
-            .into_iter()
-            .filter(|feature| feature.value.is_some())
-            .map(|feature| feature.name)
-            .collect();
-    }
-    let mut names = walked
-        .into_iter()
-        .filter(|name| camera.is_configuration_value(name))
-        .collect::<BTreeSet<_>>();
-    // Explicit writes must be restorable; stale cached names may be skipped
-    // when they are no longer readable, just as a fresh walk would skip them.
     let mut required = written
         .iter()
         .map(|&name| name.to_owned())
         .collect::<BTreeSet<_>>();
-    if all {
-        if let Some(controller) = auto {
-            required.extend(controller.status().managed.iter().cloned());
+    let mut names = BTreeSet::new();
+    for group in COUPLED {
+        if group.iter().any(|name| required.contains(*name)) {
+            names.extend(
+                group
+                    .iter()
+                    .filter(|name| camera.has(name) && camera.is_configuration_value(name))
+                    .map(|name| (*name).to_owned()),
+            );
         }
-        // Firmware may lock the numeric features while auto is running.
-        // They still have readable originals and must be included when a
-        // manual write stops the firmware controller.
-        for name in [
-            "ExposureTime",
-            "ExposureTimeAbs",
-            "Gain",
-            "GainAbs",
-            "ExposureAuto",
-            "GainAuto",
-            "BalanceWhiteAuto",
-            "BalanceRatio",
-            "BalanceRatioSelector",
-            "GainSelector",
-        ] {
-            if camera.has(name) && camera.get(name).is_ok() {
-                required.insert(name.to_owned());
-            }
+    }
+    if let Some(controller) = auto {
+        required.extend(controller.status().managed.iter().cloned());
+    }
+    // Firmware may lock the numeric features while auto is running. They
+    // still have readable originals and must be included when a manual write
+    // stops the firmware controller.
+    for name in [
+        "ExposureTime",
+        "ExposureTimeAbs",
+        "Gain",
+        "GainAbs",
+        "ExposureAuto",
+        "GainAuto",
+        "BalanceWhiteAuto",
+        "BalanceRatio",
+        "BalanceRatioSelector",
+        "GainSelector",
+    ] {
+        if camera.has(name) && camera.get(name).is_ok() {
+            required.insert(name.to_owned());
         }
     }
     names.extend(required.iter().cloned());
@@ -344,12 +214,12 @@ fn capture(
         // Auto can change every gain/white-balance bank. Other selectors stay
         // at their current bank, avoiding intrusive enumeration of unrelated
         // device settings just to checkpoint one control.
-        let all_banks = all && matches!(name.as_str(), "Gain" | "GainAbs" | "BalanceRatio");
+        let all_banks = matches!(name.as_str(), "Gain" | "GainAbs" | "BalanceRatio");
         let read = (|| -> Result<Vec<(Address, Value)>> {
             let mut read = Vec::new();
             for address in addresses(camera, &name, &|_| all_banks)? {
-                let value =
-                    read_at(camera, &address).with_context(|| format!("read {name} for undo"))?;
+                let value = read_at(camera, &address)
+                    .with_context(|| format!("read {name} for rollback"))?;
                 read.push((address, value));
             }
             Ok(read)
@@ -366,57 +236,6 @@ fn capture(
         values,
         auto: auto.clone(),
     })
-}
-
-/// Add what a write of `feature` is about to replace, at the banks selected
-/// now, to the checkpoint taken before a SetMany: an earlier value of the
-/// same SetMany may have switched a selector to a bank it did not read.
-fn extend(camera: &mut Camera, before: &mut Configuration, feature: &str) -> Result<()> {
-    for address in addresses(camera, feature, &|_| false)? {
-        if let std::collections::btree_map::Entry::Vacant(entry) = before.values.entry(address) {
-            // The address names the banks selected now: nothing switches.
-            let value =
-                read_at(camera, entry.key()).with_context(|| format!("read {feature} for undo"))?;
-            entry.insert(value);
-        }
-    }
-    Ok(())
-}
-
-fn capture_at(
-    camera: &mut Camera,
-    auto: &Option<AutoController>,
-    before: &Configuration,
-) -> Result<Configuration> {
-    let mut values = BTreeMap::new();
-    for address in before.values.keys() {
-        values.insert(
-            address.clone(),
-            read_at(camera, address)
-                .with_context(|| format!("read {} after change for undo", address.feature))?,
-        );
-    }
-    Ok(Configuration {
-        values,
-        auto: auto.clone(),
-    })
-}
-
-fn affected(before: &Configuration, after: &Configuration) -> Vec<Address> {
-    let mode_changed = auto_policy(&before.auto) != auto_policy(&after.auto);
-    before
-        .values
-        .keys()
-        .filter(|address| {
-            before.values.get(*address) != after.values.get(*address)
-                || mode_changed
-                    && [&before.auto, &after.auto]
-                        .into_iter()
-                        .flatten()
-                        .any(|auto| auto.manages(&address.feature))
-        })
-        .cloned()
-        .collect()
 }
 
 fn set_exact(camera: &mut Camera, address: &Address, target: &Value) -> Result<()> {
@@ -531,232 +350,16 @@ fn restore(
     Ok(())
 }
 
-/// Publish the camera after a change. `features` walks every feature again;
-/// a command that ended with its own walk, or only started or stopped the
-/// stream, passes false.
-fn publish(
-    h: &WorkerHandle,
-    camera: &mut Option<Camera>,
-    auto: &Option<AutoController>,
-    features: bool,
-) {
-    refresh(h, camera, features);
+/// Publish the camera after a rollback: its state and auto mode. A
+/// rollback to manual mode ends continuous auto exposure.
+fn publish(h: &WorkerHandle, camera: &Option<Camera>, auto: &Option<AutoController>) {
+    refresh(h, camera);
     if let Some(controller) = auto {
         publish_auto(h, controller);
     } else {
         h.state.write().unwrap_or_else(|e| e.into_inner()).auto = None;
+        end_auto_job(h, JobStatus::Done);
     }
-    let status = h.history.lock().unwrap_or_else(|e| e.into_inner()).status();
-    h.state.write().unwrap_or_else(|e| e.into_inner()).history = status;
-}
-
-/// The fields a replay can write only with the stream stopped: geometry
-/// and format, and, while streaming, any field `pIsLocked` holds now unless
-/// another replayed field is what unlocks it (an auto flag, for example).
-fn stream_locked_fields(camera: &mut Camera, fields: &[Address]) -> Vec<String> {
-    let names = fields
-        .iter()
-        .map(|field| field.feature.as_str())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let streaming = camera.is_streaming();
-    let mut locked = Vec::new();
-    for field in fields {
-        if locked.contains(&field.feature) {
-            continue;
-        }
-        let by_stream = crate::genicam::stream_locked(&field.feature)
-            || streaming
-                && addressed(camera, field, |camera| Ok(camera.is_locked(&field.feature)))
-                    .unwrap_or(false)
-                && !camera.lock_released_by(&field.feature, &names);
-        if by_stream {
-            locked.push(field.feature.clone());
-        }
-    }
-    locked
-}
-
-fn replay(
-    h: &WorkerHandle,
-    camera: &mut Option<Camera>,
-    auto: &mut Option<AutoController>,
-    token: Option<&str>,
-    undo: bool,
-    busy: bool,
-) -> Result<Value> {
-    let change = {
-        let journal = h.history.lock().unwrap_or_else(|e| e.into_inner());
-        match token {
-            Some(token) => journal
-                .changes
-                .iter()
-                .find(|change| change.token == token)
-                .context("camera history checkpoint expired or belongs to a previous connection")?,
-            None if undo => journal
-                .changes
-                .iter()
-                .filter(|change| change.applied)
-                .max_by_key(|change| change.last_changed_at_us)
-                .context("nothing to undo on this camera")?,
-            None => journal
-                .changes
-                .iter()
-                .filter(|change| !change.applied)
-                .max_by_key(|change| change.last_changed_at_us)
-                .context("nothing to redo on this camera")?,
-        }
-        .clone()
-    };
-    ensure!(
-        change.applied == undo,
-        "this camera change was already {}",
-        if undo { "undone" } else { "redone" }
-    );
-    let c = camera_mut(camera)?;
-    ensure!(
-        c.info.id == change.camera,
-        "camera history belongs to another camera"
-    );
-    match &change.checkpoint {
-        Checkpoint::Stream { before, after } => {
-            ensure!(
-                !busy,
-                "cannot replay stream history while capture jobs or forwarding are active"
-            );
-            let (expected, target) = if undo {
-                (after, before)
-            } else {
-                (before, after)
-            };
-            ensure!(
-                c.is_streaming() == *expected,
-                "stream state changed outside this history; undo/redo would overwrite it"
-            );
-            if *target {
-                c.start()?;
-            } else {
-                c.stop()?;
-            }
-        }
-        Checkpoint::Configuration {
-            before,
-            after,
-            fields,
-        } => {
-            let (expected, target) = if undo {
-                (after, before)
-            } else {
-                (before, after)
-            };
-            ensure!(
-                auto_policy(auto) == auto_policy(&expected.auto),
-                "auto mode changed outside this history; undo/redo would overwrite it"
-            );
-            let locked = stream_locked_fields(c, fields);
-            if let Some(locked) = locked.first() {
-                ensure!(
-                    !busy,
-                    "cannot restore {} while recording, forwarding or scheduled captures are active",
-                    locked
-                );
-            }
-            for address in fields {
-                // Software/firmware auto values evolve between commands. The
-                // Exposure/gain/white balance evolve in firmware. For other
-                // owned settings compare against the live controller's last
-                // write, so a legitimate replan is allowed but an external
-                // raw write to an auto flag or limit is a conflict.
-                if expected
-                    .auto
-                    .as_ref()
-                    .is_some_and(|auto| auto.manages(&address.feature))
-                {
-                    if !matches!(
-                        address.feature.as_str(),
-                        "ExposureTime" | "ExposureTimeAbs" | "Gain" | "GainAbs" | "BalanceRatio"
-                    ) {
-                        let current = read_at(c, address)?;
-                        let tracked = auto
-                            .as_ref()
-                            .and_then(|controller| controller.values().get(&address.feature));
-                        ensure!(
-                            tracked.or_else(|| expected.values.get(address)) == Some(&current),
-                            "{} changed outside this history; undo/redo would overwrite it",
-                            address.feature
-                        );
-                    }
-                    continue;
-                }
-                let current = read_at(c, address)?;
-                ensure!(
-                    expected.values.get(address) == Some(&current),
-                    "{} changed outside this history; undo/redo would overwrite it",
-                    address.feature
-                );
-            }
-            let rollback = capture_at(c, auto, expected)?;
-            let mut wanted = rollback.clone();
-            wanted.auto = target.auto.clone();
-            for address in fields {
-                wanted
-                    .values
-                    .insert(address.clone(), target.values[address].clone());
-            }
-            let switch_auto = auto_policy(&expected.auto) != auto_policy(&target.auto);
-            // Restore all readable configuration values to a merge of the
-            // current unrelated settings and the recorded affected values.
-            // This also repairs new coupled side effects caused by replay.
-            let all_fields = wanted.values.keys().cloned().collect::<Vec<_>>();
-            // A streaming camera locks its geometry: stop it once around the
-            // writes, as restoring a setup did, and start it again after.
-            let restart = c.is_streaming() && !locked.is_empty();
-            if restart {
-                c.stop()?;
-            }
-            let restored = restore(c, auto, &wanted, &all_fields, switch_auto);
-            if let Err(error) = restored {
-                let rollback_result = restore(c, auto, &rollback, &all_fields, switch_auto);
-                if restart {
-                    let _ = c.start();
-                }
-                publish(h, camera, auto, true);
-                return match rollback_result {
-                    Ok(()) => {
-                        Err(error.context("undo/redo failed; previous camera state restored"))
-                    }
-                    Err(rollback_error) => Err(error.context(format!(
-                        "undo/redo failed and rollback failed: {rollback_error:#}"
-                    ))),
-                };
-            }
-            if restart {
-                c.start()?;
-            }
-        }
-    }
-    let status = {
-        let mut journal = h.history.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = journal
-            .changes
-            .iter_mut()
-            .find(|entry| entry.token == change.token)
-            .unwrap();
-        entry.applied = !undo;
-        entry.last_changed_at_us = now_us();
-        journal.status()
-    };
-    publish(h, camera, auto, true);
-    h.log(
-        "info",
-        format!("{} {}", if undo { "Undid" } else { "Redid" }, change.label),
-    );
-    let snapshot = h.snapshot();
-    Ok(
-        json!({(if undo {"undone"} else {"redone"}):change.label,"history":status,
-        "camera":change.camera,"features":snapshot.features,"auto":snapshot.auto,"streaming":snapshot.streaming}),
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -767,68 +370,40 @@ pub(super) fn process(
     auto: &mut Option<AutoController>,
     jobs: &mut Vec<Scheduled>,
     next_job: &mut u64,
-    scheduled_stream: &mut bool,
-    command: SessionCommand,
+    scheduled_stream: &mut JobStream,
+    command: WorkerCommand,
 ) -> Result<Value> {
     command.validate()?;
-    if let SessionCommand::Set { feature, value } = &command {
-        camera_mut(camera)?.validate_set(feature, value)?;
-    }
-    let busy = forwarder.is_some() || jobs.iter().any(|job| job.info.active());
-    let scanner = camera.as_ref().is_some_and(Camera::is_scanner);
-    match &command {
-        SessionCommand::Undo => return replay(h, camera, auto, None, true, busy),
-        SessionCommand::Redo => return replay(h, camera, auto, None, false, busy),
-        SessionCommand::ReplayCameraChange { token, undo } => {
-            return replay(h, camera, auto, Some(token), *undo, busy);
-        }
+    match command.session() {
         // Reading and comparing switch selectors only to read, and restore them.
-        SessionCommand::ReadSetup => return setup::read(h, camera_mut(camera)?, auto),
-        SessionCommand::SetupDiff {
+        Some(SessionCommand::ReadSetup) => return setup::read(h, camera_mut(camera)?, auto),
+        Some(SessionCommand::SetupDiff {
             setup: Some(document),
             allow_other_model,
             ..
-        } => {
+        }) => {
             let holders = setup::stream_holders(forwarder, jobs);
             let c = camera_mut(camera)?;
             let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
             return Ok(setup::report(&plan, &c.info));
         }
-        SessionCommand::SetupDiff { .. } | SessionCommand::ApplySetup { setup: None, .. } => {
-            anyhow::bail!("setup names are resolved by the session coordinator")
+        Some(SessionCommand::SetupDiff { .. } | SessionCommand::ApplySetup { setup: None, .. }) => {
+            anyhow::bail!("preset names are resolved by the session coordinator")
         }
         _ => {}
     }
-    let eligible =
-        matches!(
-            command,
-            SessionCommand::Set { .. }
-                | SessionCommand::SetMany { .. }
-                | SessionCommand::Auto { .. }
+    // A change that may write several values is one change: what it would
+    // replace is read first, and a failure puts every value back.
+    let atomic = matches!(
+        command.session(),
+        Some(
+            SessionCommand::Auto { .. }
                 | SessionCommand::Manual { .. }
                 | SessionCommand::ApplySetup { .. }
-        ) || !busy && !scanner && matches!(command, SessionCommand::Start | SessionCommand::Stop);
-    if !eligible {
-        let boundary = matches!(
-            command,
-            SessionCommand::Connect { .. } | SessionCommand::Disconnect
-        );
-        let unavailable = match &command {
-            SessionCommand::Start | SessionCommand::Stop if scanner => Some(
-                "Scanner acquisition may move or consume a document; it cannot be undone or replayed safely.",
-            ),
-            SessionCommand::Execute { .. } => {
-                Some("Camera commands may have irreversible effects and cannot be replayed safely.")
-            }
-            SessionCommand::WriteMemory { .. } => Some(
-                "Raw memory writes have device-specific side effects and cannot be replayed safely.",
-            ),
-            SessionCommand::Stop if busy => Some(
-                "Stopping also closes forwarding or cancels capture jobs; those effects cannot be undone.",
-            ),
-            _ => None,
-        };
-        let mut result = process_plain(
+        )
+    );
+    if !atomic {
+        return process_plain(
             h,
             camera,
             forwarder,
@@ -838,145 +413,72 @@ pub(super) fn process(
             scheduled_stream,
             command,
         );
-        if boundary && result.is_ok() {
-            *h.history.lock().unwrap_or_else(|e| e.into_inner()) = Journal::default();
-            h.state.write().unwrap_or_else(|e| e.into_inner()).history =
-                CameraHistoryStatus::default();
-        }
-        if let (Ok(value), Some(reason)) = (&mut result, unavailable) {
-            value["history_unavailable"] = json!(reason);
-        }
-        return result;
     }
     let c = camera_mut(camera)?;
-    let id = c.info.id.clone();
-    let stream = matches!(command, SessionCommand::Start | SessionCommand::Stop);
-    let before_stream = c.is_streaming();
-    // Only a plain Set names the one value it changes. Otherwise every
-    // configuration value is captured, so a failed SetMany restores all of
-    // them, and the written features are added even when unlisted.
     // A setup is compared again here, by the camera's owner, right before
     // it is restored; only the values it changes are required readable.
     let setup_plan = match &command {
-        SessionCommand::ApplySetup {
+        WorkerCommand::Session(SessionCommand::ApplySetup {
             setup: Some(document),
             allow_other_model,
             strict,
-            confirmed_disruptive,
             ..
-        } => {
+        }) => {
             let holders = setup::stream_holders(forwarder, jobs);
             let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
             plan.check(*strict)?;
-            plan.confirm(confirmed_disruptive.as_deref())?;
             Some(plan)
         }
         _ => None,
     };
-    let (all, written) = match &command {
-        // A banked row is checkpointed at its own bank before it is
-        // written, so its feature need not be readable at the bank
-        // selected now (an input line hides an output's source).
-        SessionCommand::ApplySetup { .. } => (
-            true,
-            setup_plan
-                .iter()
-                .flat_map(|plan| {
-                    plan.changes()
-                        .filter(|row| row.address.selectors.is_empty())
-                        .map(|row| row.address.feature.as_str())
-                })
-                .collect(),
-        ),
-        SessionCommand::Set { feature, .. } => (auto.is_some(), vec![feature.as_str()]),
-        SessionCommand::SetMany { values } => (
-            true,
-            values.iter().map(|value| value.feature.as_str()).collect(),
-        ),
-        _ => (true, Vec::new()),
+    // The features a change writes are checkpointed with their coupled
+    // groups. A banked setup row is checkpointed at its own bank before it
+    // is written, so its feature need not be readable at the bank selected
+    // now (an input line hides an output's source).
+    let written = match &command {
+        WorkerCommand::Session(SessionCommand::ApplySetup { .. }) => setup_plan
+            .iter()
+            .flat_map(|plan| {
+                plan.changes()
+                    .filter(|row| row.address.selectors.is_empty())
+                    .map(|row| row.address.feature.as_str())
+            })
+            .collect(),
+        _ => Vec::new(),
     };
-    let set_many = matches!(command, SessionCommand::SetMany { .. });
-    let apply_setup = matches!(command, SessionCommand::ApplySetup { .. });
-    let mut before = if stream {
-        None
-    } else {
-        match capture(h, c, auto, all, &written) {
-            Ok(before) => Some(before),
-            // Its values must be restorable together, so it writes none.
-            Err(error) if set_many || apply_setup => {
-                return Err(error.context(format!(
-                    "{} changed nothing: the values it would replace could not be read",
-                    if apply_setup {
-                        "apply_setup"
-                    } else {
-                        "set_many"
-                    }
-                )));
-            }
-            Err(error) => {
-                // A write-only control is still useful. Its previous state
-                // cannot be reconstructed, so report that accurately instead
-                // of inventing an undo value or preventing the write.
-                let mut result = process_plain(
-                    h,
-                    camera,
-                    forwarder,
-                    auto,
-                    jobs,
-                    next_job,
-                    scheduled_stream,
-                    command,
-                )?;
-                result["history_unavailable"] =
-                    json!(format!("Undo is unavailable for this change: {error:#}"));
-                return Ok(result);
-            }
+    let apply_setup = matches!(command.session(), Some(SessionCommand::ApplySetup { .. }));
+    let mut before = match capture(c, auto, &written) {
+        Ok(before) => before,
+        // Its values must be restorable together, so it writes none.
+        Err(error) if apply_setup => {
+            return Err(error.context(
+                "apply_setup changed nothing: the values it would replace could not be read",
+            ));
         }
-    };
-    let label = match &command {
-        SessionCommand::Set { feature, .. } => format!("Set {feature}"),
-        SessionCommand::SetMany { values } => {
-            let mut names = Vec::new();
-            for value in values {
-                if !names.contains(&value.feature.as_str()) {
-                    names.push(value.feature.as_str());
-                }
-            }
-            if names.len() <= 3 {
-                format!("Set {}", names.join(", "))
-            } else {
-                format!("Set {} features", names.len())
-            }
+        // A write-only control is still useful; such a change goes ahead
+        // without a checkpoint to roll back to.
+        Err(_) => {
+            return process_plain(
+                h,
+                camera,
+                forwarder,
+                auto,
+                jobs,
+                next_job,
+                scheduled_stream,
+                command,
+            );
         }
-        SessionCommand::Auto { .. } if auto.is_some() => "Change auto balance".into(),
-        SessionCommand::Auto { .. } => "Enable auto mode".into(),
-        SessionCommand::Manual { .. } => "Switch to manual mode".into(),
-        SessionCommand::Start => "Start stream".into(),
-        SessionCommand::Stop => "Stop stream".into(),
-        SessionCommand::ApplySetup {
-            setup: Some(document),
-            ..
-        } => format!("Restore setup {}", document.name),
-        _ => unreachable!(),
     };
     let mut restart = false;
-    let result = match (&command, before.as_mut()) {
-        // Each write first records the bank it is about to change.
-        (SessionCommand::SetMany { values }, Some(before)) => {
-            super::set_many(h, camera, auto, values, |camera, feature| {
-                extend(camera, before, feature)
-            })
-        }
+    let result = match &command {
         // A streaming camera locks its geometry: stop it once, write, and
         // start it again after success or the rollback below.
-        (
-            SessionCommand::ApplySetup {
-                setup: Some(document),
-                strict,
-                ..
-            },
-            Some(before),
-        ) => {
+        WorkerCommand::Session(SessionCommand::ApplySetup {
+            setup: Some(document),
+            strict,
+            ..
+        }) => {
             let plan = setup_plan.as_ref().expect("planned above");
             restart = plan.restarts_stream;
             let stopped = if restart {
@@ -995,13 +497,13 @@ pub(super) fn process(
                         document,
                         plan,
                         *strict,
-                        |camera, address| setup::extend_at(camera, before, address),
+                        |camera, address| setup::extend_at(camera, &mut before, address),
                     )
                 })
                 .and_then(|mut result| {
                     if restart {
                         camera_mut(camera)?.start()?;
-                        refresh(h, camera, false);
+                        refresh(h, camera);
                         result["restarted_stream"] = json!(true);
                     }
                     Ok(result)
@@ -1018,101 +520,66 @@ pub(super) fn process(
             command.clone(),
         ),
     };
-    let mut result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            if let Some(before) = &before {
-                let fields = before.values.keys().cloned().collect::<Vec<_>>();
-                let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
-                let rollback = restore(camera_mut(camera)?, auto, before, &fields, switch_auto);
-                let restarted = restart.then(|| camera_mut(camera).and_then(Camera::start));
-                publish(h, camera, auto, true);
-                let restart_note = match &restarted {
-                    Some(Err(start_error)) => {
-                        format!("; the stream could not be restarted: {start_error:#}")
-                    }
-                    Some(Ok(())) => "; the stream was restarted".into(),
-                    None => String::new(),
-                };
-                if let Err(rollback_error) = rollback {
-                    return Err(error.context(format!(
-                        "failed command rollback: {rollback_error:#}{restart_note}"
-                    )));
-                }
-                // The context keeps the cause's category for the exit code.
-                if let SessionCommand::ApplySetup {
-                    setup: Some(document),
-                    ..
-                } = &command
-                {
-                    return Err(error.context(format!(
-                        "Restoring setup {} failed; every value was put back{restart_note}",
-                        document.name
-                    )));
-                }
-                if let Some(Err(_)) = restarted {
-                    return Err(error.context(restart_note.trim_start_matches("; ").to_owned()));
-                }
+    let error = match result {
+        Ok(result) => return Ok(result),
+        Err(error) => error,
+    };
+    let fields = before.values.keys().cloned().collect::<Vec<_>>();
+    // What a failed preset wrote, for the rollback its error reports.
+    let mut written = Vec::new();
+    if apply_setup {
+        let camera = camera_mut(camera)?;
+        for address in &fields {
+            let saved = &before.values[address];
+            if !saved.is_null()
+                && read_at(camera, address).is_ok_and(|now| !setup::close(&now, saved, None))
+            {
+                written.push(address_name(address));
             }
-            return Err(error);
         }
-    };
-    let checkpoint = if stream {
-        let after = camera_mut(camera)?.is_streaming();
-        (before_stream != after).then_some(Checkpoint::Stream {
-            before: before_stream,
-            after,
-        })
-    } else {
-        let before = before.unwrap();
-        let after = match capture_at(camera_mut(camera)?, auto, &before) {
-            Ok(after) => after,
-            Err(error) => {
-                let fields = before.values.keys().cloned().collect::<Vec<_>>();
-                let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
-                let rollback = restore(camera_mut(camera)?, auto, &before, &fields, switch_auto);
-                publish(h, camera, auto, true);
-                return match rollback {
-                    Ok(()) => Err(error.context("change could not be acknowledged accurately; previous camera state restored")),
-                    Err(rollback_error) => Err(error.context(format!("checkpoint read failed and rollback failed: {rollback_error:#}"))),
-                };
-            }
-        };
-        let fields = affected(&before, &after);
-        (!fields.is_empty() || auto_policy(&before.auto) != auto_policy(&after.auto)).then_some(
-            Checkpoint::Configuration {
-                before: Box::new(before),
-                after: Box::new(after),
-                fields,
-            },
-        )
-    };
-    if let Some(checkpoint) = checkpoint {
-        let (kind, feature) = match &command {
-            SessionCommand::Set { feature, .. } => ("set", Some(feature.clone())),
-            SessionCommand::SetMany { .. } => ("set_many", None),
-            SessionCommand::Auto { .. } if label == "Change auto balance" => ("balance", None),
-            SessionCommand::Auto { .. } => ("auto", None),
-            SessionCommand::Manual { .. } => ("manual", None),
-            SessionCommand::Start => ("start", None),
-            SessionCommand::Stop => ("stop", None),
-            SessionCommand::ApplySetup { .. } => ("apply_setup", None),
-            _ => unreachable!(),
-        };
-        result["camera_change"] = h.history.lock().unwrap_or_else(|e| e.into_inner()).record(
-            id,
-            label,
-            kind.into(),
-            feature,
-            checkpoint,
-        );
-        // The command already walked the features, or only moved the stream,
-        // and the checkpoint since only read values.
-        publish(h, camera, auto, false);
-        result["history"] =
-            serde_json::to_value(&h.state.read().unwrap_or_else(|e| e.into_inner()).history)?;
     }
-    Ok(result)
+    let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
+    let rollback = restore(camera_mut(camera)?, auto, &before, &fields, switch_auto);
+    let restarted = restart.then(|| camera_mut(camera).and_then(Camera::start));
+    publish(h, camera, auto);
+    let restart_note = match &restarted {
+        Some(Err(start_error)) => {
+            format!("; the stream could not be restarted: {start_error:#}")
+        }
+        Some(Ok(())) => "; the stream was restarted".into(),
+        None => String::new(),
+    };
+    if let Err(rollback_error) = rollback {
+        let error = error.context(format!(
+            "failed command rollback: {rollback_error:#}{restart_note}"
+        ));
+        if apply_setup {
+            return Err(crate::types::with_details(
+                error,
+                json!({"rollback": {"restored": [], "failed": [{"error": format!("{rollback_error:#}")}]}}),
+            ));
+        }
+        return Err(error);
+    }
+    // The context keeps the cause's category for the exit code.
+    if let WorkerCommand::Session(SessionCommand::ApplySetup {
+        setup: Some(document),
+        ..
+    }) = &command
+    {
+        let error = error.context(format!(
+            "Restoring preset {} failed; every value was put back{restart_note}",
+            document.name
+        ));
+        return Err(crate::types::with_details(
+            error,
+            json!({"rollback": {"restored": written, "failed": []}}),
+        ));
+    }
+    if let Some(Err(_)) = restarted {
+        return Err(error.context(restart_note.trim_start_matches("; ").to_owned()));
+    }
+    Err(error)
 }
 
 #[cfg(test)]
@@ -1126,600 +593,36 @@ mod tests {
         h
     }
     fn get(h: &WorkerHandle, feature: &str) -> Value {
-        h.request(SessionCommand::Get {
-            feature: feature.into(),
-        })
-        .unwrap()["value"]
-            .clone()
-    }
-    fn set(h: &WorkerHandle, feature: &str, value: &str) -> Value {
-        h.request(SessionCommand::Set {
-            feature: feature.into(),
-            value: value.into(),
-        })
-        .unwrap()
-    }
-
-    fn set_many(h: &WorkerHandle, values: &[(&str, &str)]) -> Result<Value> {
-        h.request(SessionCommand::SetMany {
-            values: values
-                .iter()
-                .map(|(feature, value)| crate::session::FeatureValue {
-                    feature: (*feature).into(),
-                    value: (*value).into(),
-                })
-                .collect(),
-        })
-    }
-
-    #[test]
-    fn set_many_fails_restores_and_undoes_as_one_change() {
-        let h = connected();
-        let (exposure, width) = (get(&h, "ExposureTime"), get(&h, "Width"));
-        let entries = h.snapshot().history.entries.len();
-        // The second value is out of range after the first was written.
-        assert!(set_many(&h, &[("ExposureTime", "5000"), ("Width", "99999")]).is_err());
-        assert_eq!(get(&h, "ExposureTime"), exposure);
-        assert_eq!(get(&h, "Width"), width);
-        assert_eq!(h.snapshot().history.entries.len(), entries);
-        let changed = set_many(&h, &[("ExposureTime", "5000"), ("Width", "256")]).unwrap();
-        assert_eq!(changed["values"][0]["name"], "ExposureTime");
-        assert_eq!(changed["values"][0]["value"].as_f64(), Some(5000.0));
-        assert_eq!(changed["values"][1], json!({"name":"Width","value":256}));
-        assert_eq!(changed["camera_change"]["label"], "Set ExposureTime, Width");
-        let token = changed["camera_change"]["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let history = h.snapshot().history;
-        assert_eq!(history.entries.len(), entries + 1);
-        let entry = history.entries.last().unwrap();
-        assert_eq!(entry.setting_changes, 2);
-        assert_eq!(
-            (entry.kind.as_str(), entry.feature.as_deref()),
-            ("set_many", None)
-        );
-        let replay = |undo| {
-            h.request(SessionCommand::ReplayCameraChange {
-                token: token.clone(),
-                undo,
-            })
-            .unwrap()
-        };
-        replay(true);
-        assert_eq!(get(&h, "ExposureTime"), exposure);
-        assert_eq!(get(&h, "Width"), width);
-        replay(false);
-        assert_eq!(get(&h, "ExposureTime").as_f64(), Some(5000.0));
-        assert_eq!(get(&h, "Width"), 256);
-        // Many features are counted rather than listed.
-        let many = set_many(
-            &h,
-            &[
-                ("Width", "128"),
-                ("Height", "128"),
-                ("Gain", "1"),
-                ("ExposureTime", "6000"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(many["camera_change"]["label"], "Set 4 features");
-        h.shutdown();
-    }
-
-    #[test]
-    fn acknowledged_values_no_ops_failed_writes_and_redo_branches() {
-        let h = connected();
-        let initial = get(&h, "Width");
-        let changed = set(&h, "Width", "128");
-        assert!(changed["camera_change"]["token"].is_string());
-        assert_eq!(
-            changed["camera_change"]["last_changed_at_us"],
-            h.snapshot().history.entries[0].last_changed_at_us
-        );
-        assert_eq!(h.snapshot().history.undo.as_deref(), Some("Set Width"));
-        assert!(set(&h, "Width", "128").get("camera_change").is_none());
-        h.request(SessionCommand::Undo).unwrap();
-        assert_eq!(get(&h, "Width"), initial);
-        assert!(
-            h.request(SessionCommand::Set {
-                feature: "Width".into(),
-                value: "0".into()
-            })
-            .is_err()
-        );
-        assert_eq!(h.snapshot().history.redo.as_deref(), Some("Set Width"));
-        h.request(SessionCommand::Redo).unwrap();
-        assert_eq!(get(&h, "Width"), 128);
-        h.request(SessionCommand::Undo).unwrap();
-        set(&h, "Height", "128");
-        assert!(h.snapshot().history.redo.is_none());
-        assert!(h.request(SessionCommand::Redo).is_err());
-        h.shutdown();
-    }
-
-    #[test]
-    fn external_raw_write_conflicts_without_overwriting_or_consuming_history() {
-        let h = connected();
-        set(&h, "Width", "128");
-        h.request(SessionCommand::WriteMemory {
-            address: 0x100,
-            data: 256u32.to_le_bytes().to_vec(),
-        })
-        .unwrap();
-        let error = h.request(SessionCommand::Undo).unwrap_err();
-        assert!(format!("{error:#}").contains("changed outside this history"));
-        assert_eq!(get(&h, "Width"), 256);
-        assert_eq!(h.snapshot().history.undo.as_deref(), Some("Set Width"));
-        h.request(SessionCommand::WriteMemory {
-            address: 0x100,
-            data: 128u32.to_le_bytes().to_vec(),
-        })
-        .unwrap();
-        h.request(SessionCommand::Undo).unwrap();
-        assert_eq!(get(&h, "Width"), 640);
-        h.shutdown();
-    }
-
-    #[test]
-    fn auto_enable_balance_and_manual_feature_writes_restore_the_whole_mode() {
-        let h = connected();
-        set(&h, "ExposureTime", "20000");
-        let originals = [
-            get(&h, "ExposureTime"),
-            get(&h, "Gain"),
-            get(&h, "AcquisitionFrameRate"),
-        ];
-        h.request(SessionCommand::Auto { balance: Some(1.0) })
-            .unwrap();
-        let first_auto = [
-            get(&h, "ExposureTime"),
-            get(&h, "Gain"),
-            get(&h, "AcquisitionFrameRate"),
-        ];
-        h.request(SessionCommand::Auto { balance: Some(0.0) })
-            .unwrap();
-        h.request(SessionCommand::Undo).unwrap();
-        assert_eq!(h.snapshot().auto.unwrap().balance, 1.0);
-        assert_eq!(
-            [
-                get(&h, "ExposureTime"),
-                get(&h, "Gain"),
-                get(&h, "AcquisitionFrameRate")
-            ],
-            first_auto
-        );
-        h.request(SessionCommand::Undo).unwrap();
-        assert!(h.snapshot().auto.is_none());
-        assert_eq!(
-            [
-                get(&h, "ExposureTime"),
-                get(&h, "Gain"),
-                get(&h, "AcquisitionFrameRate")
-            ],
-            originals
-        );
-        h.request(SessionCommand::Redo).unwrap();
-        set(&h, "ExposureTime", "5000");
-        assert!(h.snapshot().auto.is_none());
-        h.request(SessionCommand::Undo).unwrap();
-        assert_eq!(h.snapshot().auto.unwrap().balance, 1.0);
-        assert_eq!(
-            [
-                get(&h, "ExposureTime"),
-                get(&h, "Gain"),
-                get(&h, "AcquisitionFrameRate")
-            ],
-            first_auto
-        );
-        h.request(SessionCommand::Redo).unwrap();
-        assert!(h.snapshot().auto.is_none());
-        assert_eq!(get(&h, "ExposureTime"), 5000.0);
-        h.shutdown();
+        h.value(feature)
     }
 
     #[test]
     fn failed_managed_write_does_not_leave_auto_disabled() {
         let h = connected();
-        h.request(SessionCommand::Auto { balance: Some(0.3) })
-            .unwrap();
+        h.request(SessionCommand::Auto {
+            balance: Some(0.3),
+            continuous: false,
+            job: None,
+            max_exposure_us: None,
+            region: None,
+        })
+        .unwrap();
         let exposure = get(&h, "ExposureTime");
-        assert!(
-            h.request(SessionCommand::Set {
-                feature: "ExposureTime".into(),
-                value: "0".into()
-            })
-            .is_err()
-        );
+        assert!(h.set_value("ExposureTime", "0").is_err());
         assert_eq!(h.snapshot().auto.unwrap().balance, 0.3);
         assert_eq!(get(&h, "ExposureTime"), exposure);
-        assert_eq!(
-            h.snapshot().history.undo.as_deref(),
-            Some("Enable auto mode")
-        );
         h.shutdown();
     }
 
-    #[test]
-    fn stream_changes_are_reversible_but_stopping_jobs_is_not() {
-        let h = connected();
-        h.request(SessionCommand::Start).unwrap();
-        assert!(h.snapshot().streaming);
-        h.request(SessionCommand::Undo).unwrap();
-        assert!(!h.snapshot().streaming);
-        h.request(SessionCommand::Redo).unwrap();
-        assert!(h.snapshot().streaming);
-        h.request(SessionCommand::Schedule {
-            output: "history-never-written.png".into(),
-            count: 1,
-            timeout_ms: 100,
-            format: "png".into(),
-            first_at_ms: crate::scheduling::now_ms() + 60_000,
-            interval_ms: 0,
-            storage: Default::default(),
-            destination: None,
-            on_exists: Default::default(),
-            context: Default::default(),
-        })
-        .unwrap();
-        let stopped = h.request(SessionCommand::Stop).unwrap();
-        assert!(stopped.get("camera_change").is_none());
-        assert!(
-            stopped["history_unavailable"]
-                .as_str()
-                .unwrap()
-                .contains("capture jobs")
-        );
-        assert!(h.request(SessionCommand::Undo).is_err());
-        h.shutdown();
-    }
-
-    #[test]
-    fn checkpoints_cannot_cross_connection_lifetimes() {
-        let h = connected();
-        let token = set(&h, "Width", "128")["camera_change"]["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        h.request(SessionCommand::Disconnect).unwrap();
-        h.request(SessionCommand::connect("sim:0".into(), 100))
-            .unwrap();
-        assert!(
-            h.request(SessionCommand::ReplayCameraChange { token, undo: true })
-                .is_err()
-        );
-        assert_eq!(get(&h, "Width"), 640);
-        assert_eq!(h.snapshot().history, CameraHistoryStatus::default());
-        h.shutdown();
-    }
-
-    #[test]
-    fn targeted_replays_preserve_unrelated_changes_and_publish_actual_transition_order() {
-        let h = connected();
-        let a = set(&h, "Width", "128")["camera_change"]["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let b = set(&h, "Height", "128")["camera_change"]["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let before = h.snapshot().history.entries;
-        h.request(SessionCommand::ReplayCameraChange {
-            token: a.clone(),
-            undo: true,
-        })
-        .unwrap();
-        assert_eq!(get(&h, "Height"), 128);
-        h.request(SessionCommand::ReplayCameraChange {
-            token: b,
-            undo: true,
-        })
-        .unwrap();
-        assert_eq!(h.snapshot().history.redo.as_deref(), Some("Set Height"));
-        h.request(SessionCommand::Redo).unwrap();
-        h.request(SessionCommand::Redo).unwrap();
-        assert_eq!(h.snapshot().history.undo.as_deref(), Some("Set Width"));
-        let after = h.snapshot().history.entries;
-        assert!(
-            after
-                .iter()
-                .zip(before)
-                .all(|(after, before)| after.last_changed_at_us > before.last_changed_at_us)
-        );
-        h.request(SessionCommand::Undo).unwrap();
-        assert_eq!(get(&h, "Width"), 640);
-        assert_eq!(get(&h, "Height"), 128);
-        h.shutdown();
-    }
-
-    struct Banks;
-    impl crate::types::RegisterIo for Banks {
-        fn read_memory(&mut self, _: u64, length: usize) -> Result<Vec<u8>> {
-            Ok(vec![0; length])
-        }
-        fn write_memory(&mut self, _: u64, _: &[u8]) -> Result<()> {
-            Ok(())
-        }
-    }
-    impl crate::types::Backend for Banks {
-        fn xml(&mut self) -> Result<String> {
-            Ok(concat!("<RegisterDescription><Category Name='Root'><pFeature>BankSelector</pFeature><pFeature>Setting</pFeature></Category>",
-                "<Enumeration Name='BankSelector'><EnumEntry Name='A'><Value>0</Value></EnumEntry><EnumEntry Name='B'><Value>1</Value></EnumEntry><Value>0</Value><pSelected>Setting</pSelected></Enumeration>",
-                "<Integer Name='Setting'><pIndex>BankSelector</pIndex><pValueIndexed Index='0'>AValue</pValueIndexed><pValueIndexed Index='1'>BValue</pValueIndexed></Integer>",
-                "<Integer Name='AValue'><Value>10</Value></Integer><Integer Name='BValue'><Value>11</Value></Integer></RegisterDescription>").into())
-        }
-        fn start(&mut self, _: usize) -> Result<()> {
-            Ok(())
-        }
-        fn next_frame(&mut self, _: Duration) -> Result<Frame> {
-            anyhow::bail!("no frames")
-        }
-        fn stop(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    struct Firmware;
-    impl crate::types::RegisterIo for Firmware {
-        fn read_memory(&mut self, _: u64, length: usize) -> Result<Vec<u8>> {
-            Ok(vec![0; length])
-        }
-        fn write_memory(&mut self, _: u64, _: &[u8]) -> Result<()> {
-            Ok(())
-        }
-    }
-    impl crate::types::Backend for Firmware {
-        fn xml(&mut self) -> Result<String> {
-            Ok(concat!("<RegisterDescription><Category Name='Root'><pFeature>ExposureTime</pFeature><pFeature>ExposureAuto</pFeature><pFeature>AutoExposureTimeLowerLimit</pFeature><pFeature>AutoExposureTimeUpperLimit</pFeature></Category>",
-                "<Float Name='ExposureTime'><Value>2000</Value><Min>10</Min><Max>1000000</Max></Float>",
-                "<Enumeration Name='ExposureAuto'><EnumEntry Name='Off'><Value>0</Value></EnumEntry><EnumEntry Name='Continuous'><Value>1</Value></EnumEntry><Value>0</Value></Enumeration>",
-                "<Float Name='AutoExposureTimeLowerLimit'><Value>10</Value><Min>10</Min><Max>1000000</Max></Float>",
-                "<Float Name='AutoExposureTimeUpperLimit'><Value>1000000</Value><Min>10</Min><Max>1000000</Max></Float></RegisterDescription>").into())
-        }
-        fn start(&mut self, _: usize) -> Result<()> {
-            Ok(())
-        }
-        fn next_frame(&mut self, _: Duration) -> Result<Frame> {
-            anyhow::bail!("no frames")
-        }
-        fn stop(&mut self) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn external_firmware_control_changes_conflict_with_auto_history() {
-        let h = WorkerHandle::new();
-        let mut camera = Some(
-            Camera::from_backend(crate::transport::simulator::info(), Box::new(Firmware)).unwrap(),
-        );
-        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, false);
-        let mut run = |camera: &mut Option<Camera>, command| {
-            process(
-                &h,
-                camera,
-                &mut forwarder,
-                &mut auto,
-                &mut jobs,
-                &mut next,
-                &mut scheduled,
-                command,
-            )
-        };
-        run(&mut camera, SessionCommand::Auto { balance: Some(0.5) }).unwrap();
-        assert_eq!(
-            camera.as_mut().unwrap().get("ExposureAuto").unwrap(),
-            "Continuous"
-        );
-        camera.as_mut().unwrap().set("ExposureAuto", "Off").unwrap();
-        let error = run(&mut camera, SessionCommand::Undo).unwrap_err();
-        assert!(format!("{error:#}").contains("ExposureAuto changed outside"));
-        assert_eq!(camera.as_mut().unwrap().get("ExposureAuto").unwrap(), "Off");
-        assert_eq!(
-            h.snapshot().history.undo.as_deref(),
-            Some("Enable auto mode")
-        );
-        h.shutdown();
-    }
-
-    #[test]
-    fn replay_addresses_the_original_selector_bank_and_keeps_current_selection() {
-        let h = WorkerHandle::new();
-        let mut camera = Some(
-            Camera::from_backend(crate::transport::simulator::info(), Box::new(Banks)).unwrap(),
-        );
-        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, false);
-        let mut run = |camera: &mut Option<Camera>, command| {
-            process(
-                &h,
-                camera,
-                &mut forwarder,
-                &mut auto,
-                &mut jobs,
-                &mut next,
-                &mut scheduled,
-                command,
-            )
-        };
-        let changed = run(
-            &mut camera,
-            SessionCommand::Set {
-                feature: "Setting".into(),
-                value: "20".into(),
-            },
-        )
-        .unwrap();
-        let token = changed["camera_change"]["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        run(
-            &mut camera,
-            SessionCommand::Set {
-                feature: "BankSelector".into(),
-                value: "B".into(),
-            },
-        )
-        .unwrap();
-        run(
-            &mut camera,
-            SessionCommand::ReplayCameraChange {
-                token: token.clone(),
-                undo: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(camera.as_mut().unwrap().get("BankSelector").unwrap(), "B");
-        assert_eq!(camera.as_mut().unwrap().get("Setting").unwrap(), 11);
-        camera.as_mut().unwrap().set("BankSelector", "A").unwrap();
-        assert_eq!(camera.as_mut().unwrap().get("Setting").unwrap(), 10);
-        camera.as_mut().unwrap().set("BankSelector", "B").unwrap();
-        run(
-            &mut camera,
-            SessionCommand::ReplayCameraChange { token, undo: false },
-        )
-        .unwrap();
-        assert_eq!(camera.as_mut().unwrap().get("BankSelector").unwrap(), "B");
-        camera.as_mut().unwrap().set("BankSelector", "A").unwrap();
-        assert_eq!(camera.as_mut().unwrap().get("Setting").unwrap(), 20);
-        h.shutdown();
-    }
-
-    #[test]
-    fn set_many_restores_and_undoes_every_bank_it_selects() {
-        let h = WorkerHandle::new();
-        let mut camera = Some(
-            Camera::from_backend(crate::transport::simulator::info(), Box::new(Banks)).unwrap(),
-        );
-        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, false);
-        let mut run = |camera: &mut Option<Camera>, command| {
-            process(
-                &h,
-                camera,
-                &mut forwarder,
-                &mut auto,
-                &mut jobs,
-                &mut next,
-                &mut scheduled,
-                command,
-            )
-        };
-        let many = |values: &[(&str, &str)]| SessionCommand::SetMany {
-            values: values
-                .iter()
-                .map(|(feature, value)| crate::session::FeatureValue {
-                    feature: (*feature).into(),
-                    value: (*value).into(),
-                })
-                .collect(),
-        };
-        // Bank A holds 10 and bank B 11; A is selected.
-        let banks = |camera: &mut Option<Camera>| {
-            let camera = camera.as_mut().unwrap();
-            let selected = camera.get("BankSelector").unwrap();
-            let mut values = Vec::new();
-            for bank in ["A", "B"] {
-                camera.set("BankSelector", bank).unwrap();
-                values.push(camera.get("Setting").unwrap());
-            }
-            camera
-                .set("BankSelector", selected.as_str().unwrap())
-                .unwrap();
-            (selected, values)
-        };
-        let initial = (json!("A"), vec![json!(10), json!(11)]);
-        assert_eq!(banks(&mut camera), initial);
-        // A failure after switching banks restores the bank it wrote too.
-        assert!(
-            run(
-                &mut camera,
-                many(&[("BankSelector", "B"), ("Setting", "99"), ("Setting", "x")]),
-            )
-            .is_err()
-        );
-        assert_eq!(banks(&mut camera), initial);
-        // So does one after writing an unlisted feature directly.
-        assert!(
-            run(
-                &mut camera,
-                many(&[("BValue", "42"), ("Setting", "20"), ("Setting", "x")])
-            )
-            .is_err()
-        );
-        assert_eq!(banks(&mut camera), initial);
-        assert!(h.snapshot().history.entries.is_empty());
-        // Success records every bank written, even with the selector put back.
-        let changed = run(
-            &mut camera,
-            many(&[
-                ("Setting", "20"),
-                ("BankSelector", "B"),
-                ("Setting", "99"),
-                ("BankSelector", "A"),
-            ]),
-        )
-        .unwrap();
-        assert_eq!(banks(&mut camera), (json!("A"), vec![json!(20), json!(99)]));
-        let token = changed["camera_change"]["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let switched = run(
-            &mut camera,
-            many(&[("BankSelector", "B"), ("Setting", "7")]),
-        )
-        .unwrap()["camera_change"]["token"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert_eq!(banks(&mut camera), (json!("B"), vec![json!(20), json!(7)]));
-        run(
-            &mut camera,
-            SessionCommand::ReplayCameraChange {
-                token: switched,
-                undo: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(banks(&mut camera), (json!("A"), vec![json!(20), json!(99)]));
-        run(
-            &mut camera,
-            SessionCommand::ReplayCameraChange {
-                token: token.clone(),
-                undo: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(banks(&mut camera), initial);
-        run(
-            &mut camera,
-            SessionCommand::ReplayCameraChange { token, undo: false },
-        )
-        .unwrap();
-        assert_eq!(banks(&mut camera), (json!("A"), vec![json!(20), json!(99)]));
-        h.shutdown();
-    }
-
-    #[derive(Default)]
+    /// A width that clamps the offset after it, as image geometry does.
     struct CoupledState {
         width: u32,
         offset: u32,
-        fail_offset_write: bool,
-        fail_offset_read: u8,
-        arm_read_failure: bool,
     }
     struct Coupled(Arc<Mutex<CoupledState>>);
     impl crate::types::RegisterIo for Coupled {
         fn read_memory(&mut self, address: u64, _: usize) -> Result<Vec<u8>> {
-            let mut state = self.0.lock().unwrap();
-            if address == 4 && state.fail_offset_read > 0 {
-                state.fail_offset_read -= 1;
-                anyhow::bail!("one-shot offset read failure");
-            }
+            let state = self.0.lock().unwrap();
             Ok(if address == 0 {
                 state.width
             } else {
@@ -1734,12 +637,7 @@ mod tests {
             if address == 0 {
                 state.width = value;
                 state.offset = state.offset.min(1024 - value);
-                if state.arm_read_failure {
-                    state.arm_read_failure = false;
-                    state.fail_offset_read = 2;
-                }
             } else {
-                ensure!(!state.fail_offset_write, "offset write rejected");
                 ensure!(value + state.width <= 1024, "offset outside image bounds");
                 state.offset = value;
             }
@@ -1768,11 +666,10 @@ mod tests {
     }
 
     #[test]
-    fn coupled_feature_changes_and_partial_replay_failures_restore_exactly() {
+    fn a_failed_preset_restores_values_an_earlier_write_moved() {
         let state = Arc::new(Mutex::new(CoupledState {
             width: 640,
             offset: 100,
-            ..Default::default()
         }));
         let h = WorkerHandle::new();
         let mut camera = Some(
@@ -1782,76 +679,46 @@ mod tests {
             )
             .unwrap(),
         );
-        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, false);
-        let mut run = |camera: &mut Option<Camera>, command| {
+        let mut run = |command: SessionCommand| {
             process(
                 &h,
-                camera,
-                &mut forwarder,
-                &mut auto,
-                &mut jobs,
-                &mut next,
-                &mut scheduled,
-                command,
+                &mut camera,
+                &mut None,
+                &mut None,
+                &mut Vec::new(),
+                &mut 1,
+                &mut JobStream::default(),
+                command.into(),
             )
         };
-        run(
-            &mut camera,
-            SessionCommand::Set {
-                feature: "Width".into(),
-                value: "1000".into(),
-            },
-        )
-        .unwrap();
-        assert_eq!(state.lock().unwrap().offset, 24);
-        state.lock().unwrap().fail_offset_write = true;
-        assert!(run(&mut camera, SessionCommand::Undo).is_err());
-        assert_eq!(coupled_values(&state), (1000, 24));
-        assert_eq!(h.snapshot().history.undo.as_deref(), Some("Set Width"));
-        state.lock().unwrap().fail_offset_write = false;
-        run(&mut camera, SessionCommand::Undo).unwrap();
-        assert_eq!(coupled_values(&state), (640, 100));
-        run(&mut camera, SessionCommand::Redo).unwrap();
-        assert_eq!(coupled_values(&state), (1000, 24));
-        h.shutdown();
-    }
-
-    #[test]
-    fn failed_checkpoint_read_rolls_back_the_successful_hardware_write() {
-        let state = Arc::new(Mutex::new(CoupledState {
-            width: 640,
-            offset: 100,
-            arm_read_failure: true,
-            ..Default::default()
-        }));
-        let h = WorkerHandle::new();
-        let mut camera = Some(
-            Camera::from_backend(
-                crate::transport::simulator::info(),
-                Box::new(Coupled(state.clone())),
-            )
-            .unwrap(),
+        let reading = serde_json::from_value(run(SessionCommand::ReadSetup).unwrap()).unwrap();
+        let saved = crate::setup::from_read("geometry", None, reading).unwrap();
+        let preset = |width: u32, offset: u32| {
+            let mut setup = saved.clone();
+            for value in &mut setup.values {
+                let number = match value.feature.as_str() {
+                    "Width" => width,
+                    "OffsetX" => offset,
+                    _ => continue,
+                };
+                value.value = crate::setup::Scalar::Number(number.into());
+            }
+            SessionCommand::ApplySetup {
+                name: None,
+                setup: Some(setup),
+                allow_other_model: false,
+                strict: false,
+            }
+        };
+        // Width 1000 moves OffsetX to 24, and OffsetX 110 no longer fits.
+        let error = run(preset(1000, 110)).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("offset outside image bounds"),
+            "{error:#}"
         );
-        let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, false);
-        let error = process(
-            &h,
-            &mut camera,
-            &mut forwarder,
-            &mut auto,
-            &mut jobs,
-            &mut next,
-            &mut scheduled,
-            SessionCommand::Set {
-                feature: "Width".into(),
-                value: "1000".into(),
-            },
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("previous camera state restored"));
         assert_eq!(coupled_values(&state), (640, 100));
-        assert_eq!(h.snapshot().history, CameraHistoryStatus::default());
+        run(preset(1000, 20)).unwrap();
+        assert_eq!(coupled_values(&state), (1000, 20));
         h.shutdown();
     }
 
@@ -1942,14 +809,12 @@ mod tests {
     }
 
     #[test]
-    fn an_edit_walks_the_features_once_and_starting_walks_none() {
+    fn edits_starting_and_stopping_walk_no_features() {
         let walks = Arc::new(AtomicU64::new(0));
         let h = WorkerHandle::new();
         let mut camera = walked(&walks, &Arc::default());
-        // Connecting walks the features once.
-        refresh(&h, &mut camera, true);
         let (mut forwarder, mut auto, mut jobs) = (None, None, Vec::new());
-        let (mut next, mut scheduled) = (1, false);
+        let (mut next, mut scheduled) = (1, JobStream::default());
         let mut walked = |camera: &mut Option<Camera>, command| {
             let before = walks.load(Ordering::Relaxed);
             let result = process(
@@ -1965,84 +830,89 @@ mod tests {
             .unwrap();
             (walks.load(Ordering::Relaxed) - before, result)
         };
-        let set = |feature: &str, value: &str| SessionCommand::Set {
-            feature: feature.into(),
-            value: value.into(),
+        let set_values = |values: &[&str]| -> WorkerCommand {
+            SessionCommand::SetValues {
+                values: values
+                    .iter()
+                    .map(|value| crate::controls::Assignment::parse(value).unwrap())
+                    .collect(),
+                dry_run: false,
+            }
+            .into()
         };
+        let set = |feature: &str, value: &str| set_values(&[&format!("{feature}={value}")]);
         let (count, result) = walked(&mut camera, set("Width", "128"));
-        assert_eq!(count, 1);
-        assert!(result["camera_change"]["token"].is_string());
-        assert_eq!(result["history"]["undo"], "Set Width");
-        // A grouped assistant edit shares the cached checkpoint names too:
-        // all writes together still end with only one full feature walk.
+        assert_eq!(count, 0);
+        assert_eq!(result["changed"][0]["name"], "Width", "{result}");
+        assert_eq!(result["changed"][0]["to"], 128, "{result}");
+        // So does a change of several values.
+        let (count, result) = walked(&mut camera, set_values(&["Width=256", "Height=192"]));
+        assert_eq!(count, 0);
+        assert_eq!(result["changed"][1]["name"], "Height", "{result}");
+        assert_eq!(result["changed"][1]["to"], 192, "{result}");
+        // A preset's checkpoint reads what it writes and the features
+        // coupled with it, not every feature.
+        let reading =
+            serde_json::from_value(walked(&mut camera, SessionCommand::ReadSetup.into()).1)
+                .unwrap();
+        let mut preset = crate::setup::from_read("geometry", None, reading).unwrap();
+        preset.values.retain(|value| value.feature == "Width");
+        preset.values[0].value = crate::setup::Scalar::Number(320.into());
         let (count, result) = walked(
             &mut camera,
-            SessionCommand::SetMany {
-                values: [("Width", "256"), ("Height", "192")]
-                    .into_iter()
-                    .map(|(feature, value)| crate::session::FeatureValue {
-                        feature: feature.into(),
-                        value: value.into(),
-                    })
-                    .collect(),
-            },
+            SessionCommand::ApplySetup {
+                name: None,
+                setup: Some(preset),
+                allow_other_model: false,
+                strict: false,
+            }
+            .into(),
         );
-        assert_eq!(count, 1);
-        assert!(result["camera_change"]["token"].is_string());
-        assert_eq!(result["history"]["undo"], "Set Width, Height");
-        assert_eq!(walked(&mut camera, SessionCommand::Start).0, 0);
-        let writable = |h: &WorkerHandle, name: &str| {
-            h.snapshot()
-                .features
-                .iter()
-                .find(|feature| feature.name == name)
-                .unwrap()
-                .writable
-        };
-        // A walk while streaming sees the geometry and the frame rate locked;
-        // stopping unlocks both without another walk.
-        assert_eq!(walked(&mut camera, set("ExposureTime", "5000")).0, 1);
-        assert!(!writable(&h, "Width") && !writable(&h, "AcquisitionFrameRate"));
-        assert_eq!(walked(&mut camera, SessionCommand::Stop).0, 0);
-        assert!(writable(&h, "Width") && writable(&h, "AcquisitionFrameRate"));
-        assert!(!writable(&h, "DeviceScanType"));
-        // Undo still reads every value it restores, and walks once.
-        assert_eq!(walked(&mut camera, SessionCommand::Undo).0, 1);
-        assert!(camera.as_ref().unwrap().is_streaming());
+        assert_eq!(count, 0);
+        assert_eq!(result["applied"], 1, "{result}");
+        let (count, result) = walked(&mut camera, set("ExposureTime", "4000"));
+        assert_eq!(count, 0);
+        assert_eq!(result["changed"][0]["name"], "ExposureTime", "{result}");
+        assert_eq!(walked(&mut camera, SessionCommand::Start.into()).0, 0);
+        assert_eq!(walked(&mut camera, set("ExposureTime", "5000")).0, 0);
+        assert_eq!(walked(&mut camera, SessionCommand::Stop.into()).0, 0);
         h.shutdown();
     }
 
     #[test]
-    fn a_feature_that_became_unreadable_since_the_last_walk_is_left_out() {
+    fn a_coupled_feature_that_is_unavailable_is_left_out_of_the_checkpoint() {
         let hidden = Arc::new(AtomicBool::new(false));
         let h = WorkerHandle::new();
         let mut camera = walked(&Arc::default(), &hidden);
-        refresh(&h, &mut camera, true);
-        assert!(
-            h.snapshot()
-                .features
-                .iter()
-                .any(|f| f.name == "Height" && f.value.is_some())
-        );
+        let mut run = |command: SessionCommand| {
+            process(
+                &h,
+                &mut camera,
+                &mut None,
+                &mut None,
+                &mut Vec::new(),
+                &mut 1,
+                &mut JobStream::default(),
+                command.into(),
+            )
+        };
+        let reading = serde_json::from_value(run(SessionCommand::ReadSetup).unwrap()).unwrap();
+        let mut preset = crate::setup::from_read("width", None, reading).unwrap();
+        preset.values.retain(|value| value.feature == "Width");
+        preset.values[0].value = crate::setup::Scalar::Number(128.into());
         hidden.store(true, Ordering::Relaxed);
-        let result = process(
-            &h,
-            &mut camera,
-            &mut None,
-            &mut None,
-            &mut Vec::new(),
-            &mut 1,
-            &mut false,
-            SessionCommand::Set {
-                feature: "Width".into(),
-                value: "128".into(),
-            },
-        )
+        let result = run(SessionCommand::ApplySetup {
+            name: None,
+            setup: Some(preset),
+            allow_other_model: false,
+            strict: false,
+        })
         .unwrap();
-        // As a fresh walk would, the checkpoint skips Height instead of
-        // giving up on undo.
-        assert!(result.get("history_unavailable").is_none(), "{result}");
-        assert!(result["camera_change"]["token"].is_string());
+        // Height, coupled with Width, cannot be read now: the checkpoint
+        // skips it instead of refusing the change.
+        assert_eq!(result["applied"], 1, "{result}");
+        drop(run);
+        assert_eq!(camera.as_mut().unwrap().get("Width").unwrap(), 128);
         h.shutdown();
     }
 }

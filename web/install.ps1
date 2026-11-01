@@ -113,7 +113,7 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
   if ($LASTEXITCODE) { Fail 'the installed capturefab.exe did not start' }
   ''
   'Next: capturefab doctor'
-  "Try:  capturefab --direct --camera sim:0 capture -o 'first-{seq}.png'"
+  "Try:  capturefab capture -c sim:0 -o 'first-{seq}.png'"
   'When Windows Defender Firewall asks, allow Capturefab on Private networks so GigE Vision streams arrive.'
 }
 

@@ -1,6 +1,7 @@
 //! ONVIF WS-Discovery and Media1/Media2 profile/RTSP URI resolution.
 //! SOAP uses bounded HTTP requests, WS UsernameToken PasswordDigest, and HTTP
 //! Basic/Digest authentication. HTTPS SOAP is rejected explicitly.
+use crate::types::{Categorized, ErrorKind};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use md5::{Digest, Md5};
@@ -205,7 +206,13 @@ fn repeat_offsets(first_delay_ms: u64) -> [Duration; 3] {
         Duration::from_millis(at)
     })
 }
-pub fn discover(timeout: Duration) -> Result<Vec<OnvifDevice>> {
+/// Search the network for ONVIF devices for up to `timeout`, telling
+/// `found` of each device as it answers; it returns at once, with what
+/// answered so far, when `found` says that was the one.
+fn discover_until(
+    timeout: Duration,
+    found: &mut dyn FnMut(&OnvifDevice) -> bool,
+) -> Result<Vec<OnvifDevice>> {
     validate_timeout(timeout)?;
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
         .context("cannot open ONVIF discovery socket")?;
@@ -273,10 +280,15 @@ pub fn discover(timeout: Duration) -> Result<Vec<OnvifDevice>> {
         match socket.recv_from(&mut buffer) {
             Ok((n, source)) => {
                 if let Ok(xml) = std::str::from_utf8(&buffer[..n])
-                    && let Ok(found) = parse_discovery(xml, source)
+                    && let Ok(answered) = parse_discovery(xml, source)
                 {
-                    for device in found {
+                    let mut wanted = false;
+                    for device in answered {
+                        wanted |= found(&device);
                         merge_device(&mut devices, device);
+                    }
+                    if wanted {
+                        break;
                     }
                 }
             }
@@ -310,10 +322,12 @@ fn parse_endpoint(url: &str, allow_https: bool) -> Result<HttpUrl> {
     let (protocol, rest) = url
         .split_once("://")
         .context("ONVIF endpoint must use http://")?;
-    ensure!(
-        allow_https || !protocol.eq_ignore_ascii_case("https"),
-        "HTTPS ONVIF SOAP is not supported in this build; use a camera's HTTP ONVIF service endpoint (HTTPS media playback remains available through FFmpeg)"
-    );
+    if !allow_https && protocol.eq_ignore_ascii_case("https") {
+        return Err(crate::types::Categorized::error(
+            crate::types::ErrorKind::Unsupported,
+            "HTTPS ONVIF SOAP is not supported in this build; use a camera's HTTP ONVIF service endpoint (HTTPS media playback remains available through FFmpeg)",
+        ));
+    }
     ensure!(
         protocol.eq_ignore_ascii_case("http") || protocol.eq_ignore_ascii_case("https"),
         "ONVIF endpoint must use http:// or https://"
@@ -504,17 +518,37 @@ impl Write for DeadlineStream {
 }
 fn open_tcp(url: &HttpUrl, timeout: Duration) -> Result<DeadlineStream> {
     validate_timeout(timeout)?;
+    // A host that does not resolve or answer is unavailable, whatever words
+    // the OS uses for it.
+    let unavailable = |error: anyhow::Error| -> anyhow::Error {
+        if crate::types::classify(&error).kind == ErrorKind::OperationFailed {
+            Categorized::new(ErrorKind::Unavailable, format!("{error:#}"))
+                .hint("check the address and that the camera is on this network")
+                .into()
+        } else {
+            error
+        }
+    };
     let addresses = (url.host.as_str(), url.port)
         .to_socket_addrs()
-        .context("cannot resolve ONVIF host")?
+        .map_err(|error| {
+            unavailable(anyhow::Error::new(error).context("cannot resolve ONVIF host"))
+        })?
         .collect::<Vec<_>>();
-    ensure!(!addresses.is_empty(), "ONVIF host resolved to no addresses");
+    if addresses.is_empty() {
+        return Err(unavailable(anyhow!("ONVIF host resolved to no addresses")));
+    }
     let deadline = Instant::now() + timeout;
     let mut last = None;
     let mut stream = None;
     for address in addresses {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        ensure!(!remaining.is_zero(), "ONVIF connection timed out");
+        if remaining.is_zero() {
+            return Err(Categorized::error(
+                ErrorKind::Timeout,
+                "ONVIF connection timed out",
+            ));
+        }
         match TcpStream::connect_timeout(&address, remaining) {
             Ok(s) => {
                 stream = Some(s);
@@ -523,12 +557,12 @@ fn open_tcp(url: &HttpUrl, timeout: Duration) -> Result<DeadlineStream> {
             Err(e) => last = Some(e),
         }
     }
-    let stream = stream.ok_or_else(|| {
-        anyhow!(
-            "cannot connect to ONVIF service: {}",
-            last.map(|e| e.to_string()).unwrap_or_default()
-        )
-    })?;
+    let Some(stream) = stream else {
+        let error = last.map_or_else(|| anyhow!("no address answered"), anyhow::Error::new);
+        return Err(unavailable(
+            error.context("cannot connect to ONVIF service"),
+        ));
+    };
     let remaining = deadline
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(1));
@@ -1406,7 +1440,7 @@ pub fn is_source(source: &str) -> bool {
 fn percent_decode(text: &str) -> Result<String> {
     crate::logins::percent_decode(text)
 }
-fn source_endpoint(source: &str) -> Result<(String, Option<Credentials>)> {
+pub(crate) fn source_endpoint(source: &str) -> Result<(String, Option<Credentials>)> {
     source_endpoint_impl(source, false)
 }
 fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Option<Credentials>)> {
@@ -1464,7 +1498,7 @@ fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Opti
 pub fn endpoint_key(source: &str) -> Result<String> {
     let (endpoint, credentials) = source_endpoint(source)?;
     if credentials.is_some() {
-        return Err(crate::dataset::Usage(
+        return Err(crate::types::Usage(
             "leave the user name and password out of the address; use --user and --password-stdin"
                 .into(),
         )
@@ -1612,12 +1646,6 @@ fn open_stream<T>(
     .context("could not open any ONVIF stream profile")
 }
 
-pub fn connect(
-    source: &str,
-    timeout: Duration,
-) -> Result<(crate::types::CameraInfo, Box<dyn crate::types::Backend>)> {
-    connect_with(source, None, timeout)
-}
 /// Open an ONVIF camera, with a sign-in given beside its address. Sign-in
 /// errors always name the ONVIF address, never a stream URI it reported,
 /// since the ONVIF address is what a sign-in is saved under.
@@ -1630,7 +1658,7 @@ pub fn connect_with(
     if let Some(login) = login {
         ensure!(
             credentials.is_none(),
-            crate::dataset::Usage(
+            crate::types::Usage(
                 "leave the user name and password out of the address when signing in".into()
             )
         );
@@ -1680,33 +1708,64 @@ pub fn connect_with(
     };
     Ok((info, backend))
 }
-pub fn camera_infos(timeout: Duration) -> Result<Vec<crate::types::CameraInfo>> {
-    Ok(discover(timeout)?
-        .into_iter()
-        .map(|device| {
-            let endpoint = crate::media::redact_url(&device.endpoint);
-            let name = device
-                .scopes
-                .iter()
-                .find_map(|scope| scope.strip_prefix("onvif://www.onvif.org/name/"))
-                .and_then(|name| percent_decode(name).ok())
-                .unwrap_or_else(|| "Network camera".into());
-            crate::types::CameraInfo {
-                id: format!("onvif:{endpoint}"),
-                transport: crate::types::Transport::Media,
-                vendor: "ONVIF".into(),
-                model: name,
-                serial: device.uuid,
-                address: Some(endpoint),
-                profile: Default::default(),
-            }
-        })
-        .collect())
+/// The ONVIF cameras that answer within `timeout`, as `list` shows them,
+/// telling `found` of each camera as it answers; it returns at once when
+/// `found` says that was the one.
+pub fn camera_infos_until(
+    timeout: Duration,
+    found: &mut dyn FnMut(&crate::types::CameraInfo) -> bool,
+) -> Result<Vec<crate::types::CameraInfo>> {
+    Ok(
+        discover_until(timeout, &mut |device| found(&camera_info(device.clone())))?
+            .into_iter()
+            .map(camera_info)
+            .collect(),
+    )
+}
+/// A discovered device as `list` shows it.
+fn camera_info(device: OnvifDevice) -> crate::types::CameraInfo {
+    let endpoint = crate::media::redact_url(&device.endpoint);
+    let name = device
+        .scopes
+        .iter()
+        .find_map(|scope| scope.strip_prefix("onvif://www.onvif.org/name/"))
+        .and_then(|name| percent_decode(name).ok())
+        .unwrap_or_else(|| "Network camera".into());
+    crate::types::CameraInfo {
+        id: format!("onvif:{endpoint}"),
+        transport: crate::types::Transport::Media,
+        vendor: "ONVIF".into(),
+        model: name,
+        serial: device.uuid,
+        address: Some(endpoint),
+        profile: Default::default(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hosts_that_do_not_answer_are_unavailable() {
+        let code = |url: &str, timeout| {
+            let error = open_tcp(&parse_url(url).unwrap(), timeout)
+                .err()
+                .expect("no ONVIF service answers there");
+            crate::cli::output::error_code(&error)
+        };
+        // A port nothing listens on, and a name that never resolves.
+        let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = refused.local_addr().unwrap().port();
+        drop(refused);
+        assert_eq!(
+            code(&format!("http://127.0.0.1:{port}/"), Duration::from_secs(2)),
+            ("unavailable", 3)
+        );
+        assert_eq!(
+            code("http://nonexistent.invalid/", Duration::from_secs(2)),
+            ("unavailable", 3)
+        );
+    }
     #[test]
     fn discovery_ignores_prefix_variations() {
         let xml = "<s:Envelope xmlns:s='http://www.w3.org/2003/05/soap-envelope' xmlns:d='http://schemas.xmlsoap.org/ws/2005/04/discovery' xmlns:a='http://schemas.xmlsoap.org/ws/2004/08/addressing'><s:Body><d:ProbeMatches><d:ProbeMatch><a:EndpointReference><a:Address>urn:uuid:test</a:Address></a:EndpointReference><d:XAddrs>http://192.168.1.3/onvif/device_service http://host/service</d:XAddrs><d:Scopes>onvif://www.onvif.org/name/Camera</d:Scopes></d:ProbeMatch></d:ProbeMatches></s:Body></s:Envelope>";
@@ -1859,12 +1918,12 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("profile token"));
         assert!(
-            discover(Duration::ZERO)
+            discover_until(Duration::ZERO, &mut |_| false)
                 .unwrap_err()
                 .to_string()
                 .contains("positive")
         );
-        assert!(discover(Duration::MAX).is_err());
+        assert!(discover_until(Duration::MAX, &mut |_| false).is_err());
     }
     #[test]
     fn endpoint_schemes_ignore_case_and_fragments_have_specific_errors() {
@@ -2718,7 +2777,7 @@ mod tests {
         let timeout = Duration::from_secs(2);
         // No credentials: auth_required, naming the ONVIF address.
         let (address, server) = answer(vec![challenge.clone()]);
-        let error = connect(&format!("onvif://{address}"), timeout)
+        let error = connect_with(&format!("onvif://{address}"), None, timeout)
             .err()
             .unwrap();
         server.join().unwrap();
@@ -2766,8 +2825,9 @@ mod tests {
                 stream.write_all(response.as_bytes()).unwrap();
             }
         });
-        let error = connect(
+        let error = connect_with(
             &format!("onvif:http://{here}/onvif/device_service"),
+            None,
             timeout,
         )
         .err()

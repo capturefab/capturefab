@@ -77,7 +77,7 @@ Binary image stdout, raw XML, completions, help and version output use their com
 
 Plain `doctor` checks the host and prints a fix for each warning.
 `doctor --json` adds `host`, `efficiency`, `paths`, `limits`, `graphics` and `checks` (`{id,level,message,fix}`).
-Check ids include `private_dirs`, `camera_network` (wired adapters for GigE Vision, never a warning), `ffmpeg`, `receive_buffer`, `usb_access` and `storage_budget`.
+Check ids include `sessions`, `session_storage`, `private_dirs`, `read_only_root`, `resources`, `camera_network` (wired adapters for GigE Vision, never a warning), `ffmpeg`, `receive_buffer`, `usb_access` and `free_space`.
 `doctor --json` reports `runtime_directory` for sessions.
 It reports `state_directory` for settings, hubs, destinations and the storage ledger.
 On Linux, state normally lives in `~/.local/state/capturefab` and survives reboots.

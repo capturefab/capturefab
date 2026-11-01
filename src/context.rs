@@ -1,5 +1,5 @@
 //! Capture context: short key/value tags (label, line, station, part, lot,
-//! note) carried with captures, recordings and dataset notes, and usable in
+//! note) carried with captures and recordings, and usable in
 //! output names as {tag:KEY}.
 use anyhow::{Result, ensure};
 

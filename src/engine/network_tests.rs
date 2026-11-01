@@ -44,7 +44,7 @@ impl Backend for NetworkBackend {
         let extra = r#"
             <Integer Name="DeviceLinkSpeed"><Value>125000000</Value><ImposedAccessMode>RO</ImposedAccessMode><Unit>Bps</Unit></Integer>
             <Integer Name="DeviceLinkThroughputLimit"><pValue>ThroughputReg</pValue><Min>1000</Min><Max>100000000</Max><Inc>1000</Inc></Integer>
-            <IntReg Name="ThroughputReg"><Address>0x180</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
+            <IntReg Name="ThroughputReg"><Address>0x1D0</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess><Sign>Unsigned</Sign></IntReg>
         "#;
         Ok(self.simulator.xml()?.replace(
             "</RegisterDescription>",
@@ -104,7 +104,7 @@ struct Harness {
     auto: Option<AutoController>,
     jobs: Vec<Scheduled>,
     next_job: u64,
-    scheduled_stream: bool,
+    scheduled_stream: JobStream,
 }
 
 impl Harness {
@@ -112,7 +112,7 @@ impl Harness {
         let backend = Arc::new(Mutex::new(BackendState::default()));
         let mut simulator = Simulator::default();
         simulator
-            .write_memory(0x180, &100_000_000u32.to_le_bytes())
+            .write_memory(0x1D0, &100_000_000u32.to_le_bytes())
             .unwrap();
         let mut info = crate::transport::simulator::info();
         info.transport = transport;
@@ -129,24 +129,8 @@ impl Harness {
         }
         // The commands under test run synchronously, without a second camera
         // owner or a background acquisition changing their state.
-        let (sender, _) = mpsc::sync_channel(32);
-        let handle = WorkerHandle {
-            sender,
-            state: Arc::new(RwLock::new(SessionSnapshot::default())),
-            counters: Arc::default(),
-            frame: Arc::new(RwLock::new(None)),
-            quitting: Arc::new(AtomicBool::new(false)),
-            thread: Arc::new(Mutex::new(None)),
-            ring: None,
-            ring_note: Arc::default(),
-            history: Arc::default(),
-            saved: Arc::default(),
-            recording: Arc::default(),
-            forward_clock: Arc::default(),
-            names: Arc::default(),
-            logins: crate::logins::Logins::system(),
-        };
-        let mut harness = Self {
+        let handle = WorkerHandle::idle();
+        let harness = Self {
             handle,
             camera: Some(camera),
             backend,
@@ -154,14 +138,14 @@ impl Harness {
             auto: None,
             jobs: Vec::new(),
             next_job: 1,
-            scheduled_stream: false,
+            scheduled_stream: JobStream::default(),
         };
-        refresh(&harness.handle, &mut harness.camera, false);
+        refresh(&harness.handle, &harness.camera);
         harness.backend.lock().unwrap().calls.clear();
         harness
     }
 
-    fn run(&mut self, command: SessionCommand) -> Result<Value> {
+    fn run(&mut self, command: impl Into<WorkerCommand>) -> Result<Value> {
         process_plain(
             &self.handle,
             &mut self.camera,
@@ -170,12 +154,12 @@ impl Harness {
             &mut self.jobs,
             &mut self.next_job,
             &mut self.scheduled_stream,
-            command,
+            command.into(),
         )
     }
 
     fn optimize(&mut self) -> Result<Value> {
-        self.run(SessionCommand::OptimizeNetwork {
+        self.run(WorkerCommand::OptimizeNetwork {
             bytes_per_second: 33_333_333,
         })
     }
@@ -204,6 +188,36 @@ fn running_preview_is_paused_tuned_and_resumed() {
     assert_eq!(result["tuning"]["throughput_limit_bps"], 33_333_000);
     assert!(harness.camera.as_ref().unwrap().is_streaming());
     assert!(harness.handle.snapshot().streaming);
+}
+
+#[test]
+fn a_camera_armed_beside_others_is_paced_to_its_share_first() {
+    let mut harness = Harness::new(Transport::GigE, false);
+    let arm = |bytes_per_second| SessionCommand::Arm {
+        warmup_ms: Some(0),
+        bytes_per_second,
+    };
+    let armed = harness.run(arm(Some(33_333_333))).unwrap();
+    assert_eq!(harness.transport_calls(), [Call::Optimize, Call::Start]);
+    assert_eq!(armed["network"]["throughput_limit_bps"], 33_333_000);
+    assert_eq!(armed["started"], true);
+    // One that cannot be paced streams anyway, and says why.
+    let mut harness = Harness::new(Transport::GigE, false);
+    harness.backend.lock().unwrap().fail_tuning = true;
+    let armed = harness.run(arm(Some(33_333_333))).unwrap();
+    assert!(
+        armed["network_error"]
+            .as_str()
+            .unwrap()
+            .contains("injected tuning failure"),
+        "{armed}"
+    );
+    assert!(harness.camera.as_ref().unwrap().is_streaming());
+    // Alone on its interface, it keeps the camera's own pace.
+    let mut harness = Harness::new(Transport::GigE, false);
+    let armed = harness.run(arm(None)).unwrap();
+    assert_eq!(harness.transport_calls(), [Call::Start]);
+    assert!(armed.get("network").is_none());
 }
 
 #[test]
@@ -299,15 +313,23 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
         let output = "network-scan-protected.png";
         harness.jobs.push(Scheduled {
             plan: crate::naming::Plan::File(output.into()),
-            camera: "camera".into(),
+            camera: crate::naming::CameraName {
+                label: "camera".into(),
+                serial: "unknown".into(),
+            },
             on_exists: Default::default(),
             next: None,
-            saving: false,
+            shots: 0,
+            free: Default::default(),
+            stop_by: None,
+            trigger: None,
+            unanswered: 0,
+            saving: 0,
+            baseline: None,
             info: crate::scheduling::CaptureJob {
                 id: 1,
                 status: status.into(),
                 output: output.into(),
-                destination: None,
                 count: 1,
                 captured: 0,
                 skipped: 0,
@@ -316,19 +338,23 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
                 interval_ms: 1000,
                 next_at_ms: 1000,
                 last_file: None,
-                error: None,
-                context: Default::default(),
-            },
-            resolved: crate::destination::Resolved {
-                output: output.into(),
-                destination: None,
-                root: None,
+                ..Default::default()
             },
             timeout_ms: 1000,
             format: "png".into(),
-            storage: Default::default(),
+            sync: Default::default(),
+            manifest: None,
+            source: Default::default(),
+            folders: Default::default(),
             deadline: None,
             warm: None,
+            utc_offset_s: None,
+            quality: None,
+            reported: false,
+            fresh: 0,
+            wait: Duration::ZERO,
+            warmup_ms: None,
+            inspect: false,
         });
         let error = harness.optimize().unwrap_err();
         assert!(error.to_string().contains("scheduled captures"));

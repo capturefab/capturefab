@@ -1,15 +1,15 @@
-//! Host checks for `doctor`: where sessions, state and temporary files live,
-//! kernel limits that cap camera throughput, the storage budget against the
-//! capture disk and the graphics adapter the desktop window would get, each
-//! turned into a check with a copyable fix.
+//! Host checks for `doctor`: where sessions, state and temporary files live
+//! and which fallbacks are in use (read-only and immutable systems), the CPUs
+//! and memory this process may use, kernel limits that cap camera throughput
+//! and the free space captures have, each turned into a check with a
+//! copyable fix.
 #![allow(unsafe_code)]
 
-use crate::analytics::human_bytes;
-use crate::efficiency::{self, Mode, Resolved};
-use crate::ipc::LoginDir;
+#[cfg(any(target_os = "linux", test))]
+use crate::dirs::LoginDir;
 use crate::media::FfmpegHealth;
 use crate::network::{InterfaceKind, NetworkInterface};
-use crate::storage::{FREE_SPACE_FLOOR, StoragePolicy};
+use crate::types::human_bytes;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -18,24 +18,20 @@ use std::{
 };
 
 /// Where the checks are explained.
-const GUIDE: &str = concat!(
-    env!("CARGO_PKG_REPOSITORY"),
-    "#host-checks-and-efficiency-mode"
-);
+const GUIDE: &str = "https://capturefab.com/docs.html#doctor";
 /// Running Capturefab as a Linux service, with these fixes in context.
-const LINE_COMPUTER: &str = concat!(
-    env!("CARGO_PKG_REPOSITORY"),
-    "/blob/main/docs/line-computer.md"
-);
+const LINE_COMPUTER: &str = "https://capturefab.com/guides/line-computer.md";
 /// The udev rule Linux archives ship in share/udev/rules.d, and the fix for
 /// `usb_access` writes: the logged-in seat user and the plugdev group may
 /// open any device with a USB3 Vision interface (class ef/05/00).
 /// The first rule imports usb_id, which sets ID_USB_INTERFACES, as not every
 /// distribution has by the time rules sorted at 70 run.
+#[cfg(any(feature = "usb", test))]
 const UDEV_RULES: [&str; 2] = [
     r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", IMPORT{builtin}="usb_id""#,
     r#"SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ef0500:*", MODE="0660", GROUP="plugdev", TAG+="uaccess""#,
 ];
+#[cfg(any(feature = "usb", test))]
 const UDEV_RULE_FILE: &str = "70-capturefab-usb3vision.rules";
 /// Room for two frames of a 16 MiB GigE camera; the value the GigE transport
 /// already suggests when its receive buffer comes up short.
@@ -50,9 +46,12 @@ pub enum Level {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Check {
+    #[serde(rename = "name")]
     pub id: &'static str,
+    #[serde(rename = "status")]
     pub level: Level,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
 }
 impl Check {
@@ -122,7 +121,7 @@ pub struct Limits {
 }
 
 /// Only Linux reads these from sysfs.
-#[cfg_attr(not(all(target_os = "linux", feature = "usb")), allow(dead_code))]
+#[cfg(any(all(target_os = "linux", feature = "usb"), test))]
 #[derive(Debug, Clone, PartialEq)]
 struct UsbCamera {
     name: String,
@@ -130,36 +129,74 @@ struct UsbCamera {
     accessible: bool,
 }
 
+/// One kind of folder as `dirs` found it.
+struct Folder {
+    /// The folder, and its file system.
+    place: Option<Place>,
+    /// What chose it: a variable, `login`, `home`, `run`, `temp`, ...
+    from: &'static str,
+    /// Whether this process can write in it.
+    writable: bool,
+    /// Candidates passed over before it, and why.
+    passed: Vec<crate::dirs::Passed>,
+    /// Why there is none.
+    missing: Option<String>,
+}
+impl Folder {
+    fn of(kind: crate::dirs::Kind) -> Self {
+        let found = crate::dirs::found(kind);
+        let chosen = found.chosen.as_ref();
+        Self {
+            place: chosen.map(|chosen| Place::of(chosen.path.clone())),
+            from: chosen.map_or("", |chosen| chosen.from),
+            writable: chosen.is_some_and(|chosen| chosen.writable),
+            passed: found.passed.clone(),
+            missing: found.missing().map(str::to_owned),
+        }
+    }
+    fn json(&self) -> Value {
+        json!({
+            "path": self.place.as_ref().map(|place| &place.path),
+            "from": (!self.from.is_empty()).then_some(self.from),
+            "writable": self.writable,
+            "fs_type": self.place.as_ref().and_then(|place| place.fs_type.as_ref()),
+            "passed": self.passed,
+            "error": self.missing,
+        })
+    }
+}
+
 /// What the checks look at, gathered once.
 struct Facts {
-    efficiency: Resolved,
-    /// Settings › Performance, unless Automatic.
-    desktop: Option<Mode>,
-    /// The GPU probe's answer, when it ran.
-    graphics: Option<Value>,
     /// Where sessions are found, with their short-lived files.
-    runtime: Place,
-    /// Settings, saved destinations and the storage ledger.
-    state: Place,
-    /// CAPTUREFAB_SESSION_DIR chose both.
-    session_dir_set: bool,
+    runtime: Folder,
+    /// Presets, saved sign-ins and sessions' jobs.
+    state: Folder,
+    /// The extracted FFmpeg and GenICam XML.
+    cache: Folder,
+    /// A camera command can start the `auto` session, for the full report.
+    warm_sessions: Option<bool>,
+    /// The root file system is mounted read-only.
+    read_only_root: Option<bool>,
+    /// CPUs and memory this process may use.
+    memory: crate::host::Memory,
+    cpu_quota: Option<f64>,
     /// `/run/user/<uid>` when the runtime directory fell back to disk
     /// without it, and why.
+    #[cfg(any(target_os = "linux", test))]
     missed_runtime_dir: Option<(PathBuf, LoginDir)>,
     /// From a login that has XDG_RUNTIME_DIR: where a service without it
     /// keeps sessions instead.
+    #[cfg(any(target_os = "linux", test))]
     service_runtime_dir: Option<ServiceDir>,
     limits: Limits,
+    #[cfg(any(all(target_os = "linux", feature = "usb"), test))]
     usb: Vec<UsbCamera>,
-    budget: u64,
-    /// Bytes counted against the budget, reservations included; None while
-    /// the ledger's usage is unknown.
-    used: Option<u64>,
-    working_directory: Place,
-    /// The default capture folder's disk, where `storage --json` measures.
+    /// Where captures go without -o: this folder.
     captures: Place,
-    /// macOS: this executable runs from the disk image or a translocated copy.
-    install: Option<crate::volumes::InstallLocation>,
+    /// The free space writes leave on that disk, or why the setting is
+    /// wrong.
+    floor: Result<u64, String>,
     /// IPv4 adapters, for the full report only: `serve`'s warnings never
     /// need them, and on Windows listing them runs PowerShell.
     interfaces: Option<Vec<NetworkInterface>>,
@@ -168,13 +205,25 @@ struct Facts {
     ffmpeg: Option<Result<FfmpegHealth, String>>,
     /// CAPTUREFAB_FFMPEG chose FFmpeg.
     ffmpeg_overridden: bool,
-    /// The runtime or state directory, where it exists but sessions would
-    /// refuse it, and why.
-    private_dirs: Vec<(PathBuf, String)>,
+    /// Files in the state directory that version 0.5 wrote and nothing
+    /// reads any more, its storage ledger among them.
+    leftovers: Vec<PathBuf>,
+    /// Folders passed over or refused because they are not private to
+    /// this user, and why.
+    private_dirs: Vec<PrivateDir>,
+}
+/// A folder passed over, or refused, because it is not this user's alone.
+#[derive(Debug, Clone, PartialEq)]
+struct PrivateDir {
+    path: PathBuf,
+    why: String,
+    /// A cache folder, which CAPTUREFAB_CACHE_DIR moves, not sessions'.
+    cache: bool,
 }
 /// Where a service started without XDG_RUNTIME_DIR keeps sessions, out of
 /// this login's sight, the login runtime directory it passes over and why,
 /// and the sessions running there.
+#[cfg(any(target_os = "linux", test))]
 struct ServiceDir {
     dir: PathBuf,
     login: PathBuf,
@@ -183,39 +232,73 @@ struct ServiceDir {
 }
 impl Facts {
     /// `report` also lists network adapters and runs FFmpeg, which only
-    /// `doctor` shows.
-    fn gather(report: bool) -> Self {
-        let state = crate::ipc::state_dir();
-        let (budget, used) = ledger(&state);
-        let mut private_dirs = Vec::new();
-        for dir in [crate::ipc::runtime_dir(), state.clone()] {
-            if dir.exists()
-                && !private_dirs.iter().any(|(seen, _)| *seen == dir)
-                && let Err(error) = crate::ipc::check_private_dir(&dir)
-            {
-                private_dirs.push((dir, format!("{error:#}")));
+    /// `doctor` shows; `warm_sessions` is whether a session can start.
+    fn gather(report: bool, warm_sessions: Option<bool>) -> Self {
+        let runtime = Folder::of(crate::dirs::Kind::Runtime);
+        let state = Folder::of(crate::dirs::Kind::State);
+        let cache = Folder::of(crate::dirs::Kind::Cache);
+        let mut private_dirs: Vec<PrivateDir> = Vec::new();
+        for (folder, is_cache) in [(&runtime, false), (&state, false), (&cache, true)] {
+            for passed in &folder.passed {
+                if private_problem(&passed.why)
+                    && !private_dirs.iter().any(|seen| seen.path == passed.path)
+                {
+                    private_dirs.push(PrivateDir {
+                        path: passed.path.clone(),
+                        why: format!("{}: {}", passed.path.display(), passed.why),
+                        cache: is_cache,
+                    });
+                }
             }
         }
+        let state_dir = state
+            .place
+            .as_ref()
+            .map(|place| place.path.clone())
+            .unwrap_or_default();
+        let leases = std::fs::read_dir(&state_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("storage-") && name.ends_with(".lease"))
+            });
+        let mut leftovers: Vec<PathBuf> = LEFTOVERS
+            .iter()
+            .filter(|_| state.place.is_some())
+            .map(|name| state_dir.join(name))
+            .filter(|path| path.symlink_metadata().is_ok())
+            .chain(leases)
+            .collect();
+        leftovers.sort();
+        let captures = Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let floor = crate::storage::floor(captures.total_bytes.unwrap_or(0))
+            .map_err(|error| format!("{error:#}"));
         Self {
+            leftovers,
             interfaces: report.then(|| crate::network::interfaces().unwrap_or_default()),
             ffmpeg: report
                 .then(|| crate::media::ffmpeg_health().map_err(|error| format!("{error:#}"))),
             ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG").is_some(),
             private_dirs,
-            efficiency: efficiency::current(),
-            #[cfg(feature = "gui")]
-            desktop: crate::gui::saved_performance(),
-            #[cfg(not(feature = "gui"))]
-            desktop: None,
-            graphics: None,
-            budget,
-            used,
-            runtime: Place::of(crate::ipc::runtime_dir()),
-            state: Place::of(state),
-            session_dir_set: std::env::var_os("CAPTUREFAB_SESSION_DIR")
-                .is_some_and(|dir| !dir.is_empty()),
-            missed_runtime_dir: crate::ipc::missed_runtime_dir(),
-            service_runtime_dir: crate::ipc::service_runtime_dir().map(|(dir, login, why)| {
+            runtime,
+            state,
+            cache,
+            warm_sessions,
+            read_only_root: if cfg!(target_os = "linux") {
+                crate::dirs::read_only_mount(Path::new("/"))
+            } else {
+                None
+            },
+            memory: crate::host::memory(),
+            cpu_quota: crate::host::cpu_quota(),
+            #[cfg(any(target_os = "linux", test))]
+            missed_runtime_dir: crate::dirs::missed_runtime_dir(),
+            #[cfg(any(target_os = "linux", test))]
+            service_runtime_dir: crate::dirs::service_runtime_dir().map(|(dir, login, why)| {
                 let running = crate::ipc::sessions_elsewhere()
                     .map(|(_, names)| names)
                     .unwrap_or_default();
@@ -227,64 +310,60 @@ impl Facts {
                 }
             }),
             limits: limits(),
+            #[cfg(any(all(target_os = "linux", feature = "usb"), test))]
             usb: usb_cameras(),
-            working_directory: Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into())),
-            captures: capture_place(),
-            install: std::env::current_exe()
-                .ok()
-                .and_then(|exe| crate::volumes::install_location(&exe)),
+            captures,
+            floor,
         }
     }
 }
 
-/// The host part of `doctor`. The GPU probe starts first and runs in a
-/// helper process while the rest of the report is gathered.
-pub struct HostReport {
-    graphics: Option<std::thread::JoinHandle<Value>>,
-}
-impl HostReport {
-    pub fn start() -> Self {
-        Self {
-            #[cfg(feature = "gui")]
-            graphics: Some(std::thread::spawn(graphics)),
-            #[cfg(not(feature = "gui"))]
-            graphics: None,
-        }
+/// The `doctor` document: checks with fixes, this build, its folders and
+/// the fallbacks they use, the CPUs and memory it may use, and the FFmpeg
+/// it runs. `warm_sessions`: whether a camera command can start a session.
+pub fn report(warm_sessions: bool) -> Value {
+    let facts = Facts::gather(true, Some(warm_sessions));
+    let path = |folder: &Folder| folder.place.as_ref().map(|place| place.path.clone());
+    let runtime = path(&facts.runtime);
+    let mut report = json!({
+        "checks": checks(&facts),
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "features": {
+            "usb": cfg!(feature = "usb"),
+            "jpeg": cfg!(feature = "jpeg"),
+            "keychain": cfg!(feature = "keychain"),
+        },
+        "dirs": {
+            "inspect": crate::dirs::scratch().ok().map(|dir| dir.join("inspect")),
+            "runtime": runtime,
+            "state": path(&facts.state),
+            "cache": path(&facts.cache),
+        },
+        "folders": {
+            "runtime": facts.runtime.json(),
+            "state": facts.state.json(),
+            "cache": facts.cache.json(),
+        },
+        "warm_sessions": warm_sessions,
+        "read_only_root": facts.read_only_root,
+        "host": crate::host::report(),
+    });
+    if let Some(ffmpeg) = &facts.ffmpeg {
+        report["ffmpeg"] = match ffmpeg {
+            Ok(health) => {
+                json!({"source": health.source, "path": health.path, "version": health.version, "bundled_error": health.bundled_error})
+            }
+            Err(error) => json!({ "error": error }),
+        };
     }
-    pub fn finish(self, report: &mut Value) {
-        let mut facts = Facts::gather(true);
-        facts.graphics = self.graphics.map(|probe| {
-            probe
-                .join()
-                .unwrap_or_else(|_| json!({"available":false,"reason":"the GPU probe failed"}))
-        });
-        report["host"] = json!(efficiency::host());
-        report["efficiency"] = json!(facts.efficiency);
-        report["paths"] = json!({
-            "runtime": facts.runtime,
-            "state": facts.state,
-            "cache": crate::ipc::cache_dir().map(Place::of),
-            "temp": Place::of(std::env::temp_dir()),
-            "working_directory": facts.working_directory,
-        });
-        report["limits"] = json!(facts.limits);
-        report["graphics"] = facts
-            .graphics
-            .clone()
-            .unwrap_or_else(|| json!({"available":false,"reason":"not compiled in"}));
-        let mut checks = checks(&facts);
-        checks.extend(
-            crate::updates::doctor_notes()
-                .into_iter()
-                .map(|(message, fix)| Check::warn("updates", message, fix)),
-        );
-        report["checks"] = json!(checks);
-    }
+    report
 }
 
 /// For `serve`: one line naming what `doctor` warns about.
 pub fn print_warnings() {
-    let warnings: Vec<String> = checks(&Facts::gather(false))
+    let warnings: Vec<String> = checks(&Facts::gather(false, None))
         .into_iter()
         .filter(|check| check.level == Level::Warn)
         .map(|check| check.message)
@@ -297,39 +376,23 @@ pub fn print_warnings() {
     }
 }
 
-/// Human `doctor`: the host on one line, then one line per check with its fix.
+/// Human `doctor`: the build on one line, then one line per check with
+/// its fix.
 pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
-    let host = &report["host"];
-    let mut summary = vec![format!(
-        "Capturefab {} on {} {}",
+    writeln!(
+        out,
+        "Capturefab {} on {} {} · {} CPU cores",
         text(&report["version"]),
         text(&report["os"]),
-        text(&report["arch"])
-    )];
-    summary.push(format!("{} CPU cores", host["cpu_cores"]));
-    if let Some(total) = host["memory_total"].as_u64() {
-        summary.push(match host["memory_available"].as_u64() {
-            Some(free) => format!(
-                "{} memory, {} available",
-                human_bytes(total),
-                human_bytes(free)
-            ),
-            None => format!("{} memory", human_bytes(total)),
-        });
-    }
-    if host["on_battery"] == true {
-        summary.push("on battery".into());
-    }
-    if host["low_power"] == true {
-        summary.push("low-power mode".into());
-    }
-    writeln!(out, "{}", summary.join(" · "))?;
+        text(&report["arch"]),
+        crate::host::cpus()
+    )?;
     for check in report["checks"].as_array().into_iter().flatten() {
         writeln!(
             out,
             "{:<5} {}",
-            text(&check["level"]),
+            text(&check["status"]),
             text(&check["message"])
         )?;
         if let Some(fix) = check["fix"].as_str() {
@@ -338,7 +401,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     }
     writeln!(
         out,
-        "More: {GUIDE}. See also network-scan and ffmpeg; --json adds features, scanners, JPEG encoders and interfaces."
+        "More: {GUIDE}. See also capturefab network; --json adds features, folders and FFmpeg."
     )?;
     if report["os"] == "linux" {
         writeln!(out, "Running it as a service: {LINE_COMPUTER}")?;
@@ -347,127 +410,72 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
 }
 
 fn checks(facts: &Facts) -> Vec<Check> {
-    let mut checks = vec![efficiency_check(&facts.efficiency, facts.desktop)];
-    checks.extend(facts.graphics.as_ref().map(graphics_check));
-    checks.extend(
-        facts
-            .missed_runtime_dir
-            .as_ref()
-            .map(|(dir, login)| runtime_dir_check(dir, *login, &facts.runtime, &facts.state)),
-    );
-    checks.extend(facts.service_runtime_dir.as_ref().map(|service| {
-        service_runtime_dir_check(
-            &service.dir,
-            &service.login,
-            service.why,
-            &service.running,
-            &facts.runtime,
-        )
-    }));
-    checks.push(session_check(&facts.state, facts.session_dir_set));
-    checks.extend(private_dirs_check(&facts.private_dirs));
+    let mut checks = Vec::new();
+    #[cfg(any(target_os = "linux", test))]
+    if let Some(runtime) = &facts.runtime.place {
+        checks.extend(facts.missed_runtime_dir.as_ref().map(|(dir, login)| {
+            runtime_dir_check(dir, *login, runtime, facts.state.place.as_ref())
+        }));
+        checks.extend(facts.service_runtime_dir.as_ref().map(|service| {
+            service_runtime_dir_check(
+                &service.dir,
+                &service.login,
+                service.why,
+                &service.running,
+                runtime,
+            )
+        }));
+    }
+    checks.push(sessions_check(&facts.runtime, facts.warm_sessions));
+    checks.push(session_check(&facts.state));
+    checks.extend(private_dirs_check(
+        &facts.private_dirs,
+        facts.runtime.place.as_ref(),
+        facts.cache.place.as_ref(),
+    ));
+    checks.extend(facts.read_only_root.and_then(read_only_root_check));
+    checks.push(resources_check(
+        crate::host::cpus(),
+        facts.cpu_quota,
+        &facts.memory,
+    ));
     checks.extend(facts.interfaces.as_deref().map(camera_network_check));
     checks.extend(
         facts
             .ffmpeg
             .as_ref()
-            .map(|health| ffmpeg_check(health, facts.ffmpeg_overridden, cfg!(debug_assertions))),
+            .map(|health| ffmpeg_check(health, facts.ffmpeg_overridden, crate::media::bundled())),
     );
+    checks.extend(leftovers_check(&facts.leftovers));
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
+    #[cfg(any(all(target_os = "linux", feature = "usb"), test))]
     checks.extend(usb_check(&facts.usb));
-    checks.extend(facts.install.map(install_check));
-    checks.extend(
-        facts
-            .used
-            .and_then(|used| budget_check(facts.budget, used, &facts.captures)),
-    );
+    checks.extend(free_space_check(&facts.captures, &facts.floor));
     checks
-}
-
-/// `desktop` is Settings › Performance, which only the desktop window
-/// applies: it is named when the window would run otherwise than this.
-fn efficiency_check(resolved: &Resolved, desktop: Option<Mode>) -> Check {
-    let mode = if resolved.efficient {
-        "Efficient"
-    } else {
-        "Smooth"
-    };
-    let why = if resolved.reasons.is_empty() {
-        "auto found no constraint".to_owned()
-    } else {
-        resolved.reasons.join(", ")
-    };
-    let mut message = format!("{mode} mode: {why}.");
-    let window = match desktop {
-        Some(Mode::Efficient) if !resolved.efficient => Some("Efficient"),
-        Some(Mode::Smooth) if resolved.efficient => Some("Smooth"),
-        _ => None,
-    };
-    if let Some(window) = window {
-        message.push_str(&format!(
-            " The desktop window runs {window}, as set in its Settings › Performance, which applies there only."
-        ));
-    }
-    let mut check = Check::ok("efficiency", message);
-    if resolved.efficient && resolved.setting == Mode::Auto {
-        check.fix = Some(
-            "To stay smooth anyway, use --efficiency smooth or CAPTUREFAB_EFFICIENCY=smooth."
-                .into(),
-        );
-    }
-    check
-}
-
-fn graphics_check(graphics: &Value) -> Check {
-    let adapter = graphics["adapter"].as_str().unwrap_or("unknown adapter");
-    if graphics["available"] != true {
-        Check::warn(
-            "graphics",
-            format!(
-                "No GPU adapter ({}), so the desktop window would draw in software.",
-                graphics["reason"].as_str().unwrap_or("unknown reason")
-            ),
-            "Install the GPU's Vulkan, Metal, Direct3D 12 or OpenGL driver.".into(),
-        )
-    } else if graphics["software"] == true {
-        Check::warn(
-            "graphics",
-            format!(
-                "The desktop window would draw on the CPU ({adapter}): no hardware GPU driver is in use."
-            ),
-            "Install the GPU's Vulkan or OpenGL driver.".into(),
-        )
-    } else {
-        Check::ok(
-            "graphics",
-            format!(
-                "GPU: {adapter} ({}, {}).",
-                graphics["backend"].as_str().unwrap_or("unknown backend"),
-                graphics["device_type"].as_str().unwrap_or("unknown type")
-            ),
-        )
-    }
 }
 
 /// Without XDG_RUNTIME_DIR, Capturefab uses the login's runtime directory
 /// for a lingering user, so a service and an SSH shell find the same
 /// sessions. Otherwise logind removes it at logout, taking a service's
-/// session with it, so Capturefab falls back to disk. Frame rings are
-/// anonymous memory either way, but the nvJPEG and VA-API helpers' staging
-/// buffers are files there (`accel`).
-fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place) -> Check {
+/// session with it, so Capturefab falls back to disk, or to a temporary
+/// folder where the home is read-only.
+#[cfg(any(target_os = "linux", test))]
+fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: Option<&Place>) -> Check {
     let dir = login.display();
     let runtime = runtime.path.display();
-    let state = state.path.display();
     let (why, fix) = login_dir_problem(login, why);
+    let state = state.map_or_else(String::new, |state| {
+        format!(
+            " Presets, saved sign-ins and sessions' jobs stay in {} either way.",
+            state.path.display()
+        )
+    });
     Check::warn(
         "runtime_dir",
         format!(
-            "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
+            "XDG_RUNTIME_DIR is unset and {why}, so sessions are in {runtime}, while logins look for them in {dir}/capturefab."
         ),
-        format!(
-            "{fix} Settings, destinations and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
-        ),
+        format!("{fix}{state} A service unit that does this: {LINE_COMPUTER}"),
     )
 }
 
@@ -475,6 +483,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
 /// XDG_RUNTIME_DIR: a service started without it keeps its sessions in
 /// `service` instead, out of this login's sight. A warning once such a
 /// session runs, otherwise a note, as most logins never start a service.
+#[cfg(any(target_os = "linux", test))]
 fn service_runtime_dir_check(
     service: &Path,
     login: &Path,
@@ -511,6 +520,7 @@ fn service_runtime_dir_check(
 
 /// Why the login runtime directory cannot hold a service's sessions, and
 /// the fix.
+#[cfg(any(target_os = "linux", test))]
 fn login_dir_problem(login: &Path, why: LoginDir) -> (String, String) {
     let dir = login.display();
     let uid = login
@@ -538,46 +548,117 @@ fn login_dir_problem(login: &Path, why: LoginDir) -> (String, String) {
     }
 }
 
-/// Informational rather than a warning: by default state is on disk, so
-/// memory means the user chose it, and only they know whether it must
-/// outlive a reboot.
-/// The app runs from a path that goes away: the mounted disk image, or a
-/// copy macOS made of a quarantined app.
-fn install_check(location: crate::volumes::InstallLocation) -> Check {
-    let message = match location {
-        crate::volumes::InstallLocation::DiskImage => {
-            "Capturefab is running from the disk image; its path stops working once you eject it."
-        }
-        crate::volumes::InstallLocation::Translocated => {
-            "Capturefab is running from a temporary copy macOS made; its path changes on every launch."
-        }
+/// Where sessions run, and so whether camera commands keep their cameras
+/// warm, which folder is in use when the default could not be, and what
+/// goes without one: on a read-only system with nothing writable each
+/// command opens its camera alone.
+fn sessions_check(runtime: &Folder, warm: Option<bool>) -> Check {
+    let fallback = runtime.passed.first().map(|passed| {
+        format!(
+            " ({} is passed over: {})",
+            passed.path.display(),
+            passed.why
+        )
+    });
+    let Some(place) = &runtime.place else {
+        let why = runtime
+            .missing
+            .as_deref()
+            .unwrap_or("no runtime folder")
+            .trim_end_matches('.');
+        let previews = match crate::dirs::temp() {
+            Some(temp) => format!("previews go to {}", temp.join("inspect").display()),
+            None => "previews need --preview FILE or --preview none".into(),
+        };
+        return Check::warn(
+            "sessions",
+            format!(
+                "No session can start: {why}. Each camera command opens its camera alone (no warm cameras), camera locks are off and {previews}."
+            ),
+            format!(
+                "Set {} to a writable folder of your own on a RAM disk, such as /run/capturefab or /tmp/capturefab, created with mode 700.",
+                crate::dirs::SESSION_DIR_ENV
+            ),
+        );
     };
-    Check::warn(
-        "install_location",
-        message.into(),
-        "Drag Capturefab.app to /Applications and open it from there.".into(),
+    let fallback = fallback.unwrap_or_default();
+    if warm == Some(false) {
+        return Check::warn(
+            "sessions",
+            format!(
+                "Sessions are in {}{fallback}, but no session's log can be written there, so camera commands open their cameras alone.",
+                place.described()
+            ),
+            format!(
+                "Set {} to a writable folder for sessions' logs, such as {}=/data/capturefab.",
+                crate::dirs::STATE_DIR_ENV,
+                crate::dirs::STATE_DIR_ENV
+            ),
+        );
+    }
+    Check::ok(
+        "sessions",
+        format!(
+            "Sessions, camera locks and previews are in {}{fallback}; camera commands keep their camera open for 60 s after them.",
+            place.described()
+        ),
     )
 }
 
-fn session_check(state: &Place, session_dir_set: bool) -> Check {
-    if !state.ram_backed {
+/// Informational rather than a warning: by default state is on disk, so
+/// memory means the user chose it, and only they know whether it must
+/// outlive a reboot. A read-only or missing one warns: presets and saved
+/// sign-ins cannot be saved.
+fn session_check(state: &Folder) -> Check {
+    let variable = crate::dirs::STATE_DIR_ENV;
+    let fix = format!(
+        "Set {variable} to a writable folder that outlives a reboot, such as {variable}=/data/capturefab."
+    );
+    let Some(place) = &state.place else {
+        let why = state
+            .missing
+            .as_deref()
+            .unwrap_or("no home folder")
+            .trim_end_matches('.');
+        return Check::warn(
+            "session_storage",
+            format!(
+                "Presets, saved sign-ins and sessions' jobs have no folder: {why}. Commands that use them fail until there is one."
+            ),
+            fix,
+        );
+    };
+    if !state.writable {
+        return Check::warn(
+            "session_storage",
+            format!(
+                "Presets, saved sign-ins and sessions' jobs are in {}, which is read-only: they can be read, not saved.",
+                place.described()
+            ),
+            fix,
+        );
+    }
+    let from = state.from;
+    if !place.ram_backed {
         return Check::ok(
             "session_storage",
             format!(
-                "Settings, saved destinations and the storage ledger are in {}.",
-                state.described()
+                "Presets, saved sign-ins and sessions' jobs are in {}.",
+                place.described()
             ),
         );
     }
     let mut check = Check::ok(
         "session_storage",
         format!(
-            "Settings, saved destinations and the storage ledger are in memory in {} and are cleared at reboot.",
-            state.described()
+            "Presets, saved sign-ins and sessions' jobs are in memory in {} and are cleared at reboot.",
+            place.described()
         ),
     );
-    check.fix = Some(if session_dir_set {
-        "To keep them, unset CAPTUREFAB_SESSION_DIR. A folder on disk keeps them too, but JPEG captures encoded by nvJPEG or VA-API then pass their pixels through a mapped file there.".into()
+    check.fix = Some(if from == crate::dirs::SESSION_DIR_ENV {
+        "To keep them, unset CAPTUREFAB_SESSION_DIR.".into()
+    } else if from == variable {
+        format!("To keep them, point {variable} at a folder on disk.")
     } else if cfg!(target_os = "linux") {
         "To keep them, point XDG_STATE_HOME at a folder on disk.".into()
     } else {
@@ -586,30 +667,112 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
     check
 }
 
-/// A runtime or state directory that sessions refuse to use.
-fn private_dirs_check(problems: &[(PathBuf, String)]) -> Option<Check> {
+/// What version 0.5 kept in the state directory for the desktop app,
+/// hubs, destinations, the assistant, resource limits, update checks and
+/// the storage ledger, beside the ledger's `storage-*.lease` files.
+const LEFTOVERS: [&str; 17] = [
+    "gui.prefs.json",
+    "hubs.json",
+    "hubs.lock",
+    "destinations.json",
+    "destinations.lock",
+    "assistant.json",
+    "assistant.lock",
+    "assistant",
+    "resources.json",
+    "resources.lock",
+    "updates.json",
+    "updates.lock",
+    "storage.json",
+    "storage.journal",
+    "storage.lock",
+    "storage-policy.json",
+    "storage-summary.json",
+];
+
+/// Leftovers of version 0.5, with the command that removes them.
+fn leftovers_check(leftovers: &[PathBuf]) -> Option<Check> {
+    if leftovers.is_empty() {
+        return None;
+    }
+    let names = leftovers
+        .iter()
+        .map(|path| crate::hint::shell_quote(&path.display().to_string()))
+        .collect::<Vec<_>>();
+    let fix = if cfg!(windows) {
+        format!("Remove-Item -Recurse -Force {}", names.join(","))
+    } else {
+        format!("rm -r {}", names.join(" "))
+    };
+    Some(Check::warn(
+        "leftover_state",
+        format!(
+            "{} file{} from Capturefab 0.5 that nothing reads any more (desktop, hubs, destinations, assistant, update settings or the storage ledger, whose budget and retention are gone).",
+            leftovers.len(),
+            if leftovers.len() == 1 { "" } else { "s" }
+        ),
+        fix,
+    ))
+}
+
+/// Whether a folder was passed over for want of privacy, which a fix can
+/// give it back, rather than for being read-only.
+fn private_problem(why: &str) -> bool {
+    ["belongs to another user", "real directory", "may enter it"]
+        .iter()
+        .any(|known| why.contains(known))
+}
+
+/// Folders passed over, or refused, because they are not this user's
+/// alone, and where sessions and the cache are instead.
+fn private_dirs_check(
+    problems: &[PrivateDir],
+    runtime: Option<&Place>,
+    cache: Option<&Place>,
+) -> Option<Check> {
     if problems.is_empty() {
         return None;
     }
-    let messages: Vec<&str> = problems.iter().map(|(_, why)| why.as_str()).collect();
-    let foreign = problems
+    let messages: Vec<&str> = problems
         .iter()
-        .any(|(_, why)| why.contains("belongs to another user") || why.contains("real directory"));
+        .map(|problem| problem.why.as_str())
+        .collect();
+    let mut consequences = Vec::new();
+    let mut variables = Vec::new();
+    if problems.iter().any(|problem| !problem.cache) {
+        consequences.push(match runtime {
+            Some(runtime) => format!("sessions use {}", runtime.path.display()),
+            None => "no session can start".into(),
+        });
+        variables.push(crate::dirs::SESSION_DIR_ENV);
+    }
+    if problems.iter().any(|problem| problem.cache) {
+        consequences.push(match cache {
+            Some(cache) => format!("the cache is in {}", cache.path.display()),
+            None => "nothing is cached".into(),
+        });
+        variables.push(crate::dirs::CACHE_DIR_ENV);
+    }
+    let foreign = problems.iter().any(|problem| {
+        problem.why.contains("belongs to another user") || problem.why.contains("real directory")
+    });
     let dirs: Vec<String> = problems
         .iter()
-        .map(|(dir, _)| shell_word(&dir.display().to_string()))
+        .map(|problem| shell_word(&problem.path.display().to_string()))
         .collect();
+    let variables = variables.join(" or ");
     Some(Check::warn(
         "private_dirs",
         format!(
-            "Sessions, captures and discovery cannot start: {}.",
-            messages.join("; ")
+            "{}; so {}.",
+            messages.join("; "),
+            consequences.join(" and ")
         ),
         if foreign {
-            "Set CAPTUREFAB_SESSION_DIR to a folder of your own.".into()
+            format!("Set {variables} to a folder of your own.")
         } else {
             format!(
-                "chmod 700 {}  # or set CAPTUREFAB_SESSION_DIR to another folder",
+                "chmod 700 {}  # or set {variables} to another folder",
                 dirs.join(" ")
             )
         },
@@ -625,6 +788,55 @@ fn shell_word(word: &str) -> String {
     } else {
         format!("'{}'", word.replace('\'', r"'\''"))
     }
+}
+
+/// A read-only root file system, as on Yocto-style and immutable systems:
+/// what Capturefab writes, and where.
+fn read_only_root_check(read_only: bool) -> Option<Check> {
+    read_only.then(|| {
+        Check::ok(
+            "read_only_root",
+            format!(
+                "The root file system is read-only: Capturefab writes only to the folders above and to captures' -o; {}, {} and {} move them.",
+                crate::dirs::SESSION_DIR_ENV,
+                crate::dirs::STATE_DIR_ENV,
+                crate::dirs::CACHE_DIR_ENV
+            ),
+        )
+    })
+}
+
+/// The CPUs and memory this process may use, as its cgroups limit them,
+/// and what encoders and capture queues make of them.
+fn resources_check(cpus: usize, quota: Option<f64>, memory: &crate::host::Memory) -> Check {
+    let mut message = format!("{cpus} CPU{}", if cpus == 1 { "" } else { "s" });
+    if let Some(quota) = quota {
+        message.push_str(&format!(" (cgroup quota {quota:.2})"));
+    }
+    if let Some(budget) = memory.budget() {
+        message.push_str(&format!(", {} of memory available", human_bytes(budget)));
+    }
+    if let (Some(limit), Some(used)) = (memory.limit, memory.used) {
+        message.push_str(&format!(
+            " (cgroup limit {}, {} in use)",
+            human_bytes(limit),
+            human_bytes(used)
+        ));
+    }
+    let queue = memory
+        .budget()
+        .map_or(1 << 30, |budget| (budget / 4).min(1 << 30));
+    message.push_str(&format!(
+        "; captures encode on {} thread{} and a burst holds at most {} of frames.",
+        crate::host::threads(cpus),
+        if crate::host::threads(cpus) == 1 {
+            ""
+        } else {
+            "s"
+        },
+        human_bytes(queue)
+    ));
+    Check::ok("resources", message)
 }
 
 /// Wired adapters a GigE Vision camera could use. Never a warning: most
@@ -662,9 +874,9 @@ fn camera_network_check(interfaces: &[NetworkInterface]) -> Check {
 }
 
 /// Whether FFmpeg, which every webcam, stream, file and recording goes
-/// through, starts. `dev` is a development build, which embeds whatever
-/// `scripts/build-ffmpeg.sh` left.
-fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, dev: bool) -> Check {
+/// through, starts, and where it was found. `bundled` is a build with
+/// FFmpeg built in.
+fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, bundled: bool) -> Check {
     match health {
         Ok(health) => {
             let named = match health
@@ -675,14 +887,29 @@ fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, dev: bo
                 Some(version) => format!("FFmpeg {version}"),
                 None => "FFmpeg".into(),
             };
-            let from = if health.source == "bundled" {
-                "bundled".to_owned()
-            } else {
-                format!("{}={}", health.source, health.path)
+            let from = match health.source {
+                "bundled" => format!("bundled, extracted to {}", health.path),
+                "next_to_executable" => format!("next to capturefab: {}", health.path),
+                "path" => format!("on PATH: {}", health.path),
+                source => format!("{source}={}", health.path),
             };
+            // A bundled copy that found no folder to run from leaves the
+            // one installed, which works but may be another version.
+            let instead = health
+                .bundled_error
+                .as_deref()
+                .map(|error| {
+                    format!(
+                        " The bundled FFmpeg is not used: {}.",
+                        error.trim_end_matches('.')
+                    )
+                })
+                .unwrap_or_default();
             Check::ok(
                 "ffmpeg",
-                format!("{named} ({from}) runs; webcams, RTSP/SRT, files and recording use it."),
+                format!(
+                    "{named} ({from}) runs; webcams, RTSP/SRT, files and recording use it.{instead}"
+                ),
             )
         }
         Err(error) => Check::warn(
@@ -692,11 +919,19 @@ fn ffmpeg_check(health: &Result<FfmpegHealth, String>, overridden: bool, dev: bo
                 error.trim_end_matches('.')
             ),
             if overridden {
-                "Set CAPTUREFAB_FFMPEG to the absolute path of an FFmpeg executable, or unset it to use the bundled one.".into()
-            } else if dev {
-                "Run scripts/build-ffmpeg.sh and rebuild, or set CAPTUREFAB_FFMPEG to an FFmpeg executable.".into()
-            } else {
+                "Set CAPTUREFAB_FFMPEG to the absolute path of an FFmpeg executable, or unset it to use the one Capturefab finds.".into()
+            } else if bundled && error.contains("cannot extract the bundled FFmpeg") {
+                format!(
+                    "Set {} to a writable folder that allows running programs, or CAPTUREFAB_FFMPEG to an FFmpeg executable, such as the system's.",
+                    crate::dirs::CACHE_DIR_ENV
+                )
+            } else if bundled {
                 "Reinstall Capturefab from https://capturefab.com/downloads.html, or set CAPTUREFAB_FFMPEG to an FFmpeg executable.".into()
+            } else {
+                let hint = crate::media::ffmpeg_hint();
+                let mut fix = hint[..1].to_uppercase() + &hint[1..];
+                fix.push('.');
+                fix
             },
         ),
     }
@@ -726,6 +961,7 @@ fn receive_buffer_check(rmem_max: u64) -> Check {
     }
 }
 
+#[cfg(any(all(target_os = "linux", feature = "usb"), test))]
 fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
     if cameras.is_empty() {
         return None;
@@ -755,6 +991,7 @@ fn usb_check(cameras: &[UsbCamera]) -> Option<Check> {
 /// The paste-ready command that gives this user read/write access to USB3
 /// Vision cameras through the shipped udev rule. It uses sudo, so it is only
 /// ever shown or copied, never run.
+#[cfg(any(feature = "usb", test))]
 pub fn usb_access_fix() -> String {
     // One rule for the USB3 Vision class covers every camera plugged in
     // later. The note is a shell comment, so the whole line still pastes
@@ -763,41 +1000,6 @@ pub fn usb_access_fix() -> String {
         "printf '%s\\n' '{}' '{}' | sudo tee /etc/udev/rules.d/{UDEV_RULE_FILE} >/dev/null && sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=usb --action=add  # services also need their user in the plugdev group; see {LINE_COMPUTER}",
         UDEV_RULES[0], UDEV_RULES[1]
     )
-}
-
-/// How the error for a USB3 Vision camera this user may not open or claim
-/// starts (see `transport::usb`).
-pub const USB_ACCESS_DENIED: &str = "No permission to";
-
-/// `message` with [`usb_access_fix`] on a line of its own (see
-/// [`fix_line`]), so the desktop app can offer to copy it.
-pub fn with_usb_access_fix(message: impl std::fmt::Display) -> String {
-    format!("{message}\n{FIX_PREFIX}{}", usb_access_fix())
-}
-
-/// The error for a USB3 Vision camera Linux refused to open, at usbfs
-/// `node`, as `transport::usb` reports it: unavailable, carrying the fix.
-pub fn usb_access_error(name: &str, node: &Path) -> anyhow::Error {
-    crate::types::Categorized::error(
-        crate::types::ErrorKind::Unavailable,
-        with_usb_access_fix(format!(
-            "{USB_ACCESS_DENIED} open USB3 Vision camera {name} ({}). Run `capturefab doctor` for the udev rule that fixes it.",
-            node.display()
-        )),
-    )
-}
-
-/// What starts the line of an error message that carries a paste-ready fix,
-/// as `doctor` prints it; see [`fix_line`].
-pub const FIX_PREFIX: &str = "Fix: ";
-
-/// The fix an error message carries on a line of its own, if any.
-pub fn fix_line(message: &str) -> Option<&str> {
-    message
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix(FIX_PREFIX))
-        .map(str::trim)
-        .filter(|fix| !fix.is_empty())
 }
 
 /// Whether this user lacks read/write access to the usbfs `node`
@@ -812,81 +1014,47 @@ pub fn usb_access_denied(node: &Path) -> bool {
     })
 }
 
-/// Whether the part of the budget not yet used fits on the disk captures
-/// land on, less the floor every save leaves free there; what is already
-/// stored is on that disk too.
-fn budget_check(budget: u64, used: u64, place: &Place) -> Option<Check> {
+/// Whether captures in this folder have room: its disk's free space
+/// against the floor every write leaves free.
+fn free_space_check(place: &Place, floor: &Result<u64, String>) -> Option<Check> {
     let free = place.free_bytes?;
-    let usable = free.saturating_sub(FREE_SPACE_FLOOR);
     let path = place.path.display();
-    let room = budget.saturating_sub(used);
-    Some(if room > usable {
+    let floor = match floor {
+        Ok(floor) => *floor,
+        Err(error) => {
+            return Some(Check::warn(
+                "free_space",
+                format!("{error}."),
+                format!(
+                    "Set {} to bytes or a size such as 2G, or unset it for the default.",
+                    crate::storage::MIN_FREE_ENV
+                ),
+            ));
+        }
+    };
+    Some(if free < floor {
         Check::warn(
-            "storage_budget",
+            "free_space",
             format!(
-                "The storage budget leaves room for {} more ({} of {} used), but only {} is free on {path} and saves keep {} of it free, so the disk can fill first.",
-                human_bytes(room),
-                human_bytes(used),
-                human_bytes(budget),
+                "{} free on the disk of {path}, below the {} Capturefab leaves free, so captures there stop with storage_full.",
                 human_bytes(free),
-                human_bytes(FREE_SPACE_FLOOR)
+                human_bytes(floor)
             ),
             format!(
-                "capturefab storage configure --max-space {}",
-                suggested_budget(used, usable)
+                "Free some space, capture to another disk with -o, or lower {} (0 turns the floor off).",
+                crate::storage::MIN_FREE_ENV
             ),
         )
     } else {
         Check::ok(
-            "storage_budget",
+            "free_space",
             format!(
-                "Storage budget {}, {} used; {} free on {path}.",
-                human_bytes(budget),
-                human_bytes(used),
-                human_bytes(free)
+                "{} free on the disk of {path}; captures leave {} free.",
+                human_bytes(free),
+                human_bytes(floor)
             ),
         )
     })
-}
-/// What is stored plus three quarters of the usable space, in whole units
-/// `storage configure` accepts. Never below what is stored: retention would
-/// delete the oldest captures to get under it, or stop every capture.
-fn suggested_budget(used: u64, free: u64) -> String {
-    let budget = used.saturating_add(free / 4 * 3);
-    let gib = budget >> 30;
-    if gib > 0 && gib << 30 >= used {
-        format!("{gib}GiB")
-    } else {
-        format!("{}MiB", (budget >> 20).max(used.div_ceil(1 << 20)).max(1))
-    }
-}
-
-/// The configured budget and the bytes counted against it, from the storage
-/// ledger's lock-free reads, so `doctor` never waits behind capture
-/// bookkeeping; its usage summary includes the journal's tail. Unknown
-/// usage omits the check. Without a state directory nothing is stored yet,
-/// and `doctor` does not create one to find that out.
-fn ledger(state: &Path) -> (u64, Option<u64>) {
-    let default = StoragePolicy::default().max_bytes;
-    if !state.is_dir() {
-        return (default, Some(0));
-    }
-    let budget = crate::storage::configured_policy().map_or(default, |policy| policy.max_bytes);
-    let used = crate::storage::usage()
-        .ok()
-        .flatten()
-        .map(|usage| usage.allocated_bytes);
-    (budget, used)
-}
-
-/// The default capture folder, or its nearest existing parent, where
-/// `storage --json` reports free space too.
-fn capture_place() -> Place {
-    let root = crate::storage::capture_root();
-    Place {
-        free_bytes: crate::storage::free_bytes(&root),
-        ..Place::of(root)
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1003,138 +1171,9 @@ fn usb_cameras() -> Vec<UsbCamera> {
         })
         .collect()
 }
-#[cfg(not(all(target_os = "linux", feature = "usb")))]
+#[cfg(all(test, not(all(target_os = "linux", feature = "usb"))))]
 fn usb_cameras() -> Vec<UsbCamera> {
     Vec::new()
-}
-
-/// How long the GPU probe may take: a healthy driver answers in well under a
-/// second, a broken one may never answer.
-#[cfg(feature = "gui")]
-const GPU_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// The adapter the desktop window would get, asked in a helper process: a
-/// broken Vulkan or OpenGL driver can crash or hang whoever loads it.
-#[cfg(feature = "gui")]
-fn graphics() -> Value {
-    probe_graphics()
-        .unwrap_or_else(|error| json!({"available":false,"reason":format!("{error:#}")}))
-}
-
-#[cfg(feature = "gui")]
-fn probe_graphics() -> anyhow::Result<Value> {
-    use anyhow::{Context, anyhow, ensure};
-    use std::{
-        io::{BufRead, BufReader, Read},
-        process::{Command, Stdio},
-        sync::mpsc,
-    };
-    let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
-        .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
-        .unwrap_or_else(|| "capturefab".into());
-    let mut child = crate::session::spawn_helper(
-        Command::new(executable)
-            .arg("__gpu-probe")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null()),
-    )
-    .context("launch the GPU probe")?;
-    let stdout = child.stdout.take().context("GPU probe output")?;
-    let (sender, receiver) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut line = String::new();
-        let _ = BufReader::new(stdout.take(64 * 1024)).read_line(&mut line);
-        let _ = sender.send(line);
-    });
-    let line = receiver.recv_timeout(GPU_PROBE_DEADLINE);
-    // A process stuck in a graphics driver may survive even SIGKILL, so it
-    // is reaped in the background rather than waited for.
-    let _ = child.kill();
-    std::thread::spawn(move || child.wait());
-    let line = line.map_err(|_| {
-        anyhow!(
-            "the graphics driver did not answer within {} s",
-            GPU_PROBE_DEADLINE.as_secs()
-        )
-    })?;
-    ensure!(
-        !line.is_empty(),
-        "the GPU probe stopped without an answer; the graphics driver may have crashed"
-    );
-    Ok(serde_json::from_str(&line)?)
-}
-
-/// Hidden `__gpu-probe` mode: print the adapter iced would request, without
-/// a window, as one JSON line.
-#[cfg(feature = "gui")]
-pub fn run_gpu_probe() -> anyhow::Result<()> {
-    use iced::{executor::Executor, wgpu};
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::all()),
-        ..Default::default()
-    });
-    let adapter = iced::executor::Default::new()?.block_on(instance.request_adapter(
-        &wgpu::RequestAdapterOptions {
-            power_preference:
-                wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        },
-    ));
-    let report = match adapter {
-        Ok(adapter) => adapter_report(&adapter.get_info(), &adapter.limits()),
-        Err(error) => json!({"available":false,"reason":error.to_string()}),
-    };
-    crate::cli::write_json(&report)
-}
-
-#[cfg(feature = "gui")]
-fn adapter_report(info: &iced::wgpu::AdapterInfo, allowed: &iced::wgpu::Limits) -> Value {
-    use iced::wgpu::{DeviceType, Limits};
-    // iced asks for the default limits, then the downlevel ones; frames wider
-    // or taller than the granted texture size are converted on the CPU.
-    let texture = [Limits::default(), Limits::downlevel_defaults()]
-        .into_iter()
-        .map(|limits| Limits {
-            max_bind_groups: 2,
-            max_non_sampler_bindings: 2048,
-            ..limits
-        })
-        .find(|limits| limits.check_limits(allowed))
-        .map(|limits| limits.max_texture_dimension_2d);
-    let device_type = match info.device_type {
-        DeviceType::IntegratedGpu => "integrated",
-        DeviceType::DiscreteGpu => "discrete",
-        DeviceType::VirtualGpu => "virtual",
-        DeviceType::Cpu => "cpu",
-        DeviceType::Other => "other",
-    };
-    json!({
-        "available": true,
-        "adapter": info.name,
-        "backend": info.backend.to_str(),
-        "device_type": device_type,
-        "driver": info.driver,
-        "max_texture_dimension_2d": texture,
-        "software": software_adapter(info.device_type == DeviceType::Cpu, &info.name),
-    })
-}
-
-/// Software rasterizers, including GL drivers that do not report a CPU type.
-#[cfg(any(feature = "gui", test))]
-fn software_adapter(cpu: bool, name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    cpu || [
-        "llvmpipe",
-        "lavapipe",
-        "softpipe",
-        "swiftshader",
-        "basic render",
-    ]
-    .iter()
-    .any(|software| name.contains(software))
 }
 
 #[cfg(test)]
@@ -1150,22 +1189,6 @@ mod tests {
             total_bytes: Some(free * 2),
             free_bytes: Some(free),
         }
-    }
-
-    #[test]
-    fn running_from_the_disk_image_warns() {
-        use crate::volumes::InstallLocation;
-        for location in [InstallLocation::DiskImage, InstallLocation::Translocated] {
-            let check = install_check(location);
-            assert_eq!(check.id, "install_location");
-            assert_eq!(check.level, Level::Warn);
-            assert!(check.fix.unwrap().contains("/Applications"));
-        }
-        assert!(
-            install_check(InstallLocation::DiskImage)
-                .message
-                .contains("disk image")
-        );
     }
 
     #[test]
@@ -1188,129 +1211,97 @@ mod tests {
     }
 
     #[test]
-    fn budget_larger_than_free_space_warns_with_a_smaller_budget() {
-        let budget = crate::storage::StoragePolicy::default().max_bytes;
-        let card = place("/home/pi", "ext4", 6 << 30);
-        let check = budget_check(budget, 0, &card).unwrap();
+    fn the_old_storage_ledger_is_a_leftover_with_its_leases() {
+        let state = crate::dirs::state().unwrap();
+        crate::dirs::ensure_private_dir(&state).unwrap();
+        let files =
+            ["storage.journal", "storage-0123456789abcdef.lease"].map(|name| state.join(name));
+        for file in &files {
+            std::fs::write(file, b"").unwrap();
+        }
+        let leftovers = Facts::gather(false, None).leftovers;
+        for file in &files {
+            let _ = std::fs::remove_file(file);
+        }
+        for file in &files {
+            assert!(leftovers.contains(file), "{leftovers:?}");
+        }
+        let check = leftovers_check(&leftovers).unwrap();
+        assert!(
+            check.message.contains("storage ledger"),
+            "{}",
+            check.message
+        );
+        assert!(check.fix.unwrap().contains("storage.journal"));
+    }
+
+    #[test]
+    fn free_space_below_the_floor_warns() {
+        let card = place("/home/pi/captures", "ext4", 300 << 20);
+        let floor = Ok(512 << 20);
+        let check = free_space_check(&card, &floor).unwrap();
         assert_eq!(check.level, Level::Warn);
         assert_eq!(
             check.message,
-            "The storage budget leaves room for 10.00 GiB more (0.0 KiB of 10.00 GiB used), but only 6.00 GiB is free on /home/pi and saves keep 512.0 MiB of it free, so the disk can fill first."
+            "300.0 MiB free on the disk of /home/pi/captures, below the 512.0 MiB Capturefab leaves free, so captures there stop with storage_full."
         );
+        assert!(check.fix.unwrap().contains("CAPTUREFAB_MIN_FREE"));
+        let roomy = place("/data", "xfs", 100 << 30);
         assert_eq!(
-            check.fix.as_deref(),
-            Some("capturefab storage configure --max-space 4GiB")
+            free_space_check(&roomy, &floor).unwrap().message,
+            "100.00 GiB free on the disk of /data; captures leave 512.0 MiB free."
         );
-        assert_eq!(
-            budget_check(budget, 0, &place("/data", "xfs", 100 << 30))
-                .unwrap()
-                .level,
-            Level::Ok
-        );
-        // Saves keep the floor free, so a budget that fits only into it warns.
-        let tight = place("/home/pi", "ext4", 10 << 30);
-        assert_eq!(
-            budget_check(10 << 30, 0, &tight).unwrap().level,
-            Level::Warn
-        );
-        assert_eq!(
-            budget_check(10 << 30, 512 << 20, &tight).unwrap().level,
-            Level::Ok
-        );
-        assert_eq!(suggested_budget(0, 100 << 20), "75MiB");
-        assert_eq!(suggested_budget(0, 0), "1MiB");
+        // The floor turned off never warns; a disk that does not say is not
+        // checked; a wrong setting is.
+        assert_eq!(free_space_check(&card, &Ok(0)).unwrap().level, Level::Ok);
         let unknown = Place {
             free_bytes: None,
-            ..card
+            ..card.clone()
         };
-        assert_eq!(budget_check(budget, 0, &unknown), None);
+        assert_eq!(free_space_check(&unknown, &floor), None);
+        let wrong = free_space_check(&card, &Err("CAPTUREFAB_MIN_FREE must be bytes".into()));
+        assert_eq!(wrong.unwrap().level, Level::Warn);
     }
 
-    #[test]
-    fn budget_check_counts_what_is_already_stored() {
-        // A 10 GiB budget with 9.5 GiB stored has 0.5 GiB left: 5 GiB free
-        // is plenty, so nothing warns.
-        let budget = 10 << 30;
-        let stored = 19 << 29;
-        let card = place("/home/pi/captures", "ext4", 5 << 30);
-        let check = budget_check(budget, stored, &card).unwrap();
-        assert_eq!(check.level, Level::Ok);
-        assert_eq!(
-            check.message,
-            "Storage budget 10.00 GiB, 9.50 GiB used; 5.00 GiB free on /home/pi/captures."
-        );
-        // With 2 GiB stored, 8 GiB would not fit, and the suggestion keeps
-        // what is stored plus three quarters of the free space.
-        let check = budget_check(budget, 2 << 30, &card).unwrap();
-        assert_eq!(check.level, Level::Warn);
-        assert!(check.message.contains("(2.00 GiB of 10.00 GiB used)"));
-        assert_eq!(
-            check.fix.as_deref(),
-            Some("capturefab storage configure --max-space 5GiB")
-        );
-        // A suggestion never drops below what is stored, even where whole
-        // GiB would round under it.
-        for (used, free) in [
-            (stored, 200 << 20),
-            (stored + 100, 0),
-            ((1 << 30) - 1, 0),
-            (3 << 30, 100 << 30),
-        ] {
-            let suggested = crate::storage::parse_bytes(&suggested_budget(used, free)).unwrap();
-            assert!(suggested >= used, "{used} {free}: {suggested}");
-            assert!(
-                suggested <= used + free / 4 * 3 + (1 << 20),
-                "{used} {free}"
-            );
+    fn folder(place: Option<Place>, from: &'static str) -> Folder {
+        Folder {
+            place,
+            from,
+            writable: true,
+            passed: Vec::new(),
+            missing: None,
         }
-        assert_eq!(suggested_budget(stored, 200 << 20), "9878MiB");
-    }
-
-    #[test]
-    fn storage_is_measured_on_the_capture_folder_disk_without_creating_a_session() {
-        let missing = std::env::temp_dir().join(format!(
-            "capturefab-doctor-ledger-{}/sessions",
-            std::process::id()
-        ));
-        assert_eq!(
-            ledger(&missing),
-            (StoragePolicy::default().max_bytes, Some(0)),
-            "nothing is stored before a session directory exists"
-        );
-        assert!(!missing.exists());
-        // Where storage --json reports free space: the default capture
-        // folder, or its nearest existing parent.
-        // Free space moves while other processes write, so only whether the
-        // disk reports it is compared.
-        let captures = capture_place();
-        assert_eq!(captures.path, crate::storage::capture_root());
-        assert_eq!(
-            captures.free_bytes.is_some(),
-            crate::storage::free_bytes(&captures.path).is_some()
-        );
     }
 
     #[test]
     fn state_on_disk_is_the_default_and_memory_explains_how_to_keep_it() {
         let disk = place("/home/pi/.local/state/capturefab", "ext4", 6 << 30);
-        let check = session_check(&disk, false);
+        let check = session_check(&folder(Some(disk.clone()), "home"));
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.message,
-            "Settings, saved destinations and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
+            "Presets, saved sign-ins and sessions' jobs are in /home/pi/.local/state/capturefab (ext4)."
         );
         assert_eq!(check.fix, None);
         // Memory is only ever chosen, so it informs rather than warns, with
         // the setting that put it there.
         let memory = place("/tmp/capturefab", "tmpfs", 400 << 20);
-        let chosen = session_check(&memory, true);
+        let chosen = session_check(&folder(Some(memory.clone()), "CAPTUREFAB_SESSION_DIR"));
         assert_eq!(chosen.level, Level::Ok);
         assert!(chosen.message.contains("(tmpfs)"), "{}", chosen.message);
         assert!(chosen.message.contains("cleared at reboot"));
         let fix = chosen.fix.unwrap();
-        assert!(fix.starts_with("To keep them, unset CAPTUREFAB_SESSION_DIR."));
-        assert!(fix.contains("nvJPEG or VA-API"), "{fix}");
-        let fix = session_check(&memory, false).fix.unwrap();
+        assert_eq!(fix, "To keep them, unset CAPTUREFAB_SESSION_DIR.");
+        let fix = session_check(&folder(Some(memory.clone()), "CAPTUREFAB_STATE_DIR"))
+            .fix
+            .unwrap();
+        assert_eq!(
+            fix,
+            "To keep them, point CAPTUREFAB_STATE_DIR at a folder on disk."
+        );
+        let fix = session_check(&folder(Some(memory), "XDG_STATE_HOME"))
+            .fix
+            .unwrap();
         assert!(
             fix.contains(if cfg!(target_os = "linux") {
                 "XDG_STATE_HOME"
@@ -1319,6 +1310,104 @@ mod tests {
             }),
             "{fix}"
         );
+        // A read-only image keeps presets readable; saving them needs a
+        // writable folder, which the fix names.
+        let image = Folder {
+            writable: false,
+            ..folder(Some(disk), "home")
+        };
+        let read_only = session_check(&image);
+        assert_eq!(read_only.level, Level::Warn);
+        assert!(
+            read_only
+                .message
+                .ends_with("which is read-only: they can be read, not saved.")
+        );
+        assert!(
+            read_only
+                .fix
+                .unwrap()
+                .contains("CAPTUREFAB_STATE_DIR=/data/capturefab")
+        );
+        let none = Folder {
+            missing: Some("no writable state folder (/home/root/.local/state/capturefab: read-only file system)".into()),
+            ..folder(None, "")
+        };
+        let missing = session_check(&none);
+        assert_eq!(missing.level, Level::Warn);
+        assert!(
+            missing
+                .message
+                .contains("have no folder: no writable state folder"),
+            "{}",
+            missing.message
+        );
+    }
+
+    #[test]
+    fn sessions_say_where_they_run_and_what_goes_without_them() {
+        let run = place("/run/capturefab-0", "tmpfs", 400 << 20);
+        let mut runtime = folder(Some(run), "run");
+        runtime.passed.push(crate::dirs::Passed {
+            path: "/home/root/.cache/capturefab/sessions".into(),
+            from: "home",
+            why: "read-only file system".into(),
+        });
+        let check = sessions_check(&runtime, Some(true));
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(
+            check.message,
+            "Sessions, camera locks and previews are in /run/capturefab-0 (tmpfs) (/home/root/.cache/capturefab/sessions is passed over: read-only file system); camera commands keep their camera open for 60 s after them."
+        );
+        // A session that cannot write its log never starts.
+        let quiet = sessions_check(&runtime, Some(false));
+        assert_eq!(quiet.level, Level::Warn);
+        assert!(quiet.fix.unwrap().contains("CAPTUREFAB_STATE_DIR"));
+        let none = Folder {
+            missing: Some(
+                "no writable runtime folder (/tmp/capturefab-0: read-only file system)".into(),
+            ),
+            ..folder(None, "")
+        };
+        let check = sessions_check(&none, Some(false));
+        assert_eq!(check.level, Level::Warn);
+        assert!(
+            check.message.starts_with(
+                "No session can start: no writable runtime folder (/tmp/capturefab-0: read-only file system). Each camera command opens its camera alone"
+            ),
+            "{}",
+            check.message
+        );
+        assert!(check.fix.unwrap().starts_with("Set CAPTUREFAB_SESSION_DIR"));
+    }
+
+    #[test]
+    fn resources_name_cgroup_limits_and_what_captures_make_of_them() {
+        let board = crate::host::Memory {
+            total: Some(1 << 30),
+            available: Some(700 << 20),
+            limit: Some(128 << 20),
+            used: Some(28 << 20),
+            room: Some(100 << 20),
+        };
+        let check = resources_check(1, Some(0.5), &board);
+        assert_eq!(check.level, Level::Ok);
+        assert_eq!(
+            check.message,
+            "1 CPU (cgroup quota 0.50), 100.0 MiB of memory available (cgroup limit 128.0 MiB, 28.0 MiB in use); captures encode on 1 thread and a burst holds at most 25.0 MiB of frames."
+        );
+        let server = crate::host::Memory {
+            available: Some(64 << 30),
+            ..crate::host::Memory::default()
+        };
+        assert!(
+            resources_check(4, None, &server)
+                .message
+                .ends_with("a burst holds at most 1.00 GiB of frames."),
+        );
+        assert!(read_only_root_check(false).is_none());
+        let read_only = read_only_root_check(true).unwrap();
+        assert!(read_only.message.contains("CAPTUREFAB_STATE_DIR"));
     }
 
     #[test]
@@ -1326,11 +1415,11 @@ mod tests {
         let runtime = place("/home/pi/.cache/capturefab/sessions", "ext4", 6 << 30);
         let state = place("/home/pi/.local/state/capturefab", "ext4", 6 << 30);
         let login = Path::new("/run/user/1000");
-        let fallback = runtime_dir_check(login, LoginDir::NotLingering, &runtime, &state);
+        let fallback = runtime_dir_check(login, LoginDir::NotLingering, &runtime, Some(&state));
         assert_eq!(fallback.level, Level::Warn);
         assert_eq!(
             fallback.message,
-            "XDG_RUNTIME_DIR is unset and this user does not linger (logind keeps /run/user/1000 only while they are logged in), so sessions are on disk in /home/pi/.cache/capturefab/sessions, while logins look for them in /run/user/1000/capturefab."
+            "XDG_RUNTIME_DIR is unset and this user does not linger (logind keeps /run/user/1000 only while they are logged in), so sessions are in /home/pi/.cache/capturefab/sessions, while logins look for them in /run/user/1000/capturefab."
         );
         // Lingering makes the login directory exist for a service at boot;
         // state no longer moves with it.
@@ -1347,10 +1436,13 @@ mod tests {
             "{fix}"
         );
         assert!(!fix.contains("export XDG_RUNTIME_DIR"), "{fix}");
-        assert!(fix.ends_with("/docs/line-computer.md"), "{fix}");
+        assert!(
+            fix.ends_with("https://capturefab.com/guides/line-computer.md"),
+            "{fix}"
+        );
         // A lingering service that started before logind made the directory
         // needs only to wait for it.
-        let early = runtime_dir_check(login, LoginDir::Missing, &runtime, &state);
+        let early = runtime_dir_check(login, LoginDir::Missing, &runtime, Some(&state));
         assert!(
             early
                 .message
@@ -1361,7 +1453,7 @@ mod tests {
         let fix = early.fix.unwrap();
         assert!(fix.starts_with("Give a service Wants= and After=user@1000.service"));
         assert!(!fix.contains("enable-linger"), "{fix}");
-        let foreign = runtime_dir_check(login, LoginDir::NotPrivate, &runtime, &state);
+        let foreign = runtime_dir_check(login, LoginDir::NotPrivate, &runtime, Some(&state));
         assert!(foreign.message.contains("is not private to this user"));
         assert!(
             foreign
@@ -1457,7 +1549,7 @@ mod tests {
         );
         assert!(fix.contains("udevadm trigger"), "{fix}");
         assert!(
-            fix.ends_with("  # services also need their user in the plugdev group; see https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md"),
+            fix.ends_with("  # services also need their user in the plugdev group; see https://capturefab.com/guides/line-computer.md"),
             "{fix}"
         );
         // Pasted into a shell, it parses as commands; `sh -n` reads without running.
@@ -1513,7 +1605,7 @@ mod tests {
         assert_eq!(none.fix, None);
         assert!(
             none.message.starts_with("No wired Ethernet adapter is up.")
-                && !none.message.contains("network-scan"),
+                && !none.message.contains("capturefab network"),
             "{}",
             none.message
         );
@@ -1525,23 +1617,59 @@ mod tests {
             source: "bundled",
             path: "/home/pi/.cache/capturefab/ffmpeg-0123/ffmpeg".into(),
             version: "ffmpeg version 7.1.1 Copyright (c) 2000-2025 the FFmpeg developers".into(),
+            bundled_error: None,
         });
-        let check = ffmpeg_check(&bundled, false, false);
+        let check = ffmpeg_check(&bundled, false, true);
         assert_eq!(
             (check.level, check.message.as_str()),
             (
                 Level::Ok,
-                "FFmpeg 7.1.1 (bundled) runs; webcams, RTSP/SRT, files and recording use it."
+                "FFmpeg 7.1.1 (bundled, extracted to /home/pi/.cache/capturefab/ffmpeg-0123/ffmpeg) runs; webcams, RTSP/SRT, files and recording use it."
             )
         );
         let chosen = Ok(FfmpegHealth {
             source: "CAPTUREFAB_FFMPEG",
             path: "/opt/ffmpeg/bin/ffmpeg".into(),
             version: "ffmpeg version n7.0".into(),
+            bundled_error: None,
         });
         assert_eq!(
             ffmpeg_check(&chosen, true, false).message,
             "FFmpeg n7.0 (CAPTUREFAB_FFMPEG=/opt/ffmpeg/bin/ffmpeg) runs; webcams, RTSP/SRT, files and recording use it."
+        );
+        let found = Ok(FfmpegHealth {
+            source: "path",
+            path: "/usr/bin/ffmpeg".into(),
+            version: "ffmpeg version 6.1.1-3ubuntu5".into(),
+            bundled_error: None,
+        });
+        assert_eq!(
+            ffmpeg_check(&found, false, false).message,
+            "FFmpeg 6.1.1-3ubuntu5 (on PATH: /usr/bin/ffmpeg) runs; webcams, RTSP/SRT, files and recording use it."
+        );
+        // On a read-only system with a noexec /tmp the bundled copy has
+        // nowhere to run from, and the system's is used instead.
+        let instead = Ok(FfmpegHealth {
+            bundled_error: Some(
+                "cannot extract the bundled FFmpeg to a folder that runs programs (/tmp/capturefab-0/cache: mounted noexec)".into(),
+            ),
+            ..found.clone().unwrap()
+        });
+        let check = ffmpeg_check(&instead, false, true);
+        assert_eq!(check.level, Level::Ok);
+        assert!(
+            check
+                .message
+                .ends_with("The bundled FFmpeg is not used: cannot extract the bundled FFmpeg to a folder that runs programs (/tmp/capturefab-0/cache: mounted noexec)."),
+            "{}",
+            check.message
+        );
+        let nowhere = Err("cannot extract the bundled FFmpeg to a folder that runs programs (no folder to extract it to)".to_owned());
+        assert!(
+            ffmpeg_check(&nowhere, false, true)
+                .fix
+                .unwrap()
+                .starts_with("Set CAPTUREFAB_CACHE_DIR")
         );
         let missing =
             Err("cannot launch FFmpeg: No such file or directory (os error 2)".to_owned());
@@ -1556,13 +1684,13 @@ mod tests {
             ffmpeg_check(&missing, false, true)
                 .fix
                 .unwrap()
-                .starts_with("Run scripts/build-ffmpeg.sh")
-        );
-        assert!(
-            ffmpeg_check(&missing, false, false)
-                .fix
-                .unwrap()
                 .starts_with("Reinstall Capturefab")
+        );
+        let fix = ffmpeg_check(&missing, false, false).fix.unwrap();
+        assert!(fix.starts_with("Install FFmpeg with "), "{fix}");
+        assert!(
+            fix.contains("CAPTUREFAB_FFMPEG") && fix.ends_with('.'),
+            "{fix}"
         );
     }
 
@@ -1574,8 +1702,14 @@ mod tests {
             std::env::temp_dir().join(format!("capturefab-doctor-private-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let problem = crate::ipc::check_private_dir(&dir).unwrap_err();
-        let check = private_dirs_check(&[(dir.clone(), format!("{problem:#}"))]).unwrap();
+        let problem = crate::dirs::check_private_dir(&dir).unwrap_err();
+        let private = |why: String, cache: bool| PrivateDir {
+            path: dir.clone(),
+            why,
+            cache,
+        };
+        let check =
+            private_dirs_check(&[private(format!("{problem:#}"), false)], None, None).unwrap();
         assert_eq!(check.level, Level::Warn);
         assert!(
             check.message.contains("must be private"),
@@ -1588,14 +1722,49 @@ mod tests {
             "{fix}"
         );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(crate::ipc::check_private_dir(&dir).is_ok());
-        assert_eq!(private_dirs_check(&[]), None);
-        let foreign = private_dirs_check(&[(
-            dir.clone(),
-            "session directory /tmp/x belongs to another user".into(),
-        )])
+        assert!(crate::dirs::check_private_dir(&dir).is_ok());
+        assert_eq!(private_dirs_check(&[], None, None), None);
+        let runtime = place("/tmp/capturefab-1000", "tmpfs", 400 << 20);
+        let foreign = private_dirs_check(
+            &[private(
+                "folder /tmp/x belongs to another user".into(),
+                false,
+            )],
+            Some(&runtime),
+            None,
+        )
         .unwrap();
+        assert!(
+            foreign
+                .message
+                .ends_with("so sessions use /tmp/capturefab-1000."),
+            "{}",
+            foreign.message
+        );
         assert!(foreign.fix.unwrap().contains("CAPTUREFAB_SESSION_DIR"));
+        // A cache folder another user owns names the cache's variable.
+        let cache = private_dirs_check(
+            &[private(
+                "folder /data/cache belongs to another user".into(),
+                true,
+            )],
+            Some(&runtime),
+            Some(&place("/tmp/capturefab-1000/cache", "tmpfs", 400 << 20)),
+        )
+        .unwrap();
+        assert!(
+            cache
+                .message
+                .ends_with("so the cache is in /tmp/capturefab-1000/cache."),
+            "{}",
+            cache.message
+        );
+        assert_eq!(
+            cache.fix.as_deref(),
+            Some("Set CAPTUREFAB_CACHE_DIR to a folder of your own.")
+        );
+        assert!(private_problem("group or others may enter it"));
+        assert!(!private_problem("read-only file system"));
         assert_eq!(shell_word("/tmp/a b"), "'/tmp/a b'");
         let _ = std::fs::remove_dir(&dir);
     }
@@ -1608,85 +1777,6 @@ mod tests {
             .filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
             .collect();
         assert_eq!(rules, UDEV_RULES);
-        // The desktop app and the USB open error offer the same command.
-        assert_eq!(
-            fix_line(&with_usb_access_fix("x")),
-            Some(usb_access_fix().as_str())
-        );
-    }
-
-    #[test]
-    fn a_refused_camera_is_unavailable_and_keeps_its_fix_across_processes() {
-        let error = usb_access_error("acA1920-155um", Path::new("/dev/bus/usb/002/003"));
-        assert_eq!(crate::cli::error_code(&error).1, 3);
-        let code = crate::types::error_transport_code(&error);
-        assert_eq!(code, Some("unavailable"));
-        // As a worker reply carries it to the coordinator and the GUI.
-        let rebuilt = crate::types::error_from_transport(code, format!("{error:#}"));
-        assert_eq!(crate::cli::error_code(&rebuilt).1, 3);
-        let message = format!("{rebuilt:#}");
-        assert_eq!(
-            message.lines().next(),
-            Some(
-                "No permission to open USB3 Vision camera acA1920-155um (/dev/bus/usb/002/003). Run `capturefab doctor` for the udev rule that fixes it."
-            )
-        );
-        assert_eq!(fix_line(&message), Some(usb_access_fix().as_str()));
-    }
-
-    #[test]
-    fn a_fix_line_is_read_back_from_an_error_message() {
-        assert_eq!(fix_line("camera busy"), None);
-        assert_eq!(
-            fix_line("connect: no access\nFix: sudo true"),
-            Some("sudo true")
-        );
-        assert_eq!(fix_line("no access\nFix:   "), None);
-    }
-
-    #[test]
-    fn efficiency_and_graphics_checks_explain_themselves() {
-        let auto = Resolved {
-            setting: Mode::Auto,
-            efficient: true,
-            reasons: vec!["2 CPU cores".into()],
-        };
-        let check = efficiency_check(&auto, None);
-        assert_eq!(
-            (check.level, check.message.as_str()),
-            (Level::Ok, "Efficient mode: 2 CPU cores.")
-        );
-        assert!(check.fix.unwrap().contains("--efficiency smooth"));
-        let auto_smooth = Resolved {
-            setting: Mode::Auto,
-            efficient: false,
-            reasons: Vec::new(),
-        };
-        let smooth = efficiency_check(&auto_smooth, None);
-        assert_eq!(smooth.message, "Smooth mode: auto found no constraint.");
-        assert_eq!(smooth.fix, None);
-        // Only the desktop window applies its own setting, so doctor says
-        // when that window runs otherwise.
-        assert_eq!(
-            efficiency_check(&auto_smooth, Some(Mode::Efficient)).message,
-            "Smooth mode: auto found no constraint. The desktop window runs Efficient, as set in its Settings › Performance, which applies there only."
-        );
-        assert_eq!(
-            efficiency_check(&auto, Some(Mode::Efficient)).message,
-            "Efficient mode: 2 CPU cores."
-        );
-        let software = json!({"available":true,"adapter":"llvmpipe (LLVM 17.0.6, 256 bits)","backend":"vulkan","device_type":"cpu","software":true});
-        assert_eq!(graphics_check(&software).level, Level::Warn);
-        let missing = json!({"available":false,"reason":"no adapter"});
-        assert!(graphics_check(&missing).message.contains("no adapter"));
-        let metal = json!({"available":true,"adapter":"Apple M4 Max","backend":"metal","device_type":"integrated","software":false});
-        assert_eq!(
-            graphics_check(&metal).message,
-            "GPU: Apple M4 Max (metal, integrated)."
-        );
-        assert!(software_adapter(false, "llvmpipe (LLVM 15.0.7, 128 bits)"));
-        assert!(software_adapter(true, "Unknown"));
-        assert!(!software_adapter(false, "V3D 7.1"));
     }
 
     #[test]
@@ -1708,9 +1798,9 @@ mod tests {
     fn checklist_prints_one_line_per_check_with_fixes() {
         let report = json!({
             "version":"0.2.2","os":"linux","arch":"aarch64",
-            "host":{"cpu_cores":4,"memory_total":4_u64 << 30,"memory_available":3_u64 << 30,"on_battery":false,"low_power":false},
+            "host":{"cpu_cores":4},
             "checks":[
-                Check::ok("efficiency", "Smooth mode: auto found no constraint.".into()),
+                Check::ok("ffmpeg", "FFmpeg 8.0 (bundled) runs; webcams, RTSP/SRT, files and recording use it.".into()),
                 receive_buffer_check(212_992),
             ],
         });
@@ -1718,21 +1808,27 @@ mod tests {
         print_checklist(&mut out, &report).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(
-            lines[0],
-            "Capturefab 0.2.2 on linux aarch64 · 4 CPU cores · 4.00 GiB memory, 3.00 GiB available"
+        assert!(
+            lines[0].starts_with("Capturefab 0.2.2 on linux aarch64 · "),
+            "{text}"
         );
-        assert_eq!(lines[1], "ok    Smooth mode: auto found no constraint.");
+        assert_eq!(
+            lines[1],
+            "ok    FFmpeg 8.0 (bundled) runs; webcams, RTSP/SRT, files and recording use it."
+        );
         assert!(lines[2].starts_with("warn  net.core.rmem_max is 208.0 KiB"));
         assert!(lines[3].starts_with("      Fix: sudo sysctl -w"));
         assert!(
-            lines[4].contains("#host-checks-and-efficiency-mode"),
+            lines[4].contains("https://capturefab.com/docs.html#doctor"),
             "{text}"
         );
-        // What plain doctor no longer prints, so the docs' pointers still work.
-        assert!(lines[4].contains("scanners, JPEG"), "{text}");
+        // What plain doctor leaves to --json.
+        assert!(lines[4].contains("features, folders and FFmpeg"), "{text}");
         // Linux hosts also get the service guide that walks through these fixes.
-        assert!(lines[5].ends_with("/docs/line-computer.md"), "{text}");
+        assert!(
+            lines[5].ends_with("https://capturefab.com/guides/line-computer.md"),
+            "{text}"
+        );
         assert_eq!(lines.len(), 6);
         let mut out = Vec::new();
         let mut mac = report.clone();

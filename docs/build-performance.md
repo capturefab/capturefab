@@ -130,7 +130,7 @@ These are baseline observations, not a promised reduction in total CI duration.
 The first run with a new dependency-cache key still needs to populate it, and
 runner load, cache eviction and source changes affect later timings.
 
-The viewerless CLI stream test previously slept for five seconds before checking
+The unread CLI stream test previously slept for five seconds before checking
 that more than 30 frames arrived. It now polls for that same threshold with a
 10-second deadline. The loss, drop-ratio, ring-backing and disk checks remain.
 A deterministic shared-memory regression separately fills an unwatched ring and replaces slots
@@ -153,7 +153,7 @@ while measuring. The commands below retain the ordinary default-feature suite:
 ```sh
 cargo test --locked --no-run --timings
 cargo test --locked --no-fail-fast
-cargo test --locked --test cli viewerless_streams_report_no_losses_and_keep_frames_off_disk -- --exact
+cargo test --locked --test cli unread_streams_report_no_losses_and_keep_frames_off_disk -- --exact
 cargo fmt --check
 cargo clippy --locked --all-features --all-targets -- -D warnings
 python3 -m unittest discover -s scripts

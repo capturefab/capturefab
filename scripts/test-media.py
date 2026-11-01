@@ -20,12 +20,13 @@ p.add_argument("--output")
 a = p.parse_args()
 root = pathlib.Path(a.output or tempfile.mkdtemp(prefix="capturefab-media-test-"))
 root.mkdir(parents=True, exist_ok=True)
-env = dict(os.environ, CAPTUREFAB_SESSION_DIR=str(root / "sessions"), CAPTUREFAB_CACHE_DIR=str(root / "cache"))
+# Each command opens its camera for itself: no session outlives the test.
+env = dict(os.environ, CAPTUREFAB_KEEP="0", CAPTUREFAB_SESSION_DIR=str(root / "sessions"), CAPTUREFAB_CACHE_DIR=str(root / "cache"))
 binary = str(pathlib.Path(a.binary).resolve())
 publish = "srt://127.0.0.1:18890?streamid=publish:capturefab-srt&pkt_size=1316" if a.srt else "rtsp://127.0.0.1:18554/capturefab-rtsp"
 receive = "srt://127.0.0.1:18890?streamid=read:capturefab-srt" if a.srt else publish
 log = (root / "forward.log").open("wb")
-forward = subprocess.Popen([binary, "--json", "--camera", "sim:media-test", "forward", "-o", publish, "--encoder", "libx264"], env=env, stdout=log, stderr=subprocess.STDOUT)
+forward = subprocess.Popen([binary, "--json", "record", "-c", "sim:media-test", "-o", publish, "--codec", "h264"], env=env, stdout=log, stderr=subprocess.STDOUT)
 try:
     for attempt in range(60):
         if forward.poll() is not None:
@@ -45,18 +46,19 @@ try:
             time.sleep(0.1)
     else:
         raise RuntimeError("MediaMTX did not report an active stream")
-    captured = subprocess.run([binary, "--json", "--timeout-ms", "10000", "--camera", receive, "capture", "-n", "3", "-o", str(root / "frames")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+    captured = subprocess.run([binary, "--json", "capture", "-c", receive, "--timeout", "10s", "-n", "3", "-o", str(root / "frames")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
     (root / "capture.json").write_bytes(captured.stdout)
     if captured.returncode:
         raise RuntimeError(captured.stdout.decode() + captured.stderr.decode())
-    result = json.loads(captured.stdout)["result"]
-    assert result["count"] == 3
-    for f in result["frames"]:
-        assert (f["width"], f["height"]) == (640, 480)
-        assert f["bytes"] == 640 * 480 * 3
+    result = json.loads(captured.stdout)
+    assert result["count"] == 3 and len(result["files"]) == 3, result
+    assert (result["width"], result["height"]) == (640, 480), result
     for name in result["files"]:
-        assert pathlib.Path(name).read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
-    print(json.dumps({"ok": True, "protocol": "srt" if a.srt else "rtsp", "artifacts": str(root), "frames": result["frames"]}))
+        data = pathlib.Path(name).read_bytes()
+        assert data.startswith(b"\x89PNG\r\n\x1a\n"), name
+        # IHDR: the width and height every frame was saved at.
+        assert (int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")) == (640, 480), name
+    print(json.dumps({"ok": True, "protocol": "srt" if a.srt else "rtsp", "artifacts": str(root), "files": result["files"], "pixel_format": result["pixel_format"]}))
 finally:
     if forward.poll() is None:
         forward.send_signal(__import__("signal").SIGINT)

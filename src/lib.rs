@@ -2,7 +2,7 @@
 /// writing fails, as it does with EIO once the terminal hangs up, which is
 /// SIGHUP's usual cause: shutdown would then stop halfway. This one drops the
 /// line instead. Defined before the modules, it stands in for std's in all of
-/// them; `main.rs` imports it.
+/// them.
 #[macro_export]
 macro_rules! eprintln {
     ($($arg:tt)*) => {{
@@ -11,63 +11,89 @@ macro_rules! eprintln {
     }};
 }
 
-#[cfg(any(feature = "nvjpeg", feature = "vaapi"))]
-pub mod accel;
-#[cfg(feature = "ai")]
-pub mod ai;
-pub mod analytics;
-#[cfg(feature = "ai")]
-pub mod assistant;
-pub mod auto;
-#[cfg(feature = "ai")]
-pub mod aws;
-pub mod camera;
-pub mod camera_profile;
-pub mod cli;
-pub mod compatibility;
-pub mod context;
-pub mod dataset;
-pub mod destination;
-pub mod doctor;
-pub mod efficiency;
-mod engine;
-pub mod frame;
-pub mod genicam;
-#[cfg(feature = "gui")]
-pub mod gui;
-pub mod hint;
-pub mod hubs;
-pub mod inspect;
-pub mod ipc;
-pub mod jpeg;
+pub(crate) mod auto;
+pub(crate) mod camera;
+pub(crate) mod camera_profile;
+pub(crate) mod cli;
+pub(crate) mod context;
+pub(crate) mod controls;
+pub(crate) mod dirs;
+pub(crate) mod discovery;
+pub(crate) mod doctor;
+pub(crate) mod engine;
+pub(crate) mod frame;
+pub(crate) mod genicam;
+pub(crate) mod hint;
+pub(crate) mod host;
+pub(crate) mod inspect;
+pub(crate) mod ipc;
+pub(crate) mod jpeg;
 #[cfg(feature = "keychain")]
-pub mod keychain;
-pub mod logins;
-pub mod media;
-pub mod naming;
-pub mod network;
-#[cfg(feature = "nvjpeg")]
-pub mod nvjpeg;
-pub mod onvif;
-pub mod remote;
-pub mod resources;
-pub mod scanner;
-pub mod scheduling;
-pub mod secret_input;
-pub mod session;
-pub mod setup;
-pub mod shared_memory;
-pub mod simulation;
-pub mod storage;
-pub mod tools;
-pub mod transport;
-pub mod types;
-pub mod updates;
-#[cfg(feature = "vaapi")]
-pub mod vajpeg;
-#[cfg(feature = "ai")]
-pub mod video_analytics;
-pub mod volumes;
-#[cfg(all(feature = "videotoolbox", target_os = "macos"))]
-pub mod vtjpeg;
-pub mod workflow;
+pub(crate) mod keychain;
+pub(crate) mod logins;
+pub(crate) mod media;
+pub(crate) mod naming;
+pub(crate) mod network;
+pub(crate) mod onvif;
+pub(crate) mod scheduling;
+pub(crate) mod scrub;
+pub(crate) mod secret_input;
+pub(crate) mod session;
+pub(crate) mod setup;
+pub(crate) mod storage;
+#[cfg(test)]
+mod test_cameras;
+pub(crate) mod transport;
+pub(crate) mod types;
+pub(crate) mod volumes;
+pub(crate) mod xml_cache;
+
+/// The `capturefab` executable: the hidden camera worker mode, or the CLI.
+pub fn run() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__worker")) {
+        let result = session::run_worker(std::env::args_os().skip(2));
+        if let Err(e) = result {
+            eprintln!("capturefab worker: {}", scrub::scrub(&format!("{e:#}")));
+            std::process::exit(1)
+        }
+        return;
+    }
+    std::process::exit(cli::main())
+}
+
+/// What the integration tests and benchmarks use, at the same paths as in
+/// the crate. Not a public API.
+#[doc(hidden)]
+pub mod testing {
+    pub mod auto {
+        pub use crate::auto::meter;
+    }
+    pub mod camera {
+        pub use crate::camera::Camera;
+    }
+    pub mod camera_profile {
+        pub use crate::camera_profile::CameraKind;
+    }
+    pub mod frame {
+        pub use crate::frame::{
+            MAX_META, bit_depth, clipping, convert_into, convertible, encode, encode_with_meta,
+            exposure, gray8, pixel_format_name, rgb, rgba, row_bytes, sample_bits, sharpness,
+            unpacked,
+        };
+    }
+    pub mod inspect {
+        pub use crate::inspect::{PreviewFormat, inspect, measure};
+    }
+    pub mod jpeg {
+        pub use crate::jpeg::{Raster, insert_com, software};
+    }
+    pub mod session {
+        pub use crate::session::{SessionCommand, SessionHandle};
+    }
+    pub mod storage {
+        pub use crate::storage::{SyncMode, save};
+    }
+    pub mod types {
+        pub use crate::types::{Frame, MONO8, RGB8};
+    }
+}

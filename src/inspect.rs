@@ -1,8 +1,13 @@
-//! One frame made readable without the shared ring: a digital crop that
+//! One frame made readable: a digital crop that
 //! keeps the colour filter phase, exposure, auto-meter and focus
 //! measurements, and a bounded JPEG or PNG preview. The session's `frame`
 //! command answers with these for agents, scripts and remote clients.
-use crate::{camera_profile::CameraKind, frame, jpeg::Raster, types::Frame};
+use crate::{
+    camera_profile::CameraKind,
+    frame::{self, Clipping},
+    jpeg::Raster,
+    types::Frame,
+};
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, ops::RangeInclusive};
@@ -22,7 +27,9 @@ pub fn default_edge() -> u32 {
 }
 
 pub const MAX_FRESH: u32 = 10;
-pub const MAX_WAIT_MS: u64 = 10_000;
+/// The longest an inspection may wait for its frame: ten minutes, for a
+/// part on a conveyor that triggers the camera.
+pub const MAX_WAIT_MS: u64 = 600_000;
 /// Preview edges a request may ask for; 0 asks for measurements only.
 pub const EDGES: RangeInclusive<u32> = 64..=2048;
 /// The largest encoded preview. About 2 MiB as base64, well inside the
@@ -39,12 +46,11 @@ const SMALL_QUALITY: i32 = 92;
 /// `SCALE_STEPS` times.
 const SCALE: f64 = 0.8;
 const SCALE_STEPS: i32 = 3;
-/// Clipping above this share of samples is called out, as on the desktop
-/// histogram.
-const CLIP_WARN: f64 = 0.005;
+/// Clipping above this share of samples is called out.
+pub(crate) const CLIP_WARN: f64 = 0.005;
 /// Mean brightness outside this range is called out.
-const DARK: f64 = 0.25;
-const BRIGHT: f64 = 0.65;
+pub(crate) const DARK: f64 = 0.25;
+pub(crate) const BRIGHT: f64 = 0.65;
 /// Normalized region sums may exceed 1 by float rounding (0.7 + 0.3).
 const REGION_SLACK: f64 = 1e-9;
 
@@ -58,8 +64,7 @@ pub enum PreviewFormat {
     Png,
 }
 
-/// Check an inspection request. The messages avoid the words that classify
-/// errors as timeouts, so a bad value exits as a usage error.
+/// Check an inspection request.
 pub fn validate(
     fresh: u32,
     timeout_ms: u64,
@@ -68,8 +73,8 @@ pub fn validate(
 ) -> Result<()> {
     ensure!(fresh <= MAX_FRESH, "fresh frames must be 0..10");
     ensure!(
-        (1..=MAX_WAIT_MS).contains(&timeout_ms),
-        "inspection wait must be 1..10000 milliseconds"
+        timeout_ms <= MAX_WAIT_MS,
+        "inspection wait must be at most 600000 milliseconds (0: the camera's default)"
     );
     ensure!(
         max_dimension == 0 || EDGES.contains(&max_dimension),
@@ -91,8 +96,7 @@ pub fn validate(
 }
 
 /// A normalized `[x, y, width, height]` region in pixels of a `width` ×
-/// `height` frame, as the desktop focus region maps it, clamped to the frame
-/// and at least one pixel on each side.
+/// `height` frame, clamped to the frame and at least one pixel on each side.
 pub fn region_pixels(region: [f64; 4], width: u32, height: u32) -> [u32; 4] {
     let (w, h) = (f64::from(width), f64::from(height));
     let x = ((region[0] * w).round().max(0.0) as u32).min(width.saturating_sub(1));
@@ -312,6 +316,8 @@ pub struct Measurements {
     pub exposure: Option<ExposureSummary>,
     /// Brightness as auto exposure meters it, at native bit depth.
     pub auto_meter: Option<crate::auto::Meter>,
+    /// Clipped pixels over the whole region at native bit depth.
+    pub clipping: Option<Clipping>,
     /// Focus scores of the region at full resolution. Absolute values depend
     /// on the scene; compare them for one region of one camera.
     pub focus: Option<Focus>,
@@ -358,6 +364,17 @@ fn measure_view(frame: &Frame, view: &Frame, kind: CameraKind, rect: [u32; 4]) -
         Err(error) => measured
             .notes
             .push(format!("exposure not measured: {error:#}")),
+    }
+    match frame::clipping(view) {
+        Ok(clipping) => {
+            measured.clipping = Some(Clipping {
+                max: round4(clipping.max),
+                ..clipping
+            })
+        }
+        Err(error) => measured
+            .notes
+            .push(format!("clipping not counted: {error:#}")),
     }
     measured.auto_meter = crate::auto::meter(view).map(|meter| crate::auto::Meter {
         mean: round4(meter.mean),
@@ -425,26 +442,6 @@ impl Serialize for EncodedImage {
     }
 }
 
-/// A preview of `frame` whose longest edge is at most `max_dimension`, or
-/// None for 0 and for formats that cannot be decoded. Pixels are averaged
-/// over each output pixel's area, so detail blends instead of aliasing.
-/// Monochrome stays gray. A preview larger than `MAX_IMAGE_BYTES` is encoded
-/// again at lower JPEG quality, then smaller, before giving up.
-pub fn render(
-    frame: &Frame,
-    max_dimension: u32,
-    format: PreviewFormat,
-) -> Result<Option<EncodedImage>> {
-    render_within(
-        frame,
-        max_dimension,
-        format,
-        cfg!(feature = "jpeg"),
-        MAX_IMAGE_BYTES,
-        false,
-    )
-}
-
 /// The first JPEG quality for a preview of a `width` × `height` source:
 /// higher for a region crop of at most `SMALL_EDGE` pixels, whatever the
 /// preview's size. A downscaled whole frame is not a crop.
@@ -461,16 +458,23 @@ fn jpeg_preview(format: PreviewFormat, jpeg_available: bool) -> Result<bool> {
     Ok(match format {
         PreviewFormat::Auto => jpeg_available,
         PreviewFormat::Jpeg => {
-            ensure!(
-                jpeg_available,
-                "JPEG previews are unsupported in this build; request png or rebuild with --features jpeg"
-            );
+            if !jpeg_available {
+                return Err(crate::types::Categorized::error(
+                    crate::types::ErrorKind::Unsupported,
+                    "JPEG previews are unsupported in this build; request png or rebuild with --features jpeg",
+                ));
+            }
             true
         }
         PreviewFormat::Png => false,
     })
 }
 
+/// A preview of `frame` whose longest edge is at most `max_dimension`, or
+/// None for 0 and for formats that cannot be decoded. Pixels are averaged
+/// over each output pixel's area, so detail blends instead of aliasing.
+/// Monochrome stays gray. A preview larger than `limit` is encoded again at
+/// lower JPEG quality, then smaller, before giving up.
 fn render_within(
     frame: &Frame,
     max_dimension: u32,
@@ -683,13 +687,30 @@ mod tests {
     const BAYER_RG8: u32 = 0x0108_0009;
     const COORD3D_C16: u32 = 0x0110_00b8;
 
+    /// A preview as this build makes it, within the inspection limit.
+    fn render(
+        frame: &Frame,
+        max_dimension: u32,
+        format: PreviewFormat,
+    ) -> Result<Option<EncodedImage>> {
+        render_within(
+            frame,
+            max_dimension,
+            format,
+            cfg!(feature = "jpeg"),
+            MAX_IMAGE_BYTES,
+            false,
+        )
+    }
+
     fn frame(pixel_format: u32, width: u32, height: u32, data: Vec<u8>) -> Frame {
         Frame {
             id: 7,
             width,
             height,
             pixel_format,
-            timestamp_ns: 99,
+            device_ts_ns: Some(99),
+            wall_ms: 0,
             data,
         }
     }
@@ -721,18 +742,19 @@ mod tests {
     fn requests_are_bounded_with_messages_that_never_read_as_timeouts() {
         validate(default_fresh(), default_wait_ms(), default_edge(), None).unwrap();
         validate(0, 1, 0, Some([0.0, 0.0, 1.0, 1.0])).unwrap();
-        validate(10, 10_000, 2048, Some([0.7, 0.7, 0.3, 0.3])).unwrap();
+        validate(10, 600_000, 2048, Some([0.7, 0.7, 0.3, 0.3])).unwrap();
         validate(1, 3000, 64, Some([0.25, 0.5, 0.5, 0.5])).unwrap();
+        // 0: the camera's default wait.
+        validate(1, 0, 64, None).unwrap();
         for (fresh, wait, edge, region, message) in [
             (11, 3000, 1024, None, "fresh frames must be 0..10"),
             (
                 1,
-                0,
+                600_001,
                 1024,
                 None,
-                "inspection wait must be 1..10000 milliseconds",
+                "inspection wait must be at most 600000 milliseconds",
             ),
-            (1, 10_001, 1024, None, "inspection wait"),
             (
                 1,
                 3000,
@@ -949,8 +971,8 @@ mod tests {
             assert_eq!(cropped.pixel_format, canonical, "{format:08x}");
             assert_eq!(cropped.data, expected.data, "{format:08x}");
             assert_eq!(
-                (cropped.id, cropped.timestamp_ns),
-                (source.id, source.timestamp_ns)
+                (cropped.id, cropped.device_ts_ns, cropped.wall_ms),
+                (source.id, source.device_ts_ns, source.wall_ms)
             );
             let meter = crate::auto::meter(&expected).unwrap();
             assert_eq!(crate::auto::meter(&cropped), Some(meter), "{format:08x}");

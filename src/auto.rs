@@ -1,3 +1,4 @@
+use crate::controls::has_choice;
 use crate::{
     camera::Camera,
     genicam::Bounds,
@@ -164,7 +165,10 @@ pub fn meter(frame: &Frame) -> Option<Meter> {
     })
 }
 
-fn error(m: Meter) -> f64 {
+/// How many stops brighter (positive) or darker a frame metered as `m`
+/// should be: toward the target brightness, but not so far that its
+/// brightest one percent clips.
+pub(crate) fn error(m: Meter) -> f64 {
     let e = (TARGET / m.mean).log2();
     e.min((0.96 / m.p99).log2()).max(e - 1.0)
 }
@@ -422,16 +426,24 @@ pub struct AutoController {
     link_fps: Option<f64>,
     bandwidth: Option<Bandwidth>,
     white_balance: Option<WhiteBalance>,
+    /// The part of the frame metered, normalized; all of it when None.
+    region: Option<[f64; 4]>,
+    /// The longest exposure, in microseconds, before gain is raised.
+    max_exposure: Option<f64>,
 }
 
 impl AutoController {
     pub fn enter(camera: &mut Camera, balance: f64) -> Result<Self> {
         let balance = validate_balance(balance)?;
-        ensure!(
-            camera.info.profile.kind.supports_auto(),
-            "automatic image tuning is unsupported for {}; use the camera's acquisition and measurement controls",
-            camera.info.profile.kind
-        );
+        if !camera.info.profile.kind.supports_auto() {
+            return Err(crate::types::Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                format!(
+                    "automatic image tuning is unsupported for {}; use the camera's acquisition and measurement controls",
+                    camera.info.profile.kind
+                ),
+            ));
+        }
         let hash = camera
             .info
             .serial
@@ -473,6 +485,27 @@ impl AutoController {
         }
         Ok(())
     }
+    /// Meter only `region` of the frame, and keep exposure at most
+    /// `max_exposure` microseconds, raising gain instead, as against motion
+    /// blur.
+    pub fn set_limits(
+        &mut self,
+        camera: &mut Camera,
+        region: Option<[f64; 4]>,
+        max_exposure: Option<f64>,
+    ) -> Result<()> {
+        ensure!(
+            max_exposure.is_none_or(|us| us.is_finite() && us > 0.0),
+            "the longest exposure must be a positive time"
+        );
+        if (region, max_exposure) != (self.region, self.max_exposure) {
+            (self.region, self.max_exposure) = (region, max_exposure);
+            self.samples.clear();
+            self.in_band = 0;
+            self.plan(camera);
+        }
+        Ok(())
+    }
     pub fn set_forward_fps(&mut self, fps: Option<f64>) -> Result<()> {
         ensure!(
             fps.is_none_or(|fps| fps.is_finite() && fps > 0.0),
@@ -501,7 +534,11 @@ impl AutoController {
             return;
         }
         self.last_meter = Some(now);
-        let Some(m) = meter(frame) else {
+        let region = self.region.and_then(|region| {
+            let px = crate::inspect::region_pixels(region, frame.width, frame.height);
+            crate::inspect::crop(frame, px).ok()
+        });
+        let Some(m) = meter(region.as_ref().unwrap_or(frame)) else {
             self.unmetered = true;
             return;
         };
@@ -712,10 +749,11 @@ impl AutoController {
         }
         self.caps.exposure = self.find_unlockable(
             camera,
-            &["ExposureTime", "ExposureTimeAbs"],
+            &crate::controls::EXPOSURE,
             &[("ExposureAuto", "Off")],
         );
-        self.caps.gain = self.find_unlockable(camera, &["Gain", "GainAbs"], &[("GainAuto", "Off")]);
+        self.caps.gain =
+            self.find_unlockable(camera, &crate::controls::GAIN, &[("GainAuto", "Off")]);
         if let Ok(Value::String(current)) = camera.get("GainSelector")
             && current != "All"
         {
@@ -845,13 +883,10 @@ impl AutoController {
                 };
                 releases.push((enable, on));
             }
-            self.caps.frame_rate = self.find_unlockable(
-                camera,
-                &["AcquisitionFrameRate", "AcquisitionFrameRateAbs"],
-                &releases,
-            );
+            self.caps.frame_rate =
+                self.find_unlockable(camera, &crate::controls::FRAME_RATE, &releases);
         }
-        let rate_max = ["AcquisitionFrameRate", "AcquisitionFrameRateAbs"]
+        let rate_max = crate::controls::FRAME_RATE
             .into_iter()
             .find(|f| camera.has(f))
             .and_then(|f| camera.bounds(f).ok()?.max);
@@ -996,6 +1031,9 @@ impl AutoController {
             p.exposure_cap = p
                 .exposure_cap
                 .max(free.min(c.exposure_bounds.max.unwrap_or(f64::INFINITY)));
+        }
+        if let Some(max) = self.max_exposure {
+            p.exposure_cap = p.exposure_cap.min(max).max(p.exposure_lower);
         }
         self.policy = p;
         match self.status.strategy.as_str() {
@@ -2020,12 +2058,6 @@ fn bounds(camera: &mut Camera, feature: Option<&str>) -> Bounds {
         .unwrap_or_default()
 }
 
-fn has_choice(camera: &mut Camera, feature: &str, choice: &str) -> bool {
-    camera
-        .choices(feature)
-        .is_ok_and(|c| c.iter().any(|v| v == choice))
-}
-
 fn read_any(camera: &mut Camera, names: &[&'static str]) -> Option<(&'static str, f64)> {
     names.iter().copied().find_map(|n| {
         camera.has(n).then_some(())?;
@@ -2090,7 +2122,8 @@ mod tests {
             width,
             height,
             pixel_format,
-            timestamp_ns: 0,
+            device_ts_ns: None,
+            wall_ms: 0,
             data,
         }
     }

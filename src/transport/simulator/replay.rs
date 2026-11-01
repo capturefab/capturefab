@@ -434,7 +434,10 @@ impl Backend for Replay {
         self.timestamp_ns = (self.epoch.elapsed().as_nanos().min(u64::MAX as u128) as u64)
             .max(self.timestamp_ns.saturating_add(1));
         frame.id = self.frame_id;
-        frame.timestamp_ns = self.timestamp_ns;
+        frame.device_ts_ns = Some(self.timestamp_ns);
+        // A simulated camera's frame arrives when it is handed out, not when
+        // its pixels were decoded, or a held still was first read.
+        frame.wall_ms = 0;
         // Never catch up in a burst after a slow consumer or clip transition.
         let period = Duration::from_secs_f64(1.0 / self.fps);
         let now = Instant::now();
@@ -558,8 +561,9 @@ mod tests {
             );
             assert_eq!(frame.data.len(), 64 * 64 * 3);
             assert!(frame.id > id);
-            assert!(frame.timestamp_ns > timestamp);
-            (id, timestamp) = (frame.id, frame.timestamp_ns);
+            let device_ts_ns = frame.device_ts_ns.unwrap();
+            assert!(device_ts_ns > timestamp);
+            (id, timestamp) = (frame.id, device_ts_ns);
         }
     }
 
@@ -616,6 +620,26 @@ mod tests {
                 .contains("cannot inspect simulation source")
         );
         assert!(open(&dir.0, 64, 64, f64::NAN, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn a_held_still_arrives_each_time_it_is_handed_out() {
+        if ffmpeg().is_none() {
+            return;
+        }
+        let dir = Directory::new();
+        let still = dir.file("still.png");
+        png(&still, 64, 64, [10, 20, 30]);
+        let selector = format!("sim:replay:{}", still.display());
+        let mut camera =
+            crate::camera::Camera::open(&selector, &[], Duration::from_secs(3)).unwrap();
+        camera.start().unwrap();
+        let times = (0..3)
+            .map(|_| camera.next_frame(Duration::from_secs(3)).unwrap().wall_ms)
+            .collect::<Vec<_>>();
+        // Three frames of a 30 fps camera span two frame periods.
+        assert!(times[2] - times[0] >= 50, "{times:?}");
+        camera.stop().unwrap();
     }
 
     #[test]

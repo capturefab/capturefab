@@ -13,6 +13,7 @@ use nusb::{
     },
 };
 use std::{
+    collections::VecDeque,
     num::NonZeroU8,
     time::{Duration, Instant},
 };
@@ -176,23 +177,23 @@ fn access_error(
     let at = node.map(|node| format!(" ({node})")).unwrap_or_default();
     match (kind, os) {
         (Usb::PermissionDenied, "linux") => (
-            ErrorKind::Unavailable,
+            ErrorKind::PermissionDenied,
             format!(
                 "No permission to {doing} USB3 Vision camera {name}{at}. Run `capturefab doctor` for the udev rule that fixes it."
             ),
         ),
         (Usb::PermissionDenied, _) => (
-            ErrorKind::Unavailable,
+            ErrorKind::PermissionDenied,
             format!("No permission to {doing} USB3 Vision camera {name}. Run `capturefab doctor`."),
         ),
         (Usb::Busy, _) => (
-            ErrorKind::Unavailable,
+            ErrorKind::CameraBusy,
             format!(
                 "USB3 Vision camera {name} is in use by another application (for example a vendor viewer or SDK). Close it and connect again."
             ),
         ),
         (Usb::Disconnected, _) => (
-            ErrorKind::Unavailable,
+            ErrorKind::Disconnected,
             format!(
                 "USB3 Vision camera {name} disconnected while opening; reconnect it and discover again."
             ),
@@ -221,6 +222,26 @@ fn access_error(
             ErrorKind::OperationFailed,
             format!("Cannot {doing} USB3 Vision camera {name}{at}."),
         ),
+    }
+}
+
+/// The error for an open or claim the OS refused: [`access_error`]'s words
+/// with the OS's own after them for whoever debugs it, and on Linux the
+/// udev rule that fixes a refused permission as its hint.
+fn refusal(
+    stage: Stage,
+    kind: nusb::ErrorKind,
+    detail: &dyn std::fmt::Display,
+    name: &str,
+    node: Option<&str>,
+    os: &str,
+) -> anyhow::Error {
+    let (category, message) = access_error(stage, kind, name, node, os);
+    let error = Categorized::new(category, format!("{message} (USB: {detail})"));
+    if kind == nusb::ErrorKind::PermissionDenied && os == "linux" {
+        error.hint(crate::doctor::usb_access_fix()).into()
+    } else {
+        error.into()
     }
 }
 
@@ -274,24 +295,14 @@ pub fn open(info: &CameraInfo, timeout: Duration) -> Result<Box<dyn Backend>> {
         let name = name.clone();
         let node = node.clone();
         move |error: nusb::Error| {
-            let (kind, message) = access_error(
+            refusal(
                 stage,
                 error.kind(),
+                &error,
                 &name,
                 node.as_deref(),
                 std::env::consts::OS,
-            );
-            // The OS's own words stay on the line for whoever debugs it.
-            let message = format!("{message} (USB: {error})");
-            // On Linux the udev rule fixes it; the desktop app offers to
-            // copy that line.
-            let message =
-                if error.kind() == nusb::ErrorKind::PermissionDenied && cfg!(target_os = "linux") {
-                    crate::doctor::with_usb_access_fix(message)
-                } else {
-                    message
-                };
-            Categorized::error(kind, message)
+            )
         }
     };
     let device = device_info.open().wait().map_err(refused(Stage::Open))?;
@@ -519,6 +530,8 @@ struct Stream {
     /// Transfers submitted and not yet returned.
     submitted: usize,
     frame: Option<Frame>,
+    /// Frames, or why one was lost, taken in ahead of `next`.
+    taken: VecDeque<Result<Frame>>,
     /// Linux refused a submit for lack of usbfs memory: hold buffers back
     /// until a transfer completes and frees some.
     starved: bool,
@@ -553,6 +566,7 @@ impl Stream {
             idle: Vec::new(),
             submitted: 0,
             frame: None,
+            taken: VecDeque::new(),
             starved: false,
         }
     }
@@ -572,6 +586,9 @@ impl Stream {
     /// Wait for the next whole frame. A lost frame returns one error, and
     /// the transfers after it go on to the next frame.
     fn next(&mut self, transfers: &mut impl Transfers, deadline: Instant) -> Result<Frame> {
+        if let Some(taken) = self.taken.pop_front() {
+            return taken;
+        }
         loop {
             if self.submitted == 0 {
                 // Linux refused every submit: retry shortly, as Aravis does.
@@ -593,6 +610,28 @@ impl Stream {
                 return Ok(frame);
             }
         }
+    }
+    /// Take in the transfers that already completed, keeping what they
+    /// hold for `next`. Returns how many frames it holds that `next` has
+    /// not returned, whole or in part.
+    fn take_in(&mut self, transfers: &mut impl Transfers) -> u32 {
+        while self.submitted > 0 {
+            let Some(completion) = transfers.wait(Duration::ZERO) else {
+                break;
+            };
+            self.submitted -= 1;
+            let received = self.receive(completion);
+            if !self.starved {
+                self.fill(transfers);
+            }
+            match received {
+                Ok(Some(frame)) => self.taken.push_back(Ok(frame)),
+                Ok(None) => {}
+                Err(error) => self.taken.push_back(Err(error)),
+            }
+        }
+        let frames = self.taken.iter().filter(|taken| taken.is_ok()).count();
+        u32::try_from(frames + usize::from(self.frame.is_some())).unwrap_or(u32::MAX)
     }
     fn receive(&mut self, completion: Completion) -> Result<Option<Frame>> {
         let Completion {
@@ -898,10 +937,12 @@ impl<C: Channel> Control<C> {
         let mut deadline = Instant::now() + window;
         for _ in 0..64 {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            ensure!(
-                !remaining.is_zero(),
-                "USB camera control acknowledgement timed out"
-            );
+            if remaining.is_zero() {
+                return Err(crate::types::Categorized::error(
+                    crate::types::ErrorKind::Timeout,
+                    "USB camera control acknowledgement timed out",
+                ));
+            }
             let response = self.channel.receive(self.max_ack, remaining);
             let response = self
                 .unhalt(response)
@@ -1073,22 +1114,22 @@ impl RegisterIo for UsbBackend {
         self.control.write_memory(address, data)
     }
 }
-/// The address and size of each manifest entry for a raw or zipped device
-/// XML, newest version first. GenCP puts the file type in bits 0-2 of the
-/// entry's second word, where 1 is a Buffer XML holding only chunk nodes,
-/// and the 6-bit file format in bits 10-15.
-fn device_xml_entries(entries: &[u8]) -> Result<Vec<(u64, u64)>> {
+/// Each manifest entry for a raw or zipped device XML, with its address
+/// and size, newest version first. GenCP puts the file type in bits 0-2 of
+/// the entry's second word, where 1 is a Buffer XML holding only chunk
+/// nodes, and the 6-bit file format in bits 10-15.
+fn device_xml_entries(entries: &[u8]) -> Result<Vec<([u8; 64], u64, u64)>> {
     let mut candidates = Vec::new();
     for entry in entries.as_chunks::<64>().0 {
         let schema = le32(entry, 4)?;
         if schema & 7 == 0 && (schema >> 10) & 0x3f <= 1 {
-            candidates.push((le32(entry, 0)?, le64(entry, 8)?, le64(entry, 16)?));
+            candidates.push((le32(entry, 0)?, *entry, le64(entry, 8)?, le64(entry, 16)?));
         }
     }
     candidates.sort_by_key(|e| std::cmp::Reverse(e.0));
     Ok(candidates
         .into_iter()
-        .map(|(_, address, size)| (address, size))
+        .map(|(_, entry, address, size)| (entry, address, size))
         .collect())
 }
 fn parse_leader(bytes: &[u8]) -> Result<Frame> {
@@ -1120,7 +1161,8 @@ fn parse_leader(bytes: &[u8]) -> Result<Frame> {
         width,
         height,
         pixel_format: le32(bytes, 28)?,
-        timestamp_ns: le64(bytes, 20)?,
+        device_ts_ns: Some(le64(bytes, 20)?),
+        wall_ms: 0,
         data: Vec::new(),
     })
 }
@@ -1160,10 +1202,23 @@ impl Backend for UsbBackend {
             count * 64,
         )?;
         let mut last_error = anyhow!("USB manifest contains no raw or ZIP device XML entry");
-        for (address, size) in device_xml_entries(&entries)? {
+        // The manifest entry (version, address, size and a SHA-1 where the
+        // device gives one) and the model and device version name the XML
+        // on disk; a copy kept there is parsed below like a download.
+        let identity = [self.read_memory(0x0044, 64)?, self.read_memory(0x00c4, 64)?].concat();
+        for (entry, address, size) in device_xml_entries(&entries)? {
             if size == 0 || size > 32 * 1024 * 1024 {
                 last_error = anyhow!("GenICam manifest XML size is outside 1..32 MiB");
                 continue;
+            }
+            let key = crate::xml_cache::key(&[&entry, &identity]);
+            if let Some(xml) = crate::xml_cache::load(&key) {
+                if crate::genicam::NodeMap::parse(&xml)
+                    .is_ok_and(|nodes| nodes.unresolved().is_none())
+                {
+                    return Ok(xml);
+                }
+                crate::xml_cache::forget(&key);
             }
             match self
                 .read_memory(address, size as usize)
@@ -1172,7 +1227,10 @@ impl Backend for UsbBackend {
                     crate::genicam::NodeMap::parse(&xml)?;
                     Ok(xml)
                 }) {
-                Ok(xml) => return Ok(xml),
+                Ok(xml) => {
+                    crate::xml_cache::store(&key, &xml);
+                    return Ok(xml);
+                }
                 Err(error) => last_error = error,
             }
         }
@@ -1214,6 +1272,12 @@ impl Backend for UsbBackend {
         }
         frame
     }
+    fn buffered_frames(&mut self) -> u32 {
+        match self.stream.as_mut() {
+            Some(stream) => stream.take_in(&mut self.stream_in),
+            None => 0,
+        }
+    }
     fn stop(&mut self) -> Result<()> {
         let was_started = self.stream.take().is_some();
         let result = if was_started {
@@ -1246,7 +1310,6 @@ impl Drop for UsbBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::VecDeque;
 
     #[test]
     fn open_failures_name_the_fix_for_this_os() {
@@ -1257,35 +1320,35 @@ mod tests {
                 Stage::Open,
                 Usb::PermissionDenied,
                 "linux",
-                ErrorKind::Unavailable,
+                ErrorKind::PermissionDenied,
                 "/dev/bus/usb/002/003). Run `capturefab doctor` for the udev rule",
             ),
             (
                 Stage::Open,
                 Usb::PermissionDenied,
                 "macos",
-                ErrorKind::Unavailable,
+                ErrorKind::PermissionDenied,
                 "Run `capturefab doctor`.",
             ),
             (
                 Stage::ClaimControl,
                 Usb::Busy,
                 "linux",
-                ErrorKind::Unavailable,
+                ErrorKind::CameraBusy,
                 "in use by another application",
             ),
             (
                 Stage::ClaimStream,
                 Usb::Busy,
                 "windows",
-                ErrorKind::Unavailable,
+                ErrorKind::CameraBusy,
                 "Close it and connect again.",
             ),
             (
                 Stage::Open,
                 Usb::Disconnected,
                 "macos",
-                ErrorKind::Unavailable,
+                ErrorKind::Disconnected,
                 "reconnect it and discover again",
             ),
             (
@@ -1345,18 +1408,35 @@ mod tests {
         let (kind, message) =
             access_error(Stage::Open, Usb::PermissionDenied, "acA", node, "linux");
         let error = Categorized::error(kind, message).context("connect usb:2676:ba02:1");
-        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
-        // The desktop app recognizes the refusal by doctor's wording.
-        let (_, message) = access_error(
+        assert_eq!(crate::cli::error_code(&error), ("permission_denied", 3));
+        // On Linux the udev rule doctor writes is the hint, and it survives
+        // the trip from the worker to the CLI.
+        let error = refusal(
             Stage::Open,
             Usb::PermissionDenied,
+            &"Permission denied",
             "acA",
-            Some("/dev/bus/usb/002/003"),
+            node,
             "linux",
         );
-        let doctor =
-            crate::doctor::usb_access_error("acA", std::path::Path::new("/dev/bus/usb/002/003"));
-        assert_eq!(format!("{doctor:#}").lines().next(), Some(message.as_str()));
+        let rebuilt =
+            crate::types::error_from_tag(crate::types::error_tag(&error), format!("{error:#}"));
+        let classified = crate::types::classify(&rebuilt);
+        assert_eq!(classified.kind.code(), ("permission_denied", 3));
+        assert_eq!(classified.hint, Some(crate::doctor::usb_access_fix()));
+        assert!(
+            format!("{rebuilt:#}").ends_with("(USB: Permission denied)"),
+            "{rebuilt:#}"
+        );
+        let elsewhere = refusal(
+            Stage::Open,
+            Usb::PermissionDenied,
+            &"Permission denied",
+            "acA",
+            None,
+            "macos",
+        );
+        assert_eq!(crate::types::classify(&elsewhere).hint, None);
     }
     #[test]
     fn cameras_without_a_product_string_are_named_by_usb_ids() {
@@ -1455,10 +1535,16 @@ mod tests {
             entry(0x0300_0000, schema(0, 33), 0x4000, 400),
         ]
         .concat();
+        let found = device_xml_entries(&manifest).unwrap();
         assert_eq!(
-            device_xml_entries(&manifest).unwrap(),
+            found
+                .iter()
+                .map(|(_, address, size)| (*address, *size))
+                .collect::<Vec<_>>(),
             [(0x2000, 200), (0x3000, 300)]
         );
+        // The whole entry, its SHA-1 included, names a cached copy.
+        assert_eq!(found[0].0, entry(0x0100_0002, schema(0, 1), 0x2000, 200));
     }
     /// A camera's control endpoints, replying to each read from a script.
     #[derive(Default)]
@@ -1750,6 +1836,29 @@ mod tests {
             bus.send(&trailer(id, 12 * MPS));
             assert_eq!(next(&mut stream, &mut bus).unwrap().id, id);
         }
+    }
+    #[test]
+    fn frames_already_received_are_taken_in_and_returned_in_turn() {
+        let block = 4 * MPS;
+        let expected = 10 * MPS;
+        let (mut stream, mut bus) = streaming(expected, block);
+        bus.frame(1, &image(1, expected), block);
+        bus.frame(2, &image(2, expected), block);
+        // The third has its leader and part of its image so far.
+        bus.send(&leader(3, expected as u32, 1));
+        bus.send(&image(3, expected)[..block]);
+        assert_eq!(stream.take_in(&mut bus), 3);
+        assert!(bus.packets.is_empty());
+        for id in 1..=2 {
+            assert_eq!(next(&mut stream, &mut bus).unwrap().id, id);
+        }
+        for chunk in image(3, expected)[block..].chunks(block) {
+            bus.send(chunk);
+        }
+        bus.send(&trailer(3, expected));
+        let third = next(&mut stream, &mut bus).unwrap();
+        assert_eq!((third.id, third.data), (3, image(3, expected)));
+        assert_eq!(stream.take_in(&mut bus), 0);
     }
     #[test]
     fn image_ending_like_a_header_is_image_data() {

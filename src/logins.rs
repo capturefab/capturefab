@@ -1,10 +1,10 @@
 //! Camera sign-ins: user names and passwords for rtsp://, rtsps:// and
 //! onvif: cameras. Passwords live only in the OS credential store (service
-//! [`KEYCHAIN_SERVICE`], account `USER@ADDRESS`); the index of which
+//! `capturefab-camera`, account `USER@ADDRESS`); the index of which
 //! addresses have one (`camera-logins.json` in the state directory) never
-//! holds a secret. As with hubs, the worker that opens the camera is the
-//! process that reads the saved password, and only after a camera answered
-//! with a sign-in request is one ever sent.
+//! holds a secret. The worker that opens the camera is the process that
+//! reads the saved password, and only after a camera answered with a
+//! sign-in request is one ever sent.
 //!
 //! The address a sign-in is saved under is normalized by [`key`]: scheme,
 //! host and port are compared case-insensitively with the default port made
@@ -17,12 +17,13 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
 };
 use zeroize::Zeroizing;
 
-pub const KEYCHAIN_SERVICE: &str = "capturefab-camera";
+#[cfg(all(feature = "keychain", not(test)))]
+const KEYCHAIN_SERVICE: &str = "capturefab-camera";
 const INDEX: &str = "camera-logins.json";
 const LOCK: &str = "camera-logins.lock";
 const MAX_FILE: usize = 1 << 20;
@@ -40,7 +41,7 @@ pub fn can_remember() -> bool {
 }
 
 fn usage(message: impl Into<String>) -> anyhow::Error {
-    crate::dataset::Usage(message.into()).into()
+    crate::types::Usage(message.into()).into()
 }
 
 /// The normalized address a sign-in is saved under.
@@ -126,10 +127,24 @@ fn authority_of(text: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Percent-encode everything except RFC 3986 unreserved characters, with
+/// uppercase hexadecimal.
+pub fn encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 /// The keychain account: user name and address, so changing either never
 /// reads another entry's secret.
 pub fn account(user: &str, address: &str) -> String {
-    format!("{}@{address}", crate::hubs::encode(user))
+    format!("{}@{address}", encode(user))
 }
 
 /// A short form for messages and the UI: the address without its scheme,
@@ -187,7 +202,7 @@ impl CameraLogin {
             !user.chars().any(char::is_control) && !password.chars().any(char::is_control),
             usage("camera user names and passwords must not contain control characters")
         );
-        crate::hubs::scrub::register(&password);
+        crate::scrub::register(&password);
         Ok(Self { user, password })
     }
     pub fn expose(&self) -> &str {
@@ -205,7 +220,7 @@ impl std::fmt::Debug for CameraLogin {
 }
 
 /// Plaintext, for the worker pipe and the token-authenticated loopback IPC
-/// only; the remote API refuses commands that carry a login.
+/// only.
 impl Serialize for CameraLogin {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
@@ -284,7 +299,7 @@ pub fn split_userinfo(url: &str) -> Result<(String, Option<CameraLogin>)> {
 }
 
 /// Best-effort removal of credentials from text that may be a half-typed
-/// address, for undo history. A complete `user[:password]@` prefix is
+/// address. A complete `user[:password]@` prefix is
 /// removed; so is a `:password` still being typed before its `@` (a
 /// non-numeric port), keeping the user name.
 pub fn strip_userinfo(text: &str) -> String {
@@ -314,8 +329,8 @@ pub fn with_credentials(url: &str, login: &CameraLogin) -> Result<Zeroizing<Stri
     Ok(Zeroizing::new(format!(
         "{}{}:{}@{}",
         &url[..start],
-        crate::hubs::encode(&login.user),
-        crate::hubs::encode(login.expose()),
+        encode(&login.user),
+        encode(login.expose()),
         &url[stripped_from..]
     )))
 }
@@ -331,9 +346,7 @@ pub fn auth_error(address: &str, had_credentials: bool) -> anyhow::Error {
         );
     }
     let advice = if can_remember() {
-        format!(
-            "sign in from the app or run `capturefab login add {address} --user USER --password-stdin`"
-        )
+        format!("run `capturefab login add {address} --user USER --password-stdin`")
     } else {
         let scheme = address.split("://").next().unwrap_or("rtsp");
         format!("include them in the address ({scheme}://USER:PASSWORD@…)")
@@ -374,7 +387,7 @@ impl Store for SystemStore {
     }
 }
 
-/// A store in memory, for tests and screenshots.
+/// A store in memory, for tests.
 #[cfg(test)]
 #[derive(Default)]
 pub(crate) struct MemoryStore {
@@ -454,7 +467,9 @@ pub enum Remembered {
 /// The saved sign-ins of one state directory and credential store.
 #[derive(Clone)]
 pub struct Logins {
-    dir: PathBuf,
+    /// None: the state folder, found when a sign-in is first looked up, so
+    /// a camera that needs none never looks for it.
+    dir: Option<PathBuf>,
     store: Option<Arc<dyn Store>>,
 }
 
@@ -484,7 +499,10 @@ impl Logins {
         {
             static STORE: std::sync::OnceLock<Arc<MemoryStore>> = std::sync::OnceLock::new();
             let store: Arc<dyn Store> = STORE.get_or_init(Arc::default).clone();
-            Self::with(crate::ipc::state_dir(), store)
+            Self {
+                dir: None,
+                store: can_remember().then_some(store),
+            }
         }
         #[cfg(not(test))]
         {
@@ -492,38 +510,31 @@ impl Logins {
             let store: Option<Arc<dyn Store>> = Some(Arc::new(SystemStore));
             #[cfg(not(feature = "keychain"))]
             let store: Option<Arc<dyn Store>> = None;
-            Self {
-                dir: crate::ipc::state_dir(),
-                store,
-            }
+            Self { dir: None, store }
         }
     }
     #[cfg(test)]
     pub(crate) fn with(dir: PathBuf, store: Arc<dyn Store>) -> Self {
         Self {
-            dir,
+            dir: Some(dir),
             store: can_remember().then_some(store),
         }
     }
-    /// The index alone, for listing without any credential store.
-    pub fn index_only(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            dir: dir.into(),
-            store: None,
+    fn dir(&self) -> Result<PathBuf> {
+        match &self.dir {
+            Some(dir) => Ok(dir.clone()),
+            None => crate::dirs::state(),
         }
     }
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-    fn path(&self) -> PathBuf {
-        self.dir.join(INDEX)
+    fn path(&self) -> Result<PathBuf> {
+        Ok(self.dir()?.join(INDEX))
     }
     /// The non-secret index file, for messages.
-    pub fn index_path(&self) -> PathBuf {
+    pub fn index_path(&self) -> Result<PathBuf> {
         self.path()
     }
     fn read(&self) -> Result<File> {
-        let path = self.path();
+        let path = self.path()?;
         let input = match fs::File::open(&path) {
             Ok(input) => input,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -556,8 +567,9 @@ impl Logins {
         Ok(file)
     }
     fn write(&self, file: &File) -> Result<()> {
-        crate::ipc::ensure_private_dir(&self.dir)?;
-        let temp = self.dir.join(format!("{INDEX}.{}.tmp", std::process::id()));
+        let dir = self.dir()?;
+        crate::dirs::ensure_private_dir(&dir)?;
+        let temp = dir.join(format!("{INDEX}.{}.tmp", std::process::id()));
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -574,7 +586,7 @@ impl Logins {
             );
             output.write_all(&bytes)?;
             output.sync_all()?;
-            fs::rename(&temp, self.path())?;
+            fs::rename(&temp, dir.join(INDEX))?;
             Ok(())
         })();
         if result.is_err() {
@@ -583,12 +595,13 @@ impl Logins {
         result
     }
     fn open_lock(&self) -> Result<fs::File> {
-        crate::ipc::ensure_private_dir(&self.dir)?;
+        let dir = self.dir()?;
+        crate::dirs::ensure_private_dir(&dir)?;
         Ok(fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(self.dir.join(LOCK))?)
+            .open(dir.join(LOCK))?)
     }
     /// Run `update` under the cross-process lock and write the result. When
     /// writing fails, `rollback` undoes what `update` did outside the file.
@@ -617,16 +630,17 @@ impl Logins {
     pub fn list(&self) -> Result<Vec<Entry>> {
         Ok(self.read()?.logins)
     }
-    /// The saved entry for an address (index only).
+    /// The saved entry for an address (index only). Without a state
+    /// folder, as on a read-only system, nothing was saved.
     pub fn entry(&self, address: &str) -> Result<Option<Entry>> {
+        if self.dir().is_err() {
+            return Ok(None);
+        }
         Ok(self
             .read()?
             .logins
             .into_iter()
             .find(|entry| entry.address == address))
-    }
-    pub fn is_saved(&self, address: &str) -> Result<bool> {
-        Ok(self.entry(address)?.is_some())
     }
     /// Save a sign-in that worked. The secret is written first; when the
     /// index cannot be written the previous secret is restored.
@@ -829,6 +843,32 @@ mod tests {
     }
 
     #[test]
+    fn keychain_accounts_are_pinned() {
+        // Saved passwords are looked up by exactly these strings: a change
+        // leaves every saved camera password unreadable.
+        let (address, login) = split_userinfo("rtsp://user@Host:554/path").unwrap();
+        let address = key(&address).unwrap().address;
+        let login = login.unwrap();
+        assert_eq!(account(&login.user, &address), "user@rtsp://host:554/path");
+        let onvif = key("onvif://192.168.1.64").unwrap().address;
+        assert_eq!(
+            account("ad min:1@x", &onvif),
+            "ad%20min%3A1%40x@onvif:http://192.168.1.64:80/onvif/device_service"
+        );
+        assert_eq!(encode("a-z_A.Z~09 /é"), "a-z_A.Z~09%20%2F%C3%A9");
+        if can_remember() {
+            let (logins, store) = logins("pinned");
+            logins
+                .save(&address, &CameraLogin::new("user", "secret").unwrap())
+                .unwrap();
+            assert_eq!(
+                store.secrets.lock().unwrap().keys().collect::<Vec<_>>(),
+                ["user@rtsp://host:554/path"]
+            );
+        }
+    }
+
+    #[test]
     fn logins_redact_and_round_trip() {
         let login = CameraLogin::new("admin", "hunter2-secret").unwrap();
         let debug = format!("{login:?}");
@@ -908,7 +948,7 @@ mod tests {
         );
         assert!(format!("{rejected:#}").contains("refused"));
         assert!(is_auth_error(&rejected.context("connect")));
-        assert_eq!(crate::cli::error_code(&required), ("auth_required", 1));
+        assert_eq!(crate::cli::error_code(&required), ("auth_required", 3));
     }
 
     #[cfg(feature = "keychain")]
@@ -942,7 +982,7 @@ mod tests {
             secrets.values().next().unwrap().as_str(),
             "v1:longer-password"
         );
-        let bytes = fs::read(logins.dir().join(INDEX)).unwrap();
+        let bytes = fs::read(logins.index_path().unwrap()).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(
             !text.contains("longer-password") && text.contains("viewer"),
@@ -951,7 +991,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(logins.dir().join(INDEX))
+            let mode = fs::metadata(logins.index_path().unwrap())
                 .unwrap()
                 .permissions()
                 .mode();
@@ -986,8 +1026,8 @@ mod tests {
             )
             .unwrap();
         // A directory where the index belongs makes the rename fail.
-        fs::remove_file(logins.dir().join(INDEX)).unwrap();
-        fs::create_dir(logins.dir().join(INDEX)).unwrap();
+        fs::remove_file(logins.index_path().unwrap()).unwrap();
+        fs::create_dir(logins.index_path().unwrap()).unwrap();
         assert!(
             logins
                 .save(
@@ -1000,7 +1040,7 @@ mod tests {
             store.secrets.lock().unwrap()[&account("admin", address)].as_str(),
             "v1:first-password"
         );
-        fs::remove_dir(logins.dir().join(INDEX)).unwrap();
+        fs::remove_dir(logins.index_path().unwrap()).unwrap();
         assert!(
             logins
                 .save("rtsp://new:554/", &CameraLogin::new("u", "x").unwrap())
@@ -1056,34 +1096,17 @@ mod tests {
         let error = logins.remembered("rtsp://cam:554/x").unwrap_err();
         let text = format!("{error:#}");
         assert!(text.contains("unlock it and try again"), "{text}");
-        assert_eq!(crate::cli::error_code(&error), ("operation_failed", 1));
-    }
-
-    #[test]
-    fn an_index_only_handle_lists_but_never_saves() {
-        let logins = Logins::index_only(temp("index-only"));
-        assert!(logins.list().unwrap().is_empty());
-        assert!(matches!(
-            logins.remembered("rtsp://cam:554/x").unwrap(),
-            Remembered::None
-        ));
-        let error = logins
-            .save("rtsp://cam:554/x", &CameraLogin::new("a", "b").unwrap())
-            .unwrap_err();
-        assert_eq!(crate::cli::error_code(&error), ("unsupported", 5));
-        assert_eq!(
-            crate::cli::error_code(&logins.forget("rtsp://cam:554/x").unwrap_err()),
-            ("unsupported", 5)
-        );
+        assert_eq!(crate::cli::error_code(&error), ("failed", 1));
     }
 
     #[test]
     fn oversized_or_unknown_indexes_are_refused() {
         let dir = temp("oversized");
-        crate::ipc::ensure_private_dir(&dir).unwrap();
+        crate::dirs::ensure_private_dir(&dir).unwrap();
+        let logins = Logins::with(dir.clone(), Arc::new(MemoryStore::default()));
         fs::write(dir.join(INDEX), vec![b' '; MAX_FILE + 1]).unwrap();
-        assert!(Logins::index_only(&dir).list().is_err());
+        assert!(logins.list().is_err());
         fs::write(dir.join(INDEX), r#"{"version":2,"logins":[]}"#).unwrap();
-        assert!(Logins::index_only(&dir).list().is_err());
+        assert!(logins.list().is_err());
     }
 }

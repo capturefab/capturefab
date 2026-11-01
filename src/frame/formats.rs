@@ -126,8 +126,90 @@ fn layout(format: u32) -> Option<(&'static str, Layout)> {
     })
 }
 
+/// Every code `layout` knows, for looking a layout up by its name.
+const CODES: [u32; 51] = [
+    0x0108_0002,
+    0x0101_0037,
+    0x0102_0038,
+    0x0104_0039,
+    0x0230_0018,
+    0x0230_0019,
+    0x0230_001a,
+    0x0230_001b,
+    0x0218_0021,
+    0x0230_0022,
+    0x0230_0023,
+    0x0230_0024,
+    0x0230_0033,
+    0x0210_0035,
+    0x0210_0036,
+    0x021e_0048,
+    0x0224_0049,
+    0x0230_004a,
+    0x0230_004b,
+    0x0240_004c,
+    0x0228_004d,
+    0x0240_004e,
+    0x0230_004f,
+    0x0240_0050,
+    0x0240_0051,
+    0x021e_005c,
+    0x0224_005d,
+    0x0230_005e,
+    0x0240_005f,
+    0x0228_0060,
+    0x0240_0061,
+    0x0230_0062,
+    0x0240_0063,
+    0x0240_0064,
+    0x0220_001d,
+    0x0220_012d,
+    0x0220_012e,
+    0x020c_001e,
+    0x0218_0020,
+    0x0218_003a,
+    0x020c_003c,
+    0x0218_003d,
+    0x0210_003e,
+    0x020c_003f,
+    0x0218_0040,
+    0x0210_0041,
+    0x020c_0042,
+    0x0210_0044,
+    0x0210_0045,
+    0x020c_005a,
+    0x0218_005b,
+];
+
 pub(super) fn name(format: u32) -> Option<&'static str> {
     layout(format).map(|(name, _)| name)
+}
+
+/// The significant bits of each component: what the name's digits do not
+/// always say (RGB10p32 is 10, RGB8_Planar 8). RGB565p counts its widest,
+/// six-bit, component; YUV and YCbCr are 8.
+pub(super) fn sample_bits(format: u32) -> Option<u32> {
+    Some(match layout(format)?.1 {
+        Layout::Mono { bits } | Layout::Rgb { bits, .. } => bits,
+        Layout::SignedMono | Layout::Yuv { .. } => 8,
+        Layout::Rgb565 { .. } => 6,
+    })
+}
+
+/// The component depth of an RGB layout `native_color` reads, else None.
+pub(super) fn color_bits(format: u32) -> Option<u32> {
+    match layout(format)?.1 {
+        Layout::Rgb { bits, .. } => Some(bits),
+        _ => None,
+    }
+}
+
+/// `sample_bits` of the layout named `name`, such as a camera reports it.
+pub(super) fn name_bits(name: &str) -> Option<u32> {
+    CODES
+        .into_iter()
+        .find(|&code| self::name(code) == Some(name))
+        .and_then(sample_bits)
 }
 
 pub(super) fn monochrome(format: u32) -> bool {
@@ -654,7 +736,7 @@ mod tests {
     #[test]
     fn every_additional_layout_flows_through_image_consumers() {
         use crate::frame as conversion;
-        crate::efficiency::pin(false);
+        use crate::{camera_profile::CameraKind, inspect::PreviewFormat};
         let mut exercised = 0;
         // Cover every identifier in each byte-size family declared above,
         // including the newer alignment codes beyond the first 256 IDs.
@@ -701,21 +783,28 @@ mod tests {
                 conversion::sharpness(&normalized, [1, 1, 10, 6]).unwrap(),
                 "focus {label}"
             );
-            for factor in [2, 3, 4] {
-                let small = |frame| {
-                    conversion::shrink(frame, factor)
-                        .map(|small| (small.width, small.height, small.pixel_format, small.data))
-                };
+            let preview = |frame| {
+                crate::inspect::inspect(frame, CameraKind::AreaScan, None, 5, PreviewFormat::Png)
+                    .unwrap()
+                    .image
+            };
+            assert_eq!(preview(&source), preview(&normalized), "preview {label}");
+            // Components the 8-bit image keeps clip as it does; wider ones
+            // clip at their own full scale.
+            let clipped = conversion::clipping(&source).unwrap();
+            assert_eq!(clipped.pixels, 96, "clipping {label}");
+            if color_bits(format).is_none_or(|bits| bits == 8) {
                 assert_eq!(
-                    small(&source),
-                    small(&normalized),
-                    "shrink {label} by {factor}"
+                    clipped,
+                    conversion::clipping(&normalized).unwrap(),
+                    "clipping {label}"
                 );
             }
+            assert!(CODES.contains(&format), "{label}");
             assert_eq!(
-                conversion::preview_rgba(&source, 5, 4).unwrap(),
-                conversion::preview_rgba(&normalized, 5, 4).unwrap(),
-                "preview {label}"
+                conversion::name_bits(label),
+                conversion::sample_bits(format),
+                "bits {label}"
             );
             let cropped = crate::inspect::crop(&source, [3, 2, 5, 4]).unwrap();
             let expected = crate::inspect::crop(&normalized, [3, 2, 5, 4]).unwrap();

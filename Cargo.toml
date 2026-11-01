@@ -3,69 +3,32 @@ name = "capturefab"
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
-description = "Rust camera workbench for GenICam GigE Vision and USB3 Vision"
+description = "Camera capture command-line tool for people, scripts and AI agents: GigE Vision, USB3 Vision, GenICam, webcams and streams"
 license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["gui", "usb", "scanner", "jpeg", "nvjpeg", "vaapi", "videotoolbox", "parquet", "hubs", "updates"]
-gui = ["ai", "updates", "dep:iced", "dep:bytemuck", "dep:rfd", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-foundation", "dep:mundy", "dep:accesskit", "dep:accesskit_macos", "dep:accesskit_windows", "dep:accesskit_unix", "dep:raw-window-handle", "dep:windows", "dep:x11-dl", "dep:libloading"]
+default = ["usb", "jpeg", "keychain"]
 usb = ["dep:nusb"]
-# Document scanners: SANE scanimage, Windows WIA and macOS ImageCaptureCore.
-# Drivers run in disposable helper processes, never in the UI.
-scanner = []
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
-# NVIDIA nvJPEG/CUDA, loaded at runtime in an isolated helper process; no SDK at build time.
-nvjpeg = ["dep:libloading"]
-# VA-API hardware JPEG (Intel iHD and other drivers), libva loaded at runtime in
-# an isolated helper process; libjpeg-turbo verifies its output at start-up.
-vaapi = ["dep:libloading", "jpeg"]
-# OS credential store (Keychain / Credential Manager / Secret Service) shared by
-# AI provider keys and camera hubs.
+# OS credential store (Keychain / Credential Manager / Secret Service) for
+# saved camera sign-ins.
 keychain = ["dep:keyring"]
-# Parquet and JSON exports from the dataset catalog (DuckDB's statically linked extensions).
-parquet = ["duckdb/parquet", "duckdb/json", "dep:parquet"]
-# Prompt measurements use HTTPS with the OS certificate store and native
-# Keychain / Credential Manager / Secret Service credentials.
-ai = ["dep:ureq", "keychain", "dep:ring"]
-# New-version checks: a GET of the public releases.json over HTTPS with the
-# OS certificate store; the desktop app checks daily unless turned off.
-updates = ["dep:ureq"]
-# Camera hubs (Home Assistant, Frigate, go2rtc, UniFi Protect): a hand-rolled
-# HTTP/1.1 client with rustls (ring; the OS trust store or a pinned certificate)
-# in the camera worker, JPEG/PNG decoded there with libjpeg-turbo and png, and
-# RTSP restreams through FFmpeg. Secrets come from the environment, or from the
-# OS credential store when `keychain` is also enabled.
-hubs = ["jpeg", "dep:rustls", "dep:rustls-platform-verifier"]
-# Apple's hardware JPEG engine through VideoToolbox (system frameworks; no-op off macOS).
-videotoolbox = []
-# The browser client (web-client/dist, or CAPTUREFAB_WEB_DIST) built into the
-# executable for `serve --listen`; release builds enable it when it is built.
-embedded-web = []
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
-serde = { version = "1", features = ["derive", "rc"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 roxmltree = "0.20"
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zip = { version = "2.4", default-features = false, features = ["deflate-flate2", "flate2"] }
 png = "0.17"
 if-addrs = "0.13"
 socket2 = { version = "0.6", features = ["all"] }
-# SIGINT, plus SIGTERM (systemctl stop) and SIGHUP (a closed terminal).
-ctrlc = { version = "3.4", features = ["termination"] }
 getrandom = "0.3"
-iced = { version = "0.14", optional = true, default-features = false, features = ["wgpu", "tiny-skia", "crisp", "web-colors", "smol", "linux-theme-detection", "x11", "wayland", "image-without-codecs", "svg", "canvas", "advanced"] }
-unicode-segmentation = "1"
-unicode-width = "0.2"
-accesskit = { version = "0.21.1", optional = true }
-raw-window-handle = { version = "0.6", optional = true }
-bytemuck = { version = "1", optional = true, features = ["derive"] }
 nusb = { version = "0.2.7", optional = true }
-memmap2 = "0.9"
 base64 = "0.22"
 sha1 = "0.10"
 md-5 = "0.10"
@@ -74,82 +37,38 @@ fs2 = "0.4"
 # Lossless storage of the bundled executable; PNG/ZIP already use this backend.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# In-memory session analytics and on-disk dataset catalogs; bundling keeps releases portable.
-duckdb = { version = "~1.10506.1", default-features = false, features = ["bundled", "appender-arrow"] }
-# The isolated task filesystem bridge uses this exact engine's C++ headers.
-# Its metadata supplies DEP_DUCKDB_INCLUDE without rebuilding another engine.
-libduckdb-sys = { version = "=1.10506.1", default-features = false, features = ["bundled"] }
-# Streaming bounded exports use the same Arrow major as DuckDB. Keep the
-# writer uncompressed to avoid another native codec dependency; ordinary
-# DuckDB exports continue to use Zstd.
-parquet = { version = "~58.4.0", optional = true, default-features = false, features = ["arrow"] }
-plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series", "area_series"] }
 turbojpeg = { version = "1.5", optional = true, default-features = false, features = ["cmake", "require-simd"] }
-libloading = { version = "0.8", optional = true }
-ureq = { version = "3.4", optional = true, default-features = false, features = ["rustls", "platform-verifier"] }
 keyring = { version = "4.2", optional = true }
 zeroize = "1"
-rfd = { version = "0.17", optional = true }
-# RS256 signing of Google service-account tokens for the assistant; the same
-# ring that rustls already builds.
-ring = { version = "0.17.14", optional = true }
-# TLS for camera hubs: ring only (no aws-lc-rs, so no C toolchain or cmake).
-rustls = { version = "0.23.45", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
-rustls-platform-verifier = { version = "0.7.1", optional = true }
 
-# The refresh rate of the GUI window's screen, and the Reduce Motion and Reduce
-# Transparency settings; already in the tree via rfd.
-[target.'cfg(target_os = "macos")'.dependencies]
-accesskit_macos = { version = "0.22.2", optional = true }
-objc2 = { version = "0.6", optional = true }
-objc2-app-kit = { version = "0.3", optional = true, default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSCell", "NSEvent", "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSScroller", "NSView", "NSWindow", "NSWorkspace"] }
-objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSData", "NSUserDefaults", "NSDate", "NSDateFormatter", "NSFormatter", "NSLocale", "NSProcessInfo", "NSTimeZone", "NSString"] }
-
-# Native accessibility preferences. iced already uses mundy for Linux theme
-# detection; its stream keeps portal/WinRT reads off the UI thread.
-[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
-mundy = { version = "0.2.3", optional = true, default-features = false, features = ["async-io", "contrast", "reduced-motion", "reduced-transparency", "scrollbar-visibility"] }
-
-# ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
-# SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
-# Drive types and labels for the capture destination's volume list.
+# Inheritable pipes (a detached session's ready line, a worker's stdout
+# capture), the job objects that hold camera workers and what they start,
+# a worker's private protocol handle, publishing a capture without
+# replacing a file (MoveFileExW), and the memory left (GlobalMemoryStatusEx).
 [target.'cfg(windows)'.dependencies]
-accesskit_windows = { version = "0.29.2", optional = true }
-windows = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Power", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
-[target.'cfg(target_os = "linux")'.dependencies]
-accesskit_unix = { version = "0.17.2", optional = true }
-x11-dl = { version = "2.21", optional = true }
+# Ctrl-C, Ctrl-Break and a closed console where there are no Unix signals,
+# which go through libc.
+[target.'cfg(not(unix))'.dependencies]
+ctrlc = { version = "3.4", features = ["termination"] }
 
-# Host facts for doctor and efficiency mode (sysctl, statfs, access), and
-# anonymous shared memory for frame rings (memfd_create, shm_open) with
-# descriptor inheritance by camera workers.
+# Host facts for doctor and memory-scaled queues (sysctl, statfs, statvfs,
+# access), process groups and signals
+# for camera workers, and descriptor inheritance for a worker's stdout
+# capture.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# ARMv8 SHA-2 instructions for storage integrity hashing. x86 already selects
+# SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
 
 [build-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-cc = "1"
 # Digest of the embedded FFmpeg, which names its extracted copy.
 sha2 = "0.10"
-# Keep DuckDB's host dependencies stable across isolated feature checks.
-# Keep native engine build dependencies stable across feature checks.
-once_cell = "1"
-syn = { version = "3", features = ["extra-traits", "fold", "full", "visit", "visit-mut"] }
-
-[dev-dependencies]
-# Exercises the same semantic value/transition consumer as native adapters.
-accesskit_consumer = "0.31"
-# Verifies native focus task ordering and executes its real widget operation.
-iced_runtime = "0.14"
-# Validates the GUI's WGSL frame shader in unit tests; already in the tree via wgpu.
-naga = { version = "27", features = ["wgsl-in"] }
-# Blocks on wgpu device requests in the GPU preview test.
-futures = { version = "0.3", default-features = false, features = ["executor"] }
 
 [profile.release]
 lto = "thin"
@@ -162,8 +81,3 @@ debug = 0
 [[bench]]
 name = "runtime"
 harness = false
-
-# Keep iced's real editor while retaining selected text in inactive windows.
-# Exact 0.14.2 sources and the small opt-in diff are documented in the vendor.
-[patch.crates-io]
-iced_widget = { path = "vendor/iced_widget-0.14.2" }

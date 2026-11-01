@@ -49,9 +49,6 @@ h3{font-size:19px;line-height:1.35;letter-spacing:-.012em;margin:0 0 8px;font-we
 .node li{margin:2px 0}
 .ring{margin-top:12px;border:1.5px dashed var(--line);border-radius:14px;padding:16px 22px;font-size:15px;color:var(--muted);display:flex;gap:16px;align-items:center;flex-wrap:wrap}
 .ring strong{color:var(--text);font-weight:600}
-.slots{display:inline-flex;gap:5px;flex-shrink:0}
-.slots i{width:22px;height:16px;border-radius:4px;background:var(--line);display:block}
-.slots i:last-child{background:var(--accent)}
 .download-card{background:var(--panel);border-radius:16px;padding:26px}
 .platform-form{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
 .platform-form label{font-size:14px;font-weight:500;color:var(--muted)}

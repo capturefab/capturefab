@@ -230,13 +230,19 @@ fn link_metadata() -> HashMap<String, LinkMetadata> {
 fn bounded_output(program: &str, arguments: &[&str]) -> Option<String> {
     use std::io::Read;
     use std::process::{Command, Stdio};
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    // A session started without a console would otherwise open one for it.
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut output = String::new();
@@ -440,13 +446,8 @@ macro_rules! local_network_text {
 }
 /// What to try when macOS refuses a route to the local network. A denied
 /// Local Network privacy prompt reads as "no route to host", which has
-/// genuine causes too, hence "may". Free of the words `cli::error_code`
-/// reads as another category, so the error stays `unavailable`.
+/// genuine causes too, hence "may".
 pub const LOCAL_NETWORK_HINT: &str = local_network_text!();
-/// An unreachable reason for errors that carry only static text.
-#[cfg(any(feature = "hubs", test))]
-pub(crate) const NO_ROUTE_LOCAL_NETWORK: &str =
-    concat!("no route to host; ", local_network_text!());
 
 /// [`LOCAL_NETWORK_HINT`] when `error` may come from macOS Local Network
 /// privacy: EHOSTUNREACH on the way to a private, link-local, broadcast or
@@ -494,12 +495,12 @@ fn adapter_summary(interface: &NetworkInterface) -> String {
 }
 
 /// The advice a GigE connect error ends with when no adapter shares the
-/// camera's subnet. The desktop shows its Scan network button instead.
-pub(crate) const SCAN_ADVICE: &str = "run `capturefab network-scan`";
+/// camera's subnet.
+pub(crate) const SCAN_ADVICE: &str = "run `capturefab network`";
 
 /// What to do when the GigE Vision camera typed as `ip` did not answer within
 /// `waited`, or `refused` its control port, using this computer's adapters
-/// the way `network-scan` does.
+/// the way `capturefab network` does.
 pub(crate) fn explain_gige_unreachable(
     ip: Ipv4Addr,
     interfaces: &[NetworkInterface],
@@ -508,15 +509,13 @@ pub(crate) fn explain_gige_unreachable(
 ) -> String {
     let waited = wait_text(waited);
     if ip.is_loopback() {
-        // Nothing on this computer is a camera; a simulator may have been meant.
+        // Nothing on this computer is a camera; the simulator may have been meant.
         let what = if refused {
             format!("Nothing at {ip} accepts GigE Vision control traffic.")
         } else {
-            format!("No GigE Vision camera simulator answered at {ip} within {waited}.")
+            format!("No GigE Vision camera answered at {ip} within {waited}.")
         };
-        return format!(
-            "{what} Start one with `capturefab simulate run --preset gige --source PATH`, or connect sim:0 for the built-in test camera."
-        );
+        return format!("{what} Use sim:0 for the built-in test camera.");
     }
     let adapters: Vec<&NetworkInterface> = interfaces
         .iter()
@@ -564,8 +563,8 @@ pub(crate) fn explain_gige_unreachable(
             adapter_summary(adapter)
         );
     }
-    // The subnet leads: it is the likely cause, and the desktop's one-line
-    // slot shows only the start.
+    // The subnet leads: it is the likely cause, and a one-line summary shows
+    // only the start.
     format!(
         "No network adapter on this computer shares {ip}'s subnet ({listed}), and no GigE Vision camera answered there within {waited}. Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or {SCAN_ADVICE}."
     )
@@ -865,6 +864,37 @@ where
     }
 }
 
+/// What a camera streaming beside others on one host interface may send.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Share {
+    pub bytes_per_second: u64,
+    pub interface: String,
+    /// The cameras of the scan that share the interface, this one too.
+    pub sharers: usize,
+}
+
+/// The share of their host interface each camera of `scan` may send when
+/// they all stream at once, in the scan's order: None for a camera alone
+/// on its interface, or whose path is not known.
+pub fn shares(scan: &NetworkScan) -> Vec<Option<Share>> {
+    scan.cameras
+        .iter()
+        .map(|camera| {
+            let interface = camera.interface.as_ref().filter(|_| camera.reachable)?;
+            let sharers = scan
+                .cameras
+                .iter()
+                .filter(|other| other.reachable && other.interface.as_ref() == Some(interface))
+                .count();
+            (sharers >= 2).then(|| Share {
+                bytes_per_second: budget_bytes_per_second(camera, &scan.interfaces, sharers),
+                interface: interface.clone(),
+                sharers,
+            })
+        })
+        .collect()
+}
+
 /// Reserve 20% of the adapter's negotiated line rate for packet headers,
 /// control, resends and other traffic; share the remainder across active cameras
 /// on that adapter. Routed, wireless and unknown paths get conservative caps.
@@ -953,7 +983,7 @@ pub(crate) fn bytes_per_second_scale(unit: Option<&str>, default_multiplier: f64
     })
 }
 
-/// Plain name for an adapter type, shared by the CLI and the desktop dialog.
+/// Plain name for an adapter type.
 pub fn kind_label(kind: InterfaceKind) -> &'static str {
     match kind {
         InterfaceKind::Wired => "Wired Ethernet",
@@ -974,7 +1004,7 @@ fn health_label(health: NetworkHealth) -> &'static str {
     }
 }
 
-/// The readable `network-scan` summary for a terminal. Report warnings are
+/// The readable `capturefab network` summary for a terminal. Report warnings are
 /// diagnostics, so callers print `scan.warnings` to stderr themselves.
 pub fn write_human(scan: &NetworkScan, out: &mut impl std::io::Write) -> std::io::Result<()> {
     writeln!(out, "Adapters")?;
@@ -1131,7 +1161,7 @@ mod tests {
         );
         assert_eq!(
             elsewhere,
-            "No network adapter on this computer shares 192.168.77.5's subnet (en1 192.168.68.56/22, Wi-Fi), and no GigE Vision camera answered there within 2 s. Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or run `capturefab network-scan`."
+            "No network adapter on this computer shares 192.168.77.5's subnet (en1 192.168.68.56/22, Wi-Fi), and no GigE Vision camera answered there within 2 s. Give the wired adapter the camera is plugged into a compatible IPv4 address and subnet mask, then retry, or run `capturefab network`."
         );
         // A /22 covers the camera: the adapter is named with the next steps.
         let near = explain_gige_unreachable(
@@ -1178,7 +1208,7 @@ mod tests {
             routed.contains("it may not be a GigE Vision camera. No network adapter on this computer shares its subnet (en1 192.168.68.56/22, Wi-Fi), so the refusal may come from a router. For IP cameras, try onvif://192.168.77.5"),
             "{routed}"
         );
-        // Locally, only a simulator can answer.
+        // Locally, only a test camera can answer.
         for refused in [false, true] {
             let message = explain_gige_unreachable(
                 Ipv4Addr::LOCALHOST,
@@ -1187,7 +1217,7 @@ mod tests {
                 wait,
             );
             assert!(
-                message.ends_with("Start one with `capturefab simulate run --preset gige --source PATH`, or connect sim:0 for the built-in test camera."),
+                message.ends_with("Use sim:0 for the built-in test camera."),
                 "{message}"
             );
             assert!(!message.contains("onvif"), "{message}");
@@ -1230,10 +1260,7 @@ mod tests {
                 .context("receiving GVCP acknowledgement");
         let explained = explain_probe_failure(Ipv4Addr::LOCALHOST, wait, refused);
         assert_eq!(crate::cli::error_code(&explained), ("unavailable", 3));
-        assert!(
-            explained.to_string().contains("capturefab simulate"),
-            "{explained}"
-        );
+        assert!(explained.to_string().contains("sim:0"), "{explained}");
         let other = explain_probe_failure(
             Ipv4Addr::LOCALHOST,
             wait,
@@ -1277,7 +1304,10 @@ mod tests {
         );
         // The hint keeps an unreachable error unavailable.
         assert_eq!(
-            crate::cli::error_code(&anyhow::anyhow!("x: {NO_ROUTE_LOCAL_NETWORK}")),
+            crate::cli::error_code(
+                &anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::HostUnreachable))
+                    .context(format!("x; {LOCAL_NETWORK_HINT}"))
+            ),
             ("unavailable", 3)
         );
         #[cfg(target_os = "macos")]
@@ -1605,6 +1635,32 @@ mod tests {
             budget_bytes_per_second(&checked(&interface, "10.0.0.2"), &[interface], 1),
             10_000_000
         );
+    }
+
+    #[test]
+    fn cameras_on_one_interface_share_it_and_a_lone_one_keeps_it() {
+        let wired = nic(InterfaceKind::Wired, Some(1000));
+        let mut other = nic(InterfaceKind::Wired, Some(1000));
+        other.name = "en9".into();
+        let mut lost = checked(&wired, "192.168.5.5");
+        lost.reachable = false;
+        let scan = NetworkScan {
+            interfaces: vec![wired.clone(), other.clone()],
+            cameras: vec![
+                checked(&wired, "192.168.5.2"),
+                checked(&other, "192.168.5.3"),
+                checked(&wired, "192.168.5.4"),
+                lost,
+            ],
+            warnings: Vec::new(),
+            scanned_at_ms: 0,
+        };
+        let shared = Some(Share {
+            bytes_per_second: 50_000_000,
+            interface: wired.name.clone(),
+            sharers: 2,
+        });
+        assert_eq!(shares(&scan), [shared.clone(), None, shared, None]);
     }
 
     #[test]

@@ -117,7 +117,7 @@ The session path is the runtime directory.
 `limits` reports Linux `rmem_max` and `usbfs_memory_mb`, or null elsewhere.
 `graphics` reports graphics information.
 `checks` contains `{id,level:"ok"|"warn",message,fix}` entries.
-Check ids include `efficiency`, `graphics`, `runtime_dir`, `session_storage`, `private_dirs`, `camera_network`, `ffmpeg`, `receive_buffer`, `usb_access` and `storage_budget`; checks that do not apply are omitted.
+Check ids include `runtime_dir`, `sessions`, `session_storage`, `private_dirs`, `read_only_root`, `resources`, `camera_network`, `ffmpeg`, `leftover_state`, `receive_buffer`, `usb_access` and `free_space`; checks that do not apply are omitted.
 `camera_network` lists wired Ethernet adapters for GigE Vision and is never a warning.
 `ffmpeg` warns when FFmpeg, which webcams, streams, files and recording need, does not run.
 Plain `doctor` prints those checks with suggested fixes.
@@ -230,8 +230,11 @@ On Linux, state uses `$XDG_STATE_HOME/capturefab` or `~/.local/state/capturefab`
 Without `XDG_RUNTIME_DIR`, runtime can use `/run/user/<uid>/capturefab` when the user lingers and owns `/run/user/<uid>`.
 This lets a service and SSH shell find the same sessions.
 macOS and Windows use one directory for runtime and state.
-`CAPTUREFAB_SESSION_DIR` overrides both.
+`CAPTUREFAB_SESSION_DIR` overrides both; `CAPTUREFAB_STATE_DIR` overrides state alone.
 `CAPTUREFAB_CACHE_DIR` overrides the cache.
+Where the default cannot be written, as on a read-only home or root file system, runtime falls back to `/run/capturefab-0` for root and then `$TMPDIR/capturefab-<uid>`, and the cache to the runtime directory; without a runtime directory, camera commands open their camera alone, and without a state directory presets and saved sign-ins fail with `permission_denied` naming `CAPTUREFAB_STATE_DIR`.
+`doctor --json` reports each directory's fallbacks under `folders`, and CPU and memory limits under `host`.
+A client of a service that sets `CAPTUREFAB_STATE_DIR` sets the same value to share its saved sign-ins and the jobs of ended sessions; `preset apply` sends the preset the client read.
 
 `CAPTUREFAB_MAX_CAMERAS` accepts integers from 1 to 64.
 `CAPTUREFAB_FRAME_BYTES` accepts 4096–268435456 bytes in multiples of 64.

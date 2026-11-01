@@ -3,83 +3,358 @@ use crate::{
     types::{Backend, CameraInfo, Frame, Transport, TransportStats},
 };
 use anyhow::{Context, Result, ensure};
-use std::{net::Ipv4Addr, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    time::{Duration, Instant},
+};
 
-pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, Vec<String>)> {
-    discover_with(timeout, simulated, false)
+/// The transports a discovery searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kinds {
+    pub gige: bool,
+    pub u3v: bool,
+    /// Webcams and screen captures on this computer.
+    pub host: bool,
+    pub onvif: bool,
+    pub sim: bool,
+}
+impl Kinds {
+    pub fn all() -> Self {
+        Self {
+            gige: true,
+            u3v: true,
+            host: true,
+            onvif: true,
+            sim: true,
+        }
+    }
 }
 
-/// Discover cameras, adding cameras on saved hubs when `hubs` is set. Only
-/// the session coordinator lists hubs; camera workers never contact them.
-pub fn discover_with(
+/// How long past its timeout a transport's search may run before it is
+/// left behind.
+const DISCOVERY_GRACE: Duration = Duration::from_secs(2);
+
+/// Search the chosen transports in parallel; it returns when each has
+/// answered, which for the GigE and ONVIF broadcasts is when `timeout` ends.
+/// A transport that fails becomes a warning, and one still searching past
+/// its deadline is left behind on its own thread, so a hung transport never
+/// holds up the caller: what the others found is returned, with a warning.
+/// What it found is kept a minute for `lookup`. Without a network, GigE and
+/// ONVIF are not waited for.
+pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<String>) {
+    search(timeout, kinds, None)
+}
+
+/// Which cameras a search is for: it ends as soon as one answers.
+type Want = std::sync::Arc<dyn Fn(&CameraInfo) -> bool + Send + Sync>;
+
+/// Whether this computer has a network a GigE or ONVIF camera can answer
+/// on: an IPv4 address other than loopback.
+fn networked() -> bool {
+    if_addrs::get_if_addrs().is_ok_and(|interfaces| {
+        interfaces.iter().any(|interface| {
+            matches!(&interface.addr, if_addrs::IfAddr::V4(v4)
+                if !v4.ip.is_loopback() && !v4.ip.is_unspecified())
+        })
+    })
+}
+
+/// `discover_kinds`, ending as soon as a camera `want` names answers.
+fn search(
     timeout: Duration,
-    simulated: bool,
-    hubs: bool,
-) -> Result<(Vec<CameraInfo>, Vec<String>)> {
-    let mut devices = Vec::new();
-    let mut warnings = Vec::new();
-    let (gige, onvif, native, scanners, hub_cameras) = std::thread::scope(|s| {
-        let g = s.spawn(|| crate::transport::gige::discover(timeout));
-        let o = s.spawn(|| crate::onvif::camera_infos(timeout));
-        let n = s.spawn(|| crate::media::native_devices_with_timeout(timeout));
-        let d = s.spawn(|| crate::scanner::discover(timeout));
-        let h = hubs.then(|| s.spawn(|| crate::hubs::discovered(timeout)));
-        (
-            g.join(),
-            o.join(),
-            n.join(),
-            d.join(),
-            h.map(|h| h.join().unwrap_or_default()),
-        )
-    });
-    for (label, result) in [("GigE", gige), ("ONVIF", onvif), ("Scanner", scanners)] {
-        match result {
-            Ok(Ok(v)) => devices.extend(v),
-            Ok(Err(e)) => warnings.push(format!("{label} discovery: {e:#}")),
-            Err(_) => warnings.push(format!("{label} discovery worker stopped")),
-        }
+    mut kinds: Kinds,
+    want: Option<Want>,
+) -> (Vec<CameraInfo>, Vec<String>) {
+    enum Found {
+        One(CameraInfo),
+        Cameras(Vec<CameraInfo>),
+        Native(serde_json::Value),
+    }
+    type Message = (&'static str, Result<Found>);
+    type Search = Box<dyn FnOnce(&std::sync::mpsc::Sender<Message>) -> Result<Found> + Send>;
+    // Whether it looks everywhere a camera can be.
+    let everywhere = kinds.gige && kinds.u3v && kinds.host && kinds.onvif;
+    // Without a network no broadcast can be answered: nothing to wait for.
+    if (kinds.gige || kinds.onvif) && !networked() {
+        kinds.gige = false;
+        kinds.onvif = false;
+    }
+    let (sender, found) = std::sync::mpsc::channel::<Message>();
+    // Each camera a broadcast finds is told as it answers, and ends that
+    // search when it is the one wanted.
+    let stream =
+        |label: &'static str, sender: &std::sync::mpsc::Sender<Message>, want: &Option<Want>| {
+            let sender = sender.clone();
+            let want = want.clone();
+            move |info: &CameraInfo| {
+                let _ = sender.send((label, Ok(Found::One(info.clone()))));
+                want.as_ref().is_some_and(|want| want(info))
+            }
+        };
+    let mut asked = Vec::new();
+    let mut searches: Vec<(&'static str, Search)> = Vec::new();
+    if kinds.gige {
+        let want = want.clone();
+        searches.push((
+            "GigE",
+            Box::new(move |sender| {
+                crate::transport::gige::discover_until(timeout, &mut stream("GigE", sender, &want))
+                    .map(Found::Cameras)
+            }),
+        ));
+    }
+    if kinds.onvif {
+        let want = want.clone();
+        searches.push((
+            "ONVIF",
+            Box::new(move |sender| {
+                crate::onvif::camera_infos_until(timeout, &mut stream("ONVIF", sender, &want))
+                    .map(Found::Cameras)
+            }),
+        ));
+    }
+    if kinds.host {
+        searches.push((
+            "Native camera",
+            Box::new(move |_| {
+                crate::media::native_devices_with_timeout(timeout).map(Found::Native)
+            }),
+        ));
     }
     #[cfg(feature = "usb")]
-    match crate::transport::usb::discover() {
-        Ok(v) => devices.extend(v),
-        Err(e) => warnings.push(format!("USB discovery: {e:#}")),
+    if kinds.u3v {
+        searches.push((
+            "USB",
+            Box::new(|_| crate::transport::usb::discover().map(Found::Cameras)),
+        ));
     }
-    if simulated {
-        devices.push(crate::transport::simulator::info());
-    }
-    match native {
-        Ok(Ok(native)) => {
-            if let Some(items) = native["devices"].as_array() {
-                for d in items {
-                    if let Some(id) = d["id"].as_str() {
-                        devices.push(CameraInfo {
-                            id: id.into(),
-                            transport: Transport::Media,
-                            vendor: std::env::consts::OS.into(),
-                            model: d["name"].as_str().unwrap_or("Host camera").into(),
-                            serial: id.into(),
-                            address: Some(id.into()),
-                            profile: Default::default(),
-                        });
-                    }
-                }
-            }
+    for (label, search) in searches {
+        let sender = sender.clone();
+        let spawned = std::thread::Builder::new()
+            .name("capturefab-discovery".into())
+            .spawn(move || {
+                let result = search(&sender);
+                let _ = sender.send((label, result));
+            });
+        if spawned.is_ok() {
+            asked.push(label);
         }
-        Ok(Err(error)) => warnings.push(format!("Native camera discovery: {error:#}")),
-        Err(_) => warnings.push("Native camera discovery worker stopped".into()),
+    }
+    drop(sender);
+    let deadline = std::time::Instant::now() + timeout + DISCOVERY_GRACE;
+    let mut heard = Heard::default();
+    let mut warnings = Vec::new();
+    let mut answered = Vec::new();
+    let wanted = |heard: &Heard| want.as_ref().is_some_and(|want| heard.any(want.as_ref()));
+    while answered.len() < asked.len() && !wanted(&heard) {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let Ok((label, result)) = found.recv_timeout(left) else {
+            break;
+        };
+        match result {
+            Ok(Found::One(info)) => {
+                heard.told(label, info);
+                continue;
+            }
+            Ok(Found::Cameras(found)) => heard.listed(label, found),
+            Ok(Found::Native(native)) => heard.listed(label, native_cameras(&native)),
+            Err(error) => warnings.push(format!("{label} discovery: {error:#}")),
+        }
+        answered.push(label);
+    }
+    let complete = !wanted(&heard);
+    let mut devices = heard.cameras();
+    if complete {
+        for label in asked.iter().filter(|label| !answered.contains(label)) {
+            warnings.push(format!(
+                "{label} discovery did not answer within {}; listed without it",
+                crate::scheduling::format_duration(
+                    u64::try_from((timeout + DISCOVERY_GRACE).as_millis()).unwrap_or(u64::MAX)
+                )
+            ));
+        }
+    }
+    if kinds.sim {
+        devices.push(crate::transport::simulator::info());
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
     devices.dedup_by(|a, b| a.id == b.id);
-    // Hub cameras come after local ones, so they never push USB or GigE
-    // cameras off the welcome screen.
-    if let Some((hub_devices, hub_warnings)) = hub_cameras {
-        devices.extend(hub_devices);
-        warnings.extend(hub_warnings);
-    }
     for info in &mut devices {
         info.profile = crate::camera_profile::detect(info, &[]);
     }
-    Ok((devices, warnings))
+    // A search to the end says which cameras of the transports that
+    // answered are gone; one that ended early only adds what it found.
+    let searched = |info: &CameraInfo| {
+        let label = match info.transport {
+            Transport::GigE => "GigE",
+            Transport::Usb3 => "USB",
+            Transport::Simulator => return false,
+            Transport::Media if crate::onvif::is_source(&info.id) => "ONVIF",
+            Transport::Media => "Native camera",
+        };
+        answered.contains(&label)
+    };
+    crate::discovery::store(
+        &devices,
+        complete.then_some(&searched as &dyn Fn(&CameraInfo) -> bool),
+        everywhere && complete && answered.len() == asked.len(),
+    );
+    (devices, warnings)
+}
+
+/// The cameras a search heard of so far: each answer a broadcast told of
+/// as it came, until the broadcast's own list replaces them, in which a
+/// device that answered from two addresses is one camera.
+#[derive(Default)]
+struct Heard {
+    listed: Vec<CameraInfo>,
+    told: Vec<(&'static str, CameraInfo)>,
+}
+impl Heard {
+    fn told(&mut self, from: &'static str, info: CameraInfo) {
+        self.told.push((from, info));
+    }
+    fn listed(&mut self, from: &'static str, cameras: Vec<CameraInfo>) {
+        self.told.retain(|(told, _)| *told != from);
+        self.listed.extend(cameras);
+    }
+    fn any(&self, want: &(dyn Fn(&CameraInfo) -> bool + Send + Sync)) -> bool {
+        self.listed
+            .iter()
+            .chain(self.told.iter().map(|(_, info)| info))
+            .any(want)
+    }
+    fn cameras(self) -> Vec<CameraInfo> {
+        let mut cameras = self.listed;
+        cameras.extend(self.told.into_iter().map(|(_, info)| info));
+        cameras
+    }
+}
+
+/// The host cameras FFmpeg listed.
+fn native_cameras(native: &serde_json::Value) -> Vec<CameraInfo> {
+    native["devices"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|d| {
+            let id = d["id"].as_str()?;
+            Some(CameraInfo {
+                id: id.into(),
+                transport: Transport::Media,
+                vendor: std::env::consts::OS.into(),
+                model: d["name"].as_str().unwrap_or("Host camera").into(),
+                serial: id.into(),
+                address: Some(id.into()),
+                profile: Default::default(),
+            })
+        })
+        .collect()
+}
+
+/// The cameras to resolve `selector` among, a serial, name, model or
+/// discovered ID: those discovery found within the last minute when one of
+/// them is still the camera it names, else those a search finds, which ends
+/// as soon as the camera that has this ID, serial or address answers. A
+/// name or model names one camera only among every camera there is, so it
+/// is looked up there only after a search of every transport to its end.
+pub fn lookup(selector: &str, timeout: Duration) -> (Vec<CameraInfo>, Vec<String>) {
+    let (cached, everywhere) = crate::discovery::fresh();
+    if let Some(info) = cached_match(selector, &cached, everywhere)
+        && still_there(&info)
+    {
+        return (cached, Vec::new());
+    }
+    let wanted = selector.to_owned();
+    let want: Want = std::sync::Arc::new(move |info: &CameraInfo| names_exactly(&wanted, info));
+    search(timeout, kinds_for(selector), Some(want))
+}
+
+/// The camera `selector` names among those a discovery found lately: by
+/// its ID, serial or address, or by a name or model only when they are
+/// `everywhere` a search found, since a search that ended early may have
+/// missed another camera of that model.
+fn cached_match(selector: &str, cached: &[CameraInfo], everywhere: bool) -> Option<CameraInfo> {
+    match resolve_selector(selector, cached) {
+        Resolution::Exact(info) => Some(info),
+        Resolution::Loose { info, .. } if everywhere => Some(info),
+        _ => None,
+    }
+}
+
+/// The transports a camera named `selector` may be on.
+fn kinds_for(selector: &str) -> Kinds {
+    let only = |gige, u3v| Kinds {
+        gige,
+        u3v,
+        host: false,
+        onvif: false,
+        sim: false,
+    };
+    if prefixed(selector, "gige:") || mac_id(selector).is_some() {
+        only(true, false)
+    } else if prefixed(selector, "usb:") || prefixed(selector, "u3v:") {
+        only(false, true)
+    } else {
+        Kinds {
+            sim: false,
+            ..Kinds::all()
+        }
+    }
+}
+
+/// Whether the camera a recent discovery found as `info` is still that
+/// camera, where that is quick to tell: a GigE camera answers at its
+/// address with the same MAC and serial; a Linux video node still has its
+/// name; a webcam named by its name is that webcam. USB enumeration is
+/// quick, and other cameras are looked for again.
+pub(crate) fn still_there(info: &CameraInfo) -> bool {
+    match info.transport {
+        Transport::GigE => info
+            .address
+            .as_deref()
+            .and_then(|address| address.parse::<Ipv4Addr>().ok())
+            .and_then(|ip| crate::transport::gige::probe(ip, STILL_THERE).ok())
+            .is_some_and(|probed| probed.id == info.id && probed.serial == info.serial),
+        Transport::Media if crate::onvif::is_source(&info.id) => false,
+        Transport::Media => crate::media::host_camera_unchanged(info),
+        Transport::Usb3 | Transport::Simulator => false,
+    }
+}
+/// How long a GigE camera a recent discovery found has to answer at its
+/// address before it is looked for again.
+const STILL_THERE: Duration = Duration::from_millis(250);
+
+/// What a camera is, in the words `list` and `info` use: `gige`, `u3v`,
+/// `webcam`, `screen` (a screen or Desk View capture), `onvif`, `stream`,
+/// `file` or `sim`.
+pub fn kind(info: &CameraInfo) -> &'static str {
+    let source = media_source(info);
+    match info.transport {
+        Transport::GigE => "gige",
+        Transport::Usb3 => "u3v",
+        Transport::Simulator => "sim",
+        Transport::Media if crate::onvif::is_source(source) => "onvif",
+        Transport::Media if crate::media::is_host_camera(source) => {
+            let name = info.model.to_ascii_lowercase();
+            if name.starts_with("capture screen") || name.contains("desk view") {
+                "screen"
+            } else {
+                "webcam"
+            }
+        }
+        Transport::Media if source.contains("://") => "stream",
+        Transport::Media => "file",
+    }
+}
+
+/// What an FFmpeg source reads: a listed device's ID, or for an opened
+/// source (ID `media:HASH`) the redacted selector it was opened with.
+pub fn media_source(info: &CameraInfo) -> &str {
+    match &info.address {
+        Some(address) if info.id.starts_with("media:") => address,
+        _ => &info.id,
+    }
 }
 
 /// Commands that change the acquisition or transfer state, which only start
@@ -119,6 +394,53 @@ pub struct Camera {
     /// each TriggerSelector value to fire under, or `None` for a camera
     /// without a selector.
     software_triggers: Option<Vec<Option<String>>>,
+    /// What says which frames may have been exposed before the last
+    /// settings change.
+    epoch: Epoch,
+}
+/// Frames to come from before the last settings change. A change written
+/// while the camera streams reaches the frame whose exposure starts after
+/// it: on a free-running stream the frames already sent and waiting in the
+/// host's buffers, the frame being read out and the one being exposed
+/// still carry the old settings, as do the frames of software triggers
+/// fired before the change, and a hardware-triggered frame exposed before
+/// it. Where the camera's clock can be latched, a frame it stamped before
+/// the change, or the first one after, which may have been exposed in part
+/// before, predates it too, wherever it waited. A frame of an acquisition
+/// started after the change is always new.
+#[derive(Debug, Default)]
+struct Epoch {
+    /// Frames still to come that may predate the change.
+    stale: u32,
+    /// When no frame from before the change can come any more, so `stale`
+    /// counts no longer: after a stream is switched to software triggers,
+    /// no frame may come to count its frames in flight down.
+    counted_until: Option<Instant>,
+    /// Until when a hardware-triggered camera's frames may predate it.
+    stale_until: Option<Instant>,
+    /// The camera's clock at the change, where it can be latched.
+    since_ns: Option<u64>,
+    /// Software triggers fired whose frames have not come yet.
+    pending: u32,
+    /// Whether the frame `next_frame` returned last may predate it.
+    last_stale: bool,
+}
+/// Frames a free-running stream may deliver after a change, besides those
+/// already in the host's buffers, that were exposed at least in part
+/// before it: the one being read out and the one being exposed.
+const STALE_FRAMES: u32 = 2;
+/// What a settings change means for the frames to come; see
+/// `Camera::settings_changed`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Change {
+    /// For a camera that waits for a hardware trigger for each frame: how
+    /// long after the change a frame exposed before it may still come.
+    pub(crate) hardware_hold: Option<Duration>,
+    /// Whether it sent frames only when software triggered before the
+    /// change.
+    pub(crate) was_software: bool,
+    /// How long a frame being exposed at the change may take to come.
+    pub(crate) in_flight: Duration,
 }
 /// Reject malformed known source forms without checking availability or build capabilities.
 /// Bare camera IDs and serials are resolved against discovery results on open.
@@ -136,21 +458,41 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
             discovered_id || address.parse::<Ipv4Addr>().is_ok(),
             "GigE selector needs an IPv4 address or a discovered ID, for example gige:192.168.1.10"
         );
-    } else if crate::scanner::is_source(selector) {
-        crate::scanner::validate_selector_shape(selector)?;
+    } else if prefixed(selector, "hub:") {
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::Usage,
+            format!(
+                "'{}' names a camera hub, which Capturefab no longer opens",
+                crate::media::redact_url(selector)
+            ),
+        )
+        .hint("use the camera's RTSP stream from the hub, for example -c rtsp://HOST:8554/CAMERA from Frigate or go2rtc")
+        .into());
+    } else if prefixed(selector, "scanner:") {
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::Usage,
+            "document scanners are not supported",
+        )
+        .hint("capture from a camera instead")
+        .into());
     } else if crate::onvif::is_source(selector) {
         crate::onvif::validate_source_shape(selector)?;
-    } else if crate::hubs::is_source(selector) {
-        crate::hubs::validate_shape(selector)?;
     } else if crate::media::is_url_source(selector) || selector.contains("://") {
         crate::media::validate_source_shape(selector)?;
     } else if malformed_ipv4(selector) {
-        return Err(crate::dataset::Usage(format!(
+        return Err(crate::types::Usage(format!(
             "'{selector}' is not a valid IPv4 address; use A.B.C.D or gige:A.B.C.D"
         ))
         .into());
     }
     Ok(())
+}
+
+/// `selector` starts with `prefix`, ignoring ASCII case.
+fn prefixed(selector: &str, prefix: &str) -> bool {
+    selector
+        .get(..prefix.len())
+        .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
 }
 
 /// How a bare selector (no `sim:`, `gige:`, URL or other explicit form)
@@ -177,23 +519,36 @@ pub fn is_explicit_selector(selector: &str) -> bool {
         || selector.starts_with("gige:")
         || selector.parse::<Ipv4Addr>().is_ok()
         || selector.contains("://")
-        || crate::scanner::is_source(selector)
         || crate::onvif::is_source(selector)
-        || crate::hubs::is_source(selector)
         || crate::media::is_source(selector)
 }
 
-/// Resolve a bare selector against discovered cameras. Exact ID, serial or
-/// address wins; otherwise a unique case-insensitive model or name match,
-/// then a unique run of whole model words. Hub cameras keep their exact selectors only, so
-/// a loose name can never reach a hub's permission checks under another
-/// identity.
+/// The discovery ID of the GigE camera a MAC address written with colons
+/// or dashes (`00:c0:df:12:34:56`) names.
+fn mac_id(selector: &str) -> Option<String> {
+    let groups = selector.split([':', '-']).collect::<Vec<_>>();
+    (groups.len() == 6
+        && groups
+            .iter()
+            .all(|group| group.len() == 2 && group.bytes().all(|b| b.is_ascii_hexdigit())))
+    .then(|| format!("gige:{}", groups.concat().to_ascii_lowercase()))
+}
+
+/// Whether `selector` is the ID, serial, address or MAC address of `info`.
+fn names_exactly(selector: &str, info: &CameraInfo) -> bool {
+    info.id == selector
+        || info.serial == selector
+        || info.address.as_deref() == Some(selector)
+        || mac_id(selector).is_some_and(|id| id == info.id)
+}
+
+/// Resolve a bare selector against discovered cameras. Exact ID, serial,
+/// address or MAC address wins; otherwise a unique case-insensitive model
+/// or name match, then a unique run of whole model words.
 pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
     let exact: Vec<_> = known
         .iter()
-        .filter(|d| {
-            d.id == selector || d.serial == selector || d.address.as_deref() == Some(selector)
-        })
+        .filter(|d| names_exactly(selector, d))
         .cloned()
         .collect();
     match exact.len() {
@@ -205,10 +560,6 @@ pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
         return Resolution::NotFound;
     }
     let wanted = selector.to_lowercase();
-    let local: Vec<_> = known
-        .iter()
-        .filter(|d| !crate::hubs::is_source(&d.id))
-        .collect();
     let suffix = |d: &CameraInfo| {
         d.id.split_once(':')
             .map_or(d.id.as_str(), |(_, rest)| rest)
@@ -224,16 +575,16 @@ pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
             matches.iter().map(|(info, _)| (*info).clone()).collect(),
         )),
     };
-    let equal = local
+    let equal = known
         .iter()
         .filter_map(|d| {
             if d.model.to_lowercase() == wanted {
-                Some((*d, "model"))
+                Some((d, "model"))
             } else if suffix(d) == wanted
                 || d.id.to_lowercase() == wanted
                 || d.serial.to_lowercase() == wanted
             {
-                Some((*d, "name"))
+                Some((d, "name"))
             } else {
                 None
             }
@@ -244,21 +595,19 @@ pub fn resolve_selector(selector: &str, known: &[CameraInfo]) -> Resolution {
     }
     // Then whole words of a model (`C920` in `HD Pro Webcam C920`), never
     // part of a word, an ID or a serial: a partial or stale serial must not
-    // open another camera. A scanner needs its model in full, because a
-    // feeder consumes paper.
+    // open another camera.
     let words = wanted.split_whitespace().collect::<Vec<_>>();
     if wanted.chars().count() < 3 || words.is_empty() {
         return Resolution::NotFound;
     }
-    let partial = local
+    let partial = known
         .iter()
-        .filter(|d| !crate::scanner::is_source(&d.id))
         .filter(|d| {
             let model = d.model.to_lowercase();
             let model = model.split_whitespace().collect::<Vec<_>>();
             model.windows(words.len()).any(|window| window == words)
         })
-        .map(|d| (*d, "model"))
+        .map(|d| (d, "model"))
         .collect();
     pick(partial).unwrap_or(Resolution::NotFound)
 }
@@ -298,8 +647,8 @@ fn simulator_typo(selector: &str) -> Option<String> {
         .then(|| format!("sim:{digits}"))
 }
 
-/// `Pattern camera`, the simulator's model, which discovery lists only
-/// with `--simulate`.
+/// `Pattern camera`, the simulator's model, which `list` shows only with
+/// `--kind sim`.
 fn simulator_model(selector: &str) -> Option<String> {
     selector
         .trim()
@@ -313,6 +662,15 @@ pub fn needs_no_discovery(selector: &str) -> bool {
     path_like(selector) || malformed_ipv4(selector)
 }
 
+/// A camera as `camera_not_found` and `camera_ambiguous` list it.
+fn candidate(info: &CameraInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": crate::media::redact_url(&info.id),
+        "model": info.model,
+        "serial": (!info.serial.is_empty() && info.serial != info.id).then(|| info.serial.clone()),
+    })
+}
+
 /// Why `selector` did not open, with the closest cameras that did answer.
 fn selector_not_matched(
     selector: &str,
@@ -321,7 +679,7 @@ fn selector_not_matched(
 ) -> anyhow::Error {
     use crate::types::{Categorized, ErrorKind};
     let shown = crate::media::redact_url(selector);
-    let unavailable = |message: String| Categorized::error(ErrorKind::Unavailable, message);
+    let list = |cameras: &[&CameraInfo]| serde_json::json!({ "candidates": cameras.iter().take(5).map(|d| candidate(d)).collect::<Vec<_>>() });
     if matches.len() > 1 {
         let listed = matches
             .iter()
@@ -330,18 +688,35 @@ fn selector_not_matched(
             .collect::<Vec<_>>()
             .join(", ");
         let more = if matches.len() > 5 { ", ..." } else { "" };
-        return unavailable(format!(
-            "camera '{shown}' is ambiguous: it matches {} cameras: {listed}{more}; pass a camera ID or serial",
-            matches.len()
-        ));
+        return Categorized::new(
+            ErrorKind::CameraAmbiguous,
+            format!(
+                "camera '{shown}' is ambiguous: it matches {} cameras: {listed}{more}; pass a camera ID or serial",
+                matches.len()
+            ),
+        )
+        .details(list(&matches.iter().collect::<Vec<_>>()))
+        .into();
     }
+    let not_found = |message: String, cameras: &[&CameraInfo], hint: &str| -> anyhow::Error {
+        Categorized::new(ErrorKind::CameraNotFound, message)
+            .hint(hint)
+            .details(list(cameras))
+            .into()
+    };
     if let Some(simulator) = simulator_typo(selector).or_else(|| simulator_model(selector)) {
-        return unavailable(format!(
-            "camera '{shown}' not found; did you mean {simulator}?"
-        ));
+        return not_found(
+            format!("camera '{shown}' not found; did you mean {simulator}?"),
+            &[],
+            &format!("use -c {simulator}"),
+        );
     }
     if path_like(selector) {
-        return unavailable(format!("file not found: {shown}"));
+        return not_found(
+            format!("file not found: {shown}"),
+            &[],
+            "check the path; relative paths are from this terminal's folder",
+        );
     }
     let mut candidates: Vec<(usize, &CameraInfo)> = known
         .iter()
@@ -357,15 +732,19 @@ fn selector_not_matched(
         .collect();
     candidates.sort_by_key(|(distance, _)| *distance);
     if let Some((_, best)) = candidates.first() {
-        return unavailable(format!(
-            "camera '{shown}' not found; did you mean {}? Run capturefab discover to list cameras",
-            crate::hint::shell_quote(&crate::media::redact_url(&best.id))
-        ));
+        let best_id = crate::hint::shell_quote(&crate::media::redact_url(&best.id));
+        return not_found(
+            format!("camera '{shown}' not found; did you mean {best_id}?"),
+            &candidates.iter().map(|(_, d)| *d).collect::<Vec<_>>(),
+            &format!("use -c {best_id}, or run capturefab list"),
+        );
     }
     if known.is_empty() {
-        return unavailable(format!(
-            "camera '{shown}' not found; run capturefab discover to list cameras"
-        ));
+        return not_found(
+            format!("camera '{shown}' not found"),
+            &[],
+            "run capturefab list to see cameras",
+        );
     }
     let found = known
         .iter()
@@ -374,9 +753,11 @@ fn selector_not_matched(
         .collect::<Vec<_>>()
         .join(", ");
     let more = if known.len() > 5 { ", ..." } else { "" };
-    unavailable(format!(
-        "camera '{shown}' not found. Found: {found}{more}; run capturefab discover to list cameras"
-    ))
+    not_found(
+        format!("camera '{shown}' not found. Found: {found}{more}"),
+        &known.iter().collect::<Vec<_>>(),
+        "pass one of details.candidates with -c",
+    )
 }
 
 /// Check both selector syntax and local source availability before opening.
@@ -384,12 +765,8 @@ pub fn validate_selector(selector: &str) -> Result<()> {
     validate_selector_shape(selector)?;
     if let Some(source) = crate::transport::simulator::replay_source(selector) {
         crate::transport::simulator::replay::source_files(source)?;
-    } else if crate::scanner::is_source(selector) {
-        crate::scanner::info(selector)?;
     } else if crate::onvif::is_source(selector) {
         crate::onvif::validate_source(selector)?;
-    } else if crate::hubs::is_source(selector) {
-        crate::hubs::validate(selector)?;
     } else if (crate::media::is_source(selector) || selector.contains("://"))
         && !crate::onvif::is_source(selector)
     {
@@ -415,19 +792,15 @@ impl Camera {
             let (info, backend) = crate::onvif::connect_with(selector, login, timeout)?;
             return Self::from_backend(info, backend);
         }
-        if crate::hubs::is_source(selector) {
-            let (info, backend) = crate::hubs::connect(selector, timeout)?;
-            return Self::from_backend(info, backend);
-        }
-        let info = if selector.starts_with("sim:") {
+        let info = Self::identify(selector, known, timeout)?;
+        Self::open_identified(selector, info, timeout, login)
+    }
+    /// What `selector` names, read without opening the camera: a GigE camera
+    /// answers its identity to anyone. Not for ONVIF sources, which open as
+    /// they are identified.
+    pub fn identify(selector: &str, known: &[CameraInfo], timeout: Duration) -> Result<CameraInfo> {
+        Ok(if selector.starts_with("sim:") {
             crate::transport::simulator::info_named(selector)
-        } else if crate::scanner::is_source(selector) {
-            known
-                .iter()
-                .find(|d| d.id == selector && d.transport == Transport::Scanner)
-                .cloned()
-                .map(Ok)
-                .unwrap_or_else(|| crate::scanner::info(selector))?
         } else if crate::media::is_source(selector) {
             crate::media::info(selector)?
         } else if let Ok(ip) = selector
@@ -444,20 +817,20 @@ impl Camera {
                 }
                 Resolution::NotFound => return Err(selector_not_matched(selector, known, &[])),
             }
-        };
+        })
+    }
+    /// Open the camera `identify` found for `selector`.
+    pub fn open_identified(
+        selector: &str,
+        info: CameraInfo,
+        timeout: Duration,
+        login: Option<&crate::logins::CameraLogin>,
+    ) -> Result<Self> {
         let backend: Box<dyn Backend> = match info.transport {
             Transport::Simulator => crate::transport::simulator::open(&info.id, timeout)?,
-            Transport::Scanner => crate::scanner::open(&info)?,
             Transport::Media => {
                 if crate::onvif::is_source(&info.id) {
                     let (info, backend) = crate::onvif::connect_with(&info.id, login, timeout)?;
-                    return Self::from_backend(info, backend);
-                }
-                // A hub camera opened by its serial keeps the options its
-                // discovered address carries.
-                if crate::hubs::is_source(&info.id) {
-                    let address = info.address.as_deref().unwrap_or(&info.id);
-                    let (info, backend) = crate::hubs::connect(address, timeout)?;
                     return Self::from_backend(info, backend);
                 }
                 if crate::media::is_source(selector) {
@@ -481,8 +854,22 @@ impl Camera {
         Self::from_backend(info, backend)
     }
     pub fn from_backend(mut info: CameraInfo, mut backend: Box<dyn Backend>) -> Result<Self> {
-        let xml = backend.xml().context("load camera GenICam XML")?;
-        let nodes = NodeMap::parse(&xml).context("parse camera GenICam XML")?;
+        let mut xml = backend.xml().context("load camera GenICam XML")?;
+        let nodes = match NodeMap::parse(&xml) {
+            // A copy from the disk cache that does not parse, or links to a
+            // node it does not have, is read again from the device.
+            parsed
+                if !parsed
+                    .as_ref()
+                    .is_ok_and(|nodes| nodes.unresolved().is_none())
+                    && backend.forget_xml() =>
+            {
+                xml = backend.xml().context("load camera GenICam XML")?;
+                NodeMap::parse(&xml)
+            }
+            parsed => parsed,
+        }
+        .context("parse camera GenICam XML")?;
         let mut profile_metadata = nodes.profile_features(backend.as_mut());
         info.profile = crate::camera_profile::detect(&info, &profile_metadata);
         // Feature evidence must be implemented and available now. Only the
@@ -544,6 +931,7 @@ impl Camera {
             tl_locked: false,
             transferring: false,
             software_triggers: None,
+            epoch: Epoch::default(),
         })
     }
     pub fn features(&mut self) -> Vec<FeatureInfo> {
@@ -597,6 +985,27 @@ impl Camera {
     }
     pub(crate) fn lock_released_by(&self, name: &str, others: &[&str]) -> bool {
         self.nodes.lock_released_by(name, others)
+    }
+    pub(crate) fn feature_names(&self) -> Vec<&str> {
+        self.nodes.feature_names()
+    }
+    pub(crate) fn feature(&mut self, name: &str) -> Option<FeatureInfo> {
+        self.nodes.feature(self.backend.as_mut(), name)
+    }
+    pub(crate) fn lock_owner(&self, name: &str) -> Option<String> {
+        self.nodes.lock_owner(name)
+    }
+    pub(crate) fn visibility(&self, name: &str) -> &str {
+        self.nodes.visibility(name)
+    }
+    pub(crate) fn category(&self, name: &str) -> Option<&str> {
+        self.nodes.category(name)
+    }
+    pub(crate) fn static_access(&self, name: &str) -> &'static str {
+        self.nodes.static_access(name)
+    }
+    pub(crate) fn static_max(&self, name: &str) -> Option<f64> {
+        self.nodes.static_max(name)
     }
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
         ensure!(name != TL_PARAMS_LOCKED, "{TL_PARAMS_LOCKED_MESSAGE}");
@@ -681,10 +1090,12 @@ impl Camera {
             return Err(error);
         }
         self.streaming = true;
+        // Every frame of a new acquisition is exposed after any change.
+        self.epoch = Epoch::default();
         Ok(())
     }
     /// A camera left in SingleFrame or MultiFrame ends each acquisition by
-    /// itself after a frame or a few, which would freeze live view and fail
+    /// itself after a frame or a few, which would stall a stream and fail
     /// later captures: switch it to Continuous, before TLParamsLocked can
     /// lock the mode. The camera keeps the new mode after stop.
     fn acquire_continuously(&mut self) -> Result<()> {
@@ -747,15 +1158,94 @@ impl Camera {
     }
     pub fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.streaming, "camera is not streaming");
-        self.backend.next_frame(timeout)
+        let mut frame = self.backend.next_frame(timeout)?;
+        if frame.wall_ms == 0 {
+            frame.wall_ms = crate::scheduling::now_ms();
+        }
+        let now = Instant::now();
+        let epoch = &mut self.epoch;
+        let counted = epoch.stale > 0 && epoch.counted_until.is_none_or(|until| now < until);
+        let held = epoch.stale_until.is_some_and(|until| now < until);
+        let clocked = match (epoch.since_ns, frame.device_ts_ns) {
+            (Some(since), Some(stamped)) if stamped < since => true,
+            // The first frame stamped after the change, at the end of its
+            // exposure on some cameras, may have begun before it.
+            (Some(_), Some(_)) => {
+                epoch.since_ns = None;
+                true
+            }
+            _ => false,
+        };
+        epoch.last_stale = counted || held || clocked;
+        epoch.stale = epoch.stale.saturating_sub(1);
+        epoch.pending = epoch.pending.saturating_sub(1);
+        Ok(frame)
     }
     /// Ask for the next frame. A camera whose start trigger is On with a
     /// Software source sends one only after TriggerSoftware; one waiting for
     /// a hardware trigger still waits for its line.
     pub fn request_frame(&mut self) -> Result<()> {
         ensure!(self.streaming, "camera is not streaming");
-        self.trigger_software()?;
+        if self.software_triggered() {
+            self.trigger_software()?;
+            self.epoch.pending = self.epoch.pending.saturating_add(1);
+        }
         self.backend.request_frame()
+    }
+    /// Give up on the frame of the oldest software trigger fired: the
+    /// transport lost it, or it never came.
+    pub(crate) fn trigger_unanswered(&mut self) {
+        self.epoch.pending = self.epoch.pending.saturating_sub(1);
+    }
+    /// Note that settings were written: until frames exposed after the
+    /// change come, `frame_predates_change` says so of each frame.
+    pub(crate) fn settings_changed(&mut self, change: Change) {
+        if !self.streaming {
+            return;
+        }
+        // Frames already on their way left the camera before the change.
+        let buffered = self.backend.buffered_frames();
+        let now = Instant::now();
+        if let Some(hold) = change.hardware_hold {
+            self.epoch.stale = buffered;
+            self.epoch.counted_until = None;
+            self.epoch.stale_until = now.checked_add(hold);
+        } else if self.software_triggered() {
+            let in_flight = if change.was_software {
+                self.epoch.pending.max(buffered)
+            } else {
+                // Switched from free-running: its frames being read out
+                // and exposed may still come, or the camera may drop them.
+                self.epoch
+                    .pending
+                    .saturating_add(buffered)
+                    .saturating_add(STALE_FRAMES)
+            };
+            let counting = self.epoch.counted_until.is_none_or(|until| now < until);
+            let earlier = if counting { self.epoch.stale } else { 0 };
+            self.epoch.stale = earlier.max(in_flight);
+            self.epoch.counted_until = now.checked_add(change.in_flight);
+        } else {
+            self.epoch.stale = buffered.saturating_add(STALE_FRAMES);
+            self.epoch.counted_until = None;
+            // A clock that reads 0 was never latched.
+            self.epoch.since_ns = self.backend.device_time_ns().filter(|ns| *ns > 0);
+        }
+    }
+    /// Settings this process emulates for the camera; see
+    /// `Backend::emulated_settings`.
+    pub(crate) fn emulated_settings(&mut self) -> Option<serde_json::Value> {
+        self.backend.emulated_settings()
+    }
+    /// Take back settings another process emulated for the camera.
+    pub(crate) fn restore_settings(&mut self, settings: &serde_json::Value) -> Result<()> {
+        self.software_triggers = None;
+        self.backend.restore_settings(settings)
+    }
+    /// Whether the frame `next_frame` returned last may have been exposed
+    /// before the last settings change.
+    pub(crate) fn frame_predates_change(&self) -> bool {
+        self.epoch.last_stale
     }
     /// Whether the camera sends frames only when software triggered.
     pub fn software_triggered(&mut self) -> bool {
@@ -864,9 +1354,6 @@ impl Camera {
             _ => fired,
         }
     }
-    pub fn is_scanner(&self) -> bool {
-        self.info.transport == Transport::Scanner
-    }
     pub fn stop(&mut self) -> Result<()> {
         if !self.streaming {
             return Ok(());
@@ -897,6 +1384,16 @@ impl Camera {
         self.software_triggers = None;
         self.backend.write_memory(address, data)
     }
+    /// See `Backend::lingers`.
+    pub(crate) fn lingers(&self) -> bool {
+        self.backend.lingers()
+    }
+    /// See `Backend::rest`; a streaming camera keeps what it streams with.
+    pub(crate) fn rest(&mut self) {
+        if !self.streaming {
+            self.backend.rest();
+        }
+    }
     pub fn is_streaming(&self) -> bool {
         self.streaming
     }
@@ -912,6 +1409,119 @@ pub(crate) mod tests {
     use super::*;
     use crate::camera_profile::{CameraCapability, CameraKind, DetectionSource};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn selectors_are_looked_for_only_where_they_can_be() {
+        let gige = CameraInfo {
+            id: "gige:00c0df123456".into(),
+            transport: Transport::GigE,
+            vendor: "Acme".into(),
+            model: "Line Scan 4K".into(),
+            serial: "SN42".into(),
+            address: Some("192.168.1.20".into()),
+            profile: Default::default(),
+        };
+        for selector in [
+            "gige:00c0df123456",
+            "SN42",
+            "192.168.1.20",
+            "00:C0:DF:12:34:56",
+            "00-c0-df-12-34-56",
+        ] {
+            assert!(names_exactly(selector, &gige), "{selector}");
+        }
+        assert!(!names_exactly("SN4", &gige));
+        assert!(!names_exactly("00c0df12345", &gige));
+        assert_eq!(
+            resolve_selector("00:c0:df:12:34:56", std::slice::from_ref(&gige)),
+            Resolution::Exact(gige.clone())
+        );
+        let only = |gige, u3v| Kinds {
+            gige,
+            u3v,
+            host: false,
+            onvif: false,
+            sim: false,
+        };
+        assert_eq!(kinds_for("gige:00c0df123456"), only(true, false));
+        assert_eq!(kinds_for("00:c0:df:12:34:56"), only(true, false));
+        assert_eq!(kinds_for("usb:2676:ba02:SN1"), only(false, true));
+        // A serial or a model may be anywhere but the simulator.
+        assert_eq!(
+            kinds_for("SN42"),
+            Kinds {
+                sim: false,
+                ..Kinds::all()
+            }
+        );
+        // A 12-digit serial is not a MAC address.
+        assert!(mac_id("123456789012").is_none());
+        // A model names one camera only among every camera there is.
+        let cached = std::slice::from_ref(&gige);
+        assert_eq!(cached_match("SN42", cached, false), Some(gige.clone()));
+        assert_eq!(cached_match("Line Scan 4K", cached, false), None);
+        assert_eq!(
+            cached_match("Line Scan 4K", cached, true),
+            Some(gige.clone())
+        );
+    }
+
+    #[test]
+    fn a_broadcasts_list_replaces_the_answers_it_told_of() {
+        let onvif = |endpoint: &str| CameraInfo {
+            id: format!("onvif://{endpoint}"),
+            transport: Transport::Media,
+            vendor: "Acme".into(),
+            model: "Dome".into(),
+            serial: "D1".into(),
+            address: Some(endpoint.into()),
+            profile: Default::default(),
+        };
+        let gige = CameraInfo {
+            id: "gige:00c0df123456".into(),
+            transport: Transport::GigE,
+            vendor: "Acme".into(),
+            model: "Line Scan 4K".into(),
+            serial: "SN42".into(),
+            address: Some("192.168.1.20".into()),
+            profile: Default::default(),
+        };
+        // One device answered from two addresses; ONVIF's own list merges
+        // them into one camera.
+        let mut heard = Heard::default();
+        heard.told("ONVIF", onvif("10.0.0.5"));
+        heard.told("ONVIF", onvif("192.168.1.5"));
+        heard.told("GigE", gige.clone());
+        assert!(heard.any(&|info: &CameraInfo| info.serial == "D1"));
+        heard.listed("ONVIF", vec![onvif("10.0.0.5")]);
+        let ids = |heard: Heard| {
+            heard
+                .cameras()
+                .into_iter()
+                .map(|info| info.id)
+                .collect::<Vec<_>>()
+        };
+        // A broadcast that ended before its list keeps what it told of.
+        assert_eq!(ids(heard), ["onvif://10.0.0.5", "gige:00c0df123456"]);
+    }
+
+    #[test]
+    fn opened_media_sources_keep_their_kind() {
+        let clip = std::env::temp_dir().join(format!("capturefab-kind-{}.mkv", std::process::id()));
+        std::fs::write(&clip, b"").unwrap();
+        for (selector, kind) in [
+            ("avfoundation:0", "webcam"),
+            ("v4l2:/dev/video0", "webcam"),
+            ("rtsp://user:secret@camera.local/live", "stream"),
+            ("http://camera.local/snapshot.jpg", "stream"),
+            (clip.to_str().unwrap(), "file"),
+        ] {
+            let info = crate::media::info(selector).unwrap();
+            assert!(info.id.starts_with("media:"), "{selector}");
+            assert_eq!(super::kind(&info), kind, "{selector}");
+        }
+        let _ = std::fs::remove_file(&clip);
+    }
 
     const PAYLOAD: u64 = 0x00;
     const ACQUISITION_START: u64 = 0x04;
@@ -1073,7 +1683,8 @@ pub(crate) mod tests {
                 width: 4,
                 height: 4,
                 pixel_format: crate::types::MONO8,
-                timestamp_ns: self.frames,
+                device_ts_ns: Some(self.frames),
+                wall_ms: 0,
                 data: vec![0; 16],
             })
         }
@@ -1167,6 +1778,7 @@ pub(crate) mod tests {
         assert!(!camera.is_writable("GevSCPSPacketSize"));
         let error = camera.set("GevSCPSPacketSize", "9000").unwrap_err();
         assert!(error.to_string().contains("is locked"), "{error:#}");
+        assert_eq!(crate::cli::error_code(&error), ("feature_locked", 1));
         camera.stop().unwrap();
         camera.set("GevSCPSPacketSize", "9000").unwrap();
     }
@@ -1275,6 +1887,170 @@ pub(crate) mod tests {
         assert!(taken(&log).is_empty());
         assert!(camera.is_streaming());
         camera.next_frame(Duration::from_millis(10)).unwrap();
+    }
+
+    /// A stream whose frames wait in the host's buffers, stamped by a clock
+    /// the camera can latch: the test queues the frames it sends.
+    struct Queued {
+        device: Device,
+        frames: std::collections::VecDeque<u64>,
+        buffered: u32,
+        clock: Option<u64>,
+    }
+    impl crate::types::RegisterIo for Queued {
+        fn read_memory(&mut self, address: u64, length: usize) -> Result<Vec<u8>> {
+            self.device.read_memory(address, length)
+        }
+        fn write_memory(&mut self, address: u64, data: &[u8]) -> Result<()> {
+            self.device.write_memory(address, data)
+        }
+    }
+    impl Backend for Queued {
+        fn xml(&mut self) -> Result<String> {
+            self.device.xml()
+        }
+        fn start(&mut self, payload: usize) -> Result<()> {
+            self.device.start(payload)
+        }
+        fn next_frame(&mut self, _: Duration) -> Result<Frame> {
+            let stamped = self.frames.pop_front().context("frame timeout")?;
+            Ok(Frame {
+                id: stamped,
+                width: 4,
+                height: 4,
+                pixel_format: crate::types::MONO8,
+                device_ts_ns: Some(stamped),
+                wall_ms: 0,
+                data: vec![0; 16],
+            })
+        }
+        fn stop(&mut self) -> Result<()> {
+            self.device.stop()
+        }
+        fn buffered_frames(&mut self) -> u32 {
+            self.buffered
+        }
+        fn device_time_ns(&mut self) -> Option<u64> {
+            self.clock
+        }
+    }
+    /// A streaming camera that sends frames stamped `stamps`, and which of
+    /// them predate a change made before the first.
+    fn after_change(
+        device: Device,
+        buffered: u32,
+        clock: Option<u64>,
+        change: impl FnOnce(&mut Camera) -> Change,
+        stamps: &[u64],
+    ) -> Vec<bool> {
+        let queued = Queued {
+            device,
+            frames: stamps.iter().copied().collect(),
+            buffered,
+            clock,
+        };
+        let mut camera =
+            Camera::from_backend(crate::transport::simulator::info(), Box::new(queued)).unwrap();
+        camera.start().unwrap();
+        let change = change(&mut camera);
+        camera.settings_changed(change);
+        stamps
+            .iter()
+            .map(|_| {
+                camera.next_frame(Duration::ZERO).unwrap();
+                camera.frame_predates_change()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frames_sent_before_a_change_predate_it_wherever_they_waited() {
+        let plain = || Device::new(OPEN_ACQUISITION);
+        // Three frames wait in the host's buffers, then come the frame being
+        // read out and the one being exposed.
+        assert_eq!(
+            after_change(plain(), 3, None, |_| Change::default(), &[1, 2, 3, 4, 5, 6]),
+            [true, true, true, true, true, false]
+        );
+        // The camera's clock says more: frames it stamped before the change
+        // waited in the camera itself, and the first after it may have
+        // begun before it.
+        assert_eq!(
+            after_change(
+                plain(),
+                0,
+                Some(1000),
+                |_| Change::default(),
+                &[10, 20, 900, 1010, 1040]
+            ),
+            [true, true, true, true, false]
+        );
+        // A clock that reads 0 was never latched.
+        assert_eq!(
+            after_change(plain(), 0, Some(0), |_| Change::default(), &[1, 2, 3]),
+            [true, true, false]
+        );
+        // A hardware-triggered camera's frames for a while, besides those
+        // already sent.
+        let hold = Change {
+            hardware_hold: Some(Duration::from_secs(60)),
+            ..Change::default()
+        };
+        assert_eq!(
+            after_change(plain(), 1, None, |_| hold, &[1, 2]),
+            [true, true]
+        );
+    }
+
+    #[test]
+    fn a_stream_switched_to_software_triggers_counts_its_frames_in_flight_for_a_while() {
+        let triggers = || Device::new(&format!("{OPEN_ACQUISITION}{TRIGGER_NODES}"));
+        let switch = |in_flight: Duration| {
+            move |camera: &mut Camera| {
+                camera.set("TriggerSelector", "FrameStart").unwrap();
+                camera.set("TriggerSource", "Software").unwrap();
+                camera.set("TriggerMode", "On").unwrap();
+                Change {
+                    in_flight,
+                    ..Change::default()
+                }
+            }
+        };
+        // The free-running frames being read out and exposed when the
+        // trigger went on, besides the one already sent.
+        assert_eq!(
+            after_change(
+                triggers(),
+                1,
+                None,
+                switch(Duration::from_secs(60)),
+                &[1, 2, 3, 4]
+            ),
+            [true, true, true, false]
+        );
+        // The camera dropped them: once they could have come, the frames of
+        // the triggers fired since are new.
+        let dropped = after_change(triggers(), 0, None, switch(Duration::ZERO), &[1]);
+        assert_eq!(dropped, [false]);
+        // Already software triggered: only the frames of triggers fired
+        // before the change predate it.
+        let mut camera = device_camera(
+            triggers()
+                .with(TRIGGER_SELECTOR, 1)
+                .with(FRAME_TRIGGER_MODE, 1),
+        );
+        camera.start().unwrap();
+        camera.request_frame().unwrap();
+        camera.settings_changed(Change {
+            was_software: true,
+            in_flight: Duration::from_secs(60),
+            ..Change::default()
+        });
+        camera.next_frame(Duration::from_millis(10)).unwrap();
+        assert!(camera.frame_predates_change());
+        camera.request_frame().unwrap();
+        camera.next_frame(Duration::from_millis(10)).unwrap();
+        assert!(!camera.frame_predates_change());
     }
 
     #[test]
@@ -1447,7 +2223,13 @@ pub(crate) mod tests {
             "opening must not poll unrelated exposure registers"
         );
         assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
-        assert!(camera.info.profile.supports(CameraCapability::Exposure));
+        assert!(
+            camera
+                .info
+                .profile
+                .capabilities
+                .contains(&CameraCapability::Exposure)
+        );
         assert!(!camera.features().iter().any(|f| f.name == "DeviceScanType"));
         assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
         assert_eq!(camera.info.profile.source, DetectionSource::DeviceMetadata);
@@ -1489,7 +2271,13 @@ pub(crate) mod tests {
         let info = crate::transport::simulator::info();
         let mut camera = Camera::from_backend(info, Box::new(Fixture(xml))).unwrap();
         assert_eq!(camera.info.profile.kind, CameraKind::AreaScan);
-        assert!(!camera.info.profile.supports(CameraCapability::LineRate));
+        assert!(
+            !camera
+                .info
+                .profile
+                .capabilities
+                .contains(&CameraCapability::LineRate)
+        );
         camera.features();
         assert_eq!(camera.info.profile.kind, CameraKind::AreaScan);
     }
@@ -1515,11 +2303,6 @@ pub(crate) mod tests {
                 "avfoundation:Capture screen 0",
             ),
             device("gige:02007f000001", "Virtual GigE camera", "SIM7F000001"),
-            device(
-                "hub:home/camera.front_door",
-                "Front door",
-                "home/camera.front_door",
-            ),
         ]
     }
     fn open_error(selector: &str, known: &[CameraInfo]) -> anyhow::Error {
@@ -1572,7 +2355,13 @@ pub(crate) mod tests {
         assert!(message.contains("ambiguous"), "{message}");
         assert!(message.contains("C922"), "{message}");
         assert!(message.contains("HD Pro Webcam C920"), "{message}");
-        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+        assert_eq!(crate::cli::error_code(&error), ("camera_ambiguous", 2));
+        let details = crate::types::classify(&error).details.unwrap();
+        assert_eq!(
+            details["candidates"].as_array().unwrap().len(),
+            2,
+            "{details}"
+        );
     }
 
     #[test]
@@ -1580,19 +2369,11 @@ pub(crate) mod tests {
         let mut known = known();
         known.push(device("usb:2676:ba02:23015", "Industrial camera", "23015"));
         known.push(device(
-            "scanner:ica:E3248000-80CE-11DB-8000-3C2AF4FA0DE9",
-            "Brother MFC-L2750DW series",
+            "onvif:http://192.0.2.7:80/onvif/device_service",
+            "Lobby PTZ camera",
             "E3248000-80CE-11DB-8000-3C2AF4FA0DE9",
         ));
-        for selector in [
-            "2301",
-            "ba02:2301",
-            "E3248",
-            "e3248000",
-            "cam",
-            "webca",
-            "Brother",
-        ] {
+        for selector in ["2301", "ba02:2301", "E3248", "e3248000", "cam", "webca"] {
             assert_eq!(
                 resolve_selector(selector, &known),
                 Resolution::NotFound,
@@ -1600,19 +2381,22 @@ pub(crate) mod tests {
             );
         }
         assert!(matches!(
-            resolve_selector("brother mfc-l2750dw series", &known),
-            Resolution::Loose { info, .. } if info.id.starts_with("scanner:")
+            resolve_selector("lobby ptz camera", &known),
+            Resolution::Loose { info, .. } if info.id.starts_with("onvif:")
         ));
     }
 
     #[test]
-    fn hub_cameras_are_never_matched_loosely() {
-        let known = known();
-        assert_eq!(resolve_selector("front door", &known), Resolution::NotFound);
-        assert!(matches!(
-            resolve_selector("home/camera.front_door", &known),
-            Resolution::Exact(info) if info.id.starts_with("hub:")
-        ));
+    fn hub_and_scanner_selectors_are_usage_errors_with_a_way_forward() {
+        for selector in ["hub:home/camera.front_door", "HUB:x/y"] {
+            let error = validate_selector_shape(selector).unwrap_err();
+            assert_eq!(crate::cli::error_code(&error), ("usage", 2));
+            let hint = crate::types::classify(&error).hint.unwrap();
+            assert!(hint.contains("rtsp://HOST"), "{hint}");
+        }
+        let error = validate_selector("scanner:sane:device").unwrap_err();
+        assert_eq!(crate::cli::error_code(&error), ("usage", 2));
+        assert!(error.to_string().contains("not supported"), "{error:#}");
     }
 
     #[test]
@@ -1636,14 +2420,18 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 crate::cli::error_code(&error),
-                ("unavailable", 3),
+                ("camera_not_found", 3),
                 "{selector}"
             );
         }
         let error = open_error("zzzz", &[]);
+        let hint = crate::types::classify(&error).hint.unwrap();
+        assert!(hint.contains("run capturefab list"), "{hint}");
+        let error = open_error("zzzz", &known);
+        let details = crate::types::classify(&error).details.unwrap();
         assert!(
-            error.to_string().contains("run capturefab discover"),
-            "{error:#}"
+            !details["candidates"].as_array().unwrap().is_empty(),
+            "{details}"
         );
         assert!(needs_no_discovery("./nope.mp4"));
         assert!(needs_no_discovery("192.168.1.300"));
@@ -1717,13 +2505,6 @@ pub(crate) mod tests {
         );
         validate_selector_shape(&source).unwrap();
         assert!(validate_selector(&source).is_err());
-        for source in [
-            "scanner:sane:device",
-            "scanner:wia:device",
-            "scanner:ica:device",
-        ] {
-            validate_selector_shape(source).unwrap();
-        }
     }
 
     #[test]

@@ -170,42 +170,35 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual((components['media:x264']['version'], components['media:ffmpeg']['hashes'][0]['content']), ('abc', 'f' * 64))
         self.assertEqual(bom['dependencies'][1], dict(ref='media:ffmpeg', dependsOn=['media:x264']))
 
-    def test_sbom_adds_the_browser_client_crates_once(self):
-        def metadata(root, names):
-            return dict(resolve=dict(root=root, nodes=[dict(id=root, deps=[dict(pkg=n, dep_kinds=[dict(kind=None)]) for n in names])] + [dict(id=n, deps=[]) for n in names]),
-                        packages=[dict(id=i, name=i, version='1.0.0', license='MIT') for i in [root, *names]])
-        lock = '[[package]]\nname = "wasm-bindgen"\nversion = "1.0.0"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "' + 'd' * 64 + '"\n'
-        bom = release.cyclonedx(metadata('app', ['serde', 'zip']), '', '', '1.2.3', 'owner/repo', '00000000-0000-0000-0000-000000000000',
-                                (metadata('client', ['serde', 'wasm-bindgen']), lock))
-        crates = [c['bom-ref'] for c in bom['components'] if c['type'] == 'library']
-        self.assertEqual(crates, ['pkg:cargo/serde@1.0.0', 'pkg:cargo/wasm-bindgen@1.0.0', 'pkg:cargo/zip@1.0.0'])
-        self.assertEqual(bom['components'][1]['hashes'], [dict(alg='SHA-256', content='d' * 64)])
-        self.assertIn('pkg:cargo/wasm-bindgen@1.0.0', bom['dependencies'][0]['dependsOn'])
-
-    def test_build_embeds_the_browser_client_once_it_is_built(self):
+    def test_build_uses_the_default_features(self):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
             source = temp / 'media-sources.tar.gz'
             source.write_bytes(b'source')
-            dist = temp / 'web-client-dist'
             builds = []
             def run(command, **kwargs):
                 builds.append((command, kwargs['env']))
             args = SimpleNamespace(version=release.version(), target='aarch64-unknown-linux-gnu', os='linux', arch='aarch64',
                                    ffmpeg_bundle=temp / 'bundle', binary=None, repackage=False, output=temp / 'out')
-            for web in [dist, None]:
-                builds.clear()
-                with mock.patch.object(release, 'run', side_effect=run), mock.patch.object(release, 'web_dist', return_value=web), \
-                        mock.patch.object(release, 'package', return_value={}), mock.patch.object(release, 'media_sources', return_value=source):
+            with mock.patch.object(release, 'run', side_effect=run), \
+                    mock.patch.object(release, 'package', return_value={}), mock.patch.object(release, 'media_sources', return_value=source), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                # Without the bundle's FFmpeg, nothing is built.
+                with self.assertRaisesRegex(RuntimeError, 'build\\(s\\) failed'):
                     release.build(args)
-                self.assertEqual(len(builds), 1)
-                for command, env in builds:
-                    features = command[command.index('--features') + 1].split(',') if '--features' in command else []
-                    self.assertEqual(features, ['embedded-web'] if web else [], command)
-                    self.assertEqual(env.get('CAPTUREFAB_WEB_DIST'), str(dist.resolve()) if web else None)
-                self.assertNotIn('--no-default-features', builds[0][0])
+                self.assertEqual(builds, [])
+                report = json.loads((temp / 'out' / 'build-linux-aarch64.json').read_text())
+                self.assertIn('releases embed the FFmpeg', report['failures'][0]['error'])
+                (temp / 'bundle' / 'bin').mkdir(parents=True)
+                (temp / 'bundle' / 'bin' / 'ffmpeg').write_bytes(b'ffmpeg')
+                release.build(args)
+            self.assertEqual(len(builds), 1)
+            command, env = builds[0]
+            self.assertNotIn('--features', command)
+            self.assertNotIn('--no-default-features', command)
+            self.assertEqual(env['CAPTUREFAB_FFMPEG_BINARY'], str((temp / 'bundle' / 'bin' / 'ffmpeg').resolve()))
 
-    def test_package_records_and_licenses_an_embedded_browser_client(self):
+    def test_linux_packages_carry_the_udev_rule_and_licenses(self):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
             bundle = temp / 'bundle'
@@ -215,35 +208,25 @@ class ReleaseTests(unittest.TestCase):
             (bundle / 'build-manifest.txt').write_text('manifest')
             ffmpeg = self.elf(['GLIBC_2.17']) + os.urandom(70000)
             (bundle / 'bin' / 'ffmpeg').write_bytes(ffmpeg)
-            dist = temp / 'web-client-dist'
-            dist.mkdir()
-            wasm = b'\0asm' + os.urandom(4000)
-            (dist / 'index.html').write_text('<!doctype html>')
-            (dist / 'capturefab_web_bg.wasm').write_bytes(wasm)
             args = SimpleNamespace(os='linux', arch='aarch64', target='aarch64-unknown-linux-gnu', version='1.2.3', ffmpeg_bundle=bundle, output=temp / 'out', skip_smoke=True)
-            licensed = []
-            def notices(target, web=False):
-                licensed.append(web)
-                return 'crate licenses'
-            items, readmes = [], []
-            with mock.patch.object(release, 'notices', side_effect=notices), mock.patch.object(release, 'web_dist', return_value=dist):
-                for name, payload in [('embedded', ffmpeg + wasm), ('plain', ffmpeg)]:
-                    binary = temp / name
-                    binary.write_bytes(self.elf(['GLIBC_2.17']) + payload)
-                    items.append(release.package(args, binary))
-                    with tarfile.open(temp / 'out' / items[-1]['name']) as archive:
-                        readmes.append(archive.extractfile('capturefab-1.2.3-linux-aarch64/README.txt').read().decode())
-                        rule = archive.extractfile('capturefab-1.2.3-linux-aarch64/share/udev/rules.d/70-capturefab-usb3vision.rules').read()
-                        self.assertEqual(rule, (release.ROOT / 'assets/udev/70-capturefab-usb3vision.rules').read_bytes())
-                        install = archive.extractfile('capturefab-1.2.3-linux-aarch64/INSTALL-DESKTOP.txt').read().decode()
-                        self.assertIn('sudo install -m 644 share/udev/rules.d/70-capturefab-usb3vision.rules /etc/udev/rules.d/', install)
-                        self.assertIn('does not install', install)
-            self.assertEqual([item.get('browser_client') for item in items], [True, None])
-            self.assertEqual(licensed, [True, False])
-            self.assertIn('serve --name line1 --listen', readmes[0])
-            self.assertNotIn('--listen', readmes[1])
-            for readme in readmes:
-                self.assertIn('https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md', readme)
+            with mock.patch.object(release, 'notices', return_value='crate licenses'):
+                binary = temp / 'capturefab'
+                binary.write_bytes(self.elf(['GLIBC_2.17']) + ffmpeg)
+                item = release.package(args, binary)
+            with tarfile.open(temp / 'out' / item['name']) as archive:
+                names = archive.getnames()
+                readme = archive.extractfile('capturefab-1.2.3-linux-aarch64/README.txt').read().decode()
+                rule = archive.extractfile('capturefab-1.2.3-linux-aarch64/share/udev/rules.d/70-capturefab-usb3vision.rules').read()
+                self.assertEqual(rule, (release.ROOT / 'assets/udev/70-capturefab-usb3vision.rules').read_bytes())
+                install = archive.extractfile('capturefab-1.2.3-linux-aarch64/INSTALL-USB.txt').read().decode()
+                licenses = archive.extractfile('capturefab-1.2.3-linux-aarch64/THIRD-PARTY-LICENSES.txt').read().decode()
+            self.assertIn('sudo install -m 644 share/udev/rules.d/70-capturefab-usb3vision.rules /etc/udev/rules.d/', install)
+            self.assertIn('does not install', install)
+            self.assertEqual(licenses, 'crate licenses')
+            self.assertNotIn('browser_client', item)
+            self.assertFalse(any('/share/applications/' in name or '/share/icons/' in name for name in names), names)
+            self.assertNotIn('GUI', readme)
+            self.assertIn('https://github.com/capturefab/capturefab/blob/main/docs/line-computer.md', readme)
 
     def test_set_version_raises_cargo_toml_and_lock_only_forward(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -944,13 +927,13 @@ class TerminalSvgTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             fake = Path(temp) / 'capturefab'
             row = Path(temp) / 'row'
-            row.write_text('sim:0  simulator  Pattern camera  SIM0')
-            fake.write_text(f'#!{sys.executable}\nimport os, sys\nif "CAPTUREFAB_SESSION" in os.environ or not os.environ.get("CAPTUREFAB_SESSION_DIR"):\n    sys.exit(3)\nprint("ID  TRANSPORT  MODEL  SERIAL\\n" + open({str(row)!r}).read() if "discover" in sys.argv else " ".join(sys.argv[1:]))\n')
+            row.write_text('sim:0  sim  Pattern camera  SIM0')
+            fake.write_text(f'#!{sys.executable}\nimport os, sys\nif "CAPTUREFAB_SESSION" in os.environ or not os.environ.get("CAPTUREFAB_SESSION_DIR") or os.environ.get("CAPTUREFAB_KEEP") != "0":\n    sys.exit(3)\nprint("ID  KIND  MODEL  SERIAL\\n" + open({str(row)!r}).read() if "list" in sys.argv else " ".join(sys.argv[1:]))\n')
             fake.chmod(0o755)
             with mock.patch.dict(os.environ, {'CAPTUREFAB_SESSION': 'gui'}):
                 lines = svg.transcript(fake)
-            self.assertEqual(lines[:3], ['$ capturefab --simulate discover', 'ID  TRANSPORT  MODEL  SERIAL', 'sim:0  simulator  Pattern camera  SIM0'])
-            self.assertEqual(lines[-3:], ['$ capturefab --camera sim:0 capture -o frame.png', '--camera sim:0 capture -o frame.png', '$ '])
+            self.assertEqual(lines[:3], ['$ capturefab list --kind sim', 'ID  KIND  MODEL  SERIAL', 'sim:0  sim  Pattern camera  SIM0'])
+            self.assertEqual(lines[-3:], ['$ capturefab capture -c sim:0 -o frame.png', 'capture -c sim:0 -o frame.png', '$ '])
             row.write_text('10.0.0.2  gige  Camera  1234')
             with self.assertRaises(SystemExit):
                 svg.transcript(fake)
