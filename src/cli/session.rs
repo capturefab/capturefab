@@ -90,10 +90,12 @@ fn start(global: &Global, args: StartArgs) -> Result<Report> {
         .map(|selector| super::caller_selector(selector))
         .collect::<Result<Vec<_>>>()?;
     let mut warnings = Vec::new();
-    if ipc::runtime_dir_ends_at_logout() {
+    if crate::dirs::runtime_ends_at_logout()
+        && let Ok(runtime) = crate::dirs::runtime()
+    {
         warnings.push(format!(
             "{} is removed when you log out, and the session with it; run `loginctl enable-linger` to keep it",
-            ipc::runtime_dir().display()
+            runtime.display()
         ));
     }
     let _turn = ipc::start_turn(&args.name)?;
@@ -145,7 +147,7 @@ fn start(global: &Global, args: StartArgs) -> Result<Report> {
         ),
     };
     value["started"] = json!(started);
-    value["log"] = json!(log_path(&args.name));
+    value["log"] = json!(log_path(&args.name).ok());
     if !warnings.is_empty() {
         value["warnings"] = json!(warnings);
     }
@@ -212,24 +214,20 @@ pub(super) fn ensure(
 /// starts under its name.
 const ENDING: Duration = Duration::from_secs(5);
 
-/// Whether this process can start a session: its runtime folder, which
-/// holds the session's descriptor, and the folder of its log are writable.
+/// Whether this process can start a session: there is a runtime folder,
+/// which holds the session's descriptor, and its log's folder is, or can
+/// be made, a private one it can write. It makes nothing: doctor asks too.
 pub(super) fn can_start() -> bool {
-    let writable = |dir: &std::path::Path| {
-        if ipc::ensure_private_dir(dir).is_err() {
-            return false;
+    let usable = |dir: &std::path::Path| {
+        if dir.exists() {
+            crate::dirs::check_private_dir(dir).is_ok() && crate::dirs::writable(dir).is_ok()
+        } else {
+            dir.parent()
+                .is_some_and(|parent| crate::dirs::writable(parent).is_ok())
         }
-        let probe = dir.join(format!(".write-{}", std::process::id()));
-        let written = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&probe)
-            .is_ok();
-        let _ = std::fs::remove_file(&probe);
-        written
     };
-    writable(&ipc::runtime_dir()) && log_path(super::AUTO_SESSION).parent().is_some_and(writable)
+    crate::dirs::runtime().is_ok()
+        && log_path(super::AUTO_SESSION).is_ok_and(|log| log.parent().is_some_and(usable))
 }
 
 /// Session `name`'s descriptor when it runs, or `session_not_found`; what a
@@ -248,19 +246,35 @@ fn running(name: &str) -> Result<ipc::Descriptor> {
     .into())
 }
 
-/// Where a detached session's output goes.
-pub(super) fn log_path(name: &str) -> PathBuf {
-    ipc::state_dir()
-        .join("sessions")
-        .join(format!("{name}.log"))
+/// Where a detached session's output goes: `sessions/NAME.log` in the
+/// state folder, or in the runtime folder where state cannot be written,
+/// as on a read-only system.
+pub(super) fn log_path(name: &str) -> Result<PathBuf> {
+    let state = crate::dirs::found(crate::dirs::Kind::State)
+        .chosen
+        .as_ref()
+        .filter(|chosen| chosen.writable)
+        .map(|chosen| chosen.path.clone());
+    let dir = match state {
+        Some(dir) => dir,
+        None => crate::dirs::runtime()?,
+    };
+    Ok(dir.join("sessions").join(format!("{name}.log")))
+}
+/// Where to look for why session `name` failed.
+fn see_log(name: &str) -> String {
+    match log_path(name) {
+        Ok(path) => format!("see {}", path.display()),
+        Err(_) => format!("run capturefab serve --name {name} to see why"),
+    }
 }
 
 /// The session's log, private, with an older one kept once it grows past
 /// `MAX_LOG`.
 fn open_log(name: &str) -> Result<std::fs::File> {
-    let path = log_path(name);
+    let path = log_path(name)?;
     let dir = path.parent().context("session log folder")?;
-    ipc::ensure_private_dir(dir)?;
+    crate::dirs::ensure_private_dir(dir)?;
     if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > MAX_LOG) {
         let _ = std::fs::rename(&path, path.with_extension("log.1"));
     }
@@ -281,7 +295,9 @@ fn open_log(name: &str) -> Result<std::fs::File> {
 /// append to it, so they go on writing at its new end; what they write
 /// between the copy and the emptying is lost.
 pub(super) fn rotate_log(name: &str) {
-    rotate(&log_path(name), MAX_LOG);
+    if let Ok(path) = log_path(name) {
+        rotate(&path, MAX_LOG);
+    }
 }
 fn rotate(path: &std::path::Path, most: u64) {
     if std::fs::metadata(path).is_ok_and(|meta| meta.len() > most)
@@ -357,7 +373,7 @@ fn detach(
                     super::args::duration_text(wait)
                 ),
             )
-            .hint(format!("see {}", log_path(name).display()))
+            .hint(see_log(name))
             .into());
         }
     };
@@ -391,7 +407,7 @@ fn detach(
                         .unwrap_or_default()
                 ),
             )
-            .hint(format!("see {}", log_path(name).display()))
+            .hint(see_log(name))
             .into())
         }
     }
@@ -532,7 +548,7 @@ fn stop(global: &Global, name: Option<String>) -> Result<Report> {
                 super::args::duration_text(STOP_WAIT)
             ),
         )
-        .hint(format!("see {}", log_path(&name).display()))
+        .hint(see_log(&name))
         .into());
     }
     let text = format!("Stopped session {name}.\n");
@@ -545,7 +561,10 @@ mod platform_stop {
     /// serve. Whether it was sent.
     #[cfg(unix)]
     pub(super) fn terminate(name: &str, pid: u32) -> bool {
-        let lock = crate::ipc::runtime_dir().join(format!("{name}.session.lock"));
+        let Ok(runtime) = crate::dirs::runtime() else {
+            return false;
+        };
+        let lock = runtime.join(format!("{name}.session.lock"));
         // Closing the file releases a lock this took.
         let held = std::fs::File::open(&lock).is_ok_and(|file| file.try_lock_shared().is_err());
         let Ok(pid) = libc::pid_t::try_from(pid) else {

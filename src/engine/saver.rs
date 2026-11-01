@@ -4,13 +4,24 @@
 //! overflow it is not taken, and its job counts the frame dropped. Files are
 //! published as soon as they are written, and reported in the order their
 //! frames came, so a job's `saved` lines, manifest lines and files keep the
-//! frames' order.
+//! frames' order. The queue's bound follows the memory the host and its
+//! cgroup leave, so a burst on a small board drops frames rather than
+//! exhausting it.
 use super::*;
 use std::sync::mpsc::Sender;
 
 /// The most frame bytes the encoders hold, waiting and being encoded: a
-/// burst of large frames keeps up to a gigabyte of them in memory.
+/// burst of large frames keeps up to a gigabyte of them in memory, and at
+/// most a quarter of the memory this process may still use (`queue_bytes`).
 pub(super) const QUEUE_BYTES: usize = 1 << 30;
+
+/// The queue's bound for a burst starting now: `QUEUE_BYTES`, or a quarter
+/// of the memory the host and this process's cgroups leave, when less.
+fn queue_bytes() -> usize {
+    crate::host::memory_budget().map_or(QUEUE_BYTES, |budget| {
+        usize::try_from(budget / 4).map_or(QUEUE_BYTES, |quarter| quarter.min(QUEUE_BYTES))
+    })
+}
 
 /// A copy of one frame for every job that was due when it arrived.
 pub(super) struct Shot {
@@ -88,6 +99,8 @@ struct Waiting {
     bytes: usize,
     /// Shots handed over and not reported yet.
     held: usize,
+    /// The bound set when the queue last started filling.
+    capacity: usize,
     closed: bool,
 }
 impl Queue {
@@ -109,8 +122,8 @@ struct Order {
 pub(super) struct Saver {
     queue: Arc<Queue>,
     order: Arc<Mutex<Order>>,
-    /// The most frame bytes it holds.
-    capacity: usize,
+    /// The most frame bytes it holds; none to follow the memory left.
+    capacity: Option<usize>,
     /// The number of the next shot handed over.
     next: u64,
     pub(super) saved: Receiver<Saved>,
@@ -124,10 +137,15 @@ pub(super) struct Saver {
 
 impl Saver {
     pub(super) fn new(h: WorkerHandle) -> Self {
-        Self::with(h, write, QUEUE_BYTES)
+        Self::bounded(h, write, None)
     }
 
+    #[cfg(test)]
     pub(super) fn with(h: WorkerHandle, write: Write, capacity: usize) -> Self {
+        Self::bounded(h, write, Some(capacity))
+    }
+
+    fn bounded(h: WorkerHandle, write: Write, capacity: Option<usize>) -> Self {
         let (outbox, saved) = mpsc::channel();
         Self {
             queue: Arc::default(),
@@ -146,7 +164,7 @@ impl Saver {
     /// frame is always taken, however large.
     pub(super) fn has_room(&self, bytes: usize) -> bool {
         let state = self.queue.lock();
-        state.bytes == 0 || state.bytes.saturating_add(bytes) <= self.capacity
+        state.bytes == 0 || state.bytes.saturating_add(bytes) <= state.capacity
     }
 
     /// Shots handed over and not reported yet.
@@ -158,7 +176,7 @@ impl Saver {
     /// Hand a shot over; callers check `has_room` first.
     pub(super) fn offer(&mut self, shot: Shot) {
         if self.threads.is_empty() {
-            for index in 0..crate::types::processing_threads(usize::MAX) {
+            for index in 0..crate::host::threads(usize::MAX) {
                 let encoder = Encoder {
                     queue: self.queue.clone(),
                     order: self.order.clone(),
@@ -188,6 +206,11 @@ impl Saver {
             return;
         }
         let mut state = self.queue.lock();
+        // The memory left is read as the queue starts filling, not as it
+        // fills: its own frames would shrink the bound under it.
+        if state.bytes == 0 {
+            state.capacity = self.capacity.unwrap_or_else(queue_bytes);
+        }
         state.bytes = state.bytes.saturating_add(shot.frame.data.len());
         state.held += 1;
         state.shots.push_back((self.next, shot));

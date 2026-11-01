@@ -922,7 +922,7 @@ mod tests {
         let served = camera.xml().to_owned();
         assert_eq!(camera_nodes_unresolved(&served), None);
         drop(camera);
-        let kept = std::fs::read_dir(crate::ipc::cache_dir().unwrap().join("xml"))
+        let kept = std::fs::read_dir(crate::dirs::cache().unwrap().join("xml"))
             .unwrap()
             .flatten()
             .map(|entry| entry.path())

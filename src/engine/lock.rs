@@ -28,15 +28,15 @@ fn lockable(info: &CameraInfo) -> bool {
     }
 }
 
-fn path(info: &CameraInfo) -> PathBuf {
+/// The camera's lock file, in the runtime folder when there is one.
+fn path(info: &CameraInfo) -> Option<PathBuf> {
     let digest = Sha256::digest(info.id.as_bytes());
     let name = digest[..8]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    crate::ipc::runtime_dir()
-        .join("cameras")
-        .join(format!("{name}.lock"))
+    let runtime = crate::dirs::runtime().ok()?;
+    Some(runtime.join("cameras").join(format!("{name}.lock")))
 }
 
 /// Take the lock of the camera `info` names, for session `session`. None
@@ -46,11 +46,13 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
     if !lockable(info) {
         return Ok(None);
     }
-    let path = path(info);
+    let Some(path) = path(info) else {
+        return Ok(None);
+    };
     let Some(dir) = path.parent() else {
         return Ok(None);
     };
-    if crate::ipc::ensure_private_dir(dir).is_err() {
+    if crate::dirs::ensure_private_dir(dir).is_err() {
         return Ok(None);
     }
     let mut options = std::fs::OpenOptions::new();

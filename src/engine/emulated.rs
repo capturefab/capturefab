@@ -2,7 +2,8 @@
 //! registers or a webcam's video mode, kept per camera in the runtime
 //! folder: the next worker to open the camera takes them back, so a `set`
 //! and a later `capture` behave as on a real camera, which keeps its
-//! settings until it is powered off.
+//! settings until it is powered off. Without a runtime folder, as on a
+//! read-only system with nothing writable, nothing is kept.
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -10,15 +11,15 @@ use std::{io::Write as _, path::PathBuf};
 
 /// The file of `camera`'s settings, named by a hash: a camera's ID may be a
 /// URL with a password, which must not reach a file name.
-fn path(camera: &str) -> PathBuf {
+fn path(camera: &str) -> Result<PathBuf> {
     let digest = Sha256::digest(key(camera).as_bytes());
     let name = digest[..16]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    crate::ipc::runtime_dir()
+    Ok(crate::dirs::runtime()?
         .join("settings")
-        .join(format!("{name}.json"))
+        .join(format!("{name}.json")))
 }
 /// The camera a selector names: a simulator's options set up the
 /// connection, not the camera.
@@ -32,16 +33,16 @@ fn key(camera: &str) -> &str {
 
 /// The settings saved for `camera`, if any could be read.
 pub(super) fn load(camera: &str) -> Option<Value> {
-    let bytes = std::fs::read(path(camera)).ok()?;
+    let bytes = std::fs::read(path(camera).ok()?).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
 /// Save `settings` for `camera`, replacing what was saved: written whole to
 /// a private file first, so a reader never sees half of it.
 pub(super) fn save(camera: &str, settings: &Value) -> Result<()> {
-    let path = path(camera);
+    let path = path(camera)?;
     let dir = path.parent().context("settings folder")?;
-    crate::ipc::ensure_private_dir(dir)?;
+    crate::dirs::ensure_private_dir(dir)?;
     let temp = dir.join(format!(
         ".{}.{}.tmp",
         path.file_stem()
@@ -78,10 +79,10 @@ mod tests {
         let camera = "rtsp://user:secret-password@cam.test/emulated-settings";
         save(camera, &serde_json::json!({"fps": 10.0})).unwrap();
         assert_eq!(load(camera), Some(serde_json::json!({"fps": 10.0})));
-        assert!(!path(camera).to_string_lossy().contains("secret"));
-        assert_eq!(path("sim:7?drop=0.1"), path("sim:7"));
-        assert_ne!(path("sim:7"), path("sim:8"));
-        std::fs::remove_file(path(camera)).unwrap();
+        assert!(!path(camera).unwrap().to_string_lossy().contains("secret"));
+        assert_eq!(path("sim:7?drop=0.1").unwrap(), path("sim:7").unwrap());
+        assert_ne!(path("sim:7").unwrap(), path("sim:8").unwrap());
+        std::fs::remove_file(path(camera).unwrap()).unwrap();
         assert_eq!(load(camera), None);
     }
 }

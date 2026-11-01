@@ -1151,15 +1151,23 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
 }
 
 /// A new private file for an image a session captures to stdout, in the
-/// runtime folder's `out`, or the system's temporary folder when that is
+/// runtime folder's `out`, or this user's temporary folder when that is
 /// unusable. Files left there by commands that died are swept first.
 fn stdout_file() -> Result<std::path::PathBuf> {
-    let dir = crate::session::stdout_dir();
-    let dir = if crate::ipc::ensure_private_dir(&dir).is_ok() {
-        crate::session::sweep_stdout_files(&dir);
-        dir
-    } else {
-        std::env::temp_dir()
+    let dir = match crate::session::stdout_dir()
+        .filter(|dir| crate::dirs::ensure_private_dir(dir).is_ok())
+    {
+        Some(dir) => {
+            crate::session::sweep_stdout_files(&dir);
+            dir
+        }
+        None => crate::dirs::temp().ok_or_else(|| {
+            Categorized::new(
+                ErrorKind::PermissionDenied,
+                "no private folder to pass the image through",
+            )
+            .hint("capture to a file with -o, or run with --no-session")
+        })?,
     };
     let mut random = [0u8; 8];
     getrandom::fill(&mut random).map_err(|error| anyhow::anyhow!("random file name: {error}"))?;

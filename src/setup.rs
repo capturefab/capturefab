@@ -960,8 +960,10 @@ pub struct Store {
 }
 impl Store {
     /// The store in this user's state directory.
-    pub fn session() -> Self {
-        Self::at(crate::ipc::state_dir().join("setups"))
+    /// Without a state folder there are no presets: a typed error names
+    /// the variable that gives them one.
+    pub fn session() -> Result<Self> {
+        Ok(Self::at(crate::dirs::state()?.join("setups")))
     }
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -974,7 +976,7 @@ impl Store {
     }
     fn lock(&self) -> Result<fs::File> {
         use fs2::FileExt;
-        crate::ipc::ensure_private_dir(&self.dir)?;
+        crate::dirs::ensure_private_dir(&self.dir)?;
         let lock = fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -1218,7 +1220,7 @@ pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session
     let load = |name: &Option<String>, setup: Option<Setup>| -> Result<Option<Setup>> {
         match (name, setup) {
             (_, Some(setup)) => Ok(Some(setup)),
-            (Some(name), None) => Store::session().get(name).map(Some),
+            (Some(name), None) => Store::session()?.get(name).map(Some),
             (None, None) => bail!("name a preset or pass one inline"),
         }
     };
@@ -1749,7 +1751,7 @@ mod tests {
     #[test]
     fn a_full_store_refuses_a_new_name_before_saving() {
         let store = Store::at(temp("full"));
-        crate::ipc::ensure_private_dir(store.dir()).unwrap();
+        crate::dirs::ensure_private_dir(store.dir()).unwrap();
         for index in 0..MAX_SETUPS {
             fs::write(store.dir().join(format!("s{index}.json")), b"{}").unwrap();
         }

@@ -28,12 +28,15 @@ struct Entry {
     info: CameraInfo,
 }
 
-fn path() -> PathBuf {
-    crate::ipc::runtime_dir().join(".discovery.json")
+/// The cache file, in the runtime folder; without one nothing is cached.
+fn path() -> Option<PathBuf> {
+    crate::dirs::runtime()
+        .ok()
+        .map(|dir| dir.join(".discovery.json"))
 }
 
 fn read() -> Cache {
-    let Ok(file) = std::fs::File::open(path()) else {
+    let Some(Ok(file)) = path().map(std::fs::File::open) else {
         return Cache::default();
     };
     let mut text = Vec::new();
@@ -112,9 +115,9 @@ fn merge(
 }
 
 fn write(cache: &Cache) -> anyhow::Result<()> {
-    let path = path();
+    let path = path().ok_or_else(|| anyhow::anyhow!("no runtime folder"))?;
     let dir = path.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?;
-    crate::ipc::ensure_private_dir(dir)?;
+    crate::dirs::ensure_private_dir(dir)?;
     let mut suffix = [0u8; 6];
     getrandom::fill(&mut suffix).map_err(|e| anyhow::anyhow!("random file name: {e}"))?;
     let suffix = suffix
@@ -230,7 +233,12 @@ mod tests {
 
     #[test]
     fn no_session_name_is_the_cache() {
-        let name = path().file_stem().unwrap().to_string_lossy().into_owned();
+        let name = path()
+            .unwrap()
+            .file_stem()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert!(crate::ipc::validate_name(&name).is_err(), "{name}");
     }
 }

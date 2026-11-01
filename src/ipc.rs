@@ -246,234 +246,11 @@ pub struct Server {
     _name_lock: fs::File,
 }
 
-/// Session descriptors and their locks, and files that matter only while
-/// the processes using them run: camera locks, inspection previews and
-/// images captured to stdout through a session.
-/// CAPTUREFAB_SESSION_DIR overrides it together with the state directory.
-pub fn runtime_dir() -> PathBuf {
-    if let Some(dir) = var("CAPTUREFAB_SESSION_DIR") {
-        return dir;
-    }
-    if cfg!(test) {
-        return test_dir();
-    }
-    #[cfg(target_os = "linux")]
-    let login = login_runtime_dir()
-        .filter(|(_, login)| *login == LoginDir::Usable)
-        .map(|(dir, _)| dir);
-    #[cfg(not(target_os = "linux"))]
-    let login = None;
-    runtime_dir_in(&var, login)
-}
-/// What must outlive a reboot: setups, sign-in indexes and sessions' jobs. The Linux runtime directory is a RAM disk
-/// that logout clears, so there they live under XDG_STATE_HOME; elsewhere
-/// the two are one directory.
-pub fn state_dir() -> PathBuf {
-    if let Some(dir) = var("CAPTUREFAB_SESSION_DIR") {
-        return dir;
-    }
-    if cfg!(test) {
-        return test_dir();
-    }
-    state_dir_in(&var, cfg!(target_os = "linux"))
-}
-/// The per-user cache, for what can be made again: the extracted FFmpeg and
-/// its encoder probes. CAPTUREFAB_CACHE_DIR overrides it.
-pub fn cache_dir() -> Option<PathBuf> {
-    if let Some(dir) = var("CAPTUREFAB_CACHE_DIR") {
-        return Some(dir);
-    }
-    // Tests never touch the user's cache.
-    if cfg!(test) {
-        return Some(std::env::temp_dir().join("capturefab-test-cache"));
-    }
-    cache_dir_in(&var)
-}
-/// Unit tests never touch the user's sessions or saved state: without CAPTUREFAB_SESSION_DIR each test process gets its own
-/// private directory, which its tests share as they would the real one.
-fn test_dir() -> PathBuf {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        std::env::temp_dir().join(format!(
-            "capturefab-test-sessions-{}-{nanos}",
-            std::process::id()
-        ))
-    })
-    .clone()
-}
-/// An environment variable that is set to something.
-fn var(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name)
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-}
-/// An XDG base directory; the specification ignores relative ones.
-fn xdg(var: &impl Fn(&str) -> Option<PathBuf>, name: &str) -> Option<PathBuf> {
-    var(name).filter(|dir| dir.is_absolute())
-}
-fn home(var: &impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
-    var("HOME").unwrap_or_else(std::env::temp_dir)
-}
-/// The shared runtime and state directory on macOS and Windows: the
-/// login's runtime directory, or a folder on disk.
-fn session_dir_in(var: &impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
-    xdg(var, "XDG_RUNTIME_DIR").map_or_else(|| disk_session_dir(var), |dir| dir.join("capturefab"))
-}
-/// The folder on disk sessions fall back to without a runtime directory.
-fn disk_session_dir(var: &impl Fn(&str) -> Option<PathBuf>) -> PathBuf {
-    if cfg!(windows)
-        && let Some(dir) = var("LOCALAPPDATA")
-    {
-        return dir.join("capturefab").join("sessions");
-    }
-    home(var).join(".cache").join("capturefab").join("sessions")
-}
-/// Without XDG_RUNTIME_DIR, the login's own runtime directory when it is
-/// usable, so a service and an SSH shell find the same sessions.
-fn runtime_dir_in(
-    var: &impl Fn(&str) -> Option<PathBuf>,
-    user_runtime: Option<PathBuf>,
-) -> PathBuf {
-    match user_runtime {
-        Some(dir) if xdg(var, "XDG_RUNTIME_DIR").is_none() => dir.join("capturefab"),
-        _ => session_dir_in(var),
-    }
-}
-fn state_dir_in(var: &impl Fn(&str) -> Option<PathBuf>, linux: bool) -> PathBuf {
-    if !linux {
-        return session_dir_in(var);
-    }
-    xdg(var, "XDG_STATE_HOME")
-        .unwrap_or_else(|| home(var).join(".local").join("state"))
-        .join("capturefab")
-}
-/// ~/Library/Caches on macOS, %LOCALAPPDATA% on Windows, and $XDG_CACHE_HOME
-/// or ~/.cache elsewhere.
-fn cache_dir_in(var: &impl Fn(&str) -> Option<PathBuf>) -> Option<PathBuf> {
-    if cfg!(target_os = "macos") {
-        return var("HOME").map(|home| home.join("Library/Caches/capturefab"));
-    }
-    if cfg!(windows) {
-        return var("LOCALAPPDATA").map(|dir| dir.join("capturefab").join("cache"));
-    }
-    xdg(var, "XDG_CACHE_HOME")
-        .or_else(|| var("HOME").map(|home| home.join(".cache")))
-        .map(|dir| dir.join("capturefab"))
-}
-/// Whether a process without XDG_RUNTIME_DIR can keep its sessions in the
-/// login's runtime directory, /run/user/<uid>, where logins look for them.
-#[cfg(any(target_os = "linux", test))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoginDir {
-    /// This user's alone, and kept from boot to shutdown for a lingering user.
-    Usable,
-    /// logind keeps it only while the user is logged in, so a service's
-    /// session would vanish at logout.
-    NotLingering,
-    /// The user lingers, but logind has not made it yet.
-    Missing,
-    /// Another user's, or open to others.
-    NotPrivate,
-}
-#[cfg(any(target_os = "linux", all(unix, test)))]
-impl LoginDir {
-    fn of(dir: &Path, uid: u32, lingers: bool) -> Self {
-        match fs::symlink_metadata(dir) {
-            Ok(_) if !owned_private(dir, uid) => Self::NotPrivate,
-            Ok(_) if lingers => Self::Usable,
-            Err(_) if lingers => Self::Missing,
-            _ => Self::NotLingering,
-        }
-    }
-}
-/// The login's runtime directory and whether it is usable, decided once, so
-/// a process keeps its descriptor, locks and buffers in one place however
-/// logins come and go.
-#[cfg(target_os = "linux")]
-fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
-    static LOGIN: std::sync::OnceLock<(PathBuf, LoginDir)> = std::sync::OnceLock::new();
-    let login = LOGIN.get_or_init(|| {
-        let uid = effective_uid();
-        let dir = PathBuf::from(format!("/run/user/{uid}"));
-        let login = LoginDir::of(&dir, uid, lingers(uid));
-        (dir, login)
-    });
-    Some(login.clone())
-}
-#[cfg(all(test, not(target_os = "linux")))]
-fn login_runtime_dir() -> Option<(PathBuf, LoginDir)> {
-    None
-}
-/// Whether logind keeps `uid`'s runtime directory from boot to shutdown
-/// (`loginctl enable-linger`), not only while the user is logged in.
-#[cfg(target_os = "linux")]
-fn lingers(uid: u32) -> bool {
-    user_name(uid).is_some_and(|name| {
-        !name.is_empty() && Path::new("/var/lib/systemd/linger").join(name).exists()
-    })
-}
-/// The name passwd gives `uid`.
-#[cfg(target_os = "linux")]
-fn user_name(uid: u32) -> Option<std::ffi::OsString> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut entry = std::mem::MaybeUninit::<libc::passwd>::uninit();
-    let mut found = std::ptr::null_mut();
-    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
-    // SAFETY: getpwuid_r fills `entry`, with strings stored in `buffer`, and
-    // points `found` at it only when it found the user.
-    let status = unsafe {
-        libc::getpwuid_r(
-            uid,
-            entry.as_mut_ptr(),
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            &mut found,
-        )
-    };
-    if status != 0 || found.is_null() {
-        return None;
-    }
-    // SAFETY: pw_name is a NUL-terminated string in `buffer`, still alive.
-    let name = unsafe { std::ffi::CStr::from_ptr((*found).pw_name) };
-    Some(std::ffi::OsStr::from_bytes(name.to_bytes()).to_owned())
-}
-/// The login runtime directory that runtime_dir() passed over for a folder
-/// on disk, where logins look for sessions instead, and why.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn missed_runtime_dir() -> Option<(PathBuf, LoginDir)> {
-    if cfg!(test)
-        || var("CAPTUREFAB_SESSION_DIR").is_some()
-        || xdg(&var, "XDG_RUNTIME_DIR").is_some()
-    {
-        return None;
-    }
-    let logind = Path::new("/run/systemd/seats").is_dir() || Path::new("/run/user").is_dir();
-    missed(login_runtime_dir(), logind)
-}
-/// In a login with XDG_RUNTIME_DIR, where a service started without it
-/// keeps its sessions instead, with the login runtime directory it passes
-/// over and why. An SSH login on a line computer would otherwise see no sign
-/// of a service whose sessions it cannot find.
-#[cfg(any(target_os = "linux", test))]
-pub(crate) fn service_runtime_dir() -> Option<(PathBuf, PathBuf, LoginDir)> {
-    if cfg!(test)
-        || var("CAPTUREFAB_SESSION_DIR").is_some()
-        || xdg(&var, "XDG_RUNTIME_DIR").is_none()
-    {
-        return None;
-    }
-    let logind = Path::new("/run/systemd/seats").is_dir() || Path::new("/run/user").is_dir();
-    let (login, why) = missed(login_runtime_dir(), logind)?;
-    Some((disk_session_dir(&var), login, why))
-}
 /// The responsive sessions in `service_runtime_dir`, which this login's
 /// commands do not find, and that folder.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn sessions_elsewhere() -> Option<(PathBuf, Vec<String>)> {
-    let (dir, ..) = service_runtime_dir()?;
+    let (dir, ..) = crate::dirs::service_runtime_dir()?;
     let names: Vec<String> = descriptors_in(&dir)
         .ok()?
         .into_iter()
@@ -481,23 +258,6 @@ pub(crate) fn sessions_elsewhere() -> Option<(PathBuf, Vec<String>)> {
         .map(|descriptor| descriptor.name)
         .collect();
     (!names.is_empty()).then_some((dir, names))
-}
-/// A host without logind, such as a container, has no logins to miss.
-#[cfg(any(target_os = "linux", test))]
-fn missed(login: Option<(PathBuf, LoginDir)>, logind: bool) -> Option<(PathBuf, LoginDir)> {
-    login.filter(|(_, login)| logind && *login != LoginDir::Usable)
-}
-/// A real directory owned by `uid` with mode 0700.
-#[cfg(any(target_os = "linux", all(unix, test)))]
-fn owned_private(dir: &Path, uid: u32) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    fs::symlink_metadata(dir)
-        .is_ok_and(|meta| meta.is_dir() && meta.uid() == uid && meta.mode() & 0o777 == 0o700)
-}
-#[cfg(unix)]
-pub(crate) fn effective_uid() -> u32 {
-    // SAFETY: geteuid has no preconditions and always succeeds.
-    unsafe { libc::geteuid() }
 }
 /// A lock file only this user can open.
 fn lock_file(path: &Path) -> std::io::Result<fs::File> {
@@ -543,66 +303,6 @@ pub fn validate_name(name: &str) -> Result<()> {
 fn descriptor_path_in(dir: &Path, name: &str) -> Result<PathBuf> {
     validate_name(name)?;
     Ok(dir.join(format!("{name}.json")))
-}
-pub fn ensure_private_dir(path: &Path) -> Result<()> {
-    if !path.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            let mut d = fs::DirBuilder::new();
-            d.recursive(true).mode(0o700);
-            d.create(path)?;
-        }
-        #[cfg(not(unix))]
-        fs::create_dir_all(path)?;
-    }
-    check_private_dir(path)
-}
-/// A real directory that only this user can enter. One another user owns,
-/// such as a squatted /tmp or /dev/shm name, is refused even if private.
-/// A refusal is `permission_denied`, with what fixes it as the hint.
-pub(crate) fn check_private_dir(path: &Path) -> Result<()> {
-    let refused = |message: String, hint: String| -> anyhow::Error {
-        crate::types::Categorized::new(crate::types::ErrorKind::PermissionDenied, message)
-            .hint(hint)
-            .into()
-    };
-    let m = fs::symlink_metadata(path)?;
-    if !m.is_dir() || m.file_type().is_symlink() {
-        return Err(refused(
-            format!(
-                "session directory {} must be a real directory",
-                path.display()
-            ),
-            "set CAPTUREFAB_SESSION_DIR to a folder of your own, such as one `mktemp -d` makes"
-                .into(),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if m.uid() != effective_uid() {
-            return Err(refused(
-                format!(
-                    "session directory {} belongs to another user",
-                    path.display()
-                ),
-                "set CAPTUREFAB_SESSION_DIR to a folder of your own, such as one `mktemp -d` makes"
-                    .into(),
-            ));
-        }
-        if m.mode() & 0o077 != 0 {
-            let dir = crate::hint::shell_quote(&path.display().to_string());
-            return Err(refused(
-                format!(
-                    "session directory {} must be private, but its group or others may enter it",
-                    path.display()
-                ),
-                format!("chmod 700 {dir}"),
-            ));
-        }
-    }
-    Ok(())
 }
 /// No descriptor exists for this name. Only [`read_descriptor`] turns it
 /// into advice, so internal lookups never probe other sessions.
@@ -656,7 +356,15 @@ fn kind_name(kind: SessionKind) -> &'static str {
     }
 }
 pub fn read_descriptor(name: &str) -> Result<Descriptor> {
-    let dir = runtime_dir();
+    let dir = crate::dirs::runtime().map_err(|error| {
+        // No runtime folder, so no session could have started.
+        let mut missing = crate::types::Categorized::new(
+            crate::types::ErrorKind::SessionNotFound,
+            format!("session '{name}' not found: {error:#}"),
+        );
+        missing.hint = crate::types::classify(&error).hint;
+        anyhow::Error::from(missing)
+    })?;
     read_descriptor_in(&dir, name).map_err(|error| {
         if !error.is::<MissingSession>() {
             return error;
@@ -666,7 +374,7 @@ pub fn read_descriptor(name: &str) -> Result<Descriptor> {
             let absent = |dir: &Path| {
                 descriptor_path_in(dir, name).is_ok_and(|path| fs::symlink_metadata(path).is_err())
             };
-            if let Some((service, ..)) = service_runtime_dir()
+            if let Some((service, ..)) = crate::dirs::service_runtime_dir()
                 && service != dir
                 && absent(&dir)
                 && !absent(&service)
@@ -1044,7 +752,7 @@ impl Server {
     /// Serve `h` as session `name`, which exits after `idle` without use
     /// when one is given.
     pub fn start(h: SessionHandle, name: &str, idle: Option<Duration>) -> Result<Self> {
-        Self::start_in(h, name, SessionKind::Serve, &runtime_dir(), idle)
+        Self::start_in(h, name, SessionKind::Serve, &crate::dirs::runtime()?, idle)
     }
     fn start_in(
         h: SessionHandle,
@@ -1054,7 +762,7 @@ impl Server {
         idle: Option<Duration>,
     ) -> Result<Self> {
         validate_name(name)?;
-        ensure_private_dir(dir)?;
+        crate::dirs::ensure_private_dir(dir)?;
         let path = descriptor_path_in(dir, name)?;
         let name_lock = lock_file(&dir.join(format!("{name}.session.lock")))?;
         if let Err(error) = name_lock.try_lock_exclusive() {
@@ -1436,7 +1144,7 @@ fn descriptors_in(dir: &Path) -> Result<Vec<Descriptor>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    ensure_private_dir(dir)?;
+    crate::dirs::check_private_dir(dir)?;
     let mut descriptors = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
@@ -1458,7 +1166,11 @@ fn descriptors_in(dir: &Path) -> Result<Vec<Descriptor>> {
 /// Discover authenticated, responsive sessions without touching camera state
 /// or their logs.
 pub fn active_sessions() -> Result<Vec<Descriptor>> {
-    Ok(descriptors_in(&runtime_dir())?
+    // Without a runtime folder no session can run.
+    let Ok(dir) = crate::dirs::runtime() else {
+        return Ok(Vec::new());
+    };
+    Ok(descriptors_in(&dir)?
         .into_iter()
         .filter(descriptor_active)
         .collect())
@@ -1466,7 +1178,9 @@ pub fn active_sessions() -> Result<Vec<Descriptor>> {
 /// The running sessions' descriptors, read locally without asking any of
 /// them: a client matches its camera against these and sends one request.
 pub fn sessions() -> Vec<Descriptor> {
-    let dir = runtime_dir();
+    let Ok(dir) = crate::dirs::runtime() else {
+        return Vec::new();
+    };
     descriptors_in(&dir)
         .unwrap_or_default()
         .into_iter()
@@ -1493,7 +1207,9 @@ pub fn idle_left(name: &str) -> Option<Duration> {
 /// another may start under its name: whether it is. The wait is for its
 /// name lock, which it holds until it exits, so it ends as the session does.
 pub fn wait_ended(name: &str, wait: Duration) -> bool {
-    let Ok(lock) = fs::File::open(runtime_dir().join(format!("{name}.session.lock"))) else {
+    let Ok(lock) = crate::dirs::runtime()
+        .and_then(|dir| Ok(fs::File::open(dir.join(format!("{name}.session.lock")))?))
+    else {
         return running_session(name).is_none();
     };
     let (ended, gone) = std::sync::mpsc::channel();
@@ -1516,7 +1232,7 @@ pub fn wait_ended(name: &str, wait: Duration) -> bool {
 }
 /// Session `name`'s descriptor, when that session runs.
 pub fn running_session(name: &str) -> Option<Descriptor> {
-    let dir = runtime_dir();
+    let dir = crate::dirs::runtime().ok()?;
     read_descriptor_in(&dir, name)
         .ok()
         .filter(|descriptor| running_in(&dir, descriptor))
@@ -1525,7 +1241,7 @@ pub fn running_session(name: &str) -> Option<Descriptor> {
 /// False when there was none, or a session holds the name.
 pub fn remove_stale(name: &str) -> Result<bool> {
     validate_name(name)?;
-    let dir = runtime_dir();
+    let dir = crate::dirs::runtime()?;
     let lock = lock_file(&dir.join(format!("{name}.session.lock")))?;
     if lock.try_lock_exclusive().is_err() {
         return Ok(false);
@@ -1541,8 +1257,8 @@ pub fn remove_stale(name: &str) -> Result<bool> {
 /// running. The turn lasts while the returned file is open.
 pub fn start_turn(name: &str) -> Result<fs::File> {
     validate_name(name)?;
-    let dir = runtime_dir();
-    ensure_private_dir(&dir)?;
+    let dir = crate::dirs::runtime()?;
+    crate::dirs::ensure_private_dir(&dir)?;
     let lock = lock_file(&dir.join(format!("{name}.start.lock")))?;
     lock.lock_exclusive()
         .with_context(|| format!("waiting to start session {name}"))?;
@@ -1565,20 +1281,6 @@ pub(crate) fn process_alive(pid: u32) -> bool {
         true
     }
 }
-/// Whether the runtime directory is a login's /run/user that logind removes
-/// at logout: a detached session's descriptor would vanish with it.
-pub(crate) fn runtime_dir_ends_at_logout() -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let uid = effective_uid();
-        runtime_dir().starts_with(format!("/run/user/{uid}")) && !lingers(uid)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,7 +1297,7 @@ mod tests {
                 std::process::id(),
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
-            ensure_private_dir(&path).unwrap();
+            crate::dirs::ensure_private_dir(&path).unwrap();
             Self(path)
         }
         fn write_descriptor(&self, descriptor: &Descriptor) {
@@ -1641,203 +1343,6 @@ mod tests {
             cameras: Vec::new(),
         }
     }
-    #[test]
-    fn tests_never_default_to_the_users_session_directory() {
-        let dir = test_dir();
-        assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
-        assert_eq!(dir, test_dir(), "one directory per process");
-        if std::env::var_os("CAPTUREFAB_SESSION_DIR").is_none() {
-            assert_eq!(runtime_dir(), dir);
-            assert_eq!(state_dir(), dir);
-        }
-        if std::env::var_os("CAPTUREFAB_CACHE_DIR").is_none() {
-            assert!(cache_dir().unwrap().starts_with(std::env::temp_dir()));
-        }
-        assert_eq!(missed_runtime_dir(), None);
-    }
-
-    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<PathBuf> {
-        let vars: Vec<(String, PathBuf)> = vars
-            .iter()
-            .map(|(name, value)| (name.to_string(), value.into()))
-            .collect();
-        move |name| {
-            vars.iter()
-                .find(|(set, _)| set == name)
-                .map(|(_, value)| value.clone())
-        }
-    }
-
-    // XDG paths are absolute only on Unix.
-    #[cfg(unix)]
-    #[test]
-    fn the_runtime_directory_is_the_same_with_or_without_xdg_runtime_dir() {
-        let login = Some(PathBuf::from("/run/user/1000"));
-        let shell = env(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("HOME", "/home/pi")]);
-        let service = env(&[("HOME", "/home/pi")]);
-        let expected = PathBuf::from("/run/user/1000/capturefab");
-        assert_eq!(runtime_dir_in(&shell, login.clone()), expected);
-        assert_eq!(runtime_dir_in(&shell, None), expected);
-        assert_eq!(runtime_dir_in(&service, login.clone()), expected);
-        // XDG_RUNTIME_DIR, such as a unit's RuntimeDirectory, comes first.
-        let unit = env(&[("XDG_RUNTIME_DIR", "/run/capturefab"), ("HOME", "/home/pi")]);
-        assert_eq!(
-            runtime_dir_in(&unit, login.clone()),
-            PathBuf::from("/run/capturefab/capturefab")
-        );
-        // Without a usable login directory, sessions fall back to disk;
-        // a relative XDG_RUNTIME_DIR counts as unset.
-        let fallback = PathBuf::from("/home/pi/.cache/capturefab/sessions");
-        assert_eq!(runtime_dir_in(&service, None), fallback);
-        let relative = env(&[("XDG_RUNTIME_DIR", "run"), ("HOME", "/home/pi")]);
-        assert_eq!(runtime_dir_in(&relative, None), fallback);
-        assert_eq!(runtime_dir_in(&relative, login), expected);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn linux_keeps_state_out_of_the_runtime_directory() {
-        let shell = env(&[("XDG_RUNTIME_DIR", "/run/user/1000"), ("HOME", "/home/pi")]);
-        let service = env(&[("HOME", "/home/pi")]);
-        let state = PathBuf::from("/home/pi/.local/state/capturefab");
-        assert_eq!(state_dir_in(&shell, true), state);
-        assert_eq!(state_dir_in(&service, true), state);
-        let custom = env(&[("XDG_STATE_HOME", "/data/state"), ("HOME", "/home/pi")]);
-        assert_eq!(
-            state_dir_in(&custom, true),
-            PathBuf::from("/data/state/capturefab")
-        );
-        let relative = env(&[("XDG_STATE_HOME", "state"), ("HOME", "/home/pi")]);
-        assert_eq!(state_dir_in(&relative, true), state);
-        // Elsewhere nothing moves: state stays in the session directory.
-        assert_eq!(
-            state_dir_in(&shell, false),
-            PathBuf::from("/run/user/1000/capturefab")
-        );
-        assert_eq!(
-            state_dir_in(&service, false),
-            PathBuf::from("/home/pi/.cache/capturefab/sessions")
-        );
-    }
-
-    #[test]
-    fn the_cache_follows_each_platform() {
-        let home = env(&[("HOME", "/home/pi"), ("XDG_CACHE_HOME", "/data/cache")]);
-        let expected = if cfg!(target_os = "macos") {
-            Some("/home/pi/Library/Caches/capturefab")
-        } else if cfg!(windows) {
-            None
-        } else {
-            Some("/data/cache/capturefab")
-        };
-        assert_eq!(cache_dir_in(&home), expected.map(PathBuf::from));
-        if !cfg!(any(target_os = "macos", windows)) {
-            let plain = env(&[("HOME", "/home/pi"), ("XDG_CACHE_HOME", "cache")]);
-            assert_eq!(
-                cache_dir_in(&plain),
-                Some(PathBuf::from("/home/pi/.cache/capturefab"))
-            );
-            assert_eq!(cache_dir_in(&env(&[])), None);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn only_a_private_runtime_directory_of_this_user_is_used() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TestDir::new();
-        let uid = effective_uid();
-        let login = dir.0.join("1000");
-        fs::create_dir(&login).unwrap();
-        fs::set_permissions(&login, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(owned_private(&login, uid));
-        assert!(!owned_private(&login, uid + 1), "another user's");
-        fs::set_permissions(&login, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(!owned_private(&login, uid), "readable by others");
-        fs::set_permissions(&login, fs::Permissions::from_mode(0o700)).unwrap();
-        let link = dir.0.join("link");
-        std::os::unix::fs::symlink(&login, &link).unwrap();
-        assert!(!owned_private(&link, uid), "a symbolic link");
-        assert!(!owned_private(&dir.0.join("missing"), uid));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_login_directory_is_used_only_for_a_lingering_user() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = TestDir::new();
-        let uid = effective_uid();
-        let login = dir.0.join("1000");
-        assert_eq!(LoginDir::of(&login, uid, false), LoginDir::NotLingering);
-        assert_eq!(LoginDir::of(&login, uid, true), LoginDir::Missing);
-        fs::create_dir(&login).unwrap();
-        fs::set_permissions(&login, fs::Permissions::from_mode(0o700)).unwrap();
-        // Without lingering, logind removes it at logout, and a service's
-        // session with it, however private it is now.
-        assert_eq!(LoginDir::of(&login, uid, false), LoginDir::NotLingering);
-        assert_eq!(LoginDir::of(&login, uid, true), LoginDir::Usable);
-        assert_eq!(LoginDir::of(&login, uid + 1, true), LoginDir::NotPrivate);
-        fs::set_permissions(&login, fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(LoginDir::of(&login, uid, true), LoginDir::NotPrivate);
-        assert_eq!(LoginDir::of(&login, uid, false), LoginDir::NotPrivate);
-    }
-
-    #[test]
-    fn a_host_without_logind_misses_no_login_directory() {
-        let dir = PathBuf::from("/run/user/1000");
-        for login in [
-            LoginDir::NotLingering,
-            LoginDir::Missing,
-            LoginDir::NotPrivate,
-        ] {
-            assert_eq!(
-                missed(Some((dir.clone(), login)), true),
-                Some((dir.clone(), login))
-            );
-            // A container has no logins that would look there.
-            assert_eq!(missed(Some((dir.clone(), login)), false), None);
-        }
-        assert_eq!(missed(Some((dir, LoginDir::Usable)), true), None);
-        assert_eq!(missed(None, true), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linger_is_looked_up_by_user_name() {
-        assert_eq!(user_name(0).as_deref(), Some(std::ffi::OsStr::new("root")));
-        assert_eq!(user_name(u32::MAX - 1), None);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_directory_of_another_user_is_refused() {
-        // The root directory belongs to root; its mode alone would not
-        // refuse a private one that another user created first.
-        if effective_uid() != 0 {
-            let error = ensure_private_dir(Path::new("/")).unwrap_err().to_string();
-            assert!(error.contains("belongs to another user"), "{error}");
-        }
-        let dir = TestDir::new();
-        ensure_private_dir(&dir.0.join("a/b")).unwrap();
-        // A folder others may enter is refused with the command that fixes it.
-        use std::os::unix::fs::PermissionsExt;
-        let shared = dir.0.join("shared folder");
-        fs::create_dir(&shared).unwrap();
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o755)).unwrap();
-        let error = check_private_dir(&shared).unwrap_err();
-        let classified = crate::types::classify(&error);
-        assert_eq!(classified.kind.code(), ("permission_denied", 3));
-        assert_eq!(
-            classified.hint.as_deref(),
-            Some(format!("chmod 700 '{}'", shared.display()).as_str())
-        );
-        let file = dir.0.join("file");
-        fs::write(&file, b"").unwrap();
-        let classified = crate::types::classify(&check_private_dir(&file).unwrap_err());
-        assert_eq!(classified.kind.code(), ("permission_denied", 3));
-        assert!(classified.hint.unwrap().contains("CAPTUREFAB_SESSION_DIR"));
-    }
-
     #[test]
     fn a_missing_session_names_the_running_ones_and_the_likely_typo() {
         let address = "127.0.0.1:1".parse().unwrap();

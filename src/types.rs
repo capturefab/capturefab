@@ -434,30 +434,6 @@ pub fn human_bytes(value: u64) -> String {
     }
 }
 
-/// Overrides the processing thread limit, for example `CAPTUREFAB_THREADS=1`
-/// on a computer that also runs inference.
-pub const THREADS_ENV: &str = "CAPTUREFAB_THREADS";
-
-/// Threads for CPU-bound processing: `wanted`, at most the computer's cores
-/// (up to eight), or at most `CAPTUREFAB_THREADS` when that is set.
-pub fn processing_threads(wanted: usize) -> usize {
-    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let limit = *LIMIT.get_or_init(|| {
-        thread_limit(
-            std::env::var(THREADS_ENV).ok().as_deref(),
-            std::thread::available_parallelism().map_or(1, |cores| cores.get()),
-        )
-    });
-    wanted.clamp(1, limit)
-}
-
-fn thread_limit(setting: Option<&str>, cores: usize) -> usize {
-    setting
-        .and_then(|setting| setting.trim().parse::<usize>().ok())
-        .filter(|threads| *threads > 0)
-        .map_or(cores.clamp(1, 8), |threads| threads.min(256))
-}
-
 /// What an error's chain says about it: its reason and the hint and
 /// details to report. Typed causes only, never message text; anything
 /// unknown is `failed`.
@@ -797,19 +773,5 @@ mod tests {
         for invalid in ["0", "-1", "1.5GB", "10words", "18446744073709551615TB", ""] {
             assert!(parse_bytes(invalid).is_err(), "{invalid}");
         }
-    }
-
-    #[test]
-    fn thread_limits_follow_the_cores_or_the_setting() {
-        assert_eq!(thread_limit(None, 1), 1);
-        assert_eq!(thread_limit(None, 6), 6);
-        assert_eq!(thread_limit(None, 64), 8);
-        assert_eq!(thread_limit(Some("2"), 64), 2);
-        assert_eq!(thread_limit(Some(" 12 "), 4), 12);
-        for ignored in ["0", "-1", "many", ""] {
-            assert_eq!(thread_limit(Some(ignored), 4), 4, "{ignored}");
-        }
-        assert_eq!(processing_threads(0), 1);
-        assert!(processing_threads(usize::MAX) <= 256);
     }
 }

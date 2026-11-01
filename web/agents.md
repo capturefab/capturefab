@@ -230,8 +230,10 @@ On Linux, state uses `$XDG_STATE_HOME/capturefab` or `~/.local/state/capturefab`
 Without `XDG_RUNTIME_DIR`, runtime can use `/run/user/<uid>/capturefab` when the user lingers and owns `/run/user/<uid>`.
 This lets a service and SSH shell find the same sessions.
 macOS and Windows use one directory for runtime and state.
-`CAPTUREFAB_SESSION_DIR` overrides both.
+`CAPTUREFAB_SESSION_DIR` overrides both; `CAPTUREFAB_STATE_DIR` overrides state alone.
 `CAPTUREFAB_CACHE_DIR` overrides the cache.
+Where the default cannot be written, as on a read-only home or root file system, runtime falls back to `/run/capturefab-0` for root and then `$TMPDIR/capturefab-<uid>`, and the cache to the runtime directory; without a runtime directory, camera commands open their camera alone, and without a state directory presets and saved sign-ins fail with `permission_denied` naming `CAPTUREFAB_STATE_DIR`.
+`doctor --json` reports each directory's fallbacks under `folders`, and CPU and memory limits under `host`.
 
 `CAPTUREFAB_MAX_CAMERAS` accepts integers from 1 to 64.
 `CAPTUREFAB_FRAME_BYTES` accepts 4096–268435456 bytes in multiples of 64.

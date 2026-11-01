@@ -567,9 +567,14 @@ impl Client {
         // warm default leaves the camera to this command.
         if route.warm && !session::can_start() {
             if out.verbose {
+                let why = match crate::dirs::runtime() {
+                    Ok(runtime) => {
+                        format!("no writable folder for its log in {}", runtime.display())
+                    }
+                    Err(error) => format!("{error:#}"),
+                };
                 crate::eprintln!(
-                    "capturefab: no writable runtime folder ({}); the camera is opened for this command alone",
-                    ipc::runtime_dir().display()
+                    "capturefab: no session can start ({why}); the camera is opened for this command alone"
                 );
             }
             route = route.cold();

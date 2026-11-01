@@ -158,6 +158,16 @@ fn session_of(id: &str) -> Result<String> {
 
 /// A job of a session that is not running: lost, or ended, as it saved it.
 fn saved_job(session: &str, id: &str) -> Result<Value> {
+    // Jobs are saved in the state folder; without one, those of a session
+    // that ended are gone.
+    if let Err(error) = crate::dirs::state() {
+        let mut gone = Categorized::new(
+            ErrorKind::SessionNotFound,
+            format!("session {session} is not running, and its jobs were not saved: {error:#}"),
+        );
+        gone.hint = crate::types::classify(&error).hint;
+        return Err(gone.into());
+    }
     crate::session::jobs::orphaned(crate::session::jobs::read(session))
         .iter()
         .map(|job| job.doc(session))

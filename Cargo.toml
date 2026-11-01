@@ -43,17 +43,18 @@ zeroize = "1"
 
 # Inheritable pipes (a detached session's ready line, a worker's stdout
 # capture), the job objects that hold camera workers and what they start,
-# a worker's private protocol handle, and publishing a capture without
-# replacing a file (MoveFileExW).
+# a worker's private protocol handle, publishing a capture without
+# replacing a file (MoveFileExW), and the memory left (GlobalMemoryStatusEx).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 # Ctrl-C, Ctrl-Break and a closed console where there are no Unix signals,
 # which go through libc.
 [target.'cfg(not(unix))'.dependencies]
 ctrlc = { version = "3.4", features = ["termination"] }
 
-# Host facts for doctor (sysctl, statfs, access), process groups and signals
+# Host facts for doctor and memory-scaled queues (sysctl, statfs, statvfs,
+# access), process groups and signals
 # for camera workers, and descriptor inheritance for a worker's stdout
 # capture.
 [target.'cfg(unix)'.dependencies]

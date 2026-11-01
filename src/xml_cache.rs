@@ -32,7 +32,7 @@ pub(crate) fn key(parts: &[&[u8]]) -> String {
 }
 
 fn dir() -> Option<PathBuf> {
-    crate::ipc::cache_dir().map(|cache| cache.join("xml"))
+    crate::dirs::cache().map(|cache| cache.join("xml"))
 }
 
 fn path(key: &str) -> Option<PathBuf> {

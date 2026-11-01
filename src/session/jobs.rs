@@ -238,24 +238,28 @@ struct Book {
     saved_at: Instant,
 }
 
-/// Where session `name`'s jobs are saved.
-pub(crate) fn path(name: &str) -> PathBuf {
-    crate::ipc::state_dir()
+/// Where session `name`'s jobs are saved, in the state folder.
+pub(crate) fn path(name: &str) -> anyhow::Result<PathBuf> {
+    Ok(crate::dirs::state()?
         .join("jobs")
-        .join(format!("{name}.json"))
+        .join(format!("{name}.json")))
 }
 
 /// The jobs a session saved, as they were when it last saved them.
 pub(crate) fn read(name: &str) -> Vec<Job> {
-    std::fs::read(path(name))
+    path(name)
         .ok()
+        .and_then(|path| std::fs::read(path).ok())
         .and_then(|data| serde_json::from_slice::<Vec<Job>>(&data).ok())
         .unwrap_or_default()
 }
 
 /// The names of sessions that saved jobs.
 pub(crate) fn saved_sessions() -> Vec<String> {
-    let mut names = std::fs::read_dir(crate::ipc::state_dir().join("jobs"))
+    let Ok(state) = crate::dirs::state() else {
+        return Vec::new();
+    };
+    let mut names = std::fs::read_dir(state.join("jobs"))
         .into_iter()
         .flatten()
         .flatten()
@@ -298,10 +302,17 @@ impl JobBook {
     /// Session `name`'s jobs, saved as they change: those a session of the
     /// same name left are kept, as lost if they had not ended, and its
     /// numbers go on after theirs.
+    /// Without a writable state folder, as on a read-only system, the jobs
+    /// are kept only while the session runs.
     pub(super) fn saved(name: &str) -> Self {
         let jobs = orphaned(read(name));
         let next = jobs.iter().map(|job| job.number).max().unwrap_or(0);
-        let book = Self::with(name, Some(path(name)), jobs.into(), next);
+        let writable = crate::dirs::found(crate::dirs::Kind::State)
+            .chosen
+            .as_ref()
+            .is_some_and(|chosen| chosen.writable);
+        let file = path(name).ok().filter(|_| writable);
+        let book = Self::with(name, file, jobs.into(), next);
         book.lock().dirty = true;
         book
     }
@@ -605,7 +616,7 @@ impl Book {
         };
         let write = || -> anyhow::Result<()> {
             let dir = file.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?;
-            crate::ipc::ensure_private_dir(dir)?;
+            crate::dirs::ensure_private_dir(dir)?;
             let temp = dir.join(format!(".{}.tmp", std::process::id()));
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create(true).truncate(true);

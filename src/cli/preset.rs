@@ -149,20 +149,23 @@ fn renamed(mut value: Value) -> Value {
 
 pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
     prepare(&command)?;
-    let store = Store::session();
+    // Presets live in the state folder, looked for only by the commands
+    // that use it: applying a file needs none.
+    let store = Store::session;
     match command {
         PresetCommand::List => {
+            let store = store()?;
             let value = json!({"dir": store.dir(), "presets": store.list()?});
             let text = list_text(&value);
             Ok(Report::json(value).text(text))
         }
         PresetCommand::Show { name } => {
-            let value = serde_json::to_value(store.get(&name)?)?;
+            let value = serde_json::to_value(store()?.get(&name)?)?;
             let text = show_text(&value);
             Ok(Report::json(value).text(text))
         }
         PresetCommand::Rm { name } => {
-            let removed = store.remove(&name)?;
+            let removed = store()?.remove(&name)?;
             let text = format!("Deleted preset {}. No camera changed.\n", removed.name);
             Ok(Report::json(json!({"removed": removed.name})).text(text))
         }
@@ -175,7 +178,7 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             if let Some(name) = name {
                 setup.name = name;
             }
-            let path = store.save(&setup, replace).map_err(taken)?;
+            let path = store()?.save(&setup, replace).map_err(taken)?;
             let value = summary(&setup, &path);
             let text = format!(
                 "Imported preset {} with {} settings from {}.\n",
@@ -186,7 +189,7 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             Ok(Report::json(value).text(text))
         }
         PresetCommand::Export { name, output } => {
-            let setup = store.get(&name)?;
+            let setup = store()?.get(&name)?;
             let document = serde_json::to_value(&setup)?;
             let Some(output) = output else {
                 let text = serde_json::to_string_pretty(&document)? + "\n";
@@ -207,6 +210,7 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             keep,
         } => {
             // Store::save checks again under its lock.
+            let store = store()?;
             store.check_free(&name, replace).map_err(taken)?;
             let client = Client::open_with(global, camera.camera.as_deref(), keep.route())?;
             let reading = serde_json::from_value(client.call(SessionCommand::ReadSetup)?)
@@ -583,7 +587,7 @@ fn load(name: &Option<String>, file: &Option<PathBuf>) -> Result<(Option<String>
         Some(file) => Ok((None, document_input(setups::read_file(file))?)),
         None => {
             let name = name.clone().context("name a preset or pass --file")?;
-            let setup = Store::session().get(&name)?;
+            let setup = Store::session()?.get(&name)?;
             Ok((Some(name), setup))
         }
     }

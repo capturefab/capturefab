@@ -1543,6 +1543,15 @@ fn process_plain(
             let c = camera_mut(camera)?;
             let was_streaming = c.is_streaming();
             c.start()?;
+            // A camera this started streams only while something needs its
+            // frames: once the recording ends, the jobs' stream lets it go,
+            // so a warm session does not go on acquiring.
+            if !was_streaming {
+                *scheduled_stream = JobStream {
+                    started: true,
+                    ..JobStream::default()
+                };
+            }
             // A camera that sets its own exposure records once it settled.
             let warmup = if was_streaming {
                 None
@@ -1667,7 +1676,10 @@ fn process_plain(
                             "warn",
                             format!(
                                 "ignoring saved camera sign-ins; fix or remove {}: {error:#}",
-                                h.logins.index_path().display()
+                                h.logins
+                                    .index_path()
+                                    .map(|path| path.display().to_string())
+                                    .unwrap_or_default()
                             ),
                         );
                         false
@@ -2776,7 +2788,8 @@ fn sync_jobs(h: &WorkerHandle, jobs: &mut [Scheduled]) {
 /// The stream capture jobs started, which they stop once none needs it.
 #[derive(Debug, Default)]
 pub(super) struct JobStream {
-    /// Capture jobs started it, or the cameras armed for them.
+    /// Capture jobs or a recording started it, or the cameras armed for
+    /// capture jobs.
     pub(super) started: bool,
     /// Until when it streams for the first frame of jobs armed together,
     /// whether or not one is due yet.
@@ -4363,6 +4376,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
     #[test]
+    fn a_camera_a_recording_started_stops_when_the_recording_ends() {
+        // Ended by its duration, or at its first frame where no FFmpeg
+        // runs: either way nothing needs the camera's frames after it.
+        let root = temp_dir("recording-stops-camera");
+        let h = WorkerHandle::new();
+        h.request(SessionCommand::connect("sim:0".into(), 100))
+            .unwrap();
+        h.request(timed_forward(&root.join("clip.mkv"), Some(300)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.snapshot().forwarding.is_some() || h.snapshot().streaming {
+            assert!(
+                Instant::now() < deadline,
+                "the camera streams on after its recording"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // A camera that streamed before the recording goes on streaming.
+        h.request(SessionCommand::Start).unwrap();
+        h.request(timed_forward(&root.join("live.mkv"), Some(300)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h.snapshot().forwarding.is_some() {
+            assert!(Instant::now() < deadline, "the recording never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(h.snapshot().streaming);
+        h.request(SessionCommand::Stop).unwrap();
+        h.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
     #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
     fn a_timed_recording_ends_itself_and_commits_its_file() {
         let root = temp_dir("timed-recording");
@@ -4381,6 +4427,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert!(crate::scheduling::now_ms() >= until);
+        // The camera it started stops with it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.snapshot().streaming {
+            assert!(Instant::now() < deadline, "the camera streams on");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         // Once the forward is gone, its file is finished and reported.
         let saved = h.take_saved();
         assert_eq!(saved.len(), 1);
@@ -4966,7 +5018,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
             Ok(written(shot, save))
         }
-        let encoders = crate::types::processing_threads(usize::MAX);
+        let encoders = crate::host::threads(usize::MAX);
         let stop = |count: usize| {
             let h = WorkerHandle::new();
             let mut saver = saver::Saver::with(h.clone(), slow, saver::QUEUE_BYTES);
@@ -6152,7 +6204,7 @@ mod tests {
                 crate::scheduling::now_ms()
             ));
             let session = dir.join("session");
-            crate::ipc::ensure_private_dir(&session).unwrap();
+            crate::dirs::ensure_private_dir(&session).unwrap();
             // Two launches that end after half a second, then a steady one.
             let ffmpeg = dir.join("ffmpeg");
             let script = r#"case "$*" in *rtsp*) ;; *) exit 0 ;; esac
@@ -6253,7 +6305,7 @@ esac"#;
         ));
         let store = Arc::new(MemoryStore::default());
         let logins = Logins::with(dir, store.clone());
-        let index = logins.index_path();
+        let index = logins.index_path().unwrap();
         let address = "rtsp://127.0.0.1:9/live";
         logins
             .save(

@@ -756,8 +756,8 @@ pub fn validate_selector(camera: &str) -> Result<()> {
     crate::camera::validate_selector_shape(camera)
 }
 /// Where a session client receives an image captured to stdout: a private
-/// file it names `<pid>-<hex>` in the runtime folder's `out`, or in the
-/// system's temporary folder when that is unusable.
+/// file it names `<pid>-<hex>` in the runtime folder's `out`, or in this
+/// user's temporary folder when that is unusable.
 pub(crate) fn stdout_file(file: &str) -> Result<std::path::PathBuf> {
     let path = std::path::Path::new(file);
     let named = path
@@ -770,17 +770,18 @@ pub(crate) fn stdout_file(file: &str) -> Result<std::path::PathBuf> {
                 && !rest.is_empty()
                 && rest.bytes().all(|byte| byte.is_ascii_hexdigit())
         });
-    let parent = path.parent();
+    let parent = path.parent().map(std::path::Path::to_path_buf);
+    let out = stdout_dir();
     ensure!(
-        named && (parent == Some(&stdout_dir()) || parent == Some(&std::env::temp_dir())),
+        named && parent.is_some() && (parent == out || parent == crate::dirs::temp()),
         "a stdout file must be a <pid>-<hex> file in {}",
-        stdout_dir().display()
+        out.unwrap_or_default().display()
     );
     Ok(path.to_path_buf())
 }
 /// The private folder images captured to stdout through a session wait in.
-pub(crate) fn stdout_dir() -> std::path::PathBuf {
-    crate::ipc::runtime_dir().join("out")
+pub(crate) fn stdout_dir() -> Option<std::path::PathBuf> {
+    crate::dirs::runtime().ok().map(|dir| dir.join("out"))
 }
 /// Remove the images captured to stdout in `dir` that commands which died
 /// left: older than ten minutes, named for a process that is gone.
@@ -1346,7 +1347,9 @@ impl SessionHandle {
     /// own output has only warnings and errors.
     pub fn named(name: &str) -> Result<Self> {
         crate::ipc::validate_name(name)?;
-        sweep_stdout_files(&stdout_dir());
+        if let Some(dir) = stdout_dir() {
+            sweep_stdout_files(&dir);
+        }
         Ok(Self::create(name, true, true, JobBook::saved(name)))
     }
     fn create(name: &str, verbose: bool, print_logs: bool, jobs: JobBook) -> Self {
@@ -3597,7 +3600,7 @@ mod tests {
         h.shutdown();
         let name = format!("resolve-{}", std::process::id());
         let setup = crate::setup::from_read(&name, None, reading).unwrap();
-        let store = crate::setup::Store::session();
+        let store = crate::setup::Store::session().unwrap();
         store.save(&setup, true).unwrap();
         let apply = SessionCommand::ApplySetup {
             name: Some(name.clone()),

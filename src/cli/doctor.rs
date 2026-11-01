@@ -13,11 +13,27 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ("features", "{usb,jpeg,keychain} — what this build includes"),
     (
         "dirs",
-        "{runtime,state,cache,inspect} — runtime: sessions; state: presets, sign-ins; cache: FFmpeg; inspect: previews",
+        "{runtime,state,cache,inspect} — runtime: sessions; state: presets, sign-ins; cache: FFmpeg; inspect: previews; null when there is none",
+    ),
+    (
+        "folders",
+        "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
+    ),
+    (
+        "warm_sessions",
+        "bool — camera commands can keep their camera open in the auto session",
+    ),
+    (
+        "read_only_root",
+        "bool or null — the root file system is mounted read-only (Linux)",
+    ),
+    (
+        "host",
+        "{cpus,threads,cpu_quota,memory:{total_bytes,available_bytes,cgroup_limit_bytes,cgroup_used_bytes,budget_bytes}} — what cgroups leave this process",
     ),
     (
         "ffmpeg",
-        "{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version} or {error} — FFmpeg is looked for in that order",
+        "{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted",
     ),
 ];
 pub const LICENSES_FIELDS: &[(&str, &str)] = &[
@@ -29,7 +45,7 @@ pub const LICENSES_FIELDS: &[(&str, &str)] = &[
 ];
 
 pub fn doctor(_global: &Global) -> Report {
-    let report = crate::doctor::report();
+    let report = crate::doctor::report(super::session::can_start());
     let mut text = Vec::new();
     let _ = crate::doctor::print_checklist(&mut text, &report);
     Report::json(report).text(String::from_utf8_lossy(&text))

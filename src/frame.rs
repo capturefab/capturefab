@@ -580,9 +580,7 @@ pub(crate) fn worker_threads(pixels: usize) -> usize {
     if pixels < 512 * 1024 {
         return 1;
     }
-    crate::types::processing_threads(spare_cores(
-        std::thread::available_parallelism().map_or(1, |n| n.get()),
-    ))
+    crate::host::threads(spare_cores(crate::host::cpus()))
 }
 /// Up to eight of a computer's `cores`, always leaving one for the camera
 /// threads.

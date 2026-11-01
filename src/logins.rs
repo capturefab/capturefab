@@ -467,7 +467,9 @@ pub enum Remembered {
 /// The saved sign-ins of one state directory and credential store.
 #[derive(Clone)]
 pub struct Logins {
-    dir: PathBuf,
+    /// None: the state folder, found when a sign-in is first looked up, so
+    /// a camera that needs none never looks for it.
+    dir: Option<PathBuf>,
     store: Option<Arc<dyn Store>>,
 }
 
@@ -497,7 +499,10 @@ impl Logins {
         {
             static STORE: std::sync::OnceLock<Arc<MemoryStore>> = std::sync::OnceLock::new();
             let store: Arc<dyn Store> = STORE.get_or_init(Arc::default).clone();
-            Self::with(crate::ipc::state_dir(), store)
+            Self {
+                dir: None,
+                store: can_remember().then_some(store),
+            }
         }
         #[cfg(not(test))]
         {
@@ -505,28 +510,31 @@ impl Logins {
             let store: Option<Arc<dyn Store>> = Some(Arc::new(SystemStore));
             #[cfg(not(feature = "keychain"))]
             let store: Option<Arc<dyn Store>> = None;
-            Self {
-                dir: crate::ipc::state_dir(),
-                store,
-            }
+            Self { dir: None, store }
         }
     }
     #[cfg(test)]
     pub(crate) fn with(dir: PathBuf, store: Arc<dyn Store>) -> Self {
         Self {
-            dir,
+            dir: Some(dir),
             store: can_remember().then_some(store),
         }
     }
-    fn path(&self) -> PathBuf {
-        self.dir.join(INDEX)
+    fn dir(&self) -> Result<PathBuf> {
+        match &self.dir {
+            Some(dir) => Ok(dir.clone()),
+            None => crate::dirs::state(),
+        }
+    }
+    fn path(&self) -> Result<PathBuf> {
+        Ok(self.dir()?.join(INDEX))
     }
     /// The non-secret index file, for messages.
-    pub fn index_path(&self) -> PathBuf {
+    pub fn index_path(&self) -> Result<PathBuf> {
         self.path()
     }
     fn read(&self) -> Result<File> {
-        let path = self.path();
+        let path = self.path()?;
         let input = match fs::File::open(&path) {
             Ok(input) => input,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -559,8 +567,9 @@ impl Logins {
         Ok(file)
     }
     fn write(&self, file: &File) -> Result<()> {
-        crate::ipc::ensure_private_dir(&self.dir)?;
-        let temp = self.dir.join(format!("{INDEX}.{}.tmp", std::process::id()));
+        let dir = self.dir()?;
+        crate::dirs::ensure_private_dir(&dir)?;
+        let temp = dir.join(format!("{INDEX}.{}.tmp", std::process::id()));
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -577,7 +586,7 @@ impl Logins {
             );
             output.write_all(&bytes)?;
             output.sync_all()?;
-            fs::rename(&temp, self.path())?;
+            fs::rename(&temp, dir.join(INDEX))?;
             Ok(())
         })();
         if result.is_err() {
@@ -586,12 +595,13 @@ impl Logins {
         result
     }
     fn open_lock(&self) -> Result<fs::File> {
-        crate::ipc::ensure_private_dir(&self.dir)?;
+        let dir = self.dir()?;
+        crate::dirs::ensure_private_dir(&dir)?;
         Ok(fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(self.dir.join(LOCK))?)
+            .open(dir.join(LOCK))?)
     }
     /// Run `update` under the cross-process lock and write the result. When
     /// writing fails, `rollback` undoes what `update` did outside the file.
@@ -620,8 +630,12 @@ impl Logins {
     pub fn list(&self) -> Result<Vec<Entry>> {
         Ok(self.read()?.logins)
     }
-    /// The saved entry for an address (index only).
+    /// The saved entry for an address (index only). Without a state
+    /// folder, as on a read-only system, nothing was saved.
     pub fn entry(&self, address: &str) -> Result<Option<Entry>> {
+        if self.dir().is_err() {
+            return Ok(None);
+        }
         Ok(self
             .read()?
             .logins
@@ -968,7 +982,7 @@ mod tests {
             secrets.values().next().unwrap().as_str(),
             "v1:longer-password"
         );
-        let bytes = fs::read(logins.index_path()).unwrap();
+        let bytes = fs::read(logins.index_path().unwrap()).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(
             !text.contains("longer-password") && text.contains("viewer"),
@@ -977,7 +991,7 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(logins.index_path())
+            let mode = fs::metadata(logins.index_path().unwrap())
                 .unwrap()
                 .permissions()
                 .mode();
@@ -1012,8 +1026,8 @@ mod tests {
             )
             .unwrap();
         // A directory where the index belongs makes the rename fail.
-        fs::remove_file(logins.index_path()).unwrap();
-        fs::create_dir(logins.index_path()).unwrap();
+        fs::remove_file(logins.index_path().unwrap()).unwrap();
+        fs::create_dir(logins.index_path().unwrap()).unwrap();
         assert!(
             logins
                 .save(
@@ -1026,7 +1040,7 @@ mod tests {
             store.secrets.lock().unwrap()[&account("admin", address)].as_str(),
             "v1:first-password"
         );
-        fs::remove_dir(logins.index_path()).unwrap();
+        fs::remove_dir(logins.index_path().unwrap()).unwrap();
         assert!(
             logins
                 .save("rtsp://new:554/", &CameraLogin::new("u", "x").unwrap())
@@ -1088,7 +1102,7 @@ mod tests {
     #[test]
     fn oversized_or_unknown_indexes_are_refused() {
         let dir = temp("oversized");
-        crate::ipc::ensure_private_dir(&dir).unwrap();
+        crate::dirs::ensure_private_dir(&dir).unwrap();
         let logins = Logins::with(dir.clone(), Arc::new(MemoryStore::default()));
         fs::write(dir.join(INDEX), vec![b' '; MAX_FILE + 1]).unwrap();
         assert!(logins.list().is_err());

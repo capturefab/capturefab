@@ -21,9 +21,21 @@ const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 static NEXT_IMAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Where previews go unless a request names a file: private, bounded, and
-/// shown by doctor, so a person can allow reading it once.
-pub(crate) fn preview_dir() -> PathBuf {
-    crate::ipc::runtime_dir().join("inspect")
+/// shown by doctor, so a person can allow reading it once. Without a
+/// runtime folder, this user's temporary folder holds them.
+pub(crate) fn preview_dir() -> Result<PathBuf> {
+    crate::dirs::scratch()
+        .map(|dir| dir.join("inspect"))
+        .map_err(|error| {
+            let mut refused = crate::types::Categorized::new(
+                crate::types::ErrorKind::PermissionDenied,
+                format!("no folder for the preview: {error:#}"),
+            );
+            refused.hint = Some(
+                "write it to a file with --preview FILE, or skip it with --preview none".into(),
+            );
+            refused.into()
+        })
 }
 
 /// What a `frame` request asks for.
@@ -112,13 +124,24 @@ impl Job {
 pub(super) struct Inspector {
     jobs: Option<SyncSender<Job>>,
     held: Arc<AtomicUsize>,
+    /// Bytes of the frames held, which with their conversions must fit
+    /// the memory this process may use.
+    bytes: Arc<AtomicUsize>,
 }
 impl Inspector {
     /// Hand `job` to the inspector thread, or refuse it at once when it
-    /// holds as many as it may.
+    /// holds as many as it may: `MAX_INSPECTIONS`, and frames of at most a
+    /// quarter of the memory left. One is always taken.
     fn inspect(&mut self, job: Job) {
-        if self.held.fetch_add(1, Ordering::AcqRel) >= MAX_INSPECTIONS {
+        let size = job.frame.data.len();
+        let held = self.held.fetch_add(1, Ordering::AcqRel);
+        let bytes = self.bytes.fetch_add(size, Ordering::AcqRel);
+        let room = crate::host::memory_budget().map_or(usize::MAX, |budget| {
+            usize::try_from(budget / 4).unwrap_or(usize::MAX)
+        });
+        if held >= MAX_INSPECTIONS || (held > 0 && bytes.saturating_add(size) > room) {
             self.held.fetch_sub(1, Ordering::AcqRel);
+            self.bytes.fetch_sub(size, Ordering::AcqRel);
             (job.reply)(Err(crate::types::Categorized::new(
                 crate::types::ErrorKind::CameraBusy,
                 "too many frame inspections are waiting; retry when one returns",
@@ -129,14 +152,17 @@ impl Inspector {
         let jobs = self.jobs.get_or_insert_with(|| {
             let (jobs, inbox) = mpsc::sync_channel::<Job>(MAX_INSPECTIONS);
             let held = self.held.clone();
+            let bytes = self.bytes.clone();
             std::thread::Builder::new()
                 .name("capturefab-inspector".into())
                 .spawn(move || {
                     for job in inbox {
                         let result = measure(&job);
+                        let size = job.frame.data.len();
                         // The frame is let go before the reply is sent.
                         let reply = job.into_reply();
                         held.fetch_sub(1, Ordering::AcqRel);
+                        bytes.fetch_sub(size, Ordering::AcqRel);
                         reply(result);
                     }
                 })
@@ -147,6 +173,7 @@ impl Inspector {
             jobs.try_send(job)
         {
             self.held.fetch_sub(1, Ordering::AcqRel);
+            self.bytes.fetch_sub(size, Ordering::AcqRel);
             (job.reply)(Err(anyhow::anyhow!("the frame inspector stopped")));
         }
     }
@@ -540,7 +567,12 @@ pub(super) fn measurements(
                 crate::storage::save_one(&image.bytes, path)?;
                 path.to_path_buf()
             }
-            None => private_image(&preview_dir(), &safe_label(camera), &image.bytes, extension)?,
+            None => private_image(
+                &preview_dir()?,
+                &safe_label(camera),
+                &image.bytes,
+                extension,
+            )?,
         };
         reply["image"] = json!({
             "mime": image.mime,
@@ -581,7 +613,7 @@ fn safe_label(value: &str) -> String {
 /// symlinked folder), then keep only the newest `MAX_IMAGES` files and
 /// `MAX_IMAGE_BYTES` there.
 fn private_image(dir: &Path, label: &str, bytes: &[u8], extension: &str) -> Result<PathBuf> {
-    crate::ipc::ensure_private_dir(dir)?;
+    crate::dirs::ensure_private_dir(dir)?;
     let stamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
