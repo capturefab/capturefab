@@ -145,7 +145,7 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
     } else if crate::media::is_url_source(selector) || selector.contains("://") {
         crate::media::validate_source_shape(selector)?;
     } else if malformed_ipv4(selector) {
-        return Err(crate::dataset::Usage(format!(
+        return Err(crate::types::Usage(format!(
             "'{selector}' is not a valid IPv4 address; use A.B.C.D or gige:A.B.C.D"
         ))
         .into());

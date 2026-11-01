@@ -53,6 +53,7 @@ pub mod remote;
 pub mod resources;
 pub mod scanner;
 pub mod scheduling;
+pub mod scrub;
 pub mod secret_input;
 pub mod session;
 pub mod setup;

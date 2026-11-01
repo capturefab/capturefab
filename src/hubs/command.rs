@@ -258,7 +258,7 @@ fn add(store: &Store, command: &HubCommand, timeout: Duration) -> Result<Value> 
             Ok(value) if !value.is_empty() => (Some(Secret::new(hub.kind, value)?), false),
             _ if server.no_check => (None, false),
             _ => {
-                return Err(crate::dataset::Usage(format!(
+                return Err(crate::types::Usage(format!(
                     "{variable} is not set here; set it in this shell to check the hub, and in the process that opens its cameras, or save with --no-check"
                 ))
                 .into());
@@ -277,7 +277,7 @@ fn add(store: &Store, command: &HubCommand, timeout: Duration) -> Result<Value> 
                 hub.account().ok().and_then(|a| secret::keychain_has(&a)) == Some(true)
             });
         if !reusable {
-            return Err(crate::dataset::Usage(format!(
+            return Err(crate::types::Usage(format!(
                 "hub {} needs --secret-stdin or --secret-env VAR",
                 hub.kind.command()
             ))

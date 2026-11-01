@@ -12,10 +12,13 @@ pub mod task;
 mod tests;
 mod write;
 
+pub use crate::engine::saved::{
+    RecordedFile, SAVED_LOG_CAP, SavedBatch, SavedCamera, SavedFile, SavedItem, SavedLog,
+};
 pub use db::Dataset;
 pub use query::Reader;
 
-use crate::{context::Context, types::CameraInfo};
+use crate::context::Context;
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,144 +30,6 @@ use std::{
 };
 
 pub const SCHEMA_VERSION: u32 = 1;
-/// Saved-file entries a worker keeps until the coordinator collects them.
-pub const SAVED_LOG_CAP: usize = 100_000;
-
-/// The camera that produced a batch of saved files. Its source address is
-/// redacted before it leaves the worker.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SavedCamera {
-    pub id: String,
-    pub transport: String,
-    pub vendor: String,
-    pub model: String,
-    pub serial: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-}
-impl From<&CameraInfo> for SavedCamera {
-    fn from(info: &CameraInfo) -> Self {
-        Self {
-            id: info.id.clone(),
-            transport: serde_json::to_value(info.transport)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
-                .unwrap_or_default(),
-            vendor: info.vendor.clone(),
-            model: info.model.clone(),
-            serial: info.serial.clone(),
-            source: info.address.as_deref().map(crate::media::redact_url),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SavedItem {
-    Capture {
-        frame_id: u64,
-        timestamp_ns: u64,
-        width: u32,
-        height: u32,
-        pixel_format: u32,
-        format: String,
-        /// capture or schedule.
-        origin: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        job_id: Option<u64>,
-    },
-    Recording {
-        started_ms: u64,
-        ended_ms: u64,
-        codec: String,
-        encoder: String,
-        fps: f64,
-    },
-}
-
-/// One finished file, reported by a camera worker to the coordinator.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SavedFile {
-    /// Per-worker sequence number, stamped by `push_saved`; gaps mean losses.
-    #[serde(default)]
-    pub seq: u64,
-    /// UTC Unix milliseconds, taken when the frame was received.
-    pub wall_ms: u64,
-    pub path: String,
-    pub bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
-    #[serde(default, skip_serializing_if = "Context::is_empty")]
-    pub context: Context,
-    #[serde(flatten)]
-    pub item: SavedItem,
-}
-
-/// Saved files drained from a worker in one reply.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
-pub struct SavedBatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub camera: Option<SavedCamera>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub items: Vec<SavedFile>,
-    /// Entries dropped because the worker's log was full.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub lost: u64,
-}
-fn is_zero(value: &u64) -> bool {
-    *value == 0
-}
-impl SavedBatch {
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty() && self.lost == 0
-    }
-}
-
-/// A worker's bounded log of saved files; overflow drops the oldest entries
-/// and counts them as lost.
-#[derive(Debug, Default)]
-pub struct SavedLog {
-    next_seq: u64,
-    items: VecDeque<SavedFile>,
-    lost: u64,
-}
-impl SavedLog {
-    pub fn push(&mut self, mut file: SavedFile) {
-        self.next_seq += 1;
-        file.seq = self.next_seq;
-        if self.items.len() >= SAVED_LOG_CAP {
-            self.items.pop_front();
-            self.lost += 1;
-        }
-        self.items.push_back(file);
-    }
-    /// Remove up to `max` of the oldest entries and the lost count.
-    pub fn take(&mut self, max: usize) -> (Vec<SavedFile>, u64) {
-        let count = max.min(self.items.len());
-        (
-            self.items.drain(..count).collect(),
-            std::mem::take(&mut self.lost),
-        )
-    }
-}
-
-/// A finished local recording, reported by the forwarder when it stops.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct RecordedFile {
-    pub path: String,
-    pub bytes: u64,
-    pub sha256: String,
-    pub started_ms: u64,
-    pub ended_ms: u64,
-    pub codec: String,
-    pub encoder: String,
-    pub fps: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub destination: Option<String>,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct DatasetStatus {
     pub path: String,
@@ -542,15 +407,7 @@ pub const MAX_NOTE_BYTES: usize = 4096;
 /// The smallest `--max-bytes`: room for an empty dataset and some data.
 pub const MIN_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// A request the caller must change (exit code 2), raised while it runs.
-#[derive(Debug)]
-pub struct Usage(pub String);
-impl std::fmt::Display for Usage {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-impl std::error::Error for Usage {}
+pub use crate::types::Usage;
 
 fn check_path(path: &str, what: &str) -> Result<()> {
     if path.is_empty() || path.chars().any(char::is_control) {

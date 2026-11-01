@@ -106,7 +106,7 @@ pub struct Selector {
 }
 
 fn shape(message: impl Into<String>) -> anyhow::Error {
-    crate::dataset::Usage(message.into()).into()
+    crate::types::Usage(message.into()).into()
 }
 
 /// Percent-encode everything except RFC 3986 unreserved characters, with
@@ -458,7 +458,7 @@ mod tests {
         ] {
             let error = Selector::parse(bad).unwrap_err();
             assert!(
-                error.chain().any(|c| c.is::<crate::dataset::Usage>()),
+                error.chain().any(|c| c.is::<crate::types::Usage>()),
                 "{bad}: {error:#}"
             );
             assert_eq!(crate::cli::error_code(&error), ("usage", 2), "{bad}");

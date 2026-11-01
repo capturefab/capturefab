@@ -44,7 +44,7 @@ pub fn for_output_text(text: &str) -> String {
 /// string of `known` (the call's own arguments or command) that carries
 /// credentials even where the message does not show it as a URL.
 pub fn for_output_error(message: &str, known: &Value) -> String {
-    for_output_text(&crate::workflow::redact_error(message, known))
+    for_output_text(&crate::scrub::redact_error(message, known))
 }
 
 /// `value` as an AI provider may see it: `for_output`, without identifying
@@ -60,7 +60,7 @@ pub fn for_model_text(text: &str) -> String {
 
 /// An error message for an AI provider; see `for_output_error`.
 pub fn for_model_error(message: &str, known: &Value) -> String {
-    for_model_text(&crate::workflow::redact_error(message, known))
+    for_model_text(&crate::scrub::redact_error(message, known))
 }
 
 /// `path` with the home folder written `~`, as locations are shown to
@@ -82,7 +82,7 @@ fn output_string(text: &str) -> String {
         return for_output_text(text);
     }
     let mut value = Value::String(text.to_owned());
-    crate::workflow::redact_value(&mut value);
+    crate::scrub::redact_value(&mut value);
     for_output_text(value.as_str().unwrap_or(text))
 }
 

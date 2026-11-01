@@ -57,7 +57,7 @@ pub fn validate(kind: Kind, value: &str) -> Result<()> {
             }
             Kind::Frigate | Kind::Go2rtc => "1-4096 bytes with no control characters",
         };
-        Err(crate::dataset::Usage(format!("the {noun} must be {rule}")).into())
+        Err(crate::types::Usage(format!("the {noun} must be {rule}")).into())
     }
 }
 
@@ -82,7 +82,7 @@ fn read_line_bounded(reader: impl std::io::BufRead, what: &str) -> Result<String
     reader.take(4099).read_until(b'\n', &mut line)?;
     if !line.ends_with(b"\n") && line.len() > 4096 {
         line.fill(0);
-        return Err(crate::dataset::Usage(format!("the {what} exceeds 4096 bytes")).into());
+        return Err(crate::types::Usage(format!("the {what} exceeds 4096 bytes")).into());
     }
     read_bounded(line.as_slice(), what)
 }
@@ -91,7 +91,7 @@ fn read_line_bounded(reader: impl std::io::BufRead, what: &str) -> Result<String
 /// removed. The buffer moves into the returned string without a copy.
 fn read_bounded(reader: impl std::io::Read, what: &str) -> Result<String> {
     use std::io::Read;
-    let usage = |message: String| anyhow::Error::from(crate::dataset::Usage(message));
+    let usage = |message: String| anyhow::Error::from(crate::types::Usage(message));
     let mut bytes = Vec::with_capacity(4099);
     reader.take(4099).read_to_end(&mut bytes)?;
     if bytes.len() > 4098 {

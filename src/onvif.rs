@@ -1464,7 +1464,7 @@ fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Opti
 pub fn endpoint_key(source: &str) -> Result<String> {
     let (endpoint, credentials) = source_endpoint(source)?;
     if credentials.is_some() {
-        return Err(crate::dataset::Usage(
+        return Err(crate::types::Usage(
             "leave the user name and password out of the address; use --user and --password-stdin"
                 .into(),
         )
@@ -1630,7 +1630,7 @@ pub fn connect_with(
     if let Some(login) = login {
         ensure!(
             credentials.is_none(),
-            crate::dataset::Usage(
+            crate::types::Usage(
                 "leave the user name and password out of the address when signing in".into()
             )
         );

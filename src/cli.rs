@@ -1,6 +1,7 @@
 pub(crate) mod assistant;
 mod human;
 pub mod login;
+pub(crate) mod paths;
 mod resources;
 mod setup;
 mod summary;
@@ -187,7 +188,7 @@ fn caller_output(command: &mut SessionCommand) -> Result<()> {
     if matches!(command, SessionCommand::Capture { output, .. } if output == "-") {
         return Ok(());
     }
-    crate::workflow::resolve_outputs(command, &std::env::current_dir()?)
+    paths::resolve_outputs(command, &std::env::current_dir()?)
 }
 #[derive(Debug, Args)]
 pub struct StorageArgs {
@@ -1565,12 +1566,12 @@ pub fn run(mut cli: Cli) -> Result<()> {
         && !is_assistant
         && let Some(camera) = &mut cli.camera
     {
-        input(crate::workflow::resolve_selector(camera, &base))?;
+        input(paths::resolve_selector(camera, &base))?;
     }
     if let Some(Command::Connect { target } | Command::Select { target }) = &mut cli.command
         && let Some(camera) = target
     {
-        input(crate::workflow::resolve_selector(camera, &base))?;
+        input(paths::resolve_selector(camera, &base))?;
     }
     let mut prepared_tools = None;
     let mut prepared_assistant = None;
@@ -2377,10 +2378,7 @@ pub fn run(mut cli: Cli) -> Result<()> {
             if let SessionCommand::Connect { camera, .. } | SessionCommand::Select { camera } =
                 &mut command
             {
-                input(crate::workflow::resolve_selector(
-                    camera,
-                    &std::env::current_dir()?,
-                ))?;
+                input(paths::resolve_selector(camera, &std::env::current_dir()?))?;
             }
             input(caller_output(&mut command))?;
             client.call(command)?
@@ -3301,7 +3299,7 @@ fn dataset_file(command: &DatasetCommand, prepared: Option<SessionCommand>) -> R
     };
     let dataset = crate::dataset::Dataset::open_read_only(&absolute_dataset(file)?)?;
     let usage = |error: anyhow::Error| -> anyhow::Error {
-        if error.is::<crate::dataset::Usage>() {
+        if error.is::<crate::types::Usage>() {
             InvalidInput(error.to_string()).into()
         } else {
             error
@@ -3732,7 +3730,7 @@ pub fn error_code(error: &anyhow::Error) -> (&'static str, i32) {
     }
     if error.chain().any(|cause| {
         cause.is::<InvalidInput>()
-            || cause.is::<crate::dataset::Usage>()
+            || cause.is::<crate::types::Usage>()
             || cause.is::<ToolsConfirmationRequired>()
     }) {
         return ("usage", 2);

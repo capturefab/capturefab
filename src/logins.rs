@@ -40,7 +40,7 @@ pub fn can_remember() -> bool {
 }
 
 fn usage(message: impl Into<String>) -> anyhow::Error {
-    crate::dataset::Usage(message.into()).into()
+    crate::types::Usage(message.into()).into()
 }
 
 /// The normalized address a sign-in is saved under.

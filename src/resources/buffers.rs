@@ -248,9 +248,9 @@ fn reserve_at(
             .checked_add(capacity_bytes)
             .is_some_and(|total| total <= limit),
         "Camera buffer limit reached: {} reserved, {} needed, {} limit. Disconnect a camera or raise the camera-buffer budget.",
-        crate::analytics::human_bytes(usage.used_bytes),
-        crate::analytics::human_bytes(capacity_bytes),
-        crate::analytics::human_bytes(limit)
+        crate::types::human_bytes(usage.used_bytes),
+        crate::types::human_bytes(capacity_bytes),
+        crate::types::human_bytes(limit)
     );
     let room = headroom(usage.used_bytes, limit, host);
     if let Some(available) = host.memory_available {
@@ -259,9 +259,9 @@ fn reserve_at(
             room.physical_bytes
                 .is_some_and(|physical| physical >= capacity_bytes),
             "Not enough available memory for camera buffers: {} available, {} needed, plus {} kept free. Close unused cameras or other applications.",
-            crate::analytics::human_bytes(available),
-            crate::analytics::human_bytes(capacity_bytes),
-            crate::analytics::human_bytes(reserve)
+            crate::types::human_bytes(available),
+            crate::types::human_bytes(capacity_bytes),
+            crate::types::human_bytes(reserve)
         );
     }
     let mut nonce = [0u8; 16];

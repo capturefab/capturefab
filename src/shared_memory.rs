@@ -807,9 +807,9 @@ fn storage_full(dir: &Path, free: u64, length: u64) -> anyhow::Error {
     anyhow::anyhow!(
         "storage full: {} has {} free; a camera frame ring needs {} plus {} kept as disk headroom. Free disk space or lower CAPTUREFAB_FRAME_BYTES.",
         dir.display(),
-        crate::analytics::human_bytes(free),
-        crate::analytics::human_bytes(length),
-        crate::analytics::human_bytes(crate::storage::FREE_SPACE_FLOOR)
+        crate::types::human_bytes(free),
+        crate::types::human_bytes(length),
+        crate::types::human_bytes(crate::storage::FREE_SPACE_FLOOR)
     )
 }
 

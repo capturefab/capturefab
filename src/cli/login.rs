@@ -31,7 +31,7 @@ pub enum LoginCommand {
 }
 
 fn usage(message: impl Into<String>) -> anyhow::Error {
-    crate::dataset::Usage(message.into()).into()
+    crate::types::Usage(message.into()).into()
 }
 
 /// Checks that need neither stdin, the credential store nor a camera.

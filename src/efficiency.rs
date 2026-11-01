@@ -295,10 +295,7 @@ fn constraints(host: &HostFacts) -> Vec<String> {
         reasons.push(format!("{} CPU core{plural}", host.cpu_cores));
     }
     if let Some(total) = host.memory_total.filter(|total| *total <= SMALL_MEMORY) {
-        reasons.push(format!(
-            "{} of memory",
-            crate::analytics::human_bytes(total)
-        ));
+        reasons.push(format!("{} of memory", crate::types::human_bytes(total)));
     }
     if host.low_power {
         reasons.push(LOW_POWER.into());

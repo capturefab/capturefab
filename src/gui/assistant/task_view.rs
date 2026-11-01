@@ -387,7 +387,7 @@ fn setup<'a>(state: &'a tasks::State, p: &'static Palette) -> Element<'a, tasks:
                 format::span(Duration::from_millis(state.limits.max_wall_ms)),
                 state.limits.max_images,
                 state.limits.max_captures,
-                crate::analytics::human_bytes(state.limits.max_bytes),
+                crate::types::human_bytes(state.limits.max_bytes),
             ),
             p,
         ))
@@ -784,8 +784,8 @@ fn budgets<'a>(state: &'a tasks::State, p: &'static Palette) -> Element<'a, task
             totals.bytes,
             limits.max_bytes,
             Some((
-                crate::analytics::human_bytes(totals.bytes),
-                crate::analytics::human_bytes(limits.max_bytes),
+                crate::types::human_bytes(totals.bytes),
+                crate::types::human_bytes(limits.max_bytes),
             )),
         ),
     ] {
@@ -808,8 +808,8 @@ fn budgets<'a>(state: &'a tasks::State, p: &'static Palette) -> Element<'a, task
             "Export data",
             totals.data_bytes as f64,
             limits.max_data_bytes as f64,
-            crate::analytics::human_bytes(totals.data_bytes),
-            crate::analytics::human_bytes(limits.max_data_bytes),
+            crate::types::human_bytes(totals.data_bytes),
+            crate::types::human_bytes(limits.max_data_bytes),
             p,
         ));
     }

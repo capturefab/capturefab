@@ -45,6 +45,119 @@ pub const SETUP_ALL_BANKS: [&str; 8] = [
     "TimerSelector",
 ];
 
+// Capturefab owns a camera's transport, network, persistence and file
+// features: setups never save or restore them. Image-quality features are
+// reversible changes; any other writable feature is disruptive.
+
+/// Name prefixes of features Capturefab manages: GigE and transport-layer
+/// settings (writing GevSCDA would send the stream elsewhere), SFNC 2.x
+/// stream-channel settings such as DeviceStreamChannelPacketSize (the
+/// transport negotiates the packet size itself), device resets and
+/// firmware, user sets and persistent settings that survive a reboot,
+/// camera file access, events and chunk data.
+const MANAGED_PREFIXES: [&str; 17] = [
+    "Gev",
+    "TL",
+    "DeviceLink",
+    "DeviceTL",
+    "DeviceStreamChannel",
+    "DeviceReset",
+    "DeviceFactoryReset",
+    "DeviceFirmware",
+    "DeviceRegisters",
+    "DeviceUserID",
+    "File",
+    "UserSet",
+    "Persistent",
+    "LinkCommand",
+    "Transfer",
+    "EventNotification",
+    "Chunk",
+];
+
+/// SFNC categories of the same features, for cameras that report them.
+const MANAGED_CATEGORIES: [&str; 3] = [
+    "TransportLayerControl",
+    "FileAccessControl",
+    "UserSetControl",
+];
+
+/// Features that change only how the image looks, frames or is sized:
+/// undo restores them, so writing them is a reversible change.
+const IMAGE_QUALITY: [&str; 36] = [
+    "ExposureTime",
+    "ExposureTimeAbs",
+    "ExposureTimeRaw",
+    "ExposureAuto",
+    "Gain",
+    "GainAbs",
+    "GainRaw",
+    "GainAuto",
+    "GainSelector",
+    "BlackLevel",
+    "BlackLevelRaw",
+    "Gamma",
+    "BalanceRatio",
+    "BalanceRatioSelector",
+    "BalanceWhiteAuto",
+    "AcquisitionFrameRate",
+    "AcquisitionFrameRateAbs",
+    "AcquisitionFrameRateEnable",
+    "AcquisitionFrameRateEnabled",
+    "AcquisitionFrameRateMode",
+    "LensPosition",
+    "Width",
+    "Height",
+    "OffsetX",
+    "OffsetY",
+    "ReverseX",
+    "ReverseY",
+    "PixelFormat",
+    "VideoMode",
+    "IlluminationIntensity",
+    "Magnification",
+    "Sharpness",
+    "Saturation",
+    "Hue",
+    "Brightness",
+    "Contrast",
+];
+
+/// Families of image-quality features, by name prefix.
+const IMAGE_QUALITY_PREFIXES: [&str; 5] = ["Focus", "Iris", "Zoom", "Binning", "Decimation"];
+
+/// Capturefab manages this feature: by name, by its SFNC category when the
+/// camera reports one, or because it is a raw register or command node
+/// rather than a value.
+pub fn managed(name: &str, category: Option<&str>, kind: Option<&str>) -> bool {
+    managed_name(name)
+        || category.is_some_and(|category| MANAGED_CATEGORIES.contains(&category))
+        || kind.is_some_and(not_a_value)
+}
+
+/// The feature name alone marks it as managed by Capturefab.
+pub fn managed_name(name: &str) -> bool {
+    MANAGED_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Register (`IntReg`, `StringReg`, …) and command nodes hold no value a
+/// setup may save or restore.
+pub fn not_a_value(kind: &str) -> bool {
+    kind == "Command" || kind.ends_with("Reg")
+}
+
+/// Writing this feature only changes how the image looks, frames or is
+/// sized, so it is a Reversible change. Unknown features are not.
+pub fn image_quality(name: &str) -> bool {
+    !managed_name(name)
+        && (IMAGE_QUALITY.contains(&name)
+            || IMAGE_QUALITY_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix)))
+}
+
 /// One saved value: a JSON boolean, number or string.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -546,7 +659,7 @@ fn validate_bank(feature: &str, bank: &Bank) -> Result<()> {
         bank.selector
     );
     ensure!(
-        !crate::tools::risk::managed_name(&bank.selector),
+        !managed_name(&bank.selector),
         "{} is managed by Capturefab and cannot address a setup value",
         bank.selector
     );
@@ -597,7 +710,7 @@ pub fn validate(setup: &Setup) -> Result<()> {
     for value in &setup.values {
         crate::session::validate_feature(&value.feature)?;
         ensure!(
-            !crate::tools::risk::managed_name(&value.feature),
+            !managed_name(&value.feature),
             "Capturefab manages {}; a setup cannot restore it",
             value.feature
         );
@@ -1311,6 +1424,81 @@ pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session
 mod tests {
     use super::*;
     use crate::session::SessionCommand;
+
+    #[test]
+    fn transport_persistence_and_file_features_are_managed() {
+        for name in [
+            "GevSCDA",
+            "GevSCPHostPort",
+            "GevHeartbeatTimeout",
+            "GevPersistentIPAddress",
+            "TLParamsLocked",
+            "DeviceLinkThroughputLimit",
+            "DeviceReset",
+            "DeviceFactoryReset",
+            "DeviceFirmwareVersion",
+            "DeviceUserID",
+            "FileAccessControl",
+            "FileOperationExecute",
+            "UserSetSave",
+            "UserSetDefault",
+            "PersistentIPAddress",
+            "TransferStart",
+            "ChunkModeActive",
+            "EventNotification",
+            "DeviceStreamChannelPacketSize",
+            "DeviceStreamChannelSelector",
+            "DeviceStreamChannelEndianness",
+        ] {
+            assert!(managed(name, None, Some("Integer")), "{name}");
+            assert!(!image_quality(name), "{name}");
+        }
+        assert!(managed("Anything", Some("FileAccessControl"), None));
+        assert!(managed("Anything", Some("UserSetControl"), None));
+        assert!(managed("AnyReg", None, Some("IntReg")));
+        assert!(managed("TriggerSoftware", None, Some("Command")));
+        assert!(!managed(
+            "ExposureTime",
+            Some("AcquisitionControl"),
+            Some("Float")
+        ));
+        // Device information other than the managed families stays readable.
+        assert!(!managed_name("DeviceModelName") && !managed_name("DeviceTemperature"));
+    }
+
+    #[test]
+    fn image_quality_features_are_reversible_and_unknown_ones_are_not() {
+        for name in [
+            "ExposureTime",
+            "ExposureTimeAbs",
+            "Gain",
+            "BalanceRatio",
+            "BalanceRatioSelector",
+            "FocusPosition",
+            "LensPosition",
+            "BinningHorizontal",
+            "DecimationVertical",
+            "ZoomLevel",
+            "IrisAperture",
+            "AcquisitionFrameRateEnable",
+            "GainRaw",
+            "AcquisitionFrameRateAbs",
+            "AcquisitionFrameRateMode",
+            "VideoMode",
+            "Contrast",
+        ] {
+            assert!(image_quality(name), "{name}");
+        }
+        for name in [
+            "Foo",
+            "TriggerMode",
+            "LineSelector",
+            "DeviceTemperature",
+            "",
+        ] {
+            assert!(!image_quality(name), "{name}");
+        }
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

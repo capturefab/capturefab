@@ -196,12 +196,12 @@ pub fn sanitize_component(value: &str) -> Result<String> {
 fn tag_value(key: &str, context: &Context) -> Result<String> {
     let value = context.get(key).map(|v| v.trim()).unwrap_or_default();
     if value.is_empty() {
-        return Err(crate::dataset::Usage(format!(
+        return Err(crate::types::Usage(format!(
             "capture output uses {{tag:{key}}} but the capture tag '{key}' is empty; fill it in (--context {key}=VALUE) or change the file name pattern"
         ))
         .into());
     }
-    sanitize_component(value).map_err(|e| crate::dataset::Usage(format!("{e:#}")).into())
+    sanitize_component(value).map_err(|e| crate::types::Usage(format!("{e:#}")).into())
 }
 
 /// Whether `output` ends in a path separator, naming a folder to fill.
@@ -1129,7 +1129,7 @@ mod tests {
         let now = fixed_time();
         let template = "shots/{tag:label}/{camera}-{seq}.png";
         let error = validate_request(template, 1, OnExists::Fail, &NO_TAGS).unwrap_err();
-        assert!(error.is::<crate::dataset::Usage>(), "{error}");
+        assert!(error.is::<crate::types::Usage>(), "{error}");
         assert!(error.to_string().contains("'label' is empty"), "{error}");
         let blank = Context::from([("label".into(), "  ".into())]);
         assert!(validate_request(template, 1, OnExists::Fail, &blank).is_err());
@@ -1172,7 +1172,7 @@ mod tests {
         let error = namer
             .candidate(&plan, &input(fixed_time()), OnExists::Fail)
             .unwrap_err();
-        assert!(error.is::<crate::dataset::Usage>());
+        assert!(error.is::<crate::types::Usage>());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

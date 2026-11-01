@@ -3540,7 +3540,7 @@ pub struct ForwardStats {
     pub error: Option<String>,
     /// The finished local recording, set once its file is complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recording: Option<crate::dataset::RecordedFile>,
+    pub recording: Option<crate::engine::saved::RecordedFile>,
 }
 struct WriterState {
     latest: Option<Vec<u8>>,
@@ -5181,7 +5181,7 @@ impl Forwarder {
             let result = if valid {
                 output.storage.finish_cut().map(|()| {
                     // The complete local file is recorded in the storage ledger.
-                    let recorded = crate::dataset::RecordedFile {
+                    let recorded = crate::engine::saved::RecordedFile {
                         path: path.display().to_string(),
                         bytes,
                         sha256,

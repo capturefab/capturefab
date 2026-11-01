@@ -290,7 +290,7 @@ pub(crate) fn server_name(host: &str, trust: &Trust) -> Result<ServerName<'stati
         _ => host,
     };
     ServerName::try_from(name.to_owned()).map_err(|_| {
-        anyhow::Error::from(crate::dataset::Usage(format!(
+        anyhow::Error::from(crate::types::Usage(format!(
             "{name} cannot be checked against a TLS certificate"
         )))
     })

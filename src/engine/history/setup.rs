@@ -6,9 +6,8 @@ use super::*;
 use crate::genicam::Availability;
 use crate::setup::{
     Bank, Confirmed, MAX_BANKS, MAX_SETUP_VALUES, MAX_STRING, Match, Reading, SETUP_ALL_BANKS,
-    SavedAuto, SavedCamera, Scalar, Setup, SetupValue, Skipped,
+    SavedAuto, SavedCamera, Scalar, Setup, SetupValue, Skipped, image_quality, managed_name,
 };
-use crate::tools::risk;
 use crate::types::{Categorized, ErrorKind};
 
 /// How long a restore may spend writing before it gives up and rolls back.
@@ -169,7 +168,7 @@ pub(super) fn read(
             continue;
         }
         let kind = camera.node_kind(&name).unwrap_or_default().to_owned();
-        if risk::managed(&name, None, Some(&kind)) {
+        if crate::setup::managed(&name, None, Some(&kind)) {
             continue;
         }
         let banked = camera
@@ -228,7 +227,7 @@ pub(super) fn read(
             let at = banks(&address);
             if at.len() > MAX_BANKS
                 || at.iter().any(|bank| {
-                    risk::managed_name(&bank.selector) || !bank.selector.ends_with("Selector")
+                    managed_name(&bank.selector) || !bank.selector.ends_with("Selector")
                 })
             {
                 skipped.push(skip(
@@ -461,7 +460,7 @@ impl Plan {
         if unconfirmed.is_empty() {
             return Ok(());
         }
-        Err(crate::dataset::Usage(format!(
+        Err(crate::types::Usage(format!(
             "Restoring {} now also changes {}, which was not confirmed; the camera changed after the preview. Nothing changed; preview it again.",
             self.name,
             unconfirmed.join(", ")
@@ -539,13 +538,13 @@ fn row(
         return row;
     }
     let kind = camera.node_kind(feature).unwrap_or_default().to_owned();
-    if risk::managed(feature, None, Some(&kind)) {
+    if crate::setup::managed(feature, None, Some(&kind)) {
         set(&mut row, Status::Refused, "not allowed in a setup".into());
         return row;
     }
     let selectors = camera.selectors(feature);
     for bank in &value.at {
-        if risk::managed_name(&bank.selector) || !bank.selector.ends_with("Selector") {
+        if managed_name(&bank.selector) || !bank.selector.ends_with("Selector") {
             set(&mut row, Status::Refused, "not allowed in a setup".into());
             return row;
         }
@@ -821,7 +820,7 @@ pub(super) fn plan(
 /// A selector a setup reads bank by bank only chooses which bank later
 /// reads and writes address; the per-bank values carry their own risk.
 fn risk_of(feature: &str) -> &'static str {
-    if risk::image_quality(feature) || SETUP_ALL_BANKS.contains(&feature) {
+    if image_quality(feature) || SETUP_ALL_BANKS.contains(&feature) {
         "reversible"
     } else {
         "disruptive"

@@ -91,7 +91,7 @@ impl ExportSource<'_> {
                 .collect::<duckdb::Result<Vec<_>>>()?;
             rows.extend(found);
             if rows.len() > MAX_FILES {
-                return Err(crate::dataset::Usage(format!(
+                return Err(crate::types::Usage(format!(
                     "dataset export copies at most {MAX_FILES} files; narrow --since/--until or use --media images"
                 ))
                 .into());

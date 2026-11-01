@@ -4,12 +4,12 @@
 //! turned into a check with a copyable fix.
 #![allow(unsafe_code)]
 
-use crate::analytics::human_bytes;
 use crate::efficiency::{self, Mode, Resolved};
 use crate::ipc::LoginDir;
 use crate::media::FfmpegHealth;
 use crate::network::{InterfaceKind, NetworkInterface};
 use crate::storage::{FREE_SPACE_FLOOR, StoragePolicy};
+use crate::types::human_bytes;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{

@@ -783,7 +783,7 @@ pub fn validate_selector(camera: &str) -> Result<()> {
 /// name the coordinator may resolve to a discovered ONVIF camera; never
 /// with credentials already in the address.
 fn validate_login_selector(camera: &str) -> Result<()> {
-    let usage = |message: &str| -> anyhow::Error { crate::dataset::Usage(message.into()).into() };
+    let usage = |message: &str| -> anyhow::Error { crate::types::Usage(message.into()).into() };
     if crate::logins::split_userinfo(camera).is_ok_and(|(_, login)| login.is_some())
         || camera.split_once("://").is_some_and(|(_, rest)| {
             rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())].contains('@')
@@ -1370,8 +1370,8 @@ struct WorkerReply<'a> {
     #[serde(skip_serializing_if = "Kept::is_nothing")]
     kept: Kept,
     /// Files saved since the previous reply, for the coordinator's dataset.
-    #[serde(skip_serializing_if = "crate::dataset::SavedBatch::is_empty")]
-    saved: crate::dataset::SavedBatch,
+    #[serde(skip_serializing_if = "crate::engine::saved::SavedBatch::is_empty")]
+    saved: crate::engine::saved::SavedBatch,
 }
 /// A worker reply as the coordinator reads it. `S` is the snapshot, or
 /// `IgnoredAny` to keep the rest of a reply whose snapshot is unreadable.
@@ -1389,7 +1389,7 @@ struct ParentReply<S = SessionSnapshot> {
     #[serde(default)]
     kept: Kept,
     #[serde(default)]
-    saved: crate::dataset::SavedBatch,
+    saved: crate::engine::saved::SavedBatch,
 }
 /// What a reply leaves out because the previous reply on the same pipe
 /// already carried it: features, camera history, and the log lines the
@@ -1544,8 +1544,8 @@ struct Process {
     /// The efficiency setting the worker was last given.
     efficiency: crate::efficiency::Mode,
     /// Saved files reported by the worker, not yet given to the dataset.
-    saved: Vec<crate::dataset::SavedFile>,
-    saved_camera: Option<crate::dataset::SavedCamera>,
+    saved: Vec<crate::engine::saved::SavedFile>,
+    saved_camera: Option<crate::engine::saved::SavedCamera>,
     saved_seq: u64,
     saved_gaps: u64,
 }
@@ -1749,7 +1749,7 @@ impl Process {
         let preview_skipped = u64::from(self.feed.counters.preview_skipped());
         self.report.camera(self.child.id(), preview_skipped)
     }
-    fn keep_saved(&mut self, batch: crate::dataset::SavedBatch) {
+    fn keep_saved(&mut self, batch: crate::engine::saved::SavedBatch) {
         if let Some(camera) = batch.camera {
             self.saved_camera = Some(camera);
         }
@@ -1777,8 +1777,8 @@ impl Process {
         }
     }
     /// Saved files and missed-entry count collected since the last call.
-    fn take_saved(&mut self) -> (crate::dataset::SavedBatch, u64) {
-        let batch = crate::dataset::SavedBatch {
+    fn take_saved(&mut self) -> (crate::engine::saved::SavedBatch, u64) {
+        let batch = crate::engine::saved::SavedBatch {
             camera: self
                 .saved_camera
                 .clone()
@@ -2154,7 +2154,7 @@ impl SessionHandle {
             .is_saved(&key.address)
             .unwrap_or(true)
         {
-            return Err(crate::dataset::Usage(
+            return Err(crate::types::Usage(
                 "this camera uses a sign-in saved on this host; start serve with --allow-saved-sign-ins"
                     .into(),
             )
@@ -2447,7 +2447,7 @@ impl SessionHandle {
         ensure!(
             !frames.ring.preview_only(),
             "the frame is larger than the {} shared frame buffer; save it to a file, or raise CAPTUREFAB_FRAME_BYTES",
-            crate::analytics::human_bytes(frames.ring.capacity() as u64)
+            crate::types::human_bytes(frames.ring.capacity() as u64)
         );
         Ok(frame)
     }
@@ -2517,7 +2517,7 @@ impl SessionHandle {
                         ensure!(
                             !feed.ring.preview_only(),
                             "the frame is larger than the {} shared frame buffer; raise CAPTUREFAB_FRAME_BYTES to inspect full-resolution pixels",
-                            crate::analytics::human_bytes(feed.ring.capacity() as u64)
+                            crate::types::human_bytes(feed.ring.capacity() as u64)
                         );
                         return Ok(Some((frame, meta)));
                     }
@@ -3143,7 +3143,7 @@ impl SessionHandle {
                 // check below see one identity. Hub cameras never match.
                 let camera = self.loose_camera(camera);
                 if login.is_some() && crate::logins::key(&camera).is_err() {
-                    return Err(crate::dataset::Usage(
+                    return Err(crate::types::Usage(
                         "sign-in is supported for rtsp://, rtsps:// and onvif: cameras".into(),
                     )
                     .into());

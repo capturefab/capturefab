@@ -170,7 +170,7 @@ impl Kind {
             } else {
                 ""
             };
-            return Err(crate::dataset::Usage(format!(
+            return Err(crate::types::Usage(format!(
                 "{works}{} hubs take stream={allowed}",
                 self.label()
             ))
@@ -194,7 +194,7 @@ impl Kind {
                     "fps for Frigate MJPEG must be a whole number 1..10".into()
                 })
             }
-            _ => Err(crate::dataset::Usage(format!(
+            _ => Err(crate::types::Usage(format!(
                 "fps applies to stream=snapshot{}; add stream=snapshot to poll {} snapshots",
                 if self == Self::Frigate {
                     " and stream=mjpeg"
@@ -212,7 +212,7 @@ fn usage(ok: bool, message: impl FnOnce() -> String) -> Result<()> {
     if ok {
         Ok(())
     } else {
-        Err(crate::dataset::Usage(message()).into())
+        Err(crate::types::Usage(message()).into())
     }
 }
 
@@ -340,7 +340,7 @@ const URL_HINT: &str = "hub URL must be http(s)://HOST[:PORT][/PATH] without a u
 /// Parse and validate a hub URL. The message never repeats the URL, which a
 /// user may have pasted with a password in it.
 pub fn parse_url(url: &str) -> Result<Url> {
-    let usage = || anyhow::Error::from(crate::dataset::Usage(URL_HINT.into()));
+    let usage = || anyhow::Error::from(crate::types::Usage(URL_HINT.into()));
     if url.len() > MAX_URL || url.chars().any(|c| c.is_control() || c.is_whitespace()) {
         return Err(usage());
     }
@@ -480,7 +480,7 @@ pub fn validate_server_name(name: &str) -> Result<()> {
 /// Accept `SHA256:AB:CD:…`, `ab:cd:…` or 64 hexadecimal digits in any case.
 pub fn parse_fingerprint(text: &str) -> Result<[u8; 32]> {
     let hint = || {
-        anyhow::Error::from(crate::dataset::Usage(
+        anyhow::Error::from(crate::types::Usage(
             "certificate fingerprints are 32 SHA-256 bytes in hexadecimal, as `openssl x509 -noout -fingerprint -sha256` prints them (SHA256:AB:CD:…)".into(),
         ))
     };
@@ -822,7 +822,7 @@ impl Store {
                 if let Some(other) = file.hubs.iter().find(|other| {
                     other.name != hub.name && other.name.eq_ignore_ascii_case(&hub.name)
                 }) {
-                    return Err(crate::dataset::Usage(format!(
+                    return Err(crate::types::Usage(format!(
                         "a hub named {} already exists; hub names are case-insensitive",
                         other.name
                     ))
@@ -992,11 +992,7 @@ mod tests {
                 !message.contains(bad) && !message.contains("user:secret"),
                 "{bad}"
             );
-            assert!(
-                error
-                    .chain()
-                    .any(|cause| cause.is::<crate::dataset::Usage>())
-            );
+            assert!(error.chain().any(|cause| cause.is::<crate::types::Usage>()));
         }
     }
 
@@ -1108,7 +1104,7 @@ mod tests {
                 .validate_camera(bad, "home")
                 .unwrap_err();
             assert!(
-                error.chain().any(|c| c.is::<crate::dataset::Usage>()),
+                error.chain().any(|c| c.is::<crate::types::Usage>()),
                 "{bad}"
             );
         }

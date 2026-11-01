@@ -169,12 +169,33 @@ impl std::fmt::Display for FrameWait {
 }
 impl std::error::Error for FrameWait {}
 
+/// A request the caller must change (exit code 2), raised while it runs.
+#[derive(Debug)]
+pub struct Usage(pub String);
+impl std::fmt::Display for Usage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Usage {}
+
+/// A byte count for diagnostics, with two decimals in GiB and one below.
+pub fn human_bytes(value: u64) -> String {
+    if value >= 1_073_741_824 {
+        format!("{:.2} GiB", value as f64 / 1_073_741_824.0)
+    } else if value >= 1_048_576 {
+        format!("{:.1} MiB", value as f64 / 1_048_576.0)
+    } else {
+        format!("{:.1} KiB", value as f64 / 1024.0)
+    }
+}
+
 /// The category to send with an error that crosses a process or socket, so
 /// the receiving side reports it the same way: `usage` or an [`ErrorKind`]
 /// code.
 pub fn error_transport_code(error: &anyhow::Error) -> Option<&'static str> {
     error.chain().find_map(|cause| {
-        if cause.is::<crate::dataset::Usage>() {
+        if cause.is::<Usage>() {
             Some("usage")
         } else {
             cause
@@ -187,7 +208,7 @@ pub fn error_transport_code(error: &anyhow::Error) -> Option<&'static str> {
 /// Rebuild an error received with [`error_transport_code`].
 pub fn error_from_transport(code: Option<&str>, message: String) -> anyhow::Error {
     match code {
-        Some("usage") => crate::dataset::Usage(message).into(),
+        Some("usage") => Usage(message).into(),
         Some(code) => match ErrorKind::from_code(code) {
             Some(kind) => Categorized::error(kind, message),
             None => anyhow::Error::msg(message),
@@ -201,7 +222,7 @@ mod tests {
     use super::*;
     #[test]
     fn error_categories_survive_transport() {
-        let usage: anyhow::Error = crate::dataset::Usage("bad option".into()).into();
+        let usage: anyhow::Error = Usage("bad option".into()).into();
         let timeout = Categorized::error(ErrorKind::Timeout, "camera timed out");
         let wrapped = anyhow::Error::from(Categorized {
             kind: ErrorKind::Unavailable,

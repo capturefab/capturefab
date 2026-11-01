@@ -2,6 +2,8 @@
 //!
 //! Loading is offline and validates every step before any command runs. Applying
 //! stops on the first error; successful earlier steps remain in the session.
+use crate::cli::paths::{resolve_outputs, resolve_selector};
+use crate::scrub::{redact_error, redact_value};
 use crate::session::{SessionCommand, deserialize_command, validate_selector};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -102,35 +104,6 @@ pub fn from_reader<R: Read>(reader: R, base: &Path) -> Result<Workflow> {
     })
 }
 
-/// Local sources follow the same caller/file base as outputs. Network/device
-/// locators and discovered camera IDs are never rewritten.
-pub(crate) fn resolve_selector(selector: &mut String, base: &Path) -> Result<()> {
-    // Preserve malformed-input errors: an empty local path must never become
-    // the caller's valid current directory during absolute path resolution.
-    validate_selector(selector)?;
-    if let Some(path) = selector.strip_prefix("sim:replay:") {
-        let mut path = path.to_owned();
-        resolve_path(&mut path, base)?;
-        *selector = format!("sim:replay:{path}");
-    } else if selector
-        .get(..5)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
-    {
-        let path = &selector[5..];
-        if !path.starts_with("//") && Path::new(path).is_relative() {
-            let mut path = path.to_owned();
-            resolve_path(&mut path, base)?;
-            *selector = format!("file:{path}");
-        }
-    } else if selector.parse::<std::net::Ipv4Addr>().is_err()
-        && crate::media::is_recording(selector)
-        && base.join(&*selector).is_file()
-    {
-        resolve_path(selector, base)?;
-    }
-    Ok(())
-}
-
 fn validate_step(step: &Step) -> Result<()> {
     if let Some(camera) = &step.camera {
         validate_selector(camera)?;
@@ -146,7 +119,7 @@ fn validate_step(step: &Step) -> Result<()> {
         );
     }
     if let SessionCommand::Connect { login: Some(_), .. } = &step.command {
-        return Err(crate::dataset::Usage(
+        return Err(crate::types::Usage(
             "workflows cannot carry camera passwords; save the sign-in with `capturefab login add`"
                 .into(),
         )
@@ -159,67 +132,6 @@ fn validate_step(step: &Step) -> Result<()> {
         );
     }
     step.command.validate()
-}
-
-pub(crate) fn resolve_outputs(command: &mut SessionCommand, base: &Path) -> Result<()> {
-    match command {
-        SessionCommand::DatasetOpen { path, .. }
-        | SessionCommand::DatasetOpenIf { path, .. }
-        | SessionCommand::DatasetExport { output: path, .. }
-        | SessionCommand::DatasetExportIf { output: path, .. } => resolve_path(path, base),
-        SessionCommand::Capture {
-            output,
-            destination: None,
-            ..
-        }
-        | SessionCommand::Schedule {
-            output,
-            destination: None,
-            ..
-        } => resolve_path(output, base),
-        SessionCommand::Forward {
-            output,
-            destination: None,
-            ..
-        } if crate::media::is_recording(output) => {
-            // `file:relative.mkv` is a local path, while `file:///...` and
-            // `file://localhost/...` are already absolute file URLs.
-            if let Some((scheme, path)) = output.split_once(':')
-                && scheme.eq_ignore_ascii_case("file")
-            {
-                if !path.starts_with("//") && Path::new(path).is_relative() {
-                    let mut path = path.to_owned();
-                    resolve_path(&mut path, base)?;
-                    *output = format!("file:{path}");
-                }
-                Ok(())
-            } else {
-                resolve_path(output, base)
-            }
-        }
-        _ => Ok(()),
-    }
-}
-
-fn resolve_path(output: &mut String, base: &Path) -> Result<()> {
-    let path = Path::new(output);
-    #[cfg(windows)]
-    ensure!(
-        !(path
-            .components()
-            .next()
-            .is_some_and(|component| matches!(component, std::path::Component::Prefix(_)))
-            && !path.is_absolute()),
-        "drive-relative paths are ambiguous; use an absolute path or a relative path without a drive prefix"
-    );
-    if path.is_relative() {
-        *output = base
-            .join(path)
-            .to_str()
-            .context("workflow output path must be valid UTF-8")?
-            .to_owned();
-    }
-    Ok(())
 }
 
 impl Workflow {
@@ -305,46 +217,6 @@ impl Step {
             message = message.replace(login.expose(), "<redacted>");
         }
         message
-    }
-}
-
-/// `message` with every string in `known` that carries URL credentials
-/// replaced by its redacted form, longest first, so an error that quotes a
-/// step's own camera or output shows no secret even where it is not a URL.
-pub(crate) fn redact_error(message: &str, known: &Value) -> String {
-    let mut values = Vec::new();
-    collect_strings(known, &mut values);
-    values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    let mut message = message.to_owned();
-    for value in values {
-        let redacted = crate::media::redact_url(&value);
-        if redacted != value {
-            message = message.replace(&value, &redacted);
-        }
-    }
-    message
-}
-
-fn collect_strings(value: &Value, strings: &mut Vec<String>) {
-    match value {
-        Value::String(value) => strings.push(value.clone()),
-        Value::Array(values) => values
-            .iter()
-            .for_each(|value| collect_strings(value, strings)),
-        Value::Object(fields) => fields
-            .values()
-            .for_each(|value| collect_strings(value, strings)),
-        _ => {}
-    }
-}
-
-/// Redact URL credentials in every string of `value`, in place.
-pub(crate) fn redact_value(value: &mut Value) {
-    match value {
-        Value::String(value) => *value = crate::media::redact_url(value),
-        Value::Array(values) => values.iter_mut().for_each(redact_value),
-        Value::Object(fields) => fields.values_mut().for_each(redact_value),
-        _ => {}
     }
 }
 
@@ -703,56 +575,5 @@ mod tests {
             .next_frame(Duration::from_secs(1))
             .unwrap();
         assert_eq!((frame.width, frame.height), (128, 96));
-    }
-}
-#[test]
-fn resolves_relative_sources_without_rewriting_network_or_device_locators() {
-    let base = std::env::temp_dir().join("capturefab-workflow-source-tests");
-    let mut replay = "sim:replay:frames".to_owned();
-    resolve_selector(&mut replay, &base).unwrap();
-    assert_eq!(
-        replay,
-        format!("sim:replay:{}", base.join("frames").display())
-    );
-    let mut file = "file:clip.mp4".to_owned();
-    resolve_selector(&mut file, &base).unwrap();
-    assert_eq!(file, format!("file:{}", base.join("clip.mp4").display()));
-    for source in [
-        "192.168.1.10",
-        "rtsp://camera/live",
-        "sim:0",
-        "avfoundation:0",
-        "v4l2:/dev/video0",
-        "dshow:video=Camera Name",
-        "file:///tmp/clip.mp4",
-    ] {
-        let mut resolved = source.to_owned();
-        resolve_selector(&mut resolved, &base).unwrap();
-        assert_eq!(resolved, source);
-    }
-    let workflow = from_reader(
-        serde_json::to_vec(&json!({"version":1,"steps":[
-            {"command":{"op":"connect","camera":"sim:replay:frames","timeout_ms":2000}},
-            {"camera":"sim:replay:frames","command":{"op":"get","feature":"Width"}}
-        ]}))
-        .unwrap()
-        .as_slice(),
-        &base,
-    )
-    .unwrap();
-    assert_eq!(workflow.plan()["steps"][0]["command"]["camera"], replay);
-    assert_eq!(workflow.plan()["steps"][1]["camera"], replay);
-}
-
-#[test]
-fn invalid_source_selectors_are_rejected_before_path_resolution() {
-    let base = std::env::temp_dir();
-    for source in ["sim:replay:", "file:", "FiLe:"] {
-        let mut selector = source.to_owned();
-        assert!(resolve_selector(&mut selector, &base).is_err(), "{source}");
-        assert_eq!(
-            selector, source,
-            "invalid selectors retain their original meaning"
-        );
     }
 }

@@ -1552,15 +1552,7 @@ pub(crate) fn chart_cameras(report: &AnalyticsSnapshot) -> Vec<&CameraAnalytics>
     cameras
 }
 
-pub(crate) fn human_bytes(value: u64) -> String {
-    if value >= 1_073_741_824 {
-        format!("{:.2} GiB", value as f64 / 1_073_741_824.0)
-    } else if value >= 1_048_576 {
-        format!("{:.1} MiB", value as f64 / 1_048_576.0)
-    } else {
-        format!("{:.1} KiB", value as f64 / 1024.0)
-    }
-}
+pub(crate) use crate::types::human_bytes;
 
 #[cfg(test)]
 mod tests;

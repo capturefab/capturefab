@@ -23,6 +23,7 @@ mod history;
 mod network_defaults;
 #[cfg(test)]
 mod network_tests;
+pub(crate) mod saved;
 mod saver;
 use history::process;
 type Reply = Receiver<Result<Value>>;
@@ -103,7 +104,7 @@ pub struct WorkerHandle {
     ring_note: Arc<Mutex<Option<String>>>,
     history: Arc<Mutex<history::Journal>>,
     /// Files saved since the coordinator last collected them.
-    saved: Arc<Mutex<crate::dataset::SavedLog>>,
+    saved: Arc<Mutex<crate::engine::saved::SavedLog>>,
     /// The local recording in progress, reported when it stops.
     recording: Arc<Mutex<Option<crate::scheduling::RecordingMeta>>>,
     /// Private timing state, bound to the exact worker-issued forward ID.
@@ -167,21 +168,21 @@ impl WorkerHandle {
         s
     }
     /// Report a finished file to the coordinator's dataset; stamps its `seq`.
-    pub(crate) fn push_saved(&self, file: crate::dataset::SavedFile) {
+    pub(crate) fn push_saved(&self, file: crate::engine::saved::SavedFile) {
         self.saved
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(file);
     }
     /// Drain up to `max` saved files, with the camera that saved them.
-    pub(crate) fn take_saved(&self, max: usize) -> crate::dataset::SavedBatch {
+    pub(crate) fn take_saved(&self, max: usize) -> crate::engine::saved::SavedBatch {
         let (items, lost) = self
             .saved
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take(max);
         if items.is_empty() && lost == 0 {
-            return crate::dataset::SavedBatch::default();
+            return crate::engine::saved::SavedBatch::default();
         }
         let camera = self
             .state
@@ -189,8 +190,8 @@ impl WorkerHandle {
             .unwrap_or_else(|e| e.into_inner())
             .connected
             .as_ref()
-            .map(crate::dataset::SavedCamera::from);
-        crate::dataset::SavedBatch {
+            .map(crate::engine::saved::SavedCamera::from);
+        crate::engine::saved::SavedBatch {
             camera,
             items,
             lost,
@@ -318,7 +319,7 @@ impl WorkerHandle {
     /// Log a frame the ring could not take as it was, once while that keeps
     /// happening rather than for every frame.
     fn note_ring(&self, published: Result<Published>, bytes: usize, capacity: usize) {
-        use crate::analytics::human_bytes;
+        use crate::types::human_bytes;
         let (level, message) = match published {
             Ok(Published::Frame) => {
                 *self.ring_note.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -707,7 +708,7 @@ fn end_forward(
             // A finished file is reported even when stopping reported an error.
             if let Some(file) = stats.recording.clone() {
                 let context = meta.map(|m| m.context).unwrap_or_default();
-                h.push_saved(crate::dataset::SavedFile {
+                h.push_saved(crate::engine::saved::SavedFile {
                     seq: 0,
                     wall_ms: file.started_ms,
                     path: absolute_path(std::path::Path::new(&file.path)),
@@ -716,7 +717,7 @@ fn end_forward(
                     destination: file.destination,
 
                     context,
-                    item: crate::dataset::SavedItem::Recording {
+                    item: crate::engine::saved::SavedItem::Recording {
                         started_ms: file.started_ms,
                         ended_ms: file.ended_ms,
                         codec: file.codec,
@@ -993,7 +994,7 @@ fn report_image(
     job_id: Option<u64>,
     context: &crate::context::Context,
 ) {
-    h.push_saved(crate::dataset::SavedFile {
+    h.push_saved(crate::engine::saved::SavedFile {
         seq: 0,
         wall_ms,
         path: absolute_path(path),
@@ -1002,7 +1003,7 @@ fn report_image(
         destination: resolved.destination.clone(),
 
         context: context.clone(),
-        item: crate::dataset::SavedItem::Capture {
+        item: crate::engine::saved::SavedItem::Capture {
             frame_id: frame.id,
             timestamp_ns: frame.timestamp_ns,
             width: frame.width,
@@ -1969,14 +1970,14 @@ pub fn check_capture_name(output: &str, count: u32, format: &str) -> Result<()> 
         return Ok(());
     }
     if let Some(message) = crate::naming::sequence_needs_template(output, count) {
-        return Err(crate::dataset::Usage(message).into());
+        return Err(crate::types::Usage(message).into());
     }
     let directory = matches!(
         crate::naming::Plan::new(output, count, format),
         crate::naming::Plan::Directory { .. }
     );
     if !directory && let Some(message) = crate::naming::format_mismatch(output, format) {
-        return Err(crate::dataset::Usage(message).into());
+        return Err(crate::types::Usage(message).into());
     }
     Ok(())
 }
@@ -3331,7 +3332,7 @@ mod tests {
         assert_eq!(batch.items.len(), 1);
         assert!(matches!(
             batch.items[0].item,
-            crate::dataset::SavedItem::Recording { .. }
+            crate::engine::saved::SavedItem::Recording { .. }
         ));
         assert_eq!(
             std::fs::metadata(&output).unwrap().len(),
@@ -3537,7 +3538,7 @@ mod tests {
         assert!(std::path::Path::new(&saved.path).is_absolute());
         assert!(matches!(
             saved.item,
-            crate::dataset::SavedItem::Capture { ref origin, job_id: None, .. } if origin == "capture"
+            crate::engine::saved::SavedItem::Capture { ref origin, job_id: None, .. } if origin == "capture"
         ));
         assert_eq!(batch.camera.unwrap().id, "sim:0");
         assert!(h.take_saved(10).is_empty());
@@ -3756,7 +3757,7 @@ mod tests {
         assert!(batch.items.iter().all(|f| f.context["lot"] == "7"
             && matches!(
                 f.item,
-                crate::dataset::SavedItem::Capture {
+                crate::engine::saved::SavedItem::Capture {
                     job_id: Some(1),
                     ..
                 }
