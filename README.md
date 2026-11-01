@@ -19,7 +19,9 @@ The script checks the download's SHA-256, installs for your account without sudo
 hand, download the archive for your system from
 [capturefab.com/downloads.html](https://capturefab.com/downloads.html), extract it and put
 `capturefab` on your `PATH`. Every download includes FFmpeg. Then run `capturefab doctor`, which
-checks this computer and prints a fix for each warning.
+checks this computer and prints a fix for each warning. This README describes the command-line
+releases after 0.5.0: `capturefab --version` must report a later version, because 0.5.0 and
+earlier are the desktop app, with other commands and JSON.
 
 On macOS the first camera or network command asks for Camera and Local Network access for the
 app you run it from, such as Terminal. On Linux, USB3 Vision cameras need the udev rule in the
@@ -52,6 +54,8 @@ gives the call patterns. The contract in short:
   to stderr. Global flags may follow the command: `capturefab capture --json -c sim:0 -o shot.png`.
 - **Exit codes** are the category: `0` ok, `1` failed, `2` usage or input, `3` unavailable,
   `4` timeout, `5` unsupported, `6` storage full, `130` interrupted (143 SIGTERM, 129 SIGHUP).
+  Storage is full when the disk is, or when the files Capturefab saved and that still exist reach
+  its budget (10 GiB and 10,000 files by default; `capturefab storage configure` changes it).
 - **`error.code`** is the specific reason, such as `camera_not_found`, `camera_ambiguous`
   (`details.candidates`), `feature_not_found` (`details.did_you_mean`), `out_of_range`
   (`details.min`, `max`, `nearest`), `exists`, `frame_timeout` or `trigger_timeout`.
@@ -65,6 +69,8 @@ gives the call patterns. The contract in short:
   give exit 2 `camera_ambiguous` with the candidates.
 - **Names**: GenICam features (`ExposureTime`), banks (`TriggerMode[FrameStart]`) and portable
   controls (`exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure`, `auto_wb`).
+  Quote banks in the shell (`'TriggerMode[FrameStart]'`; zsh expands brackets), and quote camera
+  IDs with spaces (`-c 'avfoundation:HD Pro Webcam C920'`).
 - **Durations** need a unit: `250ms`, `2s`, `1h30m`, and `none` where a wait may be unlimited.
   A bare number such as `5000` is exit 2 `invalid_duration`.
 - **Output templates** for `-o`: `{camera}`, `{serial}`, `{seq}`, `{seq:4}`, `{time}`, `{date}`,
@@ -112,7 +118,7 @@ network paths. More: [CLI workflows](docs/cli-workflows.md),
 | `CAPTUREFAB_KEEP` | the default `--keep` |
 | `CAPTUREFAB_CAMERA_PASSWORD` | the password for `login add` without `--password-stdin` |
 | `CAPTUREFAB_FFMPEG` | an FFmpeg executable to use instead of the bundled one |
-| `CAPTUREFAB_SESSION_DIR` | one folder for sessions, presets and saved sign-in records, for isolated runs and tests |
+| `CAPTUREFAB_SESSION_DIR` | one folder for sessions, presets and saved sign-in records, for isolated runs and tests; it must be private (mode 0700, as `mktemp -d` makes) or not exist yet |
 | `CAPTUREFAB_CACHE_DIR` | the folder for the extracted FFmpeg and encoder probes |
 | `CAPTUREFAB_THREADS` | at most this many image processing threads |
 | `CAPTUREFAB_MAX_CAMERAS` | cameras one session may hold, 1–64 (default 16) |
@@ -123,9 +129,11 @@ holds `inspect` previews.
 ## Build from source
 
 Requirements: a stable Rust toolchain, a C compiler and CMake (and NASM on x86, for
-libjpeg-turbo). Webcams, streams, files and recording need FFmpeg: `scripts/build-ffmpeg.sh`
-builds the pinned GPL build that releases embed (see the [FFmpeg build guide](docs/ffmpeg-build.md)),
-or set `CAPTUREFAB_FFMPEG` to one.
+libjpeg-turbo). Every build embeds FFmpeg, which webcams, streams, files and recording need: the
+first `cargo build` runs `scripts/build-ffmpeg.sh`, which downloads and builds the pinned GPL
+version that releases embed (this takes a while; see the [FFmpeg build guide](docs/ffmpeg-build.md)).
+To embed an FFmpeg you already have, set `CAPTUREFAB_FFMPEG_BINARY` to it when building;
+`CAPTUREFAB_FFMPEG` only overrides the embedded one at run time.
 
 ```sh
 cargo build --release

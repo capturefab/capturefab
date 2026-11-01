@@ -11,7 +11,7 @@ Failed or cancelled validation leaves the candidate in draft state and does not 
 | `prepare-release.yml` | manual, with a version | Raises the version in `Cargo.toml` and `Cargo.lock` (`release.py set-version`, which refuses a version that is not newer or is already tagged), pushes `release/vVERSION`, opens a pull request labeled `release` and starts CI on it | `contents`, `pull-requests`, `issues` and `actions: write` |
 | `release.yml` | a push to `main` that raises the version in `Cargo.toml`; a `vVERSION-rc.N` tag push; manual | Creates an explicitly tagged `-rc.N` draft before building, calls the full CI workflow, builds and smoke-tests every target, signs configured Windows artifacts, assembles and attests the artifacts, uploads to the draft and promotes the draft automatically only after all checks pass. Manual branch runs are dry runs. Published releases are never modified. | `contents: read`; `contents: write` for candidate, upload, promotion and site jobs; `id-token: write` for Azure signing and attestation; `attestations: write` for attestation; `pull-requests` and `actions: write` for the site job |
 | `mirror-downloads.yml` | manual, with a published version | Copies a release published before the download bucket existed from its release assets to the bucket (`scripts/publish-downloads.py`) | `contents: read`; the `CLOUDFLARE_API_TOKEN` secret |
-| `pages.yml` | manual, and started by the release workflow after it updates `web/` | Validates `web/`, downloads and checksum-verifies the latest advertised published release, uploads its files to R2, then deploys it to capturefab.com as a Cloudflare Worker with static assets (`site/`, `cf deploy`), but only from the default branch and only when the repository variable `CAPTUREFAB_PUBLISH_SITE` is `true` | `contents: read`; the `CLOUDFLARE_API_TOKEN` secret |
+| `pages.yml` | a push to `main` that changes `web/`, `site/`, `docs/*.md`, `docs/cli-schema.json`, `scripts/install-template.*` or the site scripts; manual; and started by the release workflow after it updates `web/` | Validates `web/`, downloads and checksum-verifies the latest advertised published release, uploads its files to R2, then deploys it to capturefab.com as a Cloudflare Worker with static assets (`site/`, `cf deploy`), but only from the default branch and only when the repository variable `CAPTUREFAB_PUBLISH_SITE` is `true` | `contents: read`; the `CLOUDFLARE_API_TOKEN` secret |
 
 All actions are pinned to full commit SHAs. Checkouts do not persist credentials; the jobs that push pass the job token for that one command.
 
@@ -38,10 +38,12 @@ Every archive holds one folder, `capturefab-VERSION-OS-ARCH/`, with the `capture
 `share/udev/rules.d/` and `INSTALL-USB.txt`. macOS and Linux archives are `.tar.gz`, Windows
 archives `.zip`. There is no application bundle, disk image, launcher entry or icon: `install.sh`
 and `install.ps1` put the command on the user's `PATH`. Releases up to 0.5.0 were the desktop app:
-macOS shipped `Capturefab.app` in a disk image (0.5.0) or a ZIP (up to 0.4.0). `install.sh`
-refuses such a disk image with a pointer to the downloads page, and when it replaces a command
-link into `Capturefab.app`, or finds the app or an earlier Linux launcher entry, it says what it
-changed and how to remove the rest.
+macOS shipped `Capturefab.app` in a disk image (0.5.0) or a ZIP (up to 0.4.0). While the latest
+release in `web/releases.json` is 0.5.0 or earlier, `scripts/site-release.py` writes installers
+that install nothing and say no command-line release is published yet, and `downloads.html`
+leaves out the install commands; `install.sh` also refuses any disk image. When it replaces a
+command link into `Capturefab.app`, or finds the app or an earlier Linux launcher entry, it says
+what it changed and how to remove the rest.
 
 ## One-time repository setup
 
@@ -193,4 +195,4 @@ python3 scripts/release.py assemble --input dist --output dist/release --reposit
 - `python3 scripts/site-guides.py` publishes the user guides in `docs/` as `web/guides/`; `--check` fails when they are stale.
 - `python3 scripts/docs-search.py` regenerates `web/search-index.json` from the documentation articles, including their commands and captions. Run it after editing a page; `--check` detects a stale index.
 - `node scripts/test-docs-search.js` checks search relevance, command names, multiword queries and the real documentation corpus; `node scripts/test-site-ui.js` checks the download selector in `web/app.js`.
-- `python3 scripts/test-site.py` validates every HTML page, local links and anchors, image dimensions, SVG content, the manifest, the Atom feed, the generated pages, guides, reference and search index, and runs the generated `install.sh` against a local release, including an upgrade over a 0.5 desktop install.
+- `python3 scripts/test-site.py` validates every HTML page, local links and anchors, image dimensions, SVG content, the manifest, the Atom feed, the generated pages, guides, reference and search index, and runs the generated `install.sh` against a local release, including an upgrade over a 0.5 desktop install and a refusal while the latest release is still the desktop app.

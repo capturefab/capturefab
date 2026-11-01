@@ -46,7 +46,9 @@ done
 # resolve against the bin directory, not the directory the user ran this in.
 case "$prefix" in ''|/*) ;; *) prefix="$PWD/$prefix" ;; esac
 
-[ -n "$VERSION" ] || fail "no published release is available yet; see ${SITE}downloads.html or build from source"
+# Empty until a command-line release is published: releases up to 0.5.0 were
+# the desktop app, which this script does not install.
+[ -n "$VERSION" ] || fail "no command-line release is published yet (0.5.0 and earlier are the desktop app); see ${SITE}downloads.html or build from source"
 
 kernel=$(uname -s)
 case "$kernel" in

@@ -58,7 +58,7 @@ PAGE = '''<!doctype html>
         <h1 id="downloads-title">All downloads</h1>
         <p class="lead">Each download is the <code>capturefab</code> command-line tool for one system, with FFmpeg built in. Latest release: {status}.</p>
         <p>Choose your operating system and processor. Apple silicon Macs and 64-bit ARM systems use ARM64. Intel and AMD computers use x64.</p>
-        <p>Check the file's SHA-256 with the command under each download, then extract the archive and put <code>capturefab</code> on your <code>PATH</code>, or use the install command below, which does both.{legacy} The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
+        <p>Check the file's SHA-256 with the command under each download, then extract the archive and put <code>capturefab</code> on your <code>PATH</code>{install_note}.{legacy} The <a href="docs.html#first-launch">first-launch steps</a> cover the permission prompts each system shows.</p>
         <p>Read the <a href="docs.html#installation">installation instructions</a> for system requirements and setup on computers without a display.</p>
       </section>
 {install}{body}    </main>
@@ -195,6 +195,19 @@ def is_disk_image(asset):
     """Releases up to 0.5.0 shipped the macOS desktop app as a disk image."""
     return asset['os'] == 'macos' and asset['name'].endswith('.dmg')
 
+# The last release, with its candidates, that was the desktop app.
+LAST_DESKTOP = (0, 5, 0)
+
+def is_desktop_release(release):
+    """Releases up to 0.5.0 were the desktop app, with another command set. The
+    installers install only the command-line releases after them; until one is
+    published they install nothing, rather than a desktop release whose launcher
+    entries the migration would remove."""
+    core = SEMVER.fullmatch(release['version'])
+    if not core:
+        raise ValueError(f'invalid release version: {release["version"]}')
+    return tuple(int(part) for part in core.groups()[:3]) <= LAST_DESKTOP or any(is_disk_image(a) for a in release['assets'])
+
 def download_cards(release):
     """Keep direct downloads readable on narrow screens without JavaScript."""
     cards = []
@@ -227,9 +240,11 @@ def downloads(manifest, site):
     releases = [r for r in ordered(manifest) if r['version'] == manifest.get('latest')] or ordered(manifest)[:1]
     body = ''.join(section(r, True) + source_section(r) for r in releases) or EMPTY
     status = f'v{html.escape(manifest["latest"])}' if manifest.get('latest') else 'none published yet'
-    install = INSTALL.format(site=html.escape(site)) if releases else ''
+    installable = any(not is_desktop_release(r) for r in releases)
+    install = INSTALL.format(site=html.escape(site)) if installable else ''
+    install_note = ', or use the install command below, which does both' if installable else ''
     legacy = ' The macOS download of this release is a disk image with the desktop app: open it and drag Capturefab to Applications.' if any(is_disk_image(a) for r in releases for a in r['assets'] if a.get('available')) else ''
-    return PAGE.format(site=html.escape(site), status=status, body=body, install=install, legacy=legacy)
+    return PAGE.format(site=html.escape(site), status=status, body=body, install=install, install_note=install_note, legacy=legacy)
 
 def entry(release, site):
     page = f'{site}downloads.html#v{release["version"]}'
@@ -258,6 +273,8 @@ def installer_assets(manifest, site, system):
     release = releases[0]
     if not SEMVER.fullmatch(release['version']):
         raise ValueError(f'invalid release version: {release["version"]}')
+    if is_desktop_release(release):
+        return '', []
     builds = []
     for asset in release['assets']:
         if asset['os'] != system or not asset.get('available'):
@@ -278,7 +295,7 @@ def installers(manifest, site):
     sh = ''.join(f"    {system}/{arch}) name='{name}' url='{url}' expected='{digest}' ;;\n" for system, builds in (('macos', unix), ('linux', linux)) for arch, name, url, digest in builds)
     _, windows = installer_assets(manifest, site, 'windows')
     ps1 = ''.join(f"  '{arch}' = @{{ Name = '{name}'; Url = '{url}'; Sha256 = '{digest}' }}\n" for arch, name, url, digest in windows)
-    label = version or '(no published release)'
+    label = version or '(no command-line release published yet)'
     fill = lambda template, assets: (SCRIPTS / template).read_text(encoding='utf-8').replace('@VERSION_LABEL@', label).replace('@VERSION@', version).replace('@SITE@', site).replace('@ASSETS@', assets)
     return fill('install-template.sh', sh), fill('install-template.ps1', ps1)
 

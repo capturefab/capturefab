@@ -9,7 +9,9 @@ The [command reference](reference.html) is generated from the same output.
 
 If `capturefab` is not installed: `curl -fsSL https://capturefab.com/install.sh | sh` (macOS,
 Linux) or `irm https://capturefab.com/install.ps1 | iex` (Windows). It installs for the current
-user without sudo. `capturefab --version` and `capturefab --json doctor` confirm it runs.
+user without sudo. `capturefab --version` and `capturefab --json doctor` confirm it runs. This
+page describes the command-line releases after 0.5.0; version 0.5.0 and earlier are the desktop
+app, whose commands and JSON differ, so update a `capturefab` that reports one of them.
 
 ## Rules
 
@@ -20,11 +22,14 @@ user without sudo. `capturefab --version` and `capturefab --json doctor` confirm
    `1` failed, `2` usage or input (fix the command), `3` unavailable (camera, session or
    FFmpeg), `4` timeout, `5` unsupported, `6` storage full, `130` interrupted. `error.code` is
    the specific reason, and `error.hint` says what to do next.
-3. **Do not guess flags.** Read `capturefab schema` once (about 1,500 tokens), then
+3. **Do not guess flags.** Read `capturefab schema` once (about 9 KB, roughly 3,000 tokens), then
    `capturefab schema COMMAND` for the commands you use. Unknown flags are exit 2 `usage`.
 4. **Durations need a unit**: `250ms`, `2s`, `1.5s`, `5m`, `1h30m`. `--timeout none` waits
    without limit. A bare `5000` is exit 2 `invalid_duration`.
-5. **Name the camera** with `-c` on every camera command. `list` IDs work everywhere.
+5. **Name the camera** with `-c` on every camera command. `list` IDs work everywhere. Quote
+   arguments for the shell: webcam IDs contain spaces (`-c 'avfoundation:HD Pro Webcam C920'`),
+   and zsh, the macOS default shell, expands bracketed names unless they are quoted
+   (`'TriggerMode[FrameStart]'`).
 6. **Files are never overwritten.** A taken name is exit 1 `exists` with `details.path`; add
    `{seq}` to `-o` or pass `--on-exists number`.
 7. **Paths in results are absolute.** Relative `-o` paths resolve against your working
@@ -32,9 +37,9 @@ user without sudo. `capturefab --version` and `capturefab --json doctor` confirm
 
 ## Permissions
 
-Put the verb first and flags after it, so a harness can allow commands by prefix:
+Put the command first and flags after it, so a harness can allow commands by prefix:
 `capturefab capture --json -c sim:0 -o shot.png`. `capturefab schema` gives each command's
-`effect`:
+`effect` when it runs without the flags below:
 
 | Effect | Commands | Suggested policy |
 | --- | --- | --- |
@@ -43,10 +48,18 @@ Put the verb first and flags after it, so a harness can allow commands by prefix
 | `camera_write` | `set`, `auto`, `preset apply`, `jobs stop` | allow for cameras the task owns |
 | `disruptive` | `exec`, `session start`, `session stop`, `serve`, `debug write`, `debug rpc` | ask the user |
 
+Flags can make a command a camera write: `--set` on `inspect`, `capture` and `record`, and
+`--auto` on `capture` and `record`, change camera settings as `set` and `auto` do and leave them
+changed; `network --tune` writes camera network settings that last until the camera powers off.
+A prefix also covers subcommands: a rule for `capturefab jobs` matches `capturefab jobs stop all`,
+and one for `capturefab preset` matches `preset apply`. So allow exact prefixes
+(`capturefab jobs list`, `capturefab jobs wait`, `capturefab preset list`), and ask before any
+call with `--set`, `--auto` or `--tune` unless the task owns the camera.
+
 `inspect` writes a small JPEG preview into a private folder, `dirs.inspect` in
 `capturefab --json doctor`; allow reading files there, or pass `--preview PATH` to put it in
 the task's folder, or `--preview none` for no image. Captures go where `-o` says (the working
-directory by default). `network --tune` writes camera network settings; `network` alone only reads.
+directory by default).
 
 ## Call patterns
 
@@ -88,9 +101,10 @@ capturefab inspect --json -c sim:0 --preview none
 capturefab capture --json -c sim:0 -o 'shots/{camera}-{seq}.png'
 ```
 
-`inspect` returns `verdict` (`ok`, `dark`, `bright`, `clipped_high`, `clipped_low`,
-`not_settled`, `not_measured`) and, when exposure is off, `suggest.exposure_us`. If the verdict
-is not `ok`, either set the suggested exposure (next pattern) or let the camera settle first:
+`inspect` returns `verdict`, a list of one or more of `ok`, `dark`, `bright`, `clipped_high`,
+`clipped_low`, `not_settled` and `not_measured`, such as `["ok"]` or `["clipped_high","bright"]`,
+and, when exposure is off, `suggest.exposure_us`. Proceed when `verdict` is exactly `["ok"]`.
+Otherwise either set the suggested exposure (next pattern) or let the camera settle first:
 `capture --json -c sim:0 --auto -o shot.png` runs auto exposure, holds it and captures.
 
 The `capture` result lists `files` (absolute paths) with `width`, `height`, `pixel_format` and
@@ -142,14 +156,17 @@ keeps the files saved so far. `--at 14:30` or `--in 5m` delays the start.
 ### Triggered capture
 
 ```sh
-capturefab set --json -c sim:0 trigger=software
-capturefab capture --json -c sim:0 -o part.png
+capturefab capture --json -c sim:0 --set trigger=software -o part.png
+capturefab set --json -c sim:0 trigger=line0:rising --keep 5m
+capturefab capture --json -c sim:0 -o 'part-{seq}.png' --timeout 30s
 ```
 
 With a software trigger, `capture` fires `TriggerSoftware` itself. For a hardware trigger
 (`trigger=line0:rising`), `capture` waits for the line: `--timeout 30s` bounds the wait, and
-expiry is exit 4 `trigger_timeout` with the trigger configuration in `details.trigger`. To
-capture every trigger for a while, combine `--timeout none -n 100 --background`, then
+expiry is exit 4 `trigger_timeout` with the trigger configuration in `details.trigger`. A plain
+command opens the camera anew, and a simulator then starts from its defaults, so set the trigger
+in the same call (`--set`) or keep the camera open (`--keep 5m`) for the captures that follow.
+To capture every trigger for a while, combine `--timeout none -n 100 --background`, then
 `jobs wait` or `jobs stop`. `set -c CAM trigger=off` returns to free running.
 
 ### Record video
@@ -207,7 +224,7 @@ errors never show credentials. `onvif resolve HOST` lists an ONVIF camera's RTSP
 | `permission_denied` | 3 | Follow `error.hint` (on macOS: allow Camera or Local Network for the terminal app). |
 | `disconnected`, `worker_crashed` | 3 | Retry once; then run `doctor` and report `error.details`. |
 | `unsupported` | 5 | The camera or build cannot do it; do not retry. |
-| `storage_full` | 6 | Free disk space or choose another folder. |
+| `storage_full` | 6 | The disk is full, or the storage budget is used up: the captures and recordings Capturefab saved that still exist count against 10 GiB and 10,000 files by default, in every folder. `error.message` names the limit; free disk space, move or delete earlier captures, or ask the user to raise the budget (`capturefab storage configure --max-files N --max-space SIZE`). |
 | `interrupted` | 130 | Stopped by a signal; `error.details.files` lists what was saved. |
 
 Partial work of a failed or interrupted command is in `error.details` (for example `files` and

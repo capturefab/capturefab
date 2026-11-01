@@ -22,7 +22,9 @@ function Fail([string]$Message) { throw "capturefab install: $Message" }
 function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
   $ErrorActionPreference = 'Stop'
   $ProgressPreference = 'SilentlyContinue'
-  if (-not $Version) { Fail "no published release is available yet; see ${Site}downloads.html or build from source" }
+  # Empty until a command-line release is published: releases up to 0.5.0
+  # were the desktop app, which this script does not install.
+  if (-not $Version) { Fail "no command-line release is published yet (0.5.0 and earlier are the desktop app); see ${Site}downloads.html or build from source" }
   # A 32-bit PowerShell on 64-bit Windows reports the system in PROCESSOR_ARCHITEW6432.
   $cpu = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
   $arch = switch ($cpu) {

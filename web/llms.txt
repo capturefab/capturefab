@@ -8,14 +8,14 @@ Capturefab is one `capturefab` executable for macOS, Windows and Linux. GigE Vis
 
 - [Agent instructions](agents.md): rules, permissions, call patterns for common tasks and error recovery by `error.code`.
 - [Command reference](reference.html): every command, option, JSON result field, exit code and error code, generated from `capturefab schema`.
-- `capturefab schema` prints the same contract as JSON (about 1,500 tokens); `capturefab schema COMMAND` describes one command.
+- `capturefab schema` prints the same contract as JSON (about 9 KB, roughly 3,000 tokens); `capturefab schema COMMAND` describes one command.
 
 ## Contract in brief
 
 - `--json` (or `CAPTUREFAB_JSON=1`): exactly one single-line JSON document on stdout. Exit 0: the result. Non-zero: `{"error":{"code","message","hint"?,"details"?}}`.
 - Exit codes: 0 ok, 1 failed, 2 usage, 3 unavailable, 4 timeout, 5 unsupported, 6 storage full, 130 interrupted.
 - Cameras: `-c` takes a `list` ID, serial, IP address, `rtsp://`, `srt://`, `http(s)://`, `onvif://host`, a file path, `sim:N` or `sim:replay:PATH`.
-- Names: GenICam features, banks such as `TriggerMode[FrameStart]`, and controls `exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure`, `auto_wb`.
+- Names: GenICam features, banks such as `TriggerMode[FrameStart]` (quote them in the shell), and controls `exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure`, `auto_wb`.
 - Durations need a unit (`250ms`, `2s`, `1h30m`); files are never overwritten (`{seq}` in `-o`, or `--on-exists number`).
 - `--keep 5m` keeps a camera open between calls; `--background` returns a job (`jobs`, `jobs wait`, `jobs stop`).
 
@@ -23,7 +23,7 @@ Capturefab is one `capturefab` executable for macOS, Windows and Linux. GigE Vis
 
 - Find cameras: `capturefab list --json`
 - What a camera can do: `capturefab info --json -c CAM`
-- Measure exposure and focus: `capturefab inspect --json -c CAM --preview none`
+- Measure exposure and focus: `capturefab inspect --json -c CAM --preview none` (`verdict` is a list; `["ok"]` means well exposed)
 - Change settings and measure in one call: `capturefab inspect --json -c CAM --set exposure=5ms`
 - Capture: `capturefab capture --json -c CAM -o 'shots/{seq}.png'`
 - Time lapse: `capturefab capture --json -c CAM --every 10s --for 1h -o 'lapse/{seq}.jpg' --background`

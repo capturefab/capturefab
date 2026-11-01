@@ -176,7 +176,7 @@ capturefab features -c sim:0 --category ImageFormatControl</code></pre><button c
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab get -c sim:0 ExposureTime Gain
 capturefab get -c sim:0 exposure trigger roi
-capturefab get -c sim:0 TriggerMode[FrameStart]
+capturefab get -c sim:0 &#x27;TriggerMode[FrameStart]&#x27;
 capturefab get -c sim:0 -c sim:1 Width</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab get examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab get JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
@@ -194,7 +194,7 @@ capturefab get -c sim:0 -c sim:1 Width</code></pre><button class="copy-button" t
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab set -c sim:0 exposure=5ms gain=3
 capturefab set -c sim:0 ExposureTime=10ms Width=640
-capturefab set -c sim:0 TriggerMode[FrameStart]=On trigger=line0:rising
+capturefab set -c sim:0 &#x27;TriggerMode[FrameStart]=On&#x27; trigger=line0:rising
 capturefab set -c sim:0 roi=0,0,320,240 --dry-run</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab set examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab set JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
@@ -211,8 +211,8 @@ capturefab set -c sim:0 roi=0,0,320,240 --dry-run</code></pre><button class="cop
 <tr><td><code>COMMAND</code></td><td>A command feature, optionally at a bank: TriggerSoftware, UserSetSave[UserSet1]</td><td>—</td></tr>
 <tr><td><code>--keep</code> DUR</td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>env <code>CAPTUREFAB_KEEP</code></td></tr>
 </tbody></table></div>
-<div class="code-wrap"><pre><code>capturefab exec -c sim:0 TriggerSoftware[FrameStart]
-capturefab exec -c gige:00c0df123456 UserSetSave[UserSet1]</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab exec examples">Copy</button></div>
+<div class="code-wrap"><pre><code>capturefab exec -c sim:0 &#x27;TriggerSoftware[FrameStart]&#x27;
+capturefab exec -c gige:00c0df123456 &#x27;UserSetSave[UserSet1]&#x27;</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab exec examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab exec JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
 <tr><td><code>executed</code></td><td>string — the command run, with its bank</td></tr>

@@ -136,6 +136,7 @@ jobs:
       # Builds without optional features keep compiling, alone and with each one.
       - run: cargo check --locked --no-default-features
       - run: cargo check --locked --no-default-features --features usb
+      - run: cargo check --locked --no-default-features --features jpeg
       - run: cargo check --locked --no-default-features --features keychain
 
   site:

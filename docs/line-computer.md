@@ -184,6 +184,17 @@ capture or recording stops with exit 6 `storage_full` rather than deleting anyth
 free space on an SD card before a long time lapse (`df -h ~`), and save to a removable drive by
 pointing `-o` at a folder on it once it is mounted.
 
+The same exit 6 comes from Capturefab's storage budget: the captures and recordings it saved
+that still exist count against 10 GiB and 10,000 files by default, across every folder, and
+`error.message` names the limit reached. A capture every minute reaches 10,000 files in about a
+week. Move finished captures elsewhere (moved or deleted files stop counting), or raise the budget
+for the account the service runs as:
+
+```sh
+capturefab storage configure --max-files 100000 --max-space 200GiB
+capturefab storage status
+```
+
 ## 6. Small boards
 
 `CAPTUREFAB_THREADS=2` limits image processing to two threads when the board also runs other

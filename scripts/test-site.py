@@ -333,11 +333,12 @@ def site_release():
 
 
 def check_installers(root, errors):
-    """The generated installers offer exactly the manifest's published builds, with their checksums."""
+    """The generated installers offer exactly the manifest's published builds, with their checksums,
+    and nothing while the latest release is the desktop app (0.5.0 and earlier)."""
     manifest = json.loads((root / "releases.json").read_text(encoding="utf-8"))
     canonical = re.search(r'<link rel="canonical" href="([^"]+)"', (root / "index.html").read_text(encoding="utf-8"))
     site = canonical[1].rstrip("/") + "/" if canonical else ""
-    latest = [r for r in manifest["releases"] if r["version"] == manifest.get("latest")]
+    latest = [r for r in manifest["releases"] if r["version"] == manifest.get("latest") and not site_release().is_desktop_release(r)]
     available = [a for r in latest for a in r["assets"] if a.get("available")]
     for name, systems, pattern in (("install.sh", {"macos", "linux"}, r"url='([^']+)' expected='([0-9a-f]{64})'"),
                                    ("install.ps1", {"windows"}, r"Url = '([^']+)'; Sha256 = '([0-9a-f]{64})'")):
@@ -384,14 +385,14 @@ def fixture_archive(directory, system, arch, kind=None):
 
 def check_installer_runs(errors):
     """Install from a local server, migrate an earlier desktop install, then refuse a
-    corrupted download, a disk image and an empty release."""
+    corrupted download, a disk image, a desktop release (0.5.0 and earlier) and an empty release."""
     system = {"Darwin": "macos", "Linux": "linux"}.get(platform.system())
     if not system or not shutil.which("sh"):
         return
     check_installer_run(errors, system)
 
 
-def installer(site, temp, system, kind=None):
+def installer(site, temp, system, kind=None, version="9.9.9"):
     served = temp / "served"
     served.mkdir(exist_ok=True)
     assets = []
@@ -399,8 +400,8 @@ def installer(site, temp, system, kind=None):
         path = fixture_archive(served, system, arch, kind)
         assets.append(dict(name=path.name, os=system, arch=arch, available=True, size=path.stat().st_size,
                            sha256=hashlib.sha256(path.read_bytes()).hexdigest(), url=f"https://example.invalid/{path.name}"))
-    manifest = dict(schema_version=1, latest="9.9.9", releases=[dict(version="9.9.9", date="2026-01-01", assets=assets)])
-    script = temp / f"install-{kind or 'tar'}.sh"
+    manifest = dict(schema_version=1, latest=version, releases=[dict(version=version, date="2026-01-01", assets=assets)])
+    script = temp / f"install-{kind or 'tar'}-{version}.sh"
     script.write_text(site.installers(manifest, "https://capturefab.example/")[0], encoding="utf-8")
     return served, script
 
@@ -474,14 +475,23 @@ def check_installer_run(errors, system):
             home, result = install("legacy", script=legacy)
             if result.returncode == 0 or "downloads.html" not in result.stderr or (home / "bin").exists():
                 errors.append(f"{label}: a disk-image release must fail, pointing to the downloads page, and install nothing")
+
+            # The latest release is still the desktop app: install nothing, and
+            # keep the launcher entry it added.
+            _, desktop = installer(site, temp, system, version="0.5.0")
+            home, result = install("desktop", script=desktop, setup=desktop_install)
+            if result.returncode == 0 or "no command-line release" not in result.stderr or "downloads.html" not in result.stderr:
+                errors.append(f"{label}: a desktop release (0.5.0 and earlier) must fail with 'no command-line release', pointing to the downloads page")
+            elif not (home / "share/applications/capturefab.desktop").exists() or not (home / "bin/capturefab").is_symlink() or (home / "share/capturefab").exists():
+                errors.append(f"{label}: a desktop release must install nothing and leave the earlier install as it was")
         finally:
             server.shutdown()
             server.server_close()
         empty = temp / "empty.sh"
         empty.write_text(site.installers(dict(schema_version=1, latest=None, releases=[]), "https://capturefab.example/")[0], encoding="utf-8")
         result = subprocess.run(["sh", str(empty)], capture_output=True, text=True, env=dict(os.environ, HOME=str(temp)), timeout=30)
-        if result.returncode == 0 or "no published release" not in result.stderr:
-            errors.append("install.sh: without a release it must fail with 'no published release'")
+        if result.returncode == 0 or "no command-line release" not in result.stderr:
+            errors.append("install.sh: without a release it must fail with 'no command-line release'")
 
 
 class QuietHandler(SimpleHTTPRequestHandler):

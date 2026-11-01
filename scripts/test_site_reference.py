@@ -102,6 +102,16 @@ class RenderTests(unittest.TestCase):
         self.assertIn('<a href="#error-exists"><code>exists</code></a>', self.page)
         self.assertIn('Alias: <code>shoot</code>', self.page)
 
+    def test_examples_quote_bracketed_names_for_zsh(self):
+        self.assertEqual(reference.shell_safe('capturefab set -c sim:0 TriggerMode[FrameStart]=On trigger=off'),
+                         "capturefab set -c sim:0 'TriggerMode[FrameStart]=On' trigger=off")
+        for line in ("capturefab exec -c sim:0 'TriggerSoftware[FrameStart]'", "capturefab features -c sim:0 'Exposure*'",
+                     'echo \'{"names":[{"name":"Width"}]}\' | capturefab debug rpc -c sim:0'):
+            self.assertEqual(reference.shell_safe(line), line)
+        snap = snapshot()
+        snap['commands']['capture']['examples'] = ['capturefab get -c sim:0 TriggerMode[FrameStart]']
+        self.assertIn('capturefab get -c sim:0 &#x27;TriggerMode[FrameStart]&#x27;', reference.render(snap))
+
     def test_text_is_escaped_and_exit_codes_are_numeric_order(self):
         self.assertIn('people &amp; agents', self.page)
         self.assertIn('never overwritten &lt;ever&gt;', self.page)

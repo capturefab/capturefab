@@ -181,10 +181,20 @@ def table(caption, headers, rows):
     return f'<div class="table-scroll"><table><caption>{caption}</caption><thead><tr>{head}</tr></thead><tbody>\n{body}\n</tbody></table></div>'
 
 
+# A word with [ that is not quoted, such as TriggerMode[FrameStart]: zsh, the
+# default macOS shell, takes it as a glob and stops when nothing matches.
+GLOB_WORD = re.compile(r'(?<!\S)([^\s\'"]*\[[^\s\'"]*)(?!\S)')
+
+
+def shell_safe(line):
+    """An example line that copies into zsh as well as bash: bracketed names quoted."""
+    return GLOB_WORD.sub(lambda match: f"'{match[1]}'", line)
+
+
 def examples(lines, label):
     if not lines:
         return ''
-    body = esc('\n'.join(lines))
+    body = esc('\n'.join(shell_safe(line) for line in lines))
     return f'<div class="code-wrap"><pre><code>{body}</code></pre><button class="copy-button" type="button" aria-label="Copy the {esc(label)} examples">Copy</button></div>'
 
 
