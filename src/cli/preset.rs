@@ -239,7 +239,7 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             keep,
         } => {
             let file = file.as_deref().map(absolute).transpose()?;
-            let (name, setup) = load(&name, &file)?;
+            let setup = load(&name, &file)?;
             if let Some(user_set) = &persist {
                 crate::controls::Name::parse(user_set)?;
             }
@@ -250,10 +250,13 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
                 .as_deref()
                 .map(|user_set| check_persist(&client, user_set))
                 .transpose()?;
-            let inline = name.is_none().then(|| setup.clone());
+            // The session gets the preset this command read, never just its
+            // name: a session may keep its presets in another state folder
+            // (CAPTUREFAB_STATE_DIR), so it would apply another preset of
+            // that name, or none, than the one checked here.
             let mut diff = client.call(SessionCommand::SetupDiff {
-                setup: inline.clone(),
-                name: name.clone(),
+                setup: Some(setup.clone()),
+                name: None,
                 allow_other_model: true,
             })?;
             if !allow_other_model && diff["match"] == "other_model" {
@@ -281,8 +284,8 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
                 return Ok(Report::json(renamed(diff)).text(String::from_utf8_lossy(&text)));
             }
             let mut result = client.call(SessionCommand::ApplySetup {
-                setup: inline,
-                name,
+                setup: Some(setup),
+                name: None,
                 allow_other_model,
                 strict,
             })?;
@@ -580,15 +583,14 @@ fn summary(setup: &Setup, path: &Path) -> Value {
     }})
 }
 
-/// The setup a diff or apply names: a saved one (sent by name, so the
-/// session loads it) or a file (sent inline).
-fn load(name: &Option<String>, file: &Option<PathBuf>) -> Result<(Option<String>, Setup)> {
+/// The setup an apply names: a saved one, from this command's state
+/// folder, or a file.
+fn load(name: &Option<String>, file: &Option<PathBuf>) -> Result<Setup> {
     match file {
-        Some(file) => Ok((None, document_input(setups::read_file(file))?)),
+        Some(file) => document_input(setups::read_file(file)),
         None => {
-            let name = name.clone().context("name a preset or pass --file")?;
-            let setup = Store::session()?.get(&name)?;
-            Ok((Some(name), setup))
+            let name = name.as_deref().context("name a preset or pass --file")?;
+            Store::session()?.get(name)
         }
     }
 }

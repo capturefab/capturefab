@@ -86,6 +86,21 @@ pub fn memory() -> Memory {
     memory
 }
 
+/// Make freed frames go back to the system. glibc raises its mmap
+/// threshold to the largest block freed, after which frame-sized buffers
+/// come from its per-thread heaps and stay there once freed: a warm
+/// worker would keep a burst's peak until it exits, and the next command
+/// under a small memory cgroup could be killed for it. A fixed threshold
+/// maps every frame-sized buffer and unmaps it when freed, as musl does.
+/// For camera workers, before they start threads.
+pub fn return_freed_frames() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only changes the allocator's settings.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 128 << 10);
+    }
+}
+
 /// The cgroup CPU quota, in CPUs, when one is set (`cpu.max`).
 pub fn cpu_quota() -> Option<f64> {
     platform::cpu_quota()
@@ -123,7 +138,7 @@ mod platform {
         read(path)?.trim().parse().ok()
     }
     /// A `key value` line's value in a file such as memory.stat.
-    fn field(text: &str, key: &str) -> Option<u64> {
+    pub(super) fn field(text: &str, key: &str) -> Option<u64> {
         text.lines().find_map(|line| {
             let (name, value) = line.split_once(char::is_whitespace)?;
             (name == key)
@@ -375,5 +390,42 @@ mod tests {
         if cfg!(any(target_os = "linux", target_os = "macos", windows)) {
             assert!(memory_budget().is_some_and(|budget| budget > 0));
         }
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn freed_frames_go_back_to_the_system() {
+        const NAME: &str = "host::tests::freed_frames_go_back_to_the_system";
+        // Alone in a process: other tests' allocations would blur its own.
+        if std::env::var_os("CAPTUREFAB_TEST_FREED_FRAMES").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env("CAPTUREFAB_TEST_FREED_FRAMES", "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("1 passed"), "{stdout}");
+            return;
+        }
+        return_freed_frames();
+        let resident = || {
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            platform::field(&status, "RssAnon:").unwrap() << 10
+        };
+        // A freed frame would raise glibc's own threshold past frames of
+        // its size, so a burst after it stayed in the heap.
+        drop(vec![1u8; 6 << 20]);
+        let before = resident();
+        let burst = (0..10).map(|_| vec![1u8; 6 << 20]).collect::<Vec<_>>();
+        assert!(resident() > before + (50 << 20));
+        drop(burst);
+        let after = resident();
+        assert!(
+            after < before + (4 << 20),
+            "{} MiB of a burst's frames kept",
+            (after - before) >> 20
+        );
     }
 }

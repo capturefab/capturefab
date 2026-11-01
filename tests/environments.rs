@@ -288,3 +288,56 @@ fn a_read_only_home_records_to_a_data_folder() {
     assert!(result["frames"].as_u64().unwrap() > 0, "{result}");
     assert!(support::cli::decodes(&clip));
 }
+
+#[test]
+fn a_preset_applies_through_a_session_that_keeps_state_elsewhere() {
+    // A service with a state folder of its own, reached from a shell that
+    // sets only CAPTUREFAB_SESSION_DIR: the preset this shell saved is the
+    // one applied, not one of the same name in the service's folder.
+    let home = Home::new("env-state-elsewhere");
+    let service_state = home.root.join("service-state");
+    let mut service = home.command();
+    service.env("CAPTUREFAB_STATE_DIR", &service_state);
+    let _session = home.serve_in(&mut service, "line", &["sim:0"], &[]);
+    let at = |width: &str| {
+        home.ok(&[
+            "set",
+            "--session",
+            "line",
+            "-c",
+            "sim:0",
+            &format!("Width={width}"),
+        ]);
+    };
+    at("320");
+    home.ok(&[
+        "preset",
+        "save",
+        "narrow",
+        "--session",
+        "line",
+        "-c",
+        "sim:0",
+    ]);
+    assert!(
+        home.sessions
+            .join("setups")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some()
+    );
+    at("640");
+    let applied = home.ok(&[
+        "preset",
+        "apply",
+        "narrow",
+        "--session",
+        "line",
+        "-c",
+        "sim:0",
+    ]);
+    assert_eq!(applied["applied"], 1, "{applied}");
+    let width = home.ok(&["get", "--session", "line", "-c", "sim:0", "Width"]);
+    assert_eq!(width["values"]["Width"], 320, "{width}");
+}

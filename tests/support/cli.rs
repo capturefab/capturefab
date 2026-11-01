@@ -51,6 +51,8 @@ impl Home {
             .env_remove("CAPTUREFAB_CAMERA")
             .env_remove("CAPTUREFAB_JSON")
             .env_remove("CAPTUREFAB_CAMERA_PASSWORD")
+            // It would take state out of the test's folder.
+            .env_remove("CAPTUREFAB_STATE_DIR")
             .env("CAPTUREFAB_KEEP", "0")
             .env("CAPTUREFAB_SESSION_DIR", &self.sessions)
             .env("CAPTUREFAB_CACHE_DIR", test_cache())

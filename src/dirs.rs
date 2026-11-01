@@ -207,6 +207,9 @@ pub(crate) fn temp() -> Option<PathBuf> {
 fn choose(kind: Kind, candidates: &[Candidate]) -> Found {
     let mut passed = Vec::new();
     for candidate in candidates {
+        if kind == Kind::Cache {
+            make_private(&candidate.path);
+        }
         match prepare(&candidate.path, kind == Kind::State) {
             Ok(writable) => {
                 return Found {
@@ -220,21 +223,37 @@ fn choose(kind: Kind, candidates: &[Candidate]) -> Found {
                 };
             }
             Err(error) => {
-                let classified = crate::types::classify(&error);
                 passed.push(Passed {
                     path: candidate.path.clone(),
                     from: candidate.from,
                     why: why(&error),
                 });
                 if candidate.explicit {
+                    let refusal = match error.downcast_ref::<std::io::Error>() {
+                        // A folder that cannot be made or written, as on a
+                        // read-only file system, is named with the reason.
+                        Some(io) => Refusal {
+                            kind: ErrorKind::PermissionDenied,
+                            message: format!(
+                                "cannot write in {}: {}",
+                                candidate.path.display(),
+                                io_why(io)
+                            ),
+                            hint: Some(variable_hint(kind)),
+                        },
+                        None => {
+                            let classified = crate::types::classify(&error);
+                            Refusal {
+                                kind: classified.kind,
+                                message: format!("{error:#}"),
+                                hint: classified.hint.or_else(|| Some(variable_hint(kind))),
+                            }
+                        }
+                    };
                     return Found {
                         chosen: None,
                         passed,
-                        refusal: Some(Refusal {
-                            kind: classified.kind,
-                            message: format!("{error:#}"),
-                            hint: classified.hint.or_else(|| Some(variable_hint(kind))),
-                        }),
+                        refusal: Some(refusal),
                     };
                 }
             }
@@ -325,6 +344,27 @@ fn prepare(path: &Path, read_only: bool) -> Result<bool> {
         }
         Err(error) => Err(error.into()),
     }
+}
+
+/// Make a cache folder of this user's that others may enter private, such
+/// as one made with plain `mkdir`, as extracting FFmpeg there always did:
+/// it holds nothing others could have read. A runtime or state folder is
+/// refused instead, with `chmod 700` as the fix: others may already have
+/// read the session tokens or sign-in index in it.
+fn make_private(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && meta.is_dir()
+            && meta.uid() == effective_uid()
+            && meta.mode() & 0o077 != 0
+        {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn create_private(path: &Path) -> std::io::Result<()> {
@@ -555,14 +595,18 @@ fn runtime_defaults(
 /// The state folder's candidates: CAPTUREFAB_STATE_DIR, else
 /// CAPTUREFAB_SESSION_DIR, alone when set; else the default.
 fn state_candidates(var: &impl Fn(&str) -> Option<PathBuf>, linux: bool) -> Vec<Candidate> {
+    let session = var(SESSION_DIR_ENV);
+    // A CAPTUREFAB_STATE_DIR exported in the shell, as for a service,
+    // must not take unit tests to the user's presets: only one that also
+    // sets CAPTUREFAB_SESSION_DIR chooses its own folders.
+    if cfg!(test) && session.is_none() {
+        return vec![Candidate::explicit(test_dir(), "test")];
+    }
     if let Some(dir) = var(STATE_DIR_ENV) {
         return vec![Candidate::explicit(dir, STATE_DIR_ENV)];
     }
-    if let Some(dir) = var(SESSION_DIR_ENV) {
+    if let Some(dir) = session {
         return vec![Candidate::explicit(dir, SESSION_DIR_ENV)];
-    }
-    if cfg!(test) {
-        return vec![Candidate::explicit(test_dir(), "test")];
     }
     state_default(var, linux).into_iter().collect()
 }
@@ -823,7 +867,24 @@ pub(crate) fn noexec_mount(path: &Path) -> bool {
             flags as u64 & libc::ST_NOEXEC as u64 != 0
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    // macOS's statvfs has no noexec flag; statfs does.
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: statfs fills `stats` for a NUL-terminated path and returns
+        // 0 only then.
+        if unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return false;
+        }
+        // SAFETY: statfs succeeded, so `stats` is initialized.
+        let flags = unsafe { stats.assume_init() }.f_flags;
+        flags & libc::MNT_NOEXEC as u32 != 0
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = path;
         false
@@ -905,9 +966,13 @@ mod tests {
         assert_eq!(dir, test_dir(), "one folder per process");
         if std::env::var_os(SESSION_DIR_ENV).is_none() {
             assert_eq!(runtime().unwrap(), dir);
-            if std::env::var_os(STATE_DIR_ENV).is_none() {
-                assert_eq!(state().unwrap(), dir);
-            }
+            // Even with CAPTUREFAB_STATE_DIR exported.
+            assert_eq!(state().unwrap(), dir);
+            let exported = env(&[(STATE_DIR_ENV, "/data/state")]);
+            assert_eq!(
+                paths(&state_candidates(&exported, true)),
+                std::slice::from_ref(&dir)
+            );
         }
         if std::env::var_os(CACHE_DIR_ENV).is_none() {
             assert!(cache().unwrap().starts_with(std::env::temp_dir()));
@@ -1029,6 +1094,66 @@ mod tests {
             none.error()
         );
         assert!(none.error().to_string().contains("sessions: not writable"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_cache_of_this_user_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("shared-cache");
+        let cache = dir.0.join("cache");
+        fs::create_dir(&cache).unwrap();
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o755)).unwrap();
+        let found = choose(
+            Kind::Cache,
+            &[Candidate::explicit(cache.clone(), CACHE_DIR_ENV)],
+        );
+        assert_eq!(found.chosen.unwrap().path, cache);
+        assert_eq!(
+            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        // A runtime folder others may enter is refused with the fix.
+        let runtime = dir.0.join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).unwrap();
+        let found = choose(
+            Kind::Runtime,
+            &[Candidate::explicit(runtime.clone(), SESSION_DIR_ENV)],
+        );
+        assert_eq!(found.chosen, None);
+        let classified = crate::types::classify(&found.error());
+        let quoted = crate::hint::shell_quote(&runtime.display().to_string());
+        assert_eq!(classified.hint, Some(format!("chmod 700 {quoted}")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_variable_naming_a_folder_that_cannot_be_made_says_which() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new("unmakeable");
+        let parent = dir.0.join("read-only");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o500)).unwrap();
+        if fs::create_dir(parent.join("probe")).is_ok() {
+            return;
+        }
+        let state = parent.join("state");
+        let found = choose(
+            Kind::State,
+            &[Candidate::explicit(state.clone(), STATE_DIR_ENV)],
+        );
+        let error = found.error();
+        let classified = crate::types::classify(&error);
+        assert_eq!(classified.kind.code(), ("permission_denied", 3));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cannot write in {}: not writable by this user",
+                state.display()
+            )
+        );
+        assert!(classified.hint.unwrap().contains(STATE_DIR_ENV));
     }
 
     #[cfg(unix)]

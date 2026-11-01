@@ -66,6 +66,7 @@ struct LineRef<'a> {
 
 /// Run as a camera worker; `args` follow `__worker`.
 pub fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> {
+    crate::host::return_freed_frames();
     let args = arguments(args)?;
     // A panic on any thread, the camera's or a helper's, ends the process,
     // which its coordinator reports and recovers from; a worker whose

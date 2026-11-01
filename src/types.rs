@@ -448,17 +448,30 @@ pub fn classify(error: &anyhow::Error) -> Classified {
         hint: None,
         details: None,
     };
-    let ffmpeg = error
+    // An FFmpeg that could not be started is ffmpeg_missing with the
+    // install hint, unless the error says more, as a bundled copy with
+    // nowhere to run does.
+    if error
         .downcast_ref::<crate::media::FfmpegUnavailable>()
-        .is_some();
-    for cause in error.chain() {
-        if ffmpeg && !cause.is::<Categorized>() {
-            return Classified {
+        .is_some()
+    {
+        let categorized = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<Categorized>());
+        return match categorized {
+            Some(categorized) => Classified {
+                kind: categorized.kind,
+                hint: categorized.hint.clone(),
+                details: categorized.details.clone(),
+            },
+            None => Classified {
                 kind: ErrorKind::FfmpegMissing,
                 hint: Some(crate::media::ffmpeg_hint()),
                 details: None,
-            };
-        }
+            },
+        };
+    }
+    for cause in error.chain() {
         if let Some(categorized) = cause.downcast_ref::<Categorized>() {
             return Classified {
                 kind: categorized.kind,

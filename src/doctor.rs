@@ -210,7 +210,15 @@ struct Facts {
     leftovers: Vec<PathBuf>,
     /// Folders passed over or refused because they are not private to
     /// this user, and why.
-    private_dirs: Vec<(PathBuf, String)>,
+    private_dirs: Vec<PrivateDir>,
+}
+/// A folder passed over, or refused, because it is not this user's alone.
+#[derive(Debug, Clone, PartialEq)]
+struct PrivateDir {
+    path: PathBuf,
+    why: String,
+    /// A cache folder, which CAPTUREFAB_CACHE_DIR moves, not sessions'.
+    cache: bool,
 }
 /// Where a service started without XDG_RUNTIME_DIR keeps sessions, out of
 /// this login's sight, the login runtime directory it passes over and why,
@@ -228,17 +236,19 @@ impl Facts {
     fn gather(report: bool, warm_sessions: Option<bool>) -> Self {
         let runtime = Folder::of(crate::dirs::Kind::Runtime);
         let state = Folder::of(crate::dirs::Kind::State);
-        let mut private_dirs = Vec::new();
-        for (path, why) in runtime
-            .passed
-            .iter()
-            .chain(&state.passed)
-            .filter(|passed| private_problem(&passed.why))
-            .map(|passed| (passed.path.clone(), passed.why.clone()))
-        {
-            if !private_dirs.iter().any(|(seen, _)| *seen == path) {
-                let why = format!("{}: {why}", path.display());
-                private_dirs.push((path, why));
+        let cache = Folder::of(crate::dirs::Kind::Cache);
+        let mut private_dirs: Vec<PrivateDir> = Vec::new();
+        for (folder, is_cache) in [(&runtime, false), (&state, false), (&cache, true)] {
+            for passed in &folder.passed {
+                if private_problem(&passed.why)
+                    && !private_dirs.iter().any(|seen| seen.path == passed.path)
+                {
+                    private_dirs.push(PrivateDir {
+                        path: passed.path.clone(),
+                        why: format!("{}: {}", passed.path.display(), passed.why),
+                        cache: is_cache,
+                    });
+                }
             }
         }
         let state_dir = state
@@ -276,7 +286,7 @@ impl Facts {
             private_dirs,
             runtime,
             state,
-            cache: Folder::of(crate::dirs::Kind::Cache),
+            cache,
             warm_sessions,
             read_only_root: if cfg!(target_os = "linux") {
                 crate::dirs::read_only_mount(Path::new("/"))
@@ -421,6 +431,7 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks.extend(private_dirs_check(
         &facts.private_dirs,
         facts.runtime.place.as_ref(),
+        facts.cache.place.as_ref(),
     ));
     checks.extend(facts.read_only_root.and_then(read_only_root_check));
     checks.push(resources_check(
@@ -713,31 +724,55 @@ fn private_problem(why: &str) -> bool {
 }
 
 /// Folders passed over, or refused, because they are not this user's
-/// alone, and where sessions are instead.
-fn private_dirs_check(problems: &[(PathBuf, String)], runtime: Option<&Place>) -> Option<Check> {
+/// alone, and where sessions and the cache are instead.
+fn private_dirs_check(
+    problems: &[PrivateDir],
+    runtime: Option<&Place>,
+    cache: Option<&Place>,
+) -> Option<Check> {
     if problems.is_empty() {
         return None;
     }
-    let messages: Vec<&str> = problems.iter().map(|(_, why)| why.as_str()).collect();
-    let consequence = match runtime {
-        Some(runtime) => format!("so sessions use {}", runtime.path.display()),
-        None => "so no session can start".into(),
-    };
-    let foreign = problems
+    let messages: Vec<&str> = problems
         .iter()
-        .any(|(_, why)| why.contains("belongs to another user") || why.contains("real directory"));
+        .map(|problem| problem.why.as_str())
+        .collect();
+    let mut consequences = Vec::new();
+    let mut variables = Vec::new();
+    if problems.iter().any(|problem| !problem.cache) {
+        consequences.push(match runtime {
+            Some(runtime) => format!("sessions use {}", runtime.path.display()),
+            None => "no session can start".into(),
+        });
+        variables.push(crate::dirs::SESSION_DIR_ENV);
+    }
+    if problems.iter().any(|problem| problem.cache) {
+        consequences.push(match cache {
+            Some(cache) => format!("the cache is in {}", cache.path.display()),
+            None => "nothing is cached".into(),
+        });
+        variables.push(crate::dirs::CACHE_DIR_ENV);
+    }
+    let foreign = problems.iter().any(|problem| {
+        problem.why.contains("belongs to another user") || problem.why.contains("real directory")
+    });
     let dirs: Vec<String> = problems
         .iter()
-        .map(|(dir, _)| shell_word(&dir.display().to_string()))
+        .map(|problem| shell_word(&problem.path.display().to_string()))
         .collect();
+    let variables = variables.join(" or ");
     Some(Check::warn(
         "private_dirs",
-        format!("{}; {consequence}.", messages.join("; ")),
+        format!(
+            "{}; so {}.",
+            messages.join("; "),
+            consequences.join(" and ")
+        ),
         if foreign {
-            "Set CAPTUREFAB_SESSION_DIR to a folder of your own.".into()
+            format!("Set {variables} to a folder of your own.")
         } else {
             format!(
-                "chmod 700 {}  # or set CAPTUREFAB_SESSION_DIR to another folder",
+                "chmod 700 {}  # or set {variables} to another folder",
                 dirs.join(" ")
             )
         },
@@ -1668,7 +1703,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let problem = crate::dirs::check_private_dir(&dir).unwrap_err();
-        let check = private_dirs_check(&[(dir.clone(), format!("{problem:#}"))], None).unwrap();
+        let private = |why: String, cache: bool| PrivateDir {
+            path: dir.clone(),
+            why,
+            cache,
+        };
+        let check =
+            private_dirs_check(&[private(format!("{problem:#}"), false)], None, None).unwrap();
         assert_eq!(check.level, Level::Warn);
         assert!(
             check.message.contains("must be private"),
@@ -1682,11 +1723,15 @@ mod tests {
         );
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(crate::dirs::check_private_dir(&dir).is_ok());
-        assert_eq!(private_dirs_check(&[], None), None);
+        assert_eq!(private_dirs_check(&[], None, None), None);
         let runtime = place("/tmp/capturefab-1000", "tmpfs", 400 << 20);
         let foreign = private_dirs_check(
-            &[(dir.clone(), "folder /tmp/x belongs to another user".into())],
+            &[private(
+                "folder /tmp/x belongs to another user".into(),
+                false,
+            )],
             Some(&runtime),
+            None,
         )
         .unwrap();
         assert!(
@@ -1697,6 +1742,27 @@ mod tests {
             foreign.message
         );
         assert!(foreign.fix.unwrap().contains("CAPTUREFAB_SESSION_DIR"));
+        // A cache folder another user owns names the cache's variable.
+        let cache = private_dirs_check(
+            &[private(
+                "folder /data/cache belongs to another user".into(),
+                true,
+            )],
+            Some(&runtime),
+            Some(&place("/tmp/capturefab-1000/cache", "tmpfs", 400 << 20)),
+        )
+        .unwrap();
+        assert!(
+            cache
+                .message
+                .ends_with("so the cache is in /tmp/capturefab-1000/cache."),
+            "{}",
+            cache.message
+        );
+        assert_eq!(
+            cache.fix.as_deref(),
+            Some("Set CAPTUREFAB_CACHE_DIR to a folder of your own.")
+        );
         assert!(private_problem("group or others may enter it"));
         assert!(!private_problem("read-only file system"));
         assert_eq!(shell_word("/tmp/a b"), "'/tmp/a b'");

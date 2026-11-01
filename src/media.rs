@@ -4938,6 +4938,25 @@ mod tests {
             let hint = classified.hint.unwrap();
             assert!(hint.contains("CAPTUREFAB_FFMPEG"), "{hint}");
         }
+        // A build with FFmpeg built in that has nowhere to run it says
+        // which folder would, not how to install FFmpeg.
+        let nowhere = Categorized::new(
+            ErrorKind::FfmpegMissing,
+            "cannot extract the bundled FFmpeg to a folder that runs programs",
+        )
+        .hint("set CAPTUREFAB_CACHE_DIR to a writable folder that allows running programs");
+        let error = anyhow::Error::from(nowhere)
+            .context(FfmpegUnavailable)
+            .context("open camera");
+        let classified = crate::types::classify(&error);
+        assert_eq!(classified.kind.code(), ("ffmpeg_missing", 3));
+        assert!(
+            classified
+                .hint
+                .unwrap()
+                .starts_with("set CAPTUREFAB_CACHE_DIR"),
+            "{error:#}"
+        );
     }
     #[test]
     #[cfg(unix)]

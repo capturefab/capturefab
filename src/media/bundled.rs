@@ -4,7 +4,8 @@
 //! and noexec homes still run it. A copy is checked once against its digest
 //! when it is written or first found; a marker beside it then records the
 //! file it checked, and later processes compare the file against the marker
-//! instead of hashing it again.
+//! instead of hashing it again. A copy the system would not start gets a
+//! marker of its own, so later processes only ask the system again.
 use super::{Executable, FFMPEG_NAME, nonce};
 use crate::types::{Categorized, ErrorKind};
 use anyhow::{Context, Result, bail, ensure};
@@ -13,6 +14,7 @@ use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 
 // Keep this envelope in sync with build.rs and scripts/release.py. The raw
@@ -20,6 +22,12 @@ use std::{
 const PAYLOAD_MAGIC: &[u8] = b"CAPTUREFAB-FFMPEG-ZLIB\0";
 /// Beside a checked copy: its digest and the identity of the file checked.
 const MARKER: &str = "verified";
+/// The same for a checked copy this system would not start, as under an
+/// execution policy or on a noexec mount this platform cannot detect.
+const REFUSED_MARKER: &str = "refused";
+/// How long a process that found nowhere to run the copy uses what else
+/// there is before trying again: each try starts the copy in each folder.
+const RETRY: Duration = Duration::from_secs(60);
 
 pub(super) struct Payload<'a> {
     bytes: &'a [u8],
@@ -110,12 +118,27 @@ impl<'a> Payload<'a> {
 
 /// The copy this process runs, kept for its life.
 static EXTRACTED: OnceLock<Mutex<Option<Arc<Executable>>>> = OnceLock::new();
-/// Why the last extraction found no folder, for doctor.
-static REFUSED: Mutex<Option<String>> = Mutex::new(None);
+/// Why the last extraction found no folder, and when, for doctor and for
+/// the calls until `RETRY` has passed.
+static REFUSED: Mutex<Option<(Instant, String)>> = Mutex::new(None);
 
 /// Why the bundled FFmpeg could not be extracted, when it could not.
 pub(super) fn refused() -> Option<String> {
-    REFUSED.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    REFUSED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(_, message)| message.clone())
+}
+
+/// `ffmpeg_missing` for a copy that could not be extracted, for `why`.
+fn nowhere(why: String) -> anyhow::Error {
+    Categorized::new(ErrorKind::FfmpegMissing, why)
+        .hint(format!(
+            "set {} to a writable folder that allows running programs, or CAPTUREFAB_FFMPEG to an FFmpeg executable",
+            crate::dirs::CACHE_DIR_ENV
+        ))
+        .into()
 }
 
 /// The built-in FFmpeg, extracted once for every process of this user to
@@ -133,8 +156,21 @@ pub(super) fn extracted(embedded: &[u8]) -> Result<Arc<Executable>> {
     {
         return Ok(copy.clone());
     }
-    let mut refused = Vec::new();
-    for root in roots() {
+    if let Some((when, why)) = &*REFUSED.lock().unwrap_or_else(|e| e.into_inner())
+        && when.elapsed() < RETRY
+    {
+        return Err(nowhere(why.clone()));
+    }
+    let roots = roots();
+    // A cache folder passed over, such as one CAPTUREFAB_CACHE_DIR names
+    // that another user owns, says why first.
+    let mut refused = crate::dirs::found(crate::dirs::Kind::Cache)
+        .passed
+        .iter()
+        .filter(|passed| !roots.contains(&passed.path))
+        .map(|passed| format!("{}: {}", passed.path.display(), passed.why))
+        .collect::<Vec<_>>();
+    for root in roots {
         if noexec(&root) {
             refused.push(format!("{}: mounted noexec", root.display()));
             continue;
@@ -152,13 +188,8 @@ pub(super) fn extracted(embedded: &[u8]) -> Result<Arc<Executable>> {
             refused.join("; ")
         }
     );
-    *REFUSED.lock().unwrap_or_else(|e| e.into_inner()) = Some(message.clone());
-    Err(Categorized::new(ErrorKind::FfmpegMissing, message)
-    .hint(format!(
-        "set {} to a writable folder that allows running programs, or CAPTUREFAB_FFMPEG to an FFmpeg executable",
-        crate::dirs::CACHE_DIR_ENV
-    ))
-    .into())
+    *REFUSED.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), message.clone()));
+    Err(nowhere(message))
 }
 
 /// Where the bundled FFmpeg may be extracted, in order: the cache, a cache
@@ -216,7 +247,9 @@ fn cached_copy(root: &Path, bytes: &[u8], digest: &str) -> Result<Executable> {
 /// The copy of `payload` under `root`. A copy the marker vouches for is
 /// used as it is. Otherwise it is checked against the digest, or written
 /// anew under a lock, then `usable` must accept it before the marker
-/// vouches for it: a copy this system refuses to start never gets one.
+/// vouches for it: a copy this system refuses to start never gets one,
+/// only the refusal marker, which spares the next process the digest but
+/// not the question, as a remount or a new policy may let it start.
 fn cached_payload(
     root: &Path,
     payload: &Payload<'_>,
@@ -233,23 +266,33 @@ fn cached_payload(
         probes: Some(dir.join("probes.json")),
         _in_use: Some(in_use),
     };
-    let checked = || trusted(&path, payload.length).is_ok() && marked(&dir, &path, digest);
+    let checked =
+        |marker| trusted(&path, payload.length).is_ok() && marked(&dir, marker, &path, digest);
     let intact = || {
         trusted(&path, payload.length).is_ok()
             && sha256_file(&path).ok().as_deref() == Some(digest.as_str())
     };
-    if !checked() {
+    if !checked(MARKER) {
         let extracting = lock_file(&dir.join("extract.lock"))?;
         fs2::FileExt::lock_exclusive(&extracting)?;
         // Another process may have finished the copy while this one waited.
-        if !checked() {
-            if !intact() {
+        if !checked(MARKER) {
+            let refused_before = checked(REFUSED_MARKER);
+            if !refused_before && !intact() {
                 extract(&path, payload)?;
             }
-            ensure!(usable(&copy), "the folder does not allow running programs");
-            // Best effort: without the marker the next process hashes it
-            // again.
-            let _ = mark(&dir, &path, digest);
+            // Best effort: without a marker the next process hashes the
+            // copy again.
+            if !usable(&copy) {
+                if !refused_before {
+                    let _ = mark(&dir, REFUSED_MARKER, &path, digest);
+                }
+                bail!("the folder does not allow running programs");
+            }
+            let _ = mark(&dir, MARKER, &path, digest);
+            if refused_before {
+                let _ = fs::remove_file(dir.join(REFUSED_MARKER));
+            }
         }
     }
     prune(root, &dir);
@@ -314,23 +357,24 @@ fn identity(path: &Path) -> Option<String> {
 fn marker_line(path: &Path, digest: &str) -> Option<String> {
     Some(format!("{digest} {}\n", identity(path)?))
 }
-/// Whether the marker in `dir` vouches for the copy at `path` as it is now.
-fn marked(dir: &Path, path: &Path, digest: &str) -> bool {
+/// Whether `marker` in `dir` vouches for the copy at `path` as it is now.
+fn marked(dir: &Path, marker: &str, path: &Path, digest: &str) -> bool {
     let Some(expected) = marker_line(path, digest) else {
         return false;
     };
-    let Ok(file) = fs::File::open(dir.join(MARKER)) else {
+    let Ok(file) = fs::File::open(dir.join(marker)) else {
         return false;
     };
     let mut text = String::new();
     file.take(1024).read_to_string(&mut text).is_ok() && text == expected
 }
-/// Vouch for the copy at `path`, just checked against `digest`.
-fn mark(dir: &Path, path: &Path, digest: &str) -> Result<()> {
+/// Vouch with `marker` for the copy at `path`, just checked against
+/// `digest`.
+fn mark(dir: &Path, marker: &str, path: &Path, digest: &str) -> Result<()> {
     let line = marker_line(path, digest).context("the copy is gone")?;
-    let temporary = dir.join(format!("{MARKER}.{}.tmp", nonce()?));
+    let temporary = dir.join(format!("{marker}.{}.tmp", nonce()?));
     let written = super::write_new(&temporary, line.as_bytes(), false)
-        .and_then(|()| Ok(fs::rename(&temporary, dir.join(MARKER))?));
+        .and_then(|()| Ok(fs::rename(&temporary, dir.join(marker))?));
     if written.is_err() {
         let _ = fs::remove_file(&temporary);
     }
@@ -655,7 +699,7 @@ mod tests {
         let before = HASHED.get();
         let copy = cached_copy(&root, PAYLOAD, &digest).unwrap();
         let dir = copy.path.parent().unwrap().to_path_buf();
-        assert!(marked(&dir, &copy.path, &digest));
+        assert!(marked(&dir, MARKER, &copy.path, &digest));
         // Later processes trust the marker: hundreds of runs a minute on a
         // small board would otherwise each hash the whole executable.
         cached_copy(&root, PAYLOAD, &digest).unwrap();
@@ -666,13 +710,13 @@ mod tests {
         fs::remove_file(dir.join(MARKER)).unwrap();
         cached_copy(&root, PAYLOAD, &digest).unwrap();
         assert_eq!(HASHED.get(), first + 1);
-        assert!(marked(&dir, &copy.path, &digest));
+        assert!(marked(&dir, MARKER, &copy.path, &digest));
         cached_copy(&root, PAYLOAD, &digest).unwrap();
         assert_eq!(HASHED.get(), first + 1);
         // A marker for another digest, or nonsense, vouches for nothing.
-        assert!(!marked(&dir, &copy.path, &"0".repeat(64)));
+        assert!(!marked(&dir, MARKER, &copy.path, &"0".repeat(64)));
         fs::write(dir.join(MARKER), "nonsense\n").unwrap();
-        assert!(!marked(&dir, &copy.path, &digest));
+        assert!(!marked(&dir, MARKER, &copy.path, &digest));
         fs::remove_dir_all(base).unwrap();
     }
     #[test]
@@ -684,14 +728,35 @@ mod tests {
         let refused = cached_payload(&root, &Payload::raw(PAYLOAD, &digest), |_| false);
         assert!(refused.is_err());
         let dir = root.join(format!("ffmpeg-{}", &digest[..16]));
+        let path = dir.join(FFMPEG_NAME);
         assert!(!dir.join(MARKER).exists());
-        // Asked again, it is asked to start again.
+        assert!(marked(&dir, REFUSED_MARKER, &path, &digest));
+        // Asked again, it is asked to start again, without hashing the
+        // copy: a folder that runs nothing would cost every command that.
+        let hashed = HASHED.get();
         let asked = std::cell::Cell::new(false);
-        let _ = cached_payload(&root, &Payload::raw(PAYLOAD, &digest), |_| {
+        let again = cached_payload(&root, &Payload::raw(PAYLOAD, &digest), |_| {
             asked.set(true);
             false
         });
+        assert!(again.is_err());
         assert!(asked.get());
+        assert_eq!(HASHED.get(), hashed);
+        // Once the system starts it, as after a remount, it is vouched for.
+        cached_payload(&root, &Payload::raw(PAYLOAD, &digest), |_| true).unwrap();
+        assert_eq!(HASHED.get(), hashed);
+        assert!(marked(&dir, MARKER, &path, &digest));
+        assert!(!dir.join(REFUSED_MARKER).exists());
+        // A refusal marker vouches only for the file it saw.
+        fs::remove_file(dir.join(MARKER)).unwrap();
+        mark(&dir, REFUSED_MARKER, &path, &digest).unwrap();
+        let mut tampered = PAYLOAD.to_vec();
+        tampered[16] ^= 1;
+        thread::sleep(Duration::from_millis(10));
+        fs::write(&path, &tampered).unwrap();
+        let _ = cached_payload(&root, &Payload::raw(PAYLOAD, &digest), |_| false);
+        assert_eq!(HASHED.get(), hashed + 1);
+        assert_eq!(fs::read(&path).unwrap(), PAYLOAD);
         fs::remove_dir_all(base).unwrap();
     }
     #[test]
