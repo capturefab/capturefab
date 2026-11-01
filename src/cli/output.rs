@@ -18,6 +18,14 @@ pub struct Output {
 /// Most warnings a JSON result carries.
 const MAX_WARNINGS: usize = 10;
 
+/// Whether this process has printed, or is printing, its one document.
+static CLAIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Take the right to print this invocation's document; false when a result
+/// or error already took it, as when a signal arrives as a command ends.
+pub fn claim() -> bool {
+    !CLAIMED.swap(true, std::sync::atomic::Ordering::AcqRel)
+}
+
 /// A command's result: the JSON document, and the text people read.
 pub struct Report {
     pub value: Value,
@@ -43,6 +51,9 @@ impl Output {
     }
     /// Print a result. Returns the exit code: 0, or 0 after a closed pipe.
     pub fn result(&self, report: Report) -> i32 {
+        if !claim() {
+            return super::signals::exit_code();
+        }
         let written = if self.json {
             write_json(&document(report.value))
         } else {
@@ -62,16 +73,28 @@ impl Output {
     }
     /// Report an error; returns its exit code.
     pub fn error(&self, error: &anyhow::Error) -> i32 {
+        match self.error_once(error) {
+            Some(exit) => exit,
+            None => exit_code(error),
+        }
+    }
+    /// Report an error unless this invocation already printed its
+    /// document; its exit code, or None when it did not print.
+    pub fn error_once(&self, error: &anyhow::Error) -> Option<i32> {
         if error.chain().any(|cause| {
             cause
                 .downcast_ref::<io::Error>()
                 .is_some_and(|e| e.kind() == io::ErrorKind::BrokenPipe)
         }) {
             // The reader went away, as with `| head`: nothing to report.
-            return 0;
+            return Some(0);
         }
         let classified = classify(error);
-        let (code, exit) = classified.kind.code();
+        let code = classified.kind.code().0;
+        let exit = exit_code(error);
+        if !claim() {
+            return None;
+        }
         let message = crate::scrub::scrub(&format!("{error:#}")).into_owned();
         if self.json {
             let mut body = json!({"code": code, "message": message});
@@ -93,7 +116,18 @@ impl Output {
                 eprintln!("details: {details}");
             }
         }
-        exit
+        Some(exit)
+    }
+}
+
+/// The exit code `error` ends the process with: its reason's category, and
+/// for an interruption the signal's.
+pub fn exit_code(error: &anyhow::Error) -> i32 {
+    let kind = classify(error).kind;
+    if kind == ErrorKind::Interrupted {
+        super::signals::exit_code()
+    } else {
+        kind.code().1
     }
 }
 

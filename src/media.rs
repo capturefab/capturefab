@@ -3227,7 +3227,8 @@ impl ForwardConfig {
             self.max_file_bytes > 0,
             "recording reservation must be positive"
         );
-        if let Some((_, container)) = recording {
+        if let Some((_, container)) = &recording {
+            let container = *container;
             ensure!(
                 self.max_file_bytes <= self.storage.max_bytes,
                 "recording reservation must be no greater than the storage byte budget"
@@ -3237,6 +3238,14 @@ impl ForwardConfig {
                 "WebM recordings require the av1 codec; use .mkv or .mp4 for h264 or hevc"
             );
         }
+        ensure!(
+            family != "ffv1"
+                || recording.as_ref().is_some_and(|(path, _)| {
+                    path.extension()
+                        .is_some_and(|extension| extension.eq_ignore_ascii_case("mkv"))
+                }),
+            "ffv1 recordings are .mkv files"
+        );
         Ok(())
     }
 }
@@ -3379,7 +3388,8 @@ fn codec_family(codec: &str) -> Result<&'static str> {
         "h264" | "avc" => Ok("h264"),
         "h265" | "hevc" => Ok("hevc"),
         "av1" => Ok("av1"),
-        _ => bail!("unsupported forwarding codec {codec}; use h264, hevc or av1"),
+        "ffv1" => Ok("ffv1"),
+        _ => bail!("unsupported forwarding codec {codec}; use h264, hevc, av1 or ffv1"),
     }
 }
 /// The codec an FFmpeg encoder writes, `h264`, `hevc` or `av1`, or None for
@@ -3389,6 +3399,7 @@ pub fn encoder_family(encoder: &str) -> Option<&'static str> {
         "h264" | "libx264" | "libx264rgb" | "libopenh264" | "nvv4l2h264enc" => Some("h264"),
         "hevc" | "libx265" | "nvv4l2h265enc" => Some("hevc"),
         "av1" | "libsvtav1" | "libaom-av1" | "librav1e" | "nvv4l2av1enc" => Some("av1"),
+        "ffv1" => Some("ffv1"),
         name if name.starts_with("h264_") => Some("h264"),
         name if name.starts_with("hevc_") => Some("hevc"),
         name if name.starts_with("av1_") => Some("av1"),
@@ -3651,7 +3662,7 @@ fn usable(exe: &Executable, encoder: &str, width: u32, height: u32) -> Result<bo
 const PROBE_SIZE: (u32, u32) = (640, 480);
 /// Encoders to try for a codec on this OS, all in the bundled FFmpeg or on
 /// Jetson: vendor encoders first, then cross-vendor Vulkan Video, then
-/// software. Another FFmpeg's encoders are used with `--encoder`.
+/// software. Another FFmpeg's encoders are used when a forward names one.
 fn encoder_candidates(family: &str) -> Vec<&'static str> {
     match (family, std::env::consts::OS) {
         ("h264", "macos") => vec!["h264_videotoolbox", "libx264"],
@@ -3689,6 +3700,8 @@ fn encoder_candidates(family: &str) -> Vec<&'static str> {
             "hevc_mf",
         ],
         ("av1", "windows") => vec!["av1_nvenc", "av1_qsv", "av1_amf", "av1_vulkan", "av1_mf"],
+        // Lossless, in FFmpeg itself on every OS.
+        ("ffv1", _) => vec!["ffv1"],
         ("h264", _) => vec!["libx264"],
         ("hevc", _) => vec![],
         _ => vec!["av1_nvenc"],
@@ -3729,7 +3742,7 @@ fn select_encoder(
     ))
 }
 /// Before a recording starts, refuse a codec no encoder here can produce.
-fn check_codec(config: &ForwardConfig) -> Result<()> {
+pub(crate) fn check_codec(config: &ForwardConfig) -> Result<()> {
     // Without FFmpeg, or when probing itself fails, the first frame reports why.
     let Ok(exe) = executable() else {
         return Ok(());
@@ -3763,7 +3776,7 @@ fn unsupported_codec(exe: &Executable, family: &str, size: Option<(u32, u32)>) -
         format!(" at {width}x{height}")
     });
     format!(
-        "{family} recording{at} is not supported on this host: no {family} encoder in FFmpeg works here; working codecs: {}. Choose another codec, or an installed encoder with --encoder",
+        "{family} recording{at} is not supported on this host: no {family} encoder in FFmpeg works here; working codecs: {}. Choose another codec",
         if working.is_empty() {
             "none".to_owned()
         } else {
@@ -4066,6 +4079,11 @@ fn encoder_device_options(encoder: &str) -> Vec<String> {
     }
 }
 fn encoder_output_options(encoder: &str, input: EncoderInput) -> Vec<String> {
+    if encoder == "ffv1" {
+        // Every frame intra-coded at the camera's own pixel layout, so the
+        // file is lossless frame by frame; no padding or 4:2:0.
+        return ["-level", "3", "-g", "1"].map(str::to_owned).to_vec();
+    }
     let mut options = if encoder.ends_with("_vaapi") || encoder.ends_with("_vulkan") {
         // Convert and pad on the CPU, then upload into the device's frames.
         vec![

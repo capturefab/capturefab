@@ -1302,6 +1302,9 @@ mod tests {
             storage: Default::default(),
             on_exists: Default::default(),
             context: Default::default(),
+            utc_offset_s: None,
+            quality: None,
+            job: None,
         })
         .unwrap();
         let mut narrow = setup.clone();

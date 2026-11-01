@@ -124,7 +124,7 @@ const ANALOG_FEATURES: &str = r#"
  <IntReg Name="ExposureAutoReg"><Address>0x190</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
  <Enumeration Name="TriggerSelector"><EnumEntry Name="FrameStart"><Value>0</Value></EnumEntry><EnumEntry Name="AcquisitionStart"><Value>1</Value></EnumEntry><pValue>TriggerSelectorReg</pValue><pSelected>TriggerMode</pSelected><pSelected>TriggerSource</pSelected><pSelected>TriggerActivation</pSelected><pSelected>TriggerSoftware</pSelected></Enumeration>
  <IntReg Name="TriggerSelectorReg"><Address>0x160</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
- <Enumeration Name="TriggerMode"><Description>The simulator keeps streaming; trigger settings are stored only.</Description><EnumEntry Name="Off"><Value>0</Value></EnumEntry><EnumEntry Name="On"><Value>1</Value></EnumEntry><pValue>TriggerModeReg</pValue></Enumeration>
+ <Enumeration Name="TriggerMode"><Description>With the FrameStart trigger On from Line0 or Line1 the simulator sends no frames, as it has no lines; otherwise it keeps streaming.</Description><EnumEntry Name="Off"><Value>0</Value></EnumEntry><EnumEntry Name="On"><Value>1</Value></EnumEntry><pValue>TriggerModeReg</pValue></Enumeration>
  <IntReg Name="TriggerModeReg"><Address>0x168</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
  <Enumeration Name="TriggerSource"><EnumEntry Name="Software"><Value>0</Value></EnumEntry><EnumEntry Name="Line0"><Value>1</Value></EnumEntry><EnumEntry Name="Line1"><Value>2</Value></EnumEntry><pValue>TriggerSourceReg</pValue></Enumeration>
  <IntReg Name="TriggerSourceReg"><Address>0x170</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
@@ -407,6 +407,12 @@ impl Backend for Simulator {
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame> {
         ensure!(self.running, "camera is not streaming");
+        // TriggerMode and TriggerSource at TriggerSelector=FrameStart: a
+        // hardware line that never fires.
+        if self.u32(0x168) == 1 && self.u32(0x170) != 0 {
+            std::thread::sleep(timeout);
+            bail!("frame timeout");
+        }
         let wait = self.next.saturating_duration_since(Instant::now());
         if wait > timeout {
             std::thread::sleep(timeout);

@@ -41,10 +41,10 @@ const SCALE: f64 = 0.8;
 const SCALE_STEPS: i32 = 3;
 /// Clipping above this share of samples is called out, as on the desktop
 /// histogram.
-const CLIP_WARN: f64 = 0.005;
+pub(crate) const CLIP_WARN: f64 = 0.005;
 /// Mean brightness outside this range is called out.
-const DARK: f64 = 0.25;
-const BRIGHT: f64 = 0.65;
+pub(crate) const DARK: f64 = 0.25;
+pub(crate) const BRIGHT: f64 = 0.65;
 /// Normalized region sums may exceed 1 by float rounding (0.7 + 0.3).
 const REGION_SLACK: f64 = 1e-9;
 

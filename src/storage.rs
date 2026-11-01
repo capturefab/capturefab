@@ -1547,7 +1547,7 @@ impl Write for StorageWriter {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 format!(
-                    "Storage full: {} reached its maximum file size of {}; raise the maximum file size (--max-file-size) or record shorter segments",
+                    "Storage full: {} reached its maximum file size of {}; raise --max-size or record shorter segments",
                     self.path.display(),
                     human_bytes(self.reserve)
                 ),
@@ -1834,7 +1834,7 @@ pub fn human_bytes(bytes: u64) -> String {
     )
 }
 /// What a refused save was, for advice the person can act on: a whole file
-/// (a capture or export) fits the budget, a recording its --max-file-size.
+/// (a capture or export) fits the budget, a recording its --max-size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SaveKind {
     File,
@@ -1850,25 +1850,19 @@ impl SaveKind {
     fn budget_hint(self) -> &'static str {
         match self {
             Self::File => "raise --max-space or the saved budget (storage configure --max-space)",
-            Self::Recording => {
-                "lower --max-file-size or explicitly configure a larger storage budget"
-            }
+            Self::Recording => "lower --max-size or explicitly configure a larger storage budget",
         }
     }
     fn configured_hint(self) -> &'static str {
         match self {
             Self::File => "raise it with storage configure --max-space",
-            Self::Recording => {
-                "lower --max-file-size or explicitly configure a larger storage policy"
-            }
+            Self::Recording => "lower --max-size or explicitly configure a larger storage policy",
         }
     }
     fn disk_hint(self) -> &'static str {
         match self {
             Self::File => "free some space or choose another output folder",
-            Self::Recording => {
-                "free some space, lower --max-file-size, or choose another output folder"
-            }
+            Self::Recording => "free some space, lower --max-size, or choose another output folder",
         }
     }
 }

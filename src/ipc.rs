@@ -23,6 +23,8 @@ pub const VERSION: u32 = 2;
 const MAX_REQUEST: usize = 1024 * 1024;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+/// The largest descriptor: a session's cameras with their aliases.
+const MAX_DESCRIPTOR: u64 = 256 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionKind {
@@ -37,6 +39,70 @@ pub struct Descriptor {
     pub pid: u32,
     pub address: SocketAddr,
     pub token: String,
+    /// When the session started, UTC Unix milliseconds.
+    #[serde(default)]
+    pub started_ms: u64,
+    /// The cameras it holds, rewritten as they connect and disconnect, so a
+    /// client finds the session for a camera without asking every one.
+    #[serde(default)]
+    pub cameras: Vec<HeldCamera>,
+}
+/// A camera a session holds, as its descriptor lists it. Every field is
+/// redacted: a client compares its own selector, redacted the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeldCamera {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serial: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
+    /// Selectors it was connected by.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+}
+impl HeldCamera {
+    pub fn new<'a>(
+        info: &crate::types::CameraInfo,
+        aliases: impl Iterator<Item = &'a str>,
+    ) -> Self {
+        let redact = |text: &str| crate::media::redact_url(text);
+        let mut aliases = aliases.map(redact).collect::<Vec<_>>();
+        aliases.sort();
+        aliases.dedup();
+        Self {
+            id: redact(&info.id),
+            serial: (!info.serial.is_empty()).then(|| redact(&info.serial)),
+            address: info.address.as_deref().map(redact),
+            mac: info.id.strip_prefix("gige:").and_then(mac),
+            aliases,
+        }
+    }
+    /// Whether `selector`, as a person typed it, names this camera: 0 by
+    /// its ID, 1 by its serial, address, MAC or a selector it was opened by.
+    pub fn named_by(&self, selector: &str) -> Option<u8> {
+        let shown = crate::media::redact_url(selector);
+        if shown == self.id {
+            return Some(0);
+        }
+        (self.serial.as_deref() == Some(&shown)
+            || self.address.as_deref() == Some(&shown)
+            || self.aliases.contains(&shown)
+            || self.mac.is_some()
+                && self.mac == mac(selector.strip_prefix("gige:").unwrap_or(selector)))
+        .then_some(1)
+    }
+}
+/// A MAC address as twelve lowercase hex digits, from any usual spelling.
+fn mac(text: &str) -> Option<String> {
+    let digits = text
+        .chars()
+        .filter(|c| !matches!(c, ':' | '-' | '.'))
+        .collect::<String>()
+        .to_ascii_lowercase();
+    (digits.len() == 12 && digits.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digits)
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,6 +120,77 @@ struct Request {
     /// Authenticated liveness checks bypass the camera coordinator entirely.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     probe: bool,
+    /// Keep the session at least this long after its last use (`--keep`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    keep_ms: Option<u64>,
+    /// Shut the session down once its recordings are finished.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    stop: bool,
+}
+/// Why a session ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quit {
+    /// SIGINT, SIGTERM or SIGHUP.
+    Signal,
+    /// `session stop`.
+    Stop,
+    /// No requests and no jobs for its idle time.
+    Idle,
+}
+/// What a session's request threads share with the process that serves it.
+struct Shared {
+    dir: PathBuf,
+    /// The published descriptor, rewritten as cameras come and go.
+    descriptor: std::sync::Mutex<Descriptor>,
+    /// The last request that counted as use.
+    used: std::sync::Mutex<Instant>,
+    /// Requests in progress.
+    busy: AtomicUsize,
+    /// How long the session waits unused before it exits; None for ever.
+    idle: std::sync::Mutex<Option<Duration>>,
+    quit: (std::sync::Mutex<Option<Quit>>, std::sync::Condvar),
+}
+impl Shared {
+    fn locked<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    fn used(&self) {
+        *Self::locked(&self.used) = Instant::now();
+    }
+    fn quit(&self, why: Quit) {
+        let (quit, changed) = &self.quit;
+        Self::locked(quit).get_or_insert(why);
+        changed.notify_all();
+    }
+    /// Keep the session at least `keep` after its last use; a session that
+    /// never idles out stays that way.
+    fn keep(&self, keep: Duration) {
+        let mut idle = Self::locked(&self.idle);
+        if let Some(idle) = idle.as_mut() {
+            *idle = (*idle).max(keep);
+        }
+    }
+    /// Rewrite the descriptor when the cameras it lists changed.
+    fn publish(&self, cameras: Vec<HeldCamera>) {
+        let mut descriptor = Self::locked(&self.descriptor);
+        if descriptor.cameras == cameras {
+            return;
+        }
+        descriptor.cameras = cameras;
+        if let Err(error) = write_descriptor(&self.dir, &descriptor) {
+            crate::eprintln!("capturefab: cannot update the session descriptor: {error:#}");
+        }
+    }
+}
+/// Ends a session from a signal handler.
+#[derive(Clone)]
+pub struct Quitter(Arc<Shared>);
+impl Quitter {
+    pub fn quit(&self, why: Quit) {
+        self.0.quit(why);
+    }
 }
 fn deserialize_optional_command<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -83,6 +220,7 @@ pub struct Server {
     address: SocketAddr,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
+    shared: Arc<Shared>,
     // Keep the lock inode in place: unlinking it lets competing processes lock
     // different files and both claim the same name.
     _name_lock: fs::File,
@@ -424,7 +562,7 @@ impl std::fmt::Display for MissingSession {
         let name = &self.0;
         write!(
             f,
-            "session '{name}' not found; run capturefab serve --name {name}"
+            "session '{name}' not found; start it with capturefab session start --name {name}"
         )
     }
 }
@@ -435,7 +573,7 @@ impl std::error::Error for MissingSession {}
 fn missing_session_error(name: &str, active: &[Descriptor]) -> anyhow::Error {
     let message = if active.is_empty() {
         format!(
-            "session '{name}' is not running, and no sessions are running; start one with capturefab serve --name {name}"
+            "session '{name}' is not running, and no sessions are running; start one with capturefab session start --name {name}"
         )
     } else {
         let running = active
@@ -498,12 +636,12 @@ fn read_descriptor_in(dir: &Path, name: &str) -> Result<Descriptor> {
         }
         Err(error) => {
             return Err(anyhow::Error::from(error).context(format!(
-                "session '{name}' not found; run capturefab serve --name {name}"
+                "session '{name}' not found; start it with capturefab session start --name {name}"
             )));
         }
     };
     ensure!(
-        meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 4096,
+        meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= MAX_DESCRIPTOR,
         "invalid session descriptor"
     );
     #[cfg(unix)]
@@ -535,12 +673,12 @@ fn other_protocol(path: &Path, name: &str) -> bool {
         version: u32,
         name: String,
     }
-    fs::symlink_metadata(path)
-        .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= 4096)
-        && fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Published>(&bytes).ok())
-            .is_some_and(|published| published.version != VERSION && published.name == name)
+    fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.is_file() && !meta.file_type().is_symlink() && meta.len() <= MAX_DESCRIPTOR
+    }) && fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Published>(&bytes).ok())
+        .is_some_and(|published| published.version != VERSION && published.name == name)
 }
 #[cfg(test)]
 fn read_line(reader: &mut impl BufRead, limit: usize) -> Result<Vec<u8>> {
@@ -605,7 +743,12 @@ fn constant_eq(a: &str, b: &str) -> bool {
     }
     a.bytes().zip(b.bytes()).fold(0, |v, (x, y)| v | (x ^ y)) == 0
 }
-fn serve_client(mut stream: TcpStream, h: SessionHandle, token: String) -> Result<()> {
+fn serve_client(
+    mut stream: TcpStream,
+    h: SessionHandle,
+    token: String,
+    shared: Arc<Shared>,
+) -> Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -631,17 +774,53 @@ fn serve_client(mut stream: TcpStream, h: SessionHandle, token: String) -> Resul
             );
             return Ok(json!({"probe":true}));
         }
-        let command = request.command.context("RPC request requires a command")?;
+        if request.stop {
+            ensure!(
+                request.command.is_none() && request.camera.is_none(),
+                "a stop request cannot include a command or camera"
+            );
+            shared.quit(Quit::Stop);
+            return Ok(json!({"stopping":true}));
+        }
+        if let Some(keep) = request.keep_ms {
+            shared.keep(Duration::from_millis(keep));
+            shared.used();
+        }
+        let Some(command) = request.command else {
+            ensure!(
+                request.keep_ms.is_some() && request.camera.is_none(),
+                "RPC request requires a command"
+            );
+            return Ok(json!({"kept":true}));
+        };
         command.validate()?;
         ensure!(
             !matches!(&command,SessionCommand::Capture{output,..} if output=="-"),
             "remote captures require an output file"
         );
-        if let Some(camera) = request.camera {
+        // Looking at a session, or waiting for its jobs, is not using it.
+        let use_ = !matches!(command, SessionCommand::Status | SessionCommand::Jobs);
+        let cameras = matches!(
+            command,
+            SessionCommand::Connect { .. } | SessionCommand::Disconnect
+        );
+        if use_ {
+            shared.busy.fetch_add(1, Ordering::AcqRel);
+            shared.used();
+        }
+        let result = if let Some(camera) = request.camera {
             h.request_to(&camera, command)
         } else {
             h.request(command)
+        };
+        if use_ {
+            shared.used();
+            shared.busy.fetch_sub(1, Ordering::AcqRel);
         }
+        if cameras {
+            shared.publish(h.held_cameras());
+        }
+        result
     })();
     let response = match result {
         Ok(v) => json!({"version":VERSION,"ok":true,"result":v}),
@@ -663,11 +842,57 @@ fn serve_client(mut stream: TcpStream, h: SessionHandle, token: String) -> Resul
     stream.write_all(b"\n")?;
     Ok(())
 }
-impl Server {
-    pub fn start_with_kind(h: SessionHandle, name: &str, kind: SessionKind) -> Result<Self> {
-        Self::start_in(h, name, kind, &runtime_dir())
+/// Publish `descriptor` atomically, so discovery never reads a partially
+/// written file.
+fn write_descriptor(dir: &Path, descriptor: &Descriptor) -> Result<()> {
+    let path = descriptor_path_in(dir, &descriptor.name)?;
+    let mut suffix = [0u8; 8];
+    getrandom::fill(&mut suffix).map_err(|e| anyhow::anyhow!("random file name: {e}"))?;
+    let suffix = suffix
+        .iter()
+        .map(|v| format!("{v:02x}"))
+        .collect::<String>();
+    let temp_path = dir.join(format!(".{}.{suffix}.tmp", descriptor.name));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    fn start_in(h: SessionHandle, name: &str, kind: SessionKind, dir: &Path) -> Result<Self> {
+    let publish = (|| -> Result<()> {
+        let mut file = options.open(&temp_path).with_context(|| {
+            format!(
+                "cannot create session '{}' in {}",
+                descriptor.name,
+                dir.display()
+            )
+        })?;
+        serde_json::to_writer(&mut file, descriptor)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temp_path, &path)?;
+        Ok(())
+    })();
+    if publish.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    publish
+}
+impl Server {
+    /// Serve `h` as session `name`, which exits after `idle` without use
+    /// when one is given.
+    pub fn start(h: SessionHandle, name: &str, idle: Option<Duration>) -> Result<Self> {
+        Self::start_in(h, name, SessionKind::Serve, &runtime_dir(), idle)
+    }
+    fn start_in(
+        h: SessionHandle,
+        name: &str,
+        kind: SessionKind,
+        dir: &Path,
+        idle: Option<Duration>,
+    ) -> Result<Self> {
         validate_name(name)?;
         ensure_private_dir(dir)?;
         let path = descriptor_path_in(dir, name)?;
@@ -700,6 +925,8 @@ impl Server {
             pid: std::process::id(),
             address: listener.local_addr()?,
             token: token.clone(),
+            started_ms: crate::scheduling::now_ms(),
+            cameras: h.held_cameras(),
         };
         if let Ok(existing) = read_descriptor_in(dir, name) {
             ensure!(
@@ -719,35 +946,20 @@ impl Server {
             "session '{name}' already exists with an invalid descriptor; inspect {} before removing it",
             path.display()
         );
-        // Publish a complete descriptor atomically so discovery never reads a
-        // partially-written JSON file while another session starts.
-        let temp_path = dir.join(format!(".{name}.{}.tmp", &token[..16]));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let publish = (|| -> Result<()> {
-            let mut file = options
-                .open(&temp_path)
-                .with_context(|| format!("cannot create session '{name}' in {}", dir.display()))?;
-            serde_json::to_writer(&mut file, &descriptor)?;
-            file.write_all(b"\n")?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temp_path, &path)?;
-            Ok(())
-        })();
-        if let Err(error) = publish {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error);
-        }
+        write_descriptor(dir, &descriptor)?;
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let server_token = token.clone();
         let clients = Arc::new(AtomicUsize::new(0));
+        let shared = Arc::new(Shared {
+            dir: dir.to_owned(),
+            descriptor: std::sync::Mutex::new(descriptor),
+            used: std::sync::Mutex::new(Instant::now()),
+            busy: AtomicUsize::new(0),
+            idle: std::sync::Mutex::new(idle),
+            quit: Default::default(),
+        });
+        let thread_shared = shared.clone();
         // Accept blocks instead of polling; Drop wakes it with a loopback connect.
         let thread = std::thread::Builder::new()
             .name("capturefab-rpc".into())
@@ -776,11 +988,12 @@ impl Server {
                     };
                     let h = h.clone();
                     let token = server_token.clone();
+                    let shared = thread_shared.clone();
                     let spawned = std::thread::Builder::new()
                         .name("capturefab-rpc-client".into())
                         .spawn(move || {
                             let _slot = slot;
-                            let _ = serve_client(stream, h, token);
+                            let _ = serve_client(stream, h, token, shared);
                         });
                     if let Err(e) = spawned {
                         eprintln!("capturefab: rejected RPC client: {e}");
@@ -800,8 +1013,58 @@ impl Server {
             address,
             stop,
             thread: Some(thread),
+            shared,
             _name_lock: name_lock,
         })
+    }
+    /// What a signal handler ends the session with.
+    pub fn quitter(&self) -> Quitter {
+        Quitter(self.shared.clone())
+    }
+    /// The descriptor as published now.
+    pub fn descriptor(&self) -> Descriptor {
+        Shared::locked(&self.shared.descriptor).clone()
+    }
+    /// Republish the cameras `h` holds.
+    pub fn publish(&self, h: &SessionHandle) {
+        self.shared.publish(h.held_cameras());
+    }
+    /// Block until the session should end: a signal, `session stop`, or its
+    /// idle time passed with no request and no job running. `jobs_running`
+    /// is asked only once the idle time has passed.
+    pub fn wait(&self, mut jobs_running: impl FnMut() -> bool) -> Quit {
+        let (quit, changed) = &self.shared.quit;
+        let mut why = Shared::locked(quit);
+        loop {
+            if let Some(why) = *why {
+                return why;
+            }
+            let idle = *Shared::locked(&self.shared.idle);
+            let wait = match idle {
+                None => Duration::from_secs(3600),
+                Some(idle) => {
+                    let unused = Shared::locked(&self.shared.used).elapsed();
+                    if unused >= idle && self.shared.busy.load(Ordering::Acquire) == 0 {
+                        drop(why);
+                        let running = jobs_running();
+                        why = Shared::locked(quit);
+                        if !running && why.is_none() {
+                            *why = Some(Quit::Idle);
+                            continue;
+                        }
+                        // Jobs count as use: look again a second later.
+                        self.shared.used();
+                        Duration::from_secs(1)
+                    } else {
+                        idle.saturating_sub(unused).max(Duration::from_millis(50))
+                    }
+                }
+            };
+            why = changed
+                .wait_timeout(why, wait.min(Duration::from_secs(1)))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
     }
 }
 impl Drop for Server {
@@ -833,6 +1096,16 @@ pub fn call_to(
     command: SessionCommand,
     timeout: Duration,
 ) -> Result<Value> {
+    call_keeping(name, camera, command, timeout, None)
+}
+/// `call_to`, and keep the session at least `keep` after this request.
+pub fn call_keeping(
+    name: &str,
+    camera: Option<&str>,
+    command: SessionCommand,
+    timeout: Duration,
+    keep: Option<Duration>,
+) -> Result<Value> {
     command.validate()?;
     ensure!(
         !matches!(&command, SessionCommand::Capture { output, .. } if output == "-"),
@@ -843,7 +1116,58 @@ pub fn call_to(
     }
     ensure!(!timeout.is_zero(), "RPC timeout must be positive");
     let descriptor = read_descriptor(name)?;
-    send_request(&descriptor, camera, Some(command), false, timeout)
+    send(
+        &descriptor,
+        Request {
+            camera: camera.map(str::to_owned),
+            command: Some(command),
+            keep_ms: keep.map(millis),
+            ..Request::to(&descriptor)
+        },
+        timeout,
+    )
+}
+/// Keep session `name` at least `keep` after now.
+pub fn keep(name: &str, keep: Duration) -> Result<()> {
+    let descriptor = read_descriptor(name)?;
+    send(
+        &descriptor,
+        Request {
+            keep_ms: Some(millis(keep)),
+            ..Request::to(&descriptor)
+        },
+        Duration::from_secs(2),
+    )
+    .map(drop)
+}
+/// Ask session `name` to finish its recordings and exit.
+pub fn stop(descriptor: &Descriptor) -> Result<()> {
+    send(
+        descriptor,
+        Request {
+            stop: true,
+            ..Request::to(descriptor)
+        },
+        Duration::from_secs(2),
+    )
+    .map(drop)
+}
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+impl Request {
+    /// A request to `descriptor` with nothing in it yet.
+    fn to(descriptor: &Descriptor) -> Self {
+        Self {
+            version: VERSION,
+            token: descriptor.token.clone(),
+            camera: None,
+            command: None,
+            probe: false,
+            keep_ms: None,
+            stop: false,
+        }
+    }
 }
 fn rpc_network_error(name: &str, phase: &str, error: std::io::Error) -> anyhow::Error {
     match error.kind() {
@@ -861,14 +1185,20 @@ fn send_request(
     probe: bool,
     timeout: Duration,
 ) -> Result<Value> {
+    send(
+        descriptor,
+        Request {
+            camera: camera.map(str::to_owned),
+            command,
+            probe,
+            ..Request::to(descriptor)
+        },
+        timeout,
+    )
+}
+fn send(descriptor: &Descriptor, request: Request, timeout: Duration) -> Result<Value> {
     let deadline = rpc_deadline(timeout)?;
-    let request = serde_json::to_vec(&Request {
-        version: VERSION,
-        token: descriptor.token.clone(),
-        camera: camera.map(str::to_owned),
-        command,
-        probe,
-    })?;
+    let request = serde_json::to_vec(&request)?;
     ensure!(request.len() < MAX_REQUEST, "RPC request exceeds 1 MiB");
     let mut stream = TcpStream::connect_timeout(&descriptor.address, remaining(deadline)?)
         .map_err(|error| rpc_network_error(&descriptor.name, "connecting", error))?;
@@ -948,6 +1278,47 @@ pub fn active_sessions() -> Result<Vec<Descriptor>> {
         .filter(descriptor_active)
         .collect())
 }
+/// The sessions whose descriptors say they run, read locally without
+/// asking any of them: a client matches its camera against these and sends
+/// one request. A session that was killed leaves its descriptor until the
+/// next one by that name; its process is gone.
+pub fn sessions() -> Vec<Descriptor> {
+    descriptors_in(&runtime_dir())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|descriptor| process_alive(descriptor.pid))
+        .collect()
+}
+/// Whether process `pid` exists.
+pub(crate) fn process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let Ok(pid) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 only checks that the process exists.
+        let sent = unsafe { libc::kill(pid, 0) };
+        sent == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        true
+    }
+}
+/// Whether the runtime directory is a login's /run/user that logind removes
+/// at logout: a detached session's descriptor would vanish with it.
+pub(crate) fn runtime_dir_ends_at_logout() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let uid = effective_uid();
+        runtime_dir().starts_with(format!("/run/user/{uid}")) && !lingers(uid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -987,6 +1358,17 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
+    /// Request threads' shared state for a session that is not published.
+    fn test_shared() -> Arc<Shared> {
+        Arc::new(Shared {
+            dir: std::env::temp_dir(),
+            descriptor: std::sync::Mutex::new(test_descriptor("t", "127.0.0.1:1".parse().unwrap())),
+            used: std::sync::Mutex::new(Instant::now()),
+            busy: AtomicUsize::new(0),
+            idle: std::sync::Mutex::new(None),
+            quit: Default::default(),
+        })
+    }
     fn test_descriptor(name: &str, address: SocketAddr) -> Descriptor {
         Descriptor {
             version: VERSION,
@@ -995,6 +1377,8 @@ mod tests {
             pid: std::process::id(),
             address,
             token: "a".repeat(64),
+            started_ms: 0,
+            cameras: Vec::new(),
         }
     }
     #[test]
@@ -1217,11 +1601,12 @@ mod tests {
         let dir = TestDir::new();
         let handle = SessionHandle::new();
         let _server =
-            Server::start_in(handle.clone(), "bench", SessionKind::Serve, &dir.0).unwrap();
-        let error = match Server::start_in(handle.clone(), "bench", SessionKind::Serve, &dir.0) {
-            Ok(_) => panic!("a second bench started"),
-            Err(error) => format!("{error:#}"),
-        };
+            Server::start_in(handle.clone(), "bench", SessionKind::Serve, &dir.0, None).unwrap();
+        let error =
+            match Server::start_in(handle.clone(), "bench", SessionKind::Serve, &dir.0, None) {
+                Ok(_) => panic!("a second bench started"),
+                Err(error) => format!("{error:#}"),
+            };
         assert!(error.contains("is already running (serve, pid"), "{error}");
         assert!(!error.contains("os error"), "{error}");
         handle.shutdown();
@@ -1232,7 +1617,7 @@ mod tests {
         let dir = TestDir::new();
         let handle = SessionHandle::new();
         let server =
-            Server::start_in(handle.clone(), "desktop", SessionKind::Serve, &dir.0).unwrap();
+            Server::start_in(handle.clone(), "desktop", SessionKind::Serve, &dir.0, None).unwrap();
         let descriptor = read_descriptor_in(&dir.0, "desktop").unwrap();
         assert_eq!(descriptor.kind, SessionKind::Serve);
         assert!(descriptor_active(&descriptor));
@@ -1290,7 +1675,7 @@ mod tests {
                 let gate = gate.clone();
                 std::thread::spawn(move || {
                     gate.wait();
-                    Server::start_in(handle, "stale", SessionKind::Serve, &dir)
+                    Server::start_in(handle, "stale", SessionKind::Serve, &dir, None)
                 })
             })
             .collect();
@@ -1367,7 +1752,8 @@ mod tests {
         // While an older session runs, it holds the name.
         let lock = lock_file(&dir.0.join("old.session.lock")).unwrap();
         lock.try_lock_exclusive().unwrap();
-        let error = match Server::start_in(handle.clone(), "old", SessionKind::Serve, &dir.0) {
+        let error = match Server::start_in(handle.clone(), "old", SessionKind::Serve, &dir.0, None)
+        {
             Ok(_) => panic!("a running older session was replaced"),
             Err(error) => format!("{error:#}"),
         };
@@ -1375,7 +1761,8 @@ mod tests {
         assert!(descriptor_path_in(&dir.0, "old").unwrap().exists());
         // Its descriptor outlives a crash, and then the name is free.
         drop(lock);
-        let server = Server::start_in(handle.clone(), "old", SessionKind::Serve, &dir.0).unwrap();
+        let server =
+            Server::start_in(handle.clone(), "old", SessionKind::Serve, &dir.0, None).unwrap();
         let current = read_descriptor_in(&dir.0, "old").unwrap();
         assert_eq!(current.version, VERSION);
         assert!(descriptor_active(&current));
@@ -1417,7 +1804,7 @@ mod tests {
             let handle = SessionHandle::new();
             let server = std::thread::spawn({
                 let handle = handle.clone();
-                move || serve_client(stream, handle, "t".into())
+                move || serve_client(stream, handle, "t".into(), test_shared())
             });
             client.write_all(request.as_bytes()).unwrap();
             let response: Value =
@@ -1463,17 +1850,15 @@ mod tests {
         let h = SessionHandle::new();
         let server = std::thread::spawn({
             let h = h.clone();
-            move || serve_client(stream, h, "t".into())
+            move || serve_client(stream, h, "t".into(), test_shared())
         });
         std::thread::sleep(Duration::from_millis(200));
         serde_json::to_writer(
             &mut client,
             &Request {
-                version: VERSION,
                 token: "t".into(),
-                camera: None,
                 command: Some(SessionCommand::Jobs),
-                probe: false,
+                ..Request::to(&test_descriptor("t", "127.0.0.1:1".parse().unwrap()))
             },
         )
         .unwrap();

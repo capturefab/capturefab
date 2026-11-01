@@ -33,6 +33,25 @@ pub struct CamerasArg {
     pub cameras: Vec<String>,
 }
 
+/// `--keep DUR`: run through a session that stays this long after its
+/// last use, started if none holds the camera.
+#[derive(Debug, Clone, Default, Args)]
+pub struct KeepArg {
+    /// Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)
+    #[arg(
+        long,
+        value_name = "DUR",
+        env = "CAPTUREFAB_KEEP",
+        value_parser = duration
+    )]
+    pub keep: Option<Duration>,
+}
+impl KeepArg {
+    pub fn route(&self) -> super::Route {
+        super::Route::keep(self.keep.filter(|keep| !keep.is_zero()))
+    }
+}
+
 fn typed(error: anyhow::Error) -> Categorized {
     error
         .downcast::<Categorized>()

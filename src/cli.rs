@@ -1,18 +1,25 @@
 //! The command line: global flags, dispatch, and how a camera command
 //! reaches its camera (a session that holds it, or a worker of its own).
 mod args;
+mod auto;
 mod camera;
+mod capture;
 mod debug;
 mod doctor;
-mod legacy;
+mod inspect;
+mod jobs;
 pub mod login;
 mod network;
 mod onvif;
 pub(crate) mod output;
 pub(crate) mod paths;
 mod preset;
+mod record;
 mod schema;
-mod summary;
+mod serve;
+mod session;
+mod signals;
+mod storage;
 
 #[cfg(test)]
 pub(crate) use output::error_code;
@@ -75,7 +82,7 @@ pub struct Global {
     /// More detail on stderr, including camera worker logs
     #[arg(short = 'v', long, global = true)]
     pub verbose: bool,
-    /// Use this running session (`serve --name NAME`)
+    /// Use this running session (session start or serve --name NAME)
     #[arg(long, global = true, value_name = "NAME", env = "CAPTUREFAB_SESSION")]
     pub session: Option<String>,
     /// Never use a running session: open the camera in a worker of this command
@@ -123,7 +130,7 @@ pub enum Command {
     List(camera::ListArgs),
     /// What a camera is and what it can do: size, format, exposure, gain, trigger, controls
     #[command(
-        after_help = "Examples:\n  capturefab info -c sim:0\n  capturefab --json info -c gige:00c0df123456"
+        after_help = "Examples:\n  capturefab info -c sim:0\n  capturefab --json info -c gige:00c0df123456\n  capturefab info -c sim:0 --keep 5m"
     )]
     Info(camera::InfoArgs),
     /// List a camera's features with values, ranges, choices and locks
@@ -146,14 +153,50 @@ pub enum Command {
         after_help = "Examples:\n  capturefab exec -c sim:0 TriggerSoftware[FrameStart]\n  capturefab exec -c gige:00c0df123456 UserSetSave[UserSet1]"
     )]
     Exec(camera::ExecArgs),
+    /// Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites
+    #[command(
+        after_help = "Examples:\n  capturefab capture -c sim:0 -o shot.png\n  capturefab capture -c sim:0 -n 10 -o frames/\n  capturefab capture -c sim:0 --every 10s --for 1h -o 'lapse/{seq}.jpg' --background\n  capturefab capture -c sim:0 -o - > frame.png"
+    )]
+    Capture(capture::CaptureArgs),
+    /// Record video to a file or stream it to rtsp://, srt://, rtmp:// or udp://
+    #[command(
+        after_help = "Examples:\n  capturefab record -c sim:0 -o clip.mp4 --for 30s\n  capturefab record -c sim:0 -o clip.mkv --codec ffv1 --for 5m\n  capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background"
+    )]
+    Record(record::RecordArgs),
+    /// Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview
+    #[command(
+        after_help = "Examples:\n  capturefab inspect -c sim:0\n  capturefab inspect -c sim:0 --set exposure=20ms --region 0.25,0.25,0.5,0.5\n  capturefab inspect -c sim:0 --keep 5m --preview none"
+    )]
+    Inspect(inspect::InspectArgs),
+    /// Settle exposure and gain, then hold them; or turn auto exposure off or on
+    #[command(
+        after_help = "Examples:\n  capturefab auto -c sim:0\n  capturefab auto -c sim:0 --timeout 10s\n  capturefab auto -c sim:0 --off"
+    )]
+    Auto(auto::AutoArgs),
     /// Saved camera settings (host-side, portable between cameras of a model)
     #[command(
         subcommand,
         after_help = "A preset lives on this computer and can be applied to any camera of the model; a user set (exec UserSetSave[UserSet1], or preset apply --persist) lives in the camera.\n\nExamples:\n  capturefab preset save bench -c sim:0\n  capturefab preset apply bench -c sim:0 --dry-run\n  capturefab preset list"
     )]
     Preset(preset::PresetCommand),
-    #[command(flatten)]
-    Legacy(legacy::LegacyCommand),
+    /// Captures and recordings running in sessions: list, stop, wait
+    #[command(
+        subcommand_required = false,
+        args_conflicts_with_subcommands = true,
+        after_help = "Examples:\n  capturefab jobs\n  capturefab jobs wait auto-1 --timeout 10m\n  capturefab jobs stop all"
+    )]
+    Jobs(jobs::JobsArgs),
+    /// Sessions keep cameras open between commands: start one in the background, stop it, see it
+    #[command(
+        subcommand,
+        after_help = "Commands use a session that holds their camera on their own; --keep 5m starts one for interactive loops.\n\nExamples:\n  capturefab session start -c sim:0 --live\n  capturefab session status\n  capturefab session stop"
+    )]
+    Session(session::SessionAction),
+    /// Run a session in the foreground (systemd, a terminal); Ctrl-C stops it
+    #[command(
+        after_help = "Examples:\n  capturefab serve --name bench -c sim:0\n  capturefab serve -c gige:00c0df123456 --live"
+    )]
+    Serve(serve::ServeArgs),
     /// Save camera sign-ins for rtsp:// and ONVIF cameras in the OS credential store
     #[command(
         subcommand,
@@ -196,6 +239,9 @@ pub enum Command {
     /// Print Capturefab's license and the bundled FFmpeg's license notice
     #[command(after_help = "Examples:\n  capturefab licenses\n  capturefab --json licenses")]
     Licenses,
+    /// The storage budget for captures and recordings, until it is replaced
+    #[command(subcommand, hide = true)]
+    Storage(storage::StorageCommand),
 }
 
 /// Run the command line; the process exit code.
@@ -214,6 +260,9 @@ pub fn main() -> i32 {
     let out = cli.global.output();
     let typed = matches.value_source("session") == Some(clap::parser::ValueSource::CommandLine);
     if let Err(error) = cli.global.settle_session(typed) {
+        return out.error(&error);
+    }
+    if let Err(error) = signals::install(out) {
         return out.error(&error);
     }
     match run(cli) {
@@ -288,8 +337,14 @@ pub fn run(mut cli: Cli) -> Result<Option<Report>> {
         Command::Get(args) => camera::get(global, args)?,
         Command::Set(args) => camera::set(global, args)?,
         Command::Exec(args) => camera::exec(global, args)?,
+        Command::Capture(args) => return capture::run(global, args),
+        Command::Record(args) => record::run(global, args)?,
+        Command::Inspect(args) => inspect::run(global, args)?,
+        Command::Auto(args) => auto::run(global, args)?,
         Command::Preset(command) => preset::run(global, command)?,
-        Command::Legacy(command) => return legacy::run(global, command),
+        Command::Jobs(args) => jobs::run(global, args)?,
+        Command::Session(command) => session::run(global, command)?,
+        Command::Serve(args) => return serve::run(global, args),
         Command::Login(command) => login::run(global, &command)?,
         Command::Onvif(command) => onvif::run(global, command)?,
         Command::Network(args) => network::run(global, args)?,
@@ -315,24 +370,72 @@ pub fn run(mut cli: Cli) -> Result<Option<Report>> {
         }
         Command::Debug(command) => return debug::run(global, command),
         Command::Licenses => doctor::licenses(),
+        Command::Storage(command) => storage::run(&command)?,
     }))
 }
 
 /// How long opening a camera may take.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long finding the cameras of a default `-c` waits.
 const DEFAULT_DISCOVERY: Duration = Duration::from_secs(1);
-/// How long a session probe waits.
-const PROBE: Duration = Duration::from_secs(2);
+/// The session `--keep` and `--background` start when none holds the camera.
+pub(crate) const AUTO_SESSION: &str = "auto";
+/// How long a session started for `--background` alone stays once its jobs
+/// are done.
+const BACKGROUND_IDLE: Duration = Duration::from_secs(60);
+
+/// What a camera command asks of its route besides the global flags.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Route {
+    /// `--keep DUR`: run through a session that holds the camera and stays
+    /// at least this long after its last use.
+    pub keep: Option<Duration>,
+    /// `--background`: the command leaves a job running in a session.
+    pub background: bool,
+    /// How long opening the camera may take, when longer than usual:
+    /// capture's and record's `--timeout`, for slow streams.
+    pub connect: Option<Duration>,
+}
+impl Route {
+    pub fn keep(keep: Option<Duration>) -> Self {
+        Self {
+            keep,
+            ..Self::default()
+        }
+    }
+    /// A route whose camera may take up to `wait` (none: a minute) to open.
+    pub fn waiting(mut self, wait: args::Wait) -> Self {
+        let wait = match wait {
+            args::Wait::For(wait) => wait,
+            args::Wait::Forever => Duration::from_secs(60),
+        };
+        self.connect = Some(wait.clamp(CONNECT_TIMEOUT, Duration::from_secs(60)));
+        self
+    }
+    fn connect(self) -> u64 {
+        millis(self.connect.unwrap_or(CONNECT_TIMEOUT))
+    }
+    /// A session must hold the camera.
+    fn needs_session(self) -> bool {
+        self.keep.is_some() || self.background
+    }
+    /// How long a session started for this command waits unused.
+    fn idle(self) -> Duration {
+        self.keep.unwrap_or(BACKGROUND_IDLE)
+    }
+}
 
 /// A camera command's connection: a running session that holds (or now
 /// holds) the camera, or a worker of this command.
 pub(crate) struct Client {
     pub out: Output,
     session: Option<String>,
-    /// The camera's ID in the session.
+    /// The camera as the session is asked for it: the selector typed, which
+    /// the session resolves, or none for the session's only camera.
     target: Option<String>,
     local: Option<SessionHandle>,
+    /// `--keep`: sent with each request that uses the session.
+    keep: Option<Duration>,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -346,32 +449,62 @@ impl Drop for Client {
         }
     }
 }
+/// Why a session could not take a command: it is stopping or gone, which
+/// lets automatic routing use a worker of this command, or it failed.
+enum Unusable {
+    Gone(anyhow::Error),
+    Failed(anyhow::Error),
+}
+impl Unusable {
+    fn error(self) -> anyhow::Error {
+        match self {
+            Self::Gone(error) | Self::Failed(error) => error,
+        }
+    }
+}
 impl Client {
     /// Open `selector`, or the default camera, through the route the global
     /// flags choose.
     pub fn open(global: &Global, selector: Option<&str>) -> Result<Self> {
+        Self::open_with(global, selector, Route::default())
+    }
+    /// Open `selector` as `route` asks: through `--session`, a running
+    /// session that holds the camera, or for `--keep`/`--background` one
+    /// started for it; else a worker of this command.
+    pub fn open_with(global: &Global, selector: Option<&str>, route: Route) -> Result<Self> {
         let selector = selector.map(caller_selector).transpose()?;
         let out = global.output();
-        if let Some((session, held)) = route(global, selector.as_deref())? {
-            let target = match (held, &selector) {
-                (Some(held), _) => Some(held),
-                (None, Some(selector)) => {
-                    let connected = ipc::call_to(
-                        &session,
-                        None,
-                        SessionCommand::connect(selector.clone(), millis(CONNECT_TIMEOUT)),
-                        default_timeout(&SessionCommand::Status),
-                    )?;
-                    connected["connected"]["id"].as_str().map(str::to_owned)
-                }
-                (None, None) => None,
+        if route.needs_session() && global.no_session {
+            return Err(Usage(
+                "--keep and --background run through a session; drop --no-session".into(),
+            )
+            .into());
+        }
+        if let Some(name) = &global.session {
+            if route.needs_session() {
+                session::ensure(name, selector.as_deref(), route.idle(), global)?;
+            }
+            return Self::in_session(out, name, selector, route).map_err(Unusable::error);
+        }
+        if !global.no_session
+            && let Some(name) = route_to(&ipc::sessions(), selector.as_deref())
+        {
+            match Self::in_session(out, &name, selector.clone(), route) {
+                Ok(client) => return Ok(client),
+                // A session that is stopping, or gone, leaves the camera to
+                // this command; one that holds it and failed says why.
+                Err(Unusable::Gone(_)) if !route.needs_session() => {}
+                Err(unusable) => return Err(unusable.error()),
+            }
+        }
+        if route.needs_session() {
+            let selector = match selector {
+                Some(selector) => selector,
+                None => default_camera()?,
             };
-            return Ok(Self {
-                out,
-                session: Some(session),
-                target,
-                local: None,
-            });
+            session::ensure(AUTO_SESSION, Some(&selector), route.idle(), global)?;
+            return Self::in_session(out, AUTO_SESSION, Some(selector), route)
+                .map_err(Unusable::error);
         }
         let selector = match selector {
             Some(selector) => selector,
@@ -384,29 +517,148 @@ impl Client {
             session: None,
             target: None,
             local: Some(local.clone()),
+            keep: None,
         };
-        // Ctrl-C releases the camera rather than leaving control held.
-        let quit = local.clone();
-        legacy::on_quit_signal(move || quit.shutdown())?;
-        client.call(SessionCommand::connect(selector, millis(CONNECT_TIMEOUT)))?;
+        client.call(SessionCommand::connect(selector, route.connect()))?;
+        Ok(client)
+    }
+    /// Use session `name` for `selector`, connecting the camera there when
+    /// it does not hold it yet; otherwise a status request checks that the
+    /// session still runs and holds it.
+    fn in_session(
+        out: Output,
+        name: &str,
+        selector: Option<String>,
+        route: Route,
+    ) -> std::result::Result<Self, Unusable> {
+        let keep = route.keep;
+        let unusable = |error: anyhow::Error| {
+            if session_gone(&error) {
+                Unusable::Gone(error)
+            } else {
+                Unusable::Failed(error)
+            }
+        };
+        let descriptor = ipc::read_descriptor(name).map_err(unusable)?;
+        let held = selector.as_deref().is_none_or(|selector| {
+            descriptor
+                .cameras
+                .iter()
+                .any(|camera| camera.named_by(selector).is_some())
+        });
+        let mut client = Self {
+            out,
+            session: Some(name.to_owned()),
+            target: selector.clone(),
+            local: None,
+            keep,
+        };
+        let (target, first) = match (&selector, held) {
+            (Some(selector), false) => (
+                None,
+                SessionCommand::connect(selector.clone(), route.connect()),
+            ),
+            _ => (client.target.as_deref(), SessionCommand::Status),
+        };
+        let reply = ipc::call_keeping(name, target, first.clone(), default_timeout(&first), keep)
+            .map_err(unusable)?;
+        // Without -c, the session's only camera, named from now on so a
+        // camera connected later does not change what this command uses.
+        if selector.is_none() {
+            let cameras = reply["cameras"].as_array().cloned().unwrap_or_default();
+            client.target = match cameras.as_slice() {
+                [camera] => camera["info"]["id"].as_str().map(str::to_owned),
+                [] => {
+                    return Err(Unusable::Failed(
+                        Categorized::new(
+                            ErrorKind::CameraNotFound,
+                            format!("session '{name}' has no camera connected"),
+                        )
+                        .hint("name one with -c CAMERA")
+                        .details(json!({"candidates": []}))
+                        .into(),
+                    ));
+                }
+                cameras => {
+                    let ids = cameras
+                        .iter()
+                        .filter_map(|camera| camera["info"]["id"].as_str())
+                        .map(|id| json!({"id": crate::media::redact_url(id)}))
+                        .collect::<Vec<_>>();
+                    return Err(Unusable::Failed(
+                        Categorized::new(
+                            ErrorKind::CameraAmbiguous,
+                            format!(
+                                "session '{name}' has {} cameras connected; choose one with -c",
+                                ids.len()
+                            ),
+                        )
+                        .details(json!({ "candidates": ids }))
+                        .into(),
+                    ));
+                }
+            };
+        }
         Ok(client)
     }
     pub fn call(&self, command: SessionCommand) -> Result<Value> {
         command.validate()?;
         match (&self.session, &self.local) {
-            (Some(session), _) => ipc::call_to(
-                session,
-                self.target.as_deref(),
-                command.clone(),
-                default_timeout(&command),
-            ),
+            (Some(session), _) => {
+                // Looking does not keep a session; using it does.
+                let keep = self
+                    .keep
+                    .filter(|_| !matches!(command, SessionCommand::Status));
+                ipc::call_keeping(
+                    session,
+                    self.target.as_deref(),
+                    command.clone(),
+                    default_timeout(&command),
+                    keep,
+                )
+            }
             (None, Some(local)) => local.request(command),
             (None, None) => unreachable!("a client has a session or a worker"),
         }
     }
+    /// The camera's entry in a session status, as `Status` reports it.
+    pub fn status(&self) -> Result<Value> {
+        let state = self.call(SessionCommand::Status)?;
+        let cameras = state["cameras"].as_array().cloned().unwrap_or_default();
+        match cameras.as_slice() {
+            [camera] => Ok(camera.clone()),
+            _ => Err(Categorized::new(
+                ErrorKind::Disconnected,
+                "the camera is no longer connected",
+            )
+            .into()),
+        }
+    }
+    /// The session this client uses, if any.
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+    /// The worker of this command, without a session.
+    pub fn local(&self) -> Option<&SessionHandle> {
+        self.local.as_ref()
+    }
 }
 
-fn millis(duration: Duration) -> u64 {
+/// Whether `error` says the session is stopping or no longer runs.
+fn session_gone(error: &anyhow::Error) -> bool {
+    crate::session::is_stopping(error)
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                matches!(
+                    io.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+                )
+            })
+        })
+        || crate::types::classify(error).kind == ErrorKind::SessionNotFound
+}
+
+pub(crate) fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -434,90 +686,28 @@ pub(crate) fn input(error: anyhow::Error) -> anyhow::Error {
     }
 }
 
-/// The session a camera command uses, with the camera's ID there when it
-/// already holds it: `--session` (or CAPTUREFAB_SESSION); else a running
-/// session that holds the camera, or, without `-c`, the one session with
-/// exactly one camera. `--no-session` and no match mean a worker of this
-/// command.
-fn route(global: &Global, selector: Option<&str>) -> Result<Option<(String, Option<String>)>> {
-    if global.no_session {
-        return Ok(None);
-    }
-    if let Some(session) = &global.session {
-        let state = ipc::call(session, SessionCommand::Status, PROBE)?;
-        let held = match selector {
-            Some(selector) => held_camera(&state, selector),
-            None => Some(only_camera(session, &state)?),
-        };
-        return Ok(Some((session.clone(), held)));
-    }
-    let mut found = Vec::new();
-    for descriptor in ipc::active_sessions().unwrap_or_default() {
-        let Ok(state) = ipc::call(&descriptor.name, SessionCommand::Status, PROBE) else {
-            continue;
-        };
-        let held = match selector {
-            Some(selector) => held_camera(&state, selector),
-            None => match state["cameras"].as_array().map(Vec::as_slice) {
-                Some([camera]) => camera["info"]["id"].as_str().map(str::to_owned),
-                _ => None,
-            },
-        };
-        if let Some(held) = held {
-            found.push((descriptor.name, held));
-        }
-    }
-    Ok(match found.as_slice() {
-        [(session, held)] => Some((session.clone(), Some(held.clone()))),
-        _ => None,
-    })
-}
-
-/// The ID of the camera a session status holds for `selector`: by ID first,
-/// then serial or address.
-fn held_camera(state: &Value, selector: &str) -> Option<String> {
-    let cameras = state["cameras"].as_array()?;
-    let info = |camera: &Value| camera["info"].clone();
-    cameras
+/// The running session a camera command uses without `--session`: the one
+/// whose descriptor lists the camera, or, without `-c`, the only session
+/// that holds exactly one camera. Matched locally, without asking any.
+fn route_to(sessions: &[ipc::Descriptor], selector: Option<&str>) -> Option<String> {
+    // A camera's own ID outranks another camera's serial or alias.
+    let rank = |session: &ipc::Descriptor| match selector {
+        Some(selector) => session
+            .cameras
+            .iter()
+            .filter_map(|camera| camera.named_by(selector))
+            .min(),
+        None => (session.cameras.len() == 1).then_some(0),
+    };
+    let ranked = sessions
         .iter()
-        .map(info)
-        .find(|info| info["id"].as_str() == Some(selector))
-        .or_else(|| {
-            cameras.iter().map(info).find(|info| {
-                ["serial", "address"]
-                    .iter()
-                    .any(|key| info[*key].as_str() == Some(selector))
-            })
-        })
-        .and_then(|info| info["id"].as_str().map(str::to_owned))
-}
-
-/// The session's only camera.
-fn only_camera(session: &str, state: &Value) -> Result<String> {
-    let ids = state["cameras"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|camera| camera["info"]["id"].as_str())
+        .filter_map(|session| Some((rank(session)?, session)))
         .collect::<Vec<_>>();
-    match ids.as_slice() {
-        [id] => Ok((*id).to_owned()),
-        [] => Err(Categorized::new(
-            ErrorKind::CameraNotFound,
-            format!("session '{session}' has no camera connected"),
-        )
-        .hint("name one with -c CAMERA")
-        .details(json!({"candidates": []}))
-        .into()),
-        _ => Err(Categorized::new(
-            ErrorKind::CameraAmbiguous,
-            format!(
-                "session '{session}' has {} cameras connected; choose one with -c",
-                ids.len()
-            ),
-        )
-        .details(json!({"candidates": ids.iter().map(|id| json!({"id": crate::media::redact_url(id)})).collect::<Vec<_>>()}))
-        .into()),
+    let best = ranked.iter().map(|(rank, _)| *rank).min()?;
+    let mut found = ranked.iter().filter(|(rank, _)| *rank == best);
+    match (found.next(), found.next()) {
+        (Some((_, session)), None) => Some(session.name.clone()),
+        _ => None,
     }
 }
 
@@ -626,23 +816,65 @@ mod tests {
     }
 
     #[test]
-    fn a_session_command_without_a_camera_is_for_its_only_one() {
-        let state = |ids: &[&str]| json!({"cameras": ids.iter().map(|id| json!({"info": {"id": id}})).collect::<Vec<_>>()});
-        assert_eq!(only_camera("bench", &state(&["sim:0"])).unwrap(), "sim:0");
-        let none = only_camera("bench", &state(&[])).unwrap_err();
-        assert_eq!(error_code(&none), ("camera_not_found", 3));
-        let several =
-            only_camera("bench", &state(&["sim:0", "rtsp://user:secret@cam/live"])).unwrap_err();
-        assert_eq!(error_code(&several), ("camera_ambiguous", 2));
-        let details = crate::types::classify(&several).details.unwrap();
-        assert!(!details.to_string().contains("secret"), "{details}");
-    }
-
-    #[test]
-    fn exact_camera_identity_takes_priority_over_another_cameras_serial() {
-        let state = json!({"cameras":[{"info":{"id":"sim:first","serial":"sim:second"}}, {"info":{"id":"sim:second","serial":"SECOND"}}]});
-        assert_eq!(held_camera(&state, "sim:second").unwrap(), "sim:second");
-        assert_eq!(held_camera(&state, "SECOND").unwrap(), "sim:second");
-        assert!(held_camera(&state, "sim:third").is_none());
+    fn sessions_are_chosen_by_the_cameras_their_descriptors_list() {
+        let info = |id: &str, serial: &str| crate::types::CameraInfo {
+            id: id.into(),
+            transport: crate::types::Transport::Simulator,
+            vendor: String::new(),
+            model: String::new(),
+            serial: serial.into(),
+            address: None,
+            profile: Default::default(),
+        };
+        let session = |name: &str, cameras: Vec<ipc::HeldCamera>| ipc::Descriptor {
+            version: ipc::VERSION,
+            name: name.into(),
+            kind: ipc::SessionKind::Serve,
+            pid: 1,
+            address: "127.0.0.1:1".parse().unwrap(),
+            token: String::new(),
+            started_ms: 0,
+            cameras,
+        };
+        let one = session(
+            "one",
+            vec![ipc::HeldCamera::new(
+                &info("sim:first", "sim:second"),
+                ["front"].into_iter(),
+            )],
+        );
+        let two = session(
+            "two",
+            vec![
+                ipc::HeldCamera::new(&info("sim:second", "SECOND"), std::iter::empty()),
+                ipc::HeldCamera::new(&info("rtsp://user:secret@cam/live", ""), std::iter::empty()),
+            ],
+        );
+        let gige = session(
+            "gige",
+            vec![ipc::HeldCamera::new(
+                &info("gige:00c0df123456", "SN9"),
+                std::iter::empty(),
+            )],
+        );
+        let all = [one, two, gige];
+        assert_eq!(route_to(&all, Some("sim:first")).unwrap(), "one");
+        assert_eq!(route_to(&all, Some("front")).unwrap(), "one");
+        assert_eq!(route_to(&all, Some("SECOND")).unwrap(), "two");
+        // An ID outranks another camera's serial.
+        assert_eq!(route_to(&all, Some("sim:second")).unwrap(), "two");
+        // The same password is found; credentials never reach descriptors.
+        assert_eq!(
+            route_to(&all, Some("rtsp://user:secret@cam/live")).unwrap(),
+            "two"
+        );
+        assert!(!serde_json::to_string(&all[1]).unwrap().contains("secret"));
+        assert_eq!(route_to(&all, Some("00:C0:DF:12:34:56")).unwrap(), "gige");
+        assert!(route_to(&all, Some("sim:third")).is_none());
+        // Without -c: the only session with exactly one camera, and two of
+        // those are ambiguous.
+        assert!(route_to(&all, None).is_none());
+        assert_eq!(route_to(&all[1..2], None), None);
+        assert_eq!(route_to(&all[..2], None).unwrap(), "one");
     }
 }

@@ -309,6 +309,17 @@ def command_paths(root, with_arguments=False):
                 for alias in attr_values(attrs, "command", key):
                     result.add(" ".join(prefix + [alias]))
             child = subcommand_type(body) or (tuple_type if "subcommand" in command else None)
+            # An argument struct with a subcommand field: `jobs [list|stop|wait]`.
+            if child is None and tuple_type and "flatten" not in command:
+                struct_path, struct_name = resolve(tuple_type, path, "struct")
+                if struct_path not in tokens:
+                    tokens[struct_path] = rust_tokens(source(struct_path))
+                fields = struct_fields(tokens[struct_path], struct_name)
+                child = subcommand_type(["{", *[token for field in fields for token in (*field, ",")], "}"])
+                if child:
+                    child_path, child_enum = resolve(child, struct_path)
+                    visit(child_path, child_enum, prefix + names, ancestors | {identity})
+                continue
             if child:
                 child_path, child_enum = resolve(child, path)
                 visit(child_path, child_enum, prefix + names, ancestors | {identity})

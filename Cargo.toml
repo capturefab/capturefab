@@ -44,9 +44,10 @@ turbojpeg = { version = "1.5", optional = true, default-features = false, featur
 keyring = { version = "4.2", optional = true }
 zeroize = "1"
 
-# Share modes for the frame ring's backing file.
+# Share modes for the frame ring's backing file, and the inheritable pipe
+# a detached session reports ready on.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 # Host facts for doctor (sysctl, statfs, access), and anonymous shared memory
 # for frame rings (memfd_create, shm_open) with descriptor inheritance by

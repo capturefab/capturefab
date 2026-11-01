@@ -5,7 +5,7 @@
 //! component, so a label such as `defect` can choose a folder.
 use crate::{context::Context, storage::OutputExists, types::CameraInfo};
 use anyhow::{Context as _, Result, bail, ensure};
-use chrono::{DateTime, Local};
+use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -199,7 +199,7 @@ fn tag_value(key: &str, context: &Context) -> Result<String> {
     let value = context.get(key).map(|v| v.trim()).unwrap_or_default();
     if value.is_empty() {
         return Err(crate::types::Usage(format!(
-            "capture output uses {{tag:{key}}} but the capture tag '{key}' is empty; fill it in (--context {key}=VALUE) or change the file name pattern"
+            "capture output uses {{tag:{key}}} but the capture tag '{key}' is empty; fill it in (--tag {key}=VALUE) or change the file name pattern"
         ))
         .into());
     }
@@ -447,10 +447,33 @@ pub fn renumbers(plan: &Plan, on_exists: OnExists) -> bool {
     }
 }
 
+/// The clock {date} and {time} read: now, at the caller's UTC offset in
+/// seconds, or this computer's when none was sent. A session started in
+/// another time zone then names files as the person who asked would.
+pub fn clock(utc_offset_s: Option<i32>) -> DateTime<FixedOffset> {
+    let now = chrono::Utc::now();
+    let offset = utc_offset_s
+        .and_then(FixedOffset::east_opt)
+        .unwrap_or_else(|| *now.with_timezone(&chrono::Local).offset());
+    now.with_timezone(&offset)
+}
+/// This computer's UTC offset in seconds now, which requests carry.
+pub fn local_offset() -> i32 {
+    chrono::Local::now().offset().local_minus_utc()
+}
+/// An offset within a day either way.
+pub fn validate_offset(utc_offset_s: Option<i32>) -> Result<()> {
+    ensure!(
+        utc_offset_s.is_none_or(|offset| FixedOffset::east_opt(offset).is_some()),
+        "UTC offset must be within a day"
+    );
+    Ok(())
+}
+
 /// What a name is built from, taken once per frame before it is requested.
 pub struct NameInput<'a> {
     pub camera: &'a str,
-    pub now: DateTime<Local>,
+    pub now: DateTime<FixedOffset>,
     pub index: u32,
     /// The capture context that fills {tag:KEY}.
     pub context: &'a Context,
@@ -752,7 +775,7 @@ mod tests {
         dir
     }
     static NO_TAGS: Context = Context::new();
-    fn input(now: DateTime<Local>) -> NameInput<'static> {
+    fn input(now: DateTime<FixedOffset>) -> NameInput<'static> {
         NameInput {
             camera: "Model-SN1",
             now,
@@ -760,8 +783,21 @@ mod tests {
             context: &NO_TAGS,
         }
     }
-    fn fixed_time() -> DateTime<Local> {
-        Local.with_ymd_and_hms(2026, 10, 17, 10, 15, 0).unwrap()
+    fn fixed_time() -> DateTime<FixedOffset> {
+        FixedOffset::east_opt(3600)
+            .unwrap()
+            .with_ymd_and_hms(2026, 10, 17, 10, 15, 0)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_clock_reads_the_callers_offset() {
+        let east = clock(Some(5 * 3600 + 1800));
+        assert_eq!(east.offset().local_minus_utc(), 5 * 3600 + 1800);
+        let here = clock(None);
+        assert_eq!(here.offset().local_minus_utc(), local_offset());
+        assert!(validate_offset(Some(86_400)).is_err());
+        assert!(validate_offset(Some(-3600)).is_ok());
     }
 
     #[test]

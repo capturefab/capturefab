@@ -1,6 +1,6 @@
 //! Camera commands that read or configure: list, info, features, get, set,
 //! exec.
-use super::{Client, Global, args::CameraArg, args::CamerasArg, output::Report};
+use super::{Client, Global, args::CameraArg, args::CamerasArg, args::KeepArg, output::Report};
 use crate::controls::{Assignment, FeatureFilter, Name};
 use crate::session::SessionCommand;
 use crate::types::CameraInfo;
@@ -181,10 +181,12 @@ pub(super) fn table(headers: &[&str], rows: Vec<Vec<String>>) -> String {
 pub struct InfoArgs {
     #[command(flatten)]
     pub camera: CameraArg,
+    #[command(flatten)]
+    pub keep: KeepArg,
 }
 
 pub fn info(global: &Global, args: InfoArgs) -> Result<Report> {
-    let client = Client::open(global, args.camera.camera.as_deref())?;
+    let client = Client::open_with(global, args.camera.camera.as_deref(), args.keep.route())?;
     let value = client.call(SessionCommand::Info)?;
     let text = info_text(&value);
     Ok(Report::json(value).text(text))
@@ -292,6 +294,8 @@ pub struct FeaturesArgs {
     /// Only this category, such as ImageFormatControl
     #[arg(long, value_name = "NAME")]
     pub category: Option<String>,
+    #[command(flatten)]
+    pub keep: KeepArg,
 }
 
 pub fn features(global: &Global, args: FeaturesArgs) -> Result<Report> {
@@ -301,7 +305,7 @@ pub fn features(global: &Global, args: FeaturesArgs) -> Result<Report> {
         category: args.category,
     };
     filter.validate()?;
-    let client = Client::open(global, args.camera.camera.as_deref())?;
+    let client = Client::open_with(global, args.camera.camera.as_deref(), args.keep.route())?;
     let value = client.call(SessionCommand::FeatureList { filter })?;
     let rows = value["features"]
         .as_array()
@@ -348,6 +352,8 @@ pub struct GetArgs {
     /// Features, banks (TriggerMode[FrameStart]) or controls (exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb)
     #[arg(required = true, value_name = "NAME")]
     pub names: Vec<String>,
+    #[command(flatten)]
+    pub keep: KeepArg,
 }
 
 pub fn get(global: &Global, args: GetArgs) -> Result<Report> {
@@ -357,7 +363,7 @@ pub fn get(global: &Global, args: GetArgs) -> Result<Report> {
         .map(|name| Name::parse(name))
         .collect::<Result<Vec<_>>>()?;
     let read = |camera: Option<&str>| -> Result<Value> {
-        let client = Client::open(global, camera)?;
+        let client = Client::open_with(global, camera, args.keep.route())?;
         client.call(SessionCommand::GetValues {
             names: names.clone(),
         })
@@ -408,6 +414,8 @@ pub struct SetArgs {
     /// Check every value against the camera and show the writes in order; change nothing
     #[arg(long)]
     pub dry_run: bool,
+    #[command(flatten)]
+    pub keep: KeepArg,
 }
 
 pub fn set(global: &Global, args: SetArgs) -> Result<Report> {
@@ -416,7 +424,7 @@ pub fn set(global: &Global, args: SetArgs) -> Result<Report> {
         .iter()
         .map(|value| Assignment::parse(value))
         .collect::<Result<Vec<_>>>()?;
-    let client = Client::open(global, args.camera.camera.as_deref())?;
+    let client = Client::open_with(global, args.camera.camera.as_deref(), args.keep.route())?;
     let value = client.call(SessionCommand::SetValues {
         values,
         dry_run: args.dry_run,
@@ -457,11 +465,13 @@ pub struct ExecArgs {
     /// A command feature, optionally at a bank: TriggerSoftware, UserSetSave[UserSet1]
     #[arg(value_name = "COMMAND")]
     pub command: String,
+    #[command(flatten)]
+    pub keep: KeepArg,
 }
 
 pub fn exec(global: &Global, args: ExecArgs) -> Result<Report> {
     let name = Name::parse(&args.command)?;
-    let client = Client::open(global, args.camera.camera.as_deref())?;
+    let client = Client::open_with(global, args.camera.camera.as_deref(), args.keep.route())?;
     let value = client.call(SessionCommand::Exec { name })?;
     let text = format!(
         "Ran {} on {}.\n",

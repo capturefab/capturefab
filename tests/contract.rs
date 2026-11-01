@@ -31,6 +31,15 @@ fn every_json_command_prints_one_document() {
         (&["frobnicate"], 2),
         (&["get", "-c", "sim:0"], 2),
         (&["preset", "show", "missing"], 3),
+        (&["capture", "-c", "sim:0", "-o", "one.png"], 0),
+        (&["capture", "-c", "sim:0", "-o", "one.png"], 1),
+        (&["capture", "-c", "sim:0", "-o", "x.png", "-f", "jpg"], 2),
+        (&["inspect", "-c", "sim:0", "--preview", "none"], 0),
+        (&["auto", "-c", "sim:0", "--timeout", "2s"], 0),
+        (&["jobs"], 0),
+        (&["session", "list"], 0),
+        (&["session", "status"], 3),
+        (&["record", "-c", "sim:0", "-o", "clip.avi"], 2),
     ];
     for (args, exit) in cases {
         let run = home.run(&[&["--json"][..], args].concat());
@@ -88,6 +97,18 @@ fn argument_errors_are_usage_documents_and_help_stays_text() {
         &["setup", "list"],
         &["network-scan"],
         &["rpc"],
+        &["start"],
+        &["stop"],
+        &["status"],
+        &["connect", "sim:0"],
+        &["disconnect"],
+        &["manual"],
+        &["stop-forward"],
+        &["forward", "-o", "x.mkv"],
+        &["cancel", "1"],
+        &["serve", "--stream"],
+        &["capture", "-o", "x.png", "--timeout-ms", "5"],
+        &["capture", "-o", "x.png", "--interval", "1s"],
     ] {
         home.fails(2, args);
     }
@@ -446,11 +467,10 @@ fn set_is_one_atomic_change() {
         3000.0
     );
     // Geometry cannot change while the camera streams.
-    on(&["start"]);
-    let busy = home.fails(3, &["--session", "atomic", "set", "Width=320"]);
+    let _live = home.serve_with("live", &["sim:live"], &["--live"]);
+    let busy = home.fails(3, &["set", "-c", "sim:live", "Width=320"]);
     assert_eq!(busy["code"], "camera_busy");
     assert!(busy["hint"].is_string());
-    on(&["stop"]);
     on(&["set", "Width=320"]);
 }
 
@@ -492,25 +512,23 @@ fn sessions_are_used_when_they_hold_the_camera() {
 }
 
 #[test]
-fn session_commands_act_only_on_the_camera_named() {
+fn session_status_shows_cameras_and_refuses_unknown_jobs() {
     let home = Home::new("named-target");
     let _bench = home.serve("bench", &["sim:0"]);
-    // A camera the session does not hold is refused, not swapped for its
-    // only one.
-    for command in [&["disconnect"][..], &["stop"], &["status"], &["jobs"]] {
-        let error = home.fails(
-            3,
-            &[&["--session", "bench"][..], command, &["-c", "sim:9"]].concat(),
-        );
-        assert_eq!(error["code"], "camera_not_found", "{command:?}");
-        assert_eq!(error["details"]["candidates"][0]["id"], "sim:0");
-    }
-    let status = home.ok(&["--session", "bench", "status"]);
-    assert_eq!(status["cameras"][0]["info"]["id"], "sim:0");
-    home.ok(&["--session", "bench", "disconnect", "-c", "sim:0"]);
-    // With none left, a command for the only camera has none to act on.
-    let none = home.fails(3, &["--session", "bench", "stop"]);
-    assert_eq!(none["code"], "camera_not_found");
+    let status = home.ok(&["session", "status", "bench"]);
+    assert_eq!(status["session"], "bench");
+    assert_eq!(
+        status["cameras"],
+        json!([{"id": "sim:0", "state": "idle", "jobs": []}])
+    );
+    // The only session is the default.
+    assert_eq!(home.ok(&["session", "status"])["session"], "bench");
+    let missing = home.fails(2, &["jobs", "stop", "bench-9"]);
+    assert_eq!(missing["code"], "usage");
+    let malformed = home.fails(2, &["jobs", "wait", "bench"]);
+    assert_eq!(malformed["code"], "usage");
+    let gone = home.fails(3, &["session", "status", "nope"]);
+    assert_eq!(gone["code"], "session_not_found");
 }
 
 #[test]
@@ -524,7 +542,7 @@ fn an_environment_session_yields_to_no_session_and_binary_stdout() {
         &["--json", "--no-session", "get", "-c", "sim:env", "Width"],
     );
     assert_eq!(run.success()["values"]["Width"], 640);
-    let run = home.run_env(&env, &["--json", "status"]);
+    let run = home.run_env(&env, &["--json", "session", "status"]);
     assert!(run.success()["cameras"].as_array().unwrap().is_empty());
     // Both typed is a contradiction.
     let error = home.fails(2, &["--session", "first", "--no-session", "list"]);
@@ -538,7 +556,7 @@ fn an_environment_session_yields_to_no_session_and_binary_stdout() {
             "sim:stdout",
             "-o",
             "-",
-            "--format",
+            "-f",
             "raw",
             "--set",
             "Width=64",
@@ -548,7 +566,7 @@ fn an_environment_session_yields_to_no_session_and_binary_stdout() {
     );
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     assert_eq!(run.raw.len(), 4096);
-    let run = home.run_env(&env, &["--json", "status"]);
+    let run = home.run_env(&env, &["--json", "session", "status"]);
     assert!(run.success()["cameras"].as_array().unwrap().is_empty());
 }
 
@@ -598,11 +616,25 @@ fn schema_describes_every_command_and_its_results() {
         "set",
         "exec",
         "preset apply",
+        "capture",
+        "record",
+        "inspect",
+        "auto",
+        "jobs",
+        "jobs wait",
+        "session start",
+        "serve",
         "doctor",
         "schema",
         "licenses",
     ] {
         assert!(commands.iter().any(|command| command == name), "{name}");
+    }
+    for removed in ["storage", "status", "connect", "start", "stop-forward"] {
+        assert!(
+            !commands.iter().any(|command| command == removed),
+            "{removed}"
+        );
     }
     for command in &schema["commands"].as_array().unwrap()[..] {
         assert!(
@@ -690,6 +722,41 @@ fn results_carry_only_documented_keys() {
         ("completions", &["completions", "zsh"]),
         ("debug xml", &["debug", "xml", "-c", "sim:0"]),
         ("debug read", &["debug", "read", "-c", "sim:0", "0x100"]),
+        (
+            "capture",
+            &["capture", "-c", "sim:0", "-o", "documented.png"],
+        ),
+        (
+            "capture",
+            &["capture", "-c", "sim:0", "-n", "2", "-o", "documented/"],
+        ),
+        (
+            "capture",
+            &["capture", "-c", "sim:0", "-c", "sim:1", "-o", "both/"],
+        ),
+        (
+            "capture",
+            &[
+                "capture",
+                "-c",
+                "sim:0",
+                "--every",
+                "1s",
+                "-n",
+                "3",
+                "--dry-run",
+            ],
+        ),
+        ("inspect", &["inspect", "-c", "sim:0"]),
+        (
+            "inspect",
+            &["-v", "inspect", "-c", "sim:0", "--preview", "none"],
+        ),
+        ("auto", &["auto", "-c", "sim:0", "--timeout", "2s"]),
+        ("auto", &["auto", "-c", "sim:0", "--off"]),
+        ("jobs", &["jobs"]),
+        ("jobs list", &["jobs", "list"]),
+        ("session list", &["session", "list"]),
     ];
     for (command, args) in runs {
         let result = home.ok(args);
@@ -783,6 +850,20 @@ fn every_new_command_shows_examples() {
         &["debug", "write"],
         &["debug", "rpc"],
         &["licenses"],
+        &["capture"],
+        &["record"],
+        &["inspect"],
+        &["auto"],
+        &["jobs"],
+        &["jobs", "list"],
+        &["jobs", "stop"],
+        &["jobs", "wait"],
+        &["session"],
+        &["session", "start"],
+        &["session", "stop"],
+        &["session", "status"],
+        &["session", "list"],
+        &["serve"],
     ] {
         let help = home.run(&[words, &["--help"]].concat()).stdout;
         let examples = help
@@ -806,6 +887,15 @@ fn every_new_command_shows_examples() {
         "memory",
         "xml",
         "rpc",
+        "storage",
+        "status",
+        "start",
+        "stop",
+        "connect",
+        "disconnect",
+        "manual",
+        "cancel",
+        "forward",
     ] {
         assert!(
             !top.lines()

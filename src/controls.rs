@@ -1523,7 +1523,7 @@ pub struct Trigger {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation: Option<String>,
 }
-fn trigger_state(camera: &mut Camera) -> Result<Trigger> {
+pub(crate) fn trigger_state(camera: &mut Camera) -> Result<Trigger> {
     let bank = trigger_bank(camera);
     with_bank(camera, &bank, |camera| {
         let read = |camera: &mut Camera, feature: &str| {

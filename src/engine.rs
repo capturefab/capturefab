@@ -475,7 +475,12 @@ fn next_frame(
     deadline: Instant,
 ) -> Result<Option<Frame>> {
     loop {
-        ensure!(!h.cancelled(), "capture interrupted");
+        if h.cancelled() {
+            return Err(crate::types::Categorized::error(
+                crate::types::ErrorKind::Interrupted,
+                "capture interrupted",
+            ));
+        }
         if let Some(a) = auto.as_mut()
             && a.tick(c, Instant::now())
         {
@@ -804,6 +809,7 @@ fn name_recording(
     camera: &str,
     on_exists: crate::naming::OnExists,
     context: &crate::context::Context,
+    utc_offset_s: Option<i32>,
 ) -> Result<(PathBuf, crate::storage::StorageWriter)> {
     crate::naming::validate_output(&config.output)?;
     let local = crate::media::local_file_path(&config.output)?;
@@ -818,7 +824,7 @@ fn name_recording(
     };
     let input = crate::naming::NameInput {
         camera,
-        now: chrono::Local::now(),
+        now: crate::naming::clock(utc_offset_s),
         index: 0,
         context,
     };
@@ -975,6 +981,35 @@ fn still_meta(
     meta
 }
 
+/// A still as `frame::encode_with_meta` encodes it, but a JPEG at `quality`
+/// when one other than the default is asked for.
+pub(crate) fn encode_still(
+    frame: &Frame,
+    format: &str,
+    quality: Option<u8>,
+    meta: Option<&Value>,
+) -> Result<Vec<u8>> {
+    match quality {
+        Some(quality) if format == "jpeg" && i32::from(quality) != crate::jpeg::QUALITY => {
+            let bytes = crate::jpeg::software_quality(
+                &crate::jpeg::Raster::new(frame)?,
+                i32::from(quality),
+            )?;
+            let Some(meta) = meta else {
+                return Ok(bytes);
+            };
+            let json = serde_json::to_string(meta)?;
+            ensure!(
+                json.len() <= crate::frame::MAX_META,
+                "capture metadata exceeds {} bytes",
+                crate::frame::MAX_META
+            );
+            crate::jpeg::insert_com(&bytes, json.as_bytes())
+        }
+        _ => crate::frame::encode_with_meta(frame, format, meta),
+    }
+}
+
 /// Record a locally saved image in the saved-file log.
 #[allow(clippy::too_many_arguments)]
 fn report_image(
@@ -1085,8 +1120,22 @@ fn process_plain(
                     return Err(crate::types::frame_timeout(GRAB_TIMEOUT));
                 }
                 c.request_frame()?;
-                let frame = next_frame(h, c, auto, deadline)?
-                    .ok_or_else(|| crate::types::frame_timeout(GRAB_TIMEOUT))?;
+                let frame = match next_frame(h, c, auto, deadline)? {
+                    Some(frame) => frame,
+                    None => {
+                        let error = frame_wait_error(c, duration);
+                        // A plain frame timeout the coordinator words itself.
+                        return Err(
+                            if crate::types::classify(&error).kind
+                                == crate::types::ErrorKind::TriggerTimeout
+                            {
+                                error
+                            } else {
+                                crate::types::frame_timeout(GRAB_TIMEOUT)
+                            },
+                        );
+                    }
+                };
                 let mut value = json!({"frame":frame});
                 if !settled {
                     value["auto_settled"] = json!(false);
@@ -1158,10 +1207,11 @@ fn process_plain(
             on_exists,
             context,
             duration_ms,
+            utc_offset_s,
         } => {
             ensure!(
                 forwarder.is_none(),
-                "forwarding is already active; stop-forward first"
+                "the camera is already recording; capturefab jobs stop ends that recording"
             );
             let mut identity = [0u8; 16];
             getrandom::fill(&mut identity)
@@ -1190,7 +1240,8 @@ fn process_plain(
             let f = if named {
                 config.validate()?;
                 let label = crate::naming::camera_label(&camera_mut(camera)?.info);
-                let (path, reserved) = name_recording(h, &config, &label, on_exists, &context)?;
+                let (path, reserved) =
+                    name_recording(h, &config, &label, on_exists, &context, utc_offset_s)?;
                 config.output = path.to_string_lossy().into_owned();
                 Forwarder::with_resolved(config, Some(reserved))?
             } else {
@@ -1571,7 +1622,8 @@ fn process_plain(
                 .find(|j| j.info.id == id)
                 .context("capture job not found")?;
             ensure!(job.info.active(), "capture job is already finished");
-            job.info.status = "cancelled".into();
+            job.info.end("cancelled", None);
+            job.deadline = None;
             sync_jobs(h, jobs);
             Ok(json!({"cancelled":id}))
         }
@@ -1585,6 +1637,9 @@ fn process_plain(
             storage,
             on_exists,
             context,
+            utc_offset_s,
+            quality,
+            job,
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
             preflight_capture_output(&output, count, &format, on_exists)?;
@@ -1600,9 +1655,25 @@ fn process_plain(
             );
             crate::scheduling::validate_schedule(first_at_ms, interval_ms, count)?;
             let label = crate::naming::camera_label(&camera_mut(camera)?.info);
-            let first_at_ms = first_at_ms.max(crate::scheduling::now_ms());
+            let now_ms = crate::scheduling::now_ms();
+            let first_at_ms = first_at_ms.max(now_ms);
+            // The coordinator numbers jobs across a session's cameras.
+            let id = match job {
+                Some(id) => {
+                    ensure!(
+                        !jobs.iter().any(|j| j.info.id == id),
+                        "capture job {id} already exists"
+                    );
+                    id
+                }
+                None => {
+                    let id = *next_job;
+                    *next_job = next_job.checked_add(1).context("job ID exhausted")?;
+                    id
+                }
+            };
             let info = crate::scheduling::CaptureJob {
-                id: *next_job,
+                id,
                 status: "pending".into(),
                 output: output.clone(),
                 count,
@@ -1614,9 +1685,15 @@ fn process_plain(
                 next_at_ms: first_at_ms,
                 last_file: None,
                 error: None,
+                error_tag: None,
                 context,
+                created_ms: now_ms,
+                ended_ms: None,
+                files: Vec::new(),
+                frame: None,
+                first_ms: None,
+                settings: serde_json::Map::new(),
             };
-            *next_job = next_job.checked_add(1).context("job ID exhausted")?;
             jobs.push(Scheduled {
                 info: info.clone(),
                 plan: crate::naming::Plan::new(&output, count, &format),
@@ -1629,6 +1706,8 @@ fn process_plain(
                 on_exists,
                 next: None,
                 saving: false,
+                utc_offset_s,
+                quality,
             });
             trim_jobs(jobs);
             sync_jobs(h, jobs);
@@ -1677,13 +1756,14 @@ fn process_plain(
             storage,
             on_exists,
             context,
+            utc_offset_s,
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
             storage.validate()?;
             if output != "-" {
                 preflight_capture_output(&output, count, &format, on_exists)?;
             }
-            let duration = timeout(timeout_ms)?;
+            let duration = Duration::from_millis(timeout_ms);
             ensure!((1..=100_000).contains(&count), "count must be 1..100000");
             ensure!(
                 ["png", "jpeg", "raw", "ppm", "pgm"].contains(&format.as_str()),
@@ -1720,7 +1800,7 @@ fn process_plain(
                         // mode is refused first.
                         let input = crate::naming::NameInput {
                             camera: &label,
-                            now: chrono::Local::now(),
+                            now: crate::naming::clock(utc_offset_s),
                             index,
                             context: &context,
                         };
@@ -1735,8 +1815,10 @@ fn process_plain(
                             Some(path)
                         };
                         c.request_frame()?;
-                        let frame = next_frame(h, c, auto, Instant::now() + duration)?
-                            .ok_or_else(|| crate::types::frame_timeout("frame timeout"))?;
+                        let frame = match next_frame(h, c, auto, deadline_after(duration))? {
+                            Some(frame) => frame,
+                            None => return Err(frame_wait_error(c, duration)),
+                        };
                         if index == 0 {
                             status = auto.as_ref().map(|a| a.status().clone());
                         }
@@ -1789,7 +1871,12 @@ fn process_plain(
                         return Err(if files.is_empty() {
                             error
                         } else {
-                            error.context(saved_before(&files, count))
+                            let listed =
+                                &files[..files.len().min(crate::scheduling::MAX_JOB_FILES)];
+                            crate::types::with_details(
+                                error.context(saved_before(&files, count)),
+                                json!({ "files": listed }),
+                            )
                         });
                     }
                 }
@@ -1824,17 +1911,21 @@ struct Scheduled {
     camera: String,
     on_exists: crate::naming::OnExists,
     /// The name picked for the frame being requested, with its clock time.
-    next: Option<(PathBuf, chrono::DateTime<chrono::Local>)>,
+    next: Option<(PathBuf, chrono::DateTime<chrono::FixedOffset>)>,
     /// A shot is with the saver; the next one waits for its outcome.
     saving: bool,
+    /// The caller's UTC offset, for {date} and {time}.
+    utc_offset_s: Option<i32>,
+    /// JPEG quality, when not the default.
+    quality: Option<u8>,
 }
 impl Scheduled {
     /// Pick the next frame's name: a free one.
     fn allocate(
         &self,
         names: &Mutex<crate::naming::Namer>,
-    ) -> Result<(PathBuf, chrono::DateTime<chrono::Local>)> {
-        let now = chrono::Local::now();
+    ) -> Result<(PathBuf, chrono::DateTime<chrono::FixedOffset>)> {
+        let now = crate::naming::clock(self.utc_offset_s);
         let path = names.lock().unwrap_or_else(|e| e.into_inner()).candidate(
             &self.plan,
             &self.input(now),
@@ -1842,7 +1933,7 @@ impl Scheduled {
         )?;
         Ok((path, now))
     }
-    fn input(&self, now: chrono::DateTime<chrono::Local>) -> crate::naming::NameInput<'_> {
+    fn input(&self, now: chrono::DateTime<chrono::FixedOffset>) -> crate::naming::NameInput<'_> {
         crate::naming::NameInput {
             camera: &self.camera,
             now,
@@ -1851,7 +1942,7 @@ impl Scheduled {
         }
     }
     /// This job's file for the frame being shot, at the name picked for it.
-    fn save(&self, path: PathBuf, now: chrono::DateTime<chrono::Local>) -> saver::Save {
+    fn save(&self, path: PathBuf, now: chrono::DateTime<chrono::FixedOffset>) -> saver::Save {
         saver::Save {
             job: self.info.id,
             path,
@@ -1861,6 +1952,7 @@ impl Scheduled {
             plan: self.plan.clone(),
             on_exists: self.on_exists,
             format: self.format.clone(),
+            quality: self.quality,
             storage: self.storage.clone(),
             context: self.info.context.clone(),
         }
@@ -1884,7 +1976,7 @@ impl Scheduled {
     }
 }
 fn validate_capture(output: &str, count: u32, timeout_ms: u64, format: &str) -> Result<()> {
-    timeout(timeout_ms)?;
+    crate::session::validate_frame_wait(timeout_ms)?;
     ensure!((1..=100_000).contains(&count), "count must be 1..100000");
     ensure!(
         ["png", "jpeg", "raw", "ppm", "pgm"].contains(&format),
@@ -2089,9 +2181,13 @@ fn validate_schedule_outputs(
 }
 fn cancel_jobs(jobs: &mut [Scheduled]) {
     for j in jobs.iter_mut().filter(|j| j.info.active()) {
-        j.info.status = "cancelled".into();
+        j.info.end("cancelled", None);
+        j.deadline = None;
     }
 }
+/// Finished jobs whose file lists are kept; older ones keep their counts
+/// and last file, so every status stays small.
+const LISTED_FINISHED_JOBS: usize = 8;
 fn trim_jobs(jobs: &mut Vec<Scheduled>) {
     while jobs.len() > 132 {
         if let Some(i) = jobs.iter().position(|j| !j.info.active()) {
@@ -2099,6 +2195,14 @@ fn trim_jobs(jobs: &mut Vec<Scheduled>) {
         } else {
             break;
         }
+    }
+    let finished = jobs.iter().filter(|j| !j.info.active()).count();
+    for job in jobs
+        .iter_mut()
+        .filter(|j| !j.info.active())
+        .take(finished.saturating_sub(LISTED_FINISHED_JOBS))
+    {
+        job.info.files = Vec::new();
     }
 }
 fn sync_jobs(h: &WorkerHandle, jobs: &[Scheduled]) {
@@ -2137,8 +2241,7 @@ fn tick_jobs(
             let warm_up = match result {
                 Ok(warm_up) => warm_up,
                 Err(e) => {
-                    job.info.status = "failed".into();
-                    job.info.error = Some(format!("{e:#}"));
+                    job.info.end("failed", Some(&e));
                     h.log(
                         "error",
                         format!("Capture job {} failed: {e:#}", job.info.id),
@@ -2148,18 +2251,20 @@ fn tick_jobs(
             };
             job.info.status = "running".into();
             let timeout = Duration::from_millis(job.timeout_ms);
-            job.deadline = Some(Instant::now() + timeout);
+            job.deadline = Some(deadline_after(timeout));
             job.warm = (auto && warm_up)
                 .then(|| Instant::now() + (timeout / 2).min(Duration::from_secs(3)));
         }
         if job.deadline.is_some_and(|d| Instant::now() >= d) {
             changed = true;
-            job.info.status = "failed".into();
-            job.info.error = Some("frame timeout".into());
-            h.log(
-                "error",
-                format!("Capture job {}: frame timeout", job.info.id),
-            );
+            let waited = Duration::from_millis(job.timeout_ms);
+            let error = match camera.as_mut() {
+                Some(c) => frame_wait_error(c, waited),
+                None => crate::types::frame_timeout("frame timeout"),
+            };
+            job.deadline = None;
+            job.info.end("failed", Some(&error));
+            h.log("error", format!("Capture job {}: {error:#}", job.info.id));
         }
     }
     // A shot with the saver holds the stream too: a job due again once it is
@@ -2241,8 +2346,7 @@ fn shoot(
                 .into();
             }
             Err(e) => {
-                job.info.status = "failed".into();
-                job.info.error = Some(format!("{e:#}"));
+                job.info.end("failed", Some(&e));
                 h.log(
                     "error",
                     format!("Capture job {} stopped: {e:#}", job.info.id),
@@ -2298,20 +2402,31 @@ fn settle_saves(h: &WorkerHandle, saver: &mut saver::Saver, jobs: &mut [Schedule
 }
 /// Record what became of a job's shot. A save that may work later is taken
 /// again at the job's next interval; any other failure stops the job.
-fn finish(h: &WorkerHandle, job: &mut Scheduled, result: Result<String>) {
+fn finish(h: &WorkerHandle, job: &mut Scheduled, result: Result<saver::SavedShot>) {
     job.saving = false;
     let id = job.info.id;
     match result {
-        Ok(path) => {
-            job.info.captured += 1;
-            job.info.last_file = Some(path);
-            if job.info.active() {
-                job.info.error = None;
-                if job.info.captured >= job.info.count {
-                    job.info.status = "complete".into();
+        Ok(shot) => {
+            let info = &mut job.info;
+            info.captured += 1;
+            if info.files.len() < crate::scheduling::MAX_JOB_FILES {
+                info.files.push(shot.path.clone());
+            }
+            info.last_file = Some(shot.path);
+            info.frame = Some(shot.frame);
+            if info.first_ms.is_none() {
+                info.first_ms = Some(shot.wall_ms);
+                info.settings = shot.settings;
+            }
+            if info.active() {
+                info.error = None;
+                info.error_tag = None;
+                if info.captured >= info.count {
+                    info.status = "complete".into();
+                    info.ended_ms = Some(crate::scheduling::now_ms());
                     h.log(
                         "info",
-                        format!("Capture job {id} complete: {} frame(s)", job.info.captured),
+                        format!("Capture job {id} complete: {} frame(s)", info.captured),
                     );
                 }
             }
@@ -2327,8 +2442,7 @@ fn finish(h: &WorkerHandle, job: &mut Scheduled, result: Result<String>) {
             );
         }
         Err(e) => {
-            job.info.status = "failed".into();
-            job.info.error = Some(format!("{e:#}"));
+            job.info.end("failed", Some(&e));
             h.log("error", format!("Capture job {id} stopped: {e:#}"));
         }
     }
@@ -2344,6 +2458,40 @@ fn transient(error: &anyhow::Error) -> bool {
         })
 }
 
+/// `wait` from now, or as far ahead as this platform's clock can say.
+fn deadline_after(wait: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(wait)
+        .or_else(|| now.checked_add(Duration::from_secs(86_400 * 365)))
+        .unwrap_or(now)
+}
+/// Why no frame came within `waited`: a trigger that never fired when the
+/// camera waits for one from a line, with its configuration, else a plain
+/// frame timeout. Read only once the wait has expired.
+pub(crate) fn frame_wait_error(c: &mut Camera, waited: Duration) -> anyhow::Error {
+    let wait =
+        crate::scheduling::format_duration(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+    match crate::controls::trigger_state(c) {
+        Ok(trigger)
+            if trigger.mode == "On"
+                && trigger.source.as_deref().is_some_and(|source| {
+                    !matches!(source, "Software" | "Freerun" | "FixedRate")
+                }) =>
+        {
+            let source = trigger.source.clone().unwrap_or_default();
+            crate::types::Categorized::new(
+                crate::types::ErrorKind::TriggerTimeout,
+                format!("no trigger on {source} within {wait}; the camera sends a frame only when triggered"),
+            )
+            .hint(format!(
+                "send a trigger on {source}, wait longer with --timeout (none waits until stopped), or set trigger=off"
+            ))
+            .details(json!({"trigger": trigger}))
+            .into()
+        }
+        _ => crate::types::frame_timeout(format!("no frame within {wait}")),
+    }
+}
 /// What a burst that failed part way had already saved:
 /// `saved 2 of 3 frames to DIR (a.png, b.png) before this failed`.
 pub fn saved_before(files: &[String], count: u32) -> String {
@@ -2743,6 +2891,9 @@ mod tests {
             storage: Default::default(),
             on_exists: Default::default(),
             context: Default::default(),
+            utc_offset_s: None,
+            quality: None,
+            job: None,
         };
         let frames = root.join("f-{frame}.raw").to_string_lossy().into_owned();
         handle.request(schedule(frames.clone(), 3, "raw")).unwrap();
@@ -2796,6 +2947,7 @@ mod tests {
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms: None,
+            utc_offset_s: None,
         };
         let mut paths = Vec::new();
         let handles: Vec<_> = (0..2).map(|_| WorkerHandle::new()).collect();
@@ -2826,6 +2978,7 @@ mod tests {
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms,
+            utc_offset_s: None,
         }
     }
     #[test]
@@ -3343,6 +3496,7 @@ mod tests {
                 storage: Default::default(),
                 on_exists: Default::default(),
                 context: Default::default(),
+                utc_offset_s: None,
             })
             .unwrap();
         assert_eq!(v["frames"][0]["width"], 128);
@@ -3383,6 +3537,7 @@ mod tests {
                 storage: Default::default(),
                 on_exists: Default::default(),
                 context: Default::default(),
+                utc_offset_s: None,
             })
             .unwrap();
         let captured = reader.take_latest().unwrap().unwrap();
@@ -3463,6 +3618,7 @@ mod tests {
                 storage: Default::default(),
                 on_exists: Default::default(),
                 context: context.clone(),
+                utc_offset_s: None,
             })
             .unwrap();
         assert_eq!(v["context"]["line"], "L1");
@@ -3513,6 +3669,7 @@ mod tests {
             storage: Default::default(),
             on_exists,
             context: Default::default(),
+            utc_offset_s: None,
         }
     }
     #[test]
@@ -3589,6 +3746,7 @@ mod tests {
                 on_exists: Default::default(),
                 context: Default::default(),
                 duration_ms: None,
+                utc_offset_s: None,
             })
             .unwrap_err();
         assert!(
@@ -3682,6 +3840,9 @@ mod tests {
                 storage: Default::default(),
                 on_exists: Default::default(),
                 context: crate::context::Context::from([("lot".into(), "7".into())]),
+                utc_offset_s: None,
+                quality: None,
+                job: None,
             })
             .unwrap();
         assert_eq!(job["job"]["context"]["lot"], "7");
@@ -3728,8 +3889,7 @@ mod tests {
                 interval_ms: 60_000,
                 next_at_ms: 0,
                 last_file: None,
-                error: None,
-                context: Default::default(),
+                ..Default::default()
             },
             plan: crate::naming::Plan::new(&output, 2, "raw"),
             timeout_ms: 1000,
@@ -3741,6 +3901,21 @@ mod tests {
             on_exists: Default::default(),
             next: None,
             saving: false,
+            utc_offset_s: None,
+            quality: None,
+        }
+    }
+    /// What the saver reports for a shot it wrote to `save.path`.
+    fn written(save: &saver::Save) -> saver::SavedShot {
+        saver::SavedShot {
+            path: save.path.to_string_lossy().into_owned(),
+            frame: crate::scheduling::JobFrame {
+                width: 8,
+                height: 8,
+                pixel_format: crate::types::MONO8,
+            },
+            wall_ms: 0,
+            settings: Default::default(),
         }
     }
     fn small_frame(id: u64) -> Frame {
@@ -3755,9 +3930,9 @@ mod tests {
     }
     #[test]
     fn slow_saves_hold_up_no_frames_and_the_saver_holds_two() {
-        fn slow(_: &WorkerHandle, _: &saver::Shot, save: &saver::Save) -> Result<String> {
+        fn slow(_: &WorkerHandle, _: &saver::Shot, save: &saver::Save) -> Result<saver::SavedShot> {
             std::thread::sleep(Duration::from_millis(300));
-            Ok(save.path.to_string_lossy().into_owned())
+            Ok(written(save))
         }
         let writer = crate::shared_memory::SharedRing::create(&std::env::temp_dir(), 4096).unwrap();
         let mut reader = writer.reader().unwrap();
@@ -3817,9 +3992,9 @@ mod tests {
     }
     #[test]
     fn a_disconnect_waits_for_the_shot_the_saver_is_writing() {
-        fn slow(_: &WorkerHandle, _: &saver::Shot, save: &saver::Save) -> Result<String> {
+        fn slow(_: &WorkerHandle, _: &saver::Shot, save: &saver::Save) -> Result<saver::SavedShot> {
             std::thread::sleep(Duration::from_millis(300));
-            Ok(save.path.to_string_lossy().into_owned())
+            Ok(written(save))
         }
         let h = WorkerHandle::new();
         let mut saver = saver::Saver::with(h.clone(), slow);
@@ -3917,7 +4092,20 @@ mod tests {
         assert!(started && camera.as_ref().unwrap().is_streaming());
         assert_eq!(count(), (1, 0));
         // Saved: the next shot needs no start and no warm-up.
-        finish(&h, &mut jobs[0], Ok("shot.raw".into()));
+        finish(
+            &h,
+            &mut jobs[0],
+            Ok(saver::SavedShot {
+                path: "shot.raw".into(),
+                frame: crate::scheduling::JobFrame {
+                    width: 8,
+                    height: 8,
+                    pixel_format: crate::types::MONO8,
+                },
+                wall_ms: 0,
+                settings: Default::default(),
+            }),
+        );
         tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
         assert!(jobs[0].deadline.is_some() && jobs[0].warm.is_none());
         assert_eq!(count(), (1, 0));
@@ -3986,6 +4174,16 @@ mod tests {
         let shoot_once = |job: &mut Scheduled, result: Result<String>| {
             job.saving = true;
             job.advance();
+            let result = result.map(|path| saver::SavedShot {
+                path,
+                frame: crate::scheduling::JobFrame {
+                    width: 8,
+                    height: 8,
+                    pixel_format: crate::types::MONO8,
+                },
+                wall_ms: 0,
+                settings: Default::default(),
+            });
             finish(&h, job, result);
         };
         let busy = anyhow::Error::from(crate::storage::Busy).context("save shot.raw");
@@ -4002,7 +4200,7 @@ mod tests {
         );
         // The same frame number, one interval later.
         assert_eq!(job.info.next_at_ms, 60_000);
-        assert_eq!(job.input(chrono::Local::now()).index, 0);
+        assert_eq!(job.input(crate::naming::clock(None)).index, 0);
         let slow_disk = std::io::Error::from(std::io::ErrorKind::TimedOut);
         shoot_once(
             &mut job,
@@ -4394,6 +4592,7 @@ mod tests {
                 storage: Default::default(),
                 on_exists: Default::default(),
                 context: Default::default(),
+                utc_offset_s: None,
             })
             .unwrap();
         assert_eq!(v["frames"][0]["width"], 128);

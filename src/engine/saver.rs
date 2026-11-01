@@ -20,12 +20,14 @@ pub(super) struct Shot {
 pub(super) struct Save {
     pub(super) job: u64,
     pub(super) path: PathBuf,
-    pub(super) now: chrono::DateTime<chrono::Local>,
+    pub(super) now: chrono::DateTime<chrono::FixedOffset>,
     pub(super) index: u32,
     pub(super) camera: String,
     pub(super) plan: crate::naming::Plan,
     pub(super) on_exists: crate::naming::OnExists,
     pub(super) format: String,
+    /// JPEG quality, when not the default.
+    pub(super) quality: Option<u8>,
     pub(super) storage: crate::storage::StoragePolicy,
     pub(super) context: crate::context::Context,
 }
@@ -33,10 +35,18 @@ pub(super) struct Save {
 /// A job's saved file, or why it was not saved.
 pub(super) struct Saved {
     pub(super) job: u64,
-    pub(super) result: Result<String>,
+    pub(super) result: Result<SavedShot>,
 }
 
-type Write = fn(&WorkerHandle, &Shot, &Save) -> Result<String>;
+/// A file a shot was saved to, with what its job reports of the frame.
+pub(super) struct SavedShot {
+    pub(super) path: String,
+    pub(super) frame: crate::scheduling::JobFrame,
+    pub(super) wall_ms: u64,
+    pub(super) settings: serde_json::Map<String, Value>,
+}
+
+type Write = fn(&WorkerHandle, &Shot, &Save) -> Result<SavedShot>;
 
 pub(super) struct Saver {
     shots: Option<SyncSender<Shot>>,
@@ -127,9 +137,9 @@ impl Drop for Saver {
 
 /// Encode and write one job's file for a shot, then report it. Returns the
 /// path it was saved at.
-fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<String> {
+fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<SavedShot> {
     let meta = still_meta(&shot.frame, shot.wall_ms, &shot.acquisition, &save.context);
-    let bytes = crate::frame::encode_with_meta(&shot.frame, &save.format, Some(&meta))?;
+    let bytes = encode_still(&shot.frame, &save.format, save.quality, Some(&meta))?;
     let input = crate::naming::NameInput {
         camera: &save.camera,
         now: save.now,
@@ -155,5 +165,14 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<String> {
         Some(save.job),
         &save.context,
     );
-    Ok(path.to_string_lossy().into_owned())
+    Ok(SavedShot {
+        path: path.to_string_lossy().into_owned(),
+        frame: crate::scheduling::JobFrame {
+            width: shot.frame.width,
+            height: shot.frame.height,
+            pixel_format: shot.frame.pixel_format,
+        },
+        wall_ms: shot.wall_ms,
+        settings: shot.acquisition.settings.clone(),
+    })
 }

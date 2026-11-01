@@ -147,7 +147,10 @@ pub fn meter(frame: &Frame) -> Option<Meter> {
     })
 }
 
-fn error(m: Meter) -> f64 {
+/// How many stops brighter (positive) or darker a frame metered as `m`
+/// should be: toward the target brightness, but not so far that its
+/// brightest one percent clips.
+pub(crate) fn error(m: Meter) -> f64 {
     let e = (TARGET / m.mean).log2();
     e.min((0.96 / m.p99).log2()).max(e - 1.0)
 }

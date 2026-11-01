@@ -117,13 +117,20 @@ class SourceParserTests(unittest.TestCase):
                     #[command(subcommand)] Preset(preset::PresetCommand),
                     #[command(flatten)] Legacy(legacy::LegacyCommand),
                     List(camera::ListArgs),
+                    Jobs(jobs::JobsArgs),
                 }
             ''')
             write(root, "src/cli/preset.rs", 'pub enum PresetCommand { Save { name: String }, List }')
             write(root, "src/cli/legacy.rs", 'pub enum LegacyCommand { Capture { #[arg(short=\'o\')] output: String } }')
             write(root, "src/cli/camera.rs", 'pub struct ListArgs { #[arg(long)] kind: String }')
+            write(root, "src/cli/jobs.rs", '''
+                pub struct JobsArgs { #[command(subcommand)] action: Option<JobsAction> }
+                pub enum JobsAction { List, Wait { id: String } }
+            ''')
             commands, arguments = coverage.command_paths(root, with_arguments=True)
-            self.assertEqual(commands, {"help", "preset", "preset save", "preset list", "capture", "list"})
+            self.assertEqual(commands, {"help", "preset", "preset save", "preset list", "capture", "list", "jobs", "jobs list", "jobs wait"})
+            self.assertEqual(arguments["jobs"], set())
+            self.assertEqual(arguments["jobs wait"], {"ID"})
             # Without clap's help subcommand there is none to document.
             source = (root / "src/cli.rs").read_text(encoding="utf-8")
             write(root, "src/cli.rs", "#[command(disable_help_subcommand = true)]\n" + source)

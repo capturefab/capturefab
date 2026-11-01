@@ -64,6 +64,7 @@
 <p>What a camera is and what it can do: size, format, exposure, gain, trigger, controls. Effect: read.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-features"><code>capturefab features</code></h3>
 <p>List a camera's features with values, ranges, choices and locks. Effect: read.</p>
@@ -72,12 +73,14 @@
 <tr><td><code>PATTERN</code></td><td>Only names containing this text, or matching a glob such as 'Exposure*'</td><td>—</td></tr>
 <tr><td><code>--all</code></td><td>Every visibility level (Expert, Guru); a PATTERN or --category also searches every level</td><td>false</td></tr>
 <tr><td><code>--category</code></td><td>Only this category, such as ImageFormatControl</td><td>—</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-get"><code>capturefab get</code></h3>
 <p>Read features or controls in one call. Effect: read.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
 <tr><td><code>NAME</code></td><td>Features, banks (TriggerMode[FrameStart]) or controls (exposure, gain, fps, roi, format, trigger, auto_exposure, auto_wb)</td><td>Required</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-set"><code>capturefab set</code></h3>
 <p>Change features or controls as one atomic change; a failure restores every value. Effect: camera_write.</p>
@@ -85,12 +88,14 @@
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
 <tr><td><code>NAME=VALUE</code></td><td>NAME=VALUE: a feature (ExposureTime=10ms), a bank (TriggerMode[FrameStart]=On) or a control (exposure=5ms, roi=0,0,640,480)</td><td>Required</td></tr>
 <tr><td><code>--dry-run</code></td><td>Check every value against the camera and show the writes in order; change nothing</td><td>false</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-exec"><code>capturefab exec</code></h3>
 <p>Run a command feature, such as UserSetSave[UserSet1]. Effect: disruptive.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
 <tr><td><code>COMMAND</code></td><td>A command feature, optionally at a bank: TriggerSoftware, UserSetSave[UserSet1]</td><td>Required</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 </article>
 <article class="doc-section" id="cli-presets" data-doc-section data-doc-title="Presets" data-doc-category="Command reference" data-doc-tags="preset,save,apply,user set"><h2>Presets</h2><p class="doc-summary">Presets commands.</p>
@@ -141,129 +146,108 @@
 <tr><td><code>-o</code>, <code>--output</code></td><td>The file to write; it must not exist</td><td>—</td></tr>
 </tbody></table></div>
 </article>
-<article class="doc-section" id="cli-capture" data-doc-section data-doc-title="Capture, recording and sessions" data-doc-category="Command reference" data-doc-tags="capture,record,serve,session,jobs,storage"><h2>Capture, recording and sessions</h2><p class="doc-summary">Capture, recording and sessions commands.</p>
+<article class="doc-section" id="cli-capture" data-doc-section data-doc-title="Capture, recording and sessions" data-doc-category="Command reference" data-doc-tags="capture,record,inspect,auto,jobs,session,serve,keep,background"><h2>Capture, recording and sessions</h2><p class="doc-summary">Take frames and video, measure them, and keep cameras open between commands.</p>
+<p>Capture and record block until they finish, in a worker of their own or in a session that holds the camera. <code>--background</code> leaves the work running in a session as a job instead, and <code>--keep 5m</code> runs a command through a session (named <code>auto</code>, started when none holds the camera) that stays open five minutes after its last use, so the next command starts at once. Ctrl-C ends a capture with exit 130 (143 for SIGTERM, 129 for SIGHUP) and the files saved so far in <code>details.files</code>; an open-ended recording ends normally.</p>
 <h3 id="command-capture"><code>capturefab capture</code></h3>
-<p>Capture complete frames to files; existing files are never overwritten. Effect: file_write.</p>
+<p>Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites. Effect: file_write.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-<tr><td><code>-o</code>, <code>--output</code></td><td>File, folder (an existing one, or a name ending in /), or template with {camera} {date} {time} {datetime} {seq} {frame} {tag:KEY}; '-' writes one image to stdout</td><td>Required</td></tr>
-<tr><td><code>-n</code>, <code>--count</code></td><td>Number of frames (1-100000). With more than 1, give a folder or a template with {seq} or {frame}</td><td>1</td></tr>
-<tr><td><code>-f</code>, <code>--format</code></td><td>Image format; inferred from the file or template extension, otherwise PNG</td><td>png, jpeg, raw, pgm, ppm</td></tr>
-<tr><td><code>--set</code></td><td>Set NAME=VALUE before acquisition, as set does; may be repeated</td><td>—</td></tr>
+<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
+<tr><td><code>-o</code>, <code>--output</code></td><td>File, folder (existing, or ending in /) or template with {camera} {seq} {frame} {date} {time} {datetime} {tag:KEY}; - writes one image to stdout (default: this folder)</td><td>—</td></tr>
+<tr><td><code>-n</code>, <code>--count</code></td><td>Frames to save, 1..100000</td><td>—</td></tr>
+<tr><td><code>--every</code></td><td>Time between frames of a time lapse, with -n or --for</td><td>—</td></tr>
+<tr><td><code>--for</code></td><td>How long a time lapse runs, with --every</td><td>—</td></tr>
 <tr><td><code>--at</code></td><td>Begin at a time: HH:MM[:SS] here, or RFC 3339</td><td>—</td></tr>
-<tr><td><code>--delay</code></td><td>Begin after a delay, e.g. 30s or 5m</td><td>—</td></tr>
-<tr><td><code>--interval</code></td><td>Time between frames, e.g. 10s; count bounds the time lapse</td><td>—</td></tr>
-<tr><td><code>--timeout</code></td><td>Per-frame wait, e.g. 2s (at most 60s)</td><td>2s</td></tr>
-<tr><td><code>--on-exists</code></td><td>When the output file exists: fail (default) or number (-0001, -0002, ...). {seq} always picks a free number</td><td>fail, number</td></tr>
-<tr><td><code>--context</code></td><td>Tag the capture, e.g. --context line=L1 (repeatable)</td><td>—</td></tr>
-<tr><td><code>--max-space</code></td><td>Maximum owned bytes across all outputs (default: saved global policy, initially 10GiB)</td><td>—</td></tr>
-<tr><td><code>--max-files</code></td><td>Maximum owned files (default: saved global policy, initially 10000)</td><td>—</td></tr>
-<tr><td><code>--delete-oldest</code></td><td>Explicitly delete oldest owned files when the budget is reached</td><td>false</td></tr>
-<tr><td><code>--on-full</code></td><td>Explicit behavior when storage is full</td><td>stop, delete-oldest</td></tr>
-<tr><td><code>--max-age</code></td><td>Expire owned files older than this duration, such as 168h; requires the delete-oldest policy</td><td>—</td></tr>
-<tr><td><code>--no-max-age</code></td><td>Clear a previously configured age limit</td><td>false</td></tr>
-<tr><td><code>--auto</code></td><td>Enable auto mode first so Capturefab tunes exposure, gain and frame rate</td><td>false</td></tr>
-<tr><td><code>--balance</code></td><td>Auto mode trade-off from 0 (image quality) to 1 (frame rate), or quality, balanced, frame-rate</td><td>—</td></tr>
+<tr><td><code>--in</code></td><td>Begin after a delay</td><td>—</td></tr>
+<tr><td><code>-f</code>, <code>--format</code></td><td>Image format when -o has no extension: png (default), jpg or raw</td><td>png, jpg, raw</td></tr>
+<tr><td><code>--quality</code></td><td>JPEG quality, 1..100 (default 90)</td><td>—</td></tr>
+<tr><td><code>--set</code></td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>—</td></tr>
+<tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>false</td></tr>
+<tr><td><code>--tag</code></td><td>Tag the files: {tag:KEY} in -o, and in each image's metadata; repeatable</td><td>—</td></tr>
+<tr><td><code>--timeout</code></td><td>How long to wait for each frame; none waits for a trigger until stopped</td><td>5s</td></tr>
+<tr><td><code>--on-exists</code></td><td>When a file name without {seq} exists: fail, or number (-0001, -0002, ...)</td><td>fail, number</td></tr>
+<tr><td><code>--background</code></td><td>Leave the capture running in a session and print its job at once</td><td>false</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
+<tr><td><code>--dry-run</code></td><td>Show the camera, files, settings and timing; capture nothing</td><td>false</td></tr>
 </tbody></table></div>
 <h3 id="command-record"><code>capturefab record</code></h3>
-<p>Record video or forward frames to MediaMTX/NVR (RTSP, SRT, RTMP, UDP). Effect: file_write.</p>
+<p>Record video to a file or stream it to rtsp://, srt://, rtmp:// or udp://. Effect: file_write.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-<tr><td><code>-o</code>, <code>--output</code></td><td>Local file (.mp4, .mov, .mkv, .ts, or .webm with av1) or a stream URL (rtsp://, srt://, rtmp://, udp://)</td><td>Required</td></tr>
-<tr><td><code>--codec</code></td><td>Video codec: h264, h265/hevc or av1</td><td>h264</td></tr>
-<tr><td><code>--encoder</code></td><td>FFmpeg encoder name (e.g. libx264, h264_nvenc), or auto to probe available encoders</td><td>auto</td></tr>
-<tr><td><code>--fps</code></td><td>Output frame rate</td><td>30</td></tr>
-<tr><td><code>--bitrate</code></td><td>Target bitrate, e.g. 4M or 800k</td><td>4M</td></tr>
-<tr><td><code>--duration</code></td><td>Stop after this duration, e.g. 30s or 5m; without it a direct recording runs until Ctrl-C</td><td>—</td></tr>
-<tr><td><code>--timeout</code></td><td>Camera connect wait, e.g. 2s</td><td>2s</td></tr>
-<tr><td><code>--max-file-size</code></td><td>Bounded maximum size of a local recording file</td><td>512MiB</td></tr>
-<tr><td><code>--on-exists</code></td><td>When the output file exists: fail (default) or number (-0001, -0002, ...)</td><td>fail, number</td></tr>
-<tr><td><code>--context</code></td><td>Tag the recording, e.g. --context line=L1 (repeatable)</td><td>—</td></tr>
-<tr><td><code>--max-space</code></td><td>Maximum owned bytes across all outputs (default: saved global policy, initially 10GiB)</td><td>—</td></tr>
-<tr><td><code>--max-files</code></td><td>Maximum owned files (default: saved global policy, initially 10000)</td><td>—</td></tr>
-<tr><td><code>--delete-oldest</code></td><td>Explicitly delete oldest owned files when the budget is reached</td><td>false</td></tr>
-<tr><td><code>--on-full</code></td><td>Explicit behavior when storage is full</td><td>stop, delete-oldest</td></tr>
-<tr><td><code>--max-age</code></td><td>Expire owned files older than this duration, such as 168h; requires the delete-oldest policy</td><td>—</td></tr>
-<tr><td><code>--no-max-age</code></td><td>Clear a previously configured age limit</td><td>false</td></tr>
-<tr><td><code>--auto</code></td><td>Enable auto mode first so Capturefab tunes exposure, gain and frame rate</td><td>false</td></tr>
-<tr><td><code>--balance</code></td><td>Auto mode trade-off from 0 (image quality) to 1 (frame rate), or quality, balanced, frame-rate</td><td>—</td></tr>
+<tr><td><code>-o</code>, <code>--output</code></td><td>A file (.mkv, .mp4, .mov, .ts, .webm; it must not exist, or use {seq}) or a stream URL (rtsp://, srt://, rtmp://, udp://)</td><td>Required</td></tr>
+<tr><td><code>--for</code></td><td>Stop after this long; without it, record until Ctrl-C (or jobs stop with --background)</td><td>—</td></tr>
+<tr><td><code>--fps</code></td><td>Frames per second written (default: the camera's frame rate)</td><td>—</td></tr>
+<tr><td><code>--codec</code></td><td>h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv)</td><td>h264, hevc, av1, ffv1</td></tr>
+<tr><td><code>--bitrate</code></td><td>Target bitrate, such as 8M or 800k (not for ffv1)</td><td>8M</td></tr>
+<tr><td><code>--max-size</code></td><td>End the recording, successfully, when the file reaches this size, such as 2G</td><td>—</td></tr>
+<tr><td><code>--set</code></td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>—</td></tr>
+<tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>false</td></tr>
+<tr><td><code>--timeout</code></td><td>How long to wait for the first frame; none waits for a trigger until stopped</td><td>10s</td></tr>
+<tr><td><code>--background</code></td><td>Leave the recording running in a session and print its job once the first frame is encoded</td><td>false</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
-<h3 id="command-stop-forward"><code>capturefab stop-forward</code></h3>
-<p>Stop the encoder in a session. Effect: camera_write.</p>
+<h3 id="command-inspect"><code>capturefab inspect</code></h3>
+<p>Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview. Effect: read.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-</tbody></table></div>
-<h3 id="command-jobs"><code>capturefab jobs</code></h3>
-<p>List capture schedules in a session. Effect: read.</p>
-<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-</tbody></table></div>
-<h3 id="command-cancel"><code>capturefab cancel</code></h3>
-<p>Cancel a scheduled capture job in a session. Effect: camera_write.</p>
-<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>ID</code></td><td></td><td>Required</td></tr>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-</tbody></table></div>
-<h3 id="command-status"><code>capturefab status</code></h3>
-<p>Show a session's cameras, jobs and logs. Effect: read.</p>
-<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-</tbody></table></div>
-<h3 id="command-serve"><code>capturefab serve</code></h3>
-<p>Run a session in the foreground that keeps cameras open for other commands. Effect: disruptive.</p>
-<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>--name</code></td><td>Session name other commands pass to --session</td><td>bench</td></tr>
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-<tr><td><code>--stream</code></td><td>Start live acquisition as soon as the camera connects</td><td>false</td></tr>
-<tr><td><code>--auto</code></td><td>Enable auto mode first so Capturefab tunes exposure, gain and frame rate</td><td>false</td></tr>
-<tr><td><code>--balance</code></td><td>Auto mode trade-off from 0 (image quality) to 1 (frame rate), or quality, balanced, frame-rate</td><td>—</td></tr>
-</tbody></table></div>
-<h3 id="command-connect"><code>capturefab connect</code></h3>
-<p>Connect a camera in a session. Effect: camera_write.</p>
-<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>CAMERA</code></td><td>Camera ID, serial, IP, media URI or sim:0 (default: -c)</td><td>—</td></tr>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-</tbody></table></div>
-<h3 id="command-disconnect"><code>capturefab disconnect</code></h3>
-<p>Disconnect a camera in a session. Effect: camera_write.</p>
-<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-</tbody></table></div>
-<h3 id="command-start"><code>capturefab start</code></h3>
-<p>Start live acquisition in a session. Effect: camera_write.</p>
-<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-</tbody></table></div>
-<h3 id="command-stop"><code>capturefab stop</code></h3>
-<p>Stop live acquisition in a session. Effect: camera_write.</p>
-<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
+<tr><td><code>--region</code></td><td>Measure only this part of the frame: X,Y,W,H as fractions 0..1</td><td>—</td></tr>
+<tr><td><code>--preview</code></td><td>Where to write the preview (it must not exist), or none (default: a private folder doctor shows)</td><td>—</td></tr>
+<tr><td><code>--size</code></td><td>The preview's longest edge in pixels, 64..2048</td><td>768</td></tr>
+<tr><td><code>--fresh</code></td><td>Frames to let pass before the one measured, 0..10 (1: a frame exposed after this command began)</td><td>1</td></tr>
+<tr><td><code>--set</code></td><td>Change settings first, as one atomic change (as set does), then measure; repeatable</td><td>—</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
 <h3 id="command-auto"><code>capturefab auto</code></h3>
-<p>Let Capturefab tune exposure, gain and frame rate in a session. Effect: camera_write.</p>
+<p>Settle exposure and gain, then hold them; or turn auto exposure off or on. Effect: camera_write.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
 <tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-<tr><td><code>--balance</code></td><td>Trade-off from 0 (image quality) to 1 (frame rate), or quality, balanced, frame-rate</td><td>—</td></tr>
+<tr><td><code>--off</code></td><td>Turn the camera's auto exposure, gain and white balance off, keeping their values</td><td>false</td></tr>
+<tr><td><code>--continuous</code></td><td>Keep adjusting: the camera's continuous auto exposure, or Capturefab's in a session</td><td>false</td></tr>
+<tr><td><code>--timeout</code></td><td>How long settling may take</td><td>5s</td></tr>
+<tr><td><code>--keep</code></td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (5m for interactive loops)</td><td>—</td></tr>
 </tbody></table></div>
-<h3 id="command-manual"><code>capturefab manual</code></h3>
-<p>Stop auto mode and hold the current exposure, gain and white balance in a session. Effect: camera_write.</p>
+<h3 id="command-jobs"><code>capturefab jobs</code></h3>
+<p>Captures and recordings running in sessions. A job ID is <code>SESSION-N</code>; <code>jobs</code> alone lists every running session's jobs. Effect: read.</p>
+<h3 id="command-jobs-list"><code>capturefab jobs list</code></h3>
+<p>Every running session's jobs, finished ones included. Effect: read.</p>
+<h3 id="command-jobs-stop"><code>capturefab jobs stop</code></h3>
+<p>Stop a job, or all of them; files saved so far stay. Effect: camera_write.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
-<tr><td><code>--revert</code></td><td>Restore every feature auto mode changed to its value from before auto mode</td><td>false</td></tr>
+<tr><td><code>ID</code></td><td>A job ID such as auto-1, or all</td><td>Required</td></tr>
 </tbody></table></div>
-<h3 id="command-storage"><code>capturefab storage</code></h3>
-<p>Show owned file usage and reserved recording space. Effect: read.</p>
-<h3 id="command-storage-status"><code>capturefab storage status</code></h3>
-<p>Show global policy, owned files and reservations. Effect: read.</p>
-<h3 id="command-storage-configure"><code>capturefab storage configure</code></h3>
-<p>Persist the global storage ceiling for all cameras and future sessions. Effect: file_write.</p>
+<h3 id="command-jobs-wait"><code>capturefab jobs wait</code></h3>
+<p>Wait for a job: exit 0 when done, its own code if it failed, 4 if still running. Effect: read.</p>
 <div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
-<tr><td><code>--max-space</code></td><td>Maximum owned bytes across all outputs (default: saved global policy, initially 10GiB)</td><td>—</td></tr>
-<tr><td><code>--max-files</code></td><td>Maximum owned files (default: saved global policy, initially 10000)</td><td>—</td></tr>
-<tr><td><code>--delete-oldest</code></td><td>Explicitly delete oldest owned files when the budget is reached</td><td>false</td></tr>
-<tr><td><code>--on-full</code></td><td>Explicit behavior when storage is full</td><td>stop, delete-oldest</td></tr>
-<tr><td><code>--max-age</code></td><td>Expire owned files older than this duration, such as 168h; requires the delete-oldest policy</td><td>—</td></tr>
-<tr><td><code>--no-max-age</code></td><td>Clear a previously configured age limit</td><td>false</td></tr>
+<tr><td><code>ID</code></td><td>A job ID such as auto-1</td><td>Required</td></tr>
+<tr><td><code>--timeout</code></td><td>How long to wait; none waits until the job ends</td><td>none</td></tr>
+</tbody></table></div>
+<h3 id="command-session"><code>capturefab session</code></h3>
+<p>Sessions keep cameras open between commands: start, stop, status, list. A session started in the background ends after its idle time with no requests and no running jobs; its output goes to a log in the state folder.</p>
+<h3 id="command-session-start"><code>capturefab session start</code></h3>
+<p>Start a session in the background; it ends after --idle unused. Effect: disruptive.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--name</code></td><td>Session name other commands pass to --session</td><td>default</td></tr>
+<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
+<tr><td><code>--live</code></td><td>Keep the cameras streaming, so captures take the newest frame at once</td><td>false</td></tr>
+<tr><td><code>--idle</code></td><td>End after this long with no requests and no running jobs</td><td>30m</td></tr>
+</tbody></table></div>
+<h3 id="command-session-stop"><code>capturefab session stop</code></h3>
+<p>Stop a session once its recordings and captures are finished. Effect: disruptive.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>The session (default: the only one running)</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-session-status"><code>capturefab session status</code></h3>
+<p>A session's cameras, their state and jobs. Effect: read.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>NAME</code></td><td>The session (default: the only one running)</td><td>—</td></tr>
+</tbody></table></div>
+<h3 id="command-session-list"><code>capturefab session list</code></h3>
+<p>The running sessions. Effect: read.</p>
+<h3 id="command-serve"><code>capturefab serve</code></h3>
+<p>Run a session in the foreground (systemd, a terminal); Ctrl-C stops it. Effect: disruptive.</p>
+<div class="table-scroll"><table><thead><tr><th>Argument or option</th><th>Purpose</th><th>Default or choices</th></tr></thead><tbody>
+<tr><td><code>--name</code></td><td>Session name other commands pass to --session</td><td>default</td></tr>
+<tr><td><code>-c</code>, <code>--camera</code></td><td>Camera, repeatable: list ID, serial, IP, rtsp://…, file path, sim:0 (default: the only one)</td><td>—</td></tr>
+<tr><td><code>--live</code></td><td>Keep the cameras streaming, so captures take the newest frame at once</td><td>false</td></tr>
 </tbody></table></div>
 </article>
 <article class="doc-section" id="cli-logins" data-doc-section data-doc-title="Sign-ins and networks" data-doc-category="Command reference" data-doc-tags="login,onvif,network,GigE"><h2>Sign-ins and networks</h2><p class="doc-summary">Sign-ins and networks commands.</p>

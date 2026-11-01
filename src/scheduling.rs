@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_DURATION_MS: u64 = 315_576_000_000;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CaptureJob {
     pub id: u64,
     pub status: String,
@@ -24,12 +24,54 @@ pub struct CaptureJob {
     pub next_at_ms: u64,
     pub last_file: Option<String>,
     pub error: Option<String>,
+    /// The error's reason, hint and details, so a client reports a failed
+    /// job with the exit code a direct capture would have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_tag: Option<crate::types::ErrorTag>,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub context: crate::context::Context,
+    /// When the job was scheduled, UTC Unix milliseconds.
+    #[serde(default)]
+    pub created_ms: u64,
+    /// When it completed, failed or was cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_ms: Option<u64>,
+    /// The first [`MAX_JOB_FILES`] files saved, in order; `captured` counts
+    /// them all.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    /// The newest saved frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<JobFrame>,
+    /// When the first saved frame arrived, UTC Unix milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_ms: Option<u64>,
+    /// The camera's acquisition settings when the first frame was saved.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub settings: serde_json::Map<String, serde_json::Value>,
+}
+/// Files a job lists; a longer job keeps counting in `captured`, and its
+/// newest file is `last_file`.
+pub const MAX_JOB_FILES: usize = 1000;
+/// The shape of a saved frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobFrame {
+    pub width: u32,
+    pub height: u32,
+    pub pixel_format: u32,
 }
 impl CaptureJob {
     pub fn active(&self) -> bool {
         matches!(self.status.as_str(), "pending" | "running")
+    }
+    /// Stop the job as `status` (failed or cancelled), with the failure.
+    pub fn end(&mut self, status: &str, error: Option<&anyhow::Error>) {
+        self.status = status.into();
+        self.ended_ms = Some(now_ms());
+        if let Some(error) = error {
+            self.error = Some(format!("{error:#}"));
+            self.error_tag = crate::types::error_tag(error);
+        }
     }
 }
 /// A local recording in progress, kept by the worker until it stops so the
