@@ -2869,7 +2869,11 @@ fn tick_jobs(
                         job.info.settled = Some(warmup.settled);
                     }
                 }
-                job.wait = frame_wait(c, job.timeout_ms);
+                // Read from the camera when it starts, not for every frame of
+                // a burst.
+                if stopped || job.wait.is_zero() {
+                    job.wait = frame_wait(c, job.timeout_ms);
+                }
                 job.next = Some(job.allocate(&h.names)?);
                 c.request_frame()?;
                 // Auto exposure warms up a camera the job started, unless it
