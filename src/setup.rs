@@ -513,62 +513,6 @@ pub fn sort_values(values: &mut [SetupValue]) {
     });
 }
 
-/// A disruptive change a person confirmed from a reviewed diff: a feature
-/// name, which confirms only a value without banks, or the feature and
-/// the banks it is written at.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Confirmed {
-    Name(String),
-    At(ConfirmedAt),
-}
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ConfirmedAt {
-    pub feature: String,
-    #[serde(default)]
-    pub at: Vec<Bank>,
-}
-impl Confirmed {
-    /// The confirmation for one change of a diff (`{feature, at?}`).
-    pub fn of_change(change: &serde_json::Value) -> Option<Self> {
-        let feature = change["feature"].as_str()?.to_owned();
-        let at = if change["at"].is_null() {
-            Vec::new()
-        } else {
-            serde_json::from_value(change["at"].clone()).ok()?
-        };
-        Some(Self::At(ConfirmedAt { feature, at }))
-    }
-    pub fn feature(&self) -> &str {
-        match self {
-            Self::Name(feature) => feature,
-            Self::At(confirmed) => &confirmed.feature,
-        }
-    }
-    /// Whether this confirms writing `feature` at exactly `at`.
-    pub fn confirms(&self, feature: &str, at: &[Bank]) -> bool {
-        match self {
-            Self::Name(name) => name == feature && at.is_empty(),
-            Self::At(confirmed) => confirmed.feature == feature && confirmed.at == at,
-        }
-    }
-    pub fn validate(&self) -> Result<()> {
-        crate::session::validate_feature(self.feature())?;
-        if let Self::At(confirmed) = self {
-            ensure!(
-                confirmed.at.len() <= MAX_BANKS,
-                "{} is addressed by more than {MAX_BANKS} selectors",
-                confirmed.feature
-            );
-            for bank in &confirmed.at {
-                validate_bank(&confirmed.feature, bank)?;
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Setup names make their file names, so they avoid names some file
 /// systems reserve.
 pub fn validate_name(name: &str) -> Result<()> {
@@ -867,30 +811,6 @@ fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
-}
-
-/// "sha256:" over the compact JSON of the document.
-pub fn digest(setup: &Setup) -> String {
-    use sha2::{Digest, Sha256};
-    let bytes = serde_json::to_vec(setup).unwrap_or_default();
-    let hash = Sha256::digest(&bytes);
-    let mut text = String::with_capacity(71);
-    text.push_str("sha256:");
-    for byte in hash {
-        text.push_str(&format!("{byte:02x}"));
-    }
-    text
-}
-pub fn validate_digest(digest: &str) -> Result<()> {
-    ensure!(
-        digest.len() == 71
-            && digest.starts_with("sha256:")
-            && digest[7..]
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
-        "setup digest must be sha256: followed by 64 lowercase hexadecimal characters"
-    );
-    Ok(())
 }
 
 /// Build a setup from what a camera worker read. Values go in apply order.
@@ -1314,8 +1234,7 @@ impl Store {
 }
 
 /// Replace a setup name in `apply_setup` or `setup_diff` with the saved
-/// document, so the camera worker never reads the state directory. A given
-/// digest must still match what was reviewed.
+/// document, so the camera worker never reads the state directory.
 pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session::SessionCommand> {
     use crate::session::SessionCommand;
     let load = |name: &Option<String>, setup: Option<Setup>| -> Result<Option<Setup>> {
@@ -1338,32 +1257,14 @@ pub fn resolve(command: crate::session::SessionCommand) -> Result<crate::session
         SessionCommand::ApplySetup {
             name,
             setup,
-            digest: expected,
             allow_other_model,
             strict,
-            confirmed_disruptive,
-        } => {
-            let setup = load(&name, setup)?;
-            if let (Some(expected), Some(setup)) = (&expected, &setup)
-                && *expected != digest(setup)
-            {
-                return Err(Categorized::error(
-                    ErrorKind::OperationFailed,
-                    format!(
-                        "Setup {} changed after it was reviewed; preview it again",
-                        setup.name
-                    ),
-                ));
-            }
-            SessionCommand::ApplySetup {
-                name: None,
-                setup,
-                digest: expected,
-                allow_other_model,
-                strict,
-                confirmed_disruptive,
-            }
-        }
+        } => SessionCommand::ApplySetup {
+            setup: load(&name, setup)?,
+            name: None,
+            allow_other_model,
+            strict,
+        },
         command => command,
     })
 }
@@ -1615,10 +1516,8 @@ mod tests {
         let line = serde_json::to_vec(&SessionCommand::ApplySetup {
             name: None,
             setup: Some(big.clone()),
-            digest: Some(digest(&big)),
             allow_other_model: true,
             strict: true,
-            confirmed_disruptive: Some(vec![Confirmed::Name("TriggerMode".into()); 8]),
         })
         .unwrap();
         assert!(line.len() < 1024 * 1024);
@@ -1922,7 +1821,7 @@ mod tests {
     }
 
     #[test]
-    fn imports_rename_and_digests_are_stable() {
+    fn imports_rename() {
         let dir = temp("import");
         let store = Store::at(dir.join("setups"));
         fs::create_dir_all(&dir).unwrap();
@@ -1938,10 +1837,6 @@ mod tests {
                 .is::<NameTaken>()
         );
         assert!(store.import(&file, Some("con"), false).is_err());
-        assert_eq!(digest(&original), digest(&original.clone()));
-        assert_ne!(digest(&original), digest(&copy));
-        validate_digest(&digest(&original)).unwrap();
-        assert!(validate_digest("sha256:abc").is_err());
         fs::write(&file, vec![b' '; MAX_SETUP_BYTES + 1]).unwrap();
         assert!(format!("{:#}", read_file(&file).unwrap_err()).contains("256 KiB"));
         let _ = fs::remove_dir_all(&dir);

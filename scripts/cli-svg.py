@@ -10,10 +10,10 @@ from xml.sax.saxutils import escape
 
 ROOT = Path(__file__).resolve().parents[1]
 COMMANDS = [
-    ['--simulate', 'discover'],
-    ['--camera', 'sim:0', 'get', 'Width', 'Height', 'PixelFormat'],
-    ['--camera', 'sim:0', 'set', 'ExposureTime=5000', 'Gain=6'],
-    ['--camera', 'sim:0', 'capture', '-o', 'frame.png'],
+    ['list', '--kind', 'sim'],
+    ['get', '-c', 'sim:0', 'Width', 'Height', 'PixelFormat'],
+    ['set', '-c', 'sim:0', 'exposure=5ms', 'gain=6'],
+    ['capture', '-c', 'sim:0', '-o', 'frame.png'],
 ]
 WIDTH, FONT, LINE, PAD, BAR = 1200, 15, 22, 28, 40
 COLUMNS = int((WIDTH - 2 * PAD) / (FONT * 0.6))
@@ -29,11 +29,10 @@ def transcript(binary):
         lines = []
         for args in COMMANDS:
             result = subprocess.run([str(binary), *args], cwd=temp, env=env, capture_output=True, text=True, timeout=120)
-            # Discovery suggests a next step on stderr; anything else there is a failure.
-            stderr = '\n'.join(line for line in result.stderr.splitlines() if not line.startswith(('Next: ', 'No GigE/USB3 Vision cameras answered')))
+            stderr = result.stderr.strip()
             if result.returncode or stderr:
                 raise SystemExit(f'capturefab {shlex.join(args)} exited {result.returncode}: {stderr.strip()}')
-            if 'discover' in args and not simulated_only(result.stdout):
+            if 'list' in args and not simulated_only(result.stdout):
                 raise SystemExit('discovery found real cameras; render on a machine without cameras so only the simulator appears')
             lines += ['$ capturefab ' + shlex.join(args)] + result.stdout.splitlines()
         return lines + ['$ ']

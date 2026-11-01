@@ -2289,6 +2289,20 @@
         "writable": false
       },
       {
+        "choices": ["Off","Once"],
+        "description": "Once locks ExposureTime until it is Off again.",
+        "display_name": "ExposureAuto",
+        "error": null,
+        "inc": null,
+        "kind": "Enumeration",
+        "max": null,
+        "min": null,
+        "name": "ExposureAuto",
+        "unit": null,
+        "value": "Off",
+        "writable": true
+      },
+      {
         "choices": [],
         "description": "",
         "display_name": "ExposureTime",
@@ -2342,6 +2356,76 @@
         "name": "PixelFormat",
         "unit": null,
         "value": "Mono8",
+        "writable": true
+      },
+      {
+        "choices": ["RisingEdge","FallingEdge"],
+        "description": "",
+        "display_name": "TriggerActivation",
+        "error": null,
+        "inc": null,
+        "kind": "Enumeration",
+        "max": null,
+        "min": null,
+        "name": "TriggerActivation",
+        "unit": null,
+        "value": "RisingEdge",
+        "writable": true
+      },
+      {
+        "choices": ["Off","On"],
+        "description": "The simulator keeps streaming; trigger settings are stored only.",
+        "display_name": "TriggerMode",
+        "error": null,
+        "inc": null,
+        "kind": "Enumeration",
+        "max": null,
+        "min": null,
+        "name": "TriggerMode",
+        "unit": null,
+        "value": "Off",
+        "writable": true
+      },
+      {
+        "choices": ["FrameStart","AcquisitionStart"],
+        "description": "",
+        "display_name": "TriggerSelector",
+        "error": null,
+        "inc": null,
+        "kind": "Enumeration",
+        "max": null,
+        "min": null,
+        "name": "TriggerSelector",
+        "unit": null,
+        "value": "FrameStart",
+        "writable": true
+      },
+      {
+        "choices": [],
+        "description": "",
+        "display_name": "TriggerSoftware",
+        "error": null,
+        "inc": null,
+        "kind": "Command",
+        "max": null,
+        "min": null,
+        "name": "TriggerSoftware",
+        "unit": null,
+        "value": null,
+        "writable": true
+      },
+      {
+        "choices": ["Software","Line0","Line1"],
+        "description": "",
+        "display_name": "TriggerSource",
+        "error": null,
+        "inc": null,
+        "kind": "Enumeration",
+        "max": null,
+        "min": null,
+        "name": "TriggerSource",
+        "unit": null,
+        "value": "Software",
         "writable": true
       },
       {
@@ -2478,8 +2562,8 @@
         "op": "set",
         "value": "nope"
       },
-      {"error":"use execute for command AcquisitionStart","name":"AcquisitionStart","op":"set","value":"1"},
-      {"error":"use execute for command AcquisitionStop","name":"AcquisitionStop","op":"set","value":""},
+      {"error":"use exec for command AcquisitionStart","name":"AcquisitionStart","op":"set","value":"1"},
+      {"error":"use exec for command AcquisitionStop","name":"AcquisitionStop","op":"set","value":""},
       {"error":"unknown GenICam feature Nope","name":"Nope","op":"set","value":"1"},
       {"error":"cannot set Root to \"1\": unsupported writable node type Category","name":"Root","op":"set","value":"1"},
       {
@@ -2541,7 +2625,7 @@
       {"error":"AcqReg is write-only","name":"AcqReg","op":"set","value":"1"},
       {
         "op": "features",
-        "result": [{"choices":[],"description":"Requested frames per second. Exposure may limit the frame rate.","display_name":"AcquisitionFrameRate","error":null,"inc":null,"kind":"Float","max":120.0,"min":1.0,"name":"AcquisitionFrameRate","unit":"Hz","value":30.0,"writable":true},{"choices":["Continuous"],"description":"","display_name":"AcquisitionMode","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"AcquisitionMode","unit":null,"value":"Continuous","writable":true},{"choices":[],"description":"","display_name":"AcquisitionStart","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"AcquisitionStart","unit":null,"value":null,"writable":true},{"choices":[],"description":"","display_name":"AcquisitionStop","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"AcquisitionStop","unit":null,"value":null,"writable":true},{"choices":["Areascan","Linescan"],"description":"","display_name":"DeviceScanType","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"DeviceScanType","unit":null,"value":"Areascan","writable":false},{"choices":[],"description":"","display_name":"ExposureTime","error":null,"inc":null,"kind":"Float","max":1000000.0,"min":10.0,"name":"ExposureTime","unit":"us","value":20000.0,"writable":true},{"choices":[],"description":"","display_name":"Gain","error":null,"inc":null,"kind":"Float","max":24.0,"min":0.0,"name":"Gain","unit":"dB","value":12.0,"writable":true},{"choices":[],"description":"Image height in pixels. Stop acquisition before changing.","display_name":"Height","error":null,"inc":1.0,"kind":"Integer","max":1080.0,"min":64.0,"name":"Height","unit":null,"value":480,"writable":true},{"choices":["Mono8","RGB8","Mono12","BayerRG8"],"description":"","display_name":"PixelFormat","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"PixelFormat","unit":null,"value":"Mono8","writable":true},{"choices":[],"description":"Image width in pixels. Stop acquisition before changing.","display_name":"Width","error":null,"inc":1.0,"kind":"Integer","max":1920.0,"min":64.0,"name":"Width","unit":null,"value":640,"writable":true}]
+        "result": [{"choices":[],"description":"Requested frames per second. Exposure may limit the frame rate.","display_name":"AcquisitionFrameRate","error":null,"inc":null,"kind":"Float","max":120.0,"min":1.0,"name":"AcquisitionFrameRate","unit":"Hz","value":30.0,"writable":true},{"choices":["Continuous"],"description":"","display_name":"AcquisitionMode","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"AcquisitionMode","unit":null,"value":"Continuous","writable":true},{"choices":[],"description":"","display_name":"AcquisitionStart","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"AcquisitionStart","unit":null,"value":null,"writable":true},{"choices":[],"description":"","display_name":"AcquisitionStop","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"AcquisitionStop","unit":null,"value":null,"writable":true},{"choices":["Areascan","Linescan"],"description":"","display_name":"DeviceScanType","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"DeviceScanType","unit":null,"value":"Areascan","writable":false},{"choices":["Off","Once"],"description":"Once locks ExposureTime until it is Off again.","display_name":"ExposureAuto","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"ExposureAuto","unit":null,"value":"Off","writable":true},{"choices":[],"description":"","display_name":"ExposureTime","error":null,"inc":null,"kind":"Float","max":1000000.0,"min":10.0,"name":"ExposureTime","unit":"us","value":20000.0,"writable":true},{"choices":[],"description":"","display_name":"Gain","error":null,"inc":null,"kind":"Float","max":24.0,"min":0.0,"name":"Gain","unit":"dB","value":12.0,"writable":true},{"choices":[],"description":"Image height in pixels. Stop acquisition before changing.","display_name":"Height","error":null,"inc":1.0,"kind":"Integer","max":1080.0,"min":64.0,"name":"Height","unit":null,"value":480,"writable":true},{"choices":["Mono8","RGB8","Mono12","BayerRG8"],"description":"","display_name":"PixelFormat","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"PixelFormat","unit":null,"value":"Mono8","writable":true},{"choices":["RisingEdge","FallingEdge"],"description":"","display_name":"TriggerActivation","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"TriggerActivation","unit":null,"value":"RisingEdge","writable":true},{"choices":["Off","On"],"description":"The simulator keeps streaming; trigger settings are stored only.","display_name":"TriggerMode","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"TriggerMode","unit":null,"value":"Off","writable":true},{"choices":["FrameStart","AcquisitionStart"],"description":"","display_name":"TriggerSelector","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"TriggerSelector","unit":null,"value":"FrameStart","writable":true},{"choices":[],"description":"","display_name":"TriggerSoftware","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"TriggerSoftware","unit":null,"value":null,"writable":true},{"choices":["Software","Line0","Line1"],"description":"","display_name":"TriggerSource","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"TriggerSource","unit":null,"value":"Software","writable":true},{"choices":[],"description":"Image width in pixels. Stop acquisition before changing.","display_name":"Width","error":null,"inc":1.0,"kind":"Integer","max":1920.0,"min":64.0,"name":"Width","unit":null,"value":640,"writable":true}]
       },
       {"op":"stop"},
       {"name":"Width","op":"set","result":{"name":"Width","value":640},"value":"640"},
@@ -2550,7 +2634,7 @@
       {"name":"AcquisitionFrameRate","op":"set","result":{"name":"AcquisitionFrameRate","value":30.0},"value":"30"},
       {
         "op": "features",
-        "result": [{"choices":[],"description":"Requested frames per second. Exposure may limit the frame rate.","display_name":"AcquisitionFrameRate","error":null,"inc":null,"kind":"Float","max":120.0,"min":1.0,"name":"AcquisitionFrameRate","unit":"Hz","value":30.0,"writable":true},{"choices":["Continuous"],"description":"","display_name":"AcquisitionMode","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"AcquisitionMode","unit":null,"value":"Continuous","writable":true},{"choices":[],"description":"","display_name":"AcquisitionStart","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"AcquisitionStart","unit":null,"value":null,"writable":true},{"choices":[],"description":"","display_name":"AcquisitionStop","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"AcquisitionStop","unit":null,"value":null,"writable":true},{"choices":["Areascan","Linescan"],"description":"","display_name":"DeviceScanType","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"DeviceScanType","unit":null,"value":"Areascan","writable":false},{"choices":[],"description":"","display_name":"ExposureTime","error":null,"inc":null,"kind":"Float","max":1000000.0,"min":10.0,"name":"ExposureTime","unit":"us","value":10000.0,"writable":true},{"choices":[],"description":"","display_name":"Gain","error":null,"inc":null,"kind":"Float","max":24.0,"min":0.0,"name":"Gain","unit":"dB","value":0.0,"writable":true},{"choices":[],"description":"Image height in pixels. Stop acquisition before changing.","display_name":"Height","error":null,"inc":1.0,"kind":"Integer","max":1080.0,"min":64.0,"name":"Height","unit":null,"value":480,"writable":true},{"choices":["Mono8","RGB8","Mono12","BayerRG8"],"description":"","display_name":"PixelFormat","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"PixelFormat","unit":null,"value":"Mono8","writable":true},{"choices":[],"description":"Image width in pixels. Stop acquisition before changing.","display_name":"Width","error":null,"inc":1.0,"kind":"Integer","max":1920.0,"min":64.0,"name":"Width","unit":null,"value":640,"writable":true}]
+        "result": [{"choices":[],"description":"Requested frames per second. Exposure may limit the frame rate.","display_name":"AcquisitionFrameRate","error":null,"inc":null,"kind":"Float","max":120.0,"min":1.0,"name":"AcquisitionFrameRate","unit":"Hz","value":30.0,"writable":true},{"choices":["Continuous"],"description":"","display_name":"AcquisitionMode","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"AcquisitionMode","unit":null,"value":"Continuous","writable":true},{"choices":[],"description":"","display_name":"AcquisitionStart","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"AcquisitionStart","unit":null,"value":null,"writable":true},{"choices":[],"description":"","display_name":"AcquisitionStop","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"AcquisitionStop","unit":null,"value":null,"writable":true},{"choices":["Areascan","Linescan"],"description":"","display_name":"DeviceScanType","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"DeviceScanType","unit":null,"value":"Areascan","writable":false},{"choices":["Off","Once"],"description":"Once locks ExposureTime until it is Off again.","display_name":"ExposureAuto","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"ExposureAuto","unit":null,"value":"Off","writable":true},{"choices":[],"description":"","display_name":"ExposureTime","error":null,"inc":null,"kind":"Float","max":1000000.0,"min":10.0,"name":"ExposureTime","unit":"us","value":10000.0,"writable":true},{"choices":[],"description":"","display_name":"Gain","error":null,"inc":null,"kind":"Float","max":24.0,"min":0.0,"name":"Gain","unit":"dB","value":0.0,"writable":true},{"choices":[],"description":"Image height in pixels. Stop acquisition before changing.","display_name":"Height","error":null,"inc":1.0,"kind":"Integer","max":1080.0,"min":64.0,"name":"Height","unit":null,"value":480,"writable":true},{"choices":["Mono8","RGB8","Mono12","BayerRG8"],"description":"","display_name":"PixelFormat","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"PixelFormat","unit":null,"value":"Mono8","writable":true},{"choices":["RisingEdge","FallingEdge"],"description":"","display_name":"TriggerActivation","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"TriggerActivation","unit":null,"value":"RisingEdge","writable":true},{"choices":["Off","On"],"description":"The simulator keeps streaming; trigger settings are stored only.","display_name":"TriggerMode","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"TriggerMode","unit":null,"value":"Off","writable":true},{"choices":["FrameStart","AcquisitionStart"],"description":"","display_name":"TriggerSelector","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"TriggerSelector","unit":null,"value":"FrameStart","writable":true},{"choices":[],"description":"","display_name":"TriggerSoftware","error":null,"inc":null,"kind":"Command","max":null,"min":null,"name":"TriggerSoftware","unit":null,"value":null,"writable":true},{"choices":["Software","Line0","Line1"],"description":"","display_name":"TriggerSource","error":null,"inc":null,"kind":"Enumeration","max":null,"min":null,"name":"TriggerSource","unit":null,"value":"Software","writable":true},{"choices":[],"description":"Image width in pixels. Stop acquisition before changing.","display_name":"Width","error":null,"inc":1.0,"kind":"Integer","max":1920.0,"min":64.0,"name":"Width","unit":null,"value":640,"writable":true}]
       }
     ],
     "runs": [

@@ -25,7 +25,7 @@ binary = str(pathlib.Path(a.binary).resolve())
 publish = "srt://127.0.0.1:18890?streamid=publish:capturefab-srt&pkt_size=1316" if a.srt else "rtsp://127.0.0.1:18554/capturefab-rtsp"
 receive = "srt://127.0.0.1:18890?streamid=read:capturefab-srt" if a.srt else publish
 log = (root / "forward.log").open("wb")
-forward = subprocess.Popen([binary, "--json", "--camera", "sim:media-test", "forward", "-o", publish, "--encoder", "libx264"], env=env, stdout=log, stderr=subprocess.STDOUT)
+forward = subprocess.Popen([binary, "--json", "record", "-c", "sim:media-test", "-o", publish, "--encoder", "libx264"], env=env, stdout=log, stderr=subprocess.STDOUT)
 try:
     for attempt in range(60):
         if forward.poll() is not None:
@@ -45,11 +45,11 @@ try:
             time.sleep(0.1)
     else:
         raise RuntimeError("MediaMTX did not report an active stream")
-    captured = subprocess.run([binary, "--json", "--timeout-ms", "10000", "--camera", receive, "capture", "-n", "3", "-o", str(root / "frames")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
+    captured = subprocess.run([binary, "--json", "capture", "-c", receive, "--timeout", "10s", "-n", "3", "-o", str(root / "frames")], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=40)
     (root / "capture.json").write_bytes(captured.stdout)
     if captured.returncode:
         raise RuntimeError(captured.stdout.decode() + captured.stderr.decode())
-    result = json.loads(captured.stdout)["result"]
+    result = json.loads(captured.stdout)
     assert result["count"] == 3
     for f in result["frames"]:
         assert (f["width"], f["height"]) == (640, 480)

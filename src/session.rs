@@ -26,9 +26,12 @@ pub enum SessionCommand {
         timeout_ms: u64,
         simulated: bool,
     },
-    /// Inspect all GigE paths and optimize the connected cameras together.
+    /// Inspect all GigE paths; with `tune`, apply bandwidth sharing to the
+    /// connected cameras together.
     NetworkScan {
         timeout_ms: u64,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tune: bool,
     },
     /// Per-camera worker operation used by the network scan coordinator.
     OptimizeNetwork {
@@ -62,6 +65,29 @@ pub enum SessionCommand {
     Execute {
         feature: String,
     },
+    /// Read features, banks and canonical controls in one round trip.
+    GetValues {
+        names: Vec<crate::controls::Name>,
+    },
+    /// Write features, banks and canonical controls as one ordered change:
+    /// a failure restores every value written. With `dry_run`, only check
+    /// and plan.
+    SetValues {
+        values: Vec<crate::controls::Assignment>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+    },
+    /// Run a command feature, at a bank.
+    Exec {
+        name: crate::controls::Name,
+    },
+    /// What an agent needs to know before capturing.
+    Info,
+    /// Features with their type, access, bounds, selectors and locks.
+    FeatureList {
+        #[serde(default)]
+        filter: crate::controls::FeatureFilter,
+    },
     Start,
     Stop,
     /// Read the camera's writable configuration values for a new saved
@@ -82,7 +108,7 @@ pub enum SessionCommand {
         allow_other_model: bool,
     },
     /// Restore a saved setup as one camera change: a failure restores every
-    /// value. `digest` pins the reviewed document.
+    /// value.
     ApplySetup {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
@@ -92,22 +118,12 @@ pub enum SessionCommand {
             deserialize_with = "crate::setup::deserialize_inline"
         )]
         setup: Option<crate::setup::Setup>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        digest: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_other_model: bool,
         /// Refuse, before any write, a setup with values this camera lacks,
         /// cannot write or would not accept.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         strict: bool,
-        /// The disruptive changes a person confirmed from a reviewed diff,
-        /// each `{feature, at}` or a bare feature name, which confirms only
-        /// a value without banks. When given, the worker refuses, before
-        /// any write, a restore whose fresh comparison makes another
-        /// disruptive change. Absent, no confirmation is checked (RPC
-        /// callers).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        confirmed_disruptive: Option<Vec<crate::setup::Confirmed>>,
     },
     Auto {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -220,8 +236,10 @@ pub struct FeatureValue {
     pub feature: String,
     pub value: String,
 }
-/// Most values one `SetMany` writes.
+/// Most values one `SetMany` or `SetValues` writes.
 pub const MAX_SET_MANY: usize = 32;
+/// Most names one `GetValues` reads.
+pub const MAX_NAMES: usize = 64;
 /// The opaque identity of one worker-created recording or forward.
 pub fn valid_forwarding_id(id: &str) -> bool {
     id.len() == 32
@@ -248,6 +266,7 @@ pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
                     | "xml"
                     | "stop_forward"
                     | "read_setup"
+                    | "info"
             )
         })
         && let Some(field) = fields.keys().find(|key| key.as_str() != "op")
@@ -368,7 +387,7 @@ impl SessionCommand {
     /// their owners when the command executes.
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Discover { timeout_ms, .. } | Self::NetworkScan { timeout_ms } => {
+            Self::Discover { timeout_ms, .. } | Self::NetworkScan { timeout_ms, .. } => {
                 validate_timeout(*timeout_ms)?;
             }
             Self::OptimizeNetwork { bytes_per_second } => {
@@ -403,6 +422,30 @@ impl SessionCommand {
                     validate_feature(&value.feature)?;
                 }
             }
+            Self::GetValues { names } => {
+                if !(1..=MAX_NAMES).contains(&names.len()) {
+                    return Err(crate::types::Usage(format!(
+                        "get reads 1..{MAX_NAMES} names at once"
+                    ))
+                    .into());
+                }
+                for name in names {
+                    name.validate()?;
+                }
+            }
+            Self::SetValues { values, .. } => {
+                if !(1..=MAX_SET_MANY).contains(&values.len()) {
+                    return Err(crate::types::Usage(format!(
+                        "set writes 1..{MAX_SET_MANY} values at once"
+                    ))
+                    .into());
+                }
+                for value in values {
+                    value.validate()?;
+                }
+            }
+            Self::Exec { name } => name.validate()?,
+            Self::FeatureList { filter } => filter.validate()?,
             Self::Frame {
                 fresh,
                 timeout_ms,
@@ -421,26 +464,6 @@ impl SessionCommand {
                 }
                 if let Some(setup) = setup {
                     crate::setup::validate(setup)?;
-                }
-                if let Self::ApplySetup {
-                    digest,
-                    confirmed_disruptive,
-                    ..
-                } = self
-                {
-                    if let Some(digest) = digest {
-                        crate::setup::validate_digest(digest)?;
-                    }
-                    if let Some(confirmed) = confirmed_disruptive {
-                        ensure!(
-                            confirmed.len() <= crate::setup::MAX_SETUP_VALUES,
-                            "confirmed_disruptive names at most {} features",
-                            crate::setup::MAX_SETUP_VALUES
-                        );
-                        for confirmed in confirmed {
-                            confirmed.validate()?;
-                        }
-                    }
                 }
             }
             Self::Auto {
@@ -933,10 +956,10 @@ struct WorkerReply<'a> {
     result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
-    /// The error's category (`usage` or an `ErrorKind` code), so the parent
-    /// reports it with the same exit code.
+    /// The error's reason, hint and details, so the parent reports it the
+    /// same way.
     #[serde(skip_serializing_if = "Option::is_none")]
-    code: Option<&'static str>,
+    tag: Option<crate::types::ErrorTag>,
     snapshot: &'a WorkerSnapshot,
     /// Files saved since the previous reply. The coordinator does not read
     /// them; draining the worker's log in every reply keeps it bounded.
@@ -953,7 +976,7 @@ struct ParentReply<S = WorkerSnapshot> {
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
-    code: Option<String>,
+    tag: Option<crate::types::ErrorTag>,
     #[serde(default)]
     snapshot: Option<S>,
 }
@@ -1055,7 +1078,7 @@ impl Process {
                     ok: reply.ok,
                     result: reply.result,
                     error: reply.error,
-                    code: reply.code,
+                    tag: reply.tag,
                     snapshot: None,
                 }
             }
@@ -1077,8 +1100,8 @@ impl Process {
             self.report = snapshot;
         }
         if !reply.ok {
-            return Err(crate::types::error_from_transport(
-                reply.code.as_deref(),
+            return Err(crate::types::error_from_tag(
+                reply.tag,
                 reply
                     .error
                     .unwrap_or_else(|| "worker command failed".into()),
@@ -1706,7 +1729,7 @@ impl SessionHandle {
             .recv()
             .context("coordinator stopped")?
     }
-    fn scan_network(&self, timeout: Duration) -> Result<Value> {
+    fn scan_network(&self, timeout: Duration, tune: bool) -> Result<Value> {
         self.refresh_workers();
         let before = self.assemble();
         let active: Vec<_> = before
@@ -1753,7 +1776,7 @@ impl SessionHandle {
             .cameras
             .iter()
             .enumerate()
-            .filter(|(_, camera)| camera.active && camera.reachable)
+            .filter(|(_, camera)| tune && camera.active && camera.reachable)
             .map(|(index, camera)| {
                 let sharers = report
                     .cameras
@@ -1894,8 +1917,8 @@ impl SessionHandle {
     }
     fn process(&self, target: Option<&str>, command: SessionCommand) -> Result<Value> {
         match command {
-            SessionCommand::NetworkScan { timeout_ms } => {
-                self.scan_network(Duration::from_millis(timeout_ms))
+            SessionCommand::NetworkScan { timeout_ms, tune } => {
+                self.scan_network(Duration::from_millis(timeout_ms), tune)
             }
             SessionCommand::Status => {
                 // A camera's status shows that camera alone.
@@ -2074,7 +2097,9 @@ impl SessionHandle {
             ("live", fresh, Vec::new())
         } else {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            ensure!(!remaining.is_zero(), "{}", no_new_frame(&info.id, timeout));
+            if remaining.is_zero() {
+                return Err(crate::types::frame_timeout(no_new_frame(&info.id, timeout)));
+            }
             let grab = SessionCommand::Grab {
                 timeout_ms: u64::try_from(remaining.as_millis())
                     .unwrap_or(u64::MAX)
@@ -2092,7 +2117,7 @@ impl SessionHandle {
         };
         let (frame, meta) = self
             .await_frame(&info.id, start, fresh, deadline)?
-            .with_context(|| no_new_frame(&info.id, timeout))?;
+            .ok_or_else(|| crate::types::frame_timeout(no_new_frame(&info.id, timeout)))?;
         let mut reply = serde_json::to_value(crate::inspect::inspect(
             &frame,
             info.profile.kind,
@@ -2232,8 +2257,8 @@ fn no_new_frame(camera: &str, wait: Duration) -> String {
 /// Explain a `Grab` that received no frame in time; any other failure, a
 /// transport timeout included, keeps its own diagnostic.
 fn grab_failed(error: anyhow::Error, camera: &str, wait: Duration) -> anyhow::Error {
-    if format!("{error:#}") == crate::engine::GRAB_TIMEOUT {
-        anyhow::anyhow!(no_new_frame(camera, wait))
+    if crate::types::classify(&error).kind == crate::types::ErrorKind::FrameTimeout {
+        crate::types::frame_timeout(no_new_frame(camera, wait))
     } else {
         error
     }
@@ -2312,13 +2337,13 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
             // clone keeps the state lock out of the blocking write.
             let mut snapshot = handle.snapshot();
             keep_new_lines(&mut snapshot, &mut sent);
-            let (ok, result, error, code) = match result {
+            let (ok, result, error, mut tag) = match result {
                 Ok(result) => (true, result, None, None),
                 Err(e) => (
                     false,
                     None,
                     Some(format!("{e:#}")),
-                    crate::types::error_transport_code(&e),
+                    crate::types::error_tag(&e),
                 ),
             };
             // Camera passwords this worker holds never leave it, even in text
@@ -2331,6 +2356,14 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
             let mut error = error;
             if crate::scrub::active() {
                 error.iter_mut().for_each(scrub);
+                if let Some(tag) = &mut tag {
+                    tag.hint.iter_mut().for_each(scrub);
+                    if let Some(details) = &mut tag.details {
+                        let mut text = details.to_string();
+                        scrub(&mut text);
+                        *details = serde_json::from_str(&text).unwrap_or_default();
+                    }
+                }
                 snapshot.last_error.iter_mut().for_each(scrub);
                 snapshot
                     .logs
@@ -2343,7 +2376,7 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
                     ok,
                     result,
                     error,
-                    code,
+                    tag,
                     snapshot: &snapshot,
                     saved: handle.take_saved(2048),
                 },
@@ -2387,7 +2420,7 @@ impl SessionHandle {
     ) -> Result<(Arc<Frame>, FrameMeta)> {
         let window = deadline.saturating_duration_since(Instant::now());
         self.await_frame(id, after_seq, fresh, deadline)?
-            .with_context(|| no_new_frame(id, window))
+            .ok_or_else(|| crate::types::frame_timeout(no_new_frame(id, window)))
     }
     /// Camera `id`'s newest frame as a reader that keeps watching its ring
     /// takes it.
@@ -2532,7 +2565,7 @@ mod tests {
             ok: true,
             result: None,
             error: None,
-            code: None,
+            tag: None,
             snapshot: worker,
             saved: Default::default(),
         })
@@ -2869,7 +2902,10 @@ mod tests {
     fn invalid_command_values_are_rejected_before_queueing() {
         let handle = SessionHandle::new();
         for command in [
-            SessionCommand::NetworkScan { timeout_ms: 0 },
+            SessionCommand::NetworkScan {
+                timeout_ms: 0,
+                tune: false,
+            },
             SessionCommand::OptimizeNetwork {
                 bytes_per_second: 0,
             },
@@ -3431,7 +3467,11 @@ mod tests {
         assert_eq!(handle.frame_sequence_for("sim:unknown"), None);
         // No frame at all: even fresh 0 waits for one, and fails as a timeout.
         let error = handle.wait_frame("sim:feed", 0, 0, soon()).unwrap_err();
-        assert_eq!(crate::cli::error_code(&error), ("timeout", 4), "{error}");
+        assert_eq!(
+            crate::cli::error_code(&error),
+            ("frame_timeout", 4),
+            "{error}"
+        );
         assert!(
             error
                 .to_string()
@@ -3607,15 +3647,23 @@ mod tests {
     #[test]
     fn only_a_grab_deadline_reads_as_a_missing_frame() {
         let wait = Duration::from_millis(3000);
-        let missed = grab_failed(anyhow::anyhow!(crate::engine::GRAB_TIMEOUT), "sim:0", wait);
+        let missed = grab_failed(
+            crate::types::frame_timeout(crate::engine::GRAB_TIMEOUT),
+            "sim:0",
+            wait,
+        );
         assert_eq!(missed.to_string(), no_new_frame("sim:0", wait));
-        assert_eq!(crate::cli::error_code(&missed), ("timeout", 4));
+        assert_eq!(crate::cli::error_code(&missed), ("frame_timeout", 4));
         // Transport timeouts keep their diagnostic and their exit code.
         for cause in [
             "GVCP command 0x0080 timed out after 200ms (three attempts); check camera address, network and firewall",
             "USB camera control acknowledgement timed out",
         ] {
-            let error = grab_failed(anyhow::anyhow!(cause), "sim:0", wait);
+            let error = grab_failed(
+                crate::types::Categorized::error(crate::types::ErrorKind::Timeout, cause),
+                "sim:0",
+                wait,
+            );
             assert_eq!(format!("{error:#}"), cause);
             assert_eq!(crate::cli::error_code(&error), ("timeout", 4));
         }
@@ -3706,10 +3754,6 @@ mod tests {
             r#"{"op":"setup_diff","name":"bench"}"#,
             r#"{"op":"setup_diff","name":"bench","allow_other_model":true}"#,
             r#"{"op":"apply_setup","name":"bench","strict":true}"#,
-            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":["TriggerMode"]}"#,
-            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[]}"#,
-            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"TriggerMode","at":[{"selector":"TriggerSelector","value":"FrameStart"}]},{"feature":"Gain"}]}"#,
-            r#"{"op":"apply_setup","name":"bench","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
         ] {
             SessionCommand::from_json_slice(valid.as_bytes())
                 .unwrap_or_else(|e| panic!("{valid}: {e}"))
@@ -3720,8 +3764,9 @@ mod tests {
             r#"{"op":"read_setup","name":"bench"}"#,
             r#"{"op":"setup_diff","name":"bench","extra":1}"#,
             r#"{"op":"apply_setup","name":"bench","name":"other"}"#,
-            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"TriggerMode","bank":"A"}]}"#,
-            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"TriggerMode","at":"FrameStart"}]}"#,
+            // The two-phase confirmation and digest pinning are gone.
+            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":["TriggerMode"]}"#,
+            r#"{"op":"apply_setup","name":"bench","digest":"sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
         ] {
             assert!(
                 SessionCommand::from_json_slice(invalid.as_bytes()).is_err(),
@@ -3731,10 +3776,6 @@ mod tests {
         for invalid in [
             r#"{"op":"apply_setup"}"#,
             r#"{"op":"apply_setup","name":"con"}"#,
-            r#"{"op":"apply_setup","name":"bench","digest":"sha256:abc"}"#,
-            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":["Trigger Mode"]}"#,
-            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"TriggerMode","at":[{"selector":"TriggerMode","value":"On"}]}]}"#,
-            r#"{"op":"apply_setup","name":"bench","confirmed_disruptive":[{"feature":"LineSource","at":[{"selector":"GevSCPSSelector","value":"A"}]}]}"#,
             r#"{"op":"setup_diff","name":"bench","setup":{"version":1,"name":"bench","saved_at":"x","camera":{"transport":"simulator"},"values":[{"feature":"Width","value":1}]}}"#,
             r#"{"op":"setup_diff","setup":{"version":1,"name":"bench","saved_at":"x","camera":{"transport":"simulator"},"values":[{"feature":"GevSCDA","value":1}]}}"#,
         ] {
@@ -3753,7 +3794,7 @@ mod tests {
         );
     }
     #[test]
-    fn named_setups_resolve_in_the_coordinator_and_pin_their_digest() {
+    fn named_setups_resolve_in_the_coordinator() {
         let h = crate::engine::WorkerHandle::new();
         h.request(SessionCommand::connect("sim:0".into(), 1000))
             .unwrap();
@@ -3764,29 +3805,17 @@ mod tests {
         let setup = crate::setup::from_read(&name, None, reading).unwrap();
         let store = crate::setup::Store::session();
         store.save(&setup, true).unwrap();
-        let apply = |digest: Option<String>| SessionCommand::ApplySetup {
+        let apply = SessionCommand::ApplySetup {
             name: Some(name.clone()),
             setup: None,
-            digest,
             allow_other_model: false,
             strict: false,
-            confirmed_disruptive: None,
         };
-        let resolved = crate::setup::resolve(apply(Some(crate::setup::digest(&setup)))).unwrap();
+        let resolved = crate::setup::resolve(apply).unwrap();
         assert!(
             matches!(&resolved, SessionCommand::ApplySetup { name: None, setup: Some(s), .. } if *s == setup)
         );
         resolved.validate().unwrap();
-        let stale =
-            crate::setup::resolve(apply(Some(format!("sha256:{}", "0".repeat(64))))).unwrap_err();
-        assert_eq!(
-            stale.to_string(),
-            format!("Setup {name} changed after it was reviewed; preview it again")
-        );
-        assert_eq!(
-            crate::types::error_transport_code(&stale),
-            Some("operation_failed")
-        );
         // A missing setup fails on the command thread, before the worker.
         let handle = SessionHandle::new();
         let missing = handle

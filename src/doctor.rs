@@ -48,9 +48,12 @@ pub enum Level {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Check {
+    #[serde(rename = "name")]
     pub id: &'static str,
+    #[serde(rename = "status")]
     pub level: Level,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
 }
 impl Check {
@@ -219,29 +222,37 @@ impl Facts {
     }
 }
 
-/// Add the host part of `doctor` to `report`: host facts, paths, limits
-/// and the checks.
-pub fn add_host(report: &mut Value) {
+/// The `doctor` document: checks with fixes, this build, its folders and
+/// the FFmpeg it runs.
+pub fn report() -> Value {
     let facts = Facts::gather(true);
-    report["host"] = json!({
-        "cpu_cores": std::thread::available_parallelism().map_or(1, |cores| cores.get()),
+    let runtime = crate::ipc::runtime_dir();
+    let mut report = json!({
+        "checks": checks(&facts),
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "features": {
+            "usb": cfg!(feature = "usb"),
+            "jpeg": cfg!(feature = "jpeg"),
+            "keychain": cfg!(feature = "keychain"),
+        },
+        "dirs": {
+            "inspect": runtime.join("inspect"),
+            "runtime": runtime,
+            "state": crate::ipc::state_dir(),
+            "cache": crate::ipc::cache_dir(),
+        },
     });
-    report["ffmpeg"] = match &facts.ffmpeg {
-        Some(Ok(health)) => {
-            json!({"source": health.source, "path": health.path, "version": health.version})
-        }
-        Some(Err(error)) => json!({ "error": error }),
-        None => Value::Null,
-    };
-    report["paths"] = json!({
-        "runtime": facts.runtime,
-        "state": facts.state,
-        "cache": crate::ipc::cache_dir().map(Place::of),
-        "temp": Place::of(std::env::temp_dir()),
-        "working_directory": facts.working_directory,
-    });
-    report["limits"] = json!(facts.limits);
-    report["checks"] = json!(checks(&facts));
+    if let Some(ffmpeg) = &facts.ffmpeg {
+        report["ffmpeg"] = match ffmpeg {
+            Ok(health) => {
+                json!({"source": health.source, "path": health.path, "version": health.version})
+            }
+            Err(error) => json!({ "error": error }),
+        };
+    }
+    report
 }
 
 /// For `serve`: one line naming what `doctor` warns about.
@@ -259,23 +270,23 @@ pub fn print_warnings() {
     }
 }
 
-/// Human `doctor`: the host on one line, then one line per check with its fix.
+/// Human `doctor`: the build on one line, then one line per check with
+/// its fix.
 pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     let text = |value: &Value| value.as_str().unwrap_or_default().to_owned();
-    let host = &report["host"];
-    let mut summary = vec![format!(
-        "Capturefab {} on {} {}",
+    writeln!(
+        out,
+        "Capturefab {} on {} {} · {} CPU cores",
         text(&report["version"]),
         text(&report["os"]),
-        text(&report["arch"])
-    )];
-    summary.push(format!("{} CPU cores", host["cpu_cores"]));
-    writeln!(out, "{}", summary.join(" · "))?;
+        text(&report["arch"]),
+        std::thread::available_parallelism().map_or(1, |cores| cores.get())
+    )?;
     for check in report["checks"].as_array().into_iter().flatten() {
         writeln!(
             out,
             "{:<5} {}",
-            text(&check["level"]),
+            text(&check["status"]),
             text(&check["message"])
         )?;
         if let Some(fix) = check["fix"].as_str() {
@@ -284,7 +295,7 @@ pub fn print_checklist(out: &mut impl Write, report: &Value) -> io::Result<()> {
     }
     writeln!(
         out,
-        "More: {GUIDE}. See also network-scan; --json adds features, FFmpeg, JPEG and interfaces."
+        "More: {GUIDE}. See also capturefab network; --json adds features, folders and FFmpeg."
     )?;
     if report["os"] == "linux" {
         writeln!(out, "Running it as a service: {LINE_COMPUTER}")?;
@@ -636,10 +647,11 @@ pub fn with_usb_access_fix(message: impl std::fmt::Display) -> String {
 }
 
 /// The error for a USB3 Vision camera Linux refused to open, at usbfs
-/// `node`, as `transport::usb` reports it: unavailable, carrying the fix.
+/// `node`, as `transport::usb` reports it: permission denied, carrying the
+/// fix.
 pub fn usb_access_error(name: &str, node: &Path) -> anyhow::Error {
     crate::types::Categorized::error(
-        crate::types::ErrorKind::Unavailable,
+        crate::types::ErrorKind::PermissionDenied,
         with_usb_access_fix(format!(
             "{USB_ACCESS_DENIED} open USB3 Vision camera {name} ({}). Run `capturefab doctor` for the udev rule that fixes it.",
             node.display()
@@ -1330,11 +1342,11 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_camera_is_unavailable_and_keeps_its_fix_across_processes() {
+    fn a_refused_camera_is_permission_denied_and_keeps_its_fix_across_processes() {
         let error = usb_access_error("acA1920-155um", Path::new("/dev/bus/usb/002/003"));
         assert_eq!(crate::cli::error_code(&error).1, 3);
         let code = crate::types::error_transport_code(&error);
-        assert_eq!(code, Some("unavailable"));
+        assert_eq!(code, Some("permission_denied"));
         // As a worker reply carries it to the coordinator and the CLI.
         let rebuilt = crate::types::error_from_transport(code, format!("{error:#}"));
         assert_eq!(crate::cli::error_code(&rebuilt).1, 3);
@@ -1387,7 +1399,10 @@ mod tests {
         print_checklist(&mut out, &report).unwrap();
         let text = String::from_utf8(out).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "Capturefab 0.2.2 on linux aarch64 · 4 CPU cores");
+        assert!(
+            lines[0].starts_with("Capturefab 0.2.2 on linux aarch64 · "),
+            "{text}"
+        );
         assert_eq!(
             lines[1],
             "ok    FFmpeg 8.0 (bundled) runs; webcams, RTSP/SRT, files and recording use it."
@@ -1398,8 +1413,8 @@ mod tests {
             lines[4].contains("#host-checks-and-efficiency-mode"),
             "{text}"
         );
-        // What plain doctor no longer prints, so the docs' pointers still work.
-        assert!(lines[4].contains("FFmpeg, JPEG"), "{text}");
+        // What plain doctor leaves to --json.
+        assert!(lines[4].contains("features, folders and FFmpeg"), "{text}");
         // Linux hosts also get the service guide that walks through these fixes.
         assert!(lines[5].ends_with("/docs/line-computer.md"), "{text}");
         assert_eq!(lines.len(), 6);

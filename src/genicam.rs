@@ -1,7 +1,7 @@
 //! A small, uncached GenApi interpreter. Unsupported nodes and expressions fail closed.
 //! Every feature operation resolves its links again, so selector-dependent addresses and
 //! access conditions are evaluated against the camera's current state.
-use crate::types::RegisterIo;
+use crate::types::{Categorized, ErrorKind, RegisterIo, Usage};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,6 +14,24 @@ use std::{
 const MAX_XML: usize = 32 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
 const MAX_FORMULA_DEPTH: usize = 128;
+
+/// Node kinds that are features a person reads, writes or executes.
+const FEATURE_KINDS: [&str; 14] = [
+    "Integer",
+    "Float",
+    "Boolean",
+    "Enumeration",
+    "String",
+    "Command",
+    "IntReg",
+    "MaskedIntReg",
+    "FloatReg",
+    "StringReg",
+    "IntSwissKnife",
+    "SwissKnife",
+    "IntConverter",
+    "Converter",
+];
 
 /// Features a camera cannot change while it streams: the image's geometry
 /// and format.
@@ -325,6 +343,95 @@ impl NodeMap {
         false
     }
 
+    /// The feature a `pIsLocked` on `name` waits for, such as ExposureAuto
+    /// for ExposureTime: an exposed value feature whose stored value the
+    /// lock condition reads. Auto switches first, then other switches.
+    pub(crate) fn lock_owner(&self, name: &str) -> Option<String> {
+        let inputs = self.lock_inputs(name);
+        if inputs.is_empty() {
+            return None;
+        }
+        let exposed = self.exposed_features();
+        let mut owners = self
+            .nodes
+            .iter()
+            .filter(|(candidate, node)| {
+                candidate.as_str() != name
+                    && !candidate.starts_with("__")
+                    && exposed
+                        .as_ref()
+                        .is_none_or(|names| names.contains(*candidate))
+                    && matches!(
+                        node.kind.as_str(),
+                        "Enumeration" | "Boolean" | "Integer" | "Float"
+                    )
+                    && self
+                        .value_chain(candidate)
+                        .iter()
+                        .any(|link| inputs.contains(link))
+            })
+            .map(|(candidate, node)| (candidate.clone(), node.kind.clone()))
+            .collect::<Vec<_>>();
+        owners.sort_by_key(|(candidate, kind)| {
+            (
+                !candidate.ends_with("Auto"),
+                !matches!(kind.as_str(), "Enumeration" | "Boolean"),
+                candidate.clone(),
+            )
+        });
+        owners.into_iter().next().map(|(owner, _)| owner)
+    }
+    /// The XML Visibility of a feature; GenICam's default is Beginner.
+    pub(crate) fn visibility(&self, name: &str) -> &str {
+        self.nodes
+            .get(name)
+            .and_then(|node| node.prop("Visibility"))
+            .unwrap_or("Beginner")
+    }
+    /// The category that lists a feature, other than Root.
+    pub(crate) fn category(&self, name: &str) -> Option<&str> {
+        let mut listing = self.nodes.iter().filter(|(_, node)| {
+            node.kind == "Category"
+                && node
+                    .props
+                    .iter()
+                    .any(|p| p.tag == "pFeature" && p.text == name)
+        });
+        listing
+            .clone()
+            .find(|(category, _)| category.as_str() != "Root")
+            .or_else(|| listing.next())
+            .map(|(category, _)| category.as_str())
+    }
+    /// The access a feature's declaration allows, whatever locks hold now:
+    /// `ro`, `wo` or `rw`.
+    pub(crate) fn static_access(&self, name: &str) -> &'static str {
+        let mut name = name;
+        for _ in 0..=MAX_DEPTH {
+            let Some(node) = self.nodes.get(name) else {
+                return "ro";
+            };
+            for key in ["ImposedAccessMode", "AccessMode"] {
+                match node.prop(key) {
+                    Some("RO") => return "ro",
+                    Some("WO") => return "wo",
+                    _ => {}
+                }
+            }
+            match node.kind.as_str() {
+                "Command" => return "wo",
+                "IntSwissKnife" | "SwissKnife" => return "ro",
+                _ => {}
+            }
+            match node.prop("pValue") {
+                Some(link) => name = link,
+                None if node.prop("Value").is_some() || node.kind.ends_with("Reg") => return "rw",
+                // A value table or converter writes through its links.
+                None => return "rw",
+            }
+        }
+        "rw"
+    }
     /// The node's GenICam kind, such as `Float` or `IntReg`.
     pub(crate) fn kind(&self, name: &str) -> Option<&str> {
         self.nodes.get(name).map(|node| node.kind.as_str())
@@ -679,9 +786,12 @@ impl NodeMap {
             depth <= MAX_DEPTH,
             "GenICam dependency cycle or excessive nesting at {name}"
         );
-        self.nodes
-            .get(name)
-            .ok_or_else(|| anyhow!("unknown GenICam feature {name}"))
+        self.nodes.get(name).ok_or_else(|| {
+            Categorized::error(
+                ErrorKind::FeatureNotFound,
+                format!("unknown GenICam feature {name}"),
+            )
+        })
     }
     fn available(&self, io: &mut dyn RegisterIo, node: &Node, depth: usize) -> Result<()> {
         for key in ["pIsImplemented", "pIsAvailable"] {
@@ -718,80 +828,84 @@ impl NodeMap {
                     matches!(mode, "RO" | "WO" | "RW"),
                     "{name} has unsupported or unavailable access mode {mode}"
                 );
-                ensure!(
-                    if write { mode != "RO" } else { mode != "WO" },
-                    "{name} is {}",
-                    if write { "read-only" } else { "write-only" }
-                );
+                if write && mode == "RO" {
+                    return Err(Categorized::error(
+                        ErrorKind::NotWritable,
+                        format!("{name} is read-only"),
+                    ));
+                }
+                ensure!(write || mode != "WO", "{name} is write-only");
             }
         }
         if write
             && check_lock
             && let Some(link) = node.prop("pIsLocked")
+            && self.number(io, link, depth + 1)? != 0.0
         {
-            ensure!(self.number(io, link, depth + 1)? == 0.0, "{name} is locked");
+            let owner = self.lock_owner(name);
+            let mut locked =
+                Categorized::new(ErrorKind::FeatureLocked, format!("{name} is locked"))
+                    .details(json!({"feature": name, "locked_by": owner}));
+            if let Some(owner) = &owner {
+                locked = locked.hint(format!("change {owner} first, in the same set"));
+            }
+            return Err(locked.into());
         }
         Ok(())
     }
-    pub fn features(&self, io: &mut dyn RegisterIo) -> Vec<FeatureInfo> {
+    /// Exposed, visible value and command features, by name.
+    pub(crate) fn feature_names(&self) -> Vec<&str> {
         let exposed = self.exposed_features();
         self.nodes
             .iter()
             .filter(|(name, n)| {
                 !name.starts_with("__")
                     && (exposed.as_ref().is_none_or(|names| names.contains(*name)))
-                    && matches!(
-                        n.kind.as_str(),
-                        "Integer"
-                            | "Float"
-                            | "Boolean"
-                            | "Enumeration"
-                            | "String"
-                            | "Command"
-                            | "IntReg"
-                            | "MaskedIntReg"
-                            | "FloatReg"
-                            | "StringReg"
-                            | "IntSwissKnife"
-                            | "SwissKnife"
-                            | "IntConverter"
-                            | "Converter"
-                    )
+                    && FEATURE_KINDS.contains(&n.kind.as_str())
                     && n.prop("Visibility") != Some("Invisible")
             })
-            .filter_map(|(name, node)| {
-                // A feature this model does not implement is never shown.
-                if self.availability(io, name) == Availability::Absent {
-                    return None;
-                }
-                let result = self.get(io, name);
-                let (value, error) = match result {
-                    Ok(v) => (Some(v), None),
-                    Err(e) => (None, Some(format!("{e:#}"))),
-                };
-                let writable = self.writable(io, name, 0).is_ok();
-                let choices = self.entry_names(io, name, node);
-                let bounds = self.bounds(io, name).unwrap_or_default();
-                Some(FeatureInfo {
-                    name: name.clone(),
-                    display_name: node.prop("DisplayName").unwrap_or(name).into(),
-                    kind: node.kind.clone(),
-                    value,
-                    writable,
-                    description: node
-                        .prop("Description")
-                        .or_else(|| node.prop("ToolTip"))
-                        .unwrap_or("")
-                        .into(),
-                    unit: node.prop("Unit").map(str::to_string),
-                    min: bounds.min,
-                    max: bounds.max,
-                    inc: bounds.inc,
-                    choices,
-                    error,
-                })
-            })
+            .map(|(name, _)| name.as_str())
             .collect()
+    }
+    pub fn features(&self, io: &mut dyn RegisterIo) -> Vec<FeatureInfo> {
+        self.feature_names()
+            .into_iter()
+            .filter_map(|name| self.feature(io, name))
+            .collect()
+    }
+    /// One feature as `features` lists it: none when this model does not
+    /// implement it.
+    pub(crate) fn feature(&self, io: &mut dyn RegisterIo, name: &str) -> Option<FeatureInfo> {
+        let node = self.nodes.get(name)?;
+        if self.availability(io, name) == Availability::Absent {
+            return None;
+        }
+        let result = self.get(io, name);
+        let (value, error) = match result {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(format!("{e:#}"))),
+        };
+        let writable = self.writable(io, name, 0).is_ok();
+        let choices = self.entry_names(io, name, node);
+        let bounds = self.bounds(io, name).unwrap_or_default();
+        Some(FeatureInfo {
+            name: name.to_owned(),
+            display_name: node.prop("DisplayName").unwrap_or(name).into(),
+            kind: node.kind.clone(),
+            value,
+            writable,
+            description: node
+                .prop("Description")
+                .or_else(|| node.prop("ToolTip"))
+                .unwrap_or("")
+                .into(),
+            unit: node.prop("Unit").map(str::to_string),
+            min: bounds.min,
+            max: bounds.max,
+            inc: bounds.inc,
+            choices,
+            error,
+        })
     }
     /// Classification needs feature names and only a few identifying values.
     /// Avoid a second full live feature/bounds/access walk during connection.
@@ -1299,8 +1413,9 @@ impl NodeMap {
             &n.kind
         };
         let v = input_value(name, kind, value)?;
-        self.set_inner(io, name, &v, 0, true)
-            .map_err(|error| anyhow!("cannot set {name} to {value:?}: {error:#}"))
+        self.set_inner(io, name, &v, 0, true).map_err(|error| {
+            crate::types::rephrase(error, format!("cannot set {name} to {value:?}"))
+        })
     }
     /// Validate without changing host values or camera registers. Temporary
     /// locks are checked by the actual write, allowing auto-to-manual takeover
@@ -1313,8 +1428,9 @@ impl NodeMap {
             &n.kind
         };
         let v = input_value(name, kind, value)?;
-        self.set_inner(io, name, &v, 0, false)
-            .map_err(|error| anyhow!("cannot set {name} to {value:?}: {error:#}"))
+        self.set_inner(io, name, &v, 0, false).map_err(|error| {
+            crate::types::rephrase(error, format!("cannot set {name} to {value:?}"))
+        })
     }
     fn set_inner(
         &self,
@@ -1402,10 +1518,15 @@ impl NodeMap {
             "Enumeration" => {
                 let (en, symbol) = if let Some(symbol) = value.as_str() {
                     let entry = self.find_entry(name, n, symbol).ok_or_else(|| {
-                        anyhow!(
-                            "unknown {name} choice {symbol:?}; choose one of: {}",
-                            self.entry_names(io, name, n).join(", ")
+                        let choices = self.entry_names(io, name, n);
+                        Categorized::new(
+                            ErrorKind::InvalidChoice,
+                            format!(
+                                "unknown {name} choice {symbol:?}; choose one of: {}",
+                                choices.join(", ")
+                            ),
                         )
+                        .details(json!({"feature": name, "value": symbol, "choices": choices}))
                     })?;
                     (self.node(entry, depth + 1)?, symbol.to_string())
                 } else {
@@ -1869,13 +1990,16 @@ fn input_value(name: &str, kind: &str, text: &str) -> Result<Value> {
         "Boolean" => match text.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "on" => Ok(json!(true)),
             "false" | "0" | "off" => Ok(json!(false)),
-            _ => bail!("{name} must be true or false (also accepts 1/0 and on/off)"),
+            _ => Err(Usage(format!(
+                "{name} must be true or false (also accepts 1/0 and on/off)"
+            ))
+            .into()),
         },
-        "Command" => bail!("use execute for command {name}"),
-        _ if integer_kind(kind) => {
-            integer_literal(text).with_context(|| format!("{name} requires an exact integer"))
-        }
-        _ => literal(text).with_context(|| format!("{name} requires a finite number")),
+        "Command" => Err(Usage(format!("use exec for command {name}")).into()),
+        _ if integer_kind(kind) => integer_literal(text)
+            .map_err(|error| Usage(format!("{name} requires an exact integer: {error:#}")).into()),
+        _ => literal(text)
+            .map_err(|error| Usage(format!("{name} requires a finite number: {error:#}")).into()),
     }
 }
 /// Parse integral decimal, scientific and hexadecimal forms without first
@@ -1965,6 +2089,18 @@ fn validate_numeric(
     max: Option<Value>,
     inc: Option<Value>,
 ) -> Result<()> {
+    let out_of_range = |message: String, nearest: Value| -> anyhow::Error {
+        Categorized::new(ErrorKind::OutOfRange, message)
+            .details(json!({
+                "feature": name,
+                "value": value,
+                "min": min,
+                "max": max,
+                "inc": inc,
+                "nearest": nearest,
+            }))
+            .into()
+    };
     if integer_kind(kind) {
         let value = exact_integer(value).with_context(|| format!("{name} requires an integer"))?;
         let min = min.as_ref().map(exact_integer).transpose()?;
@@ -1973,25 +2109,38 @@ fn validate_numeric(
             !min.zip(max).is_some_and(|(low, high)| low > high),
             "{name} has invalid camera bounds"
         );
-        if let Some(min) = min {
-            ensure!(
-                value >= min,
-                "{name} violates Min={min}; enter {min} or greater"
-            );
+        if let Some(min) = min
+            && value < min
+        {
+            return Err(out_of_range(
+                format!("{name} violates Min={min}; enter {min} or greater"),
+                json!(min),
+            ));
         }
-        if let Some(max) = max {
-            ensure!(
-                value <= max,
-                "{name} violates Max={max}; enter {max} or less"
-            );
+        if let Some(max) = max
+            && value > max
+        {
+            return Err(out_of_range(
+                format!("{name} violates Max={max}; enter {max} or less"),
+                json!(max),
+            ));
         }
         if let Some(inc) = inc.as_ref().map(exact_integer).transpose()? {
             ensure!(inc > 0, "{name} has invalid camera increment {inc}");
             let base = min.unwrap_or(0);
-            ensure!(
-                (value - base) % inc == 0,
-                "{name} requires increment {inc} from {base}"
-            );
+            if (value - base) % inc != 0 {
+                let below = value - (value - base).rem_euclid(inc);
+                let nearest = if value - below > inc / 2 && max.is_none_or(|max| below + inc <= max)
+                {
+                    below + inc
+                } else {
+                    below
+                };
+                return Err(out_of_range(
+                    format!("{name} requires increment {inc} from {base}"),
+                    json!(nearest),
+                ));
+            }
         }
     } else {
         let value = number(value)?;
@@ -2001,17 +2150,21 @@ fn validate_numeric(
             !min.zip(max).is_some_and(|(low, high)| low > high),
             "{name} has invalid camera bounds"
         );
-        if let Some(min) = min {
-            ensure!(
-                value >= min,
-                "{name} violates Min={min}; enter {min} or greater"
-            );
+        if let Some(min) = min
+            && value < min
+        {
+            return Err(out_of_range(
+                format!("{name} violates Min={min}; enter {min} or greater"),
+                json!(min),
+            ));
         }
-        if let Some(max) = max {
-            ensure!(
-                value <= max,
-                "{name} violates Max={max}; enter {max} or less"
-            );
+        if let Some(max) = max
+            && value > max
+        {
+            return Err(out_of_range(
+                format!("{name} violates Max={max}; enter {max} or less"),
+                json!(max),
+            ));
         }
         // GenApi does not verify a float increment on writes; the camera
         // rounds the value itself.

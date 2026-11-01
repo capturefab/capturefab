@@ -14,7 +14,9 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-INTERNAL_RPC = {"Grab"}  # Worker-only acquisition, documented by public Frame.
+# Worker-only operations that `debug rpc` refuses: acquisition is documented
+# by public Frame, and network tuning by NetworkScan.
+INTERNAL_RPC = {"Grab", "OptimizeNetwork"}
 RAW_STRING = re.compile(r'(?:br|r)(#*)"')
 CHAR = re.compile(r"'(?:\\.|[^'\\\n])'")
 IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z_0-9]*")
@@ -280,23 +282,30 @@ def command_paths(root, with_arguments=False):
             attrs = variant["attrs"]
             if "true" in attr_values(attrs, "command", "hide"):
                 continue
+            command = attr_options(attrs, "command")
+            body = variant["body"]
+            tuple_type = type_name(body[1:-1]) if body and body[0] == "(" else None
+            # A flattened subcommand enum adds its commands at this level.
+            if tuple_type and "flatten" in command:
+                child_path, child_enum = resolve(tuple_type, path)
+                visit(child_path, child_enum, prefix, ancestors | {identity})
+                continue
             names = attr_values(attrs, "command", "name") or [snake_case(variant["name"]).replace("_", "-")]
             if len(names) != 1:
                 raise ValueError("command has more than one canonical name")
             canonical = " ".join(prefix + names)
             result.add(canonical)
             if with_arguments:
-                body = variant["body"]
                 if body and body[0] == "{":
                     arguments[canonical] = fields_arguments(list(split_items(body[1:-1])), path, set())
-                elif body and body[0] == "(":
-                    arguments[canonical] = flatten_arguments(type_name(body[1:-1]), path, set())
+                elif tuple_type and "subcommand" not in command:
+                    arguments[canonical] = flatten_arguments(tuple_type, path, set())
                 else:
                     arguments[canonical] = set()
             for key in ("visible_alias", "visible_aliases"):
                 for alias in attr_values(attrs, "command", key):
                     result.add(" ".join(prefix + [alias]))
-            child = subcommand_type(variant["body"])
+            child = subcommand_type(body) or (tuple_type if "subcommand" in command else None)
             if child:
                 child_path, child_enum = resolve(child, path)
                 visit(child_path, child_enum, prefix + names, ancestors | {identity})

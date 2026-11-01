@@ -93,60 +93,210 @@ pub trait Backend: RegisterIo {
 pub const MONO8: u32 = 0x0108_0001;
 pub const RGB8: u32 = 0x0218_0014;
 
-/// How a failure is reported to scripts. Carried as a type, so a name inside a
-/// message (a camera called `porch_disabled`) cannot change the exit code that
-/// `cli::error_code` would otherwise infer from the text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Why a command failed: a stable reason code scripts and agents match on,
+/// and its category, the process exit code. Carried as a type from where
+/// the failure happened, so a name inside a message (a camera called
+/// `porch_disabled`) can never change the exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     OperationFailed,
+    Usage,
+    InvalidDuration,
+    FeatureNotFound,
+    OutOfRange,
+    InvalidChoice,
+    NotWritable,
+    FeatureLocked,
+    CameraAmbiguous,
+    CameraNotFound,
+    CameraBusy,
+    PermissionDenied,
+    Disconnected,
+    WorkerCrashed,
+    SessionNotFound,
+    FfmpegMissing,
     Unavailable,
-    Timeout,
-    Unsupported,
     /// A camera asked for a user name and password and none was sent.
     AuthRequired,
     /// A camera refused the user name and password that were sent.
     AuthRejected,
+    FrameTimeout,
+    TriggerTimeout,
+    Timeout,
+    Unsupported,
+    Exists,
+    StorageFull,
+    Incomplete,
+    Interrupted,
 }
 impl ErrorKind {
+    pub const ALL: [Self; 27] = [
+        Self::OperationFailed,
+        Self::Usage,
+        Self::InvalidDuration,
+        Self::FeatureNotFound,
+        Self::OutOfRange,
+        Self::InvalidChoice,
+        Self::NotWritable,
+        Self::FeatureLocked,
+        Self::CameraAmbiguous,
+        Self::CameraNotFound,
+        Self::CameraBusy,
+        Self::PermissionDenied,
+        Self::Disconnected,
+        Self::WorkerCrashed,
+        Self::SessionNotFound,
+        Self::FfmpegMissing,
+        Self::Unavailable,
+        Self::AuthRequired,
+        Self::AuthRejected,
+        Self::FrameTimeout,
+        Self::TriggerTimeout,
+        Self::Timeout,
+        Self::Unsupported,
+        Self::Exists,
+        Self::StorageFull,
+        Self::Incomplete,
+        Self::Interrupted,
+    ];
     /// The JSON error code and process exit code.
     pub fn code(self) -> (&'static str, i32) {
+        let (code, exit, _) = self.describe();
+        (code, exit)
+    }
+    /// What the reason means, for `schema`.
+    pub fn meaning(self) -> &'static str {
+        self.describe().2
+    }
+    fn describe(self) -> (&'static str, i32, &'static str) {
         match self {
-            Self::OperationFailed => ("operation_failed", 1),
-            Self::Unavailable => ("unavailable", 3),
-            Self::Timeout => ("timeout", 4),
-            Self::Unsupported => ("unsupported", 5),
-            Self::AuthRequired => ("auth_required", 1),
-            Self::AuthRejected => ("auth_rejected", 1),
+            Self::OperationFailed => ("failed", 1, "the operation failed; see message"),
+            Self::Usage => ("usage", 2, "invalid arguments or input; fix the command"),
+            Self::InvalidDuration => (
+                "invalid_duration",
+                2,
+                "a duration needs a unit: 250ms, 2s, 1.5s, 5m, 1h30m",
+            ),
+            Self::FeatureNotFound => (
+                "feature_not_found",
+                2,
+                "no such feature or control; details.did_you_mean lists close names",
+            ),
+            Self::OutOfRange => (
+                "out_of_range",
+                2,
+                "value outside the feature's range; details {feature,value,min,max,inc,nearest,unit}",
+            ),
+            Self::InvalidChoice => ("invalid_choice", 2, "value is not one of details.choices"),
+            Self::NotWritable => ("not_writable", 2, "the feature is read-only"),
+            Self::FeatureLocked => (
+                "feature_locked",
+                1,
+                "another setting locks the feature now; details.locked_by names it",
+            ),
+            Self::CameraAmbiguous => (
+                "camera_ambiguous",
+                2,
+                "several cameras match; pick one of details.candidates with -c",
+            ),
+            Self::CameraNotFound => (
+                "camera_not_found",
+                3,
+                "no camera matches; details.candidates lists what answered",
+            ),
+            Self::CameraBusy => (
+                "camera_busy",
+                3,
+                "another process or job holds the camera; details.held_by names it when known",
+            ),
+            Self::PermissionDenied => (
+                "permission_denied",
+                3,
+                "the operating system refused access; see hint",
+            ),
+            Self::Disconnected => ("disconnected", 3, "the camera went away"),
+            Self::WorkerCrashed => (
+                "worker_crashed",
+                3,
+                "the camera worker process ended unexpectedly",
+            ),
+            Self::SessionNotFound => ("session_not_found", 3, "no running session has that name"),
+            Self::FfmpegMissing => ("ffmpeg_missing", 3, "FFmpeg could not be found or started"),
+            Self::Unavailable => (
+                "unavailable",
+                3,
+                "the camera, stream or service cannot be reached",
+            ),
+            Self::AuthRequired => (
+                "auth_required",
+                3,
+                "the camera needs a user name and password; run login add",
+            ),
+            Self::AuthRejected => (
+                "auth_rejected",
+                3,
+                "the camera refused the user name and password",
+            ),
+            Self::FrameTimeout => ("frame_timeout", 4, "no frame arrived in time"),
+            Self::TriggerTimeout => (
+                "trigger_timeout",
+                4,
+                "a triggered camera received no trigger in time; details.trigger",
+            ),
+            Self::Timeout => ("timeout", 4, "the operation did not finish in time"),
+            Self::Unsupported => ("unsupported", 5, "the camera or this build cannot do that"),
+            Self::Exists => (
+                "exists",
+                1,
+                "the output exists and is never overwritten; details.path",
+            ),
+            Self::StorageFull => (
+                "storage_full",
+                6,
+                "not enough disk space or the storage budget is used up",
+            ),
+            Self::Incomplete => ("incomplete", 1, "fewer results than requested; see details"),
+            Self::Interrupted => (
+                "interrupted",
+                130,
+                "stopped by a signal (130 SIGINT, 143 SIGTERM, 129 SIGHUP); details hold partial results",
+            ),
         }
     }
-    fn from_code(code: &str) -> Option<Self> {
-        [
-            Self::OperationFailed,
-            Self::Unavailable,
-            Self::Timeout,
-            Self::Unsupported,
-            Self::AuthRequired,
-            Self::AuthRejected,
-        ]
-        .into_iter()
-        .find(|kind| kind.code().0 == code)
+    pub fn from_code(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.code().0 == code)
     }
 }
 
-/// An error whose category was decided where it happened.
+/// An error whose reason was decided where it happened, with an optional
+/// hint (what to do next) and JSON details (bounds, choices, candidates).
 #[derive(Debug)]
 pub struct Categorized {
     pub kind: ErrorKind,
     pub message: String,
+    pub hint: Option<String>,
+    pub details: Option<serde_json::Value>,
 }
 impl Categorized {
-    pub fn error(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
+    pub fn new(kind: ErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
             message: message.into(),
+            hint: None,
+            details: None,
         }
-        .into()
+    }
+    pub fn error(kind: ErrorKind, message: impl Into<String>) -> anyhow::Error {
+        Self::new(kind, message).into()
+    }
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+    /// JSON details; null values are dropped, since results never carry them.
+    pub fn details(mut self, details: serde_json::Value) -> Self {
+        self.details = Some(without_nulls(details));
+        self
     }
 }
 impl std::fmt::Display for Categorized {
@@ -155,6 +305,21 @@ impl std::fmt::Display for Categorized {
     }
 }
 impl std::error::Error for Categorized {}
+
+/// `value` without null object members, at any depth.
+pub fn without_nulls(value: serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .map(|(key, value)| (key, without_nulls(value)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.into_iter().map(without_nulls).collect()),
+        value => value,
+    }
+}
 
 /// No frame arrived within the requested wait, but the source is still
 /// running: the engine keeps polling instead of counting a transport error.
@@ -212,31 +377,216 @@ fn thread_limit(setting: Option<&str>, cores: usize) -> usize {
         .map_or(cores.clamp(1, 8), |threads| threads.min(256))
 }
 
-/// The category to send with an error that crosses a process or socket, so
-/// the receiving side reports it the same way: `usage` or an [`ErrorKind`]
-/// code.
-pub fn error_transport_code(error: &anyhow::Error) -> Option<&'static str> {
-    error.chain().find_map(|cause| {
-        if cause.is::<Usage>() {
-            Some("usage")
-        } else {
-            cause
-                .downcast_ref::<Categorized>()
-                .map(|categorized| categorized.kind.code().0)
+/// What an error's chain says about it: its reason and the hint and
+/// details to report. Typed causes only, never message text; anything
+/// unknown is `failed`.
+pub struct Classified {
+    pub kind: ErrorKind,
+    pub hint: Option<String>,
+    pub details: Option<serde_json::Value>,
+}
+pub fn classify(error: &anyhow::Error) -> Classified {
+    let plain = |kind| Classified {
+        kind,
+        hint: None,
+        details: None,
+    };
+    let ffmpeg = error
+        .downcast_ref::<crate::media::FfmpegUnavailable>()
+        .is_some();
+    for cause in error.chain() {
+        if ffmpeg && !cause.is::<Categorized>() {
+            return plain(ErrorKind::FfmpegMissing);
         }
-    })
+        if let Some(categorized) = cause.downcast_ref::<Categorized>() {
+            return Classified {
+                kind: categorized.kind,
+                hint: categorized.hint.clone(),
+                details: categorized.details.clone(),
+            };
+        }
+        if cause.is::<Usage>() {
+            return plain(ErrorKind::Usage);
+        }
+        if let Some(exists) = cause.downcast_ref::<crate::storage::OutputExists>() {
+            return Classified {
+                kind: ErrorKind::Exists,
+                hint: None,
+                details: Some(serde_json::json!({"path": exists.0})),
+            };
+        }
+        if cause.is::<FrameWait>() {
+            return plain(ErrorKind::FrameTimeout);
+        }
+        if cause.is::<crate::transport::gige::GvcpTimeout>() {
+            return plain(ErrorKind::Timeout);
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind as Io;
+            match io.kind() {
+                Io::StorageFull | Io::QuotaExceeded => return plain(ErrorKind::StorageFull),
+                Io::TimedOut => return plain(ErrorKind::Timeout),
+                Io::PermissionDenied => return plain(ErrorKind::PermissionDenied),
+                Io::ConnectionRefused
+                | Io::HostUnreachable
+                | Io::NetworkUnreachable
+                | Io::NetworkDown
+                | Io::AddrNotAvailable => return plain(ErrorKind::Unavailable),
+                _ => {}
+            }
+        }
+    }
+    match crate::media::stream_end(error) {
+        Some(crate::media::StreamEnd::Lost) => plain(ErrorKind::Disconnected),
+        Some(crate::media::StreamEnd::Abandoned) => plain(ErrorKind::AuthRejected),
+        _ => plain(ErrorKind::OperationFailed),
+    }
 }
 
-/// Rebuild an error received with [`error_transport_code`].
-pub fn error_from_transport(code: Option<&str>, message: String) -> anyhow::Error {
-    match code {
-        Some("usage") => Usage(message).into(),
-        Some(code) => match ErrorKind::from_code(code) {
-            Some(kind) => Categorized::error(kind, message),
-            None => anyhow::Error::msg(message),
-        },
+/// The reason, hint and details sent beside an error's message when it
+/// crosses a process or socket, so the receiving side reports it the same
+/// way.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ErrorTag {
+    pub code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+/// The tag for `error`; none for a plain failure.
+pub fn error_tag(error: &anyhow::Error) -> Option<ErrorTag> {
+    let classified = classify(error);
+    (classified.kind != ErrorKind::OperationFailed
+        || classified.hint.is_some()
+        || classified.details.is_some())
+    .then(|| ErrorTag {
+        code: classified.kind.code().0.into(),
+        hint: classified.hint,
+        details: classified.details,
+    })
+}
+/// The reason code an error would cross a process with.
+pub fn error_transport_code(error: &anyhow::Error) -> Option<&'static str> {
+    let kind = classify(error).kind;
+    (kind != ErrorKind::OperationFailed).then(|| kind.code().0)
+}
+/// Rebuild an error received with [`error_tag`].
+pub fn error_from_tag(tag: Option<ErrorTag>, message: String) -> anyhow::Error {
+    let Some(tag) = tag else {
+        return anyhow::Error::msg(message);
+    };
+    match ErrorKind::from_code(&tag.code) {
+        Some(ErrorKind::Usage) if tag.hint.is_none() && tag.details.is_none() => {
+            Usage(message).into()
+        }
+        Some(kind) => Categorized {
+            kind,
+            message,
+            hint: tag.hint,
+            details: tag.details,
+        }
+        .into(),
         None => anyhow::Error::msg(message),
     }
+}
+/// Rebuild an error received with only its reason code.
+pub fn error_from_transport(code: Option<&str>, message: String) -> anyhow::Error {
+    error_from_tag(
+        code.map(|code| ErrorTag {
+            code: code.into(),
+            ..Default::default()
+        }),
+        message,
+    )
+}
+
+/// Most a duration may be: ten years.
+const MAX_DURATION: Duration = Duration::from_secs(315_576_000);
+
+/// Parse a duration with the one grammar every command uses: one or more
+/// number-unit pairs (`250ms`, `2s`, `1.5s`, `5m`, `1h30m`, `500us`), or
+/// `0`. A bare number is refused: `5000` could mean milliseconds or
+/// seconds.
+pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
+    let text = text.trim();
+    let invalid = |message: String| -> anyhow::Error {
+        Categorized::new(ErrorKind::InvalidDuration, message)
+            .hint("durations need a unit: 250ms, 2s, 1.5s, 5m, 1h30m")
+            .into()
+    };
+    if text == "0" {
+        return Ok(Duration::ZERO);
+    }
+    if text.is_empty() {
+        return Err(invalid("a duration cannot be empty".into()));
+    }
+    if !text.is_empty() && text.parse::<f64>().is_ok() {
+        return Err(invalid(format!(
+            "'{text}' has no unit; did you mean {text}ms or {text}s?"
+        )));
+    }
+    let mut rest = text;
+    let mut nanos = 0f64;
+    while !rest.is_empty() {
+        let number_end = rest
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(rest.len());
+        let (number, after) = rest.split_at(number_end);
+        let unit_end = after
+            .find(|c: char| c.is_ascii_digit() || c == '.')
+            .unwrap_or(after.len());
+        let (unit, after) = after.split_at(unit_end);
+        let value = number
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && !number.is_empty())
+            .ok_or_else(|| invalid(format!("'{text}' is not a duration")))?;
+        let scale = match unit {
+            "h" => 3.6e12,
+            "m" => 6e10,
+            "s" => 1e9,
+            "ms" => 1e6,
+            "us" | "µs" | "μs" => 1e3,
+            "" => return Err(invalid(format!("'{text}' needs a unit after {number}"))),
+            other => {
+                return Err(invalid(format!(
+                    "'{other}' in '{text}' is not a unit; use h, m, s, ms or us"
+                )));
+            }
+        };
+        nanos += value * scale;
+        rest = after;
+    }
+    if !(0.0..=MAX_DURATION.as_nanos() as f64).contains(&nanos) {
+        return Err(invalid(format!("'{text}' is longer than ten years")));
+    }
+    Ok(Duration::from_nanos(nanos.round() as u64))
+}
+
+/// `error` as one message, `message: cause`, keeping its reason, hint and
+/// details.
+pub fn rephrase(error: anyhow::Error, message: impl std::fmt::Display) -> anyhow::Error {
+    let text = format!("{message}: {error:#}");
+    let classified = classify(&error);
+    if classified.kind == ErrorKind::OperationFailed
+        && classified.hint.is_none()
+        && classified.details.is_none()
+    {
+        return anyhow::Error::msg(text);
+    }
+    Categorized {
+        kind: classified.kind,
+        message: text,
+        hint: classified.hint,
+        details: classified.details,
+    }
+    .into()
+}
+
+/// A frame wait that ended without a frame, as the reason agents match.
+pub fn frame_timeout(message: impl Into<String>) -> anyhow::Error {
+    Categorized::error(ErrorKind::FrameTimeout, message)
 }
 
 #[cfg(test)]
@@ -246,28 +596,103 @@ mod tests {
     fn error_categories_survive_transport() {
         let usage: anyhow::Error = Usage("bad option".into()).into();
         let timeout = Categorized::error(ErrorKind::Timeout, "camera timed out");
-        let wrapped = anyhow::Error::from(Categorized {
-            kind: ErrorKind::Unavailable,
-            message: "camera porch_disabled is offline".into(),
-        })
+        let wrapped = anyhow::Error::from(Categorized::new(
+            ErrorKind::Unavailable,
+            "camera porch_disabled is offline",
+        ))
         .context("connect");
         let required = Categorized::error(ErrorKind::AuthRequired, "rtsp://cam needs a sign-in");
         let rejected = Categorized::error(ErrorKind::AuthRejected, "rtsp://cam refused it")
             .context("open camera");
+        let range = anyhow::Error::from(
+            Categorized::new(ErrorKind::OutOfRange, "Width must be at most 1920")
+                .hint("use 1920 or less")
+                .details(serde_json::json!({"feature":"Width","max":1920,"unit":null})),
+        )
+        .context("set");
         for (error, code) in [
             (required, Some("auth_required")),
             (rejected, Some("auth_rejected")),
             (usage, Some("usage")),
             (timeout, Some("timeout")),
             (wrapped, Some("unavailable")),
+            (range, Some("out_of_range")),
             (anyhow::anyhow!("plain"), None),
         ] {
             assert_eq!(error_transport_code(&error), code);
-            let rebuilt = error_from_transport(code, format!("{error:#}"));
+            let tag = error_tag(&error);
+            // The tag survives JSON, as it does on the worker pipe and IPC.
+            let tag: Option<ErrorTag> =
+                serde_json::from_value(serde_json::to_value(&tag).unwrap()).unwrap();
+            let rebuilt = error_from_tag(tag, format!("{error:#}"));
             assert_eq!(error_transport_code(&rebuilt), code);
+            assert_eq!(error_tag(&rebuilt), error_tag(&error));
             assert_eq!(format!("{rebuilt:#}"), format!("{error:#}"));
         }
+        let range = error_tag(&error_from_transport(Some("out_of_range"), "x".into()));
+        assert_eq!(range.unwrap().code, "out_of_range");
         assert!(error_transport_code(&error_from_transport(Some("bogus"), "x".into())).is_none());
+    }
+
+    #[test]
+    fn durations_need_units() {
+        let ms = Duration::from_millis;
+        for (text, expected) in [
+            ("250ms", ms(250)),
+            ("2s", ms(2000)),
+            ("1.5s", ms(1500)),
+            ("5m", ms(300_000)),
+            ("1h30m", ms(5_400_000)),
+            ("500us", Duration::from_micros(500)),
+            ("0", Duration::ZERO),
+            (" 10ms ", ms(10)),
+        ] {
+            assert_eq!(parse_duration(text).unwrap(), expected, "{text}");
+        }
+        for text in [
+            "5000",
+            "1.5",
+            "",
+            "ms",
+            "5x",
+            "-1s",
+            "1s5",
+            "11y",
+            "100000000h",
+        ] {
+            let error = parse_duration(text).unwrap_err();
+            assert_eq!(classify(&error).kind, ErrorKind::InvalidDuration, "{text}");
+        }
+        let bare = parse_duration("5000").unwrap_err().to_string();
+        assert!(bare.contains("did you mean 5000ms or 5000s?"), "{bare}");
+    }
+
+    #[test]
+    fn typed_causes_pick_the_reason_and_nulls_never_reach_details() {
+        let exists =
+            anyhow::Error::from(crate::storage::OutputExists("/tmp/x.png".into())).context("save");
+        let classified = classify(&exists);
+        assert_eq!(classified.kind, ErrorKind::Exists);
+        assert_eq!(classified.details.unwrap()["path"], "/tmp/x.png");
+        let full = anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        assert_eq!(classify(&full).kind.code(), ("storage_full", 6));
+        assert_eq!(
+            classify(&anyhow::Error::from(FrameWait)).kind,
+            ErrorKind::FrameTimeout
+        );
+        // English that sounds like a timeout is still a plain failure.
+        assert_eq!(
+            classify(&anyhow::anyhow!("camera timed_out not found")).kind,
+            ErrorKind::OperationFailed
+        );
+        let details = Categorized::new(ErrorKind::OutOfRange, "x")
+            .details(serde_json::json!({"a":null,"b":[{"c":null,"d":1}]}))
+            .details
+            .unwrap();
+        assert_eq!(details, serde_json::json!({"b":[{"d":1}]}));
+        for kind in ErrorKind::ALL {
+            assert_eq!(ErrorKind::from_code(kind.code().0), Some(kind));
+        }
     }
 
     #[test]

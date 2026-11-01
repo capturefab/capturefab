@@ -801,10 +801,13 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         SocketAddr::V4(address) => *address.ip(),
         _ => unreachable!(),
     };
-    ensure!(
-        control.read_register(CONTROL_PRIVILEGE)? & 3 == 0,
-        "camera is controlled by another application; disconnect it first"
-    );
+    if control.read_register(CONTROL_PRIVILEGE)? & 3 != 0 {
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::CameraBusy,
+            "camera is controlled by another application; disconnect it first",
+        )
+        .into());
+    }
     control
         .write_register(CONTROL_PRIVILEGE, 2)
         .context("acquiring camera controller privilege")?;

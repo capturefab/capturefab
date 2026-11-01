@@ -1,3 +1,4 @@
+use crate::controls::has_choice;
 use crate::{
     camera::Camera,
     genicam::Bounds,
@@ -409,11 +410,15 @@ pub struct AutoController {
 impl AutoController {
     pub fn enter(camera: &mut Camera, balance: f64) -> Result<Self> {
         let balance = validate_balance(balance)?;
-        ensure!(
-            camera.info.profile.kind.supports_auto(),
-            "automatic image tuning is unsupported for {}; use the camera's acquisition and measurement controls",
-            camera.info.profile.kind
-        );
+        if !camera.info.profile.kind.supports_auto() {
+            return Err(crate::types::Categorized::error(
+                crate::types::ErrorKind::Unsupported,
+                format!(
+                    "automatic image tuning is unsupported for {}; use the camera's acquisition and measurement controls",
+                    camera.info.profile.kind
+                ),
+            ));
+        }
         let hash = camera
             .info
             .serial
@@ -694,10 +699,11 @@ impl AutoController {
         }
         self.caps.exposure = self.find_unlockable(
             camera,
-            &["ExposureTime", "ExposureTimeAbs"],
+            &crate::controls::EXPOSURE,
             &[("ExposureAuto", "Off")],
         );
-        self.caps.gain = self.find_unlockable(camera, &["Gain", "GainAbs"], &[("GainAuto", "Off")]);
+        self.caps.gain =
+            self.find_unlockable(camera, &crate::controls::GAIN, &[("GainAuto", "Off")]);
         if let Ok(Value::String(current)) = camera.get("GainSelector")
             && current != "All"
         {
@@ -827,13 +833,10 @@ impl AutoController {
                 };
                 releases.push((enable, on));
             }
-            self.caps.frame_rate = self.find_unlockable(
-                camera,
-                &["AcquisitionFrameRate", "AcquisitionFrameRateAbs"],
-                &releases,
-            );
+            self.caps.frame_rate =
+                self.find_unlockable(camera, &crate::controls::FRAME_RATE, &releases);
         }
-        let rate_max = ["AcquisitionFrameRate", "AcquisitionFrameRateAbs"]
+        let rate_max = crate::controls::FRAME_RATE
             .into_iter()
             .find(|f| camera.has(f))
             .and_then(|f| camera.bounds(f).ok()?.max);
@@ -2000,12 +2003,6 @@ fn bounds(camera: &mut Camera, feature: Option<&str>) -> Bounds {
     feature
         .and_then(|f| camera.bounds(f).ok())
         .unwrap_or_default()
-}
-
-fn has_choice(camera: &mut Camera, feature: &str, choice: &str) -> bool {
-    camera
-        .choices(feature)
-        .is_ok_and(|c| c.iter().any(|v| v == choice))
 }
 
 fn read_any(camera: &mut Camera, names: &[&'static str]) -> Option<(&'static str, f64)> {

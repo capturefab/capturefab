@@ -55,10 +55,6 @@ mod tests {
             message.contains("camera credentials in the address"),
             "{message}"
         );
-        assert_eq!(
-            crate::cli::error_code(&error),
-            ("operation_failed", 1),
-            "{message}"
-        );
+        assert_eq!(crate::cli::error_code(&error), ("failed", 1), "{message}");
     }
 }

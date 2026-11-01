@@ -296,12 +296,14 @@ pub fn validate_source(url: &str) -> Result<()> {
     if is_recording(url) {
         let path = local_file_path(url)?;
         let metadata = fs::metadata(&path).map_err(|error| {
-            let message = if error.kind() == std::io::ErrorKind::NotFound {
-                format!("media file not found: {}", path.display())
-            } else {
-                format!("cannot inspect media file {}", path.display())
-            };
-            anyhow::Error::new(error).context(message)
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Categorized::error(
+                    ErrorKind::CameraNotFound,
+                    format!("media file not found: {}", path.display()),
+                );
+            }
+            anyhow::Error::new(error)
+                .context(format!("cannot inspect media file {}", path.display()))
         })?;
         ensure!(
             metadata.is_file(),
@@ -2057,7 +2059,12 @@ fn probe(source: &str) -> (Vec<Mode>, Vec<String>) {
 /// `cli::error_code` reads it.
 pub const CAMERA_ACCESS_DENIED: &str = "camera access denied";
 
-fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> Option<String> {
+fn native_failure(
+    log: &str,
+    stalled: bool,
+    source: &str,
+    timeout: Duration,
+) -> Option<(ErrorKind, String)> {
     let lower = log.to_ascii_lowercase();
     let platform = scheme(source);
     if log.contains("Cannot use ")
@@ -2079,28 +2086,40 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
             }
             _ => "allow this app in System Settings > Privacy & Security > Camera",
         };
-        Some(format!("{CAMERA_ACCESS_DENIED}: {guidance}"))
+        Some((
+            ErrorKind::PermissionDenied,
+            format!("{CAMERA_ACCESS_DENIED}: {guidance}"),
+        ))
     } else if platform.as_deref() == Some("dshow") && log.contains("Could not run graph") {
         // DirectShow reports a device another app holds and one Windows
         // camera privacy blocks alike, without the underlying error.
-        Some(format!(
-            "camera is in use by another application, or {CAMERA_ACCESS_DENIED} by Windows privacy settings: close other apps using the camera, or allow desktop apps to access the camera in Windows Settings > Privacy & security > Camera"
+        Some((
+            ErrorKind::CameraBusy,
+            format!(
+                "camera is in use by another application, or {CAMERA_ACCESS_DENIED} by Windows privacy settings: close other apps using the camera, or allow desktop apps to access the camera in Windows Settings > Privacy & security > Camera"
+            ),
         ))
     } else if log.contains("Cannot Use ")
         || ["device or resource busy", "already in use"]
             .iter()
             .any(|text| lower.contains(text))
     {
-        Some("camera is in use by another application".into())
+        Some((
+            ErrorKind::CameraBusy,
+            "camera is in use by another application".into(),
+        ))
     } else if log.contains("Not a video capture device.")
         // ENOTTY, as glibc and musl word it.
         || ["Inappropriate ioctl for device", "Not a tty"]
             .iter()
             .any(|text| log.contains(&format!("ioctl(VIDIOC_G_INPUT): {text}")))
     {
-        Some(format!(
-            "video capture is not supported by {}, which may be a metadata, codec or ISP node; run capturefab discover to list capture nodes",
-            device_name(source)
+        Some((
+            ErrorKind::Unsupported,
+            format!(
+                "video capture is not supported by {}, which may be a metadata, codec or ISP node; run capturefab list to see capture nodes",
+                device_name(source)
+            ),
         ))
     } else if [
         "video device not found",
@@ -2110,9 +2129,12 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
     .iter()
     .any(|text| lower.contains(text))
     {
-        Some(format!(
-            "camera device not found: {}; reconnect the device and run capturefab discover to obtain its current locator",
-            device_name(source)
+        Some((
+            ErrorKind::CameraNotFound,
+            format!(
+                "camera device not found: {}; reconnect the device and run capturefab list to obtain its current locator",
+                device_name(source)
+            ),
         ))
     } else {
         let guidance = if platform.as_deref() == Some("avfoundation") {
@@ -2121,10 +2143,13 @@ fn native_failure(log: &str, stalled: bool, source: &str, timeout: Duration) -> 
             "check camera permissions, whether another app is using it, and the selected video mode"
         };
         stalled.then(|| {
-            format!(
-                "no frames from {} (timed out after {} s): {guidance}",
-                device_name(source),
-                timeout.as_secs_f64()
+            (
+                ErrorKind::FrameTimeout,
+                format!(
+                    "no frames from {} (timed out after {} s): {guidance}",
+                    device_name(source),
+                    timeout.as_secs_f64()
+                ),
             )
         })
     }
@@ -2481,10 +2506,13 @@ impl Reconnect {
         self.backoff = (self.backoff * 2).min(RECONNECT_BACKOFF_MAX);
     }
     fn waiting(&self, source: &str) -> anyhow::Error {
-        anyhow!(
-            "reconnecting to {} (attempt {}): timed out",
-            redact_url(source),
-            self.attempt
+        Categorized::error(
+            ErrorKind::Timeout,
+            format!(
+                "reconnecting to {} (attempt {}): timed out",
+                redact_url(source),
+                self.attempt
+            ),
         )
     }
 }
@@ -2751,7 +2779,7 @@ impl MediaBackend {
                 decoder.stop();
                 let log = decoder.log.text(&self.source);
                 native_failure(&log, stalled, &self.source, timeout)
-                    .map_or(error, |message| anyhow!(message))
+                    .map_or(error, |(kind, message)| Categorized::error(kind, message))
             })?
         } else {
             decoder.next(self.timeout).map_err(|error| {
@@ -3690,7 +3718,10 @@ fn select_encoder(
             return Ok(candidate.into());
         }
     }
-    bail!("{}", unsupported_codec(exe, family, Some((width, height))))
+    Err(Categorized::error(
+        ErrorKind::Unsupported,
+        unsupported_codec(exe, family, Some((width, height))),
+    ))
 }
 /// Before a recording starts, refuse a codec no encoder here can produce.
 fn check_codec(config: &ForwardConfig) -> Result<()> {
@@ -3706,7 +3737,10 @@ fn check_codec(config: &ForwardConfig) -> Result<()> {
     {
         return Ok(());
     }
-    bail!("{}", unsupported_codec(&exe, family, None))
+    Err(Categorized::error(
+        ErrorKind::Unsupported,
+        unsupported_codec(&exe, family, None),
+    ))
 }
 /// Says which codecs do work, since the bundled FFmpeg has no software HEVC
 /// or AV1 encoder and many hosts have no hardware one either.
@@ -5238,7 +5272,7 @@ esac"#,
             ),
             "{message}"
         );
-        assert_eq!(crate::cli::error_code(&lost).1, 4);
+        assert_eq!(crate::cli::error_code(&lost), ("disconnected", 3));
         // Until a relaunch is due, each poll waits out its budget instead of
         // failing at once; the first relaunch is refused, the next streams.
         let started = Instant::now();
@@ -5291,7 +5325,7 @@ esac"#,
             "[rtsp @ 0x1] method DESCRIBE failed: 401 Unauthorized",
             false,
         );
-        assert_eq!(code, "operation_failed");
+        assert_eq!(code, "failed");
         assert!(
             message.starts_with("127.0.0.1 rejected the username or password (rtsp://<redacted>@127.0.0.1:1/x). Check them, or add them as rtsp://USER:PASS@127.0.0.1:1/x if none were given."),
             "{message}"
@@ -7900,21 +7934,22 @@ Error opening input files: Input/output error
                 "Windows Settings",
             ),
         ] {
-            let message = native_failure(log, false, source, Duration::from_secs(2)).unwrap();
+            let (kind, message) =
+                native_failure(log, false, source, Duration::from_secs(2)).unwrap();
             assert!(message.contains(guidance));
-            assert_eq!(crate::cli::error_code(&anyhow!(message)).1, 3);
-            let timeout = native_failure("", true, source, Duration::from_secs(2)).unwrap();
+            assert_eq!(kind.code().1, 3);
+            let (_, timeout) = native_failure("", true, source, Duration::from_secs(2)).unwrap();
             assert!(!timeout.contains("MacBook"));
             assert!(timeout.contains("selected video mode"));
         }
-        let busy = native_failure(
+        let (busy, _) = native_failure(
             "Device or resource busy",
             false,
             "v4l2:/dev/video0",
             Duration::from_secs(2),
         )
         .unwrap();
-        assert_eq!(crate::cli::error_code(&anyhow!(busy)).1, 3);
+        assert_eq!(busy.code(), ("camera_busy", 3));
         assert!(
             native_failure(
                 "unknown decoding error",
@@ -7951,14 +7986,15 @@ Error opening input files: Input/output error
             ),
         ] {
             let source = format!("v4l2:{node}");
-            let message = native_failure(log, false, &source, Duration::from_secs(2)).unwrap();
+            let (kind, message) =
+                native_failure(log, false, &source, Duration::from_secs(2)).unwrap();
             assert_eq!(
                 message,
                 format!(
-                    "video capture is not supported by {node}, which may be a metadata, codec or ISP node; run capturefab discover to list capture nodes"
+                    "video capture is not supported by {node}, which may be a metadata, codec or ISP node; run capturefab list to see capture nodes"
                 )
             );
-            assert_eq!(crate::cli::error_code(&anyhow!(message)).1, 5);
+            assert_eq!(kind.code().1, 5);
         }
     }
     #[test]
@@ -8031,11 +8067,12 @@ Error opening input files: Input/output error
             &base,
             Duration::from_secs(2),
         )
-        .unwrap();
+        .unwrap()
+        .1;
         assert_eq!(
             missing,
             format!(
-                "camera device not found: {by_path}; reconnect the device and run capturefab discover to obtain its current locator"
+                "camera device not found: {by_path}; reconnect the device and run capturefab list to obtain its current locator"
             )
         );
     }
@@ -8133,7 +8170,7 @@ Error opening input files: Input/output error
         let timeout = Duration::from_secs(5);
         let failure = |log| native_failure(log, false, "avfoundation:FaceTime HD Camera", timeout);
         assert_eq!(
-            failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot use FaceTime HD Camera").unwrap(),
+            failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot use FaceTime HD Camera").unwrap().1,
             "camera access denied: allow this app in System Settings > Privacy & Security > Camera"
         );
         for (source, log) in [
@@ -8147,11 +8184,11 @@ Error opening input files: Input/output error
             ),
             ("v4l2:/dev/video0", "Permission denied"),
         ] {
-            let denied = native_failure(log, false, source, timeout).unwrap();
+            let (kind, denied) = native_failure(log, false, source, timeout).unwrap();
             assert!(denied.starts_with(CAMERA_ACCESS_DENIED), "{denied}");
-            assert_eq!(crate::cli::error_code(&anyhow!(denied)).1, 3);
+            assert_eq!(kind.code(), ("permission_denied", 3));
         }
-        let blocked = native_failure(
+        let (kind, blocked) = native_failure(
             "[dshow @ 000001b5e2a6c3c0] Could not run graph (sometimes caused by a device already in use by other application)\n[in#0 @ 000001b5e2a6c000] Error opening input: I/O error\n",
             false,
             "dshow:video=Integrated Webcam",
@@ -8161,19 +8198,20 @@ Error opening input files: Input/output error
         assert!(blocked.contains(CAMERA_ACCESS_DENIED), "{blocked}");
         assert!(blocked.contains("in use by another application"));
         assert!(blocked.contains("Privacy & security > Camera"));
-        assert_eq!(crate::cli::error_code(&anyhow!(blocked)).1, 3);
+        assert_eq!(kind.code().1, 3);
         assert_eq!(
-            failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot Use FaceTime HD Camera").unwrap(),
+            failure("[in#0 @ 0x1] Failed to create AV capture input device: Cannot Use FaceTime HD Camera").unwrap().1,
             "camera is in use by another application"
         );
-        let missing = failure("[in#0 @ 0x1] Video device not found").unwrap();
-        assert!(missing.contains("run capturefab discover"));
-        assert_eq!(crate::cli::error_code(&anyhow!(missing)).1, 3);
-        let stalled = native_failure("", true, "avfoundation:FaceTime HD Camera", timeout).unwrap();
+        let (kind, missing) = failure("[in#0 @ 0x1] Video device not found").unwrap();
+        assert!(missing.contains("run capturefab list"));
+        assert_eq!(kind.code(), ("camera_not_found", 3));
+        let (kind, stalled) =
+            native_failure("", true, "avfoundation:FaceTime HD Camera", timeout).unwrap();
         assert_eq!(
             stalled,
             "no frames from FaceTime HD Camera (timed out after 5 s): the camera may be suspended (for example a closed MacBook lid), in use, or blocked by permissions"
         );
-        assert_eq!(crate::cli::error_code(&anyhow!(stalled)).1, 4);
+        assert_eq!(kind.code().1, 4);
     }
 }

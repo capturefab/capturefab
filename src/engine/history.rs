@@ -47,29 +47,7 @@ fn addressed<T>(
     address: &Address,
     action: impl FnOnce(&mut Camera) -> Result<T>,
 ) -> Result<T> {
-    let mut originals = Vec::new();
-    let result = (|| {
-        for (selector, value) in &address.selectors {
-            let old = camera.get(selector)?;
-            if text(&old) != *value {
-                originals.push((selector.clone(), old));
-                camera.set(selector, value)?;
-            }
-        }
-        action(camera)
-    })();
-    let mut restoration = Vec::new();
-    for (selector, original) in originals.into_iter().rev() {
-        if let Err(error) = camera.set(&selector, &text(&original)) {
-            restoration.push(format!("{selector}: {error:#}"));
-        }
-    }
-    ensure!(
-        restoration.is_empty(),
-        "could not restore selectors: {}",
-        restoration.join("; ")
-    );
-    result
+    crate::controls::with_bank(camera, &address.selectors, action)
 }
 
 /// Read the value at `address` for a checkpoint. A bank hidden by
@@ -437,13 +415,11 @@ pub(super) fn process(
             setup: Some(document),
             allow_other_model,
             strict,
-            confirmed_disruptive,
             ..
         } => {
             let holders = setup::stream_holders(forwarder, jobs);
             let plan = setup::plan(c, auto, &holders, document, *allow_other_model)?;
             plan.check(*strict)?;
-            plan.confirm(confirmed_disruptive.as_deref())?;
             Some(plan)
         }
         _ => None,

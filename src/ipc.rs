@@ -459,7 +459,7 @@ fn missing_session_error(name: &str, active: &[Descriptor]) -> anyhow::Error {
         };
         format!("session '{name}' is not running. Running sessions: {running}{guess}")
     };
-    crate::types::Categorized::error(crate::types::ErrorKind::Unavailable, message)
+    crate::types::Categorized::error(crate::types::ErrorKind::SessionNotFound, message)
 }
 fn kind_name(kind: SessionKind) -> &'static str {
     match kind {
@@ -478,7 +478,7 @@ pub fn read_descriptor(name: &str) -> Result<Descriptor> {
         match service_runtime_dir() {
             Some((service, ..)) if service != dir && absent(&dir) && !absent(&service) => {
                 crate::types::Categorized::error(
-                    crate::types::ErrorKind::Unavailable,
+                    crate::types::ErrorKind::SessionNotFound,
                     format!(
                         "{error}; a session named {name} is in {}, where a service started without XDG_RUNTIME_DIR keeps it and this login does not look: `capturefab doctor` shows the fix under runtime_dir",
                         service.display()
@@ -557,7 +557,10 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|duration| !duration.is_zero())
-        .context("RPC deadline exceeded")
+        .ok_or_else(|| deadline_exceeded("RPC deadline exceeded".into()))
+}
+fn deadline_exceeded(message: String) -> anyhow::Error {
+    crate::types::Categorized::error(crate::types::ErrorKind::Timeout, message)
 }
 fn rpc_deadline(timeout: Duration) -> Result<Instant> {
     ensure!(!timeout.is_zero(), "RPC timeout must be positive");
@@ -575,7 +578,7 @@ fn read_rpc_line(stream: TcpStream, limit: usize, deadline: Instant) -> Result<V
             .set_read_timeout(Some(remaining(deadline)?))?;
         let buffer = reader.fill_buf().map_err(|error| match error.kind() {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                anyhow::anyhow!("RPC deadline exceeded")
+                deadline_exceeded("RPC deadline exceeded".into())
             }
             _ => error.into(),
         })?;
@@ -645,10 +648,13 @@ fn serve_client(mut stream: TcpStream, h: SessionHandle, token: String) -> Resul
         Err(e) => {
             let mut error = json!({"message":format!("{e:#}")});
             // A request the caller must change keeps exit code 2 across the
-            // connection, and a categorized failure its category; the text
-            // alone may not say so.
-            if let Some(code) = crate::types::error_transport_code(&e) {
-                error["code"] = json!(code);
+            // connection, and every failure its reason, hint and details;
+            // the text alone may not say so.
+            if let Some(tag) = crate::types::error_tag(&e)
+                && let (Some(error), Ok(Value::Object(tag))) =
+                    (error.as_object_mut(), serde_json::to_value(tag))
+            {
+                error.extend(tag);
             }
             json!({"version":VERSION,"ok":false,"error":error})
         }
@@ -841,9 +847,9 @@ pub fn call_to(
 }
 fn rpc_network_error(name: &str, phase: &str, error: std::io::Error) -> anyhow::Error {
     match error.kind() {
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-            anyhow::anyhow!("RPC deadline exceeded while {phase} to session '{name}'")
-        }
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => deadline_exceeded(
+            format!("RPC deadline exceeded while {phase} to session '{name}'"),
+        ),
         _ => anyhow::Error::new(error)
             .context(format!("session '{name}' is not responding while {phase}")),
     }
@@ -899,10 +905,8 @@ fn send_request(
             .as_str()
             .unwrap_or("session request failed")
             .to_owned();
-        return Err(crate::types::error_from_transport(
-            response["error"]["code"].as_str(),
-            message,
-        ));
+        let tag = serde_json::from_value::<crate::types::ErrorTag>(response["error"].clone()).ok();
+        return Err(crate::types::error_from_tag(tag, message));
     }
     response
         .get("result")
@@ -1200,7 +1204,7 @@ mod tests {
             "{unrelated}"
         );
         for error in [none, typo, unrelated] {
-            assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+            assert_eq!(crate::cli::error_code(&error), ("session_not_found", 3));
             assert!(!format!("{error:#}").contains("os error"), "{error:#}");
         }
         let dir = TestDir::new();

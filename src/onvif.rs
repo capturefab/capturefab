@@ -310,10 +310,12 @@ fn parse_endpoint(url: &str, allow_https: bool) -> Result<HttpUrl> {
     let (protocol, rest) = url
         .split_once("://")
         .context("ONVIF endpoint must use http://")?;
-    ensure!(
-        allow_https || !protocol.eq_ignore_ascii_case("https"),
-        "HTTPS ONVIF SOAP is not supported in this build; use a camera's HTTP ONVIF service endpoint (HTTPS media playback remains available through FFmpeg)"
-    );
+    if !allow_https && protocol.eq_ignore_ascii_case("https") {
+        return Err(crate::types::Categorized::error(
+            crate::types::ErrorKind::Unsupported,
+            "HTTPS ONVIF SOAP is not supported in this build; use a camera's HTTP ONVIF service endpoint (HTTPS media playback remains available through FFmpeg)",
+        ));
+    }
     ensure!(
         protocol.eq_ignore_ascii_case("http") || protocol.eq_ignore_ascii_case("https"),
         "ONVIF endpoint must use http:// or https://"
@@ -1406,7 +1408,7 @@ pub fn is_source(source: &str) -> bool {
 fn percent_decode(text: &str) -> Result<String> {
     crate::logins::percent_decode(text)
 }
-fn source_endpoint(source: &str) -> Result<(String, Option<Credentials>)> {
+pub(crate) fn source_endpoint(source: &str) -> Result<(String, Option<Credentials>)> {
     source_endpoint_impl(source, false)
 }
 fn source_endpoint_impl(source: &str, allow_https: bool) -> Result<(String, Option<Credentials>)> {

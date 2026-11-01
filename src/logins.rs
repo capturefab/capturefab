@@ -936,7 +936,7 @@ mod tests {
         );
         assert!(format!("{rejected:#}").contains("refused"));
         assert!(is_auth_error(&rejected.context("connect")));
-        assert_eq!(crate::cli::error_code(&required), ("auth_required", 1));
+        assert_eq!(crate::cli::error_code(&required), ("auth_required", 3));
     }
 
     #[cfg(feature = "keychain")]
@@ -1084,7 +1084,7 @@ mod tests {
         let error = logins.remembered("rtsp://cam:554/x").unwrap_err();
         let text = format!("{error:#}");
         assert!(text.contains("unlock it and try again"), "{text}");
-        assert_eq!(crate::cli::error_code(&error), ("operation_failed", 1));
+        assert_eq!(crate::cli::error_code(&error), ("failed", 1));
     }
 
     #[test]

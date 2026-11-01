@@ -918,13 +918,13 @@ class TerminalSvgTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             fake = Path(temp) / 'capturefab'
             row = Path(temp) / 'row'
-            row.write_text('sim:0  simulator  Pattern camera  SIM0')
-            fake.write_text(f'#!{sys.executable}\nimport os, sys\nif "CAPTUREFAB_SESSION" in os.environ or not os.environ.get("CAPTUREFAB_SESSION_DIR"):\n    sys.exit(3)\nprint("ID  TRANSPORT  MODEL  SERIAL\\n" + open({str(row)!r}).read() if "discover" in sys.argv else " ".join(sys.argv[1:]))\n')
+            row.write_text('sim:0  sim  Pattern camera  SIM0')
+            fake.write_text(f'#!{sys.executable}\nimport os, sys\nif "CAPTUREFAB_SESSION" in os.environ or not os.environ.get("CAPTUREFAB_SESSION_DIR"):\n    sys.exit(3)\nprint("ID  KIND  MODEL  SERIAL\\n" + open({str(row)!r}).read() if "list" in sys.argv else " ".join(sys.argv[1:]))\n')
             fake.chmod(0o755)
             with mock.patch.dict(os.environ, {'CAPTUREFAB_SESSION': 'gui'}):
                 lines = svg.transcript(fake)
-            self.assertEqual(lines[:3], ['$ capturefab --simulate discover', 'ID  TRANSPORT  MODEL  SERIAL', 'sim:0  simulator  Pattern camera  SIM0'])
-            self.assertEqual(lines[-3:], ['$ capturefab --camera sim:0 capture -o frame.png', '--camera sim:0 capture -o frame.png', '$ '])
+            self.assertEqual(lines[:3], ['$ capturefab list --kind sim', 'ID  KIND  MODEL  SERIAL', 'sim:0  sim  Pattern camera  SIM0'])
+            self.assertEqual(lines[-3:], ['$ capturefab capture -c sim:0 -o frame.png', 'capture -c sim:0 -o frame.png', '$ '])
             row.write_text('10.0.0.2  gige  Camera  1234')
             with self.assertRaises(SystemExit):
                 svg.transcript(fake)

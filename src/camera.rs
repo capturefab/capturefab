@@ -6,31 +6,78 @@ use anyhow::{Context, Result, ensure};
 use std::{net::Ipv4Addr, time::Duration};
 
 pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, Vec<String>)> {
-    let mut devices = Vec::new();
-    let mut warnings = Vec::new();
-    let (gige, onvif, native) = std::thread::scope(|s| {
-        let g = s.spawn(|| crate::transport::gige::discover(timeout));
-        let o = s.spawn(|| crate::onvif::camera_infos(timeout));
-        let n = s.spawn(|| crate::media::native_devices_with_timeout(timeout));
-        (g.join(), o.join(), n.join())
-    });
-    for (label, result) in [("GigE", gige), ("ONVIF", onvif)] {
-        match result {
-            Ok(Ok(v)) => devices.extend(v),
-            Ok(Err(e)) => warnings.push(format!("{label} discovery: {e:#}")),
-            Err(_) => warnings.push(format!("{label} discovery worker stopped")),
+    Ok(discover_kinds(
+        timeout,
+        Kinds {
+            sim: simulated,
+            ..Kinds::all()
+        },
+    ))
+}
+
+/// The transports a discovery searches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Kinds {
+    pub gige: bool,
+    pub u3v: bool,
+    /// Webcams and screen captures on this computer.
+    pub host: bool,
+    pub onvif: bool,
+    pub sim: bool,
+}
+impl Kinds {
+    pub fn all() -> Self {
+        Self {
+            gige: true,
+            u3v: true,
+            host: true,
+            onvif: true,
+            sim: true,
         }
     }
-    #[cfg(feature = "usb")]
-    match crate::transport::usb::discover() {
-        Ok(v) => devices.extend(v),
-        Err(e) => warnings.push(format!("USB discovery: {e:#}")),
+}
+
+/// Search the chosen transports in parallel; it returns when each has
+/// answered, which for the GigE and ONVIF broadcasts is when `timeout` ends.
+/// A transport that fails becomes a warning.
+pub fn discover_kinds(timeout: Duration, kinds: Kinds) -> (Vec<CameraInfo>, Vec<String>) {
+    let mut devices = Vec::new();
+    let mut warnings = Vec::new();
+    let (gige, onvif, native, usb) = std::thread::scope(|s| {
+        let g = kinds
+            .gige
+            .then(|| s.spawn(|| crate::transport::gige::discover(timeout)));
+        let o = kinds
+            .onvif
+            .then(|| s.spawn(|| crate::onvif::camera_infos(timeout)));
+        let n = kinds
+            .host
+            .then(|| s.spawn(|| crate::media::native_devices_with_timeout(timeout)));
+        #[cfg(feature = "usb")]
+        let u = kinds.u3v.then(|| s.spawn(crate::transport::usb::discover));
+        #[cfg(not(feature = "usb"))]
+        let u: Option<std::thread::ScopedJoinHandle<'_, Result<Vec<CameraInfo>>>> = None;
+        (
+            g.map(|g| g.join()),
+            o.map(|o| o.join()),
+            n.map(|n| n.join()),
+            u.map(|u| u.join()),
+        )
+    });
+    for (label, result) in [("GigE", gige), ("ONVIF", onvif), ("USB", usb)] {
+        match result {
+            None => {}
+            Some(Ok(Ok(v))) => devices.extend(v),
+            Some(Ok(Err(e))) => warnings.push(format!("{label} discovery: {e:#}")),
+            Some(Err(_)) => warnings.push(format!("{label} discovery worker stopped")),
+        }
     }
-    if simulated {
+    if kinds.sim {
         devices.push(crate::transport::simulator::info());
     }
     match native {
-        Ok(Ok(native)) => {
+        None => {}
+        Some(Ok(Ok(native))) => {
             if let Some(items) = native["devices"].as_array() {
                 for d in items {
                     if let Some(id) = d["id"].as_str() {
@@ -47,15 +94,37 @@ pub fn discover(timeout: Duration, simulated: bool) -> Result<(Vec<CameraInfo>, 
                 }
             }
         }
-        Ok(Err(error)) => warnings.push(format!("Native camera discovery: {error:#}")),
-        Err(_) => warnings.push("Native camera discovery worker stopped".into()),
+        Some(Ok(Err(error))) => warnings.push(format!("Native camera discovery: {error:#}")),
+        Some(Err(_)) => warnings.push("Native camera discovery worker stopped".into()),
     }
     devices.sort_by(|a, b| a.id.cmp(&b.id));
     devices.dedup_by(|a, b| a.id == b.id);
     for info in &mut devices {
         info.profile = crate::camera_profile::detect(info, &[]);
     }
-    Ok((devices, warnings))
+    (devices, warnings)
+}
+
+/// What a camera is, in the words `list` and `info` use: `gige`, `u3v`,
+/// `webcam`, `screen` (a screen or Desk View capture), `onvif`, `stream`,
+/// `file` or `sim`.
+pub fn kind(info: &CameraInfo) -> &'static str {
+    match info.transport {
+        Transport::GigE => "gige",
+        Transport::Usb3 => "u3v",
+        Transport::Simulator => "sim",
+        Transport::Media if crate::onvif::is_source(&info.id) => "onvif",
+        Transport::Media if crate::media::is_host_camera(&info.id) => {
+            let name = info.model.to_ascii_lowercase();
+            if name.starts_with("capture screen") || name.contains("desk view") {
+                "screen"
+            } else {
+                "webcam"
+            }
+        }
+        Transport::Media if info.id.contains("://") => "stream",
+        Transport::Media => "file",
+    }
 }
 
 /// Commands that change the acquisition or transfer state, which only start
@@ -113,15 +182,21 @@ pub fn validate_selector_shape(selector: &str) -> Result<()> {
             "GigE selector needs an IPv4 address or a discovered ID, for example gige:192.168.1.10"
         );
     } else if prefixed(selector, "hub:") {
-        return Err(crate::types::Usage(format!(
-            "'{}' names a camera hub, which Capturefab no longer opens; use the camera's RTSP stream from the hub instead, for example rtsp://HOST:8554/CAMERA from Frigate or go2rtc",
-            crate::media::redact_url(selector)
-        ))
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::Usage,
+            format!(
+                "'{}' names a camera hub, which Capturefab no longer opens",
+                crate::media::redact_url(selector)
+            ),
+        )
+        .hint("use the camera's RTSP stream from the hub, for example -c rtsp://HOST:8554/CAMERA from Frigate or go2rtc")
         .into());
     } else if prefixed(selector, "scanner:") {
-        return Err(crate::types::Usage(
-            "document scanners are not supported; capture from a camera instead".into(),
+        return Err(crate::types::Categorized::new(
+            crate::types::ErrorKind::Usage,
+            "document scanners are not supported",
         )
+        .hint("capture from a camera instead")
         .into());
     } else if crate::onvif::is_source(selector) {
         crate::onvif::validate_source_shape(selector)?;
@@ -293,6 +368,15 @@ pub fn needs_no_discovery(selector: &str) -> bool {
     path_like(selector) || malformed_ipv4(selector)
 }
 
+/// A camera as `camera_not_found` and `camera_ambiguous` list it.
+fn candidate(info: &CameraInfo) -> serde_json::Value {
+    serde_json::json!({
+        "id": crate::media::redact_url(&info.id),
+        "model": info.model,
+        "serial": (!info.serial.is_empty() && info.serial != info.id).then(|| info.serial.clone()),
+    })
+}
+
 /// Why `selector` did not open, with the closest cameras that did answer.
 fn selector_not_matched(
     selector: &str,
@@ -301,7 +385,7 @@ fn selector_not_matched(
 ) -> anyhow::Error {
     use crate::types::{Categorized, ErrorKind};
     let shown = crate::media::redact_url(selector);
-    let unavailable = |message: String| Categorized::error(ErrorKind::Unavailable, message);
+    let list = |cameras: &[&CameraInfo]| serde_json::json!({ "candidates": cameras.iter().take(5).map(|d| candidate(d)).collect::<Vec<_>>() });
     if matches.len() > 1 {
         let listed = matches
             .iter()
@@ -310,18 +394,35 @@ fn selector_not_matched(
             .collect::<Vec<_>>()
             .join(", ");
         let more = if matches.len() > 5 { ", ..." } else { "" };
-        return unavailable(format!(
-            "camera '{shown}' is ambiguous: it matches {} cameras: {listed}{more}; pass a camera ID or serial",
-            matches.len()
-        ));
+        return Categorized::new(
+            ErrorKind::CameraAmbiguous,
+            format!(
+                "camera '{shown}' is ambiguous: it matches {} cameras: {listed}{more}; pass a camera ID or serial",
+                matches.len()
+            ),
+        )
+        .details(list(&matches.iter().collect::<Vec<_>>()))
+        .into();
     }
+    let not_found = |message: String, cameras: &[&CameraInfo], hint: &str| -> anyhow::Error {
+        Categorized::new(ErrorKind::CameraNotFound, message)
+            .hint(hint)
+            .details(list(cameras))
+            .into()
+    };
     if let Some(simulator) = simulator_typo(selector).or_else(|| simulator_model(selector)) {
-        return unavailable(format!(
-            "camera '{shown}' not found; did you mean {simulator}?"
-        ));
+        return not_found(
+            format!("camera '{shown}' not found; did you mean {simulator}?"),
+            &[],
+            &format!("use -c {simulator}"),
+        );
     }
     if path_like(selector) {
-        return unavailable(format!("file not found: {shown}"));
+        return not_found(
+            format!("file not found: {shown}"),
+            &[],
+            "check the path; relative paths are from this terminal's folder",
+        );
     }
     let mut candidates: Vec<(usize, &CameraInfo)> = known
         .iter()
@@ -337,15 +438,19 @@ fn selector_not_matched(
         .collect();
     candidates.sort_by_key(|(distance, _)| *distance);
     if let Some((_, best)) = candidates.first() {
-        return unavailable(format!(
-            "camera '{shown}' not found; did you mean {}? Run capturefab discover to list cameras",
-            crate::hint::shell_quote(&crate::media::redact_url(&best.id))
-        ));
+        let best_id = crate::hint::shell_quote(&crate::media::redact_url(&best.id));
+        return not_found(
+            format!("camera '{shown}' not found; did you mean {best_id}?"),
+            &candidates.iter().map(|(_, d)| *d).collect::<Vec<_>>(),
+            &format!("use -c {best_id}, or run capturefab list"),
+        );
     }
     if known.is_empty() {
-        return unavailable(format!(
-            "camera '{shown}' not found; run capturefab discover to list cameras"
-        ));
+        return not_found(
+            format!("camera '{shown}' not found"),
+            &[],
+            "run capturefab list to see cameras",
+        );
     }
     let found = known
         .iter()
@@ -354,9 +459,11 @@ fn selector_not_matched(
         .collect::<Vec<_>>()
         .join(", ");
     let more = if known.len() > 5 { ", ..." } else { "" };
-    unavailable(format!(
-        "camera '{shown}' not found. Found: {found}{more}; run capturefab discover to list cameras"
-    ))
+    not_found(
+        format!("camera '{shown}' not found. Found: {found}{more}"),
+        &known.iter().collect::<Vec<_>>(),
+        "pass one of details.candidates with -c",
+    )
 }
 
 /// Check both selector syntax and local source availability before opening.
@@ -554,6 +661,24 @@ impl Camera {
     }
     pub(crate) fn lock_released_by(&self, name: &str, others: &[&str]) -> bool {
         self.nodes.lock_released_by(name, others)
+    }
+    pub(crate) fn feature_names(&self) -> Vec<&str> {
+        self.nodes.feature_names()
+    }
+    pub(crate) fn feature(&mut self, name: &str) -> Option<FeatureInfo> {
+        self.nodes.feature(self.backend.as_mut(), name)
+    }
+    pub(crate) fn lock_owner(&self, name: &str) -> Option<String> {
+        self.nodes.lock_owner(name)
+    }
+    pub(crate) fn visibility(&self, name: &str) -> &str {
+        self.nodes.visibility(name)
+    }
+    pub(crate) fn category(&self, name: &str) -> Option<&str> {
+        self.nodes.category(name)
+    }
+    pub(crate) fn static_access(&self, name: &str) -> &'static str {
+        self.nodes.static_access(name)
     }
     pub fn set(&mut self, name: &str, value: &str) -> Result<()> {
         ensure!(name != TL_PARAMS_LOCKED, "{TL_PARAMS_LOCKED_MESSAGE}");
@@ -1121,6 +1246,7 @@ pub(crate) mod tests {
         assert!(!camera.is_writable("GevSCPSPacketSize"));
         let error = camera.set("GevSCPSPacketSize", "9000").unwrap_err();
         assert!(error.to_string().contains("is locked"), "{error:#}");
+        assert_eq!(crate::cli::error_code(&error), ("feature_locked", 1));
         camera.stop().unwrap();
         camera.set("GevSCPSPacketSize", "9000").unwrap();
     }
@@ -1521,7 +1647,13 @@ pub(crate) mod tests {
         assert!(message.contains("ambiguous"), "{message}");
         assert!(message.contains("C922"), "{message}");
         assert!(message.contains("HD Pro Webcam C920"), "{message}");
-        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+        assert_eq!(crate::cli::error_code(&error), ("camera_ambiguous", 2));
+        let details = crate::types::classify(&error).details.unwrap();
+        assert_eq!(
+            details["candidates"].as_array().unwrap().len(),
+            2,
+            "{details}"
+        );
     }
 
     #[test]
@@ -1551,7 +1683,8 @@ pub(crate) mod tests {
         for selector in ["hub:home/camera.front_door", "HUB:x/y"] {
             let error = validate_selector_shape(selector).unwrap_err();
             assert_eq!(crate::cli::error_code(&error), ("usage", 2));
-            assert!(error.to_string().contains("rtsp://HOST"), "{error:#}");
+            let hint = crate::types::classify(&error).hint.unwrap();
+            assert!(hint.contains("rtsp://HOST"), "{hint}");
         }
         let error = validate_selector("scanner:sane:device").unwrap_err();
         assert_eq!(crate::cli::error_code(&error), ("usage", 2));
@@ -1579,14 +1712,18 @@ pub(crate) mod tests {
             );
             assert_eq!(
                 crate::cli::error_code(&error),
-                ("unavailable", 3),
+                ("camera_not_found", 3),
                 "{selector}"
             );
         }
         let error = open_error("zzzz", &[]);
+        let hint = crate::types::classify(&error).hint.unwrap();
+        assert!(hint.contains("run capturefab list"), "{hint}");
+        let error = open_error("zzzz", &known);
+        let details = crate::types::classify(&error).details.unwrap();
         assert!(
-            error.to_string().contains("run capturefab discover"),
-            "{error:#}"
+            !details["candidates"].as_array().unwrap().is_empty(),
+            "{details}"
         );
         assert!(needs_no_discovery("./nope.mp4"));
         assert!(needs_no_discovery("192.168.1.300"));

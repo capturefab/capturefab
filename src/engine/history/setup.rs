@@ -5,8 +5,8 @@
 use super::*;
 use crate::genicam::Availability;
 use crate::setup::{
-    Bank, Confirmed, MAX_BANKS, MAX_SETUP_VALUES, MAX_STRING, Match, Reading, SETUP_ALL_BANKS,
-    SavedAuto, SavedCamera, Scalar, Setup, SetupValue, Skipped, image_quality, managed_name,
+    Bank, MAX_BANKS, MAX_SETUP_VALUES, MAX_STRING, Match, Reading, SETUP_ALL_BANKS, SavedAuto,
+    SavedCamera, Scalar, Setup, SetupValue, Skipped, image_quality, managed_name,
 };
 use crate::types::{Categorized, ErrorKind};
 
@@ -384,7 +384,6 @@ pub(super) struct Plan {
     warnings: Vec<String>,
     pub(super) restarts_stream: bool,
     blocked: Option<String>,
-    digest: String,
     /// Software auto exposure's balance now and in the setup.
     auto: (Option<f64>, Option<f64>),
 }
@@ -429,43 +428,6 @@ impl Plan {
             ));
         }
         Ok(())
-    }
-    /// Refuse, before any write, disruptive changes nobody confirmed: the
-    /// camera may have changed since the reviewed diff. A confirmation
-    /// names the feature and its banks; a bare name confirms only a value
-    /// without banks. `None` checks nothing (RPC and workflow callers).
-    pub(super) fn confirm(&self, confirmed: Option<&[Confirmed]>) -> Result<()> {
-        let Some(confirmed) = confirmed else {
-            return Ok(());
-        };
-        let mut unconfirmed = Vec::new();
-        for row in self.changes() {
-            let feature = row.address.feature.as_str();
-            if risk_of(feature) != "disruptive"
-                || confirmed
-                    .iter()
-                    .any(|confirmed| confirmed.confirms(feature, &row.at))
-            {
-                continue;
-            }
-            let label = if row.at.is_empty() {
-                feature.to_owned()
-            } else {
-                format!("{feature} ({})", bank_text(&row.at))
-            };
-            if !unconfirmed.contains(&label) {
-                unconfirmed.push(label);
-            }
-        }
-        if unconfirmed.is_empty() {
-            return Ok(());
-        }
-        Err(crate::types::Usage(format!(
-            "Restoring {} now also changes {}, which was not confirmed; the camera changed after the preview. Nothing changed; preview it again.",
-            self.name,
-            unconfirmed.join(", ")
-        ))
-        .into())
     }
 }
 
@@ -809,7 +771,6 @@ pub(super) fn plan(
                 locked.join(", ")
             )
         }),
-        digest: crate::setup::digest(setup),
         auto: (
             auto.as_ref().map(|controller| controller.status().balance),
             setup.auto.as_ref().map(|saved| saved.balance),
@@ -889,7 +850,6 @@ fn outcome(plan: &Plan, info: &crate::types::CameraInfo, unavailable: &BTreeSet<
     let auto = plan.auto_change();
     json!({
         "setup": plan.name,
-        "digest": plan.digest,
         "camera": {"id":info.id,"vendor":info.vendor,"model":info.model,"serial":info.serial},
         "match": plan.matched.as_str(),
         "warnings": plan.warnings,
@@ -1230,10 +1190,8 @@ mod tests {
         h.request(SessionCommand::ApplySetup {
             name: None,
             setup: Some(setup.clone()),
-            digest: None,
             allow_other_model: false,
             strict: false,
-            confirmed_disruptive: None,
         })
     }
 
@@ -1379,10 +1337,8 @@ mod tests {
             .request(SessionCommand::ApplySetup {
                 name: None,
                 setup: Some(setup.clone()),
-                digest: None,
                 allow_other_model: false,
                 strict: true,
-                confirmed_disruptive: None,
             })
             .unwrap_err();
         assert_eq!(
@@ -1457,7 +1413,7 @@ mod tests {
             error.to_string(),
             "Restoring setup bench failed; every value was put back"
         );
-        assert_eq!(crate::cli::error_code(&error).0, "operation_failed");
+        assert_eq!(crate::cli::error_code(&error).0, "failed");
         assert_eq!(get(&h, "Gain").as_f64(), Some(5.0));
         assert_eq!(get(&h, "ExposureTime").as_f64(), Some(7000.0));
         assert_eq!(get(&h, "Width"), 640);
@@ -1569,41 +1525,6 @@ mod tests {
         .unwrap();
         assert!(setup.skipped[0].reason.len() <= MAX_REASON);
         h.shutdown();
-    }
-
-    #[test]
-    fn unconfirmed_disruptive_changes_are_refused_before_any_write() {
-        let mut rig = Rig::new();
-        let reading: crate::setup::Reading =
-            serde_json::from_value(rig.run(SessionCommand::ReadSetup).unwrap()).unwrap();
-        let setup = crate::setup::from_read("confirm", None, reading).unwrap();
-        // Reviewed with only Gain differing; TriggerMode changes afterwards.
-        rig.c().set("Gain", "40").unwrap();
-        rig.c().set("TriggerMode", "On").unwrap();
-        let apply = |confirmed: Option<Vec<Confirmed>>| SessionCommand::ApplySetup {
-            name: None,
-            setup: Some(setup.clone()),
-            digest: None,
-            allow_other_model: false,
-            strict: false,
-            confirmed_disruptive: confirmed,
-        };
-        let refused = rig.run(apply(Some(Vec::new()))).unwrap_err();
-        assert_eq!(crate::types::error_transport_code(&refused), Some("usage"));
-        assert!(
-            refused.to_string().contains("also changes TriggerMode"),
-            "{refused}"
-        );
-        assert_eq!(rig.c().get("Gain").unwrap(), 40);
-        assert_eq!(rig.c().get("TriggerMode").unwrap(), "On");
-        rig.run(apply(Some(vec![Confirmed::Name("TriggerMode".into())])))
-            .unwrap();
-        assert_eq!(rig.c().get("TriggerMode").unwrap(), "Off");
-        rig.c().set("TriggerMode", "On").unwrap();
-        // Without the field (RPC, workflows), nothing is checked.
-        rig.run(apply(None)).unwrap();
-        assert_eq!(rig.c().get("TriggerMode").unwrap(), "Off");
-        rig.h.shutdown();
     }
 
     #[test]
@@ -1771,10 +1692,8 @@ mod tests {
             .run(SessionCommand::ApplySetup {
                 name: None,
                 setup: Some(setup_on),
-                digest: None,
                 allow_other_model: false,
                 strict: false,
-                confirmed_disruptive: None,
             })
             .unwrap();
         assert_eq!(applied["applied"], 3, "{applied}");
@@ -1839,10 +1758,8 @@ mod tests {
             rig.run(SessionCommand::ApplySetup {
                 name: None,
                 setup: Some(setup),
-                digest: None,
                 allow_other_model: false,
                 strict: true,
-                confirmed_disruptive: None,
             })
             .is_err()
         );
@@ -2060,19 +1977,12 @@ mod tests {
             })
             .unwrap()
         }
-        fn apply_with(
-            &mut self,
-            setup: &Setup,
-            strict: bool,
-            confirmed: Option<Vec<Confirmed>>,
-        ) -> Result<Value> {
+        fn apply_with(&mut self, setup: &Setup, strict: bool) -> Result<Value> {
             let result = self.run(SessionCommand::ApplySetup {
                 name: None,
                 setup: Some(setup.clone()),
-                digest: None,
                 allow_other_model: false,
                 strict,
-                confirmed_disruptive: confirmed,
             });
             refresh(&self.h, &mut self.camera, true);
             result
@@ -2167,7 +2077,7 @@ mod tests {
         // Restored with the input line selected, in one apply.
         rig.c().set("LineSelector", "Line0").unwrap();
         rig.set_at("LineSelector", "Line1", "LineSource", "Off");
-        let applied = rig.apply_with(&setup, false, None).unwrap();
+        let applied = rig.apply_with(&setup, false).unwrap();
         assert_eq!(applied["applied"], 1, "{applied}");
         assert_eq!(
             rig.line("Line1"),
@@ -2206,7 +2116,7 @@ mod tests {
             (&json!("Mono8"), &json!(true))
         );
         // Strict too: nothing is missing once the earlier writes land.
-        let applied = rig.apply_with(&setup, true, None).unwrap();
+        let applied = rig.apply_with(&setup, true).unwrap();
         assert_eq!(applied["not_applied"], json!([]), "{applied}");
         assert_eq!(
             rig.line("Line1"),
@@ -2239,7 +2149,7 @@ mod tests {
         rig.c().set("BlackLevel", "9").unwrap();
         let preview = rig.diff(&setup);
         assert_eq!(change(&preview, "LineSource").unwrap()["deferred"], true);
-        let strict = rig.apply_with(&setup, true, None).unwrap_err();
+        let strict = rig.apply_with(&setup, true).unwrap_err();
         assert_eq!(
             crate::types::error_transport_code(&strict),
             Some("unsupported")
@@ -2249,7 +2159,7 @@ mod tests {
             "{strict:#}"
         );
         assert_eq!(rig.c().get("BlackLevel").unwrap(), 9);
-        let applied = rig.apply_with(&setup, false, None).unwrap();
+        let applied = rig.apply_with(&setup, false).unwrap();
         assert_eq!(rig.c().get("BlackLevel").unwrap(), 0);
         assert_eq!(applied["applied"], 1, "{applied}");
         assert_eq!(applied["not_applied"][0]["feature"], "LineSource");
@@ -2301,7 +2211,7 @@ mod tests {
         assert_eq!(preview["changes"].as_array().unwrap().len(), 1, "{preview}");
         assert!(change(&preview, "BinningHorizontal").is_some());
         // Binning 1 doubles Width to 1280; the restore writes it again.
-        let applied = rig.apply_with(&setup, false, None).unwrap();
+        let applied = rig.apply_with(&setup, false).unwrap();
         assert_eq!(rig.c().get("BinningHorizontal").unwrap(), 1);
         assert_eq!(rig.c().get("Width").unwrap(), 640);
         assert_eq!(applied["applied"], 2, "{applied}");
@@ -2321,7 +2231,7 @@ mod tests {
             change(&preview, "DigitalShift").unwrap()["stream_locked"],
             true
         );
-        let applied = rig.apply_with(&setup, false, None).unwrap();
+        let applied = rig.apply_with(&setup, false).unwrap();
         assert_eq!(applied["restarted_stream"], true, "{applied}");
         assert!(rig.c().is_streaming());
         assert_eq!(rig.c().get("DigitalShift").unwrap(), 0);
@@ -2337,7 +2247,7 @@ mod tests {
             change(&preview, "ExposureTime").unwrap()["stream_locked"],
             false
         );
-        let applied = rig.apply_with(&manual, false, None).unwrap();
+        let applied = rig.apply_with(&manual, false).unwrap();
         assert_eq!(applied["restarted_stream"], false);
         assert_eq!(rig.c().get("ExposureAuto").unwrap(), "Off");
         assert_eq!(rig.c().get("ExposureTime").unwrap().as_f64(), Some(10000.0));
@@ -2429,7 +2339,7 @@ mod tests {
         );
         // A bank that cannot be read is not applied; the rest is.
         rig.c().set("BlackLevel", "7").unwrap();
-        let applied = rig.apply_with(&good, false, None).unwrap();
+        let applied = rig.apply_with(&good, false).unwrap();
         assert_eq!(applied["applied"], 1, "{applied}");
         let row = &applied["not_applied"][0];
         assert_eq!(
@@ -2453,7 +2363,7 @@ mod tests {
         let plan_reads = wires.black_reads.load(std::sync::atomic::Ordering::SeqCst) - before;
         *wires.fail_black_after.lock().unwrap() =
             Some(wires.black_reads.load(std::sync::atomic::Ordering::SeqCst) + plan_reads);
-        let error = rig.apply_with(&setup, false, None).unwrap_err();
+        let error = rig.apply_with(&setup, false).unwrap_err();
         assert!(
             format!("{error:#}").contains("apply_setup changed nothing"),
             "{error:#}"
@@ -2461,55 +2371,6 @@ mod tests {
         *wires.fail_black_after.lock().unwrap() = None;
         assert_eq!(rig.c().get("BlackLevel").unwrap(), 7);
         assert_eq!(rig.c().get("BinningHorizontal").unwrap(), 2);
-        rig.h.shutdown();
-    }
-
-    #[test]
-    fn confirmations_name_the_bank_they_confirm() {
-        let (mut rig, _) = Rig::rich();
-        let setup = rig.save("triggers");
-        let frame_start = vec![Bank {
-            selector: "TriggerSelector".into(),
-            value: "FrameStart".into(),
-        }];
-        let confirmed = vec![Confirmed::At(crate::setup::ConfirmedAt {
-            feature: "TriggerMode".into(),
-            at: frame_start.clone(),
-        })];
-        rig.set_at("TriggerSelector", "FrameStart", "TriggerMode", "On");
-        // A bare name confirms only a value without banks.
-        let bare = rig
-            .apply_with(
-                &setup,
-                false,
-                Some(vec![Confirmed::Name("TriggerMode".into())]),
-            )
-            .unwrap_err();
-        assert_eq!(crate::types::error_transport_code(&bare), Some("usage"));
-        assert!(
-            bare.to_string()
-                .contains("TriggerMode (TriggerSelector = FrameStart)"),
-            "{bare}"
-        );
-        // Another bank changed after the preview: refused, nothing changes.
-        rig.set_at("TriggerSelector", "LineStart", "TriggerMode", "On");
-        let refused = rig
-            .apply_with(&setup, false, Some(confirmed.clone()))
-            .unwrap_err();
-        assert!(
-            refused
-                .to_string()
-                .contains("TriggerMode (TriggerSelector = LineStart)"),
-            "{refused}"
-        );
-        assert_eq!(rig.at("TriggerSelector", "FrameStart", "TriggerMode"), "On");
-        assert_eq!(rig.at("TriggerSelector", "LineStart", "TriggerMode"), "On");
-        rig.set_at("TriggerSelector", "LineStart", "TriggerMode", "Off");
-        rig.apply_with(&setup, false, Some(confirmed)).unwrap();
-        assert_eq!(
-            rig.at("TriggerSelector", "FrameStart", "TriggerMode"),
-            "Off"
-        );
         rig.h.shutdown();
     }
 
@@ -2522,13 +2383,12 @@ mod tests {
         let preview = rig.diff(&setup);
         assert_eq!(preview["changes"].as_array().unwrap().len(), 2, "{preview}");
         assert_eq!(preview["risk"], "reversible");
-        rig.apply_with(&setup, false, Some(Vec::new())).unwrap();
+        rig.apply_with(&setup, false).unwrap();
         assert_eq!(rig.c().get("LineSelector").unwrap(), "Line0");
-        // A per-bank value still needs confirmation.
+        // A per-bank value is a disruptive change, listed as one.
         rig.set_at("LineSelector", "Line0", "LineMode", "Output");
         let preview = rig.diff(&setup);
         assert_eq!(change(&preview, "LineMode").unwrap()["risk"], "disruptive");
-        assert!(rig.apply_with(&setup, false, Some(Vec::new())).is_err());
         rig.h.shutdown();
     }
 
@@ -2545,14 +2405,14 @@ mod tests {
         rig.c().set("TriggerMode", "On").unwrap();
         let on = rig.save("on");
         // Arming: the source is written before the mode turns on.
-        rig.apply_with(&off, false, None).unwrap();
+        rig.apply_with(&off, false).unwrap();
         wires.writes.lock().unwrap().clear();
-        rig.apply_with(&on, false, None).unwrap();
+        rig.apply_with(&on, false).unwrap();
         let (source, mode) = order(&wires);
         assert!(source < mode, "{:?}", wires.writes.lock().unwrap());
         // Disarming: the mode turns off before the source changes.
         wires.writes.lock().unwrap().clear();
-        rig.apply_with(&off, false, None).unwrap();
+        rig.apply_with(&off, false).unwrap();
         let (source, mode) = order(&wires);
         assert!(mode < source, "{:?}", wires.writes.lock().unwrap());
         rig.h.shutdown();
@@ -2571,8 +2431,8 @@ mod tests {
         rig.c().set("TriggerSource", "Line0").unwrap();
         rig.c().set("TriggerMode", "On").unwrap();
         let on = rig.save("on");
-        rig.apply_with(&off, false, None).unwrap();
-        rig.apply_with(&on, false, None).unwrap();
+        rig.apply_with(&off, false).unwrap();
+        rig.apply_with(&on, false).unwrap();
         // A failed restore that disarmed re-arms after the source is back.
         let mut bad = off.clone();
         for value in &mut bad.values {
@@ -2581,7 +2441,7 @@ mod tests {
             }
         }
         wires.writes.lock().unwrap().clear();
-        let error = rig.apply_with(&bad, false, None).unwrap_err();
+        let error = rig.apply_with(&bad, false).unwrap_err();
         assert!(
             error.to_string().contains("every value was put back"),
             "{error:#}"

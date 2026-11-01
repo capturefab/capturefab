@@ -176,23 +176,23 @@ fn access_error(
     let at = node.map(|node| format!(" ({node})")).unwrap_or_default();
     match (kind, os) {
         (Usb::PermissionDenied, "linux") => (
-            ErrorKind::Unavailable,
+            ErrorKind::PermissionDenied,
             format!(
                 "No permission to {doing} USB3 Vision camera {name}{at}. Run `capturefab doctor` for the udev rule that fixes it."
             ),
         ),
         (Usb::PermissionDenied, _) => (
-            ErrorKind::Unavailable,
+            ErrorKind::PermissionDenied,
             format!("No permission to {doing} USB3 Vision camera {name}. Run `capturefab doctor`."),
         ),
         (Usb::Busy, _) => (
-            ErrorKind::Unavailable,
+            ErrorKind::CameraBusy,
             format!(
                 "USB3 Vision camera {name} is in use by another application (for example a vendor viewer or SDK). Close it and connect again."
             ),
         ),
         (Usb::Disconnected, _) => (
-            ErrorKind::Unavailable,
+            ErrorKind::Disconnected,
             format!(
                 "USB3 Vision camera {name} disconnected while opening; reconnect it and discover again."
             ),
@@ -897,10 +897,12 @@ impl<C: Channel> Control<C> {
         let mut deadline = Instant::now() + window;
         for _ in 0..64 {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            ensure!(
-                !remaining.is_zero(),
-                "USB camera control acknowledgement timed out"
-            );
+            if remaining.is_zero() {
+                return Err(crate::types::Categorized::error(
+                    crate::types::ErrorKind::Timeout,
+                    "USB camera control acknowledgement timed out",
+                ));
+            }
             let response = self.channel.receive(self.max_ack, remaining);
             let response = self
                 .unhalt(response)
@@ -1256,35 +1258,35 @@ mod tests {
                 Stage::Open,
                 Usb::PermissionDenied,
                 "linux",
-                ErrorKind::Unavailable,
+                ErrorKind::PermissionDenied,
                 "/dev/bus/usb/002/003). Run `capturefab doctor` for the udev rule",
             ),
             (
                 Stage::Open,
                 Usb::PermissionDenied,
                 "macos",
-                ErrorKind::Unavailable,
+                ErrorKind::PermissionDenied,
                 "Run `capturefab doctor`.",
             ),
             (
                 Stage::ClaimControl,
                 Usb::Busy,
                 "linux",
-                ErrorKind::Unavailable,
+                ErrorKind::CameraBusy,
                 "in use by another application",
             ),
             (
                 Stage::ClaimStream,
                 Usb::Busy,
                 "windows",
-                ErrorKind::Unavailable,
+                ErrorKind::CameraBusy,
                 "Close it and connect again.",
             ),
             (
                 Stage::Open,
                 Usb::Disconnected,
                 "macos",
-                ErrorKind::Unavailable,
+                ErrorKind::Disconnected,
                 "reconnect it and discover again",
             ),
             (
@@ -1344,7 +1346,7 @@ mod tests {
         let (kind, message) =
             access_error(Stage::Open, Usb::PermissionDenied, "acA", node, "linux");
         let error = Categorized::error(kind, message).context("connect usb:2676:ba02:1");
-        assert_eq!(crate::cli::error_code(&error), ("unavailable", 3));
+        assert_eq!(crate::cli::error_code(&error), ("permission_denied", 3));
         // The refusal keeps doctor's wording.
         let (_, message) = access_error(
             Stage::Open,

@@ -1,4 +1,5 @@
 //! `capturefab login`: camera sign-ins saved in the OS credential store.
+use super::{Global, output::Report};
 use crate::logins::{self, CameraLogin, Logins};
 use crate::session::{SessionCommand, SessionHandle};
 use anyhow::Result;
@@ -11,6 +12,9 @@ pub const PASSWORD_ENV: &str = "CAPTUREFAB_CAMERA_PASSWORD";
 #[derive(Debug, Subcommand)]
 pub enum LoginCommand {
     /// Check a camera sign-in, then save it in the OS credential store
+    #[command(
+        after_help = "Examples:\n  printf '%s\\n' \"$PASS\" | capturefab login add rtsp://cam.local/stream --user admin --password-stdin\n  CAPTUREFAB_CAMERA_PASSWORD=secret capturefab login add onvif://cam.local --user admin"
+    )]
     Add {
         /// A credential-free rtsp://, rtsps://, onvif:http://… or onvif://HOST address, or with --session the ID or serial of a discovered ONVIF camera
         address: String,
@@ -25,17 +29,25 @@ pub enum LoginCommand {
         no_check: bool,
     },
     /// List saved camera sign-ins (never their passwords)
+    #[command(after_help = "Examples:\n  capturefab login list\n  capturefab --json login list")]
     List,
     /// Forget a saved camera sign-in and delete its password
-    Remove { address: String },
+    #[command(
+        visible_alias = "remove",
+        after_help = "Examples:\n  capturefab login rm rtsp://cam.local/stream\n  capturefab login rm onvif://cam.local"
+    )]
+    Rm { address: String },
 }
+
+/// How long `login add` waits for the camera it checks.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn usage(message: impl Into<String>) -> anyhow::Error {
     crate::types::Usage(message.into()).into()
 }
 
 /// Checks that need neither stdin, the credential store nor a camera.
-pub fn prepare(command: &LoginCommand) -> Result<()> {
+fn prepare(command: &LoginCommand) -> Result<()> {
     if let LoginCommand::Add {
         address,
         user,
@@ -61,7 +73,7 @@ pub fn prepare(command: &LoginCommand) -> Result<()> {
             )));
         }
     }
-    if let LoginCommand::Remove { address } = command
+    if let LoginCommand::Rm { address } = command
         && (address.contains("://") || crate::onvif::is_source(address))
     {
         logins::key(address)?;
@@ -118,14 +130,20 @@ fn password(stdin: bool) -> Result<zeroize::Zeroizing<String>> {
     Ok(zeroize::Zeroizing::new(value))
 }
 
-pub fn run(command: &LoginCommand, session: Option<&str>, timeout: Duration) -> Result<Value> {
+pub fn run(global: &Global, command: &LoginCommand) -> Result<Report> {
+    let value = run_with(command, global.session.as_deref(), CHECK_TIMEOUT)?;
+    let text = human(command, &value);
+    Ok(Report::json(value).text(text))
+}
+
+fn run_with(command: &LoginCommand, session: Option<&str>, timeout: Duration) -> Result<Value> {
     prepare(command)?;
     match command {
         LoginCommand::List => {
             let logins = Logins::system().list()?;
             Ok(json!({"logins": logins, "supported": logins::can_remember()}))
         }
-        LoginCommand::Remove { address } => {
+        LoginCommand::Rm { address } => {
             if !logins::can_remember() {
                 return Err(unsupported());
             }
@@ -222,7 +240,7 @@ pub fn human(command: &LoginCommand, value: &Value) -> String {
             value["login"]["address"].as_str().unwrap_or_default(),
             value["login"]["user"].as_str().unwrap_or_default()
         ),
-        LoginCommand::Remove { .. } => format!(
+        LoginCommand::Rm { .. } => format!(
             "Forgot the sign-in for {}\n",
             value["removed"].as_str().unwrap_or_default()
         ),

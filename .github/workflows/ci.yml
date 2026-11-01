@@ -108,7 +108,7 @@ jobs:
             echo "### ${{ matrix.os }} ($RUNNER_ARCH)"
             echo '```json'
             python=$(command -v python3 || command -v python)
-            cargo run --locked --quiet -- --json doctor | "$python" -c 'import json, sys; r = json.load(sys.stdin)["result"]; print(json.dumps({k: r[k] for k in ("os", "arch", "features", "jpeg")}, indent=2))' || echo '"doctor failed"'
+            cargo run --locked --quiet -- --json doctor | "$python" -c 'import json, sys; r = json.load(sys.stdin); print(json.dumps({k: r[k] for k in ("os", "arch", "features", "version")}, indent=2))' || echo '"doctor failed"'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY" || true
 

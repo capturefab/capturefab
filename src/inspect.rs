@@ -426,10 +426,12 @@ fn jpeg_preview(format: PreviewFormat, jpeg_available: bool) -> Result<bool> {
     Ok(match format {
         PreviewFormat::Auto => jpeg_available,
         PreviewFormat::Jpeg => {
-            ensure!(
-                jpeg_available,
-                "JPEG previews are unsupported in this build; request png or rebuild with --features jpeg"
-            );
+            if !jpeg_available {
+                return Err(crate::types::Categorized::error(
+                    crate::types::ErrorKind::Unsupported,
+                    "JPEG previews are unsupported in this build; request png or rebuild with --features jpeg",
+                ));
+            }
             true
         }
         PreviewFormat::Png => false,

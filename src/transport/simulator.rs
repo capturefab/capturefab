@@ -118,7 +118,20 @@ const XML: &str = r#"<?xml version="1.0"?>
 </RegisterDescription>"#;
 
 const ANALOG_FEATURES: &str = r#"
- <Float Name="ExposureTime"><pValue>ExposureReg</pValue><Min>10</Min><Max>1000000</Max><Unit>us</Unit></Float>
+ <Float Name="ExposureTime"><pValue>ExposureReg</pValue><pIsLocked>ExposureLocked</pIsLocked><Min>10</Min><Max>1000000</Max><Unit>us</Unit></Float>
+ <IntSwissKnife Name="ExposureLocked"><pVariable Name="A">ExposureAutoReg</pVariable><Formula>A!=0</Formula></IntSwissKnife>
+ <Enumeration Name="ExposureAuto"><Description>Once locks ExposureTime until it is Off again.</Description><EnumEntry Name="Off"><Value>0</Value></EnumEntry><EnumEntry Name="Once"><Value>1</Value></EnumEntry><pValue>ExposureAutoReg</pValue></Enumeration>
+ <IntReg Name="ExposureAutoReg"><Address>0x190</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Enumeration Name="TriggerSelector"><EnumEntry Name="FrameStart"><Value>0</Value></EnumEntry><EnumEntry Name="AcquisitionStart"><Value>1</Value></EnumEntry><pValue>TriggerSelectorReg</pValue><pSelected>TriggerMode</pSelected><pSelected>TriggerSource</pSelected><pSelected>TriggerActivation</pSelected><pSelected>TriggerSoftware</pSelected></Enumeration>
+ <IntReg Name="TriggerSelectorReg"><Address>0x160</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Enumeration Name="TriggerMode"><Description>The simulator keeps streaming; trigger settings are stored only.</Description><EnumEntry Name="Off"><Value>0</Value></EnumEntry><EnumEntry Name="On"><Value>1</Value></EnumEntry><pValue>TriggerModeReg</pValue></Enumeration>
+ <IntReg Name="TriggerModeReg"><Address>0x168</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Enumeration Name="TriggerSource"><EnumEntry Name="Software"><Value>0</Value></EnumEntry><EnumEntry Name="Line0"><Value>1</Value></EnumEntry><EnumEntry Name="Line1"><Value>2</Value></EnumEntry><pValue>TriggerSourceReg</pValue></Enumeration>
+ <IntReg Name="TriggerSourceReg"><Address>0x170</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Enumeration Name="TriggerActivation"><EnumEntry Name="RisingEdge"><Value>0</Value></EnumEntry><EnumEntry Name="FallingEdge"><Value>1</Value></EnumEntry><pValue>TriggerActivationReg</pValue></Enumeration>
+ <IntReg Name="TriggerActivationReg"><Address>0x178</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
+ <Command Name="TriggerSoftware"><pValue>TriggerSoftwareReg</pValue><CommandValue>1</CommandValue></Command>
+ <IntReg Name="TriggerSoftwareReg"><Address>0x180</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>WO</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
  <FloatReg Name="ExposureReg"><Address>0x110</Address><Length>8</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></FloatReg>
  <Float Name="Gain"><pValue>GainReg</pValue><Min>0</Min><Max>24</Max><Unit>dB</Unit></Float>
  <FloatReg Name="GainReg"><Address>0x118</Address><Length>8</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></FloatReg>"#;
@@ -258,7 +271,7 @@ impl Simulator {
                 "Image height in pixels. Stop acquisition before changing."
             })
             .replace("$PixelEntries", pixel_entries)
-            .replace("$AnalogCategory", if analog { "<pFeature>ExposureTime</pFeature><pFeature>Gain</pFeature>" } else { "" })
+            .replace("$AnalogCategory", if analog { "<pFeature>ExposureTime</pFeature><pFeature>ExposureAuto</pFeature><pFeature>Gain</pFeature><pFeature>TriggerSelector</pFeature><pFeature>TriggerMode</pFeature><pFeature>TriggerSource</pFeature><pFeature>TriggerActivation</pFeature><pFeature>TriggerSoftware</pFeature>" } else { "" })
             .replace("$AnalogFeatures", if analog { ANALOG_FEATURES } else { "" })
             .replace("$RateFeature", if line { "AcquisitionLineRate" } else { "AcquisitionFrameRate" })
             .replace("$RateMax", if line { "100000" } else { "120" })
@@ -309,6 +322,7 @@ impl RegisterIo for Simulator {
         ensure!(
             !self.running
                 || (a >= 0x110 && end <= 0x128)
+                || (a >= 0x160 && end <= 0x194)
                 || (self.kind == SimKind::Microscope && a >= 0x140 && end <= 0x158)
                 || (a == 0x130 && end <= 0x134),
             "stop acquisition before changing image format"

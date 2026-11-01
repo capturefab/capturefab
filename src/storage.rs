@@ -432,22 +432,24 @@ impl Manager {
     ) -> Result<StorageWriter> {
         policy.validate()?;
         ensure!(reserve > 0, "capture storage reservation must be positive");
-        ensure!(
-            reserve <= policy.max_bytes,
-            "Storage full: {} exceeds the {} budget; {}",
-            kind.reservation(reserve),
-            human_bytes(policy.max_bytes),
-            kind.budget_hint()
-        );
+        if reserve > policy.max_bytes {
+            return Err(full(format!(
+                "Storage full: {} exceeds the {} budget; {}",
+                kind.reservation(reserve),
+                human_bytes(policy.max_bytes),
+                kind.budget_hint()
+            )));
+        }
         let mut locked = self.lock()?;
         let policy = policy.constrained_by(&locked.configured_policy()?);
-        ensure!(
-            reserve <= policy.max_bytes,
-            "Storage full: {} exceeds the configured {} global budget; {}",
-            kind.reservation(reserve),
-            human_bytes(policy.max_bytes),
-            kind.configured_hint()
-        );
+        if reserve > policy.max_bytes {
+            return Err(full(format!(
+                "Storage full: {} exceeds the configured {} global budget; {}",
+                kind.reservation(reserve),
+                human_bytes(policy.max_bytes),
+                kind.configured_hint()
+            )));
+        }
         let (base, path) = output_path(path)?;
         match fs::symlink_metadata(&path) {
             Ok(_) => return Err(OutputExists(path).into()),
@@ -1337,17 +1339,17 @@ impl Locked {
                 continue;
             }
             if policy.on_full == "stop" && (full || expired) {
-                bail!(
+                return Err(self::full(format!(
                     "Storage full: {} allocated and {} retained files (limits: {}, {} files{}); enable explicit --delete-oldest retention, remove old captures yourself, or raise --max-space/--max-files (storage configure keeps them)",
                     human_bytes(allocated),
                     self.ledger.entries.len(),
                     human_bytes(policy.max_bytes),
                     policy.max_files,
                     if expired { "; maximum age reached" } else { "" }
-                );
+                )));
             }
             let low = |stalled: bool| {
-                anyhow!(
+                self::full(format!(
                     "Storage full: {} needs at least 512 MiB free on its disk after this {} save, and {} is free{}; {}",
                     base.display(),
                     human_bytes(reserve),
@@ -1358,7 +1360,7 @@ impl Locked {
                         ""
                     },
                     kind.disk_hint()
-                )
+                ))
             };
             if short > 0 {
                 // When not even a tenth of what the round removed shows as
@@ -1373,22 +1375,23 @@ impl Locked {
                 // Without device numbers, files on other drives could be
                 // removed for nothing, so none are.
                 let stalled = device.is_some_and(|device| self.ledger.stalled.contains(&device));
-                ensure!(
-                    policy.on_full != "stop" && round.is_none() && device.is_some() && !stalled,
-                    low(stalled)
-                );
+                if !(policy.on_full != "stop" && round.is_none() && device.is_some() && !stalled) {
+                    return Err(low(stalled));
+                }
             }
             let Some(victims) = self.victims(policy, reserve, device, short)? else {
-                ensure!(full, low(false));
-                if !self.ledger.entries.iter().any(Self::removable) {
-                    bail!(
-                        "Storage full: no unchanged, completed Capturefab files can be removed safely; active recordings and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits"
-                    );
+                if !full {
+                    return Err(low(false));
                 }
-                bail!(
+                if !self.ledger.entries.iter().any(Self::removable) {
+                    return Err(self::full(
+                        "Storage full: no unchanged, completed Capturefab files can be removed safely; active recordings and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits".into(),
+                    ));
+                }
+                return Err(self::full(format!(
                     "Storage full: removing every unchanged, completed Capturefab file would still not make room, so {} removed; active recordings, files awaiting upload and externally changed files are protected. Stop recordings, remove files yourself, or increase the storage limits",
                     if removed { "no more were" } else { "none were" }
-                );
+                )));
             };
             let files = self.ledger.entries.len();
             let freed = self.delete_all(&victims, device)?;
@@ -1541,11 +1544,14 @@ impl Write for StorageWriter {
         {
             self.failed = true;
             self.cut = true;
-            return Err(io::Error::other(format!(
-                "Storage full: {} reached its maximum file size of {}; raise the maximum file size (--max-file-size) or record shorter segments",
-                self.path.display(),
-                human_bytes(self.reserve)
-            )));
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "Storage full: {} reached its maximum file size of {}; raise the maximum file size (--max-file-size) or record shorter segments",
+                    self.path.display(),
+                    human_bytes(self.reserve)
+                ),
+            ));
         }
         let result = self
             .file
@@ -1784,6 +1790,11 @@ pub struct Stored {
     pub bytes: u64,
     pub sha256: String,
 }
+/// A save refused for lack of space or budget.
+fn full(message: String) -> anyhow::Error {
+    crate::types::Categorized::error(crate::types::ErrorKind::StorageFull, message)
+}
+
 /// The output path is already taken. Callers that pick names retry with the
 /// next free one when this is in the error chain; nothing is ever replaced.
 #[derive(Debug)]
@@ -2055,7 +2066,7 @@ mod tests {
             format!("{error:#}").contains("is saved, but the storage manager stayed busy"),
             "{error:#}"
         );
-        assert_eq!(crate::cli::error_code(&error), ("operation_failed", 1));
+        assert_eq!(crate::cli::error_code(&error), ("failed", 1));
         assert_eq!(fs::read(&path).unwrap(), b"shot");
         // The next manager reclaims the reservation and keeps the file out of
         // retention, since its content was never recorded.

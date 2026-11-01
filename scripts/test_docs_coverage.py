@@ -107,6 +107,28 @@ class SourceParserTests(unittest.TestCase):
             })
 
 
+    def test_tuple_subcommands_and_flattened_command_enums(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write(root, "src/cli.rs", '''
+                pub struct Cli { #[command(subcommand)] command: Command }
+                pub enum Command {
+                    #[command(subcommand)] Preset(preset::PresetCommand),
+                    #[command(flatten)] Legacy(legacy::LegacyCommand),
+                    List(camera::ListArgs),
+                }
+            ''')
+            write(root, "src/cli/preset.rs", 'pub enum PresetCommand { Save { name: String }, List }')
+            write(root, "src/cli/legacy.rs", 'pub enum LegacyCommand { Capture { #[arg(short=\'o\')] output: String } }')
+            write(root, "src/cli/camera.rs", 'pub struct ListArgs { #[arg(long)] kind: String }')
+            commands, arguments = coverage.command_paths(root, with_arguments=True)
+            self.assertEqual(commands, {"help", "preset", "preset save", "preset list", "capture", "list"})
+            self.assertEqual(arguments["preset"], set())
+            self.assertEqual(arguments["preset save"], {"NAME"})
+            self.assertEqual(arguments["capture"], {"-o"})
+            self.assertEqual(arguments["list"], {"--kind"})
+
+
 class DocumentationTargetTests(unittest.TestCase):
     def test_heading_needs_explanation_before_next_heading(self):
         page = coverage.DocPage('''<article><h2 id="empty">Empty</h2>

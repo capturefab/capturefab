@@ -211,7 +211,7 @@ case ":${PATH:-}:" in
 esac
 say ""
 say "Next: capturefab doctor"
-say "Try:  capturefab --direct --camera sim:0 capture -o 'first-{seq}.png'"
+say "Try:  capturefab capture -c sim:0 -o 'first-{seq}.png'"
 if [ "$os" = linux ]; then
   say "USB3 Vision and GigE Vision cameras can need system settings; capturefab doctor prints each fix."
 fi

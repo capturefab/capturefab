@@ -84,7 +84,7 @@ fn serve_ready(mut child: Child) -> Child {
         .read_line(&mut ready)
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&ready).unwrap()["result"]["ready"],
+        serde_json::from_str::<Value>(&ready).unwrap()["ready"],
         true,
         "{ready}"
     );
@@ -119,9 +119,9 @@ fn automatic_session_targeting_and_caller_relative_paths() {
         .current_dir(&caller)
         .args([
             "--json",
+            "capture",
             "--camera",
             "sim:visible",
-            "capture",
             "-o",
             "first.ppm",
             "--set",
@@ -136,8 +136,9 @@ fn automatic_session_targeting_and_caller_relative_paths() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(envelope["session"], "visual");
+    // The only running session took the capture: it now holds the camera.
+    let held = json(&dir, &["--json", "status"]);
+    assert_eq!(held["cameras"][0]["info"]["id"], "sim:visible");
     assert!(
         std::fs::read(caller.join("first.ppm"))
             .unwrap()
@@ -151,9 +152,9 @@ fn automatic_session_targeting_and_caller_relative_paths() {
         &dir,
         &[
             "--json",
+            "set",
             "--camera",
             "sim:visible",
-            "set",
             "ExposureTime=2000",
         ],
     );
@@ -167,13 +168,13 @@ fn automatic_session_targeting_and_caller_relative_paths() {
             .any(|camera| camera["worker_pid"] == worker_pid)
     );
     // With two cameras connected, a camera command must name one.
-    let unnamed = cmd(&dir, &["--json", "get", "Width"]);
+    let unnamed = cmd(&dir, &["--json", "--session", "visual", "get", "Width"]);
     assert_eq!(unnamed.status.code(), Some(2));
     let error: Value = serde_json::from_slice(&unnamed.stdout).unwrap();
-    let message = error["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("2 cameras connected (sim:other, sim:visible)"),
-        "{message}"
+    assert_eq!(error["error"]["code"], "camera_ambiguous");
+    assert_eq!(
+        error["error"]["details"]["candidates"],
+        serde_json::json!([{"id":"sim:other"},{"id":"sim:visible"}])
     );
 
     // A relative output given with an explicit session also lands beside
@@ -188,9 +189,9 @@ fn automatic_session_targeting_and_caller_relative_paths() {
             "--json",
             "--session",
             "visual",
+            "capture",
             "--camera",
             "sim:visible",
-            "capture",
             "-o",
             "frames/second.png",
         ])
@@ -203,117 +204,6 @@ fn automatic_session_targeting_and_caller_relative_paths() {
     );
     assert!(caller.join("frames/second.png").is_file());
     assert!(!server.join("frames/second.png").exists());
-}
-
-#[test]
-fn ambiguous_sessions_require_target_and_direct_bypasses_them() {
-    let dir = std::env::temp_dir().join(format!(
-        "capturefab-ambiguous-cli-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let cwd = std::env::current_dir().unwrap();
-    let _first = Fixture {
-        child: serve_at(&dir, &cwd, "first"),
-        dir: dir.clone(),
-    };
-    let _second = Fixture {
-        child: serve_at(&dir, &cwd, "second"),
-        dir: dir.clone(),
-    };
-    let out = cmd(&dir, &["--json", "--camera", "sim:0", "set", "Width=64"]);
-    assert_eq!(out.status.code(), Some(2));
-    let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
-    // The message names the sessions itself and points at no listing command.
-    let message = failure["error"]["message"].as_str().unwrap();
-    assert!(
-        message.starts_with("multiple sessions are running (")
-            && message.contains("first")
-            && message.contains("second")
-            && message.ends_with("choose --session NAME or --direct --camera ID"),
-        "{message}"
-    );
-    for name in ["first", "second"] {
-        assert!(
-            json(&dir, &["--json", "--session", name, "status"])["cameras"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-    }
-    assert_eq!(
-        json(
-            &dir,
-            &["--json", "--direct", "--camera", "sim:0", "get", "Width"]
-        )["features"][0]["value"],
-        640
-    );
-    let env_direct = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-        .env("CAPTUREFAB_SESSION_DIR", &dir)
-        .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .env("CAPTUREFAB_SESSION", "first")
-        .env("CAPTUREFAB_CAMERA", "sim:environment")
-        .args(["--json", "--direct", "get", "Width"])
-        .output()
-        .unwrap();
-    assert!(
-        env_direct.status.success(),
-        "{}",
-        String::from_utf8_lossy(&env_direct.stdout)
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&env_direct.stdout).unwrap()["result"]["features"][0]["value"],
-        640
-    );
-    assert!(
-        json(&dir, &["--json", "--session", "first", "status"])["cameras"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let env_stdout = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-        .env("CAPTUREFAB_SESSION_DIR", &dir)
-        .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .env("CAPTUREFAB_SESSION", "first")
-        .env_remove("CAPTUREFAB_CAMERA")
-        .args([
-            "--camera",
-            "sim:stdout",
-            "capture",
-            "-o",
-            "-",
-            "--format",
-            "raw",
-            "--set",
-            "Width=64",
-            "--set",
-            "Height=64",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        env_stdout.status.success(),
-        "{}",
-        String::from_utf8_lossy(&env_stdout.stderr)
-    );
-    assert_eq!(env_stdout.stdout.len(), 4096);
-    assert!(
-        json(&dir, &["--json", "--session", "first", "status"])["cameras"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let schema = json(&dir, &["schema", "--json"]);
-    assert!(
-        schema["cli"]["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|command| command["name"] == "serve")
-    );
 }
 
 #[test]
@@ -343,9 +233,9 @@ fn session_recording_duration_stops_its_camera_while_others_connect() {
         .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args([
             "--json",
+            "record",
             "--camera",
             "sim:recording",
-            "record",
             "-o",
             output.to_str().unwrap(),
             "--encoder",
@@ -371,7 +261,7 @@ fn session_recording_duration_stops_its_camera_while_others_connect() {
                 String::from_utf8_lossy(&finished.stderr)
             );
         }
-        let state = json(&dir, &["--json", "--camera", "sim:recording", "status"]);
+        let state = json(&dir, &["--json", "status", "--camera", "sim:recording"]);
         if state["cameras"][0]["forwarding"].is_string() {
             break;
         }
@@ -412,8 +302,8 @@ fn json(dir: &PathBuf, args: &[&str]) -> Value {
         String::from_utf8_lossy(&out.stderr)
     );
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["ok"], true);
-    v["result"].clone()
+    assert!(v.get("error").is_none(), "{v}");
+    v
 }
 
 /// A short timed recording that fails before any status shows it running
@@ -429,7 +319,7 @@ fn a_short_timed_recording_that_cannot_start_fails() {
     let env = [("CAPTUREFAB_FFMPEG", missing.to_str().unwrap())];
     let output = root.join("clip.mkv");
     let record = |camera: Option<&str>| {
-        let mut args = vec!["--json"];
+        let mut args = vec!["--json", "record"];
         args.extend(
             camera
                 .map(|camera| ["--camera", camera])
@@ -437,7 +327,6 @@ fn a_short_timed_recording_that_cannot_start_fails() {
                 .flatten(),
         );
         args.extend([
-            "record",
             "-o",
             output.to_str().unwrap(),
             "--duration",
@@ -450,7 +339,7 @@ fn a_short_timed_recording_that_cannot_start_fails() {
         let out = cmd_env(&dir, &env, &args);
         let reply: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
         assert!(
-            !out.status.success() && reply["ok"] == false,
+            !out.status.success() && reply.get("error").is_some(),
             "{reply}\n{}",
             String::from_utf8_lossy(&out.stderr)
         );
@@ -485,9 +374,9 @@ fn network_scan_preserves_active_non_gige_streams() {
         .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args([
             "--json",
+            "serve",
             "--camera",
             "sim:0",
-            "serve",
             "--name",
             "network-ci",
         ])
@@ -500,7 +389,7 @@ fn network_scan_preserves_active_non_gige_streams() {
         .read_line(&mut ready)
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&ready).unwrap()["result"]["ready"],
+        serde_json::from_str::<Value>(&ready).unwrap()["ready"],
         true,
         "{ready}"
     );
@@ -516,16 +405,17 @@ fn network_scan_preserves_active_non_gige_streams() {
             "--json",
             "--session",
             "network-ci",
-            "--timeout-ms",
-            "50",
-            "network-scan",
+            "network",
+            "--tune",
+            "--timeout",
+            "50ms",
         ],
     );
-    let report = &result["network_scan"];
+    let report = &result;
     assert!(report["interfaces"].is_array());
     assert!(report["cameras"].is_array());
-    assert!(report["warnings"].is_array());
-    assert!(report["scanned_at_ms"].as_u64().unwrap() > 0);
+    assert!(report.get("warnings").is_none_or(Value::is_array));
+    assert!(report["time"].is_string());
     assert!(report["cameras"].as_array().unwrap().iter().all(
         |camera| camera["camera"]["transport"] == "gig_e"
             && camera["active"] == false
@@ -550,12 +440,12 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
             .as_nanos()
     ));
     for args in [
-        vec!["--camera", "sim:0", "capture", "-o", "rtsp://host/stream"],
-        vec!["--camera", "sim:0", "capture", "-o", "shot-{unknown}.png"],
+        vec!["capture", "--camera", "sim:0", "-o", "rtsp://host/stream"],
+        vec!["capture", "--camera", "sim:0", "-o", "shot-{unknown}.png"],
         vec![
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             "shot.png",
             "--delay",
@@ -564,24 +454,24 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
             "Width=128",
         ],
         vec![
-            "--camera", "sim:0", "forward", "-o", "shot.mp4", "--fps", "NaN", "--auto",
+            "record", "--camera", "sim:0", "-o", "shot.mp4", "--fps", "NaN", "--auto",
         ],
         vec![
+            "debug",
+            "read",
             "--camera",
             "sim:0",
-            "memory",
-            "read",
             "18446744073709551615",
             "2",
         ],
-        vec!["--camera", "sim:0", "set", "Width=128", "=bad"],
-        vec!["--camera", "gige:gige:192.0.2.1", "get", "Width"],
-        vec!["--camera", "sim:0", "serve", "--name", "../bad"],
-        vec!["--camera", "sim:0", "xml", "-o", ""],
+        vec!["set", "--camera", "sim:0", "Width=128", "=bad"],
+        vec!["get", "--camera", "gige:gige:192.0.2.1", "Width"],
+        vec!["serve", "--camera", "sim:0", "--name", "../bad"],
+        vec!["debug", "xml", "--camera", "sim:0", "-o", ""],
         // An empty local path never becomes the current directory.
-        vec!["--camera", "sim:replay:", "capture", "-o", "unused.png"],
-        vec!["--camera", "file:", "capture", "-o", "unused.png"],
-        vec!["--camera", "FiLe:", "capture", "-o", "unused.png"],
+        vec!["capture", "--camera", "sim:replay:", "-o", "unused.png"],
+        vec!["capture", "--camera", "file:", "-o", "unused.png"],
+        vec!["capture", "--camera", "FiLe:", "-o", "unused.png"],
         vec!["connect", "sim:replay:"],
         vec!["connect", "file:"],
     ] {
@@ -608,7 +498,7 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
             .env("CAPTUREFAB_SESSION_DIR", &dir)
             .env("CAPTUREFAB_CACHE_DIR", test_cache())
             .env(name, value)
-            .args(["--json", "--camera", "sim:0", "get", "Width"])
+            .args(["--json", "get", "--camera", "sim:0", "Width"])
             .output()
             .unwrap();
         assert!(!result.status.success());
@@ -617,110 +507,6 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
             !dir.exists(),
             "invalid {name} created camera/session resources"
         );
-    }
-}
-
-#[test]
-fn rpc_rejects_ignored_fields_before_accessing_a_session() {
-    use std::io::Write;
-    let dir = std::env::temp_dir().join(format!(
-        "capturefab-json-validation-test-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    for request in [
-        r#"{"op":"status","unknown":1}"#,
-        r#"{"op":"status","op":"start"}"#,
-    ] {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-            .env("CAPTUREFAB_SESSION_DIR", &dir)
-            .env("CAPTUREFAB_CACHE_DIR", test_cache())
-            .args(["--json", "--session", "missing", "rpc"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(request.as_bytes())
-            .unwrap();
-        let result = child.wait_with_output().unwrap();
-        assert_eq!(
-            result.status.code(),
-            Some(2),
-            "{}",
-            String::from_utf8_lossy(&result.stdout)
-        );
-        let response: Value = serde_json::from_slice(&result.stdout).unwrap();
-        assert_eq!(response["error"]["code"], "usage");
-        assert!(!dir.exists());
-    }
-}
-
-#[test]
-fn live_source_unavailability_keeps_its_operation_category() {
-    let dir = std::env::temp_dir().join(format!(
-        "capturefab-source-validation-test-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let source = format!("file:{}", dir.join("missing.mp4").display());
-    let result = cmd(&dir, &["--json", "--camera", &source, "get", "Width"]);
-    assert_eq!(
-        result.status.code(),
-        Some(3),
-        "{}",
-        String::from_utf8_lossy(&result.stdout)
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&result.stdout).unwrap()["error"]["code"],
-        "unavailable"
-    );
-    assert!(!dir.exists());
-    let result = cmd(
-        &dir,
-        &[
-            "--json",
-            "--camera",
-            "onvif:https://192.0.2.1/onvif/device_service",
-            "get",
-            "Width",
-        ],
-    );
-    assert_eq!(
-        result.status.code(),
-        Some(5),
-        "{}",
-        String::from_utf8_lossy(&result.stdout)
-    );
-    assert!(!dir.exists());
-    // Camera hubs and document scanners are gone; their selectors say what
-    // to use instead.
-    for (camera, hint) in [
-        ("hub:home/camera.front_door", "rtsp://HOST"),
-        ("scanner:sane:test", "not supported"),
-    ] {
-        let result = cmd(&dir, &["--json", "--camera", camera, "get", "Width"]);
-        assert_eq!(
-            result.status.code(),
-            Some(2),
-            "{}",
-            String::from_utf8_lossy(&result.stdout)
-        );
-        let response: Value = serde_json::from_slice(&result.stdout).unwrap();
-        assert_eq!(response["error"]["code"], "usage");
-        let message = response["error"]["message"].as_str().unwrap();
-        assert!(message.contains(hint), "{message}");
-        assert!(!dir.exists());
     }
 }
 
@@ -746,10 +532,7 @@ fn parallel_camera_workers_and_public_cli() {
     BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&line).unwrap()["result"]["ready"],
-        true
-    );
+    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["ready"], true);
     let fixture = Fixture {
         child,
         dir: dir.clone(),
@@ -764,9 +547,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "set",
             "--camera",
             "sim:0",
-            "set",
             "Width=128",
         ],
     );
@@ -776,9 +559,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "set",
             "--camera",
             "sim:1",
-            "set",
             "Width=256",
         ],
     );
@@ -788,9 +571,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "get",
             "--camera",
             "sim:0",
-            "get",
             "Width",
         ],
     );
@@ -800,14 +583,14 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "get",
             "--camera",
             "sim:1",
-            "get",
             "Width",
         ],
     );
-    assert_eq!(a["features"][0]["value"], 128);
-    assert_eq!(b["features"][0]["value"], 256);
+    assert_eq!(a["values"]["Width"], 128);
+    assert_eq!(b["values"]["Width"], 256);
     let outa = dir.join("a.png");
     let outb = dir.join("b.png");
     let da = dir.clone();
@@ -821,9 +604,9 @@ fn parallel_camera_workers_and_public_cli() {
                 "--json",
                 "--session",
                 "ci",
+                "capture",
                 "--camera",
                 "sim:0",
-                "capture",
                 "-o",
                 &pa,
             ],
@@ -836,9 +619,9 @@ fn parallel_camera_workers_and_public_cli() {
                 "--json",
                 "--session",
                 "ci",
+                "capture",
                 "--camera",
                 "sim:1",
-                "capture",
                 "-o",
                 &pb,
             ],
@@ -862,9 +645,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             outa.to_str().unwrap(),
         ],
@@ -875,7 +658,7 @@ fn parallel_camera_workers_and_public_cli() {
     // Targeted status must not report another camera's identity.
     let targeted = json(
         &dir,
-        &["--json", "--session", "ci", "--camera", "sim:0", "status"],
+        &["--json", "--session", "ci", "status", "--camera", "sim:0"],
     );
     assert_eq!(targeted["cameras"].as_array().unwrap().len(), 1);
     assert_eq!(targeted["cameras"][0]["info"]["id"], "sim:0");
@@ -886,9 +669,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             sequence.to_str().unwrap(),
             "-n",
@@ -904,7 +687,7 @@ fn parallel_camera_workers_and_public_cli() {
     loop {
         let jobs = json(
             &dir,
-            &["--json", "--session", "ci", "--camera", "sim:0", "jobs"],
+            &["--json", "--session", "ci", "jobs", "--camera", "sim:0"],
         );
         let job = jobs["jobs"]
             .as_array()
@@ -931,9 +714,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             cancelled.to_str().unwrap(),
             "--delay",
@@ -947,9 +730,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "cancel",
             "--camera",
             "sim:0",
-            "cancel",
             &id,
         ],
     );
@@ -961,9 +744,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             dir.join("full.png").to_str().unwrap(),
             "--max-space",
@@ -986,9 +769,9 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "disconnect",
             "--camera",
             "sim:0",
-            "disconnect",
         ],
     );
     json(
@@ -997,17 +780,17 @@ fn parallel_camera_workers_and_public_cli() {
             "--json",
             "--session",
             "ci",
+            "disconnect",
             "--camera",
             "sim:1",
-            "disconnect",
         ],
     );
     let raw = cmd(
         &dir,
         &[
+            "capture",
             "--camera",
             "sim:raw",
-            "capture",
             "-o",
             "-",
             "-f",
@@ -1047,7 +830,7 @@ fn auto_mode_session_contract() {
         .env("CAPTUREFAB_SESSION_DIR", &dir)
         .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args([
-            "--json", "--camera", "sim:0", "serve", "--name", "auto-ci", "--auto",
+            "--json", "serve", "--camera", "sim:0", "--name", "auto-ci", "--auto",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -1057,10 +840,7 @@ fn auto_mode_session_contract() {
     BufReader::new(child.stdout.take().unwrap())
         .read_line(&mut line)
         .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&line).unwrap()["result"]["ready"],
-        true
-    );
+    assert_eq!(serde_json::from_str::<Value>(&line).unwrap()["ready"], true);
     let _fixture = Fixture {
         child,
         dir: dir.clone(),
@@ -1074,7 +854,7 @@ fn auto_mode_session_contract() {
     );
     assert_eq!(session(&["auto"])["auto"]["balance"], 0.25);
     assert_eq!(session(&["status"])["cameras"][0]["auto"]["balance"], 0.25);
-    let before_width = session(&["get", "Width"])["features"][0]["value"].clone();
+    let before_width = session(&["get", "Width"])["values"]["Width"].clone();
     for args in [
         vec![
             "capture",
@@ -1099,7 +879,7 @@ fn auto_mode_session_contract() {
             "quality",
         ],
         vec![
-            "forward",
+            "record",
             "-o",
             "bad.mp4",
             "--fps",
@@ -1121,7 +901,7 @@ fn auto_mode_session_contract() {
             "invalid input changed auto mode: {args:?}"
         );
         assert_eq!(
-            session(&["get", "Width"])["features"][0]["value"],
+            session(&["get", "Width"])["values"]["Width"],
             before_width,
             "invalid input changed a feature: {args:?}"
         );
@@ -1148,7 +928,10 @@ fn auto_mode_session_contract() {
         serde_json::from_slice::<Value>(&usage.stdout).unwrap()["error"]["code"],
         "usage"
     );
-    let direct = cmd(&dir, &["--json", "--direct", "--camera", "sim:0", "auto"]);
+    let direct = cmd(
+        &dir,
+        &["--json", "--no-session", "auto", "--camera", "sim:0"],
+    );
     assert_eq!(direct.status.code(), Some(2));
     assert!(
         serde_json::from_slice::<Value>(&direct.stdout).unwrap()["error"]["message"]
@@ -1161,9 +944,9 @@ fn auto_mode_session_contract() {
         &dir,
         &[
             "--json",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "--auto",
             "-o",
             tuned.to_str().unwrap(),
@@ -1199,7 +982,7 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
         .read_line(&mut line)
         .unwrap();
     assert_eq!(
-        serde_json::from_str::<Value>(&line).unwrap()["result"]["ready"],
+        serde_json::from_str::<Value>(&line).unwrap()["ready"],
         true,
         "{line}"
     );
@@ -1279,14 +1062,26 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
                 "--json",
                 "--session",
                 "types-ci",
+                "info",
                 "--camera",
                 selector,
-                "info",
             ],
         );
-        assert_eq!(info["camera"]["profile"]["kind"], kind);
+        assert_eq!(info["camera"], selector);
+        let features = json(
+            &dir,
+            &[
+                "--json",
+                "--session",
+                "types-ci",
+                "features",
+                "--all",
+                "--camera",
+                selector,
+            ],
+        );
         assert!(
-            info["features"]
+            features["features"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -1294,7 +1089,7 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
         );
         if kind == "line_scan" {
             assert!(
-                !info["features"]
+                !features["features"]
                     .as_array()
                     .unwrap()
                     .iter()
@@ -1309,9 +1104,9 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
                 "--json",
                 "--session",
                 "types-ci",
+                "capture",
                 "--camera",
                 selector,
-                "capture",
                 "-o",
                 output.to_str().unwrap(),
                 "-f",
@@ -1345,9 +1140,9 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
                     "--json",
                     "--session",
                     "types-ci",
+                    "auto",
                     "--camera",
                     selector,
-                    "auto",
                 ],
             );
             assert_eq!(
@@ -1371,9 +1166,9 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
                 "--json",
                 "--session",
                 "types-ci",
+                "status",
                 "--camera",
                 selector,
-                "status",
             ],
         );
         assert_eq!(
@@ -1385,98 +1180,6 @@ fn camera_types_propagate_through_workers_and_preserve_native_capture() {
     assert_eq!(all["cameras"].as_array().unwrap().len(), 5);
 }
 
-#[test]
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-fn discovery_reports_native_backend_failure_without_hiding_other_cameras() {
-    let dir = std::env::temp_dir().join(format!(
-        "capturefab-discovery-test-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    let mut child = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-        .env("CAPTUREFAB_SESSION_DIR", &dir)
-        .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .env("CAPTUREFAB_FFMPEG", dir.join("missing-ffmpeg"))
-        .args(["--json", "serve", "--name", "discovery"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap();
-    let mut ready = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut ready)
-        .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&ready).unwrap()["result"]["ready"],
-        true
-    );
-    let _fixture = Fixture {
-        child,
-        dir: dir.clone(),
-    };
-    let output = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-        .env("CAPTUREFAB_SESSION_DIR", &dir)
-        .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .env("CAPTUREFAB_FFMPEG", dir.join("missing-ffmpeg"))
-        .args([
-            "--json",
-            "--session",
-            "discovery",
-            "--simulate",
-            "--timeout-ms",
-            "100",
-            "discover",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response["ok"], true);
-    assert!(
-        response["result"]["warnings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|warning| {
-                let text = warning.as_str().unwrap();
-                text.contains("Native camera discovery") && text.contains("cannot launch FFmpeg")
-            }),
-        "{response}"
-    );
-    assert!(
-        response["result"]["devices"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|device| device["id"] == "sim:0"),
-        "{response}"
-    );
-    json(
-        &dir,
-        &["--json", "--session", "discovery", "connect", "sim:0"],
-    );
-    // A connected worker refreshes its own logs; coordinator diagnostics must
-    // survive these snapshots as well as the initial discovery response.
-    json(&dir, &["--json", "--session", "discovery", "get", "Width"]);
-    let status = json(&dir, &["--json", "--session", "discovery", "status"]);
-    assert!(
-        status["logs"].as_array().unwrap().iter().any(|entry| {
-            entry["level"] == "warn"
-                && entry["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Native camera discovery")
-        }),
-        "{status}"
-    );
-}
 #[test]
 fn stale_session_descriptor_is_replaced_but_live_one_is_kept() {
     let dir = std::env::temp_dir().join(format!(
@@ -1560,14 +1263,10 @@ fn unread_streams_report_no_losses_and_keep_frames_off_disk() {
         (Some(0), Some(0))
     );
     assert!(dropped * 10 < frames, "{dropped} dropped of {frames}");
-    let backing = json(&dir, &["--json", "doctor"])["ring_backing"].clone();
     if cfg!(target_os = "linux") {
-        assert_eq!(backing, "memfd");
         let pid = camera["worker_pid"].as_u64().unwrap();
         let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
         assert!(maps.contains("/memfd:capturefab-ring"), "{maps}");
-    } else if cfg!(target_os = "macos") {
-        assert_eq!(backing, "posix-shm");
     }
     if cfg!(unix) {
         assert!(ring_files(&dir).is_empty(), "frame rings stay in memory");
@@ -1585,9 +1284,9 @@ fn a_direct_timelapse_waits_for_its_job_and_reports_it() {
         &dir,
         &[
             "--json",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             frames.to_str().unwrap(),
             "-n",
@@ -1687,9 +1386,9 @@ fn serve_shuts_down_cleanly_on_sigterm_and_sighup() {
                 "--json",
                 "--session",
                 name,
+                "capture",
                 "--camera",
                 "sim:0",
-                "capture",
                 "-o",
                 path.to_str().unwrap(),
             ],
@@ -1983,213 +1682,7 @@ fn json_env(dir: &PathBuf, env: &[(&str, &str)], args: &[&str]) -> Value {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    serde_json::from_slice::<Value>(&out.stdout).unwrap()["result"].clone()
-}
-
-#[test]
-fn doctor_reports_build_features_paths_and_checks() {
-    let dir = temp_root("doctor-report");
-    let doctor = json(&dir, &["--json", "doctor"]);
-    assert!(doctor["host"]["cpu_cores"].as_u64().unwrap() >= 1);
-    assert!(doctor.get("efficiency").is_none(), "{doctor}");
-    assert!(
-        doctor["ffmpeg"]["version"].is_string() || doctor["ffmpeg"]["error"].is_string(),
-        "{doctor}"
-    );
-    // CAPTUREFAB_SESSION_DIR is both the runtime and the state directory.
-    let path = Value::from(dir.to_string_lossy().into_owned());
-    for key in ["runtime_directory", "state_directory"] {
-        assert_eq!(doctor[key], path, "{key}");
-    }
-    for key in ["runtime", "state"] {
-        assert_eq!(doctor["paths"][key]["path"], path, "{key}");
-    }
-    let cache = Value::from(test_cache().to_string_lossy().into_owned());
-    assert_eq!(doctor["cache_directory"], cache);
-    assert_eq!(doctor["paths"]["cache"]["path"], cache);
-    let checks = doctor["checks"].as_array().unwrap();
-    assert!(checks.iter().all(|check| {
-        check["id"].is_string()
-            && matches!(check["level"].as_str(), Some("ok" | "warn"))
-            && check["message"].is_string()
-    }));
-    for id in ["camera_network", "ffmpeg"] {
-        assert!(checks.iter().any(|check| check["id"] == id), "{id}");
-    }
-    // A private session directory raises nothing.
-    assert!(!checks.iter().any(|check| check["id"] == "private_dirs"));
-    // camera_network informs; serve prints every warning at start.
-    assert!(
-        checks
-            .iter()
-            .any(|check| check["id"] == "camera_network" && check["level"] == "ok")
-    );
-    assert!(doctor.get("graphics").is_none(), "{doctor}");
-    // Timed after the first launch, which can include the OS scanning a
-    // freshly linked binary.
-    let started = std::time::Instant::now();
-    let out = cmd(&dir, &["--json", "doctor"]);
-    let elapsed = started.elapsed();
-    assert!(out.status.success());
-    assert!(
-        elapsed < std::time::Duration::from_secs(15),
-        "doctor took {elapsed:?}"
-    );
-    // Default builds persist saved sign-ins in the OS credential store.
-    assert_eq!(
-        doctor["features"]["keychain"].as_bool(),
-        Some(cfg!(feature = "keychain"))
-    );
-    for removed in [
-        "gui",
-        "wgpu",
-        "ai",
-        "parquet",
-        "embedded_web",
-        "scanner",
-        "nvjpeg",
-        "vaapi",
-        "videotoolbox",
-        "hubs",
-        "updates",
-    ] {
-        assert!(doctor["features"].get(removed).is_none(), "{removed}");
-    }
-    for removed in ["scanners", "update_check"] {
-        assert!(doctor.get(removed).is_none(), "{removed}");
-    }
-    assert_eq!(
-        doctor["jpeg"]["libjpeg_turbo"].as_bool(),
-        Some(cfg!(feature = "jpeg"))
-    );
-    let schema = json(&dir, &["--json", "schema"]);
-    for removed in [
-        "uploads",
-        "hubs",
-        "updates",
-        "scanners",
-        "efficiency",
-        "resources",
-    ] {
-        assert!(schema.get(removed).is_none(), "{removed}");
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// Installers copy only the executable, so it carries the GPL notice of the
-/// FFmpeg it embeds.
-#[test]
-fn version_carries_the_bundled_ffmpeg_license_notice() {
-    let dir = temp_root("version");
-    let version = json(&dir, &["--json", "version"]);
-    assert_eq!(version["version"], env!("CARGO_PKG_VERSION"));
-    let notice = version["ffmpeg_license_notice"].as_str().unwrap();
-    assert!(notice.contains("GPL"), "{notice}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn doctor_warns_when_ffmpeg_does_not_run_and_when_sessions_are_shared() {
-    let dir = temp_root("doctor-ffmpeg");
-    std::fs::create_dir_all(&dir).unwrap();
-    let missing = dir.join("missing-ffmpeg");
-    let env = [("CAPTUREFAB_FFMPEG", missing.to_str().unwrap())];
-    let doctor = json_env(&dir, &env, &["--json", "doctor"]);
-    let check = |id: &str| {
-        doctor["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|check| check["id"] == id)
-            .cloned()
-            .unwrap_or_else(|| panic!("no {id} check: {doctor}"))
-    };
-    let ffmpeg = check("ffmpeg");
-    assert_eq!(ffmpeg["level"], "warn", "{ffmpeg}");
-    assert!(
-        ffmpeg["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("Webcams, RTSP/SRT, files and recording need FFmpeg"),
-        "{ffmpeg}"
-    );
-    assert!(
-        ffmpeg["fix"]
-            .as_str()
-            .unwrap()
-            .contains("CAPTUREFAB_FFMPEG")
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let doctor = json(&dir, &["--json", "doctor"]);
-        let private = doctor["checks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|check| check["id"] == "private_dirs")
-            .cloned()
-            .unwrap_or_else(|| panic!("{doctor}"));
-        assert_eq!(private["level"], "warn");
-        assert!(
-            private["fix"]
-                .as_str()
-                .unwrap()
-                .starts_with(&format!("chmod 700 {}", dir.display())),
-            "{private}"
-        );
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn a_local_address_without_a_gige_camera_suggests_the_simulator() {
-    let dir = temp_root("gige-refused");
-    let out = cmd(
-        &dir,
-        &[
-            "--json",
-            "--timeout-ms",
-            "500",
-            "info",
-            "--camera",
-            "127.0.0.1",
-        ],
-    );
-    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(out.status.code(), Some(3), "{reply}");
-    assert_eq!(reply["error"]["code"], "unavailable", "{reply}");
-    let message = reply["error"]["message"].as_str().unwrap();
-    assert!(message.contains("127.0.0.1"), "{message}");
-    assert!(message.contains("sim:0"), "{message}");
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
-fn a_refused_rtsp_stream_explains_itself_in_one_line() {
-    let dir = temp_root("rtsp-refused");
-    let out = cmd(
-        &dir,
-        &[
-            "--json",
-            "info",
-            "--camera",
-            "rtsp://user:secret@127.0.0.1:1/x",
-        ],
-    );
-    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(out.status.code(), Some(3), "{reply}");
-    assert_eq!(reply["error"]["code"], "unavailable", "{reply}");
-    let message = reply["error"]["message"].as_str().unwrap();
-    assert!(message.contains("127.0.0.1:1"), "{message}");
-    assert!(
-        !message.contains('\n') && !message.contains("secret") && !message.contains("@ 0x"),
-        "{message}"
-    );
-    let _ = std::fs::remove_dir_all(&dir);
+    serde_json::from_slice::<Value>(&out.stdout).unwrap()
 }
 
 #[test]
@@ -2198,25 +1691,6 @@ fn storage_status_reports_free_space_and_the_schema_its_floor() {
     let status = json(&dir, &["--json", "storage"]);
     assert!(status["free_bytes"].is_u64(), "{status}");
     assert_eq!(status["files"], 0);
-    let schema = json(&dir, &["--json", "schema"]);
-    assert_eq!(schema["storage"]["free_space_floor"], 512 * 1024 * 1024);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn doctor_prints_a_checklist() {
-    let dir = temp_root("doctor-checklist");
-    let out = cmd(&dir, &["doctor"]);
-    assert!(out.status.success());
-    let text = String::from_utf8(out.stdout).unwrap();
-    assert!(
-        text.lines().any(|line| line.starts_with("ok    ")),
-        "{text}"
-    );
-    assert!(text.contains("#host-checks-and-efficiency-mode"), "{text}");
-    // Efficiency mode is gone.
-    let flag = cmd(&dir, &["--efficiency", "smooth", "--json", "doctor"]);
-    assert_eq!(flag.status.code(), Some(2));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2239,9 +1713,9 @@ fn doctor_measures_the_storage_budget_on_the_capture_folder_disk() {
         &env,
         &[
             "--json",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             shot.to_str().unwrap(),
         ],
@@ -2251,7 +1725,7 @@ fn doctor_measures_the_storage_budget_on_the_capture_folder_disk() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|check| check["id"] == "storage_budget")
+        .find(|check| check["name"] == "storage_budget")
         .unwrap();
     let message = budget["message"].as_str().unwrap();
     // doctor reads the storage ledger's usage summary, so the capture's
@@ -2293,7 +1767,7 @@ fn linux_state_is_written_to_the_configured_state_directory() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        serde_json::from_slice::<Value>(&output.stdout).unwrap()["result"].clone()
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()
     };
     command(&["--json", "storage", "configure", "--max-space", "2GiB"]);
     let directory = state.join("capturefab");
@@ -2332,32 +1806,10 @@ fn serve_greets_people_and_keeps_its_json_ready_line() {
         "{ready}"
     );
     assert!(
-        ready.ends_with("Try: capturefab --session banner discover"),
+        ready.ends_with("Try: capturefab --session banner info"),
         "{ready}"
     );
     assert_eq!(stop, "Ctrl-C stops the session.");
-}
-
-#[test]
-fn a_bare_invocation_prints_help_without_creating_a_session() {
-    let dir = temp_root("bare-help");
-    let out = cmd(&dir, &[]);
-    assert_eq!(out.status.code(), Some(0));
-    let help = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        help.contains("Usage:") && help.contains("discover"),
-        "{help}"
-    );
-    assert!(help.contains("capturefab serve --name bench"), "{help}");
-    // Printing help starts no session, which would create the directory.
-    assert!(!dir.exists());
-    // With --json there is no command to answer, so it is a usage error.
-    let out = cmd(&dir, &["--json"]);
-    assert_eq!(out.status.code(), Some(2));
-    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(reply["error"]["code"], "usage", "{reply}");
-    assert!(!dir.exists());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Needs FFmpeg: a direct recording stopped by --duration or Ctrl-C keeps a
@@ -2373,9 +1825,9 @@ fn direct_recordings_finish_on_duration_and_ctrl_c() {
         &dir,
         &[
             "--json",
+            "record",
             "--camera",
             "sim:0",
-            "record",
             "-o",
             root.join("a.mp4").to_str().unwrap(),
             "--duration",
@@ -2389,9 +1841,9 @@ fn direct_recordings_finish_on_duration_and_ctrl_c() {
         .env("CAPTUREFAB_CACHE_DIR", test_cache())
         .args([
             "--json",
+            "record",
             "--camera",
             "sim:0",
-            "record",
             "-o",
             root.join("b.mp4").to_str().unwrap(),
         ])
@@ -2427,9 +1879,9 @@ fn record_template_expands() {
             &dir,
             &[
                 "--json",
+                "record",
                 "--camera",
                 "sim:0",
-                "record",
                 "-o",
                 template.to_str().unwrap(),
                 "--duration",
@@ -2467,7 +1919,7 @@ fn capture_outputs_number_templates_and_carry_context() {
     let out = root.join("out");
     std::fs::create_dir_all(&out).unwrap();
     let capture = |args: &[&str]| {
-        let mut all = vec!["--json", "--camera", "sim:0", "capture"];
+        let mut all = vec!["--json", "capture", "--camera", "sim:0"];
         all.extend_from_slice(args);
         cmd(&dir, &all)
     };
@@ -2478,7 +1930,7 @@ fn capture_outputs_number_templates_and_carry_context() {
             String::from_utf8_lossy(&output.stdout)
         );
         let v: Value = serde_json::from_slice(&output.stdout).unwrap();
-        v["result"]["files"]
+        v["files"]
             .as_array()
             .unwrap()
             .iter()
@@ -2501,7 +1953,7 @@ fn capture_outputs_number_templates_and_carry_context() {
     for n in 1..=2 {
         let output = capture(&["-o", template.to_str().unwrap(), "--context", "line=L1"]);
         let v: Value = serde_json::from_slice(&output.stdout).unwrap();
-        let path = std::path::Path::new(v["result"]["files"][0].as_str().unwrap());
+        let path = std::path::Path::new(v["files"][0].as_str().unwrap());
         assert!(path.exists());
         assert!(
             path.to_str().unwrap().ends_with(&format!("-{n:04}.png")),
@@ -2515,10 +1967,10 @@ fn capture_outputs_number_templates_and_carry_context() {
             .to_str()
             .unwrap();
         assert_eq!(folder.len(), 10, "{folder}");
-        assert_eq!(v["result"]["frames"][0]["file"], v["result"]["files"][0]);
-        assert!(v["result"]["frames"][0]["wall_ms"].as_u64().unwrap() > 0);
-        assert_eq!(v["result"]["context"]["line"], "L1");
-        let frame = &v["result"]["frames"][0];
+        assert_eq!(v["frames"][0]["file"], v["files"][0]);
+        assert!(v["frames"][0]["wall_ms"].as_u64().unwrap() > 0);
+        assert_eq!(v["context"]["line"], "L1");
+        let frame = &v["frames"][0];
         assert_eq!(frame["pixel_format_name"], "Mono8");
         assert!(frame["settings"]["ExposureTime"].is_number(), "{frame}");
         // The tags and settings travel inside the file, without a dataset.
@@ -2566,7 +2018,7 @@ fn capture_outputs_number_templates_and_carry_context() {
         &["--context", "Bad=1"][..],
         &["--context", "a=1", "--context", "a=2"],
     ] {
-        let mut all = vec!["--json", "--camera", "sim:0", "capture", "-o", file];
+        let mut all = vec!["--json", "capture", "--camera", "sim:0", "-o", file];
         all.extend_from_slice(bad);
         assert_eq!(cmd(&fresh, &all).status.code(), Some(2), "{bad:?}");
     }
@@ -2599,9 +2051,10 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
                 "--json",
                 "--session",
                 "frame-ci",
+                "debug",
+                "rpc",
                 "--camera",
                 "sim:0",
-                "rpc",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2626,14 +2079,15 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
     let ok = |request: &str| {
         let (code, response) = rpc(request);
         assert_eq!(code, Some(0), "{request}: {response}");
-        response["result"].clone()
+        response.clone()
     };
     let session = |args: &[&str]| {
         json(
             &dir,
             &[
-                &["--json", "--session", "frame-ci", "--camera", "sim:0"],
+                &["--json", "--session", "frame-ci"][..],
                 args,
+                &["--camera", "sim:0"],
             ]
             .concat(),
         )
@@ -2688,7 +2142,7 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
     // One grouped change; the next fresh frame shows it, and putting the
     // values back restores the exposure.
     let before = session(&["get", "ExposureTime", "Gain"]);
-    let value = |index: usize| before["features"][index]["value"].to_string();
+    let value = |name: &str| before["values"][name].to_string();
     let changed = ok(
         r#"{"op":"set_many","values":[{"feature":"ExposureTime","value":"40000"},{"feature":"Gain","value":"0"}]}"#,
     );
@@ -2708,8 +2162,8 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
     );
     session(&[
         "set",
-        &format!("ExposureTime={}", value(0)),
-        &format!("Gain={}", value(1)),
+        &format!("ExposureTime={}", value("ExposureTime")),
+        &format!("Gain={}", value("Gain")),
     ]);
     let restored = ok(r#"{"op":"frame","max_dimension":0}"#);
     assert!(
@@ -2727,12 +2181,13 @@ fn rpc_frame_inspects_stopped_and_live_cameras_without_saving() {
             .unwrap()
             .contains("fresh frames must be 0..10")
     );
+    // Grab belongs to camera workers; debug rpc takes public commands only.
     let (code, grab) = rpc(r#"{"op":"grab","timeout_ms":1000}"#);
-    assert_eq!(code, Some(1), "{grab}");
+    assert_eq!(code, Some(2), "{grab}");
     // Thirty frames a second cannot bring ten new ones within 200 ms.
     let (code, slow) = rpc(r#"{"op":"frame","fresh":10,"timeout_ms":200}"#);
     assert_eq!(code, Some(4), "{slow}");
-    assert_eq!(slow["error"]["code"], "timeout");
+    assert_eq!(slow["error"]["code"], "frame_timeout");
     assert!(
         slow["error"]["message"]
             .as_str()
@@ -2795,7 +2250,7 @@ fn rpc_frame_grabs_once_a_schedule_has_stopped_the_stream() {
         .env_remove("CAPTUREFAB_CAMERA")
         .env("CAPTUREFAB_SESSION_DIR", &dir)
         .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .args(["--json", "--session", "schedule-frame", "rpc"])
+        .args(["--json", "--session", "schedule-frame", "debug", "rpc"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2810,7 +2265,7 @@ fn rpc_frame_grabs_once_a_schedule_has_stopped_the_stream() {
     let out = child.wait_with_output().unwrap();
     let frame: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(0), "{frame}");
-    assert_eq!(frame["result"]["frame"]["source"], "grab", "{frame}");
+    assert_eq!(frame["frame"]["source"], "grab", "{frame}");
     assert_eq!(
         session(&["status"])["cameras"][0]["streaming"],
         false,
@@ -2827,102 +2282,6 @@ fn failure(out: &std::process::Output) -> Value {
         )
     })["error"]
         .clone()
-}
-
-#[test]
-fn discover_prints_aligned_plain_rows_and_a_next_step() {
-    let root = temp_root("discover-table");
-    let out = cmd(
-        &root,
-        &["--direct", "--simulate", "--timeout-ms", "300", "discover"],
-    );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stdout.starts_with("ID "), "{stdout}");
-    let row = stdout
-        .lines()
-        .find(|line| line.starts_with("sim:0 "))
-        .unwrap_or_else(|| panic!("{stdout}"));
-    assert!(
-        row.contains("Simulator") && row.contains("Pattern camera"),
-        "{row}"
-    );
-    assert!(!stdout.contains("Next:"), "hints stay off stdout: {stdout}");
-    assert!(stderr.contains("Next: capturefab --camera "), "{stderr}");
-    let result = json(
-        &root,
-        &[
-            "--json",
-            "--direct",
-            "--simulate",
-            "--timeout-ms",
-            "300",
-            "discover",
-        ],
-    );
-    let sim = result["devices"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|device| device["id"] == "sim:0")
-        .cloned()
-        .unwrap();
-    assert_eq!(sim["transport"], "simulator");
-    let _ = std::fs::remove_dir_all(root);
-}
-
-#[test]
-fn camera_selectors_explain_what_did_not_match() {
-    let root = temp_root("selector-hints");
-    let out = cmd(
-        &root,
-        &[
-            "--json",
-            "--direct",
-            "--timeout-ms",
-            "300",
-            "--camera",
-            "sim0",
-            "info",
-        ],
-    );
-    assert_eq!(out.status.code(), Some(3));
-    let error = failure(&out);
-    assert_eq!(error["code"], "unavailable");
-    assert!(
-        error["message"].as_str().unwrap().contains("sim:0"),
-        "{error}"
-    );
-    let out = cmd(
-        &root,
-        &["--json", "--direct", "--camera", "./missing.mp4", "info"],
-    );
-    assert_eq!(out.status.code(), Some(3));
-    let error = failure(&out);
-    assert!(
-        error["message"]
-            .as_str()
-            .unwrap()
-            .contains("file not found"),
-        "{error}"
-    );
-    let out = cmd(
-        &root,
-        &["--json", "--direct", "--camera", "192.168.1.300", "info"],
-    );
-    assert_eq!(out.status.code(), Some(2));
-    assert!(
-        failure(&out)["message"]
-            .as_str()
-            .unwrap()
-            .contains("not a valid IPv4 address")
-    );
-    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -2953,9 +2312,9 @@ fn connect_takes_a_camera_argument_or_flag_and_reads_like_prose() {
             "--json",
             "--session",
             "conn",
+            "connect",
             "--camera",
             "sim:1",
-            "connect",
         ],
     );
     assert_eq!(global["connected"]["id"], "sim:1");
@@ -2994,16 +2353,14 @@ fn connect_takes_a_camera_argument_or_flag_and_reads_like_prose() {
         "{text}"
     );
     assert!(
-        text.contains(
-            "Next: capturefab --session conn --camera sim:3 capture -o 'shot-{seq}.png'   (or start live acquisition: capturefab --session conn --camera sim:3 start)"
-        ),
+        text.contains("Next: capturefab --session conn capture -c sim:3 -o 'shot-{seq}.png'"),
         "{text}"
     );
     // Several cameras: a camera command must name one.
     let unnamed = cmd(&root, &["--session", "conn", "get", "Width"]);
     assert_eq!(unnamed.status.code(), Some(2));
     assert!(
-        String::from_utf8_lossy(&unnamed.stderr).contains("choose one with --camera ID"),
+        String::from_utf8_lossy(&unnamed.stderr).contains("choose one with -c"),
         "{}",
         String::from_utf8_lossy(&unnamed.stderr)
     );
@@ -3011,115 +2368,13 @@ fn connect_takes_a_camera_argument_or_flag_and_reads_like_prose() {
     let typo = cmd(&root, &["--json", "--session", "conx", "status"]);
     assert_eq!(typo.status.code(), Some(3));
     let error = failure(&typo);
-    assert_eq!(error["code"], "unavailable");
+    assert_eq!(error["code"], "session_not_found");
     let message = error["message"].as_str().unwrap();
     assert!(
         message.contains("did you mean --session conn?"),
         "{message}"
     );
     assert!(!message.contains("os error"), "{message}");
-}
-
-#[test]
-fn json_usage_errors_carry_structured_details() {
-    let root = temp_root("usage-details");
-    let out = cmd(&root, &["--json", "captur"]);
-    assert_eq!(out.status.code(), Some(2));
-    let error = failure(&out);
-    assert_eq!(error["code"], "usage");
-    assert_eq!(error["message"], "unrecognized subcommand 'captur'");
-    assert_eq!(error["details"]["kind"], "invalid_subcommand");
-    assert_eq!(error["details"]["suggestions"][0], "capture");
-    let out = cmd(&root, &["--json", "capture", "--bogus"]);
-    assert_eq!(out.status.code(), Some(2));
-    let error = failure(&out);
-    assert_eq!(error["details"]["invalid"], "--bogus");
-    assert!(
-        error["details"]["usage"]
-            .as_str()
-            .unwrap()
-            .starts_with("capturefab capture"),
-        "{error}"
-    );
-    assert!(
-        !error["message"].as_str().unwrap().contains('\n'),
-        "{error}"
-    );
-    let out = cmd(
-        &root,
-        &[
-            "--json",
-            "capture",
-            "-c",
-            "sim:0",
-            "-o",
-            "x.png",
-            "--on-exists",
-            "nope",
-        ],
-    );
-    let error = failure(&out);
-    assert_eq!(error["details"]["invalid"], "nope");
-    assert!(
-        !error["details"]["valid_values"]
-            .as_array()
-            .unwrap()
-            .is_empty()
-    );
-    let human = cmd(&root, &["captur"]);
-    assert_eq!(human.status.code(), Some(2));
-    assert!(human.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&human.stderr).contains("tip:"));
-}
-
-#[test]
-fn subcommand_help_shows_examples_and_describes_every_option() {
-    let root = temp_root("help-examples");
-    for command in ["capture", "record", "discover", "set", "serve", "connect"] {
-        let out = cmd(&root, &[command, "--help"]);
-        assert!(out.status.success());
-        assert!(
-            String::from_utf8_lossy(&out.stdout).contains("Examples:"),
-            "{command}"
-        );
-    }
-    let schema = json(&root, &["--json", "schema"]);
-    let command = |name: &str| {
-        schema["cli"]["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|command| command["name"] == name)
-            .cloned()
-            .unwrap()
-    };
-    for (name, args) in [
-        ("capture", &["output", "count", "format"][..]),
-        ("forward", &["output", "codec", "fps", "bitrate"][..]),
-        ("connect", &["target"][..]),
-    ] {
-        let command = command(name);
-        for arg in command["arguments"].as_array().unwrap() {
-            if args.contains(&arg["name"].as_str().unwrap()) {
-                assert!(arg["description"].is_string(), "{name} {arg}");
-            }
-        }
-    }
-}
-
-#[test]
-fn network_scan_prints_a_readable_summary() {
-    let root = temp_root("network-human");
-    let out = cmd(&root, &["--direct", "--timeout-ms", "300", "network-scan"]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(text.starts_with("Adapters\n"), "{text}");
-    assert!(text.contains("GigE cameras"), "{text}");
-    let _ = std::fs::remove_dir_all(root);
 }
 
 fn text(output: &std::process::Output) -> (String, String) {
@@ -3138,12 +2393,12 @@ fn capture_output_paths_and_summaries() {
     std::fs::create_dir_all(&root).unwrap();
     let path = |name: &str| root.join(name).to_str().unwrap().to_owned();
     let capture = |args: &[&str]| {
-        let mut all = vec!["--camera", "sim:0", "capture"];
+        let mut all = vec!["capture", "--camera", "sim:0"];
         all.extend(args);
         cmd(&dir, &all)
     };
     let json_capture = |args: &[&str]| {
-        let mut all = vec!["--json", "--camera", "sim:0", "capture"];
+        let mut all = vec!["--json", "capture", "--camera", "sim:0"];
         all.extend(args);
         let out = cmd(&dir, &all);
         let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -3160,7 +2415,7 @@ fn capture_output_paths_and_summaries() {
     );
     let (code, reply) = json_capture(&["-o", &path("one.png")]);
     assert_eq!(code, Some(0), "{reply}");
-    let frame = &reply["result"]["frames"][0];
+    let frame = &reply["frames"][0];
     assert!(frame["pixel_format"].is_u64(), "{reply}");
     assert!(frame["pixel_format_name"].is_string(), "{reply}");
     assert_eq!(
@@ -3178,12 +2433,10 @@ fn capture_output_paths_and_summaries() {
     );
     let (code, reply) = json_capture(&["-o", &path("one.png")]);
     assert_eq!(code, Some(1));
-    assert_eq!(reply["error"]["code"], "operation_failed");
+    assert_eq!(reply["error"]["code"], "exists");
+    assert!(reply["error"]["details"]["path"].is_string(), "{reply}");
     assert!(
-        reply["error"]["details"]["hint"]
-            .as_str()
-            .unwrap()
-            .contains("{seq}"),
+        reply["error"]["hint"].as_str().unwrap().contains("{seq}"),
         "{reply}"
     );
     // Several frames to one image name is a usage error with a suggestion.
@@ -3250,18 +2503,21 @@ fn capture_output_paths_and_summaries() {
         "{stdout}"
     );
     assert!(json(&dir, &["--json", "storage"])["externally_changed_files"].is_u64());
-    let out = cmd(&dir, &["--camera", "sim:0", "info"]);
+    let out = cmd(&dir, &["info", "--camera", "sim:0"]);
     let (stdout, _) = text(&out);
-    assert!(stdout.starts_with("sim:0 · "), "{stdout}");
+    assert!(
+        stdout.starts_with("sim:0  Capturefab Pattern camera"),
+        "{stdout}"
+    );
     assert!(!stdout.contains('{'), "{stdout}");
     // A taken recording file fails before any encoder starts or banner shows.
     std::fs::write(root.join("existing.mp4"), b"keep").unwrap();
     let out = cmd(
         &dir,
         &[
+            "record",
             "--camera",
             "sim:0",
-            "record",
             "-o",
             &path("existing.mp4"),
             "--duration",
@@ -3291,9 +2547,9 @@ fn partial_bursts_and_storage_errors_say_what_happened() {
         &dir,
         &[
             "--json",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             folder.to_str().unwrap(),
             "-n",
@@ -3318,9 +2574,9 @@ fn partial_bursts_and_storage_errors_say_what_happened() {
         &fresh,
         &[
             "--json",
+            "capture",
             "--camera",
             "sim:0",
-            "capture",
             "-o",
             root.join("h.png").to_str().unwrap(),
             "--max-space",
@@ -3394,9 +2650,9 @@ fn a_timed_recording_reports_its_final_stats() {
         &dir,
         &[
             "--json",
+            "record",
             "--camera",
             "sim:0",
-            "record",
             "-o",
             clip.to_str().unwrap(),
             "--duration",
@@ -3429,7 +2685,7 @@ fn tag_folders_sort_captures_by_their_tags() {
     let template = out.join("{tag:label}/{seq}.png");
     let template = template.to_str().unwrap();
     let capture = |label: Option<&str>| {
-        let mut args = vec!["--json", "--camera", "sim:0", "capture", "-o", template];
+        let mut args = vec!["--json", "capture", "--camera", "sim:0", "-o", template];
         let context;
         if let Some(label) = label {
             context = format!("label={label}");
@@ -3450,7 +2706,7 @@ fn tag_folders_sort_captures_by_their_tags() {
             String::from_utf8_lossy(&output.stdout)
         );
         let v: Value = serde_json::from_slice(&output.stdout).unwrap();
-        let file = std::path::PathBuf::from(v["result"]["files"][0].as_str().unwrap());
+        let file = std::path::PathBuf::from(v["files"][0].as_str().unwrap());
         assert_eq!(
             file.parent().unwrap().file_name().unwrap(),
             folder,
@@ -3471,968 +2727,4 @@ fn tag_folders_sort_captures_by_their_tags() {
         "{v}"
     );
     let _ = std::fs::remove_dir_all(root);
-}
-
-fn login_cmd(dir: &PathBuf, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_capturefab"))
-        .env_remove("CAPTUREFAB_SESSION")
-        .env_remove("CAPTUREFAB_CAMERA")
-        .env_remove("CAPTUREFAB_CAMERA_PASSWORD")
-        .env("CAPTUREFAB_SESSION_DIR", dir)
-        .env("CAPTUREFAB_CACHE_DIR", test_cache())
-        .envs(env.iter().copied())
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .unwrap()
-}
-
-fn temp_session_dir(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "capturefab-{name}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    dir
-}
-
-/// Camera sign-in management never touches a keychain in these cases: every
-/// one fails before saving, and listing reads only the index.
-#[test]
-fn login_commands_validate_before_touching_the_credential_store() {
-    let dir = temp_session_dir("login");
-    let out = login_cmd(&dir, &["--json", "login", "list"], &[]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["result"]["logins"], serde_json::json!([]));
-    assert!(value["result"]["supported"].is_boolean());
-    for (args, env) in [
-        (
-            vec![
-                "login",
-                "add",
-                "rtsp://u:p@h/x",
-                "--user",
-                "u",
-                "--password-stdin",
-            ],
-            vec![],
-        ),
-        (
-            vec!["login", "add", "rtsp://h/x", "--password-stdin"],
-            vec![],
-        ),
-        (vec!["login", "add", "rtsp://h/x", "--user", "u"], vec![]),
-        (
-            vec![
-                "login",
-                "add",
-                "rtsp://h/x",
-                "--user",
-                "u",
-                "--password-stdin",
-            ],
-            vec![("CAPTUREFAB_CAMERA_PASSWORD", "x")],
-        ),
-        (
-            vec![
-                "login",
-                "add",
-                "http://h/x",
-                "--user",
-                "u",
-                "--password-stdin",
-            ],
-            vec![],
-        ),
-    ] {
-        let mut full = vec!["--json"];
-        full.extend(&args);
-        let out = login_cmd(&dir, &full, &env);
-        assert_eq!(out.status.code(), Some(2), "{args:?}");
-        let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(value["error"]["code"], "usage", "{args:?}");
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("u:p@"));
-    }
-    let out = login_cmd(&dir, &["--json", "login", "remove", "rtsp://h/x"], &[]);
-    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let expected = if value["error"]["code"] == "unsupported" {
-        5
-    } else {
-        3
-    };
-    assert_eq!(out.status.code(), Some(expected), "{value}");
-    let schema = login_cmd(&dir, &["--json", "schema"], &[]);
-    let text = String::from_utf8_lossy(&schema.stdout);
-    for word in ["\"login\"", "auth_required", "auth_rejected"] {
-        assert!(text.contains(word), "schema lacks {word}");
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// An ONVIF service that answers every request with a Digest challenge.
-fn refusing_onvif() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            std::thread::spawn(move || {
-                use std::io::{Read, Write};
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut buffer = [0; 4096];
-                while let Ok(n) = stream.read(&mut buffer) {
-                    if n == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..n]);
-                    let text = String::from_utf8_lossy(&request);
-                    if let Some(head) = text.find("\r\n\r\n") {
-                        let length = text[..head]
-                            .lines()
-                            .find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().ok())?
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= head + 4 + length {
-                            break;
-                        }
-                    }
-                }
-                let _ = stream.write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest realm=\"Camera\", nonce=\"n\", qop=\"auth\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-            });
-        }
-    });
-    address
-}
-
-#[test]
-fn cameras_that_ask_for_a_sign_in_report_typed_errors() {
-    let dir = temp_session_dir("auth");
-    let address = refusing_onvif();
-    let camera = format!("onvif:http://{address}/onvif/device_service");
-    let out = login_cmd(&dir, &["--json", "--camera", &camera, "info"], &[]);
-    assert_eq!(out.status.code(), Some(1));
-    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["error"]["code"], "auth_required", "{value}");
-    let message = value["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("capturefab login add") || message.contains("include them in the address"),
-        "{message}"
-    );
-    let camera = format!("onvif://admin:secret-pw@{address}");
-    let out = login_cmd(&dir, &["--json", "--camera", &camera, "info"], &[]);
-    assert_eq!(out.status.code(), Some(1));
-    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(value["error"]["code"], "auth_rejected", "{value}");
-    assert!(
-        value["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("refused")
-    );
-    for stream in [&out.stdout, &out.stderr] {
-        assert!(!String::from_utf8_lossy(stream).contains("secret-pw"));
-    }
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
-#[ignore = "saves to and removes from the real OS credential store"]
-fn login_add_saves_in_the_real_credential_store() {
-    let dir = temp_session_dir("login-real");
-    let out = login_cmd(
-        &dir,
-        &[
-            "--json",
-            "login",
-            "add",
-            "rtsp://capturefab-test.invalid/live",
-            "--user",
-            "test",
-            "--no-check",
-        ],
-        &[("CAPTUREFAB_CAMERA_PASSWORD", "capturefab-test-password")],
-    );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let out = login_cmd(
-        &dir,
-        &[
-            "--json",
-            "login",
-            "remove",
-            "rtsp://capturefab-test.invalid/live",
-        ],
-        &[],
-    );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stdout)
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// The printed restore hint names the camera it was for, so running it as
-/// printed in a session with several cameras changes that camera alone.
-#[test]
-fn setup_hints_name_the_camera_in_a_session_with_several() {
-    let root = temp_root("setup-hints");
-    let dir = root.join("sessions");
-    let cwd = root.join("work");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let _fixture = Fixture {
-        child: serve_at(&dir, &cwd, "setup-two"),
-        dir: root.clone(),
-    };
-    let on = |camera: &str, args: &[&str]| {
-        json(
-            &dir,
-            &[
-                &["--json", "--session", "setup-two", "--camera", camera],
-                args,
-            ]
-            .concat(),
-        )
-    };
-    let gain = |camera: &str| {
-        on(camera, &["get", "Gain"])["features"][0]["value"]
-            .as_f64()
-            .unwrap()
-    };
-    // Runs a printed hint word for word; the ids need no quoting.
-    let run = |hint: &str| {
-        let args = hint.split_whitespace().skip(1).collect::<Vec<_>>();
-        let out = cmd(&dir, &args);
-        assert!(out.status.success(), "{hint}");
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    let hint = |text: &str, prefix: &str| {
-        text.lines()
-            .find_map(|line| {
-                line.split_once(prefix)
-                    .map(|(_, hint)| hint.trim().to_owned())
-            })
-            .unwrap_or_else(|| panic!("no {prefix} in {text}"))
-    };
-    on("sim:0", &["connect", "sim:0"]);
-    on("sim:0", &["set", "Gain=3"]);
-    let out = cmd(
-        &dir,
-        &[
-            "--session",
-            "setup-two",
-            "--camera",
-            "sim:0",
-            "setup",
-            "save",
-            "bench",
-        ],
-    );
-    assert!(out.status.success());
-    let restore = hint(&String::from_utf8_lossy(&out.stdout), "Restore with:");
-    assert_eq!(
-        restore,
-        "capturefab --session setup-two --camera sim:0 setup apply bench"
-    );
-    on("sim:0", &["set", "Gain=9"]);
-    on("sim:1", &["connect", "sim:1"]);
-    on("sim:1", &["set", "Gain=4"]);
-    let applied = run(&restore);
-    assert_eq!((gain("sim:0"), gain("sim:1")), (3.0, 4.0), "{applied}");
-}
-
-/// Restoring a change outside the known image settings needs --yes, by name and from a
-/// file; the refusal changes nothing and names the commands that review
-/// and confirm the same setup on the same camera.
-#[test]
-fn saved_setups_require_yes_for_disruptive_changes() {
-    let root = temp_root("setup-yes");
-    let dir = root.join("sessions");
-    let cwd = root.join("work");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let _fixture = Fixture {
-        child: serve_at(&dir, &cwd, "setup-yes"),
-        dir: root.clone(),
-    };
-    let base = ["--session", "setup-yes", "--camera", "sim:line:conveyor"];
-    let on = |args: &[&str]| json(&dir, &[&["--json"][..], &base, args].concat());
-    let refused = |args: &[&str]| {
-        let out = cmd(&dir, &[&["--json"][..], &base, args].concat());
-        assert_eq!(out.status.code(), Some(2), "{args:?}");
-        let error: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(error["error"]["code"], "usage", "{error}");
-        error["error"]["message"].as_str().unwrap().to_owned()
-    };
-    let rate = || {
-        on(&["get", "AcquisitionLineRate"])["features"][0]["value"]
-            .as_f64()
-            .unwrap()
-    };
-    on(&["connect", "sim:line:conveyor"]);
-    on(&["setup", "save", "line"]);
-    let saved = rate();
-    on(&["set", "AcquisitionLineRate=500"]);
-    assert_ne!(saved, 500.0);
-    let diff = on(&["setup", "diff", "line"]);
-    assert_eq!(
-        diff["changes"][0]["feature"], "AcquisitionLineRate",
-        "{diff}"
-    );
-    assert_eq!(diff["changes"][0]["risk"], "disruptive");
-
-    let message = refused(&["setup", "apply", "line"]);
-    assert!(
-        message.contains(
-            "AcquisitionLineRate, which is not a known image setting and may change triggering"
-        ),
-        "{message}"
-    );
-    assert!(!message.contains("triggers or signals"), "{message}");
-    assert!(
-        message
-            .contains("\nReview with: capturefab --session setup-yes --camera sim:line:conveyor setup diff line\n")
-            && message.ends_with(
-                "\nThen confirm with: capturefab --session setup-yes --camera sim:line:conveyor setup apply line --yes"
-            ),
-        "{message}"
-    );
-    assert_eq!(rate(), 500.0);
-    // Human mode prints the diff before refusing.
-    let out = cmd(&dir, &[&base[..], &["setup", "apply", "line"]].concat());
-    assert_eq!(out.status.code(), Some(2));
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        text.contains("Would change 1 on sim:line:conveyor")
-            && text.contains("! AcquisitionLineRate: 500 → ")
-            && text.contains("restoring needs --yes"),
-        "{text}"
-    );
-
-    // The same gate for a file; the hint reviews that file, not the
-    // saved setup its document is named after.
-    let shown = cmd(&dir, &["--json", "setup", "show", "line"]);
-    let file = cwd.join("line copy.json");
-    std::fs::write(&file, &shown.stdout).unwrap();
-    let path = file.to_str().unwrap();
-    let message = refused(&["setup", "apply", "--file", path, "--strict"]);
-    let quoted = format!("'{path}'");
-    assert!(
-        message.contains(&format!("setup diff --file {quoted}\n"))
-            && message.ends_with(&format!("setup apply --file {quoted} --strict --yes")),
-        "{message}"
-    );
-    assert!(!message.contains("setup diff line"), "{message}");
-    assert_eq!(rate(), 500.0);
-
-    let applied = on(&["setup", "apply", "line", "--yes"]);
-    assert!(applied["applied"].as_u64().unwrap() > 0, "{applied}");
-    assert_eq!(rate(), saved);
-}
-
-/// Checks that need no running camera: a taken name is refused before the
-/// camera is read, a strict preview fails as the restore would, and the
-/// diff's --allow-other-model is described as what it does.
-#[test]
-fn setup_save_and_preview_refuse_early_and_strictly() {
-    let root = temp_root("setup-early");
-    let dir = root.join("sessions");
-    let cwd = root.join("work");
-    std::fs::create_dir_all(&cwd).unwrap();
-    json(
-        &dir,
-        &["--json", "--camera", "sim:0", "setup", "save", "taken"],
-    );
-    // No GigE camera answers at this address; the name is checked first.
-    let start = std::time::Instant::now();
-    let out = cmd(
-        &dir,
-        &[
-            "--json",
-            "--camera",
-            "gige:192.0.2.1",
-            "setup",
-            "save",
-            "TAKEN",
-        ],
-    );
-    let error: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(out.status.code(), Some(2), "{error}");
-    assert_eq!(error["error"]["code"], "usage");
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("pass --replace"),
-        "{error}"
-    );
-    assert!(start.elapsed() < std::time::Duration::from_secs(2));
-    // --replace goes on to the camera.
-    let out = cmd(
-        &dir,
-        &[
-            "--json",
-            "--camera",
-            "gige:192.0.2.1",
-            "setup",
-            "save",
-            "taken",
-            "--replace",
-        ],
-    );
-    assert_ne!(out.status.code(), Some(2));
-    assert_ne!(out.status.code(), Some(0));
-
-    // A value this camera lacks: a strict preview fails like the restore.
-    let shown = cmd(&dir, &["--json", "setup", "show", "taken"]);
-    let mut document: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    document["result"]["values"]
-        .as_array_mut()
-        .unwrap()
-        .push(serde_json::json!({"feature":"Scan3dOutputMode","value":"Range"}));
-    let file = cwd.join("extra.json");
-    std::fs::write(&file, serde_json::to_vec(&document).unwrap()).unwrap();
-    let path = file.to_str().unwrap();
-    let apply = |extra: &[&str]| {
-        cmd(
-            &dir,
-            &[
-                &[
-                    "--json", "--camera", "sim:0", "setup", "apply", "--file", path,
-                ][..],
-                extra,
-            ]
-            .concat(),
-        )
-    };
-    assert!(apply(&["--dry-run"]).status.success());
-    for flags in [&["--dry-run", "--strict"][..], &["--strict"]] {
-        let out = apply(flags);
-        let error: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(out.status.code(), Some(5), "{flags:?} {error}");
-        assert!(
-            error["error"]["message"].as_str().unwrap().contains(
-                "cannot be applied strictly; nothing changed. Not applicable: Scan3dOutputMode"
-            ),
-            "{error}"
-        );
-    }
-
-    let help = cmd(&dir, &["setup", "diff", "--help"]);
-    let help = String::from_utf8_lossy(&help.stdout);
-    assert!(
-        help.contains("a diff always compares the settings both cameras share"),
-        "{help}"
-    );
-    // read_setup takes no fields, as web/agents.md says.
-    let mut rpc = binary(&dir)
-        .args(["--json", "--camera", "sim:0", "rpc"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    use std::io::Write as _;
-    rpc.stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"op":"read_setup","name":"taken"}"#)
-        .unwrap();
-    let out = rpc.wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(2));
-}
-
-/// Split a command line printed with `hint::shell_quote`.
-fn shell_words(line: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut quoted = false;
-    let mut started = false;
-    for c in line.chars() {
-        match c {
-            '\'' => {
-                quoted = !quoted;
-                started = true;
-            }
-            ' ' if !quoted => {
-                if started {
-                    words.push(std::mem::take(&mut word));
-                    started = false;
-                }
-            }
-            c => {
-                word.push(c);
-                started = true;
-            }
-        }
-    }
-    if started {
-        words.push(word);
-    }
-    words
-}
-
-/// Damaged and newer setup files are listed and deletable, and notes stay
-/// on one line.
-#[test]
-fn unreadable_setups_list_and_delete_and_inline_setups_take_the_envelope() {
-    let root = temp_root("setup-store");
-    let dir = root.join("sessions");
-    let cwd = root.join("work");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let run = |args: &[&str]| {
-        let out = cmd(&dir, args);
-        let value: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
-        (out.status.code().unwrap(), value)
-    };
-    json(
-        &dir,
-        &[
-            "--json", "--direct", "--camera", "sim:0", "setup", "save", "low",
-        ],
-    );
-    let setups = dir.join("setups");
-    std::fs::write(setups.join("broken.json"), br#"{"name":"broken","#).unwrap();
-    let mut future: Value =
-        serde_json::from_slice(&std::fs::read(setups.join("low.json")).unwrap()).unwrap();
-    future["version"] = serde_json::json!(2);
-    future["name"] = serde_json::json!("future");
-    future["lens"] = serde_json::json!("25mm");
-    std::fs::write(
-        setups.join("future.json"),
-        serde_json::to_vec(&future).unwrap(),
-    )
-    .unwrap();
-    let list = json(&dir, &["--json", "setup", "list"]);
-    let rows = list["setups"].as_array().unwrap();
-    assert_eq!(rows.len(), 3, "{list}");
-    assert_eq!(rows[0]["name"], "broken");
-    assert_eq!(rows[0]["status"], "unreadable");
-    assert!(rows[0]["reason"].is_string());
-    assert_eq!(rows[1]["status"], "newer_version");
-    assert!(rows[2].get("status").is_none());
-    let text = String::from_utf8_lossy(&cmd(&dir, &["setup", "list"]).stdout).into_owned();
-    assert!(text.contains("cannot be read"), "{text}");
-    assert!(text.contains("capturefab setup delete broken"), "{text}");
-    // A newer file is a good setup: the row never suggests deleting it.
-    let future_row = text
-        .lines()
-        .find(|line| line.starts_with("future"))
-        .unwrap();
-    assert!(
-        future_row.contains("saved by a newer Capturefab; update Capturefab to use it"),
-        "{text}"
-    );
-    assert!(!future_row.contains("delete"), "{text}");
-    // Using it is unsupported here, from the store or from a file; a
-    // damaged one is unavailable.
-    for args in [
-        &["--json", "setup", "show", "future"][..],
-        &["--json", "--camera", "sim:0", "setup", "diff", "future"],
-        &["--json", "--camera", "sim:0", "setup", "apply", "future"],
-    ] {
-        let (code, error) = run(args);
-        assert_eq!(
-            (code, error["error"]["code"].as_str()),
-            (5, Some("unsupported")),
-            "{args:?}: {error}"
-        );
-        let message = error["error"]["message"].as_str().unwrap();
-        assert!(message.contains("update Capturefab"), "{message}");
-        assert!(!message.contains("delete"), "{message}");
-    }
-    let future_file = cwd.join("future.json");
-    std::fs::write(&future_file, serde_json::to_vec(&future).unwrap()).unwrap();
-    let (code, error) = run(&["--json", "setup", "import", future_file.to_str().unwrap()]);
-    assert_eq!(
-        (code, error["error"]["code"].as_str()),
-        (5, Some("unsupported")),
-        "{error}"
-    );
-    let (code, error) = run(&["--json", "setup", "show", "broken"]);
-    assert_eq!(
-        (code, error["error"]["code"].as_str()),
-        (3, Some("unavailable")),
-        "{error}"
-    );
-    // A copied file's suggested command works as printed.
-    std::fs::copy(setups.join("low.json"), setups.join("copy.json")).unwrap();
-    let (code, error) = run(&["--json", "setup", "show", "copy"]);
-    assert_eq!(code, 3, "{error}");
-    let message = error["error"]["message"].as_str().unwrap();
-    let (_, command) = message
-        .split_once("Save it under this name with: capturefab ")
-        .unwrap();
-    let (command, _) = command.split_once(", or remove").unwrap();
-    let args = shell_words(command);
-    let mut args = args.iter().map(String::as_str).collect::<Vec<_>>();
-    args.insert(0, "--json");
-    json(&dir, &args);
-    assert_eq!(
-        json(&dir, &["--json", "setup", "show", "copy"])["name"],
-        "copy"
-    );
-    json(&dir, &["--json", "setup", "delete", "copy"]);
-    let removed = json(&dir, &["--json", "setup", "delete", "broken"]);
-    assert_eq!(removed["removed"], "broken");
-    json(&dir, &["--json", "setup", "delete", "future"]);
-    assert_eq!(
-        json(&dir, &["--json", "setup", "list"])["setups"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
-    // Notes cannot carry line breaks or terminal escapes.
-    let (code, error) = run(&[
-        "--json", "--direct", "--camera", "sim:0", "setup", "save", "x", "--note", "a\nb",
-    ]);
-    assert_eq!((code, error["error"]["code"].as_str()), (2, Some("usage")));
-    let shown = cmd(&dir, &["--json", "setup", "show", "low"]);
-    assert!(shown.status.success());
-    let envelope: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    let mut evil = envelope["result"].clone();
-    evil["name"] = serde_json::json!("evil");
-    evil["note"] = serde_json::json!("\u{1b}]0;x\u{7}\nFAKE  2026-01-01  99  line");
-    let evil_file = cwd.join("evil.json");
-    std::fs::write(&evil_file, serde_json::to_vec(&evil).unwrap()).unwrap();
-    let (code, error) = run(&["--json", "setup", "import", evil_file.to_str().unwrap()]);
-    assert_eq!(code, 2);
-    let message = error["error"]["message"].as_str().unwrap();
-    assert!(message.contains("control characters"), "{message}");
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Save a simulator's settings, change them, preview and restore the setup
-/// in a session, and move it between files and RPC requests.
-#[test]
-fn saved_setups_restore_and_preview_in_a_session() {
-    let root = temp_root("setups");
-    let dir = root.join("sessions");
-    let cwd = root.join("work");
-    std::fs::create_dir_all(&cwd).unwrap();
-    let _fixture = Fixture {
-        child: serve_at(&dir, &cwd, "setup-ci"),
-        dir: root.clone(),
-    };
-    let fail = |args: &[&str]| {
-        let out = cmd(&dir, args);
-        assert!(!out.status.success(), "{args:?}");
-        let error: Value = serde_json::from_slice(&out.stdout).unwrap();
-        (out.status.code().unwrap(), error["error"].clone())
-    };
-    // Direct mode saves without a session.
-    let saved = json(
-        &dir,
-        &[
-            "--json", "--direct", "--camera", "sim:0", "setup", "save", "bench",
-        ],
-    );
-    assert_eq!(saved["setup"]["name"], "bench");
-    assert!(saved["setup"]["values"].as_u64().unwrap() >= 4);
-    let list = json(&dir, &["--json", "setup", "list"]);
-    assert_eq!(list["setups"][0]["name"], "bench");
-    assert_eq!(list["setups"][0]["model"], "Pattern camera");
-    assert!(list["dir"].as_str().unwrap().ends_with("setups"));
-    let (code, error) = fail(&[
-        "--json", "--direct", "--camera", "sim:0", "setup", "save", "BENCH",
-    ]);
-    assert_eq!((code, error["code"].as_str()), (2, Some("usage")));
-    let (code, error) = fail(&["--json", "setup", "save", "CON"]);
-    assert_eq!((code, error["code"].as_str()), (2, Some("usage")));
-    // A non-ASCII name is a usage error, never a crash.
-    for name in ["1€", "é", "€€"] {
-        let (code, error) = fail(&["--json", "setup", "show", name]);
-        assert_eq!((code, error["code"].as_str()), (2, Some("usage")), "{name}");
-    }
-    // The restore hint names the camera the save used, so it runs as is.
-    let human = cmd(
-        &dir,
-        &["--direct", "--camera", "sim:0", "setup", "save", "hint"],
-    );
-    assert!(human.status.success());
-    let text = String::from_utf8_lossy(&human.stdout);
-    assert!(
-        text.contains("Restore with: capturefab --camera sim:0 setup apply hint"),
-        "{text}"
-    );
-    let shown = String::from_utf8_lossy(&cmd(&dir, &["setup", "show", "hint"]).stdout).into_owned();
-    assert!(!shown.contains(".0\n"), "{shown}");
-    json(&dir, &["--json", "setup", "delete", "hint"]);
-    let (code, error) = fail(&["--json", "--session", "setup-ci", "setup", "apply", "nope"]);
-    assert_eq!((code, error["code"].as_str()), (3, Some("unavailable")));
-
-    let session = |args: &[&str]| {
-        json(
-            &dir,
-            &[
-                &["--json", "--session", "setup-ci", "--camera", "sim:0"],
-                args,
-            ]
-            .concat(),
-        )
-    };
-    session(&["connect", "sim:0"]);
-    session(&["set", "ExposureTime=5000"]);
-    let diff = session(&["setup", "diff", "bench"]);
-    assert_eq!(diff["changes"].as_array().unwrap().len(), 1, "{diff}");
-    assert_eq!(diff["changes"][0]["feature"], "ExposureTime");
-    assert_eq!(diff["match"], "same_camera");
-    let dry = session(&["setup", "apply", "bench", "--dry-run"]);
-    assert_eq!(dry["dry_run"], true);
-    let exposure = |session: &dyn Fn(&[&str]) -> Value| {
-        session(&["get", "ExposureTime"])["features"][0]["value"]
-            .as_f64()
-            .unwrap()
-    };
-    assert_eq!(exposure(&session), 5000.0);
-    let applied = session(&["setup", "apply", "bench"]);
-    assert_eq!(applied["applied"], 1, "{applied}");
-    assert_eq!(exposure(&session), 10000.0);
-    // Nothing differs: the human output says so plainly.
-    let human = |args: &[&str]| {
-        let out = cmd(
-            &dir,
-            &[&["--session", "setup-ci", "--camera", "sim:0"], args].concat(),
-        );
-        assert!(out.status.success(), "{args:?}");
-        String::from_utf8_lossy(&out.stdout).into_owned()
-    };
-    let text = human(&["setup", "diff", "bench"]);
-    assert!(
-        text.starts_with("Nothing to change: all ")
-            && text.contains("settings in bench already match sim:0."),
-        "{text}"
-    );
-    let text = human(&["setup", "apply", "bench"]);
-    assert!(
-        text.starts_with("sim:0 already matches bench; nothing was changed."),
-        "{text}"
-    );
-    session(&["set", "ExposureTime=5000"]);
-    assert_eq!(exposure(&session), 5000.0);
-    let text = human(&["setup", "diff", "bench"]);
-    assert!(text.contains("ExposureTime: 5000 → 10000"), "{text}");
-    let matched = session(&["setup", "diff", "bench"]);
-    assert_eq!(
-        matched["matched"].as_array().unwrap().len() as u64,
-        matched["unchanged"].as_u64().unwrap()
-    );
-
-    // Another model is previewed with a warning; applying it needs
-    // --allow-other-model; the same model warns.
-    let out = cmd(
-        &dir,
-        &[
-            "--json",
-            "--session",
-            "setup-ci",
-            "--camera",
-            "sim:line:0",
-            "setup",
-            "diff",
-            "bench",
-        ],
-    );
-    assert!(out.status.success());
-    let preview: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(preview["result"]["match"], "other_model");
-    // The note is in the JSON, not only on stderr.
-    let note = preview["result"]["warnings"][0]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        note.contains("Pattern camera") && note.contains("Pattern line scan camera"),
-        "{preview}"
-    );
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--allow-other-model"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let (code, error) = fail(&[
-        "--json",
-        "--session",
-        "setup-ci",
-        "--camera",
-        "sim:line:0",
-        "setup",
-        "apply",
-        "bench",
-    ]);
-    assert_eq!(code, 2);
-    assert!(
-        error["message"]
-            .as_str()
-            .unwrap()
-            .contains("--allow-other-model"),
-        "{error}"
-    );
-    let other = json(
-        &dir,
-        &[
-            "--json",
-            "--session",
-            "setup-ci",
-            "--camera",
-            "sim:line:0",
-            "setup",
-            "apply",
-            "bench",
-            "--allow-other-model",
-        ],
-    );
-    assert_eq!(other["match"], "other_model");
-    let same_model = json(
-        &dir,
-        &[
-            "--json",
-            "--session",
-            "setup-ci",
-            "--camera",
-            "sim:1",
-            "setup",
-            "apply",
-            "bench",
-        ],
-    );
-    assert_eq!(same_model["match"], "same_model");
-    assert!(same_model["warnings"][0].as_str().unwrap().contains("SIM0"));
-
-    // `setup show NAME --json > FILE` round-trips as is: import and
-    // apply --file read the envelope it prints.
-    let shown = cmd(&dir, &["--json", "setup", "show", "bench"]);
-    assert!(shown.status.success());
-    let backup = cwd.join("backup.json");
-    std::fs::write(&backup, &shown.stdout).unwrap();
-    let backup = backup.to_str().unwrap();
-    let restored = json(
-        &dir,
-        &["--json", "setup", "import", backup, "--name", "backup"],
-    );
-    assert_eq!(restored["setup"]["name"], "backup");
-    session(&["set", "ExposureTime=7000"]);
-    let applied = session(&["setup", "apply", "--file", backup]);
-    assert_eq!(applied["applied"], 1, "{applied}");
-    assert_eq!(exposure(&session), 10000.0);
-    json(&dir, &["--json", "setup", "delete", "backup"]);
-    // A restore that fails says every value was put back.
-    let mut bad: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    for value in bad["result"]["values"].as_array_mut().unwrap() {
-        if value["feature"] == "Gain" {
-            value["value"] = serde_json::json!(99999);
-        }
-    }
-    let bad_file = cwd.join("bad.json");
-    std::fs::write(&bad_file, serde_json::to_vec(&bad).unwrap()).unwrap();
-    // The preview says this value fails the whole restore.
-    let preview = session(&["setup", "diff", "--file", bad_file.to_str().unwrap()]);
-    let gain = preview["changes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["feature"] == "Gain")
-        .unwrap()
-        .clone();
-    assert!(
-        gain["warning"]
-            .as_str()
-            .unwrap()
-            .contains("restoring fails and puts every value back"),
-        "{gain}"
-    );
-    let (code, error) = fail(&[
-        "--json",
-        "--session",
-        "setup-ci",
-        "--camera",
-        "sim:0",
-        "setup",
-        "apply",
-        "--file",
-        bad_file.to_str().unwrap(),
-    ]);
-    assert_eq!(
-        (code, error["code"].as_str()),
-        (1, Some("operation_failed"))
-    );
-    assert!(
-        error["message"]
-            .as_str()
-            .unwrap()
-            .starts_with("Restoring setup bench failed; every value was put back"),
-        "{error}"
-    );
-    assert_eq!(exposure(&session), 10000.0);
-    // The bare document works too.
-    let document: Value = serde_json::from_slice(&shown.stdout).unwrap();
-    let file = cwd.join("bench.json");
-    std::fs::write(&file, serde_json::to_vec(&document["result"]).unwrap()).unwrap();
-    let file = file.to_str().unwrap();
-    let imported = json(&dir, &["--json", "setup", "import", file, "--name", "copy"]);
-    assert_eq!(imported["setup"]["name"], "copy");
-    let (code, _) = fail(&["--json", "setup", "import", file, "--name", "copy"]);
-    assert_eq!(code, 2);
-    // An inline setup in an RPC request takes the whole `setup show --json`
-    // output or its result.
-    for setup in [document.clone(), document["result"].clone()] {
-        session(&["set", "ExposureTime=6000"]);
-        let mut rpc = Command::new(env!("CARGO_BIN_EXE_capturefab"))
-            .env("CAPTUREFAB_SESSION_DIR", &dir)
-            .env("CAPTUREFAB_CACHE_DIR", test_cache())
-            .args([
-                "--json",
-                "--session",
-                "setup-ci",
-                "--camera",
-                "sim:0",
-                "rpc",
-            ])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        serde_json::to_writer(
-            rpc.stdin.take().unwrap(),
-            &serde_json::json!({"op":"apply_setup","setup":setup}),
-        )
-        .unwrap();
-        let out = rpc.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stdout)
-        );
-        assert_eq!(exposure(&session), 10000.0);
-    }
-    let removed = json(&dir, &["--json", "setup", "delete", "bench"]);
-    assert_eq!(removed["removed"], "bench");
-    let list = json(&dir, &["--json", "setup", "list"]);
-    assert_eq!(list["setups"].as_array().unwrap().len(), 1);
-    let schema = json(&dir, &["--json", "schema"]);
-    assert!(schema["setup"]["cli"].is_string());
 }

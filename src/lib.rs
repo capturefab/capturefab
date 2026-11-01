@@ -19,6 +19,7 @@ pub(crate) mod camera;
 pub(crate) mod camera_profile;
 pub(crate) mod cli;
 pub(crate) mod context;
+pub(crate) mod controls;
 pub(crate) mod doctor;
 pub(crate) mod engine;
 pub(crate) mod frame;
@@ -47,8 +48,6 @@ pub(crate) mod transport;
 pub(crate) mod types;
 pub(crate) mod volumes;
 
-use serde_json::json;
-
 /// The `capturefab` executable: the hidden camera worker mode, or the CLI.
 pub fn run() {
     if std::env::args().nth(1).as_deref() == Some("__worker") {
@@ -62,53 +61,7 @@ pub fn run() {
         }
         return;
     }
-    let json_mode = std::env::args().any(|a| a == "--json");
-    let cli = match <cli::Cli as clap::Parser>::try_parse() {
-        Ok(c) => c,
-        Err(e) => {
-            if matches!(
-                e.kind(),
-                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
-            ) {
-                let _ = e.print();
-                return;
-            }
-            if json_mode {
-                let _ = cli::write_json(&cli::clap_error_envelope(&e));
-            } else {
-                let _ = e.print();
-            }
-            std::process::exit(2)
-        }
-    };
-    let typed_output = cli.typed_output();
-    if let Err(error) = cli::run(cli) {
-        if error.chain().any(|e| {
-            e.downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe)
-        }) {
-            return;
-        }
-        let (code, exit) = cli::error_code(&error);
-        let message = scrub::scrub(&format!("{error:#}")).into_owned();
-        let hint = typed_output
-            .as_deref()
-            .and_then(|output| cli::exists_hint(&error, output));
-        if json_mode {
-            let mut envelope =
-                json!({"version":1,"ok":false,"error":{"code":code,"message":message}});
-            if let Some(hint) = hint {
-                envelope["error"]["details"] = json!({"hint":hint});
-            }
-            let _ = cli::write_json(&envelope);
-        } else {
-            eprintln!("capturefab: {message}");
-            if let Some(hint) = hint {
-                eprintln!("capturefab: to keep both, {hint}");
-            }
-        }
-        std::process::exit(exit)
-    }
+    std::process::exit(cli::main())
 }
 
 /// What the integration tests and benchmarks use, at the same paths as in

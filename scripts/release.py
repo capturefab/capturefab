@@ -392,13 +392,13 @@ def smoke(binary):
         env['CAPTUREFAB_CACHE_DIR'] = str(Path(temp) / 'cache')
         run([binary, '--version'], stdout=subprocess.PIPE, text=True, env=env)
         result = run([binary, '--json', 'doctor'], stdout=subprocess.PIPE, text=True, env=env)
-        media = json.loads(result.stdout)['result'].get('ffmpeg') or {}
+        media = json.loads(result.stdout).get('ffmpeg') or {}
         if media.get('source') != 'bundled' or not media.get('path'):
             raise ValueError(f'release binary does not run its embedded FFmpeg: {media}')
         protocols = run([media['path'], '-hide_banner', '-protocols'], stdout=subprocess.PIPE, text=True, env=env)
         if not srt_protocols(protocols.stdout):
             raise ValueError('release FFmpeg does not expose SRT input and output')
-        run([binary, '--camera', 'sim:release', 'capture', '-n', '2', '-o', str(Path(temp) / 'frames')], env=env, stdout=subprocess.DEVNULL)
+        run([binary, 'capture', '-c', 'sim:release', '-n', '2', '-o', str(Path(temp) / 'frames')], env=env, stdout=subprocess.DEVNULL)
         if len(list((Path(temp) / 'frames').glob('*.png'))) != 2:
             raise ValueError('release capture smoke did not produce two PNGs')
 

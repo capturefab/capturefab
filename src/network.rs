@@ -440,8 +440,7 @@ macro_rules! local_network_text {
 }
 /// What to try when macOS refuses a route to the local network. A denied
 /// Local Network privacy prompt reads as "no route to host", which has
-/// genuine causes too, hence "may". Free of the words `cli::error_code`
-/// reads as another category, so the error stays `unavailable`.
+/// genuine causes too, hence "may".
 pub const LOCAL_NETWORK_HINT: &str = local_network_text!();
 
 /// [`LOCAL_NETWORK_HINT`] when `error` may come from macOS Local Network
@@ -1268,9 +1267,10 @@ mod tests {
         );
         // The hint keeps an unreachable error unavailable.
         assert_eq!(
-            crate::cli::error_code(&anyhow::anyhow!(
-                "x: no route to host; {LOCAL_NETWORK_HINT}"
-            )),
+            crate::cli::error_code(
+                &anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::HostUnreachable))
+                    .context(format!("x; {LOCAL_NETWORK_HINT}"))
+            ),
             ("unavailable", 3)
         );
         #[cfg(target_os = "macos")]

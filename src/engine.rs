@@ -446,7 +446,7 @@ fn timed_out(e: &anyhow::Error) -> bool {
             return false;
         }
         if let Some(categorized) = cause.downcast_ref::<crate::types::Categorized>() {
-            return categorized.kind == crate::types::ErrorKind::Timeout;
+            return categorized.kind.code().1 == 4;
         }
     }
     let message = format!("{e:#}").to_ascii_lowercase();
@@ -1081,9 +1081,12 @@ fn process_plain(
                             deadline.saturating_duration_since(Instant::now()),
                             true,
                         )?);
-                ensure!(Instant::now() < deadline, GRAB_TIMEOUT);
+                if Instant::now() >= deadline {
+                    return Err(crate::types::frame_timeout(GRAB_TIMEOUT));
+                }
                 c.request_frame()?;
-                let frame = next_frame(h, c, auto, deadline)?.context(GRAB_TIMEOUT)?;
+                let frame = next_frame(h, c, auto, deadline)?
+                    .ok_or_else(|| crate::types::frame_timeout(GRAB_TIMEOUT))?;
                 let mut value = json!({"frame":frame});
                 if !settled {
                     value["auto_settled"] = json!(false);
@@ -1440,6 +1443,91 @@ fn process_plain(
             refresh(h, camera, true);
             Ok(json!({"features":h.snapshot().features}))
         }
+        SessionCommand::GetValues { names } => {
+            let c = camera_mut(camera)?;
+            let values = crate::controls::get(c, &names)?;
+            Ok(json!({"camera": crate::media::redact_url(&c.info.id), "values": values}))
+        }
+        SessionCommand::SetValues { values, dry_run } => {
+            if !dry_run {
+                // Writing a value Capturefab's auto mode manages ends it, as
+                // set always has; any other write changes what it measures.
+                let managed = auto.as_ref().is_some_and(|a| {
+                    values.iter().any(|value| {
+                        a.manages(&value.name)
+                            || matches!(value.name.as_str(), "exposure" | "gain" | "fps")
+                    })
+                });
+                if managed {
+                    // Invalid values leave auto mode as it was.
+                    crate::controls::set(camera_mut(camera)?, &values, true)?;
+                    release_auto(h, auto, camera, false)?;
+                    h.log(
+                        "info",
+                        "Switched to manual mode because set changed its values".into(),
+                    );
+                } else if let Some(a) = auto.as_mut() {
+                    a.invalidate();
+                }
+            }
+            let c = camera_mut(camera)?;
+            let result = crate::controls::set(c, &values, dry_run);
+            refresh(h, camera, false);
+            let result = result?;
+            if let Some(changed) = &result.changed
+                && !changed.is_empty()
+            {
+                let mut s = h.state.write().unwrap_or_else(|e| e.into_inner());
+                for change in changed {
+                    if let Some(feature) = s.features.iter_mut().find(|f| f.name == change.name) {
+                        feature.value = Some(change.to.clone());
+                    }
+                }
+                drop(s);
+                h.log(
+                    "info",
+                    format!(
+                        "Set {}",
+                        changed
+                            .iter()
+                            .map(|change| format!(
+                                "{} = {}",
+                                change.name,
+                                crate::controls::text(&change.to)
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                );
+            }
+            Ok(serde_json::to_value(result)?)
+        }
+        SessionCommand::Exec { name } => {
+            if auto.is_some() && matches!(name.name.as_str(), "UserSetLoad" | "UserSetDefault") {
+                release_auto(h, auto, camera, false)?;
+                h.log(
+                    "info",
+                    format!("Switched to manual mode because {} was executed", name.name),
+                );
+            } else if let Some(a) = auto.as_mut() {
+                a.invalidate();
+            }
+            let c = camera_mut(camera)?;
+            let executed = crate::controls::exec(c, &name);
+            let id = crate::media::redact_url(&c.info.id);
+            refresh(h, camera, false);
+            Ok(json!({"camera": id, "executed": executed?}))
+        }
+        SessionCommand::Info => {
+            let c = camera_mut(camera)?;
+            Ok(serde_json::to_value(crate::controls::info(c))?)
+        }
+        SessionCommand::FeatureList { filter } => {
+            let c = camera_mut(camera)?;
+            Ok(serde_json::to_value(crate::controls::features(
+                c, &filter,
+            )?)?)
+        }
         SessionCommand::Xml => Ok(json!({"xml":camera_mut(camera)?.xml()})),
         SessionCommand::ReadMemory { address, length } => {
             ensure!(
@@ -1633,7 +1721,7 @@ fn process_plain(
                         };
                         c.request_frame()?;
                         let frame = next_frame(h, c, auto, Instant::now() + duration)?
-                            .context("frame timeout")?;
+                            .ok_or_else(|| crate::types::frame_timeout("frame timeout"))?;
                         if index == 0 {
                             status = auto.as_ref().map(|a| a.status().clone());
                         }
