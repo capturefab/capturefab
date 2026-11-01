@@ -1270,6 +1270,9 @@ fn still_meta(
         "height": frame.height,
         "pixel_format": crate::frame::pixel_format_name(frame.pixel_format),
     });
+    if let Some(bits) = crate::frame::sample_bits(frame.pixel_format) {
+        meta["bits"] = json!(bits);
+    }
     if let Some(device_ts_ns) = frame.device_ts_ns {
         meta["device_ts_ns"] = json!(device_ts_ns);
     }
@@ -1314,6 +1317,40 @@ pub(crate) fn encode_still(
     }
 }
 
+/// Save `NAME.json` beside the raw file `path`: what reading its bytes back
+/// needs, as they carry nothing but the samples. When it cannot be saved,
+/// the raw file goes too: nothing reported it yet.
+fn save_sidecar(
+    path: &Path,
+    frame: &Frame,
+    wall_ms: u64,
+    acquisition: &Acquisition,
+    sync: crate::storage::SyncMode,
+) -> Result<()> {
+    let mut name = path.file_name().context("raw file name")?.to_os_string();
+    name.push(".json");
+    let sidecar = path.with_file_name(name);
+    let document = crate::types::without_nulls(json!({
+        "pixel_format": crate::inspect::pixel_format_label(frame.pixel_format),
+        "pfnc_code": frame.pixel_format,
+        "width": frame.width,
+        "height": frame.height,
+        "row_bytes": crate::frame::row_bytes(frame.width, frame.pixel_format),
+        "bytes": frame.data.len(),
+        "frame_id": (frame.id > 0).then_some(frame.id),
+        "device_ts_ns": frame.device_ts_ns,
+        "time": crate::scheduling::rfc3339(wall_ms),
+        "settings": crate::engine::saved::settings(&Value::Object(acquisition.settings.clone())),
+    }));
+    let saved = serde_json::to_vec(&document)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| crate::storage::save(&bytes, &sidecar, sync, false));
+    if let Err(error) = saved {
+        let _ = std::fs::remove_file(path);
+        return Err(error).with_context(|| format!("save {}", sidecar.display()));
+    }
+    Ok(())
+}
 /// A published image, as its `saved` line reports it.
 fn image_file(
     path: &std::path::Path,
@@ -2225,6 +2262,9 @@ fn process_plain(
                                 |path| crate::storage::save(&bytes, path, sync, false),
                             )
                             .with_context(|| format!("save {}", first.display()))?;
+                            if format == "raw" {
+                                save_sidecar(&path, &frame, wall_ms, &settings, sync)?;
+                            }
                             folders.add(&path);
                             let file = path.to_string_lossy().into_owned();
                             let saved = image_file(
@@ -4504,7 +4544,18 @@ mod tests {
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
         names.sort();
-        assert_eq!(names, ["s-0001.raw", "s-0002.raw", "s-0003.raw"]);
+        // Each raw file has its sidecar.
+        assert_eq!(
+            names,
+            [
+                "s-0001.raw",
+                "s-0001.raw.json",
+                "s-0002.raw",
+                "s-0002.raw.json",
+                "s-0003.raw",
+                "s-0003.raw.json"
+            ]
+        );
         let batch = h.take_saved();
         assert_eq!(batch.len(), 3);
         assert!(batch.iter().all(|f| f.context["lot"] == "7"

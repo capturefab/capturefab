@@ -63,7 +63,7 @@ pub struct CaptureArgs {
     /// Begin after a delay
     #[arg(long = "in", value_name = "DUR", value_parser = super::args::duration)]
     pub after: Option<Duration>,
-    /// Image format when -o has no extension: png (default), jpg or raw
+    /// Image format when -o has no extension: png (default; 16-bit for Mono10..Mono16), jpg or raw (the exact bytes, with NAME.json beside)
     #[arg(short = 'f', long, value_enum)]
     pub format: Option<Format>,
     /// JPEG quality, 1..100 (default 90)
@@ -495,7 +495,12 @@ fn shoot(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
         seq = reply["seq"].as_u64().unwrap_or(seq);
         let (job, detail) = (&reply["job"], &reply["detail"]);
         if jobs::ended(job) {
-            return finished(job, detail, stopping.is_some() || signals::interrupted());
+            return finished(
+                job,
+                detail,
+                plan.format,
+                stopping.is_some() || signals::interrupted(),
+            );
         }
         if signals::interrupted() {
             let since = *stopping.get_or_insert_with(Instant::now);
@@ -525,7 +530,7 @@ fn started(client: &Client, id: &str, plan: &Plan) -> Result<Value> {
         let job = &reply["job"];
         match job["state"].as_str() {
             Some("failed" | "cancelled" | "interrupted") => {
-                return finished(job, &reply["detail"], false);
+                return finished(job, &reply["detail"], plan.format, false);
             }
             Some("running" | "stopping")
                 if job["saved"].as_u64().unwrap_or(0) == 0
@@ -560,9 +565,9 @@ fn interrupted(job: &Value, detail: &Value) -> anyhow::Error {
 }
 
 /// The result of a finished job, or its failure with what it saved.
-fn finished(job: &Value, detail: &Value, stopped: bool) -> Result<Value> {
+fn finished(job: &Value, detail: &Value, format: &str, stopped: bool) -> Result<Value> {
     match job["state"].as_str() {
-        Some("done") => Ok(result(job, detail)),
+        Some("done") => Ok(result(job, detail, format)),
         Some("cancelled") if stopped => Err(interrupted(job, detail)),
         Some("cancelled" | "interrupted") => Err(Categorized::new(
             ErrorKind::Incomplete,
@@ -596,28 +601,42 @@ pub(super) fn job_error(job: &Value, detail: &Value) -> anyhow::Error {
 }
 
 /// A finished job's result, from its document and its worker's account.
-fn result(job: &Value, detail: &Value) -> Value {
+fn result(job: &Value, detail: &Value, format: &str) -> Value {
     let files = detail["files"].as_array().cloned().unwrap_or_default();
     let count = job["saved"].as_u64().unwrap_or(0);
     let frame = &detail["frame"];
     let first = detail["first_ms"].as_u64();
+    let pixel_format = frame["pixel_format"].as_u64().map(|format| format as u32);
     let mut value = json!({
         "camera": job["camera"],
         "files": files,
         "count": count,
         "width": frame["width"],
         "height": frame["height"],
-        "pixel_format": frame["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
+        "pixel_format": pixel_format.map(crate::inspect::pixel_format_label),
         "settings": crate::engine::saved::settings(&detail["settings"]),
         "time": first.map(rfc3339),
         "device_ts_ns": detail["first_ts_ns"],
     });
+    if let Some(pixel_format) = pixel_format {
+        depth(&mut value, pixel_format, format);
+    }
     integrity(&mut value, detail, count);
     if let Some(truncated) = detail["truncated"].as_u64() {
         value["truncated"] = json!(truncated);
     }
     freshness(&mut value, detail);
     crate::types::without_nulls(value)
+}
+
+/// The bit depth of the files, and the frames' own when the files keep
+/// fewer bits, so a loss of precision is never silent.
+fn depth(value: &mut Value, pixel_format: u32, format: &str) {
+    let (bit_depth, source_bits) = crate::frame::bit_depth(pixel_format, format);
+    value["bit_depth"] = json!(bit_depth);
+    if let Some(bits) = source_bits {
+        value["source_bits"] = json!(bits);
+    }
 }
 
 /// What a result says of the frames' integrity, from the worker's account:
@@ -860,6 +879,8 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         "width": meta["width"],
         "height": meta["height"],
         "pixel_format": meta["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
+        "bit_depth": meta["pixel_format"].as_u64().map(|format| crate::frame::bit_depth(format as u32, plan.format).0),
+        "source_bits": meta["pixel_format"].as_u64().and_then(|format| crate::frame::bit_depth(format as u32, plan.format).1),
         "settings": crate::engine::saved::settings(&meta["settings"]),
         "time": meta["wall_ms"].as_u64().map(rfc3339),
         "device_ts_ns": meta["device_ts_ns"],
@@ -961,6 +982,14 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("height", "int"),
     ("pixel_format", "string — the camera's PFNC format"),
     (
+        "bit_depth",
+        "int — bits per sample in the files: 16 for PNG of Mono10..Mono16 (samples at the top bits, sBIT says how many count), every bit for raw, else 8",
+    ),
+    (
+        "source_bits",
+        "int — the camera's bits per sample, when the files keep fewer (color or Bayer PNG, JPEG)",
+    ),
+    (
         "settings",
         "{exposure_us?,auto_exposure?,gain_db?,gain?,auto_gain?,auto_wb?,fps?,trigger?,black_level?,gamma?,binning?,offset_x?,offset_y?,reverse_x?,reverse_y?} — the camera's settings when the first frame was taken, as the camera has them; trigger: off, or its source (software, line0)",
     ),
@@ -1017,7 +1046,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("bytes", "int — with -o -: the image's size"),
     (
         "cameras",
-        "[{camera,files,count,truncated?,width,height,pixel_format,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,warnings?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
+        "[{camera,files,count,truncated?,width,height,pixel_format,bit_depth,source_bits?,settings,time,device_ts_ns?,frames,dropped,incomplete?,resent?,duration_s?,fps?,first_id?,last_id?,gaps?,consecutive?,after_change?,warmup_ms?,settled?,warnings?,dry_run?,output?,format?,every_s?,first_at?,ends_at?,auto?}] — with -c repeated: one result per camera; in error details, a failed camera's {camera,error,files?,truncated?,job?}",
     ),
     (
         "job",

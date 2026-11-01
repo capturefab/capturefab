@@ -2182,7 +2182,8 @@
     },
     {
       "chunks": [
-        {"hex":"0000000d494844520000002100000011080000000076f59a1e","type":"IHDR"},
+        {"hex":"0000000d49484452000000210000001110000000002665465d","type":"IHDR"},
+        {"hex":"00000001734249540ce1679f80","type":"sBIT"},
         {"hex":null,"type":"IDAT"},
         {"hex":"0000000049454e44ae426082","type":"IEND"}
       ],
@@ -2190,7 +2191,7 @@
       "height": 17,
       "meta_json": null,
       "pixel_format": 17825797,
-      "pixels_fnv1a64": "e4486c1e4ed38b17",
+      "pixels_fnv1a64": "c740e14f74ccbc8d",
       "width": 33
     },
     {

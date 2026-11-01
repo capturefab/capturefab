@@ -877,3 +877,51 @@ fn bursts_report_the_integrity_of_their_frames() {
     );
     assert_eq!(camera["resent"], 0, "{status}");
 }
+
+#[test]
+fn wide_samples_keep_their_bits_or_say_they_did_not() {
+    let home = Home::new("depth");
+    let shot = |format: &str, output: &str| {
+        home.ok(&[
+            "capture",
+            "-c",
+            "sim:0",
+            "--set",
+            &format!("PixelFormat={format}"),
+            "-o",
+            output,
+        ])
+    };
+    let mono = shot("Mono12p", "mono.png");
+    assert_eq!(
+        (mono["bit_depth"].clone(), mono.get("source_bits")),
+        (json!(16), None)
+    );
+    let decoder = png::Decoder::new(std::fs::File::open(home.path("mono.png")).unwrap());
+    let reader = decoder.read_info().unwrap();
+    assert_eq!(reader.info().bit_depth, png::BitDepth::Sixteen);
+    assert_eq!(reader.info().sbit.as_deref(), Some(&[12u8][..]));
+    let bayer = shot("BayerRG12", "bayer.png");
+    assert_eq!(
+        (bayer["bit_depth"].clone(), bayer["source_bits"].clone()),
+        (json!(8), json!(12))
+    );
+    let jpeg = shot("Mono16", "mono.jpg");
+    assert_eq!(jpeg["source_bits"], 16, "{jpeg}");
+    // Raw keeps the exact bytes, with what reading them back needs beside.
+    let raw = shot("Mono12p", "frame.raw");
+    assert_eq!(raw["bit_depth"], 12, "{raw}");
+    let bytes = std::fs::read(home.path("frame.raw")).unwrap();
+    let sidecar: Value =
+        serde_json::from_slice(&std::fs::read(home.path("frame.raw.json")).unwrap()).unwrap();
+    assert_eq!(sidecar["pixel_format"], "Mono12p");
+    assert_eq!(sidecar["pfnc_code"], 0x010c_0047);
+    assert_eq!(
+        (sidecar["width"].clone(), sidecar["height"].clone()),
+        (json!(640), json!(480))
+    );
+    assert_eq!(sidecar["row_bytes"], 960);
+    assert_eq!(sidecar["bytes"], bytes.len());
+    assert!(sidecar["frame_id"].is_u64() && sidecar["device_ts_ns"].is_u64());
+    assert!(sidecar["time"].is_string() && sidecar["settings"]["exposure_us"].is_f64());
+}

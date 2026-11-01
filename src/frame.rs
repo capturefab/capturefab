@@ -357,6 +357,65 @@ pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
             .collect(),
     ))
 }
+/// The significant bits of each sample of `pixel_format`, from its PFNC
+/// name: 12 for Mono12, Mono12p and BayerRG12, 8 for RGB8. None for a
+/// format this does not know.
+pub fn sample_bits(pixel_format: u32) -> Option<u32> {
+    let name = pixel_format_name(pixel_format);
+    let digits = name
+        .trim_end_matches(|c: char| c.is_ascii_alphabetic())
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    digits.chars().rev().collect::<String>().parse().ok()
+}
+/// The bit depth of `format` (png, jpeg, raw, pgm, ppm) for a frame of
+/// `pixel_format`, and the frame's own when the file keeps fewer: PNG keeps
+/// up to 16 bits of a monochrome format, raw every bit, the rest 8.
+pub fn bit_depth(pixel_format: u32, format: &str) -> (u32, Option<u32>) {
+    let source = sample_bits(pixel_format).unwrap_or(8);
+    let depth = match format {
+        "raw" => source,
+        "png" if wide_gray_bits(unpacked_format(pixel_format)).is_some() => 16,
+        _ => 8,
+    };
+    (depth, (source > depth).then_some(source))
+}
+/// The significant bits of an unpacked monochrome format wider than 8
+/// bits, which a PNG keeps as 16-bit gray.
+fn wide_gray_bits(pixel_format: u32) -> Option<u32> {
+    match pixel_format {
+        0x0110_0003 => Some(10),
+        0x0110_0005 => Some(12),
+        0x0110_0025 => Some(14),
+        0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => Some(16),
+        _ => None,
+    }
+}
+/// A monochrome frame of more than 8 bits, packed or not, as big-endian
+/// 16-bit PNG samples with the significant bits at the top, and how many
+/// bits are significant; None for any other format.
+fn gray16(frame: &Frame) -> Result<Option<(Vec<u8>, u32)>> {
+    let Some(bits) = wide_gray_bits(unpacked_format(frame.pixel_format)) else {
+        return Ok(None);
+    };
+    let pixels = checked_pixels(frame)?;
+    let frame = &*unpacked(frame)?;
+    ensure!(
+        frame.data.len() >= pixels * 2,
+        "truncated {} frame",
+        pixel_format_name(frame.pixel_format)
+    );
+    let mask = u16::MAX >> (16 - bits);
+    let samples = frame.data[..pixels * 2]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|sample| ((u16::from_le_bytes(*sample) & mask) << (16 - bits)).to_be_bytes())
+        .collect();
+    Ok(Some((samples, bits)))
+}
 /// Opaque RGBA bytes, converted in one pass without an intermediate RGB image.
 pub fn rgba(frame: &Frame) -> Result<Vec<u8>> {
     Ok(convert(frame, |[r, g, b]| [r, g, b, 255])?.into_flattened())
@@ -1047,8 +1106,11 @@ pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
 
 /// Encode a still, writing `meta` (compact provenance JSON) into PNG as an
 /// iTXt chunk named `capturefab` and into JPEG as a COM segment. Raw, PPM and
-/// PGM have no place for it and stay plain. Monochrome PNG and PGM are one
-/// 8-bit gray channel; color and Bayer are 8-bit RGB.
+/// PGM have no place for it and stay plain. Monochrome PNG of more than 8
+/// bits is 16-bit gray with the samples at the top bits and an sBIT chunk
+/// saying how many are significant; other monochrome PNG and PGM are one
+/// 8-bit gray channel; color and Bayer are 8-bit RGB. PNG is compressed
+/// fast: deflate would otherwise take most of a large frame's capture time.
 pub fn encode_with_meta(
     frame: &Frame,
     format: &str,
@@ -1074,13 +1136,22 @@ pub fn encode_with_meta(
     let mut bytes = Vec::new();
     match format {
         "png" => {
-            let (color, samples) = match gray8(frame)? {
-                Some(gray) => (png::ColorType::Grayscale, gray),
-                None => (png::ColorType::Rgb, rgb(frame)?),
+            let (color, depth, samples, significant) = match gray16(frame)? {
+                Some((samples, bits)) => (
+                    png::ColorType::Grayscale,
+                    png::BitDepth::Sixteen,
+                    samples,
+                    Some(bits),
+                ),
+                None => match gray8(frame)? {
+                    Some(gray) => (png::ColorType::Grayscale, png::BitDepth::Eight, gray, None),
+                    None => (png::ColorType::Rgb, png::BitDepth::Eight, rgb(frame)?, None),
+                },
             };
             let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
             encoder.set_color(color);
-            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_depth(depth);
+            encoder.set_compression(png::Compression::Fast);
             // A fixed Paeth filter reduces camera-texture output size without
             // running all five filters for every scanline.
             encoder.set_filter(png::FilterType::Paeth);
@@ -1092,7 +1163,11 @@ pub fn encode_with_meta(
                 }
                 encoder.add_itxt_chunk("capturefab".into(), json)?;
             }
-            encoder.write_header()?.write_image_data(&samples)?;
+            let mut writer = encoder.write_header()?;
+            if let Some(bits) = significant {
+                writer.write_chunk(png::chunk::sBIT, &[bits as u8])?;
+            }
+            writer.write_image_data(&samples)?;
         }
         "ppm" => {
             write!(bytes, "P6\n{} {}\n255\n", frame.width, frame.height)?;
@@ -1790,36 +1865,57 @@ mod tests {
             (png::ColorType::Grayscale, png::BitDepth::Eight)
         );
         assert_eq!(samples, mono.data);
-        // Mono12 keeps its top 8 bits, the same as JPEG and the preview.
-        let mono12 = sized(
-            0x0110_0005,
-            [0x0ABCu16; 8]
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect(),
-        );
-        let (color, depth, samples, _) = decode_png(&encode(&mono12, "png").unwrap());
-        assert_eq!(
-            (color, depth),
-            (png::ColorType::Grayscale, png::BitDepth::Eight)
-        );
-        assert_eq!(samples, vec![0xAB; 8]);
-        // Packed Mono12p and Mono12Packed rows of 0xABC unpack to the same
-        // gray; Mono14 keeps bits 13-6.
-        for (mono, expected) in [
-            (sized(0x010c_0047, [0xBC, 0xCA, 0xAB].repeat(4)), 0xAB),
-            (sized(0x010c_0006, [0xAB, 0xCC, 0xAB].repeat(4)), 0xAB),
-            (sized(0x0110_0025, le16(&[0x2ABC; 8])), 0xAA),
-        ] {
-            let name = pixel_format_name(mono.pixel_format);
-            let (color, depth, samples, _) = decode_png(&encode(&mono, "png").unwrap());
+        // Monochrome of more than 8 bits keeps every bit: 16-bit gray with
+        // the samples at the top and an sBIT chunk saying how many count.
+        let sixteen = |frame: &Frame| {
+            let (color, depth, samples, info) = decode_png(&encode(frame, "png").unwrap());
             assert_eq!(
                 (color, depth),
-                (png::ColorType::Grayscale, png::BitDepth::Eight),
-                "{name}"
+                (png::ColorType::Grayscale, png::BitDepth::Sixteen),
+                "{}",
+                pixel_format_name(frame.pixel_format)
             );
-            assert_eq!(samples, vec![expected; 8], "{name}");
+            let samples = samples
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|sample| u16::from_be_bytes(*sample))
+                .collect::<Vec<_>>();
+            (samples, info.sbit.map(|bits| bits.into_owned()))
+        };
+        let mono12 = sized(0x0110_0005, le16(&[0x0ABC; 8]));
+        assert_eq!(sixteen(&mono12), (vec![0xABC0; 8], Some(vec![12])));
+        // Packed Mono12p and Mono12Packed rows of 0xABC unpack to the same
+        // samples; bits above the format's are not samples.
+        for mono in [
+            sized(0x010c_0047, [0xBC, 0xCA, 0xAB].repeat(4)),
+            sized(0x010c_0006, [0xAB, 0xCC, 0xAB].repeat(4)),
+            sized(0x0110_0005, le16(&[0xFABC; 8])),
+        ] {
+            assert_eq!(sixteen(&mono), (vec![0xABC0; 8], Some(vec![12])));
         }
+        assert_eq!(
+            sixteen(&sized(0x0110_0025, le16(&[0x2ABC; 8]))),
+            (vec![0xAAF0; 8], Some(vec![14]))
+        );
+        assert_eq!(
+            sixteen(&sized(0x010a_0046, [0xFF; 10].to_vec())),
+            (vec![0xFFC0; 8], Some(vec![10]))
+        );
+        assert_eq!(
+            sixteen(&sized(0x0110_0007, le16(&[0x1234; 8]))),
+            (vec![0x1234; 8], Some(vec![16]))
+        );
+        // JPEG and PGM keep the top 8 bits, as the preview does.
+        assert_eq!(
+            encode(&mono12, "pgm").unwrap()[b"P5\n4 2\n255\n".len()..],
+            [0xAB; 8]
+        );
+        assert_eq!(bit_depth(0x0110_0005, "png"), (16, None));
+        assert_eq!(bit_depth(0x010c_0047, "raw"), (12, None));
+        assert_eq!(bit_depth(0x010c_0047, "jpeg"), (8, Some(12)));
+        assert_eq!(bit_depth(0x0110_0011, "png"), (8, Some(12)));
+        assert_eq!(bit_depth(RGB8, "png"), (8, None));
         // Bayer at any depth or packing, YUV 4:2:2 and RGBa stay RGB.
         for color_frame in [
             sized(RGB8, vec![7; 24]),

@@ -358,6 +358,15 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
         |path| crate::storage::save(&bytes, path, save.sync, save.manifest.is_some()),
     )
     .with_context(|| format!("save {}", save.path.display()))?;
+    if save.format == "raw" {
+        save_sidecar(
+            &path,
+            &shot.frame,
+            shot.wall_ms,
+            &shot.acquisition,
+            save.sync,
+        )?;
+    }
     let file = image_file(
         &path,
         &stored,
