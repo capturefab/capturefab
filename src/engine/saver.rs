@@ -28,7 +28,10 @@ pub(super) struct Save {
     pub(super) format: String,
     /// JPEG quality, when not the default.
     pub(super) quality: Option<u8>,
-    pub(super) storage: crate::storage::StoragePolicy,
+    pub(super) sync: crate::storage::SyncMode,
+    /// The job's manifest, which gets a line once the file is published.
+    pub(super) manifest: Option<Arc<super::saved::Manifest>>,
+    pub(super) source: Source,
     pub(super) context: crate::context::Context,
 }
 
@@ -135,8 +138,8 @@ impl Drop for Saver {
     }
 }
 
-/// Encode and write one job's file for a shot, then report it. Returns the
-/// path it was saved at.
+/// Encode and write one job's file for a shot, then report it, in its
+/// manifest too. Returns the path it was saved at.
 fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<SavedShot> {
     let meta = still_meta(&shot.frame, shot.wall_ms, &shot.acquisition, &save.context);
     let bytes = encode_still(&shot.frame, &save.format, save.quality, Some(&meta))?;
@@ -152,19 +155,26 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<SavedShot> {
         &input,
         save.on_exists,
         save.path.clone(),
-        |path| crate::storage::save_bytes(&bytes, path, &save.storage),
+        |path| crate::storage::save(&bytes, path, save.sync, save.manifest.is_some()),
     )
     .with_context(|| format!("save {}", save.path.display()))?;
-    report_image(
-        h,
+    let file = image_file(
         &path,
-        stored,
+        &stored,
         &shot.frame,
         &save.format,
         shot.wall_ms,
         Some(save.job),
         &save.context,
     );
+    let listed = save.manifest.as_ref().map(|manifest| {
+        let settings = Value::Object(shot.acquisition.settings.clone());
+        manifest.append(&file.manifest_line(&save.source.id, &settings, save.source.device_clock))
+    });
+    // The file is saved either way: it is reported before a manifest
+    // failure ends its job.
+    h.push_saved(Some(save.job), file);
+    listed.transpose()?;
     Ok(SavedShot {
         path: path.to_string_lossy().into_owned(),
         frame: crate::scheduling::JobFrame {

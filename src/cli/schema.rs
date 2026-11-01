@@ -276,6 +276,7 @@ fn errors(command: &str) -> &'static [&'static str] {
             "frame_timeout",
             "trigger_timeout",
             "exists",
+            "storage_full",
             "feature_not_found",
             "out_of_range",
             "camera_not_found",
@@ -357,7 +358,7 @@ fn leaves(command: &clap::Command, prefix: &str, out: &mut Vec<(String, clap::Co
             format!("{prefix} {}", sub.get_name())
         };
         if sub.has_subcommands() {
-            // A group that runs on its own (storage) is a command too.
+            // A group that runs on its own (jobs) is a command too.
             if !sub.is_subcommand_required_set() {
                 out.push((name.clone(), sub.clone()));
             }

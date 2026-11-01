@@ -741,7 +741,8 @@ impl Namer {
     }
 }
 
-/// The highest number already used in `dir` for this pattern, or 0.
+/// The highest number already used in `dir` for this pattern, or 0. Stills
+/// still being written, under their hidden partial names, are not counted.
 fn highest(dir: &Path, parts: &[Part]) -> u32 {
     let dir = if dir.as_os_str().is_empty() {
         Path::new(".")
@@ -755,7 +756,10 @@ fn highest(dir: &Path, parts: &[Part]) -> u32 {
         .take(MAX_SCAN_ENTRIES)
         .filter_map(|entry| {
             let name = entry.ok()?.file_name();
-            matches(name.to_str()?, parts)
+            let name = name.to_str()?;
+            (!crate::storage::is_partial(name))
+                .then(|| matches(name, parts))
+                .flatten()
         })
         .max()
         .unwrap_or(0)
@@ -1097,6 +1101,31 @@ mod tests {
             dir.join("Model-SN1-20261017-101500.000-0004.raw")
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stills_being_written_are_not_numbers_in_use() {
+        // Another process's burst: two published, two still being written.
+        let dir = temp("partials");
+        for name in [
+            "x-0001.png",
+            "x-0002.png",
+            ".x-0003.png.4242-a1b2c3d4e5f6.partial",
+            ".x-0004.png.4242-0a0b0c0d0e0f.partial",
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+        let parts = [Part::Lit("x-".into()), Part::Seq, Part::Lit(".png".into())];
+        assert_eq!(highest(&dir, &parts), 2);
+        // Even a pattern their hidden names fit.
+        let tail = Part::Lit(".png.4242-a1b2c3d4e5f6.partial".into());
+        let hidden = [Part::Lit(".x-".into()), Part::Seq, tail];
+        assert_eq!(highest(&dir, &hidden), 0);
+        let plan = Plan::Template(format!("{}/x-{{seq}}.png", dir.display()));
+        let next = Namer::default()
+            .candidate(&plan, &input(fixed_time()), OnExists::Fail)
+            .unwrap();
+        assert_eq!(next, dir.join("x-0003.png"));
     }
 
     #[test]

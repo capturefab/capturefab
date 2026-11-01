@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     controls::Assignment,
+    scheduling::rfc3339,
     session::SessionCommand,
     types::{Categorized, ErrorKind, Usage},
 };
@@ -83,6 +84,12 @@ pub struct CaptureArgs {
     /// When a file name without {seq} exists: fail, or number (-0001, -0002, ...)
     #[arg(long, value_enum, default_value_t = crate::naming::OnExists::Fail)]
     pub on_exists: crate::naming::OnExists,
+    /// Append one JSON line per saved file (path, time, size, SHA-256, settings, tags) to this file
+    #[arg(long, value_name = "FILE")]
+    pub manifest: Option<String>,
+    /// file: each file reaches the disk before it is reported; none: skip that, for scratch captures
+    #[arg(long, value_enum, default_value_t = crate::storage::SyncMode::File)]
+    pub sync: crate::storage::SyncMode,
     /// Leave the capture running in a session and print its job at once
     #[arg(long)]
     pub background: bool,
@@ -106,6 +113,8 @@ struct Plan {
     timeout_ms: u64,
     settings: Vec<Assignment>,
     context: crate::context::Context,
+    /// Absolute, as the caller meant it.
+    manifest: Option<String>,
 }
 
 impl Plan {
@@ -158,7 +167,7 @@ impl Plan {
             (Some(at), _) => {
                 let at = u64::try_from(at.timestamp_millis()).unwrap_or(0);
                 if at < now {
-                    return Err(Usage(format!("--at {} has passed", jobs_time(at))).into());
+                    return Err(Usage(format!("--at {} has passed", rfc3339(at))).into());
                 }
                 Some(at)
             }
@@ -180,6 +189,30 @@ impl Plan {
             Wait::For(wait) => millis(wait).max(1),
             Wait::Forever => crate::scheduling::MAX_DURATION_MS,
         };
+        let manifest = match args.manifest.as_deref() {
+            None => None,
+            Some("-") => {
+                return Err(Usage("--manifest needs a file; stdout is for results".into()).into());
+            }
+            Some(_) if output == "-" => {
+                return Err(Usage("-o - saves no file for --manifest to list".into()).into());
+            }
+            Some(manifest) => {
+                crate::naming::validate_output(manifest).map_err(super::input)?;
+                let mut manifest = manifest.to_owned();
+                super::paths::resolve_path(&mut manifest, &std::env::current_dir()?)
+                    .map_err(super::input)?;
+                if std::path::Path::new(&manifest).is_dir()
+                    || manifest.ends_with(std::path::is_separator)
+                {
+                    return Err(Usage(format!(
+                        "--manifest {manifest} is a folder; name a file such as captures.jsonl"
+                    ))
+                    .into());
+                }
+                Some(manifest)
+            }
+        };
         let plan = Self {
             output,
             format,
@@ -189,6 +222,7 @@ impl Plan {
             timeout_ms,
             settings,
             context,
+            manifest,
         };
         if plan.output != "-" {
             crate::engine::check_capture_name(&plan.output, count, format)?;
@@ -208,8 +242,9 @@ impl Plan {
             format: self.format.into(),
             first_at_ms: self.first_at_ms.unwrap_or_else(crate::scheduling::now_ms),
             interval_ms: self.interval_ms,
-            storage: storage_policy(),
             on_exists: args.on_exists,
+            manifest: self.manifest.clone(),
+            sync: args.sync,
             context: self.context.clone(),
             utc_offset_s: Some(crate::naming::local_offset()),
             quality,
@@ -217,17 +252,6 @@ impl Plan {
             lease: !args.background,
         }
     }
-}
-
-/// The storage budget captures count against until it is replaced.
-pub(super) fn storage_policy() -> crate::storage::StoragePolicy {
-    crate::storage::configured_policy().unwrap_or_default()
-}
-
-fn jobs_time(ms: u64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(i64::try_from(ms).unwrap_or(i64::MAX))
-        .unwrap_or_default()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 /// The image format: the output's extension names it; `-f` only when there
@@ -567,8 +591,8 @@ fn result(job: &Value, detail: &Value) -> Value {
         "width": frame["width"],
         "height": frame["height"],
         "pixel_format": frame["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
-        "settings": settings(&detail["settings"]),
-        "time": first.map(jobs_time),
+        "settings": crate::engine::saved::settings(&detail["settings"]),
+        "time": first.map(rfc3339),
     });
     if count > 1
         && let (Some(first), Some(ended)) = (first, detail["ended_ms"].as_u64())
@@ -579,44 +603,6 @@ fn result(job: &Value, detail: &Value) -> Value {
         value["truncated"] = json!(truncated);
     }
     crate::types::without_nulls(value)
-}
-
-/// The camera's settings when the first frame was taken (`features`, the
-/// GenICam values the worker read) under the names `inspect` and `info`
-/// use, with units in the names: SFNC gives ExposureTime in microseconds
-/// and Gain in dB.
-fn settings(features: &Value) -> Value {
-    let number = |names: &[&str]| names.iter().find_map(|name| features[*name].as_f64());
-    let mode = |name: &str| features[name].as_str().map(str::to_ascii_lowercase);
-    let trigger = match features["TriggerMode"].as_str() {
-        Some(mode) if mode.eq_ignore_ascii_case("off") => Some("off".to_owned()),
-        Some(_) => Some(
-            features["TriggerSource"]
-                .as_str()
-                .map_or_else(|| "on".to_owned(), str::to_ascii_lowercase),
-        ),
-        None => None,
-    };
-    let binning = number(&["BinningHorizontal"])
-        .zip(number(&["BinningVertical"]))
-        .map(|(x, y)| format!("{x}x{y}"));
-    crate::types::without_nulls(json!({
-        "exposure_us": number(&["ExposureTime", "ExposureTimeAbs"]),
-        "auto_exposure": mode("ExposureAuto"),
-        "gain_db": number(&["Gain"]),
-        "gain": features["Gain"].is_null().then(|| number(&["GainRaw"])).flatten(),
-        "auto_gain": mode("GainAuto"),
-        "auto_wb": mode("BalanceWhiteAuto"),
-        "fps": number(&["AcquisitionFrameRate", "AcquisitionFrameRateAbs"]),
-        "trigger": trigger,
-        "black_level": number(&["BlackLevel"]),
-        "gamma": number(&["Gamma"]),
-        "binning": binning,
-        "offset_x": number(&["OffsetX"]),
-        "offset_y": number(&["OffsetY"]),
-        "reverse_x": features["ReverseX"].as_bool(),
-        "reverse_y": features["ReverseY"].as_bool(),
-    }))
 }
 
 fn dry_run(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
@@ -633,10 +619,10 @@ fn dry_run(client: &Client, args: &CaptureArgs, plan: &Plan) -> Result<Value> {
     }
     let first = plan.first_at_ms.unwrap_or_else(crate::scheduling::now_ms);
     if plan.first_at_ms.is_some() {
-        value["first_at"] = json!(jobs_time(first));
+        value["first_at"] = json!(rfc3339(first));
     }
     if plan.interval_ms > 0 {
-        value["ends_at"] = json!(jobs_time(
+        value["ends_at"] = json!(rfc3339(
             first.saturating_add(
                 plan.interval_ms
                     .saturating_mul(u64::from(plan.count.saturating_sub(1)))
@@ -710,8 +696,8 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         count: 1,
         timeout_ms: plan.timeout_ms,
         format: plan.format.into(),
-        storage: storage_policy(),
         on_exists: Default::default(),
+        sync: args.sync,
         context: plan.context.clone(),
         utc_offset_s: Some(crate::naming::local_offset()),
         quality: args.quality,
@@ -796,8 +782,8 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         "width": meta["width"],
         "height": meta["height"],
         "pixel_format": meta["pixel_format"].as_u64().map(|format| crate::inspect::pixel_format_label(format as u32)),
-        "settings": settings(&meta["settings"]),
-        "time": meta["wall_ms"].as_u64().map(jobs_time),
+        "settings": crate::engine::saved::settings(&meta["settings"]),
+        "time": meta["wall_ms"].as_u64().map(rfc3339),
     }));
     // The image owns stdout; the result goes to stderr in one write.
     if global.json && super::output::claim() {
@@ -928,25 +914,6 @@ pub const FIELDS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn settings_take_the_names_inspect_uses() {
-        let shown = settings(&json!({
-            "ExposureTime": 10000.0, "ExposureAuto": "Off", "Gain": 0.0,
-            "AcquisitionFrameRate": 30.0, "TriggerMode": "On", "TriggerSource": "Line0",
-            "BinningHorizontal": 2, "BinningVertical": 2,
-        }));
-        assert_eq!(
-            shown,
-            json!({"exposure_us": 10000.0, "auto_exposure": "off", "gain_db": 0.0,
-                "fps": 30.0, "trigger": "line0", "binning": "2x2"})
-        );
-        assert_eq!(
-            settings(&json!({"TriggerMode": "Off", "GainRaw": 4})),
-            json!({"trigger": "off", "gain": 4.0})
-        );
-        assert_eq!(settings(&Value::Null), json!({}));
-    }
 
     #[test]
     fn formats_come_from_the_name_and_flags_only_fill_in() {

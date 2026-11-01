@@ -19,7 +19,6 @@ mod schema;
 mod serve;
 mod session;
 mod signals;
-mod storage;
 
 #[cfg(test)]
 pub(crate) use output::error_code;
@@ -243,9 +242,6 @@ pub enum Command {
     /// Print Capturefab's license and the bundled FFmpeg's license notice
     #[command(after_help = "Examples:\n  capturefab licenses\n  capturefab --json licenses")]
     Licenses,
-    /// The storage budget for captures and recordings, until it is replaced
-    #[command(subcommand, hide = true)]
-    Storage(storage::StorageCommand),
 }
 
 /// Run the command line; the process exit code.
@@ -385,7 +381,6 @@ pub fn run(mut cli: Cli) -> Result<Option<Report>> {
         }
         Command::Debug(command) => return debug::run(global, command),
         Command::Licenses => doctor::licenses(),
-        Command::Storage(command) => storage::run(&command)?,
     }))
 }
 

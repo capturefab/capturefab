@@ -3200,14 +3200,14 @@ pub struct ForwardConfig {
     pub encoder: String,
     pub fps: f64,
     pub bitrate: String,
-    #[serde(default)]
-    pub storage: crate::storage::StoragePolicy,
-    #[serde(default = "default_recording_cap")]
-    pub max_file_bytes: u64,
+    /// A local recording ends, as asked, at exactly this many bytes; none by
+    /// default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_bytes: Option<u64>,
 }
 impl ForwardConfig {
     /// Validate forwarding settings before starting a process, changing camera
-    /// settings or reserving storage.
+    /// settings or creating a file.
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.fps.is_finite() && (0.1..=240.0).contains(&self.fps),
@@ -3222,18 +3222,12 @@ impl ForwardConfig {
         output_args(&self.output)?;
         crate::naming::validate_output(&self.output)?;
         let recording = recording_output(&self.output)?;
-        // Storage fields remain valid even when a network stream does not use them.
-        self.storage.validate()?;
         ensure!(
-            self.max_file_bytes > 0,
-            "recording reservation must be positive"
+            self.max_file_bytes != Some(0),
+            "a recording's maximum size must be positive"
         );
         if let Some((_, container)) = &recording {
             let container = *container;
-            ensure!(
-                self.max_file_bytes <= self.storage.max_bytes,
-                "recording reservation must be no greater than the storage byte budget"
-            );
             ensure!(
                 container != "webm" || family == "av1",
                 "WebM recordings require the av1 codec; use .mkv or .mp4 for h264 or hevc"
@@ -3250,29 +3244,11 @@ impl ForwardConfig {
         Ok(())
     }
 }
-pub fn default_recording_cap() -> u64 {
-    512 * 1024 * 1024
-}
-/// `max_file_bytes` for a recording without a size cap: it runs until it is
-/// stopped, or the disk is full.
-pub const NO_SIZE_CAP: u64 = u64::MAX;
-/// What a recording without a size cap holds of the storage budget while it
-/// runs, so captures and other recordings keep working beside it.
-const UNCAPPED_RESERVATION: u64 = 64 * 1024 * 1024;
 impl ForwardConfig {
-    /// The file writer of a local recording at `path`: bounded by
-    /// `max_file_bytes`, or without a cap reserving a little and growing.
-    pub fn writer(&self, path: &std::path::Path) -> Result<crate::storage::StorageWriter> {
-        if self.max_file_bytes == NO_SIZE_CAP {
-            crate::storage::create_growing_writer(
-                path,
-                &self.storage,
-                UNCAPPED_RESERVATION,
-                NO_SIZE_CAP,
-            )
-        } else {
-            crate::storage::create_writer(path, &self.storage, self.max_file_bytes)
-        }
+    /// The new file of a local recording at `path`, bounded by
+    /// `max_file_bytes` when it has one.
+    pub fn writer(&self, path: &std::path::Path) -> Result<crate::storage::Recording> {
+        crate::storage::Recording::create(path, self.max_file_bytes, false)
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -3310,6 +3286,8 @@ struct WriterQueue {
     busy: AtomicBool,
     /// Writing the encoded recording failed, for example on a full disk.
     output_failed: AtomicBool,
+    /// The recording reached its maximum size, which ends it as asked.
+    full_size: AtomicBool,
     epoch: Instant,
     /// When the newest frame arrived, in milliseconds since `epoch`.
     arrived_ms: AtomicU64,
@@ -3333,6 +3311,7 @@ impl WriterQueue {
             late: AtomicU64::new(0),
             busy: AtomicBool::new(false),
             output_failed: AtomicBool::new(false),
+            full_size: AtomicBool::new(false),
             epoch: Instant::now(),
             arrived_ms: AtomicU64::new(0),
         }
@@ -3387,12 +3366,14 @@ struct EncoderProcess {
     stage: Option<Child>,
     stage_log: Option<JoinHandle<()>>,
     encoder: String,
-    /// When the recording file was reserved, UTC Unix milliseconds.
+    /// When the recording file was created, UTC Unix milliseconds.
     started_ms: u64,
     spawned: Instant,
+    /// What the recording's file finds on its disk.
+    alarm: Option<Arc<crate::storage::Alarm>>,
 }
 struct EncodedOutput {
-    storage: crate::storage::StorageWriter,
+    storage: crate::storage::Recording,
     error: Option<String>,
 }
 pub struct Forwarder {
@@ -3401,7 +3382,7 @@ pub struct Forwarder {
     final_stats: ForwardStats,
     /// The recording file, created when its name was picked so no other
     /// writer can take the name before the first frame.
-    reserved: Option<crate::storage::StorageWriter>,
+    reserved: Option<crate::storage::Recording>,
     /// An automatically chosen encoder that exited early; the recording
     /// falls back once to the next candidate.
     failed: Option<String>,
@@ -3451,26 +3432,6 @@ pub fn validate_encoder(codec: &str, encoder: &str) -> Result<()> {
 
 pub fn validate_bitrate(bitrate: &str) -> Result<()> {
     bits_per_second(bitrate).map(|_| ())
-}
-/// The `max_file_bytes` to reserve for a recording at `bitrate` that lasts
-/// `duration_ms`: the estimate plus 25% and 16 MiB, rounded up to a whole
-/// MiB. A recording stops when it outgrows its reservation, so err high.
-pub fn recording_reservation(bitrate: &str, duration_ms: u64) -> Result<u64> {
-    Ok(reservation_bytes(bits_per_second(bitrate)?, duration_ms))
-}
-fn estimated_bytes(bits_per_second: u64, duration_ms: u64) -> u64 {
-    let bits = u128::from(bits_per_second) * u128::from(duration_ms);
-    // Bit-milliseconds over 8 bits per byte and 1000 ms per second.
-    u64::try_from(bits.div_ceil(8000)).unwrap_or(u64::MAX)
-}
-fn reservation_bytes(bits_per_second: u64, duration_ms: u64) -> u64 {
-    const MIB: u64 = 1024 * 1024;
-    let estimate = estimated_bytes(bits_per_second, duration_ms);
-    estimate
-        .saturating_add(estimate.div_ceil(4))
-        .saturating_add(16 * MIB)
-        .div_ceil(MIB)
-        .saturating_mul(MIB)
 }
 /// What probing one FFmpeg found: remembered for the process and, beside a
 /// shared extracted copy, for the rest of the boot. A missing, corrupt or
@@ -4391,7 +4352,7 @@ impl Forwarder {
     /// created recording file, if any.
     pub fn with_resolved(
         config: ForwardConfig,
-        reserved: Option<crate::storage::StorageWriter>,
+        reserved: Option<crate::storage::Recording>,
     ) -> Result<Self> {
         if let Err(error) = config.validate().and_then(|()| check_codec(&config)) {
             if let Some(reserved) = reserved {
@@ -4551,7 +4512,7 @@ impl Forwarder {
         }
         cmd.stdout(if local { Stdio::piped() } else { Stdio::null() })
             .stderr(Stdio::piped());
-        // Validate/probe before creating a file, then reserve the global budget.
+        // Validate and probe before creating a file.
         let storage = match self.reserved.take() {
             Some(reserved) => Some(reserved),
             None => recording
@@ -4583,6 +4544,7 @@ impl Forwarder {
         };
         let log_thread = log.collect(child.stderr.take().unwrap());
         let queue = Arc::new(WriterQueue::new());
+        let alarm = storage.as_ref().map(crate::storage::Recording::alarm);
         let output_thread = storage.map(|mut storage| {
             let mut output = child.stdout.take().expect("piped encoded output");
             let shared = queue.clone();
@@ -4590,6 +4552,9 @@ impl Forwarder {
                 let error = std::io::copy(&mut output, &mut storage)
                     .err()
                     .map(|error| format!("write bounded recording: {error}"));
+                if storage.cut() == Some(crate::storage::Cut::MaxSize) {
+                    shared.full_size.store(true, Ordering::Release);
+                }
                 if let Some(error) = &error {
                     shared.fail(error.clone());
                     shared.output_failed.store(true, Ordering::Release);
@@ -4662,6 +4627,7 @@ impl Forwarder {
             encoder,
             started_ms,
             spawned: Instant::now(),
+            alarm,
         });
         Ok(())
     }
@@ -4736,6 +4702,12 @@ impl Forwarder {
             frame.pixel_format == process.raw.pixel_format,
             "the camera's pixel format changed; start a new recording to continue"
         );
+        // A recording at its maximum size, or on a disk below its floor,
+        // ends: as asked, or with storage_full.
+        if let Some(end) = self.storage_end() {
+            return Err(end);
+        }
+        let process = self.process.as_mut().unwrap();
         // An encoder that died at start leaves a broken pipe behind; falling
         // back to the next one comes first.
         if let Some(status) = process.child.try_wait()?
@@ -4790,6 +4762,17 @@ impl Forwarder {
         queue.changed.notify_one();
         Ok(!replaced)
     }
+    /// Why the recording must end for its file: it reached its maximum
+    /// size ([`crate::storage::MaxSize`]), or its disk fell below the
+    /// free-space floor (`storage_full`).
+    pub fn storage_end(&self) -> Option<anyhow::Error> {
+        let process = self.process.as_ref()?;
+        if process.queue.full_size.load(Ordering::Acquire) {
+            let limit = self.config.max_file_bytes.unwrap_or_default();
+            return Some(crate::storage::MaxSize(limit).into());
+        }
+        process.alarm.as_ref()?.error()
+    }
     pub fn stats(&self) -> ForwardStats {
         if let Some(p) = &self.process {
             ForwardStats {
@@ -4829,14 +4812,24 @@ impl Forwarder {
     fn settle(&mut self, process: EncoderProcess, finished: Finished) -> Result<()> {
         let (status, recording, mut error) = finished;
         self.final_stats.written = process.queue.written.load(Ordering::Relaxed);
-        if let Some(output) = recording {
+        let mut full_size = false;
+        if let Some(mut output) = recording {
             // Video the encoder wrote stays even when it failed or had to be
-            // stopped, or when the file reached its maximum size or a write
-            // to it failed, since every recording container plays up to its
-            // last complete part. The cause still ends the recording.
+            // stopped, or when a write to the file failed, since every
+            // recording container plays up to its last complete part. The
+            // cause still ends the recording. One that reached its maximum
+            // size ended as asked: the encoder then fails on its closed
+            // output, which is no error.
             let cut = output.storage.cut();
-            let kept =
-                (output.error.is_none() || cut) && output.storage.bytes_written() > HEADER_BYTES;
+            full_size = cut == Some(crate::storage::Cut::MaxSize);
+            if full_size {
+                (error, output.error) = (None, None);
+            }
+            let kept = (output.error.is_none() || cut.is_some())
+                && output.storage.bytes_written() > HEADER_BYTES;
+            if full_size && !kept {
+                error = Some("the recording reached its maximum size before any video".into());
+            }
             if error.is_none() {
                 error = output.error;
             }
@@ -4845,14 +4838,12 @@ impl Forwarder {
                     && error.is_none()
                     && output.storage.bytes_written() > 0;
             let path = output.storage.path().to_path_buf();
-            let (bytes, sha256) = (output.storage.bytes_written(), output.storage.sha256());
             let result = if valid {
-                output.storage.finish_cut().map(|()| {
-                    // The complete local file is recorded in the storage ledger.
+                output.storage.finish().map(|stored| {
                     let recorded = crate::engine::saved::RecordedFile {
                         path: path.display().to_string(),
-                        bytes,
-                        sha256,
+                        bytes: stored.bytes,
+                        sha256: stored.sha256,
                         started_ms: process.started_ms,
                         ended_ms: crate::scheduling::now_ms(),
                         codec: self.config.codec.clone(),
@@ -4868,7 +4859,7 @@ impl Forwarder {
                 error.get_or_insert_with(|| format!("recording finalization failed: {failure:#}"));
             }
         }
-        if error.is_none() {
+        if error.is_none() && !full_size {
             error = match status {
                 Some(status) if status.success() => None,
                 Some(status) => Some(format!(
@@ -5876,8 +5867,7 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
             encoder: encoder.into(),
             fps,
             bitrate: "1M".into(),
-            storage: Default::default(),
-            max_file_bytes: default_recording_cap(),
+            max_file_bytes: None,
         }
     }
     #[cfg(unix)]
@@ -5888,8 +5878,8 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
         }
     }
     /// Run the calling test again in a child process with its own session
-    /// directory, since recordings reserve storage in its ledger. True in
-    /// the child, which does the work.
+    /// directory, so what it records never meets another test's files. True
+    /// in the child, which does the work.
     #[cfg(unix)]
     fn in_own_session(test: &str) -> bool {
         if std::env::var_os("CAPTUREFAB_OWN_SESSION_TEST").is_some() {
@@ -6811,8 +6801,7 @@ esac"#
             encoder: "libx264".into(),
             fps: 10.0,
             bitrate: "1M".into(),
-            storage: Default::default(),
-            max_file_bytes: default_recording_cap(),
+            max_file_bytes: None,
         })
         .unwrap();
         for frame in frames {
@@ -6853,8 +6842,7 @@ esac"#
             encoder: "libx264".into(),
             fps: 30.0,
             bitrate: "8M".into(),
-            storage: Default::default(),
-            max_file_bytes: default_recording_cap(),
+            max_file_bytes: None,
         })
         .unwrap();
         let (width, height) = (1920usize, 1080usize);
@@ -6951,8 +6939,7 @@ esac"#
             encoder: "libx264".into(),
             fps: 30.0,
             bitrate: "4M".into(),
-            storage: Default::default(),
-            max_file_bytes: default_recording_cap(),
+            max_file_bytes: None,
         })
         .unwrap();
         let (width, height) = (1280usize, 720usize);
@@ -7032,8 +7019,7 @@ esac"#
             encoder: "libx264".into(),
             fps: 60.0,
             bitrate: "32M".into(),
-            storage: Default::default(),
-            max_file_bytes: default_recording_cap(),
+            max_file_bytes: None,
         })
         .unwrap();
         let mut noise = 123u32;
@@ -7080,8 +7066,7 @@ esac"#
             encoder: "capturefab_nonexistent_encoder".into(),
             fps: 30.0,
             bitrate: "1M".into(),
-            storage: Default::default(),
-            max_file_bytes: default_recording_cap(),
+            max_file_bytes: None,
         })
         .unwrap();
         let frame = Frame {
@@ -7095,14 +7080,11 @@ esac"#
         let error = forward.push(frame.clone()).unwrap_err();
         assert!(format!("{error:#}").contains("is unavailable in this FFmpeg build"));
         forward.stop().unwrap();
-        assert!(
-            !path.exists(),
-            "invalid recordings must be removed and release their reservation"
-        );
+        assert!(!path.exists(), "invalid recordings must be removed");
     }
     #[test]
     #[ignore = "requires FFmpeg"]
-    fn ffmpeg_local_recording_reservation_is_bounded_and_removed_on_failure() {
+    fn ffmpeg_a_recording_cut_before_any_video_is_removed() {
         // A full disk is not an encoder failure, so auto does not fall back.
         for encoder in ["libx264", "auto"] {
             bounded_recording_is_removed_on_failure(encoder);
@@ -7120,8 +7102,7 @@ esac"#
             encoder: encoder.into(),
             fps: 30.0,
             bitrate: "1M".into(),
-            storage: Default::default(),
-            max_file_bytes: 512,
+            max_file_bytes: Some(512),
         })
         .unwrap();
         let frame = Frame {
@@ -7140,7 +7121,10 @@ esac"#
         }
         let encoder = forward.stats().encoder;
         let error = forward.stop().unwrap_err().to_string();
-        assert!(error.contains("Storage full"), "{error}");
+        assert!(
+            error.contains("reached its maximum size before any video"),
+            "{error}"
+        );
         assert_eq!(forward.stats().encoder, encoder);
         assert!(
             !path.exists(),
@@ -7162,8 +7146,7 @@ esac"#
             encoder: "libx264".into(),
             fps: 30.0,
             bitrate: "8M".into(),
-            storage: Default::default(),
-            max_file_bytes: limit,
+            max_file_bytes: Some(limit),
         })
         .unwrap();
         // Noise compresses poorly, so the limit comes within seconds.
@@ -7190,14 +7173,18 @@ esac"#
             let _ = forward.push(frame);
             thread::sleep(Duration::from_millis(33));
         }
-        let error = forward.stop().unwrap_err().to_string();
-        assert!(error.contains("maximum file size"), "{error}");
+        // It ends as asked, with exactly the bytes it was given.
+        let end = forward
+            .storage_end()
+            .expect("the recording reached its size");
+        assert!(end.is::<crate::storage::MaxSize>(), "{end:#}");
+        forward.stop().unwrap();
         let recorded = forward
             .stats()
             .recording
             .expect("the recording up to its limit is kept");
         let bytes = std::fs::metadata(&path).unwrap().len();
-        assert!(bytes > HEADER_BYTES && bytes <= limit, "{bytes}");
+        assert_eq!(bytes, limit);
         assert_eq!(recorded.bytes, bytes);
         let exe = executable().unwrap();
         let args = [
@@ -7223,8 +7210,7 @@ esac"#
             encoder: "auto".into(),
             fps: 30.0,
             bitrate: "4M".into(),
-            storage: Default::default(),
-            max_file_bytes: default_recording_cap(),
+            max_file_bytes: None,
         };
         assert!(Forwarder::new(config.clone()).is_ok());
         let mut serialized = serde_json::to_value(&config).unwrap();
@@ -7279,31 +7265,6 @@ esac"#
         let mut invalid = config;
         invalid.fps = f64::NAN;
         assert!(Forwarder::new(invalid).is_err());
-    }
-    #[test]
-    fn recording_sizes_are_estimated_and_reserved_with_headroom() {
-        const MIB: u64 = 1024 * 1024;
-        let hour = 3_600_000;
-        // 4 Mbit/s for an hour is 1.8 GB, far above the default 512 MiB cap.
-        assert_eq!(estimated_bytes(4_000_000, hour), 1_800_000_000);
-        assert_eq!(estimated_bytes(1, 1), 1);
-        assert_eq!(estimated_bytes(4_000_000, 0), 0);
-        assert_eq!(
-            estimated_bytes(4_294_967_295, crate::scheduling::MAX_DURATION_MS),
-            169_423_574_885_865_000
-        );
-        assert!(recording_reservation("4MM", hour).is_err());
-        // 1.8 GB plus 25% and 16 MiB is 2,266,777,216 bytes: 2162 MiB, rounded up.
-        let reserved = recording_reservation("4M", hour).unwrap();
-        assert_eq!(reserved, 2162 * MIB);
-        assert!(reserved >= 1_800_000_000 / 4 * 5 + 16 * MIB);
-        assert_eq!(recording_reservation("4M", 0).unwrap(), 16 * MIB);
-        assert_eq!(recording_reservation("1", 1).unwrap(), 17 * MIB);
-        assert_eq!(
-            recording_reservation("4294967295", crate::scheduling::MAX_DURATION_MS).unwrap() % MIB,
-            0
-        );
-        assert!(recording_reservation("", hour).is_err());
     }
     #[test]
     fn host_cameras_are_named_by_their_operating_system_scheme() {

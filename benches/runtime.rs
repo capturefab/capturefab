@@ -3,7 +3,7 @@ use capturefab::testing::jpeg;
 use capturefab::testing::{
     frame,
     session::{SessionCommand, SessionHandle},
-    storage::{self, StoragePolicy},
+    storage::{self, SyncMode},
     types::{Frame, MONO8, RGB8},
 };
 use sha2::{Digest, Sha256};
@@ -282,63 +282,22 @@ fn main() {
             f.data.len(),
             || {
                 index += 1;
-                storage::save_bytes(
+                storage::save(
                     &capturefab::testing::frame::encode(&f, encoding).unwrap(),
                     &output.join(format!("{index}.{encoding}")),
-                    &StoragePolicy::default(),
+                    SyncMode::File,
+                    false,
                 )
                 .unwrap();
             },
         );
     }
-    let tiny = Frame {
-        id: 1,
-        width: 1,
-        height: 1,
-        pixel_format: MONO8,
-        timestamp_ns: 0,
-        data: vec![0],
-    };
-    // Room for the largest ledger below; the default keeps 10,000 files.
-    let policy = StoragePolicy {
-        max_files: 100_000,
-        ..StoragePolicy::default()
-    };
-    storage::configure_policy(&policy).unwrap();
     let five = vec![7u8; 5_000_000];
-    for entries in [100, 1000, 10_000] {
-        let name = format!("storage/save/raw/1x1/ledger{entries}");
-        let large = format!("storage/save_bytes/5MB/ledger{entries}");
-        let mut save = || {
-            index += 1;
-            let bytes = capturefab::testing::frame::encode(&tiny, "raw").unwrap();
-            storage::save_bytes(&bytes, &output.join(format!("{index}.raw")), &policy).unwrap();
-            index
-        };
-        if b.selected(&name) || b.selected(&large) {
-            while save() < entries {}
-        }
-        b.run(&name, 1, save);
-        // What a save adds to the ledger: journal growth, or the snapshot
-        // and new journal when it compacts. Constant however many are kept.
-        let ledger = |name| std::fs::metadata(session.join(name)).ok();
-        let (mut written, mut saves) = (0, 0);
-        b.run(&large, five.len(), || {
-            index += 1;
-            let snapshot = ledger("storage.json").and_then(|meta| meta.modified().ok());
-            let journal = ledger("storage.journal").map_or(0, |meta| meta.len());
-            storage::save_bytes(&five, &output.join(format!("{index}.raw")), &policy).unwrap();
-            let after = ledger("storage.journal").map_or(0, |meta| meta.len());
-            written += match ledger("storage.json") {
-                Some(meta) if meta.modified().ok() != snapshot => meta.len() + after,
-                _ => after.saturating_sub(journal),
-            };
-            saves += 1;
-        });
-        if let Some(per_save) = written.checked_div(saves) {
-            println!("{large:<40} ledger {per_save:>7} bytes per save");
-        }
-    }
+    b.run("storage/save/5MB", five.len(), || {
+        index += 1;
+        let path = output.join(format!("{index}.raw"));
+        storage::save(&five, &path, SyncMode::File, false).unwrap();
+    });
     // Session snapshots, as status takes them, with eight idle simulated
     // cameras on real workers and a full session log.
     if b.selected("session/snapshot") {

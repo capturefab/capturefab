@@ -1,12 +1,11 @@
 //! Host checks for `doctor`: where sessions, state and temporary files live,
-//! kernel limits that cap camera throughput and the storage budget against
-//! the capture disk, each turned into a check with a copyable fix.
+//! kernel limits that cap camera throughput and the free space captures
+//! have, each turned into a check with a copyable fix.
 #![allow(unsafe_code)]
 
 use crate::ipc::LoginDir;
 use crate::media::FfmpegHealth;
 use crate::network::{InterfaceKind, NetworkInterface};
-use crate::storage::{FREE_SPACE_FLOOR, StoragePolicy};
 use crate::types::human_bytes;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -135,7 +134,7 @@ struct UsbCamera {
 struct Facts {
     /// Where sessions are found, with their short-lived files.
     runtime: Place,
-    /// Presets, saved sign-ins and the storage ledger.
+    /// Presets, saved sign-ins and sessions' jobs.
     state: Place,
     /// CAPTUREFAB_SESSION_DIR chose both.
     session_dir_set: bool,
@@ -147,12 +146,11 @@ struct Facts {
     service_runtime_dir: Option<ServiceDir>,
     limits: Limits,
     usb: Vec<UsbCamera>,
-    budget: u64,
-    /// Bytes counted against the budget, reservations included; None while
-    /// the ledger's usage is unknown.
-    used: Option<u64>,
-    /// The default capture folder's disk, where `storage --json` measures.
+    /// Where captures go without -o: this folder.
     captures: Place,
+    /// The free space writes leave on that disk, or why the setting is
+    /// wrong.
+    floor: Result<u64, String>,
     /// IPv4 adapters, for the full report only: `serve`'s warnings never
     /// need them, and on Windows listing them runs PowerShell.
     interfaces: Option<Vec<NetworkInterface>>,
@@ -162,7 +160,7 @@ struct Facts {
     /// CAPTUREFAB_FFMPEG chose FFmpeg.
     ffmpeg_overridden: bool,
     /// Files in the state directory that version 0.5 wrote and nothing
-    /// reads any more.
+    /// reads any more, its storage ledger among them.
     leftovers: Vec<PathBuf>,
     /// The runtime or state directory, where it exists but sessions would
     /// refuse it, and why.
@@ -182,7 +180,6 @@ impl Facts {
     /// `doctor` shows.
     fn gather(report: bool) -> Self {
         let state = crate::ipc::state_dir();
-        let (budget, used) = ledger(&state);
         let mut private_dirs = Vec::new();
         for dir in [crate::ipc::runtime_dir(), state.clone()] {
             if dir.exists()
@@ -192,11 +189,26 @@ impl Facts {
                 private_dirs.push((dir, format!("{error:#}")));
             }
         }
-        let leftovers = LEFTOVERS
+        let leases = std::fs::read_dir(&state)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("storage-") && name.ends_with(".lease"))
+            });
+        let mut leftovers: Vec<PathBuf> = LEFTOVERS
             .iter()
             .map(|name| state.join(name))
             .filter(|path| path.symlink_metadata().is_ok())
+            .chain(leases)
             .collect();
+        leftovers.sort();
+        let captures = Place::of(std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        let floor = crate::storage::floor(captures.total_bytes.unwrap_or(0))
+            .map_err(|error| format!("{error:#}"));
         Self {
             leftovers,
             interfaces: report.then(|| crate::network::interfaces().unwrap_or_default()),
@@ -204,8 +216,6 @@ impl Facts {
                 .then(|| crate::media::ffmpeg_health().map_err(|error| format!("{error:#}"))),
             ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG").is_some(),
             private_dirs,
-            budget,
-            used,
             runtime: Place::of(crate::ipc::runtime_dir()),
             state: Place::of(state),
             session_dir_set: std::env::var_os("CAPTUREFAB_SESSION_DIR")
@@ -224,7 +234,8 @@ impl Facts {
             }),
             limits: limits(),
             usb: usb_cameras(),
-            captures: capture_place(),
+            captures,
+            floor,
         }
     }
 }
@@ -339,11 +350,7 @@ fn checks(facts: &Facts) -> Vec<Check> {
     checks.extend(leftovers_check(&facts.leftovers));
     checks.extend(facts.limits.rmem_max.map(receive_buffer_check));
     checks.extend(usb_check(&facts.usb));
-    checks.extend(
-        facts
-            .used
-            .and_then(|used| budget_check(facts.budget, used, &facts.captures)),
-    );
+    checks.extend(free_space_check(&facts.captures, &facts.floor));
     checks
 }
 
@@ -362,7 +369,7 @@ fn runtime_dir_check(login: &Path, why: LoginDir, runtime: &Place, state: &Place
             "XDG_RUNTIME_DIR is unset and {why}, so sessions are on disk in {runtime}, while logins look for them in {dir}/capturefab."
         ),
         format!(
-            "{fix} Presets, saved sign-ins and the storage ledger stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
+            "{fix} Presets, saved sign-ins and sessions' jobs stay in {state} either way. A service unit that does this: {LINE_COMPUTER}"
         ),
     )
 }
@@ -442,7 +449,7 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
         return Check::ok(
             "session_storage",
             format!(
-                "Presets, saved sign-ins and the storage ledger are in {}.",
+                "Presets, saved sign-ins and sessions' jobs are in {}.",
                 state.described()
             ),
         );
@@ -450,7 +457,7 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
     let mut check = Check::ok(
         "session_storage",
         format!(
-            "Presets, saved sign-ins and the storage ledger are in memory in {} and are cleared at reboot.",
+            "Presets, saved sign-ins and sessions' jobs are in memory in {} and are cleared at reboot.",
             state.described()
         ),
     );
@@ -465,8 +472,9 @@ fn session_check(state: &Place, session_dir_set: bool) -> Check {
 }
 
 /// What version 0.5 kept in the state directory for the desktop app,
-/// hubs, destinations, the assistant, resource limits and update checks.
-const LEFTOVERS: [&str; 12] = [
+/// hubs, destinations, the assistant, resource limits, update checks and
+/// the storage ledger, beside the ledger's `storage-*.lease` files.
+const LEFTOVERS: [&str; 17] = [
     "gui.prefs.json",
     "hubs.json",
     "hubs.lock",
@@ -479,6 +487,11 @@ const LEFTOVERS: [&str; 12] = [
     "resources.lock",
     "updates.json",
     "updates.lock",
+    "storage.json",
+    "storage.journal",
+    "storage.lock",
+    "storage-policy.json",
+    "storage-summary.json",
 ];
 
 /// Leftovers of version 0.5, with the command that removes them.
@@ -498,7 +511,7 @@ fn leftovers_check(leftovers: &[PathBuf]) -> Option<Check> {
     Some(Check::warn(
         "leftover_state",
         format!(
-            "{} file{} from Capturefab 0.5 that nothing reads any more (desktop, hubs, destinations, assistant or update settings).",
+            "{} file{} from Capturefab 0.5 that nothing reads any more (desktop, hubs, destinations, assistant, update settings or the storage ledger, whose budget and retention are gone).",
             leftovers.len(),
             if leftovers.len() == 1 { "" } else { "s" }
         ),
@@ -733,81 +746,47 @@ pub fn usb_access_denied(node: &Path) -> bool {
     })
 }
 
-/// Whether the part of the budget not yet used fits on the disk captures
-/// land on, less the floor every save leaves free there; what is already
-/// stored is on that disk too.
-fn budget_check(budget: u64, used: u64, place: &Place) -> Option<Check> {
+/// Whether captures in this folder have room: its disk's free space
+/// against the floor every write leaves free.
+fn free_space_check(place: &Place, floor: &Result<u64, String>) -> Option<Check> {
     let free = place.free_bytes?;
-    let usable = free.saturating_sub(FREE_SPACE_FLOOR);
     let path = place.path.display();
-    let room = budget.saturating_sub(used);
-    Some(if room > usable {
+    let floor = match floor {
+        Ok(floor) => *floor,
+        Err(error) => {
+            return Some(Check::warn(
+                "free_space",
+                format!("{error}."),
+                format!(
+                    "Set {} to bytes or a size such as 2G, or unset it for the default.",
+                    crate::storage::MIN_FREE_ENV
+                ),
+            ));
+        }
+    };
+    Some(if free < floor {
         Check::warn(
-            "storage_budget",
+            "free_space",
             format!(
-                "The storage budget leaves room for {} more ({} of {} used), but only {} is free on {path} and saves keep {} of it free, so the disk can fill first.",
-                human_bytes(room),
-                human_bytes(used),
-                human_bytes(budget),
+                "{} free on the disk of {path}, below the {} Capturefab leaves free, so captures there stop with storage_full.",
                 human_bytes(free),
-                human_bytes(FREE_SPACE_FLOOR)
+                human_bytes(floor)
             ),
             format!(
-                "capturefab storage configure --max-space {}",
-                suggested_budget(used, usable)
+                "Free some space, capture to another disk with -o, or lower {} (0 turns the floor off).",
+                crate::storage::MIN_FREE_ENV
             ),
         )
     } else {
         Check::ok(
-            "storage_budget",
+            "free_space",
             format!(
-                "Storage budget {}, {} used; {} free on {path}.",
-                human_bytes(budget),
-                human_bytes(used),
-                human_bytes(free)
+                "{} free on the disk of {path}; captures leave {} free.",
+                human_bytes(free),
+                human_bytes(floor)
             ),
         )
     })
-}
-/// What is stored plus three quarters of the usable space, in whole units
-/// `storage configure` accepts. Never below what is stored: retention would
-/// delete the oldest captures to get under it, or stop every capture.
-fn suggested_budget(used: u64, free: u64) -> String {
-    let budget = used.saturating_add(free / 4 * 3);
-    let gib = budget >> 30;
-    if gib > 0 && gib << 30 >= used {
-        format!("{gib}GiB")
-    } else {
-        format!("{}MiB", (budget >> 20).max(used.div_ceil(1 << 20)).max(1))
-    }
-}
-
-/// The configured budget and the bytes counted against it, from the storage
-/// ledger's lock-free reads, so `doctor` never waits behind capture
-/// bookkeeping; its usage summary includes the journal's tail. Unknown
-/// usage omits the check. Without a state directory nothing is stored yet,
-/// and `doctor` does not create one to find that out.
-fn ledger(state: &Path) -> (u64, Option<u64>) {
-    let default = StoragePolicy::default().max_bytes;
-    if !state.is_dir() {
-        return (default, Some(0));
-    }
-    let budget = crate::storage::configured_policy().map_or(default, |policy| policy.max_bytes);
-    let used = crate::storage::usage()
-        .ok()
-        .flatten()
-        .map(|usage| usage.allocated_bytes);
-    (budget, used)
-}
-
-/// The default capture folder, or its nearest existing parent, where
-/// `storage --json` reports free space too.
-fn capture_place() -> Place {
-    let root = crate::storage::capture_root();
-    Place {
-        free_bytes: crate::storage::free_bytes(&root),
-        ..Place::of(root)
-    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -964,106 +943,56 @@ mod tests {
     }
 
     #[test]
-    fn budget_larger_than_free_space_warns_with_a_smaller_budget() {
-        let budget = crate::storage::StoragePolicy::default().max_bytes;
-        let card = place("/home/pi", "ext4", 6 << 30);
-        let check = budget_check(budget, 0, &card).unwrap();
+    fn the_old_storage_ledger_is_a_leftover_with_its_leases() {
+        let state = crate::ipc::state_dir();
+        crate::ipc::ensure_private_dir(&state).unwrap();
+        let files =
+            ["storage.journal", "storage-0123456789abcdef.lease"].map(|name| state.join(name));
+        for file in &files {
+            std::fs::write(file, b"").unwrap();
+        }
+        let leftovers = Facts::gather(false).leftovers;
+        for file in &files {
+            let _ = std::fs::remove_file(file);
+        }
+        for file in &files {
+            assert!(leftovers.contains(file), "{leftovers:?}");
+        }
+        let check = leftovers_check(&leftovers).unwrap();
+        assert!(
+            check.message.contains("storage ledger"),
+            "{}",
+            check.message
+        );
+        assert!(check.fix.unwrap().contains("storage.journal"));
+    }
+
+    #[test]
+    fn free_space_below_the_floor_warns() {
+        let card = place("/home/pi/captures", "ext4", 300 << 20);
+        let floor = Ok(512 << 20);
+        let check = free_space_check(&card, &floor).unwrap();
         assert_eq!(check.level, Level::Warn);
         assert_eq!(
             check.message,
-            "The storage budget leaves room for 10.00 GiB more (0.0 KiB of 10.00 GiB used), but only 6.00 GiB is free on /home/pi and saves keep 512.0 MiB of it free, so the disk can fill first."
+            "300.0 MiB free on the disk of /home/pi/captures, below the 512.0 MiB Capturefab leaves free, so captures there stop with storage_full."
         );
+        assert!(check.fix.unwrap().contains("CAPTUREFAB_MIN_FREE"));
+        let roomy = place("/data", "xfs", 100 << 30);
         assert_eq!(
-            check.fix.as_deref(),
-            Some("capturefab storage configure --max-space 4GiB")
+            free_space_check(&roomy, &floor).unwrap().message,
+            "100.00 GiB free on the disk of /data; captures leave 512.0 MiB free."
         );
-        assert_eq!(
-            budget_check(budget, 0, &place("/data", "xfs", 100 << 30))
-                .unwrap()
-                .level,
-            Level::Ok
-        );
-        // Saves keep the floor free, so a budget that fits only into it warns.
-        let tight = place("/home/pi", "ext4", 10 << 30);
-        assert_eq!(
-            budget_check(10 << 30, 0, &tight).unwrap().level,
-            Level::Warn
-        );
-        assert_eq!(
-            budget_check(10 << 30, 512 << 20, &tight).unwrap().level,
-            Level::Ok
-        );
-        assert_eq!(suggested_budget(0, 100 << 20), "75MiB");
-        assert_eq!(suggested_budget(0, 0), "1MiB");
+        // The floor turned off never warns; a disk that does not say is not
+        // checked; a wrong setting is.
+        assert_eq!(free_space_check(&card, &Ok(0)).unwrap().level, Level::Ok);
         let unknown = Place {
             free_bytes: None,
-            ..card
+            ..card.clone()
         };
-        assert_eq!(budget_check(budget, 0, &unknown), None);
-    }
-
-    #[test]
-    fn budget_check_counts_what_is_already_stored() {
-        // A 10 GiB budget with 9.5 GiB stored has 0.5 GiB left: 5 GiB free
-        // is plenty, so nothing warns.
-        let budget = 10 << 30;
-        let stored = 19 << 29;
-        let card = place("/home/pi/captures", "ext4", 5 << 30);
-        let check = budget_check(budget, stored, &card).unwrap();
-        assert_eq!(check.level, Level::Ok);
-        assert_eq!(
-            check.message,
-            "Storage budget 10.00 GiB, 9.50 GiB used; 5.00 GiB free on /home/pi/captures."
-        );
-        // With 2 GiB stored, 8 GiB would not fit, and the suggestion keeps
-        // what is stored plus three quarters of the free space.
-        let check = budget_check(budget, 2 << 30, &card).unwrap();
-        assert_eq!(check.level, Level::Warn);
-        assert!(check.message.contains("(2.00 GiB of 10.00 GiB used)"));
-        assert_eq!(
-            check.fix.as_deref(),
-            Some("capturefab storage configure --max-space 5GiB")
-        );
-        // A suggestion never drops below what is stored, even where whole
-        // GiB would round under it.
-        for (used, free) in [
-            (stored, 200 << 20),
-            (stored + 100, 0),
-            ((1 << 30) - 1, 0),
-            (3 << 30, 100 << 30),
-        ] {
-            let suggested = crate::storage::parse_bytes(&suggested_budget(used, free)).unwrap();
-            assert!(suggested >= used, "{used} {free}: {suggested}");
-            assert!(
-                suggested <= used + free / 4 * 3 + (1 << 20),
-                "{used} {free}"
-            );
-        }
-        assert_eq!(suggested_budget(stored, 200 << 20), "9878MiB");
-    }
-
-    #[test]
-    fn storage_is_measured_on_the_capture_folder_disk_without_creating_a_session() {
-        let missing = std::env::temp_dir().join(format!(
-            "capturefab-doctor-ledger-{}/sessions",
-            std::process::id()
-        ));
-        assert_eq!(
-            ledger(&missing),
-            (StoragePolicy::default().max_bytes, Some(0)),
-            "nothing is stored before a session directory exists"
-        );
-        assert!(!missing.exists());
-        // Where storage --json reports free space: the default capture
-        // folder, or its nearest existing parent.
-        // Free space moves while other processes write, so only whether the
-        // disk reports it is compared.
-        let captures = capture_place();
-        assert_eq!(captures.path, crate::storage::capture_root());
-        assert_eq!(
-            captures.free_bytes.is_some(),
-            crate::storage::free_bytes(&captures.path).is_some()
-        );
+        assert_eq!(free_space_check(&unknown, &floor), None);
+        let wrong = free_space_check(&card, &Err("CAPTUREFAB_MIN_FREE must be bytes".into()));
+        assert_eq!(wrong.unwrap().level, Level::Warn);
     }
 
     #[test]
@@ -1073,7 +1002,7 @@ mod tests {
         assert_eq!(check.level, Level::Ok);
         assert_eq!(
             check.message,
-            "Presets, saved sign-ins and the storage ledger are in /home/pi/.local/state/capturefab (ext4)."
+            "Presets, saved sign-ins and sessions' jobs are in /home/pi/.local/state/capturefab (ext4)."
         );
         assert_eq!(check.fix, None);
         // Memory is only ever chosen, so it informs rather than warns, with

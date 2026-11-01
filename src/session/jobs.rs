@@ -4,6 +4,7 @@
 //! events. Ended jobs are kept a while, and the book is saved so the jobs of
 //! a session that died still read, as lost.
 use super::protocol::{JobStatus, Output};
+use crate::scheduling::rfc3339;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -107,12 +108,6 @@ pub(crate) struct Job {
 struct Lease {
     until: Instant,
     waiters: usize,
-}
-
-fn rfc3339(ms: u64) -> String {
-    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(i64::try_from(ms).unwrap_or(i64::MAX))
-        .unwrap_or_default()
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 impl Job {

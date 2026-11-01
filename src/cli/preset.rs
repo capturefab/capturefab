@@ -189,20 +189,9 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
                 return Ok(Report::json(document).text(text));
             };
             let path = absolute(&output)?;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        crate::storage::OutputExists(path.clone()).into()
-                    } else {
-                        anyhow::Error::from(error)
-                            .context(format!("cannot write {}", path.display()))
-                    }
-                })?;
-            file.write_all(&serde_json::to_vec_pretty(&document)?)?;
-            file.write_all(b"\n")?;
+            let mut bytes = serde_json::to_vec_pretty(&document)?;
+            bytes.push(b'\n');
+            crate::storage::save_one(&bytes, &path)?;
             let text = format!("Wrote preset {name} to {}.\n", path.display());
             Ok(Report::json(json!({"preset": name, "path": path})).text(text))
         }

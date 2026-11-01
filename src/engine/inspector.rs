@@ -410,8 +410,7 @@ fn measure(job: &Job) -> Result<Value> {
         };
         let path = match &request.preview {
             Some(path) => {
-                let policy = crate::storage::configured_policy().unwrap_or_default();
-                crate::storage::save_bytes(&image.bytes, path, &policy)?;
+                crate::storage::save_one(&image.bytes, path)?;
                 path.clone()
             }
             None => private_image(

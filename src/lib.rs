@@ -86,7 +86,7 @@ pub mod testing {
         pub use crate::session::{SessionCommand, SessionHandle};
     }
     pub mod storage {
-        pub use crate::storage::{StoragePolicy, configure_policy, save_bytes};
+        pub use crate::storage::{SyncMode, save};
     }
     pub mod types {
         pub use crate::types::{Frame, MONO8, RGB8};

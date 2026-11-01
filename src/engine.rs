@@ -856,6 +856,26 @@ impl Ended {
     }
 }
 
+/// End the forward that failed with `error`. A recording that reached its
+/// maximum size ended as asked.
+fn forward_failed(
+    h: &WorkerHandle,
+    forwarder: &mut Option<(Forwarder, f64)>,
+    auto: &mut Option<AutoController>,
+    error: anyhow::Error,
+) {
+    if error.is::<crate::storage::MaxSize>() {
+        let _ = end_forward(h, forwarder, auto, Ended::MaxSize, None, |_| {
+            Some(("info", format!("Recording ended: {error:#}"), None))
+        });
+        return;
+    }
+    let message = format!("Forwarding stopped: {error:#}");
+    let tag = crate::types::error_tag(&error);
+    let _ = end_forward(h, forwarder, auto, Ended::Failed, Some(&error), |_| {
+        Some(("error", message, tag))
+    });
+}
 /// Stop forwarding; the stopped forwarder's final counters, if one ran.
 fn stop_forward(
     h: &WorkerHandle,
@@ -938,7 +958,7 @@ fn end_forward(
                         wall_ms: file.started_ms,
                         path,
                         bytes: file.bytes,
-                        sha256: Some(file.sha256),
+                        sha256: file.sha256,
                         context,
                         item: crate::engine::saved::SavedItem::Recording {
                             started_ms: file.started_ms,
@@ -1062,7 +1082,7 @@ fn name_recording(
     on_exists: crate::naming::OnExists,
     context: &crate::context::Context,
     utc_offset_s: Option<i32>,
-) -> Result<(PathBuf, crate::storage::StorageWriter)> {
+) -> Result<(PathBuf, crate::storage::Recording)> {
     crate::naming::validate_output(&config.output)?;
     let local = crate::media::local_file_path(&config.output)?;
     let local = local
@@ -1262,43 +1282,38 @@ pub(crate) fn encode_still(
     }
 }
 
-/// Record a locally saved image in the saved-file log.
-#[allow(clippy::too_many_arguments)]
-fn report_image(
-    h: &WorkerHandle,
+/// A published image, as its `saved` line reports it.
+fn image_file(
     path: &std::path::Path,
-    stored: crate::storage::Stored,
+    stored: &crate::storage::Stored,
     frame: &Frame,
     format: &str,
     wall_ms: u64,
     job_id: Option<u64>,
     context: &crate::context::Context,
-) {
-    h.push_saved(
-        job_id,
-        crate::engine::saved::SavedFile {
-            wall_ms,
-            path: absolute_path(path),
-            bytes: stored.bytes,
-            sha256: Some(stored.sha256),
-            context: context.clone(),
-            item: crate::engine::saved::SavedItem::Capture {
-                frame_id: frame.id,
-                timestamp_ns: frame.timestamp_ns,
-                width: frame.width,
-                height: frame.height,
-                pixel_format: frame.pixel_format,
-                format: format.into(),
-                origin: if job_id.is_some() {
-                    "schedule"
-                } else {
-                    "capture"
-                }
-                .into(),
-                job_id,
-            },
+) -> crate::engine::saved::SavedFile {
+    crate::engine::saved::SavedFile {
+        wall_ms,
+        path: absolute_path(path),
+        bytes: stored.bytes,
+        sha256: stored.sha256.clone(),
+        context: context.clone(),
+        item: crate::engine::saved::SavedItem::Capture {
+            frame_id: frame.id,
+            timestamp_ns: frame.timestamp_ns,
+            width: frame.width,
+            height: frame.height,
+            pixel_format: frame.pixel_format,
+            format: format.into(),
+            origin: if job_id.is_some() {
+                "schedule"
+            } else {
+                "capture"
+            }
+            .into(),
+            job_id,
         },
-    );
+    }
 }
 
 /// Enter auto mode, or change its balance: the `auto` command, which a
@@ -1498,7 +1513,6 @@ fn process_plain(
             encoder,
             fps,
             bitrate,
-            storage,
             max_file_bytes,
             on_exists,
             context,
@@ -1530,7 +1544,6 @@ fn process_plain(
                 encoder,
                 fps,
                 bitrate,
-                storage,
                 max_file_bytes,
             };
             let named = crate::media::is_recording(&output)
@@ -1876,8 +1889,9 @@ fn process_plain(
             format,
             first_at_ms,
             interval_ms,
-            storage,
             on_exists,
+            manifest,
+            sync,
             context,
             utc_offset_s,
             quality,
@@ -1887,7 +1901,6 @@ fn process_plain(
             validate_capture(&output, count, timeout_ms, &format)?;
             preflight_capture_output(&output, count, &format, on_exists)?;
             validate_schedule_outputs(&output, count, &format, on_exists, jobs)?;
-            storage.validate()?;
             ensure!(
                 output != "-",
                 "scheduled capture requires a file or directory"
@@ -1897,7 +1910,18 @@ fn process_plain(
                 "capture schedule queue is full (32 active jobs)"
             );
             crate::scheduling::validate_schedule(first_at_ms, interval_ms, count)?;
-            let label = crate::naming::camera_name(&camera_mut(camera)?.info);
+            let manifest = manifest
+                .map(|path| crate::engine::saved::Manifest::open(Path::new(&path)).map(Arc::new))
+                .transpose()?;
+            let info = &camera_mut(camera)?.info;
+            let label = crate::naming::camera_name(info);
+            let source = Source {
+                id: info.id.as_str().into(),
+                device_clock: matches!(
+                    info.transport,
+                    crate::types::Transport::GigE | crate::types::Transport::Usb3
+                ),
+            };
             let now_ms = crate::scheduling::now_ms();
             let first_at_ms = first_at_ms.max(now_ms);
             // The coordinator numbers jobs across a session's cameras.
@@ -1942,7 +1966,10 @@ fn process_plain(
                 plan: crate::naming::Plan::new(&output, count, &format),
                 timeout_ms,
                 format,
-                storage,
+                sync,
+                manifest,
+                source,
+                folders: Default::default(),
                 deadline: None,
                 warm: None,
                 camera: label,
@@ -2001,15 +2028,14 @@ fn process_plain(
             count,
             timeout_ms,
             format,
-            storage,
             on_exists,
+            sync,
             context,
             utc_offset_s,
             quality,
             stdout,
         } => {
             validate_capture(&output, count, timeout_ms, &format)?;
-            storage.validate()?;
             if output != "-" {
                 preflight_capture_output(&output, count, &format, on_exists)?;
             }
@@ -2027,7 +2053,8 @@ fn process_plain(
             let c = camera_mut(camera)?;
             let was_streaming = c.is_streaming();
             c.start()?;
-            let result = (|| -> Result<Value> {
+            let mut folders = crate::storage::Folders::default();
+            let mut result = (|| -> Result<Value> {
                 let mut files = Vec::new();
                 // The first frame's metadata: a reply lists files, never
                 // every frame, so a long burst's reply stays small.
@@ -2106,13 +2133,15 @@ fn process_plain(
                                 &input,
                                 on_exists,
                                 first.clone(),
-                                |path| crate::storage::save_bytes(&bytes, path, &storage),
+                                |path| crate::storage::save(&bytes, path, sync, false),
                             )
                             .with_context(|| format!("save {}", first.display()))?;
+                            folders.add(&path);
                             let file = path.to_string_lossy().into_owned();
-                            report_image(
-                                h, &path, stored, &frame, &format, wall_ms, None, &context,
+                            let saved = image_file(
+                                &path, &stored, &frame, &format, wall_ms, None, &context,
                             );
+                            h.push_saved(None, saved);
                             metadata["file"] = json!(file);
                             metadata["file_bytes"] = json!(bytes.len());
                             files.push(file);
@@ -2153,6 +2182,14 @@ fn process_plain(
             })();
             let stopped = if !was_streaming { c.stop() } else { Ok(()) };
             refresh(h, camera, false);
+            // The names of the files saved, even before a failure, reach the
+            // disk before the reply.
+            if sync.is_file()
+                && let Err(error) = folders.sync()
+                && result.is_ok()
+            {
+                result = Err(error);
+            }
             let value = result?;
             stopped?;
             h.log("info", format!("Captured {count} frame(s)"));
@@ -2161,12 +2198,25 @@ fn process_plain(
     }
 }
 
+/// The camera a job's files come from, as its manifest lines name it.
+#[derive(Clone, Default)]
+struct Source {
+    id: Arc<str>,
+    /// Its frames carry the camera's own timestamps.
+    device_clock: bool,
+}
+
 struct Scheduled {
     info: crate::scheduling::CaptureJob,
     plan: crate::naming::Plan,
     timeout_ms: u64,
     format: String,
-    storage: crate::storage::StoragePolicy,
+    sync: crate::storage::SyncMode,
+    /// Where a line for each saved file goes.
+    manifest: Option<Arc<crate::engine::saved::Manifest>>,
+    source: Source,
+    /// The folders its files were published in, synced when it ends.
+    folders: crate::storage::Folders,
     deadline: Option<Instant>,
     warm: Option<Instant>,
     /// What {camera} and {serial} name, taken when the job was scheduled.
@@ -2217,7 +2267,9 @@ impl Scheduled {
             on_exists: self.on_exists,
             format: self.format.clone(),
             quality: self.quality,
-            storage: self.storage.clone(),
+            sync: self.sync,
+            manifest: self.manifest.clone(),
+            source: self.source.clone(),
             context: self.info.context.clone(),
         }
     }
@@ -2489,6 +2541,14 @@ fn sync_jobs(h: &WorkerHandle, jobs: &mut [Scheduled]) {
             h.events.progress(job.info.id, summary());
             continue;
         }
+        // Its files' names, and its manifest, reach the disk before its end
+        // is reported.
+        if job.sync.is_file() {
+            let manifest = job.manifest.as_ref().map(|manifest| manifest.sync());
+            if let Err(error) = job.folders.sync().and(manifest.transpose()) {
+                h.log("warn", format!("Capture job {}: {error:#}", job.info.id));
+            }
+        }
         let status = match job.info.status.as_str() {
             "complete" => JobStatus::Done,
             "cancelled" => JobStatus::Cancelled,
@@ -2712,6 +2772,7 @@ fn finish(h: &WorkerHandle, job: &mut Scheduled, result: Result<saver::SavedShot
     let id = job.info.id;
     match result {
         Ok(shot) => {
+            job.folders.add(Path::new(&shot.path));
             let info = &mut job.info;
             info.captured += 1;
             if info.files.len() < crate::scheduling::MAX_JOB_FILES {
@@ -2752,15 +2813,14 @@ fn finish(h: &WorkerHandle, job: &mut Scheduled, result: Result<saver::SavedShot
         }
     }
 }
-/// A failed save that may work later: the storage ledger stayed locked, or
-/// the disk, such as a network share, timed out.
+/// A failed save that may work later: the disk, such as a network share,
+/// timed out.
 fn transient(error: &anyhow::Error) -> bool {
-    crate::storage::is_busy(error)
-        || error.chain().any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
-        })
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+    })
 }
 
 /// `wait` from now, or as far ahead as this platform's clock can say.
@@ -3038,6 +3098,11 @@ fn worker(h: WorkerHandle) {
         if forwarder.is_some() {
             finish_timed_forward(&h, &mut forwarder, &mut auto, crate::scheduling::now_ms());
         }
+        // A recording at its size, or on a disk below its floor, ends even
+        // while no frame comes.
+        if let Some(end) = forwarder.as_ref().and_then(|(f, _)| f.storage_end()) {
+            forward_failed(&h, &mut forwarder, &mut auto, end);
+        }
         if let (Some(controller), Some(c)) = (auto.as_mut(), camera.as_mut())
             && controller.tick(c, Instant::now())
         {
@@ -3077,18 +3142,7 @@ fn worker(h: WorkerHandle) {
                     if let (Some((f, _)), Some(frame)) = (forwarder.as_mut(), frame)
                         && let Err(e) = f.push(frame)
                     {
-                        let message = format!("Forwarding stopped: {e:#}");
-                        let tag = crate::types::error_tag(&e);
-                        // A recording that reached the size asked for ended
-                        // as asked.
-                        let ended = if message.contains("maximum file size") {
-                            Ended::MaxSize
-                        } else {
-                            Ended::Failed
-                        };
-                        let _ = end_forward(&h, &mut forwarder, &mut auto, ended, Some(&e), |_| {
-                            Some(("error", message, tag))
-                        });
+                        forward_failed(&h, &mut forwarder, &mut auto, e);
                     }
                     if let Some(shot) = shot {
                         saver.offer(shot);
@@ -3297,8 +3351,9 @@ mod tests {
             format: format.into(),
             first_at_ms: crate::scheduling::now_ms() + 60_000,
             interval_ms: 1000,
-            storage: Default::default(),
             on_exists: Default::default(),
+            manifest: None,
+            sync: Default::default(),
             context: Default::default(),
             utc_offset_s: None,
             quality: None,
@@ -3352,8 +3407,7 @@ mod tests {
             encoder: "auto".into(),
             fps: 5.0,
             bitrate: "1M".into(),
-            storage: Default::default(),
-            max_file_bytes: 1 << 20,
+            max_file_bytes: Some(1 << 20),
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms: None,
@@ -3385,8 +3439,7 @@ mod tests {
             encoder: "libx264".into(),
             fps: 10.0,
             bitrate: "1M".into(),
-            storage: Default::default(),
-            max_file_bytes: 8 << 20,
+            max_file_bytes: Some(8 << 20),
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms,
@@ -3783,8 +3836,8 @@ mod tests {
                 count: 1,
                 timeout_ms: 1000,
                 format: "raw".into(),
-                storage: Default::default(),
                 on_exists: Default::default(),
+                sync: Default::default(),
                 context: context.clone(),
                 utc_offset_s: None,
                 quality: None,
@@ -3807,7 +3860,8 @@ mod tests {
         assert_eq!(saved.wall_ms, wall_ms);
         assert_eq!(saved.context, context);
         assert_eq!(saved.bytes, 128 * 128);
-        assert!(saved.sha256.as_ref().is_some_and(|s| s.len() == 64));
+        // Files are hashed only for a manifest, which a capture command has not.
+        assert_eq!(saved.sha256, None);
         assert!(std::path::Path::new(&saved.path).is_absolute());
         assert!(matches!(
             saved.item,
@@ -3835,8 +3889,8 @@ mod tests {
             count,
             timeout_ms: 1000,
             format: "raw".into(),
-            storage: Default::default(),
             on_exists,
+            sync: Default::default(),
             context: Default::default(),
             utc_offset_s: None,
             quality: None,
@@ -3908,8 +3962,7 @@ mod tests {
                 encoder: "auto".into(),
                 fps: 30.0,
                 bitrate: "4M".into(),
-                storage: Default::default(),
-                max_file_bytes: 1 << 20,
+                max_file_bytes: Some(1 << 20),
                 on_exists: Default::default(),
                 context: Default::default(),
                 duration_ms: None,
@@ -4010,8 +4063,9 @@ mod tests {
                 format: "raw".into(),
                 first_at_ms: 0,
                 interval_ms: 10,
-                storage: Default::default(),
                 on_exists: Default::default(),
+                manifest: None,
+                sync: Default::default(),
                 context: crate::context::Context::from([("lot".into(), "7".into())]),
                 utc_offset_s: None,
                 quality: None,
@@ -4068,7 +4122,10 @@ mod tests {
             plan: crate::naming::Plan::new(&output, 2, "raw"),
             timeout_ms: 1000,
             format: "raw".into(),
-            storage: Default::default(),
+            sync: Default::default(),
+            manifest: None,
+            source: Default::default(),
+            folders: Default::default(),
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             warm: None,
             camera: crate::naming::CameraName {
@@ -4340,7 +4397,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn a_busy_ledger_retries_the_shot_and_other_failures_stop_the_job() {
+    fn a_slow_disk_retries_the_shot_and_other_failures_stop_the_job() {
         let h = WorkerHandle::new();
         let dir = temp_dir("retry");
         let mut job = armed(1, &dir);
@@ -4359,26 +4416,19 @@ mod tests {
             });
             finish(&h, job, result);
         };
-        let busy = anyhow::Error::from(crate::storage::Busy).context("save shot.raw");
-        shoot_once(&mut job, Err(busy));
+        let slow_disk = || {
+            let timed_out = std::io::Error::from(std::io::ErrorKind::TimedOut);
+            Err(anyhow::Error::from(timed_out).context("save shot.raw"))
+        };
+        shoot_once(&mut job, slow_disk());
         assert!(job.info.active() && !job.saving);
         assert_eq!((job.info.retries, job.info.captured), (1, 0));
         assert_eq!(job.info.status, "pending");
-        assert!(
-            job.info
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("storage manager is busy")
-        );
+        assert!(job.info.error.as_deref().unwrap().contains("timed out"));
         // The same frame number, one interval later.
         assert_eq!(job.info.next_at_ms, 60_000);
         assert_eq!(job.input(crate::naming::clock(None)).index, 0);
-        let slow_disk = std::io::Error::from(std::io::ErrorKind::TimedOut);
-        shoot_once(
-            &mut job,
-            Err(anyhow::Error::from(slow_disk).context("save shot.raw")),
-        );
+        shoot_once(&mut job, slow_disk());
         assert_eq!((job.info.retries, job.info.next_at_ms), (2, 120_000));
         // A later save clears the error.
         shoot_once(&mut job, Ok("shot.raw".into()));
@@ -4388,19 +4438,15 @@ mod tests {
         let refused = anyhow::anyhow!("Permission denied").context("save /data/timeouts/a.raw");
         shoot_once(&mut job, Err(refused));
         assert_eq!(job.info.status, "failed");
+        // A disk below its floor ends the job with its reason.
         let mut full = armed(2, &dir);
-        shoot_once(
-            &mut full,
-            Err(anyhow::anyhow!("Storage full: 10 GiB budget reached")),
+        let floor = crate::types::Categorized::error(
+            crate::types::ErrorKind::StorageFull,
+            "100 MiB free on the disk of /data/a.raw",
         );
+        shoot_once(&mut full, Err(floor));
         assert_eq!(full.info.status, "failed");
-        assert!(
-            full.info
-                .error
-                .as_deref()
-                .unwrap()
-                .starts_with("Storage full")
-        );
+        assert_eq!(full.info.error_tag.as_ref().unwrap().code, "storage_full");
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4857,8 +4903,8 @@ mod tests {
                 count: 1,
                 timeout_ms: 6000,
                 format: "raw".into(),
-                storage: Default::default(),
                 on_exists: Default::default(),
+                sync: Default::default(),
                 context: Default::default(),
                 utc_offset_s: None,
                 quality: None,

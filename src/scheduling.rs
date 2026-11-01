@@ -15,8 +15,8 @@ pub struct CaptureJob {
     /// Shots not taken because the saver already held two frames.
     #[serde(default)]
     pub skipped: u32,
-    /// Shots that failed for a reason that may pass, such as a busy storage
-    /// ledger, and were taken again at a later interval.
+    /// Shots that failed for a reason that may pass, such as a network
+    /// share that timed out, and were taken again at a later interval.
     #[serde(default)]
     pub retries: u32,
     pub first_at_ms: u64,
@@ -90,6 +90,13 @@ pub fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis()
         .min(u64::MAX as u128) as u64
+}
+/// UTC Unix milliseconds as an RFC 3339 time, as results and job documents
+/// show times.
+pub fn rfc3339(ms: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(i64::try_from(ms).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 pub fn validate_schedule(first_at_ms: u64, interval_ms: u64, count: u32) -> Result<()> {
     ensure!((1..=100_000).contains(&count), "count must be 1..100000");

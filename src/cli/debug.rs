@@ -106,18 +106,7 @@ pub fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
                     } else {
                         std::env::current_dir()?.join(path)
                     };
-                    let mut file = std::fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(&path)
-                        .map_err(|error| {
-                            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                                crate::storage::OutputExists(path.clone()).into()
-                            } else {
-                                anyhow::Error::from(error)
-                            }
-                        })?;
-                    file.write_all(xml.as_bytes())?;
+                    crate::storage::save_one(xml.as_bytes(), &path)?;
                     let text = format!("Wrote {}\n", path.display());
                     Report::json(json!({"path": path, "bytes": xml.len()})).text(text)
                 }

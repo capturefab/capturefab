@@ -186,11 +186,6 @@ fn serve_finishes_a_recording_on_a_signal() {
         assert!(exit.success(), "{name}: {exit:?}");
         assert!(std::fs::metadata(&clip).unwrap().len() > 0);
         assert!(decodes(std::path::Path::new(&clip)), "{name}");
-        // Complete in the storage ledger too, with nothing left reserved.
-        let storage = home.ok(&["storage", "status"]);
-        assert_eq!(storage["files"], 1, "{name}: {storage}");
-        assert_eq!(storage["active_reservations"], 0, "{name}: {storage}");
-        assert_eq!(storage["reserved_bytes"], 0, "{name}: {storage}");
     }
 }
 
@@ -281,20 +276,15 @@ fn a_short_timed_recording_that_cannot_start_fails() {
     }
 }
 
-/// A recording without --max-size holds little of the storage budget, so
-/// captures and other recordings run beside it; and every recording stays a
-/// job once it ends, however many follow on its camera.
+/// Captures and other recordings run beside a recording without
+/// --max-size; and every recording stays a job once it ends, however many
+/// follow on its camera.
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
 fn recordings_leave_room_and_stay_listed() {
     let home = Home::new("record-room");
     let first = home.ok(&["record", "-c", "sim:0", "-o", "open.mkv", "--background"]);
     let open = first["job"]["id"].as_str().unwrap().to_owned();
-    let storage = home.ok(&["storage", "status"]);
-    assert!(
-        storage["reserved_bytes"].as_u64().unwrap() <= 64 * 1024 * 1024,
-        "{storage}"
-    );
     home.ok(&["capture", "-c", "sim:0", "-o", "beside.png"]);
     home.ok(&["capture", "-c", "sim:1", "-o", "other.png"]);
     home.ok(&["record", "-c", "sim:1", "-o", "second.mkv", "--for", "1s"]);
@@ -334,28 +324,67 @@ fn recordings_leave_room_and_stay_listed() {
 }
 
 /// A recording that fails for lack of room says so with its own reason,
-/// as a capture would.
+/// as a capture would, and leaves no file.
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
 fn a_recording_without_room_fails_as_storage_full() {
     let home = Home::new("record-full");
-    home.ok(&["storage", "configure", "--max-space", "1MiB"]);
-    let full = home.fails(
-        6,
-        &[
-            "record",
-            "-c",
-            "sim:0",
-            "-o",
-            "big.mkv",
-            "--max-size",
-            "2MiB",
-            "--for",
-            "2s",
-        ],
-    );
+    let full = home
+        .run_env(
+            &[("CAPTUREFAB_MIN_FREE", "1000T")],
+            &[
+                "--json", "record", "-c", "sim:0", "-o", "big.mkv", "--for", "2s",
+            ],
+        )
+        .failure(6);
     assert_eq!(full["code"], "storage_full", "{full}");
+    assert_eq!(
+        full["details"]["path"],
+        serde_json::json!(home.real("big.mkv"))
+    );
+    assert!(full["details"]["free_bytes"].as_u64().is_some(), "{full}");
     assert_eq!(full["details"]["job"]["error"]["code"], "storage_full");
+    assert!(!home.path("big.mkv").exists());
+}
+
+/// --max-size ends a recording successfully, at exactly that size, with
+/// the video before it playable; without it nothing caps a recording.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_recording_ends_as_asked_at_its_maximum_size() {
+    let home = Home::new("record-max-size");
+    let capped = home.ok(&[
+        "record",
+        "-c",
+        "sim:0",
+        "-o",
+        "capped.mkv",
+        "--max-size",
+        "64KiB",
+        "--for",
+        "20s",
+    ]);
+    assert_eq!(capped["ended"], "max_size", "{capped}");
+    assert_eq!(capped["bytes"], 64 * 1024, "{capped}");
+    assert_eq!(capped["finalized"], true, "{capped}");
+    assert_eq!(
+        std::fs::metadata(home.path("capped.mkv")).unwrap().len(),
+        64 * 1024
+    );
+    // Cut at a byte, it plays up to its last complete part.
+    let played = std::process::Command::new(support::cli::ffmpeg())
+        .args(["-v", "error", "-i"])
+        .arg(home.path("capped.mkv"))
+        .args(["-f", "framemd5", "-"])
+        .output()
+        .unwrap();
+    let frames = String::from_utf8_lossy(&played.stdout)
+        .lines()
+        .filter(|line| line.starts_with("0,"))
+        .count();
+    assert!(frames > 0, "{}", String::from_utf8_lossy(&played.stderr));
+    let open = home.ok(&["record", "-c", "sim:0", "-o", "open.mkv", "--for", "1s"]);
+    assert_eq!(open["ended"], "duration", "{open}");
 }
 
 /// A second signal ends the command at once, still with one document.

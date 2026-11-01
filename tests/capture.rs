@@ -453,3 +453,191 @@ fn a_signal_during_a_capture_from_several_cameras_lists_all_their_files() {
         assert!(!camera["files"].as_array().unwrap().is_empty(), "{camera}");
     }
 }
+
+/// What is in the work folder, other than folders.
+fn names(home: &Home) -> Vec<String> {
+    let mut names = std::fs::read_dir(&home.work)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_file())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+/// Two commands numbering into one folder at the same time never share a
+/// name: each file is published without replacing another's.
+#[test]
+fn concurrent_captures_numbering_one_folder_never_overwrite() {
+    use std::process::Stdio;
+    let home = Home::new("concurrent-names");
+    let spawn = || {
+        home.command()
+            .args([
+                "--json",
+                "--no-session",
+                "capture",
+                "-c",
+                "sim:0",
+                "-n",
+                "15",
+                "-o",
+                "shot-{seq}.png",
+                "--on-exists",
+                "number",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let children = [spawn(), spawn()];
+    let mut files = Vec::new();
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+        for file in result["files"].as_array().unwrap() {
+            files.push(file.as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(files.len(), 30);
+    files.sort();
+    files.dedup();
+    assert_eq!(files.len(), 30, "two captures reported one name");
+    // Exactly those files, whole, and nothing half written left behind.
+    let on_disk = names(&home);
+    assert_eq!(on_disk.len(), 30, "{on_disk:?}");
+    for file in &files {
+        assert!(
+            std::fs::read(file).unwrap().starts_with(b"\x89PNG"),
+            "{file}"
+        );
+    }
+}
+
+/// A capture's manifest gets one line per saved file, with its size and
+/// SHA-256; later captures, and several cameras, append to it.
+#[test]
+fn a_manifest_lists_each_saved_file_with_its_hash() {
+    use sha2::{Digest, Sha256};
+    let home = Home::new("manifest");
+    let burst = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "-n",
+        "3",
+        "-o",
+        "m-{seq}.png",
+        "--tag",
+        "lot=7",
+        "--manifest",
+        "runs/manifest.jsonl",
+    ]);
+    let several = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "-c",
+        "sim:1",
+        "-o",
+        "{camera}-{seq}.jpg",
+        "--manifest",
+        "runs/manifest.jsonl",
+        "--sync",
+        "none",
+    ]);
+    let text = std::fs::read_to_string(home.path("runs/manifest.jsonl")).unwrap();
+    let lines = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(lines.len(), 5, "{text}");
+    let mut saved = burst["files"].as_array().unwrap().clone();
+    for camera in several["cameras"].as_array().unwrap() {
+        saved.extend(camera["files"].as_array().unwrap().iter().cloned());
+    }
+    let listed = lines
+        .iter()
+        .map(|line| line["file"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(listed[..3], saved[..3], "a burst's lines are in order");
+    let sorted = |mut files: Vec<Value>| {
+        files.sort_by_key(|file| file.to_string());
+        files
+    };
+    assert_eq!(sorted(listed), sorted(saved));
+    for line in &lines {
+        let bytes = std::fs::read(line["file"].as_str().unwrap()).unwrap();
+        assert_eq!(line["bytes"], bytes.len(), "{line}");
+        let sha256 = Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(line["sha256"], sha256, "{line}");
+        assert!(line["time"].as_str().unwrap().ends_with('Z'), "{line}");
+        assert_eq!(line["pixel_format"], "Mono8", "{line}");
+        assert!(line["width"].as_u64().unwrap() > 0 && line["settings"].is_object());
+    }
+    assert_eq!(lines[0]["camera"], burst["camera"]);
+    assert_eq!(lines[0]["tags"], json!({"lot": "7"}));
+    assert!(lines[3].get("tags").is_none_or(|tags| tags == &json!({})));
+    // A folder is no manifest, and an image to stdout saves no file.
+    let folder = home.fails(
+        2,
+        &[
+            "capture",
+            "-c",
+            "sim:0",
+            "-o",
+            "x.png",
+            "--manifest",
+            "runs/",
+        ],
+    );
+    assert_eq!(folder["code"], "usage");
+    let stdout = home.run(&["capture", "-c", "sim:0", "-o", "-", "--manifest", "x.jsonl"]);
+    assert_eq!(stdout.code, Some(2), "{}", stdout.stderr);
+}
+
+/// A capture that would leave less than the free-space floor is refused,
+/// with the disk's free space, and leaves nothing behind.
+#[test]
+fn a_disk_below_the_free_space_floor_refuses_captures() {
+    let home = Home::new("floor");
+    let full = home
+        .run_env(
+            &[("CAPTUREFAB_MIN_FREE", "1000T")],
+            &[
+                "--json",
+                "capture",
+                "-c",
+                "sim:0",
+                "-n",
+                "2",
+                "-o",
+                "f-{seq}.png",
+            ],
+        )
+        .failure(6);
+    assert_eq!(full["code"], "storage_full", "{full}");
+    assert_eq!(full["details"]["path"], json!(home.real("f-0001.png")));
+    assert!(full["details"]["free_bytes"].as_u64().is_some(), "{full}");
+    assert_eq!(full["details"]["files"], json!([]));
+    assert!(
+        full["hint"]
+            .as_str()
+            .unwrap()
+            .contains("CAPTUREFAB_MIN_FREE")
+    );
+    assert_eq!(names(&home), Vec::<String>::new());
+    // 0 turns the floor off.
+    home.run_env(
+        &[("CAPTUREFAB_MIN_FREE", "0")],
+        &["--json", "capture", "-c", "sim:0", "-o", "free.png"],
+    )
+    .success();
+}

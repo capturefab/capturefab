@@ -251,7 +251,7 @@ pub fn runtime_dir() -> PathBuf {
     let login = login_runtime_dir().filter(|(_, login)| *login == LoginDir::Usable);
     runtime_dir_in(&var, login.map(|(dir, _)| dir))
 }
-/// What must outlive a reboot: setups, sign-in indexes and the storage ledger. The Linux runtime directory is a RAM disk
+/// What must outlive a reboot: setups, sign-in indexes and sessions' jobs. The Linux runtime directory is a RAM disk
 /// that logout clears, so there they live under XDG_STATE_HOME; elsewhere
 /// the two are one directory.
 pub fn state_dir() -> PathBuf {
@@ -275,7 +275,7 @@ pub fn cache_dir() -> Option<PathBuf> {
     }
     cache_dir_in(&var)
 }
-/// Unit tests never touch the user's sessions or storage ledger: without CAPTUREFAB_SESSION_DIR each test process gets its own
+/// Unit tests never touch the user's sessions or saved state: without CAPTUREFAB_SESSION_DIR each test process gets its own
 /// private directory, which its tests share as they would the real one.
 fn test_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -496,6 +496,8 @@ fn lock_file(path: &Path) -> std::io::Result<fs::File> {
 }
 pub fn validate_name(name: &str) -> Result<()> {
     let lower = name.to_ascii_lowercase();
+    // A session's descriptor is NAME.json, and version 0.5's storage ledger
+    // may still have these in the same folder.
     ensure!(
         !matches!(
             lower.as_str(),

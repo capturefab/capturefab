@@ -77,6 +77,8 @@ pub(super) struct Shared {
     exit: Mutex<Option<Value>>,
     exited: Condvar,
     tail: Mutex<VecDeque<String>>,
+    /// Its stderr reached its end, so the tail holds its last words.
+    errors_ended: AtomicBool,
     /// The ID of the camera it serves, once connected.
     pub(super) label: Mutex<String>,
     tree: tree::Tree,
@@ -173,6 +175,7 @@ impl Worker {
             exit: Mutex::new(None),
             exited: Condvar::new(),
             tail: Mutex::default(),
+            errors_ended: AtomicBool::new(false),
             label: Mutex::new(String::new()),
             tree,
         });
@@ -531,6 +534,7 @@ impl Shared {
             }
         }
         if let Some(said) = hello.take() {
+            self.drain_errors();
             let tail = self.tail();
             let _ = said.send(Err(anyhow::anyhow!(
                 "the camera worker exited before it started{}",
@@ -584,6 +588,7 @@ impl Shared {
     }
     /// What the exit means: a hang, a shutdown, or a crash with how it ended.
     fn exit_error(&self, status: Option<ExitStatus>) -> anyhow::Error {
+        self.drain_errors();
         let tail = self.tail();
         #[cfg(unix)]
         let signal =
@@ -628,6 +633,14 @@ impl Shared {
     fn tail(&self) -> Vec<String> {
         locked(&self.tail).iter().cloned().collect()
     }
+    /// Wait a moment for the stderr lines still in the pipe when the worker's
+    /// exit is seen, such as a panic's message after its backtrace.
+    fn drain_errors(&self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !self.errors_ended.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     /// Keep the worker's last stderr lines and pass them on, tagged with its
     /// camera.
     fn read_errors(&self, errors: std::process::ChildStderr) {
@@ -636,7 +649,10 @@ impl Shared {
             let line = match read_line(&mut reader, 64 * 1024) {
                 Ok(Some(Some(line))) => line,
                 Ok(Some(None)) => continue,
-                Ok(None) | Err(_) => return,
+                Ok(None) | Err(_) => {
+                    self.errors_ended.store(true, Ordering::Release);
+                    return;
+                }
             };
             let text = crate::scrub::redact_urls(String::from_utf8_lossy(&line).trim_end());
             if text.is_empty() {

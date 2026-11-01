@@ -43,9 +43,10 @@ zeroize = "1"
 
 # Inheritable pipes (a detached session's ready line, a worker's stdout
 # capture), the job objects that hold camera workers and what they start,
-# and a worker's private protocol handle.
+# a worker's private protocol handle, and publishing a capture without
+# replacing a file (MoveFileExW).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 # Ctrl-C, Ctrl-Break and a closed console where there are no Unix signals,
 # which go through libc.

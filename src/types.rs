@@ -253,7 +253,7 @@ impl ErrorKind {
             Self::StorageFull => (
                 "storage_full",
                 6,
-                "not enough disk space or the storage budget is used up",
+                "below the free-space floor (CAPTUREFAB_MIN_FREE); details path, free_bytes",
             ),
             Self::Incomplete => ("incomplete", 1, "fewer results than requested; see details"),
             Self::Interrupted => (
@@ -358,6 +358,35 @@ impl std::fmt::Display for Usage {
     }
 }
 impl std::error::Error for Usage {}
+
+/// Parse a size: 10GiB/10G use binary units; 10GB uses decimal units.
+pub fn parse_bytes(value: &str) -> anyhow::Result<u64> {
+    use anyhow::Context as _;
+    let value = value.trim();
+    let split = value
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(value.len());
+    let number: u64 = value[..split]
+        .parse()
+        .context("a size must start with an integer")?;
+    let multiplier: u64 = match value[split..].trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "ki" | "kib" => 1024,
+        "m" | "mi" | "mib" => 1024u64.pow(2),
+        "g" | "gi" | "gib" => 1024u64.pow(3),
+        "t" | "ti" | "tib" => 1024u64.pow(4),
+        "kb" => 1000,
+        "mb" => 1000u64.pow(2),
+        "gb" => 1000u64.pow(3),
+        "tb" => 1000u64.pow(4),
+        _ => anyhow::bail!("unknown size unit; use B, KiB, MiB, GiB, TiB, KB, MB, GB or TB"),
+    };
+    let bytes = number
+        .checked_mul(multiplier)
+        .context("the size is too large")?;
+    anyhow::ensure!(bytes > 0, "a size must be positive");
+    Ok(bytes)
+}
 
 /// A byte count for diagnostics, with two decimals in GiB and one below.
 pub fn human_bytes(value: u64) -> String {
@@ -705,6 +734,18 @@ mod tests {
         assert_eq!(details, serde_json::json!({"b":[{"d":1}]}));
         for kind in ErrorKind::ALL {
             assert_eq!(ErrorKind::from_code(kind.code().0), Some(kind));
+        }
+    }
+
+    #[test]
+    fn sizes_take_binary_and_decimal_units() {
+        assert_eq!(parse_bytes("10GiB").unwrap(), 10 * 1024u64.pow(3));
+        assert_eq!(parse_bytes("10G").unwrap(), 10 * 1024u64.pow(3));
+        assert_eq!(parse_bytes("10GB").unwrap(), 10_000_000_000);
+        assert_eq!(parse_bytes(" 5 KB ").unwrap(), 5000);
+        assert_eq!(parse_bytes("512").unwrap(), 512);
+        for invalid in ["0", "-1", "1.5GB", "10words", "18446744073709551615TB", ""] {
+            assert!(parse_bytes(invalid).is_err(), "{invalid}");
         }
     }
 

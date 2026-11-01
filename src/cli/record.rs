@@ -77,7 +77,7 @@ pub struct RecordArgs {
 }
 
 fn parse_size(text: &str) -> std::result::Result<u64, String> {
-    crate::storage::parse_bytes(text).map_err(|error| error.to_string())
+    crate::types::parse_bytes(text).map_err(|error| error.to_string())
 }
 
 /// A local file's path, absolute; a stream URL as it is.
@@ -155,17 +155,13 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
     {
         return Err(Usage("--fps must be 0.1..240".into()).into());
     }
-    let max_file_bytes = args.max_size.unwrap_or(crate::media::NO_SIZE_CAP);
+    let max_file_bytes = args.max_size;
     let request = |fps: f64| SessionCommand::Forward {
         output: output.clone(),
         codec: args.codec.name().into(),
         encoder: "auto".into(),
         fps,
         bitrate: args.bitrate.clone(),
-        storage: crate::storage::StoragePolicy {
-            max_bytes: u64::MAX,
-            ..Default::default()
-        },
         max_file_bytes,
         on_exists: Default::default(),
         context: Default::default(),
@@ -199,7 +195,6 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         encoder: "auto".into(),
         fps: args.fps.unwrap_or(30.0),
         bitrate: args.bitrate.clone(),
-        storage: Default::default(),
         max_file_bytes,
     })?;
     signals::take_over();
@@ -276,6 +271,8 @@ enum Ended {
     MaxSize,
     /// Another command stopped it (jobs stop, session stop).
     Stopped,
+    /// It failed, after recording what its error's details show.
+    Failed,
 }
 impl Ended {
     fn name(self) -> &'static str {
@@ -284,6 +281,7 @@ impl Ended {
             Self::Signal => "signal",
             Self::MaxSize => "max_size",
             Self::Stopped => "stopped",
+            Self::Failed => "failed",
         }
     }
 }
@@ -358,12 +356,19 @@ impl Recording<'_> {
             super::args::duration_text(self.first_frame_wait().unwrap_or_default())
         ))
     }
-    /// The recording's error, as its job ended with it, with its reason.
+    /// The recording's error, as its job ended with it, with its reason,
+    /// and what it recorded before, as a disk below its floor leaves.
     fn failure(&self, job: &Value, detail: &Value) -> anyhow::Error {
-        crate::types::with_details(
-            super::capture::job_error(job, detail),
-            json!({ "job": job }),
-        )
+        let mut details = json!({ "job": job });
+        if detail["recording"].is_object()
+            && let (Some(details), Value::Object(result)) = (
+                details.as_object_mut(),
+                self.result(job, detail, Ended::Failed),
+            )
+        {
+            details.extend(result);
+        }
+        crate::types::with_details(super::capture::job_error(job, detail), details)
     }
     /// Wait until the recording ends: its result. A signal stops it, and
     /// the file it finished is the result.

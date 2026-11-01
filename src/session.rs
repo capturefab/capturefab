@@ -134,11 +134,12 @@ pub enum SessionCommand {
         count: u32,
         timeout_ms: u64,
         format: String,
-        #[serde(default)]
-        storage: crate::storage::StoragePolicy,
         /// What to do when an output name without {seq} exists; fail by default.
         #[serde(default, skip_serializing_if = "crate::naming::OnExists::is_fail")]
         on_exists: crate::naming::OnExists,
+        /// Whether each file reaches the disk before it is reported.
+        #[serde(default, skip_serializing_if = "crate::storage::SyncMode::is_file")]
+        sync: crate::storage::SyncMode,
         /// Tags such as line, station, part, lot and note.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         context: crate::context::Context,
@@ -161,11 +162,15 @@ pub enum SessionCommand {
         format: String,
         first_at_ms: u64,
         interval_ms: u64,
-        #[serde(default)]
-        storage: crate::storage::StoragePolicy,
         /// What to do when an output name without {seq} exists; fail by default.
         #[serde(default, skip_serializing_if = "crate::naming::OnExists::is_fail")]
         on_exists: crate::naming::OnExists,
+        /// The absolute JSON Lines file each saved file's line is appended to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        manifest: Option<String>,
+        /// Whether each file reaches the disk before it is reported.
+        #[serde(default, skip_serializing_if = "crate::storage::SyncMode::is_file")]
+        sync: crate::storage::SyncMode,
         /// Tags such as line, station, part, lot and note.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         context: crate::context::Context,
@@ -238,10 +243,10 @@ pub enum SessionCommand {
         encoder: String,
         fps: f64,
         bitrate: String,
-        #[serde(default)]
-        storage: crate::storage::StoragePolicy,
-        #[serde(default = "crate::media::default_recording_cap")]
-        max_file_bytes: u64,
+        /// End the recording, as asked, at exactly this many bytes; none by
+        /// default, when the free-space floor alone ends it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_file_bytes: Option<u64>,
         /// What to do when an output name without {seq} exists; fail by default.
         #[serde(default, skip_serializing_if = "crate::naming::OnExists::is_fail")]
         on_exists: crate::naming::OnExists,
@@ -488,7 +493,6 @@ impl SessionCommand {
                 count,
                 timeout_ms,
                 format,
-                storage,
                 on_exists,
                 context,
                 utc_offset_s,
@@ -499,7 +503,6 @@ impl SessionCommand {
                 count,
                 timeout_ms,
                 format,
-                storage,
                 on_exists,
                 context,
                 utc_offset_s,
@@ -512,7 +515,6 @@ impl SessionCommand {
                     ["png", "jpeg", "raw", "pgm", "ppm"].contains(&format.as_str()),
                     "format must be png, jpeg, raw, pgm or ppm"
                 );
-                storage.validate()?;
                 crate::engine::validate_capture_output(output)?;
                 crate::naming::validate_request(output, *count, *on_exists, context)?;
                 if matches!(self, Self::Schedule { .. }) {
@@ -547,10 +549,18 @@ impl SessionCommand {
                     interval_ms,
                     quality,
                     job,
+                    manifest,
                     ..
                 } = self
                 {
                     crate::scheduling::validate_schedule(*first_at_ms, *interval_ms, *count)?;
+                    if let Some(manifest) = manifest {
+                        crate::naming::validate_output(manifest)?;
+                        ensure!(
+                            std::path::Path::new(manifest).is_absolute(),
+                            "a manifest path must be absolute"
+                        );
+                    }
                     ensure!(
                         quality.is_none_or(|quality| (1..=100).contains(&quality)),
                         "JPEG quality must be 1..100"
@@ -576,7 +586,6 @@ impl SessionCommand {
                 encoder,
                 fps,
                 bitrate,
-                storage,
                 max_file_bytes,
                 on_exists,
                 context,
@@ -599,7 +608,6 @@ impl SessionCommand {
                     encoder: encoder.clone(),
                     fps: *fps,
                     bitrate: bitrate.clone(),
-                    storage: storage.clone(),
                     max_file_bytes: *max_file_bytes,
                 }
                 .validate()?;
@@ -2746,13 +2754,15 @@ mod tests {
         let snapshot = serde_json::to_value(WorkerSnapshot::default()).unwrap();
         assert!(snapshot.get("forwarding_until_ms").is_none());
         assert!(snapshot.get("logs").is_none(), "log lines are events");
-        // A forward without a duration keeps its old shape both ways.
+        // A forward without a duration keeps its old shape both ways, and
+        // one without a maximum size has none.
         let old = br#"{"op":"forward","output":"a.mkv","codec":"h264","encoder":"auto","fps":30,"bitrate":"4M"}"#;
         let command = SessionCommand::from_json_slice(old).unwrap();
         assert!(matches!(
             command,
             SessionCommand::Forward {
                 duration_ms: None,
+                max_file_bytes: None,
                 ..
             }
         ));
@@ -2782,8 +2792,7 @@ mod tests {
             encoder: "auto".into(),
             fps: 30.0,
             bitrate: "4M".into(),
-            storage: Default::default(),
-            max_file_bytes: crate::media::default_recording_cap(),
+            max_file_bytes: None,
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms,
@@ -2877,8 +2886,8 @@ mod tests {
         for (command, field) in [
             (r#"{"op":"status","op":"start"}"#, "op"),
             (
-                r#"{"op":"capture","output":"frame.png","count":1,"timeout_ms":1000,"format":"png","storage":{"max_files":1,"max_files":2}}"#,
-                "max_files",
+                r#"{"op":"capture","output":"frame.png","count":1,"timeout_ms":1000,"format":"png","context":{"line":"1","line":"2"}}"#,
+                "line",
             ),
         ] {
             assert!(

@@ -386,7 +386,7 @@ def smoke(binary):
     env.pop('CAPTUREFAB_SESSION', None)
     env.pop('CAPTUREFAB_EXECUTABLE', None)
     with tempfile.TemporaryDirectory(prefix='capturefab-release-smoke-') as temp:
-        # Sessions, the storage ledger and the extracted FFmpeg stay out of
+        # Sessions, their saved state and the extracted FFmpeg stay out of
         # the builder's own folders.
         env['CAPTUREFAB_SESSION_DIR'] = str(Path(temp) / 'sessions')
         env['CAPTUREFAB_CACHE_DIR'] = str(Path(temp) / 'cache')
