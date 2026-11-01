@@ -542,7 +542,7 @@ pub(crate) fn worker_threads(pixels: usize) -> usize {
     if pixels < 512 * 1024 {
         return 1;
     }
-    crate::resources::processing_threads(spare_cores(
+    crate::types::processing_threads(spare_cores(
         std::thread::available_parallelism().map_or(1, |n| n.get()),
     ))
 }

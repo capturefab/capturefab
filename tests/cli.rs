@@ -578,6 +578,13 @@ fn invalid_inputs_fail_before_creating_camera_resources() {
         vec!["--camera", "gige:gige:192.0.2.1", "get", "Width"],
         vec!["--camera", "sim:0", "serve", "--name", "../bad"],
         vec!["--camera", "sim:0", "xml", "-o", ""],
+        // An empty local path never becomes the current directory.
+        vec!["--camera", "sim:replay:", "capture", "-o", "unused.png"],
+        vec!["--camera", "file:", "capture", "-o", "unused.png"],
+        vec!["--camera", "FiLe:", "capture", "-o", "unused.png"],
+        vec!["connect", "sim:replay:"],
+        vec!["connect", "file:"],
+        vec!["select", "file:"],
         vec!["destination", "remove", "../bad"],
         vec!["destination", "test", "../bad"],
         vec!["destination", "add-folder", "../bad", "/tmp"],
@@ -2379,10 +2386,7 @@ fn a_local_address_without_a_gige_camera_suggests_the_simulator() {
     assert_eq!(out.status.code(), Some(3), "{reply}");
     assert_eq!(reply["error"]["code"], "unavailable", "{reply}");
     let message = reply["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("capturefab simulate run --preset gige"),
-        "{message}"
-    );
+    assert!(message.contains("127.0.0.1"), "{message}");
     assert!(message.contains("sim:0"), "{message}");
     let _ = std::fs::remove_dir_all(&dir);
 }

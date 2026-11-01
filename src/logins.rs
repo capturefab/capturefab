@@ -126,10 +126,24 @@ fn authority_of(text: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
+/// Percent-encode everything except RFC 3986 unreserved characters, with
+/// uppercase hexadecimal.
+pub fn encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 /// The keychain account: user name and address, so changing either never
 /// reads another entry's secret.
 pub fn account(user: &str, address: &str) -> String {
-    format!("{}@{address}", crate::hubs::encode(user))
+    format!("{}@{address}", encode(user))
 }
 
 /// A short form for messages and the UI: the address without its scheme,
@@ -187,7 +201,7 @@ impl CameraLogin {
             !user.chars().any(char::is_control) && !password.chars().any(char::is_control),
             usage("camera user names and passwords must not contain control characters")
         );
-        crate::hubs::scrub::register(&password);
+        crate::scrub::register(&password);
         Ok(Self { user, password })
     }
     pub fn expose(&self) -> &str {
@@ -314,8 +328,8 @@ pub fn with_credentials(url: &str, login: &CameraLogin) -> Result<Zeroizing<Stri
     Ok(Zeroizing::new(format!(
         "{}{}:{}@{}",
         &url[..start],
-        crate::hubs::encode(&login.user),
-        crate::hubs::encode(login.expose()),
+        encode(&login.user),
+        encode(login.expose()),
         &url[stripped_from..]
     )))
 }
@@ -824,6 +838,30 @@ mod tests {
         );
         assert_eq!(short("rtsp://cam:80/live"), "cam:80/live");
         assert_eq!(short("rtsps://cam:322/live"), "cam/live");
+    }
+
+    #[test]
+    fn keychain_accounts_are_pinned() {
+        // Saved passwords are looked up by exactly these strings: a change
+        // leaves every saved camera password unreadable.
+        let (address, login) = split_userinfo("rtsp://user@Host:554/path").unwrap();
+        let address = key(&address).unwrap().address;
+        let login = login.unwrap();
+        assert_eq!(account(&login.user, &address), "user@rtsp://host:554/path");
+        let onvif = key("onvif://192.168.1.64").unwrap().address;
+        assert_eq!(
+            account("ad min:1@x", &onvif),
+            "ad%20min%3A1%40x@onvif:http://192.168.1.64:80/onvif/device_service"
+        );
+        assert_eq!(encode("a-z_A.Z~09 /é"), "a-z_A.Z~09%20%2F%C3%A9");
+        let (logins, store) = logins("pinned");
+        logins
+            .save(&address, &CameraLogin::new("user", "secret").unwrap())
+            .unwrap();
+        assert_eq!(
+            store.secrets.lock().unwrap().keys().collect::<Vec<_>>(),
+            ["user@rtsp://host:554/path"]
+        );
     }
 
     #[test]

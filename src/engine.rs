@@ -1876,7 +1876,7 @@ fn validate_capture(output: &str, count: u32, timeout_ms: u64, format: &str) -> 
     Ok(())
 }
 pub fn validate_capture_output(output: &str) -> Result<()> {
-    crate::destination::validate_output(None, output)?;
+    crate::naming::validate_output(output)?;
     ensure!(
         !output.contains("://") && !output.starts_with("file:"),
         "capture output must be a file or directory; use forward for a network stream"

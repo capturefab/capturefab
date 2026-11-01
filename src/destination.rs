@@ -379,10 +379,7 @@ pub fn resolve_with(destination: &Destination, output: &str) -> Result<Resolved>
 /// Check an output's shape before settings or storage can change. Network
 /// forwarding can use URLs without a destination; named destinations use paths.
 pub fn validate_output(name: Option<&str>, output: &str) -> Result<()> {
-    ensure!(
-        !output.trim().is_empty() && output.len() <= 16384 && !output.chars().any(char::is_control),
-        "capture output needs a path without control characters (maximum 16384 bytes)"
-    );
+    crate::naming::validate_output(output)?;
     if let Some(name) = name {
         validate_name(name)?;
         let relative = Path::new(output);

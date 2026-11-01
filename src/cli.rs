@@ -295,11 +295,6 @@ pub enum Command {
         after_help = "Examples:\n  capturefab discover                      List cameras on this computer and network\n  capturefab discover --simulate           Include the built-in test camera sim:0\n  capturefab --json discover               One versioned JSON result for scripts\n  capturefab --timeout-ms 5000 discover    Wait longer for slow networks"
     )]
     Discover,
-    /// Host virtual GigE Vision, RTSP or ONVIF cameras using looping test data
-    Simulate {
-        #[command(subcommand)]
-        command: crate::simulation::SimulationCommand,
-    },
     /// Inspect GigE interfaces and reachability; tune connected cameras together
     NetworkScan,
     /// List document scanners using the platform scanner driver
@@ -974,16 +969,6 @@ fn prepare(cli: &Cli) -> Result<Option<SessionCommand>> {
                 .transpose()?
                 .unwrap_or(0),
         }),
-        Some(Command::Simulate { command }) => {
-            ensure!(
-                cli.session.is_none() && cli.camera.is_none(),
-                "simulate creates its own virtual camera; use --source instead of --camera and omit --session"
-            );
-            if let crate::simulation::SimulationCommand::Run(options) = command {
-                options.validate()?;
-            }
-            None
-        }
         Some(Command::Resources { command }) => {
             resources::prepare(command.as_ref())?;
             None
@@ -1351,37 +1336,6 @@ pub fn run(mut cli: Cli) -> Result<()> {
                 write_json(&schema())
             };
         }
-        Some(Command::Simulate { command }) => match command {
-            crate::simulation::SimulationCommand::Presets => {
-                return output(&cli, crate::simulation::presets());
-            }
-            crate::simulation::SimulationCommand::Run(options) => {
-                let server = options.start(Duration::from_millis(cli.timeout_ms))?;
-                let stopped = Arc::new(AtomicBool::new(false));
-                let flag = stopped.clone();
-                on_quit_signal(move || flag.store(true, Ordering::Relaxed))?;
-                let mut ready = server.endpoints();
-                ready["ready"] = json!(true);
-                ready["preset"] = json!(options.preset);
-                ready["pid"] = json!(std::process::id());
-                output(&cli, ready)?;
-                let deadline = options
-                    .duration
-                    .as_deref()
-                    .map(|duration| {
-                        crate::scheduling::parse_duration(duration)
-                            .map(|ms| std::time::Instant::now() + Duration::from_millis(ms))
-                    })
-                    .transpose()?;
-                while !stopped.load(Ordering::Relaxed)
-                    && deadline.is_none_or(|end| std::time::Instant::now() < end)
-                {
-                    server.check()?;
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                return server.check();
-            }
-        },
         Some(Command::Doctor) => return output(&cli, doctor()),
         Some(Command::Version { check }) => {
             return output(&cli, crate::updates::version_command(*check)?);
@@ -2550,13 +2504,9 @@ fn schema() -> Value {
         "stream_limits":"Existing transports acquire single rasters. Depth requires a compatible single-component stream; multipart, GenDC, point-cloud payloads and vendor SDK-only access remain unsupported. Detection does not establish hardware compatibility."
     });
     contract["simulation"] = json!({
-        "cli":"simulate presets | simulate run --preset gige|rtsp|onvif|vision [--source PATH] [--duration 30s]",
-        "presets":crate::simulation::presets()["presets"],
-        "replay":"--camera sim:replay:PATH uses a local simulator with configurable Width, Height and AcquisitionFrameRate; network presets use --source PATH",
+        "replay":"--camera sim:replay:PATH uses a local simulator with configurable Width, Height and AcquisitionFrameRate",
         "playlist":"A file or one-level directory of supported images/videos. Regular files only, lexicographically sorted by filename, no recursion or symlink traversal; loops until stopped.",
-        "timing":"Fixed delivered frame rate; frames are letterboxed to camera dimensions. Frame IDs and timestamps continue across file and playlist boundaries.",
-        "network":"Loopback by default. Use --bind LAN_IP for remote clients, or --bind 0.0.0.0 --advertise LAN_IP. Ports default to GigE 3956/UDP, RTSP 8554/TCP and ONVIF 8080/HTTP.",
-        "lifetime":"Runs in foreground until Ctrl-C or --duration; protocol listeners and decoder/encoder children are stopped on exit."
+        "timing":"Fixed delivered frame rate; frames are letterboxed to camera dimensions. Frame IDs and timestamps continue across file and playlist boundaries."
     });
     contract["scanners"] = json!({"enumeration":"scanners --json or discover --json; transport is scanner","backends":{"linux":"SANE scanimage (installed separately)","windows":"Windows Image Acquisition (WIA)","macos":"ImageCaptureCore (bundled native helper)"},"feature":"scanner; enabled by default","settings":{"ScanResolution":{"default":150,"range":[75,600],"unit":"dpi"},"ScanMode":{"default":"Color","choices":["Color","Gray","Lineart"]},"ScanSource":{"default":"Default","choices":["Default","Flatbed","Feeder"]}},"acquisition":"capture requests one page; count requests successive pages, including feeder pages; connecting/start never scans; forwarding and auto exposure are unsupported","timeout":"Use --timeout-ms 60000 for physical scans. Each page has its own deadline and timeout cancels the helper.","outputs":"Existing capture image formats, destinations and storage quotas; no PDF/OCR conversion","limits":{"frame_bytes":134217728,"shared_ring_default_bytes_per_slot":134217728},"compatibility":"Driver-dependent settings; unsupported resolutions, modes and source names fail without silent fallback. SANE source names vary between drivers."});
     contract["resources"] = json!({

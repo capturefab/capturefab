@@ -508,15 +508,13 @@ pub(crate) fn explain_gige_unreachable(
 ) -> String {
     let waited = wait_text(waited);
     if ip.is_loopback() {
-        // Nothing on this computer is a camera; a simulator may have been meant.
+        // Nothing on this computer is a camera; the simulator may have been meant.
         let what = if refused {
             format!("Nothing at {ip} accepts GigE Vision control traffic.")
         } else {
-            format!("No GigE Vision camera simulator answered at {ip} within {waited}.")
+            format!("No GigE Vision camera answered at {ip} within {waited}.")
         };
-        return format!(
-            "{what} Start one with `capturefab simulate run --preset gige --source PATH`, or connect sim:0 for the built-in test camera."
-        );
+        return format!("{what} Use sim:0 for the built-in test camera.");
     }
     let adapters: Vec<&NetworkInterface> = interfaces
         .iter()
@@ -1178,7 +1176,7 @@ mod tests {
             routed.contains("it may not be a GigE Vision camera. No network adapter on this computer shares its subnet (en1 192.168.68.56/22, Wi-Fi), so the refusal may come from a router. For IP cameras, try onvif://192.168.77.5"),
             "{routed}"
         );
-        // Locally, only a simulator can answer.
+        // Locally, only a test camera can answer.
         for refused in [false, true] {
             let message = explain_gige_unreachable(
                 Ipv4Addr::LOCALHOST,
@@ -1187,7 +1185,7 @@ mod tests {
                 wait,
             );
             assert!(
-                message.ends_with("Start one with `capturefab simulate run --preset gige --source PATH`, or connect sim:0 for the built-in test camera."),
+                message.ends_with("Use sim:0 for the built-in test camera."),
                 "{message}"
             );
             assert!(!message.contains("onvif"), "{message}");
@@ -1230,10 +1228,7 @@ mod tests {
                 .context("receiving GVCP acknowledgement");
         let explained = explain_probe_failure(Ipv4Addr::LOCALHOST, wait, refused);
         assert_eq!(crate::cli::error_code(&explained), ("unavailable", 3));
-        assert!(
-            explained.to_string().contains("capturefab simulate"),
-            "{explained}"
-        );
+        assert!(explained.to_string().contains("sim:0"), "{explained}");
         let other = explain_probe_failure(
             Ipv4Addr::LOCALHOST,
             wait,

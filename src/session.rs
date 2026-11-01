@@ -3343,12 +3343,12 @@ pub fn run_worker(ring: &std::ffi::OsStr) -> Result<()> {
             // Hub secrets this worker holds never leave it, even in text a
             // dependency produced.
             let scrub = |text: &mut String| {
-                if let std::borrow::Cow::Owned(clean) = crate::hubs::scrub::scrub(text) {
+                if let std::borrow::Cow::Owned(clean) = crate::scrub::scrub(text) {
                     *text = clean;
                 }
             };
             let mut error = error;
-            if crate::hubs::scrub::active() {
+            if crate::scrub::active() {
                 error.iter_mut().for_each(scrub);
                 snapshot.last_error.iter_mut().for_each(scrub);
                 snapshot

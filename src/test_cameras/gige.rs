@@ -849,8 +849,6 @@ mod tests {
             bind: ip,
             advertise: ip,
             gige_port: Some(3956),
-            rtsp_port: None,
-            onvif_port: None,
             name: "GigE test".into(),
             fps: 30.0,
             bitrate: "2M".into(),
@@ -992,14 +990,12 @@ mod tests {
             bind: ip,
             advertise: ip,
             gige_port: Some(0),
-            rtsp_port: None,
-            onvif_port: None,
             name: "GVCP test".into(),
             fps: 30.0,
             bitrate: "2M".into(),
         };
         let server = super::super::VirtualCameraServer::start(source, options).unwrap();
-        let port = server.endpoints()["gige"]["port"].as_u64().unwrap() as u16;
+        let port = server.port();
         (server, SocketAddr::from((ip, port)))
     }
     fn client() -> UdpSocket {
@@ -1166,6 +1162,8 @@ mod tests {
             0x8006
         );
         drop(server);
+        // A stopped camera releases its control port at once.
+        drop(UdpSocket::bind(camera).unwrap());
     }
 
     #[test]
@@ -1263,14 +1261,12 @@ mod tests {
             bind: ip,
             advertise: ip,
             gige_port: Some(0),
-            rtsp_port: None,
-            onvif_port: None,
             name: "Broadcast test".into(),
             fps: 30.0,
             bitrate: "2M".into(),
         };
         let server = super::super::VirtualCameraServer::start(source, options).unwrap();
-        let port = server.endpoints()["gige"]["port"].as_u64().unwrap() as u16;
+        let port = server.port();
         let client = UdpSocket::bind((ip, 0)).unwrap();
         client.set_broadcast(true).unwrap();
         client

@@ -88,6 +88,16 @@ fn tokens(template: &str) -> Result<Vec<Token>> {
     Ok(out)
 }
 
+/// Check an output's shape before settings or storage can change: a path or
+/// stream URL without control characters, at most 16 KiB.
+pub fn validate_output(output: &str) -> Result<()> {
+    ensure!(
+        !output.trim().is_empty() && output.len() <= 16384 && !output.chars().any(char::is_control),
+        "capture output needs a path without control characters (maximum 16384 bytes)"
+    );
+    Ok(())
+}
+
 /// Check placeholder names and where {seq} may appear.
 pub fn validate_template(output: &str) -> Result<()> {
     let tokens = tokens(output)?;

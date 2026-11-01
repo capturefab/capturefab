@@ -13,7 +13,7 @@ fn main() {
         if let Err(e) = result {
             eprintln!(
                 "capturefab worker: {}",
-                capturefab::hubs::scrub::scrub(&format!("{e:#}"))
+                capturefab::scrub::scrub(&format!("{e:#}"))
             );
             std::process::exit(1)
         }
@@ -63,7 +63,7 @@ fn main() {
             return;
         }
         let (code, exit) = cli::error_code(&error);
-        let message = capturefab::hubs::scrub::scrub(&format!("{error:#}")).into_owned();
+        let message = capturefab::scrub::scrub(&format!("{error:#}")).into_owned();
         let hint = typed_output
             .as_deref()
             .and_then(|output| cli::exists_hint(&error, output));

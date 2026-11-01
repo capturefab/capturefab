@@ -34,7 +34,7 @@ pub(crate) mod multipart;
 #[cfg(feature = "hubs")]
 pub(crate) mod pump;
 pub mod registry;
-pub mod scrub;
+pub(crate) use crate::scrub;
 pub mod secret;
 #[cfg(feature = "hubs")]
 pub(crate) mod sources;
@@ -43,6 +43,7 @@ pub(crate) mod tls;
 #[cfg(feature = "hubs")]
 pub(crate) mod unifi;
 
+pub(crate) use crate::logins::encode;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -107,20 +108,6 @@ pub struct Selector {
 
 fn shape(message: impl Into<String>) -> anyhow::Error {
     crate::types::Usage(message.into()).into()
-}
-
-/// Percent-encode everything except RFC 3986 unreserved characters, with
-/// uppercase hexadecimal.
-pub fn encode(text: &str) -> String {
-    let mut encoded = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
-            encoded.push(byte as char);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
 }
 
 fn decode(text: &str) -> Option<String> {

@@ -197,12 +197,6 @@ impl OnvifServer {
     pub(crate) fn endpoint(&self) -> &str {
         &self.service.endpoint
     }
-    pub(crate) fn snapshot(&self) -> &str {
-        &self.service.snapshot
-    }
-    pub(crate) fn discovery_enabled(&self) -> bool {
-        self.announcer.is_some()
-    }
 }
 impl Drop for OnvifServer {
     fn drop(&mut self) {
@@ -733,8 +727,6 @@ mod tests {
             bind: Ipv4Addr::LOCALHOST,
             advertise: Ipv4Addr::LOCALHOST,
             gige_port: None,
-            rtsp_port: Some(8554),
-            onvif_port: Some(0),
             name: "Lobby".into(),
             fps: 15.0,
             bitrate: "2M".into(),
@@ -1047,8 +1039,6 @@ mod tests {
             bind: Ipv4Addr::LOCALHOST,
             advertise: Ipv4Addr::LOCALHOST,
             gige_port: None,
-            rtsp_port: Some(8554),
-            onvif_port: Some(0),
             name: "Camera & test".into(),
             fps: 15.0,
             bitrate: "2M".into(),

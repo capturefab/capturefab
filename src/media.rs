@@ -891,9 +891,7 @@ impl Active {
     }
 }
 fn cores() -> usize {
-    crate::resources::processing_threads(
-        thread::available_parallelism().map_or(1, |cores| cores.get()),
-    )
+    crate::types::processing_threads(thread::available_parallelism().map_or(1, |cores| cores.get()))
 }
 /// FFmpeg's default frame threading runs cores + 1 threads per stream, each
 /// holding frames and adding latency; share the cores between live streams.
