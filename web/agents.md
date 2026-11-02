@@ -78,7 +78,8 @@ capturefab list --json
 {"cameras":[{"id":"gige:00c0df123456","kind":"gige","vendor":"…","model":"…","serial":"…","address":"192.168.1.20"}]}
 ```
 
-Use `id` with `-c`. `list --kind gige,u3v` narrows the search; `--timeout 3s` gives GigE and
+Use `id` with `-c` (without it, several cameras are exit 2 `camera_ambiguous`; only a person at
+a terminal without `--json` is asked to pick one). `list --kind gige,u3v` narrows the search; `--timeout 3s` gives GigE and
 ONVIF broadcasts longer to answer. `list` leaves out simulators and screen captures unless
 `--kind sim` or `--kind screen` names them. A camera on another machine's stream needs no
 `list`: pass its `rtsp://`, `srt://` or `onvif://` address to `-c`.
@@ -130,6 +131,15 @@ in hardware where it works in a session, and files and `--no-session` commands i
 session's cameras keep the `CAPTUREFAB_JPEG` and `CAPTUREFAB_HWDEC` the session started with:
 stop it, or use `--no-session`, to change them.
 
+The result also says which frame it saved: `time` (RFC 3339) and `device_ts_ns` (the camera's
+own clock, never a date), with `frames` the camera delivered while it ran, `dropped` frames lost
+and `incomplete` ones damaged on the way. The first frame saved is always one exposed after the
+camera's last settings change; `--fresh N` lets N more pass. `--inspect` adds the last frame's
+measurements to the result (`inspect.verdict`, `exposure`, `focus`) instead of a second call.
+`--manifest shots.jsonl` appends one JSON line per file with its path, time, size, SHA-256,
+settings and tags. With `-c` repeated, the cameras are armed, then asked for a frame together:
+the result holds `cameras`, one entry each, and `skew_ms`, how far apart their first frames came.
+
 ### Set and verify in one call
 
 ```sh
@@ -174,7 +184,9 @@ capturefab jobs wait --json auto-1 --timeout 10m
 armed, and a session (started on demand) keeps running it. `jobs wait ID` exits 0 when the job is done,
 with the job's own error code if it failed, and 4 if it is still running when `--timeout`
 ends; call it again to keep waiting. `jobs --json` lists every job; `jobs stop ID` ends one and
-keeps the files saved so far. `--at 14:30` or `--in 5m` delays the start.
+keeps the files saved so far. A job's `state` is `armed`, `running` or `stopping`, then `done`,
+`failed`, `cancelled`, `interrupted`, or `lost` when its session died. `--at 14:30` or `--in 5m`
+delays the start.
 
 ### Triggered capture
 
@@ -264,5 +276,6 @@ Partial work of a failed or interrupted command is in `error.details` (for examp
 - Cameras stay open for 60 seconds between commands; `--keep 5m` for longer loops.
 - `capturefab shell --json -c CAM -e 'inspect --preview none' -e 'capture -o shot.png'` runs
   several commands in one start, one JSON line each (or one command per line of stdin).
-- One call instead of two: `inspect --set`, `capture --set NAME=VALUE`, `capture --auto`.
+- One call instead of two: `inspect --set`, `capture --set NAME=VALUE`, `capture --auto`,
+  `capture --inspect`.
 - `-q` silences progress on stderr.

@@ -29,6 +29,7 @@ Capturefab is one `capturefab` executable for macOS, Windows and Linux. GigE Vis
 - Measure exposure and focus: `capturefab inspect --json -c CAM --preview none` (`verdict` is a list; `["ok"]` means well exposed)
 - Change settings and measure in one call: `capturefab inspect --json -c CAM --set exposure=5ms`
 - Capture: `capturefab capture --json -c CAM -o 'shots/{seq}.png'` (a `.jpg` of a Motion JPEG webcam, stream or file without `--quality` is the JPEG it sent, `"passthrough": true`)
+- Capture, measure and log in one call: `capturefab capture --json -c CAM -o shot.png --inspect --manifest shots.jsonl` (results give `time`, `device_ts_ns`, `frames`, `dropped`; the frame saved is exposed after the last settings change)
 - Time lapse: `capturefab capture --json -c CAM --every 10s --for 1h -o 'lapse/{seq}.jpg' --background`
 - Record: `capturefab record --json -c CAM -o clip.mp4 --for 30s` (an H.264 or HEVC source is copied without re-encoding, `"encoder":"copy"`, unless `--codec`, `--fps` or `--bitrate` asks otherwise)
 - Live measurements: `capturefab watch --json -c CAM --for 10s` (one JSON line per measurement)

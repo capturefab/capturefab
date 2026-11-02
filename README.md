@@ -69,13 +69,22 @@ gives the call patterns. The contract in short:
 - **Cameras**: `-c SELECTOR` takes a `list` ID (`gige:…`, `u3v:…`, `avfoundation:…`, `v4l2:…`,
   `dshow:…`), a serial number, an IP address, `rtsp://`, `srt://`, `http(s)://`, `onvif://host`,
   a file path, `sim:N` or `sim:replay:PATH`. Without `-c` the only camera found is used; several
-  give exit 2 `camera_ambiguous` with the candidates.
+  give exit 2 `camera_ambiguous` with the candidates (at a terminal without `--json`, a numbered
+  list asks which).
 - **Names**: GenICam features (`ExposureTime`), banks (`TriggerMode[FrameStart]`) and portable
   controls (`exposure`, `gain`, `fps`, `roi`, `format`, `trigger`, `auto_exposure`, `auto_wb`).
   Quote banks in the shell (`'TriggerMode[FrameStart]'`; zsh expands brackets), and quote camera
   IDs with spaces (`-c 'avfoundation:HD Pro Webcam C920'`).
 - **Durations** need a unit: `250ms`, `2s`, `1h30m`, and `none` where a wait may be unlimited.
   A bare number such as `5000` is exit 2 `invalid_duration`.
+- **Captures** report which frame they saved (`time`, and `device_ts_ns` from the camera's clock)
+  and what the camera delivered and lost meanwhile (`frames`, `dropped`, `incomplete`). The first
+  frame saved is one exposed after the last settings change; `--fresh N` lets N more pass, and a
+  camera that sets its own exposure gets `--warmup` (default 2s) to settle. `--inspect` adds the
+  last frame's measurements, `--manifest FILE` appends a JSON line per file (path, time, size,
+  SHA-256, settings, tags), and `--sync none` skips flushing scratch files to the disk. With `-c`
+  repeated, the cameras are asked for a frame together and `skew_ms` says how far apart their
+  first frames arrived.
 - **Output templates** for `-o`: `{camera}`, `{serial}`, `{seq}`, `{seq:4}`, `{time}`, `{date}`,
   `{tag:KEY}`, `{ext}`. A folder holds `{camera}-{time}-{seq}.{ext}`. An existing file is never
   overwritten: exit 1 `exists`, unless the name has `{seq}` or `--on-exists number` is given.

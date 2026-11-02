@@ -29,14 +29,15 @@ anything. A preset restores the setup later, also on another camera of the same 
 ## Capture a sequence with names and tags
 
 ```sh
-capturefab capture -c sim:0 -n 10 -o 'parts/{date}/{tag:part}-{seq:4}.png' --tag part=A-100 --tag station=3
+capturefab capture -c sim:0 -n 10 -o 'parts/{date}/{tag:part}-{seq:4}.png' --tag part=A-100 --tag station=3 --manifest parts.jsonl
 ```
 
 Templates: `{camera}`, `{serial}`, `{seq}` (`{seq:4}` pads to four digits), `{time}`, `{date}`,
 `{tag:KEY}` and `{ext}`. A folder (an existing one, or a name ending in `/`) gets
 `{camera}-{time}-{seq}.{ext}`. Tags also go into each image's metadata. Existing files are never
 overwritten; a name without `{seq}` that exists fails with `exists`, or is numbered with
-`--on-exists number`.
+`--on-exists number`. `--manifest` appends one JSON line per saved file (path, time, size,
+SHA-256, settings and tags) for whatever reads the files later.
 
 ## A time lapse that outlives the terminal
 
@@ -74,7 +75,9 @@ capturefab get -c sim:0 -c sim:1 ExposureTime Width
 capturefab inspect -c sim:0 -c sim:1 --preview none
 ```
 
-With `-c` repeated, the JSON result holds `cameras`, one entry per camera.
+With `-c` repeated, the JSON result holds `cameras`, one entry per camera. A capture arms every
+camera first, then asks all of them for a frame at once; `skew_ms` says how far apart their first
+frames arrived, and each entry's `time` and `device_ts_ns` say when its own frame was taken.
 
 ## Record and stream video
 
