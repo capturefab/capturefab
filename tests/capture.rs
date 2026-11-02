@@ -479,6 +479,58 @@ fn a_session_writes_where_the_caller_asked() {
     assert_eq!(explicit["files"][0], json!(home.real("second.png")));
 }
 
+/// A relative source is a file in the caller's folder: a session started
+/// in another folder never opens a file of the same name in its own, and
+/// a camera name still names the camera.
+#[test]
+fn a_session_never_opens_a_relative_source_from_its_own_folder() {
+    let home = Home::new("caller-sources");
+    let away = home.root.join("away");
+    std::fs::create_dir_all(&away).unwrap();
+    for own in ["clip.mkv", "SIM0"] {
+        std::fs::write(away.join(own), b"the session's own file").unwrap();
+    }
+    let mut command = home.command();
+    command.current_dir(&away);
+    let _session = home.serve_in(&mut command, "src", &["sim:0"], &[]);
+    for camera in ["clip.mkv", "./clip.mkv"] {
+        let missing = home.fails(
+            3,
+            &[
+                "--session",
+                "src",
+                "capture",
+                "-c",
+                camera,
+                "-o",
+                "shot.png",
+            ],
+        );
+        assert_eq!(missing["code"], "camera_not_found", "{camera}: {missing}");
+        assert!(
+            missing["message"]
+                .as_str()
+                .unwrap()
+                .contains("file not found"),
+            "{camera}: {missing}"
+        );
+    }
+    assert!(!home.path("shot.png").exists());
+    // A camera name, here the session's camera's serial, still names it,
+    // whatever file of that name the session's folder holds.
+    let shot = home.ok(&[
+        "--session",
+        "src",
+        "capture",
+        "-c",
+        "SIM0",
+        "-o",
+        "shot.png",
+    ]);
+    assert_eq!(shot["camera"], "sim:0", "{shot}");
+    assert!(home.path("shot.png").is_file());
+}
+
 /// `..` after a symbolic link is the parent of where the link leads, as
 /// the system has it, also through a session started elsewhere.
 #[cfg(unix)]

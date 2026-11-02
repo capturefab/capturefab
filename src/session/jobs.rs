@@ -268,35 +268,78 @@ pub(crate) fn path(name: &str) -> anyhow::Result<PathBuf> {
         .join(format!("{name}.json")))
 }
 
-/// What a session saves: its jobs, and the last number it gave a job,
+/// What a session saved: its jobs, and the last number it gave a job,
 /// which outlives the jobs it numbered so that a later run of the session
 /// never gives an earlier job's ID to a new one.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 struct Saved {
-    #[serde(default)]
+    /// The highest number given: the saved one, or a saved job's.
     next: u64,
-    #[serde(default)]
     jobs: Vec<Job>,
 }
 
 /// What session `name` saved, as it was when it last saved it.
 fn load(name: &str) -> Saved {
-    /// Files saved before the last number was kept hold the jobs alone.
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum File {
-        Jobs(Vec<Job>),
-        Saved(Saved),
+    let Some(data) = path(name).ok().and_then(|path| std::fs::read(path).ok()) else {
+        return Saved::default();
+    };
+    match serde_json::from_slice::<Value>(&data) {
+        Ok(file) => parse(file),
+        // A file cut short or damaged keeps the numbers it shows.
+        Err(_) => Saved {
+            next: numbers_in(&String::from_utf8_lossy(&data)),
+            jobs: Vec::new(),
+        },
     }
-    let file = path(name)
-        .ok()
-        .and_then(|path| std::fs::read(path).ok())
-        .and_then(|data| serde_json::from_slice::<File>(&data).ok());
-    match file {
-        Some(File::Saved(saved)) => saved,
-        Some(File::Jobs(jobs)) => Saved { next: 0, jobs },
-        None => Saved::default(),
+}
+
+/// The highest number `text`, a saved book that is no longer JSON, still
+/// shows after a `"next"` or `"number"` key. One that means something else
+/// only skips numbers.
+fn numbers_in(text: &str) -> u64 {
+    ["\"next\"", "\"number\""]
+        .into_iter()
+        .flat_map(|key| text.match_indices(key).map(move |(at, _)| at + key.len()))
+        .filter_map(|after| {
+            let value = text[after..].trim_start().strip_prefix(':')?.trim_start();
+            let end = value
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(value.len());
+            value[..end].parse::<u64>().ok()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The jobs in a saved book this build reads, each on its own: one it
+/// cannot, of a kind or state a later build added or damaged on disk, is
+/// left out, but its number still counts, as the saved number does.
+fn parse(file: Value) -> Saved {
+    let (next, entries) = match file {
+        // Files saved before the last number was kept hold the jobs alone.
+        Value::Array(entries) => (0, entries),
+        Value::Object(mut file) => (
+            file.get("next").and_then(Value::as_u64).unwrap_or(0),
+            match file.remove("jobs") {
+                Some(Value::Array(entries)) => entries,
+                _ => Vec::new(),
+            },
+        ),
+        _ => (0, Vec::new()),
+    };
+    let mut saved = Saved {
+        next,
+        jobs: Vec::new(),
+    };
+    for entry in entries {
+        if let Some(number) = entry.get("number").and_then(Value::as_u64) {
+            saved.next = saved.next.max(number);
+        }
+        if let Ok(job) = serde_json::from_value::<Job>(entry) {
+            saved.jobs.push(job);
+        }
     }
+    saved
 }
 
 /// The jobs a session saved, as they were when it last saved them.
@@ -356,13 +399,8 @@ impl JobBook {
     /// Without a writable state folder, as on a read-only system, the jobs
     /// are kept only while the session runs.
     pub(super) fn saved(name: &str) -> Self {
-        let saved = load(name);
-        let next = saved
-            .jobs
-            .iter()
-            .map(|job| job.number)
-            .fold(saved.next, u64::max);
-        let jobs = orphaned(saved.jobs);
+        let Saved { next, jobs } = load(name);
+        let jobs = orphaned(jobs);
         let writable = crate::dirs::found(crate::dirs::Kind::State)
             .chosen
             .as_ref()
@@ -950,6 +988,61 @@ mod tests {
         let book = JobBook::saved(&name);
         assert_eq!(book.all().len(), 1);
         assert_eq!(book.start(JobKind::Auto, "sim:0", None, false), 61);
+        std::fs::remove_file(file).unwrap();
+    }
+
+    /// A job this build cannot read, such as one of a kind a later build
+    /// added or an entry damaged on disk, is left out, but its number and
+    /// the saved one still count: no later job takes an ID one had.
+    #[test]
+    fn jobs_this_build_cannot_read_keep_their_numbers() {
+        let name = format!("unreadable-{}", std::process::id());
+        let file = path(&name).unwrap();
+        crate::dirs::ensure_private_dir(file.parent().unwrap()).unwrap();
+        let mut kept = forgotten(3);
+        kept.ended_ms = Some(crate::scheduling::now_ms());
+        let mut later = serde_json::to_value(&kept).unwrap();
+        (later["number"], later["kind"]) = (json!(80), json!("timelapse"));
+        let mut paused = serde_json::to_value(&kept).unwrap();
+        (paused["number"], paused["state"]) = (json!(85), json!("paused"));
+        let damaged = json!({"number": 90, "camera": 7});
+        let write = |saved: Value| std::fs::write(&file, serde_json::to_vec(&saved).unwrap());
+        write(json!({"next": 70, "jobs": [kept, later, paused, damaged, "junk", {}]})).unwrap();
+        let book = JobBook::saved(&name);
+        assert_eq!(
+            book.all().iter().map(|job| job.number).collect::<Vec<_>>(),
+            [3],
+            "the jobs it can read stay"
+        );
+        assert_eq!(book.start(JobKind::Capture, "sim:0", Some(1), false), 91);
+        let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(saved["next"], 91, "{saved}");
+        // The saved number alone, when no job reads.
+        write(json!({"next": 70, "jobs": [{"number": 5, "kind": "timelapse"}]})).unwrap();
+        assert_eq!(
+            JobBook::saved(&name).start(JobKind::Record, "sim:0", None, false),
+            71
+        );
+        // A job list that is not one keeps the number too.
+        write(json!({"next": 70, "jobs": {"number": 99}})).unwrap();
+        assert_eq!(
+            JobBook::saved(&name).start(JobKind::Record, "sim:0", None, false),
+            71
+        );
+        // A file of an earlier version, which holds the jobs alone.
+        write(json!([kept, {"number": 12, "kind": "timelapse"}])).unwrap();
+        let book = JobBook::saved(&name);
+        assert_eq!(book.all().len(), 1);
+        assert_eq!(book.start(JobKind::Auto, "sim:0", None, false), 13);
+        // A file cut short, no longer JSON, keeps the numbers it shows.
+        std::fs::write(
+            &file,
+            br#"{"next": 70, "jobs": [{"number" : 75, "kind": "capt"#,
+        )
+        .unwrap();
+        let book = JobBook::saved(&name);
+        assert!(book.all().is_empty());
+        assert_eq!(book.start(JobKind::Capture, "sim:0", Some(1), false), 76);
         std::fs::remove_file(file).unwrap();
     }
 

@@ -34,8 +34,9 @@ app, whose commands and JSON differ, so update a `capturefab` that reports one o
    (`'TriggerMode[FrameStart]'`).
 6. **Files are never overwritten.** A taken name is exit 1 `exists` with `details.path`; add
    `{seq}` to `-o` or pass `--on-exists number`.
-7. **Paths in results are absolute.** Relative `-o` paths resolve against your working
-   directory, also when a session does the work.
+7. **Paths in results are absolute.** Relative `-o` paths and file sources (`-c clip.mkv`,
+   `file:`, `sim:replay:`) resolve against your working directory, also when a session does
+   the work; a session never opens a file from its own.
 
 ## Permissions
 

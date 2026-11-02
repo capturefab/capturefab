@@ -288,6 +288,7 @@ pub fn validate_source(url: &str) -> Result<()> {
     validate_source_shape(url)?;
     if is_recording(url) {
         let path = local_file_path(url)?;
+        absolute_source(&path, "a media file source")?;
         let metadata = fs::metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 return crate::camera::missing_path(format!(
@@ -310,8 +311,28 @@ pub fn validate_source(url: &str) -> Result<()> {
 pub fn is_recording(output: &str) -> bool {
     matches!(scheme(output).as_deref(), None | Some("file"))
 }
+/// Whether `url` names a source: by its scheme, or as the absolute path of
+/// a file. A relative path never does here: it is from the folder of the
+/// command that typed it, which makes it absolute (`cli::paths`), and this
+/// process's own folder, a session's, may hold another file of that name.
 pub fn is_source(url: &str) -> bool {
-    is_url_source(url) || std::path::Path::new(url).is_file()
+    let path = std::path::Path::new(url);
+    is_url_source(url) || path.is_absolute() && path.is_file()
+}
+/// `what`, a local source at `path`, named absolutely: a relative path
+/// would be from this process's folder, which for a session is not that of
+/// the command that asked for it. A command makes the paths typed to it
+/// absolute; a request that sends a relative one is wrong.
+pub(crate) fn absolute_source(path: &std::path::Path, what: &str) -> Result<()> {
+    if path.is_absolute() {
+        return Ok(());
+    }
+    Err(Categorized::new(
+        ErrorKind::Usage,
+        format!("{what} must be an absolute path, not {}", path.display()),
+    )
+    .hint("a session opens no file from its own folder; name the file by its absolute path")
+    .into())
 }
 /// Whether `url` names a source by its scheme alone, without asking the
 /// disk whether it is a file.

@@ -2444,6 +2444,45 @@ pub(crate) mod tests {
         assert!(!needs_no_discovery("C920"));
     }
 
+    /// A relative path is from the folder of the command that typed it,
+    /// which makes it absolute before it sends it: here, as in a session
+    /// started in another folder, it never names a file of this process's
+    /// folder, the package's, which holds Cargo.toml and src.
+    #[test]
+    fn relative_paths_never_open_a_file_of_this_processs_folder() {
+        assert!(std::path::Path::new("Cargo.toml").is_file());
+        assert!(std::path::Path::new("src").is_dir());
+        for selector in ["Cargo.toml", "./Cargo.toml"] {
+            assert!(!crate::media::is_source(selector), "{selector}");
+            assert!(!is_explicit_selector(selector), "{selector}");
+        }
+        let error = open_error("./Cargo.toml", &[]);
+        assert_eq!(crate::cli::error_code(&error), ("camera_not_found", 3));
+        assert!(
+            error.to_string().contains("file not found: ./Cargo.toml"),
+            "{error:#}"
+        );
+        for selector in [
+            "file:Cargo.toml",
+            "FILE:./Cargo.toml",
+            "sim:replay:src",
+            "sim:replay:./Cargo.toml",
+        ] {
+            let error = validate_selector(selector).unwrap_err();
+            assert_eq!(crate::cli::error_code(&error), ("usage", 2), "{selector}");
+            assert!(
+                error.to_string().contains("absolute path"),
+                "{selector}: {error:#}"
+            );
+        }
+        // The same files named absolutely are sources.
+        let absolute = std::fs::canonicalize("Cargo.toml").unwrap();
+        let absolute = absolute.to_str().unwrap();
+        assert!(crate::media::is_source(absolute));
+        validate_selector(absolute).unwrap();
+        validate_selector(&format!("file:{absolute}")).unwrap();
+    }
+
     #[test]
     fn suggestions_never_show_credentials() {
         let known = vec![device(

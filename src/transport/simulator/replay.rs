@@ -83,8 +83,10 @@ fn regular_file(path: &Path) -> Result<()> {
 /// List supported direct children, sorted by filename. Subdirectories, symlinks,
 /// and unrelated files are ignored; a symlink selected as the source is rejected.
 /// A source that is not there is `camera_not_found`, as a missing file named
-/// as a camera is; one that cannot be replayed is a usage error.
+/// as a camera is; one that cannot be replayed, or a relative path, which
+/// would be from this process's folder, is a usage error.
 pub fn source_files(source: &Path) -> Result<Vec<PathBuf>> {
+    crate::media::absolute_source(source, "a simulation source")?;
     let metadata = fs::symlink_metadata(source).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             return crate::camera::missing_path(format!(
