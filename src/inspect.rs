@@ -178,7 +178,7 @@ pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
             width,
             height,
             pixel_format,
-            data,
+            data: data.into(),
             ..*frame
         });
     }
@@ -200,7 +200,7 @@ pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
     Ok(Frame {
         width,
         height,
-        data,
+        data: data.into(),
         ..*frame
     })
 }
@@ -722,7 +722,7 @@ mod tests {
             pixel_format,
             device_ts_ns: Some(99),
             wall_ms: 0,
-            data,
+            data: data.into(),
         }
     }
     /// A horizontal ramp from black to white with vertical bars, so it has
@@ -851,7 +851,7 @@ mod tests {
             frame::bayer_pattern(source.pixel_format)
         );
         // Mono crops are exact.
-        let mono = frame(MONO8, 8, 6, source.data.clone());
+        let mono = frame(MONO8, 8, 6, source.data.to_vec());
         let cropped = crop(&mono, [3, 1, 2, 2]).unwrap();
         assert_eq!(cropped.data, [11, 12, 19, 20]);
     }
@@ -993,7 +993,7 @@ mod tests {
                 round4(meter.mean),
                 "{format:08x}"
             );
-            source.data.pop();
+            source.data.make_mut().pop();
             assert!(crop(&source, [1, 1, 2, 2]).is_err(), "{format:08x}");
         }
     }

@@ -340,8 +340,8 @@ pub(super) fn acquire(
 
 /// Serve the waiting requests a streaming camera's new `frame` is due for:
 /// each takes it, shared, once it has let its frames pass. The frame is
-/// handed back for the recording when `keep`, copied only if an inspection
-/// still holds it.
+/// handed back for the recording when `keep`, sharing its buffer with the
+/// inspections.
 pub(super) fn serve(
     c: &mut Camera,
     frame: Frame,
@@ -393,12 +393,7 @@ pub(super) fn serve(
             reply: item.reply,
         });
     }
-    keep.then(|| {
-        Arc::try_unwrap(shared).unwrap_or_else(|shared| {
-            crate::copies::record(crate::copies::Site::FrameClone, shared.data.len());
-            (*shared).clone()
-        })
-    })
+    keep.then(|| Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone()))
 }
 
 /// End the waiting requests that were cancelled, whose deadline passed, or

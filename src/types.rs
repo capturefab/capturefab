@@ -49,8 +49,9 @@ pub struct Frame {
     /// `Camera::next_frame`.
     #[serde(default)]
     pub wall_ms: u64,
+    /// The pixels, shared by every clone of the frame.
     #[serde(skip)]
-    pub data: Vec<u8>,
+    pub data: crate::framebuf::FrameBuf,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

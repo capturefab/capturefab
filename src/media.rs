@@ -978,7 +978,11 @@ fn ppm_token(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     }
     Ok(token)
 }
-fn read_ppm(reader: &mut impl BufRead, id: u64) -> Result<Frame> {
+fn read_ppm(
+    reader: &mut impl BufRead,
+    id: u64,
+    pool: &crate::framebuf::FramePool,
+) -> Result<Frame> {
     ensure!(
         ppm_token(reader)? == b"P6",
         "FFmpeg emitted an unsupported image format"
@@ -1002,8 +1006,8 @@ fn read_ppm(reader: &mut impl BufRead, id: u64) -> Result<Frame> {
         width > 0 && height > 0 && size <= MAX_FRAME,
         "media frame exceeds 256 MiB limit"
     );
-    let mut data = vec![0; size];
-    crate::copies::record(crate::copies::Site::ZeroFill, size);
+    // `read_exact` fills every byte, so a recycled buffer needs no zeroing.
+    let mut data = pool.take_stale(size);
     reader
         .read_exact(&mut data)
         .context("truncated FFmpeg RGB frame")?;
@@ -1015,7 +1019,7 @@ fn read_ppm(reader: &mut impl BufRead, id: u64) -> Result<Frame> {
         pixel_format: RGB8,
         device_ts_ns: None,
         wall_ms: 0,
-        data,
+        data: data.freeze(),
     })
 }
 impl Decoder {
@@ -1088,6 +1092,10 @@ impl Decoder {
                 "ppm",
                 "-pix_fmt",
                 "rgb24",
+                // One PPM packet per frame, written to the pipe as it is
+                // rather than through FFmpeg's I/O buffer.
+                "-avioflags",
+                "direct",
                 "pipe:1",
             ])
             .stdout(Stdio::piped())
@@ -1112,7 +1120,7 @@ impl Decoder {
             while !shared.stopped.load(Ordering::Relaxed) {
                 id += 1;
                 // Stamp a frame when it has arrived, not when it is taken.
-                let result = read_ppm(&mut reader, id).map(|mut frame| {
+                let result = read_ppm(&mut reader, id, crate::framebuf::pool()).map(|mut frame| {
                     frame.wall_ms = crate::scheduling::now_ms();
                     frame
                 });
@@ -4243,9 +4251,9 @@ impl RawInput {
         } else if self.unpack {
             let data = crate::frame::unpacked(&frame)?.into_owned().data;
             crate::copies::record(crate::copies::Site::FfmpegUnpack, data.len());
-            data
+            data.into_pool_vec().into_vec()
         } else {
-            frame.data
+            frame.data.into_pool_vec().into_vec()
         };
         ensure!(data.len() >= length, "truncated {name} frame");
         data.truncate(length);
@@ -5542,6 +5550,10 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
         );
         assert_eq!(launch.matches("-threads ").count(), 1, "{launch}");
         assert!(launch.contains("-hwaccel none"), "{launch}");
+        assert!(
+            launch.trim_end().ends_with("-avioflags direct pipe:1"),
+            "{launch}"
+        );
     }
     #[test]
     fn decoders_and_software_encoders_are_sized_to_the_host() {
@@ -5630,7 +5642,7 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: 0,
-            data: vec![7; (width * height * 3) as usize],
+            data: vec![7; (width * height * 3) as usize].into(),
         }
     }
     #[cfg(unix)]
@@ -5947,9 +5959,28 @@ esac"#
         bytes.extend(b"P6\n1 1\n255\n");
         bytes.extend([1, 2, 3]);
         let mut reader = BufReader::new(bytes.as_slice());
-        let a = read_ppm(&mut reader, 1).unwrap();
+        let pool = crate::framebuf::pool();
+        let a = read_ppm(&mut reader, 1, pool).unwrap();
         assert_eq!(a.data, [10, 32, 13, 0, 255, 1]);
-        assert_eq!(read_ppm(&mut reader, 2).unwrap().data, [1, 2, 3]);
+        assert_eq!(read_ppm(&mut reader, 2, pool).unwrap().data, [1, 2, 3]);
+    }
+    #[test]
+    fn ppm_frames_reuse_the_buffers_of_frames_dropped() {
+        let size = 64 * 48 * 3;
+        let mut bytes = Vec::new();
+        for frame in 0..20u8 {
+            bytes.extend(b"P6\n64 48\n255\n");
+            bytes.extend(std::iter::repeat_n(frame, size));
+        }
+        let pool = crate::framebuf::FramePool::new(|| None);
+        let mut reader = BufReader::new(bytes.as_slice());
+        for id in 0..20 {
+            let frame = read_ppm(&mut reader, id, &pool).unwrap();
+            assert!(frame.data.iter().all(|&byte| u64::from(byte) == id));
+        }
+        // One buffer for the first frame, used again for the rest.
+        let stats = pool.stats();
+        assert_eq!((stats.allocations, stats.reuses), (1, 19));
     }
     #[test]
     fn ppm_rejects_oversize_truncation_and_sample_depth() {
@@ -5958,7 +5989,7 @@ esac"#
             &b"P6\n1 1\n65535\n"[..],
             &b"P6\n1 1\n255\n\0"[..],
         ] {
-            assert!(read_ppm(&mut BufReader::new(bytes), 1).is_err());
+            assert!(read_ppm(&mut BufReader::new(bytes), 1, crate::framebuf::pool()).is_err());
         }
     }
     #[test]
@@ -6205,20 +6236,23 @@ esac"#
                 ("gray12le", 2, false)
             );
             assert_eq!(
-                raw.bytes(frame(format, 2, data)).unwrap(),
+                raw.bytes(frame(format, 2, data.into())).unwrap(),
                 le(&[0xabc, 0x123])
             );
         }
         // 10- and 12-bit Bayer fill FFmpeg's 16-bit Bayer formats.
         let raw = RawInput::for_format(0x0110_0011).unwrap();
         assert_eq!(raw.ffmpeg, "bayer_rggb16le");
-        let samples = frame(0x0110_0011, 2, le(&[0xfff, 0x001]));
+        let samples = frame(0x0110_0011, 2, le(&[0xfff, 0x001]).into());
         assert_eq!(raw.bytes(samples).unwrap(), le(&[0xfff0, 0x0010]));
         let raw = RawInput::for_format(0x010c_0029).unwrap();
         assert_eq!(raw.ffmpeg, "bayer_bggr16le");
-        let packed = frame(0x010c_0029, 2, vec![0x55, 0x21, 0xaa]);
+        let packed = frame(0x010c_0029, 2, vec![0x55, 0x21, 0xaa].into());
         assert_eq!(raw.bytes(packed).unwrap(), le(&[0x155 << 6, 0x2aa << 6]));
-        assert!(raw.bytes(frame(0x010c_0029, 2, vec![0x55, 0x21])).is_err());
+        assert!(
+            raw.bytes(frame(0x010c_0029, 2, vec![0x55, 0x21].into()))
+                .is_err()
+        );
         for (format, ffmpeg) in [
             (0x0110_0025, "gray14le"),
             (0x0110_002e, "bayer_grbg16le"),
@@ -6248,7 +6282,10 @@ esac"#
                 ["-color_range", "pc", "-colorspace", "bt470bg"]
             );
             let pair = vec![1, 2, 3, 4, 5];
-            assert_eq!(raw.bytes(frame(format, 2, pair)).unwrap(), [1, 2, 3, 4]);
+            assert_eq!(
+                raw.bytes(frame(format, 2, pair.into())).unwrap(),
+                [1, 2, 3, 4]
+            );
         }
         let error = RawInput::for_format(0x0110_0099).unwrap_err().to_string();
         assert!(error.contains("0x01100099") && error.contains("--format raw"));
@@ -6294,7 +6331,8 @@ esac"#
         let mono = RawInput::for_format(0x010e_0104).unwrap();
         assert_eq!(mono.ffmpeg, "gray14le");
         assert_eq!(
-            mono.bytes(frame(0x010e_0104, packed.clone())).unwrap(),
+            mono.bytes(frame(0x010e_0104, packed.clone().into()))
+                .unwrap(),
             unpacked
         );
         for (plain, packed_format, ffmpeg) in [
@@ -6307,7 +6345,7 @@ esac"#
                 let raw = RawInput::for_format(format).unwrap();
                 assert_eq!(raw.ffmpeg, ffmpeg);
                 assert_eq!(
-                    raw.bytes(frame(format, data)).unwrap(),
+                    raw.bytes(frame(format, data.into())).unwrap(),
                     [0x48d0u16, 0xeaf0]
                         .into_iter()
                         .flat_map(u16::to_le_bytes)
@@ -6337,7 +6375,7 @@ esac"#
                 width: 3,
                 height: 1,
                 pixel_format: format,
-                data,
+                data: data.into(),
                 ..Frame::default()
             };
             let bytes = raw.bytes(frame).unwrap();
@@ -6354,7 +6392,7 @@ esac"#
                     width,
                     height,
                     pixel_format: format,
-                    data: vec![],
+                    data: vec![].into(),
                     ..Frame::default()
                 };
                 assert!(
@@ -6374,7 +6412,7 @@ esac"#
             width: 1,
             height: 1,
             pixel_format: crate::types::RGB8,
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
             ..Frame::default()
         };
         assert!(
@@ -6455,7 +6493,7 @@ esac"#
                 width,
                 height,
                 pixel_format: format,
-                data,
+                data: data.into(),
                 ..Frame::default()
             };
             assert_eq!(raw.bytes(frame).unwrap(), expected, "{format:#x}");
@@ -6483,13 +6521,13 @@ esac"#
                 "{format:x}"
             );
             assert_eq!(
-                raw.bytes(frame(1, 1, vec![9, 7])).unwrap(),
+                raw.bytes(frame(1, 1, vec![9, 7].into())).unwrap(),
                 [9, 7, 128, 128]
             );
-            assert!(raw.bytes(frame(3, 2, vec![0; 11])).is_err());
+            assert!(raw.bytes(frame(3, 2, vec![0; 11].into())).is_err());
             // Even widths and other formats pass through unchanged.
             let even = (1..=8).collect::<Vec<u8>>();
-            assert_eq!(raw.bytes(frame(2, 2, even.clone())).unwrap(), even);
+            assert_eq!(raw.bytes(frame(2, 2, even.clone().into())).unwrap(), even);
         }
         let mono = RawInput::for_format(crate::types::MONO8).unwrap();
         let odd = Frame {
@@ -6499,7 +6537,7 @@ esac"#
             pixel_format: crate::types::MONO8,
             device_ts_ns: None,
             wall_ms: 0,
-            data: vec![1, 2, 3],
+            data: vec![1, 2, 3].into(),
         };
         assert_eq!(mono.bytes(odd).unwrap(), [1, 2, 3]);
     }
@@ -6530,7 +6568,7 @@ esac"#
                 pixel_format: format,
                 device_ts_ns: None,
                 wall_ms: 0,
-                data,
+                data: data.into(),
             };
             let expected = crate::frame::rgb(&frame).unwrap();
             let mut child = command(&exe)
@@ -6687,7 +6725,7 @@ esac"#
                 pixel_format,
                 device_ts_ns: None,
                 wall_ms: 0,
-                data,
+                data: data.into(),
             };
             let expected = crate::frame::rgb(&frame).unwrap();
             let mut child = command(&exe)
@@ -6846,7 +6884,7 @@ esac"#
                     pixel_format: RGB8,
                     device_ts_ns: None,
                     wall_ms: 0,
-                    data: pictures[id as usize % pictures.len()].clone(),
+                    data: pictures[id as usize % pictures.len()].clone().into(),
                 })
                 .unwrap();
             // The recording starts when FFmpeg takes its first frame.
@@ -6933,7 +6971,7 @@ esac"#
                     pixel_format: RGB8,
                     device_ts_ns: None,
                     wall_ms: 0,
-                    data: vec![(id * 8) as u8; width * height * 3],
+                    data: vec![(id * 8) as u8; width * height * 3].into(),
                 })
                 .unwrap();
             thread::sleep(Duration::from_secs_f64(1.0 / 30.0));
@@ -7020,7 +7058,7 @@ esac"#
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: 0,
-            data,
+            data: data.into(),
         };
         forward.push(frame.clone()).unwrap();
         let start = Instant::now();
@@ -7059,7 +7097,7 @@ esac"#
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: 0,
-            data: vec![0; 64 * 48 * 3],
+            data: vec![0; 64 * 48 * 3].into(),
         };
         let error = forward.push(frame.clone()).unwrap_err();
         assert!(format!("{error:#}").contains("is unavailable in this FFmpeg build"));
@@ -7096,7 +7134,7 @@ esac"#
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: 0,
-            data: vec![127; 64 * 48 * 3],
+            data: vec![127; 64 * 48 * 3].into(),
         };
         forward.push(frame.clone()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -7406,7 +7444,7 @@ while :; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; sleep 0.05; done"#,
             pixel_format: RGB8,
             device_ts_ns: None,
             wall_ms: id,
-            data: vec![0; 3],
+            data: vec![0; 3].into(),
         };
         let queue = DecoderQueue {
             state: Mutex::new(Decoded {

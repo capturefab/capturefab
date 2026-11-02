@@ -1035,8 +1035,9 @@ impl Simulator {
             }
         };
         let mut sum = 0u64;
-        let mut data = vec![0; self.u32(PAYLOAD) as usize];
-        crate::copies::record(crate::copies::Site::ZeroFill, data.len());
+        // Every byte of every row is written below, so a recycled buffer's
+        // old pixels never show.
+        let mut data = crate::framebuf::pool().take_stale(self.u32(PAYLOAD) as usize);
         let row_bytes = crate::frame::row_bytes(width, pixel_format);
         for (i, (base, ring)) in self.scene.2.iter().enumerate() {
             let (x, y) = (i as u32 % width, i as u32 / width);
@@ -1130,13 +1131,15 @@ impl Simulator {
                 BAYER_RG12 => {
                     p[x * 2..x * 2 + 2].copy_from_slice(&wide(bayer, 12, x as u32).to_le_bytes())
                 }
-                // PFNC lsb packing: two 12-bit samples in three bytes.
+                // PFNC lsb packing: two 12-bit samples in three bytes. An
+                // even sample clears the high nibble, which the odd one
+                // after it fills, or which stays zero at an odd width.
                 MONO12P => {
                     let sample = wide(red, 12, x as u32);
                     let at = x / 2 * 3;
                     if x.is_multiple_of(2) {
                         p[at] = sample as u8;
-                        p[at + 1] = (p[at + 1] & 0xf0) | (sample >> 8) as u8;
+                        p[at + 1] = (sample >> 8) as u8;
                     } else {
                         p[at + 1] = (p[at + 1] & 0x0f) | ((sample & 0x0f) << 4) as u8;
                         p[at + 2] = (sample >> 4) as u8;
@@ -1168,21 +1171,25 @@ impl Simulator {
                     .unwrap_or(u64::MAX),
             ),
             wall_ms: 0,
-            data,
+            data: data.freeze(),
         }
     }
 }
 
 /// Write the `bits` low bits of `sample` into `row` from bit `first` on,
 /// least significant bit first, as PFNC lsb packing lays samples out. The
-/// bits it covers must still be zero.
+/// bits below `first` in its first byte are kept, and those above the
+/// sample in its last byte cleared: samples written in order then fill a
+/// row whose old contents were anything, with its padding bits zero.
 fn put_lsb(row: &mut [u8], first: usize, bits: usize, sample: u16) {
     let value = u32::from(sample) << (first % 8);
+    let kept = (1u8 << (first % 8)) - 1;
     for (i, byte) in row[first / 8..(first + bits).div_ceil(8)]
         .iter_mut()
         .enumerate()
     {
-        *byte |= (value >> (8 * i)) as u8;
+        let old = if i == 0 { *byte & kept } else { 0 };
+        *byte = old | (value >> (8 * i)) as u8;
     }
 }
 
@@ -1344,7 +1351,11 @@ mod tests {
                 camera.set(name, value).unwrap();
             }
             camera.start().unwrap();
-            camera.next_frame(Duration::from_secs(1)).unwrap().data
+            camera
+                .next_frame(Duration::from_secs(1))
+                .unwrap()
+                .data
+                .to_vec()
         }
         let baseline = specimen(None);
         assert_ne!(baseline, specimen(Some(("FocusPosition", "0"))));
@@ -1591,9 +1602,36 @@ mod tests {
                 .as_chunks::<2>()
                 .0
                 .iter()
-                .zip(&rgb8.data)
+                .zip(rgb8.data.iter())
                 .all(|(wide, &narrow)| (u16::from_le_bytes(*wide) >> 4) as u8 == narrow)
         );
+    }
+
+    /// Frames are rendered into recycled buffers, which in tests hold
+    /// `framebuf::tests::POISON`: every byte of a packed row is written,
+    /// and the bits past an odd width's last sample are zero.
+    #[test]
+    fn packed_rows_at_odd_widths_are_written_whole() {
+        let grab = |format: &str| {
+            let mut c = camera("sim:0");
+            c.set("Width", "65").unwrap();
+            c.set("PixelFormat", format).unwrap();
+            c.start().unwrap();
+            c.next_frame(Duration::from_secs(1)).unwrap()
+        };
+        let samples = |format: &str| crate::frame::unpacked(&grab(format)).unwrap().into_owned();
+        assert_eq!(samples("Mono12p").data, samples("Mono12").data);
+        assert_eq!(samples("BayerRG12p").data, samples("BayerRG12").data);
+        for (format, bits) in [("Mono12p", 12), ("BayerRG12p", 12), ("Mono14p", 14)] {
+            let frame = grab(format);
+            let row = crate::frame::row_bytes(65, frame.pixel_format);
+            assert_eq!(frame.data.len(), row * 480);
+            let unused = row * 8 - 65 * bits;
+            assert!(unused > 0, "{format}");
+            for line in frame.data.chunks_exact(row) {
+                assert_eq!(line[row - 1] >> (8 - unused), 0, "{format}");
+            }
+        }
     }
 
     #[test]

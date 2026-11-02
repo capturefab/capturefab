@@ -1,6 +1,7 @@
 //! USB3 Vision transport using native OS USB APIs through nusb (no libusb).
 //! UVCP/UVSP wire fields and bootstrap register addresses follow USB3 Vision.
 use crate::{
+    framebuf::{PoolVec, pool},
     genicam::decode_xml,
     types::{Backend, CameraInfo, Categorized, ErrorKind, Frame, RegisterIo, Transport},
 };
@@ -529,7 +530,8 @@ struct Stream {
     idle: Vec<Buffer>,
     /// Transfers submitted and not yet returned.
     submitted: usize,
-    frame: Option<Frame>,
+    /// The frame being received: its leader's fields, and its image so far.
+    frame: Option<(Frame, PoolVec)>,
     /// Frames, or why one was lost, taken in ahead of `next`.
     taken: VecDeque<Result<Frame>>,
     /// Linux refused a submit for lack of usbfs memory: hold buffers back
@@ -663,28 +665,27 @@ impl Stream {
         let rest = self
             .frame
             .as_ref()
-            .is_some_and(|frame| frame.data.len() + bytes.len() == self.expected);
+            .is_some_and(|(_, data)| data.len() + bytes.len() == self.expected);
         if !rest && is_header(bytes, LEADER_MAGIC, 52, self.leader) {
             let open = self.frame.take().is_some();
-            let mut frame = parse_leader(bytes)?;
-            frame.data.reserve(self.expected);
-            self.frame = Some(frame);
+            let frame = parse_leader(bytes)?;
+            self.frame = Some((frame, pool().take_empty(self.expected)));
             ensure!(!open, "USB stream image ended without a trailer");
             return Ok(None);
         }
         // Without an open image, the data belongs to one already dropped or
         // was left over from before acquisition started.
-        let Some(frame) = self.frame.as_mut() else {
+        let Some((_, data)) = self.frame.as_mut() else {
             return Ok(None);
         };
         let trailer = if !rest && is_header(bytes, TRAILER_MAGIC, 28, self.trailer) {
             bytes
         } else {
-            let image = (self.expected - frame.data.len()).min(bytes.len());
+            let image = (self.expected - data.len()).min(bytes.len());
             crate::copies::record(crate::copies::Site::UsbAssemble, image);
-            frame.data.extend_from_slice(&bytes[..image]);
+            data.extend_from_slice(&bytes[..image]);
             if image == bytes.len() {
-                if full || frame.data.len() == self.expected {
+                if full || data.len() == self.expected {
                     return Ok(None);
                 }
                 self.frame = None;
@@ -694,7 +695,8 @@ impl Stream {
             // the trailer followed in it.
             &bytes[image..]
         };
-        let frame = self.frame.take().context("USB stream frame missing")?;
+        let (mut frame, data) = self.frame.take().context("USB stream frame missing")?;
+        frame.data = data.freeze();
         validate_trailer(trailer, &frame, self.expected)?;
         Ok(Some(frame))
     }
@@ -1164,7 +1166,7 @@ fn parse_leader(bytes: &[u8]) -> Result<Frame> {
         pixel_format: le32(bytes, 28)?,
         device_ts_ns: Some(le64(bytes, 20)?),
         wall_ms: 0,
-        data: Vec::new(),
+        data: Vec::new().into(),
     })
 }
 fn validate_trailer(bytes: &[u8], frame: &Frame, expected: usize) -> Result<()> {
@@ -1674,7 +1676,7 @@ mod tests {
         leader[32..36].copy_from_slice(&4u32.to_le_bytes());
         leader[36..40].copy_from_slice(&2u32.to_le_bytes());
         let mut frame = parse_leader(&leader).unwrap();
-        frame.data = vec![0; 8];
+        frame.data = vec![0; 8].into();
         let mut trailer = vec![0; 28];
         trailer[..4].copy_from_slice(&TRAILER_MAGIC.to_le_bytes());
         trailer[6..8].copy_from_slice(&28u16.to_le_bytes());
@@ -1822,7 +1824,7 @@ mod tests {
             for id in 1..=3 {
                 bus.frame(id, &image(id, expected), block);
                 let frame = next(&mut stream, &mut bus).unwrap();
-                assert_eq!((frame.id, frame.data), (id, image(id, expected)));
+                assert_eq!((frame.id, frame.data.to_vec()), (id, image(id, expected)));
             }
         }
         // Some cameras end the last payload transfer with a zero-length
@@ -1858,7 +1860,7 @@ mod tests {
         }
         bus.send(&trailer(3, expected));
         let third = next(&mut stream, &mut bus).unwrap();
-        assert_eq!((third.id, third.data), (3, image(3, expected)));
+        assert_eq!((third.id, third.data.to_vec()), (3, image(3, expected)));
         assert_eq!(stream.take_in(&mut bus), 0);
     }
     #[test]
@@ -1872,7 +1874,7 @@ mod tests {
                 pixels[expected - 64..][..header.len()].copy_from_slice(&header);
                 bus.frame(id, &pixels, block);
                 let frame = next(&mut stream, &mut bus).unwrap();
-                assert_eq!((frame.id, frame.data), (id, pixels));
+                assert_eq!((frame.id, frame.data.to_vec()), (id, pixels));
             }
         }
     }
@@ -1892,7 +1894,7 @@ mod tests {
             bus.frame(id, &image(id, expected), block);
             assert!(next(stream, bus).is_err());
             let frame = next(stream, bus).unwrap();
-            assert_eq!((frame.id, frame.data), (id, image(id, expected)));
+            assert_eq!((frame.id, frame.data.to_vec()), (id, image(id, expected)));
         };
         // A truncated frame whose trailer arrives early.
         bus.send(&leader(2, expected as u32, 1));
@@ -1932,7 +1934,7 @@ mod tests {
             bus.refuse = 1;
             bus.frame(id, &image(id, 10 * MPS), block);
             let frame = next(&mut stream, &mut bus).unwrap();
-            assert_eq!((frame.id, frame.data), (id, image(id, 10 * MPS)));
+            assert_eq!((frame.id, frame.data.to_vec()), (id, image(id, 10 * MPS)));
         }
         // The transfers already submitted still complete a frame.
         bus.refuse = usize::MAX;

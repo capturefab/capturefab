@@ -220,8 +220,14 @@ mod audit {
                 )
             })
             .collect();
+        let pool = crate::framebuf::pool().stats();
         json!({
             "frames": FRAMES.load(Ordering::Relaxed),
+            "pool": {
+                "allocations": pool.allocations,
+                "reuses": pool.reuses,
+                "freed": pool.freed,
+            },
             "sites": sites,
             "large_allocs": super::large_allocations(),
         })

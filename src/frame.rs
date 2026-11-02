@@ -197,7 +197,7 @@ pub fn unpacked(frame: &Frame) -> Result<Cow<'_, Frame>> {
     crate::copies::record(crate::copies::Site::Intermediate, data.len());
     Ok(Cow::Owned(Frame {
         pixel_format,
-        data,
+        data: data.into(),
         ..*frame
     }))
 }
@@ -407,7 +407,7 @@ fn eight_bit(frame: &Frame) -> Result<Cow<'_, Frame>> {
     crate::copies::record(crate::copies::Site::Intermediate, data.len());
     Ok(Cow::Owned(Frame {
         pixel_format,
-        data,
+        data: data.into(),
         ..*frame
     }))
 }
@@ -511,7 +511,8 @@ pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
     if matches!(frame.pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6) {
         ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
         return Ok(Some(match frame {
-            Cow::Owned(Frame { mut data, .. }) => {
+            Cow::Owned(Frame { data, .. }) => {
+                let mut data = data.into_pool_vec().into_vec();
                 data.truncate(pixels);
                 data
             }
@@ -1251,7 +1252,7 @@ pub fn encode_with_meta(
     }
     if format == "raw" {
         crate::copies::record(crate::copies::Site::StillCopy, frame.data.len());
-        return Ok(frame.data.clone());
+        return Ok(frame.data.to_vec());
     }
     if format == "jpeg" {
         let bytes = crate::jpeg::encode(frame)?;
@@ -1361,7 +1362,7 @@ mod tests {
             pixel_format: fmt,
             device_ts_ns: None,
             wall_ms: 0,
-            data,
+            data: data.into(),
         }
     }
     #[test]
@@ -1472,7 +1473,7 @@ mod tests {
                     reference_bayer(&frame),
                     "{width}x{height} {pixel_format:x}"
                 );
-                frame.data = vec![255; width * height];
+                frame.data = vec![255; width * height].into();
                 assert_eq!(rgb(&frame).unwrap(), reference_bayer(&frame));
             }
         }
@@ -1516,7 +1517,7 @@ mod tests {
             };
             let demosaiced = Frame {
                 pixel_format: RGB8,
-                data: rgb(&mosaic).unwrap(),
+                data: rgb(&mosaic).unwrap().into(),
                 ..mosaic.clone()
             };
             let (quads, bilinear) = (exposure(&mosaic).unwrap(), exposure(&demosaiced).unwrap());
@@ -1560,7 +1561,7 @@ mod tests {
                     let region = [100, 100, 400, 300];
                     let reference = Frame {
                         pixel_format: RGB8,
-                        data: rgb(&soft).unwrap(),
+                        data: rgb(&soft).unwrap().into(),
                         ..soft.clone()
                     };
                     (
@@ -1678,7 +1679,7 @@ mod tests {
                 let expected = (!is_bayer(format)).then_some(gray);
                 assert_eq!(gray8(&frame).unwrap(), expected, "{format:x}");
                 let mut short = frame;
-                short.data.pop();
+                short.data.make_mut().pop();
                 assert!(rgb(&short).is_err(), "{format:x}");
                 assert!(is_bayer(format) || gray8(&short).is_err(), "{format:x}");
             }
@@ -2113,7 +2114,7 @@ mod tests {
                 convert_into(&source, &mut direct, |p| p).unwrap();
                 assert_eq!(direct.into_flattened(), rgb(&reference).unwrap());
                 let mut short = source;
-                short.data.pop();
+                short.data.make_mut().pop();
                 assert!(exposure(&short).is_err());
                 assert!(rgba(&short).is_err());
                 assert!(clipping(&short).is_err());
@@ -2345,9 +2346,9 @@ mod tests {
             assert!(exposure(&frame).unwrap().channels.is_some());
             let mut rows = frame.clone();
             (rows.width, rows.height) = (2, 2);
-            rows.data.truncate(8);
+            rows.data.make_mut().truncate(8);
             assert_eq!(rgb(&rows).unwrap(), expected[..12], "{name}");
-            rows.data.pop();
+            rows.data.make_mut().pop();
             assert!(rgb(&rows).is_err());
         }
     }

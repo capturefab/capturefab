@@ -2124,7 +2124,7 @@ mod tests {
             pixel_format,
             device_ts_ns: None,
             wall_ms: 0,
-            data,
+            data: data.into(),
         }
     }
     fn near(a: f64, b: f64) -> bool {
@@ -2244,7 +2244,7 @@ mod tests {
             );
             assert_eq!(meter(&source), meter(&whole), "{packed:08x}");
             assert!(meter(&source).is_some());
-            source.data.pop();
+            source.data.make_mut().pop();
             assert!(meter(&source).is_none(), "{packed:08x}");
         }
         for (width, height) in [(0, 4), (4, 0), (u32::MAX, u32::MAX)] {

@@ -3,6 +3,7 @@
 //! Wire constants and layouts follow the GigE Vision bootstrap/GVCP/GVSP
 //! protocols (also documented in Aravis' protocol headers). This implementation
 //! does not link to, embed, or translate Aravis code.
+use crate::framebuf::{PoolVec, pool};
 use crate::types::{
     Backend, CameraInfo, Categorized, Frame, RegisterIo, Transport, TransportStats,
 };
@@ -1810,7 +1811,10 @@ struct PartialFrame {
     leader: Option<ImageLeader>,
     trailer: Option<(u32, u32)>,
     packets: Option<usize>,
-    data: Vec<u8>,
+    /// The frame's buffer, taken from the pool when its leader or first
+    /// payload packet arrives. Only the bytes of the packets received are
+    /// written, and a frame is delivered only once it has them all.
+    data: Option<PoolVec>,
     received: Vec<u64>,
     requested: Vec<u64>,
     count: usize,
@@ -2093,6 +2097,9 @@ impl Assembler {
                         frame.packets.get_or_insert(packets);
                     }
                     frame.leader = Some(leader);
+                    frame
+                        .data
+                        .get_or_insert_with(|| pool().take_stale(self.payload_limit));
                     set_bit(&mut frame.received, 0);
                 }
             }
@@ -2149,9 +2156,10 @@ impl Assembler {
                     // both copies hold must match.
                     let held = (frame.end - offset).min(block_size);
                     let common = held.min(kept.len());
+                    let data = frame.data.as_ref().context("GVSP frame buffer missing")?;
                     ensure!(
                         (length == held || frame.end <= offset + block_size)
-                            && frame.data[offset..offset + common] == kept[..common],
+                            && data[offset..offset + common] == kept[..common],
                         "conflicting duplicate GVSP payload packet"
                     );
                 } else {
@@ -2164,12 +2172,11 @@ impl Assembler {
                     if length < block_size {
                         frame.packets = Some(packet.id as usize);
                     }
-                    if frame.data.is_empty() {
-                        frame.data = vec![0; self.payload_limit];
-                        crate::copies::record(crate::copies::Site::ZeroFill, self.payload_limit);
-                    }
+                    let data = frame
+                        .data
+                        .get_or_insert_with(|| pool().take_stale(self.payload_limit));
                     crate::copies::record(crate::copies::Site::GvspAssemble, kept.len());
-                    frame.data[range].copy_from_slice(kept);
+                    data[range].copy_from_slice(kept);
                     set_bit(&mut frame.received, packet.id);
                     frame.count += 1;
                     frame.bytes += kept.len();
@@ -2212,7 +2219,7 @@ impl Assembler {
             leader: None,
             trailer: None,
             packets: None,
-            data: Vec::new(),
+            data: None,
             received: vec![0; (max_packets + 2).div_ceil(64)],
             requested: Vec::new(),
             count: 0,
@@ -2335,7 +2342,7 @@ impl Assembler {
         self.stats.lost_frames += self.blocks.delivered(frame.block, frame.extended);
         let leader = frame.leader.expect("complete frames have a leader");
         let height = frame.trailer.map_or(leader.height, |(_, height)| height);
-        let mut data = frame.data;
+        let mut data = frame.data.unwrap_or_else(|| pool().take_stale(0));
         let stride = leader.row_bytes + leader.x_padding;
         if leader.x_padding > 0 {
             crate::copies::record(
@@ -2407,7 +2414,7 @@ impl Assembler {
             pixel_format: leader.pixel_format,
             device_ts_ns,
             wall_ms: 0,
-            data,
+            data: data.freeze(),
         });
     }
 }
@@ -3701,7 +3708,10 @@ mod tests {
                 .filter_map(|id| assembler.push(&packets[*id]).unwrap())
                 .collect();
             assert_eq!(delivered.len(), 1, "{order:?}");
-            assert_eq!((delivered[0].height, &delivered[0].data), (300, &lines));
+            assert_eq!(
+                (delivered[0].height, &delivered[0].data.to_vec()),
+                (300, &lines)
+            );
         }
         let start = Instant::now();
         let mut assembler = Assembler::new(4_096_000, 9000, 0);
@@ -3779,7 +3789,7 @@ mod tests {
                 .iter()
                 .find_map(|packet| assembler.push_at(packet, at(resumed)).unwrap())
                 .unwrap();
-            assert_eq!((frame.height, frame.data), (lines, pixels));
+            assert_eq!((frame.height, frame.data.to_vec()), (lines, pixels));
             assert_eq!(assembler.stats.incomplete_frames, 0);
         }
         // A pause longer than FRAME_IDLE still loses the frame.
@@ -3906,7 +3916,7 @@ mod tests {
                 .into_iter()
                 .find_map(|packet| assembler.push(packet).unwrap())
                 .unwrap();
-            assert_eq!((frame.height, frame.data), (2, pixels.clone()));
+            assert_eq!((frame.height, frame.data.to_vec()), (2, pixels.clone()));
         }
         let start = Instant::now();
         let mut assembler = Assembler::new(32, 44, 0);
@@ -4272,7 +4282,10 @@ mod tests {
             let block = if extended { 0x1_0000_0001 } else { 1 };
             fake.send(block, extended, &[3, 7]);
             let frame = gige.next_frame(Duration::from_secs(2)).unwrap();
-            assert_eq!((frame.id, frame.data), (block, image(WIDTH, HEIGHT)));
+            assert_eq!(
+                (frame.id, frame.data.to_vec()),
+                (block, image(WIDTH, HEIGHT))
+            );
             assert!(gige.next_frame(Duration::from_millis(50)).is_err());
             let port = gige
                 .stream

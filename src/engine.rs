@@ -3724,15 +3724,13 @@ fn worker(h: WorkerHandle) {
                     if !saves.is_empty() {
                         scheduled_stream.armed_until = None;
                     }
-                    // The saver takes the frame itself when nothing else
-                    // needs it, and a copy otherwise. Inspections share the
-                    // frame; the forwarder then takes the sensor buffer,
-                    // copied only if an inspection still holds it.
+                    // The saver, the inspections and the forwarder share
+                    // the camera's buffer: a frame's clone is a reference,
+                    // and nothing writes to it.
                     let forward = forwarder.is_some();
                     let (shot, frame) = if saves.is_empty() {
                         (None, Some(frame))
                     } else if forward || !waiting.is_empty() {
-                        crate::copies::record(crate::copies::Site::FrameClone, frame.data.len());
                         (Some(frame.clone()), Some(frame))
                     } else {
                         (Some(frame), None)
@@ -4877,7 +4875,7 @@ mod tests {
             pixel_format: crate::types::MONO8,
             device_ts_ns: Some(id),
             wall_ms: 0,
-            data: vec![id as u8; 64],
+            data: vec![id as u8; 64].into(),
         }
     }
     /// Offer `frame` to the jobs due, as the camera thread does.
@@ -5673,7 +5671,7 @@ mod tests {
             pixel_format: crate::types::MONO8,
             device_ts_ns: Some(9),
             wall_ms: 0,
-            data: vec![0, 0],
+            data: vec![0, 0].into(),
         };
         let context = crate::context::Context::from([("part".into(), "B-7".into())]);
         let meta = still_meta(&frame, 11, &acquired, &context);

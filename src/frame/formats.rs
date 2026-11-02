@@ -410,7 +410,7 @@ pub(super) fn unpacked(frame: &Frame) -> Result<Option<Frame>> {
         }
     }
     Ok(Some(Frame {
-        data,
+        data: data.into(),
         pixel_format: if mono { MONO8 } else { RGB8 },
         ..*frame
     }))
@@ -425,13 +425,13 @@ mod tests {
             width,
             height,
             pixel_format: format,
-            data,
+            data: data.into(),
             ..Frame::default()
         }
     }
 
     fn decoded(frame: &Frame) -> Vec<u8> {
-        unpacked(frame).unwrap().unwrap().data
+        unpacked(frame).unwrap().unwrap().data.to_vec()
     }
 
     #[test]
@@ -493,7 +493,7 @@ mod tests {
             let mut source = frame(format, 2, 2, data);
             assert_eq!(decoded(&source), expected, "{}", name(format).unwrap());
             assert_eq!(pixel_at(&source, 1, 1).unwrap(), [5, 10, 15]);
-            source.data.pop();
+            source.data.make_mut().pop();
             assert!(unpacked(&source).is_err());
         }
     }
@@ -649,7 +649,7 @@ mod tests {
             let length = super::super::row_bytes(4, format) * 2;
             let mut source = frame(format, 4, 2, vec![128; length]);
             assert!(unpacked(&source).is_ok());
-            source.data.pop();
+            source.data.make_mut().pop();
             assert!(unpacked(&source).is_err(), "{format:#x}");
             source.width = 0;
             assert!(unpacked(&source).is_err());

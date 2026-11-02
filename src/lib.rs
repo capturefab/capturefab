@@ -24,6 +24,7 @@ pub(crate) mod discovery;
 pub(crate) mod doctor;
 pub(crate) mod engine;
 pub(crate) mod frame;
+pub(crate) mod framebuf;
 pub(crate) mod genicam;
 pub(crate) mod hint;
 pub(crate) mod host;
@@ -106,5 +107,8 @@ pub mod testing {
     }
     pub mod types {
         pub use crate::types::{Frame, MONO8, RGB8};
+    }
+    pub mod framebuf {
+        pub use crate::framebuf::{FrameBuf, FramePool, PoolStats, PoolVec, pool};
     }
 }

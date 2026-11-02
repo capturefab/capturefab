@@ -270,7 +270,7 @@ mod tests {
                 "{format:x}"
             );
             let mut short = frame.clone();
-            short.data.pop();
+            short.data.make_mut().pop();
             assert!(encode(&short).is_err(), "{format:x}");
         }
     }

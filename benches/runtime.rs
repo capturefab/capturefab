@@ -232,7 +232,7 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
         pixel_format,
         device_ts_ns: None,
         wall_ms: 0,
-        data,
+        data: data.into(),
     }
 }
 
@@ -452,6 +452,8 @@ fn main() {
     }
     // A frame-sized buffer, as a camera's receive loop takes one per frame.
     b.run("pool/vec-zeroed/12MB", 12 << 20, || vec![0u8; 12 << 20]);
+    let pool = capturefab::testing::framebuf::pool();
+    b.run("pool/take/12MB", 12 << 20, || pool.take_stale(12 << 20));
     // The stage's scopes on a common 5 MP industrial sensor: the histogram,
     // and focus in the default quarter region and over the whole frame.
     let f = frame(2448, 2048, 0x0108_0009);
@@ -501,8 +503,8 @@ fn main() {
         ("best-adaptive", png::Compression::Best, None),
     ] {
         for (content, data, color) in [
-            ("BayerRG8-rgb", &rgb, png::ColorType::Rgb),
-            ("Mono8-gray", &mono.data, png::ColorType::Grayscale),
+            ("BayerRG8-rgb", &rgb[..], png::ColorType::Rgb),
+            ("Mono8-gray", &mono.data[..], png::ColorType::Grayscale),
         ] {
             let name = format!("png-settings/{label}/{content}");
             if b.selected(&name) {

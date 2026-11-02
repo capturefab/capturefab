@@ -297,8 +297,8 @@ impl Replay {
                 self.decoded(timeout)?
                     .context("simulation image contains no decodable frame")?,
             );
-            // A static test image needs one bounded frame allocation, rather
-            // than a fresh FFmpeg process on every camera frame.
+            // A static test image is decoded once, rather than by a fresh
+            // FFmpeg process on every camera frame.
             self.decoder = None;
             self.manifest = None;
         }
@@ -401,8 +401,8 @@ impl Backend for Replay {
             if let Some(first) = self.first.take() {
                 break first;
             }
+            // Each frame of a still shares its decoded pixels.
             if let Some(still) = &self.still {
-                crate::copies::record(crate::copies::Site::FrameClone, still.data.len());
                 break still.clone();
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
