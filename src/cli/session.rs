@@ -490,6 +490,7 @@ mod platform {
         command.args(["--ready-fd", &(handle as usize).to_string()]);
         let flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
         command.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
+        let _withheld = Withheld::standard();
         match command.spawn() {
             Err(error) if error.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
                 warnings.push(
@@ -499,6 +500,58 @@ mod platform {
                 command.spawn().context("start the session")
             }
             spawned => spawned.context("start the session"),
+        }
+    }
+
+    /// This process's standard handles, kept from the processes it starts
+    /// while this lives. Windows gives a new process every handle that can
+    /// be inherited, and those this process was started with can be: a
+    /// session holding the write end of the pipe this command's output
+    /// goes to would keep whoever reads it to its end, a script or
+    /// `| more`, waiting until the session ends. A child given one of them
+    /// as its own standard handle still gets it: std duplicates that
+    /// handle for the child.
+    struct Withheld(Vec<windows_sys::Win32::Foundation::HANDLE>);
+    impl Withheld {
+        fn standard() -> Self {
+            use windows_sys::Win32::{
+                Foundation::{
+                    GetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+                    SetHandleInformation,
+                },
+                System::Console::{
+                    GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+                },
+            };
+            let mut withheld = Vec::new();
+            for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                // SAFETY: these only read and change whether this process's
+                // own standard handles are inherited.
+                unsafe {
+                    let handle = GetStdHandle(which);
+                    let mut flags = 0;
+                    if !handle.is_null()
+                        && handle != INVALID_HANDLE_VALUE
+                        && !withheld.contains(&handle)
+                        && GetHandleInformation(handle, &mut flags) != 0
+                        && flags & HANDLE_FLAG_INHERIT != 0
+                        && SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) != 0
+                    {
+                        withheld.push(handle);
+                    }
+                }
+            }
+            Self(withheld)
+        }
+    }
+    impl Drop for Withheld {
+        fn drop(&mut self) {
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+            for &handle in &self.0 {
+                // SAFETY: the handle is one of this process's standard
+                // handles, made inheritable again as it was.
+                unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+            }
         }
     }
 }
