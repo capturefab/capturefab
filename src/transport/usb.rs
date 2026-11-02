@@ -445,6 +445,19 @@ fn usbfs_window() -> usize {
     window(None, 1)
 }
 
+/// The longest transfer that may receive a whole image. nusb turns on
+/// WinUSB's RAW_IO, under which a transfer must fit the pipe's
+/// MAXIMUM_TRANSFER_SIZE, which nusb does not report, so Windows keeps to
+/// the length every other transfer uses. macOS and Linux take a transfer
+/// of any length, Linux within its usbfs window.
+#[cfg(windows)]
+const WHOLE_TRANSFER: usize = MAX_TRANSFER;
+#[cfg(not(windows))]
+const WHOLE_TRANSFER: usize = MAX_FRAME;
+/// The share of the memory the process may still use that whole-image
+/// transfers may hold: `MIN_TRANSFERS` frames, all submitted at once.
+const WHOLE_SHARE: u64 = 8;
+
 /// How the camera splits a frame's image into payload transfers, and the
 /// transfers kept submitted to receive it.
 struct Layout {
@@ -454,6 +467,11 @@ struct Layout {
     /// Length every transfer requests.
     request: usize,
     transfers: usize,
+    /// One transfer receives a whole image, into a buffer that becomes the
+    /// frame's: where the platform takes a transfer that long, and
+    /// `MIN_TRANSFERS` of them fit the usbfs window and a share of the
+    /// memory left.
+    whole: bool,
 }
 fn layout(
     expected: usize,
@@ -461,7 +479,23 @@ fn layout(
     trailer: usize,
     alignment: usize,
     window: usize,
+    memory: Option<u64>,
 ) -> Result<Layout> {
+    let image = aligned(expected, alignment)?;
+    let request = image.max(leader).max(trailer);
+    let room = memory.map_or(usize::MAX, |memory| {
+        usize::try_from(memory / WHOLE_SHARE).unwrap_or(usize::MAX)
+    });
+    if request <= WHOLE_TRANSFER && request.saturating_mul(MIN_TRANSFERS) <= window.min(room) {
+        return Ok(Layout {
+            block: image,
+            count: expected / image,
+            tail: if expected == image { 0 } else { image },
+            request,
+            transfers: MIN_TRANSFERS,
+            whole: true,
+        });
+    }
     let block = aligned(
         expected
             .min(MAX_TRANSFER)
@@ -484,6 +518,7 @@ fn layout(
         tail,
         request,
         transfers: (window / request).clamp(MIN_TRANSFERS, 2 * per_frame),
+        whole: false,
     })
 }
 
@@ -520,18 +555,28 @@ fn is_header(bytes: &[u8], magic: u32, min: usize, max: usize) -> bool {
 /// packet, so a leader always starts a transfer. Frames are assembled from
 /// what each transfer holds rather than from its place in the queue, and
 /// the stream recovers at the next leader after any lost or extra data.
+///
+/// Where one transfer can take a whole image (`Layout::whole`), the
+/// transfers' buffers come from the frame pool, and the buffer that
+/// receives an image becomes the frame's, replaced by another from the
+/// pool: the image is never copied. Anything else is assembled by copying,
+/// as with smaller transfers.
 struct Stream {
     /// Image bytes in each frame.
     expected: usize,
     /// Longest leader and trailer the camera sends.
     leader: usize,
     trailer: usize,
+    /// The transfer length, when transfers receive whole images into
+    /// buffers from the pool.
+    whole: Option<usize>,
     /// Buffers not submitted.
     idle: Vec<Buffer>,
     /// Transfers submitted and not yet returned.
     submitted: usize,
-    /// The frame being received: its leader's fields, and its image so far.
-    frame: Option<(Frame, PoolVec)>,
+    /// The frame being received: its leader's fields, and its image so
+    /// far, in a buffer taken once image bytes must be assembled.
+    frame: Option<(Frame, Option<PoolVec>)>,
     /// Frames, or why one was lost, taken in ahead of `next`.
     taken: VecDeque<Result<Frame>>,
     /// Linux refused a submit for lack of usbfs memory: hold buffers back
@@ -560,11 +605,12 @@ impl Transfers for Endpoint<Bulk, In> {
     }
 }
 impl Stream {
-    fn new(expected: usize, leader: usize, trailer: usize) -> Self {
+    fn new(expected: usize, leader: usize, trailer: usize, whole: Option<usize>) -> Self {
         Self {
             expected,
             leader,
             trailer,
+            whole,
             idle: Vec::new(),
             submitted: 0,
             frame: None,
@@ -573,10 +619,16 @@ impl Stream {
         }
     }
     /// Allocate and submit `count` transfers of `len` bytes. Allocating maps
-    /// memory, so this happens only when acquisition starts.
+    /// memory, so this happens only when acquisition starts; whole-image
+    /// transfers take their buffers from the pool.
     fn queue(&mut self, transfers: &mut impl Transfers, count: usize, len: usize) {
-        self.idle
-            .extend((0..count).map(|_| transfers.allocate(len)));
+        for _ in 0..count {
+            let buffer = match self.whole {
+                Some(len) => whole_buffer(len),
+                None => transfers.allocate(len),
+            };
+            self.idle.push(buffer);
+        }
         self.fill(transfers);
     }
     fn fill(&mut self, transfers: &mut impl Transfers) {
@@ -648,28 +700,31 @@ impl Stream {
         } else {
             self.starved = false;
             let full = buffer.len() == buffer.requested_len();
-            self.take(&buffer, full)
+            self.take(&mut buffer, full)
         };
         buffer.clear();
         self.idle.push(buffer);
         received
     }
-    /// Returns the frame a trailer completes.
-    fn take(&mut self, bytes: &[u8], full: bool) -> Result<Option<Frame>> {
+    /// Returns the frame a trailer completes. A whole image in a transfer
+    /// of the pool becomes the frame's buffer, `transfer` replaced.
+    fn take(&mut self, transfer: &mut Buffer, full: bool) -> Result<Option<Frame>> {
+        let bytes = &transfer[..];
         // Some cameras end the last payload transfer with a zero-length packet.
         if bytes.is_empty() {
             return Ok(None);
         }
+        let held = |data: &Option<PoolVec>| data.as_ref().map_or(0, |data| data.len());
         // A transfer holding exactly the rest of an open image is image data,
         // even when its pixels start like a leader or trailer.
         let rest = self
             .frame
             .as_ref()
-            .is_some_and(|(_, data)| data.len() + bytes.len() == self.expected);
+            .is_some_and(|(_, data)| held(data) + bytes.len() == self.expected);
         if !rest && is_header(bytes, LEADER_MAGIC, 52, self.leader) {
             let open = self.frame.take().is_some();
             let frame = parse_leader(bytes)?;
-            self.frame = Some((frame, pool().take_empty(self.expected)));
+            self.frame = Some((frame, None));
             ensure!(!open, "USB stream image ended without a trailer");
             return Ok(None);
         }
@@ -679,25 +734,41 @@ impl Stream {
             return Ok(None);
         };
         let trailer = if !rest && is_header(bytes, TRAILER_MAGIC, 28, self.trailer) {
-            bytes
+            bytes.to_vec()
         } else {
-            let image = (self.expected - data.len()).min(bytes.len());
-            crate::copies::record(crate::copies::Site::UsbAssemble, image);
-            data.extend_from_slice(&bytes[..image]);
-            if image == bytes.len() {
-                if full || data.len() == self.expected {
-                    return Ok(None);
+            let image = (self.expected - held(data)).min(bytes.len());
+            match self.whole {
+                // The whole image, in a transfer whose buffer is the pool's:
+                // the frame takes the buffer.
+                Some(len) if image == self.expected => {
+                    let mut received = std::mem::replace(transfer, whole_buffer(len)).into_vec();
+                    let trailer = received.split_off(image);
+                    *data = Some(pool().adopt(received));
+                    if trailer.is_empty() {
+                        return Ok(None);
+                    }
+                    trailer
                 }
-                self.frame = None;
-                bail!("short USB image payload transfer");
+                _ => {
+                    crate::copies::record(crate::copies::Site::UsbAssemble, image);
+                    data.get_or_insert_with(|| pool().take_empty(self.expected))
+                        .extend_from_slice(&bytes[..image]);
+                    if image == bytes.len() {
+                        if full || held(data) == self.expected {
+                            return Ok(None);
+                        }
+                        self.frame = None;
+                        bail!("short USB image payload transfer");
+                    }
+                    // The image ended on a packet boundary within the
+                    // transfer, so the trailer followed in it.
+                    bytes[image..].to_vec()
+                }
             }
-            // The image ended on a packet boundary within the transfer, so
-            // the trailer followed in it.
-            &bytes[image..]
         };
         let (mut frame, data) = self.frame.take().context("USB stream frame missing")?;
-        frame.data = data.freeze();
-        validate_trailer(trailer, &frame, self.expected)?;
+        frame.data = data.map(PoolVec::freeze).unwrap_or_default();
+        validate_trailer(&trailer, &frame, self.expected)?;
         Ok(Some(frame))
     }
     /// Cancel every submitted transfer and take its buffer back.
@@ -716,6 +787,14 @@ impl Stream {
         self.starved = false;
         Ok(())
     }
+}
+/// A transfer of `len` bytes whose buffer is the frame pool's, so a frame
+/// can take it.
+fn whole_buffer(len: usize) -> Buffer {
+    let mut buffer = Buffer::from(pool().take_stale(len).into_vec());
+    // An IN transfer requests `len` bytes and starts empty.
+    buffer.clear();
+    buffer
 }
 fn aligned(size: usize, alignment: usize) -> Result<usize> {
     ensure!(
@@ -1065,7 +1144,14 @@ impl UsbBackend {
             leader <= MAX_TRANSFER && trailer <= MAX_TRANSFER,
             "USB stream header transfer is too large"
         );
-        let layout = layout(expected, leader, trailer, alignment, usbfs_window())?;
+        let layout = layout(
+            expected,
+            leader,
+            trailer,
+            alignment,
+            usbfs_window(),
+            crate::host::memory_budget(),
+        )?;
         self.put32(0x18, leader)?;
         self.put32(0x2c, trailer)?;
         self.put32(0x1c, layout.block)?;
@@ -1074,7 +1160,8 @@ impl UsbBackend {
         self.put32(0x28, 0)?;
         self.reset_stream_endpoint()?;
         // Submit the transfers before AcquisitionStart.
-        let mut stream = Stream::new(expected, leader, trailer);
+        let whole = layout.whole.then_some(layout.request);
+        let mut stream = Stream::new(expected, leader, trailer, whole);
         stream.queue(&mut self.stream_in, layout.transfers, layout.request);
         self.stream = Some(stream);
         self.put32(SIRM_CONTROL, 1)
@@ -1696,6 +1783,8 @@ mod tests {
     #[derive(Default)]
     struct Bus {
         allocated: usize,
+        /// Where each buffer submitted starts.
+        buffers: std::collections::HashSet<usize>,
         submitted: VecDeque<(Buffer, Option<TransferError>)>,
         packets: VecDeque<Vec<u8>>,
         /// Submits to refuse, as Linux does when usbfs memory runs out.
@@ -1733,6 +1822,8 @@ mod tests {
         }
         fn submit(&mut self, buffer: Buffer) {
             assert!(buffer.requested_len().is_multiple_of(MPS));
+            assert!(buffer.is_empty());
+            self.buffers.insert(buffer.as_ptr() as usize);
             let refused = self.refuse > 0;
             self.refuse = self.refuse.saturating_sub(1);
             let status = refused.then_some(TransferError::Unknown(ENOMEM));
@@ -1801,7 +1892,7 @@ mod tests {
     /// A stream set up as `start` sets one up for `expected` bytes, through
     /// four transfers of `block` bytes: fewer than one frame needs.
     fn streaming(expected: usize, block: usize) -> (Stream, Bus) {
-        let mut stream = Stream::new(expected, MPS, MPS);
+        let mut stream = Stream::new(expected, MPS, MPS, None);
         let mut bus = Bus::default();
         stream.queue(&mut bus, 4, block);
         (stream, bus)
@@ -1924,7 +2015,7 @@ mod tests {
     #[test]
     fn refused_submits_hold_buffers_back_without_losing_data() {
         let block = 4 * MPS;
-        let mut stream = Stream::new(10 * MPS, MPS, MPS);
+        let mut stream = Stream::new(10 * MPS, MPS, MPS, None);
         let mut bus = Bus {
             refuse: 2,
             ..Bus::default()
@@ -1977,33 +2068,271 @@ mod tests {
         assert_eq!(window(Some(256), 1), 128 * MIB);
         assert_eq!(window(Some(0), 1), usize::MAX);
         assert_eq!(window(None, 4), usize::MAX);
-        let submitted = |layout: Layout| layout.request * layout.transfers;
-        // 4000x3000 Mono8 and 5472x3648 Mono8 at Linux's default limit.
+        let submitted = |layout: &Layout| layout.request * layout.transfers;
+        let at =
+            |expected, window, memory| layout(expected, MPS, MPS, MPS, window, memory).unwrap();
+        // 4000x3000 Mono8 and 5472x3648 Mono8 at Linux's default limit:
+        // transfers recycled within the window, the image assembled.
         for expected in [12_000_000, 19_961_856] {
-            let one = layout(expected, MPS, MPS, MPS, window(Some(16), 1)).unwrap();
-            assert_eq!((one.block, one.transfers), (MIB, 8));
-            let two = layout(expected, MPS, MPS, MPS, window(Some(16), 2)).unwrap();
-            assert_eq!(submitted(two), 4 * MIB);
-            let many = layout(expected, MPS, MPS, MPS, window(Some(16), 8)).unwrap();
-            assert_eq!((many.block, submitted(many)), (MIB / 4, MIB));
+            let one = at(expected, window(Some(16), 1), None);
+            assert_eq!((one.block, one.transfers, one.whole), (MIB, 8, false));
+            let two = at(expected, window(Some(16), 2), None);
+            assert_eq!(submitted(&two), 4 * MIB);
+            let many = at(expected, window(Some(16), 8), None);
+            assert_eq!((many.block, submitted(&many)), (MIB / 4, MIB));
         }
-        // Small frames keep two frames of transfers submitted.
-        let vga = layout(640 * 480, MPS, MPS, MPS, window(Some(16), 1)).unwrap();
-        assert_eq!(
-            (vga.block, vga.count, vga.tail, vga.transfers),
-            (307_200, 1, 0, 6)
-        );
-        let tail = layout(2_304_000, MPS, MPS, MPS, window(Some(16), 1)).unwrap();
-        assert_eq!((tail.count, tail.tail), (2, 206_848));
-        // Without a usbfs limit, or with a raised one, large frames keep two
-        // frames of transfers submitted too.
-        for limit in [None, Some(0), Some(256)] {
-            let unlimited = layout(12_000_000, MPS, MPS, MPS, window(limit, 1)).unwrap();
+        // Frames of which four fit the window, and the memory, arrive whole
+        // where the platform takes transfers that long: VGA everywhere but
+        // Windows, which keeps to 1 MiB transfers.
+        let whole = !cfg!(windows);
+        let vga = at(640 * 480, window(Some(16), 1), Some(1 << 30));
+        assert_eq!(vga.whole, whole);
+        if whole {
             assert_eq!(
-                (unlimited.block, unlimited.count, unlimited.transfers),
-                (MIB, 11, 28)
+                (vga.block, vga.count, vga.tail, vga.request, vga.transfers),
+                (307_200, 1, 0, 307_200, MIN_TRANSFERS)
+            );
+        } else {
+            assert_eq!((vga.block, vga.count, vga.transfers), (307_200, 1, 6));
+        }
+        // An image that is no whole number of packets: one final transfer.
+        let odd = at(1000 * MPS + 100, usize::MAX, None);
+        if whole {
+            assert_eq!(
+                (odd.count, odd.tail, odd.request),
+                (0, 1001 * MPS, 1001 * MPS)
             );
         }
+        // Not where four would leave too little memory.
+        assert!(!at(640 * 480, window(Some(16), 1), Some(8 * 307_200)).whole);
+        let tail = at(2_304_000, window(Some(16), 1), None);
+        assert_eq!((tail.count, tail.tail, tail.whole), (2, 206_848, false));
+        // Without a usbfs limit, or with a raised one, large frames arrive
+        // whole too, four transfers at a time; Windows keeps two frames of
+        // 1 MiB transfers submitted.
+        for limit in [None, Some(0), Some(256)] {
+            let unlimited = at(12_000_000, window(limit, 1), Some(4 << 30));
+            if whole {
+                assert_eq!(
+                    (unlimited.block, unlimited.count, unlimited.transfers),
+                    (12_000_256, 0, MIN_TRANSFERS)
+                );
+            } else {
+                assert_eq!(
+                    (unlimited.block, unlimited.count, unlimited.transfers),
+                    (MIB, 11, 28)
+                );
+            }
+        }
+    }
+    /// A stream whose transfers each request `request` bytes, with whole
+    /// images taken by their frames when `whole`, else copied.
+    fn requesting(expected: usize, request: usize, whole: bool) -> (Stream, Bus) {
+        let mut stream = Stream::new(expected, MPS, MPS, whole.then_some(request));
+        let mut bus = Bus::default();
+        stream.queue(&mut bus, 4, request);
+        (stream, bus)
+    }
+    /// A frame's ID and image, or the error instead, and whether its image
+    /// was a transfer's own buffer.
+    type Received = (std::result::Result<(u64, Vec<u8>), String>, bool);
+    /// What the stream made of a camera's transfers.
+    fn received(stream: &mut Stream, bus: &mut Bus, calls: usize) -> Vec<Received> {
+        (0..calls)
+            .map(|_| {
+                let frame = stream.next(bus, Instant::now() + Duration::from_millis(20));
+                let own = frame
+                    .as_ref()
+                    .is_ok_and(|frame| bus.buffers.contains(&(frame.data.as_ptr() as usize)));
+                let frame = frame
+                    .map(|frame| (frame.id, frame.data.to_vec()))
+                    .map_err(|error| format!("{error:#}"));
+                (frame, own)
+            })
+            .collect()
+    }
+    /// Images that fill a transfer whole become their frames' buffers; the
+    /// frames and errors are those of copying them, whatever the camera
+    /// sends.
+    #[test]
+    fn whole_images_are_taken_by_their_frames_as_copies_would_be() {
+        type Script = fn(&mut Bus, usize, usize);
+        let scripts: [(&str, Script, usize); 9] = [
+            (
+                "frames",
+                |bus, expected, request| {
+                    for id in 1..=3 {
+                        bus.frame(id, &image(id, expected), request);
+                    }
+                },
+                4,
+            ),
+            (
+                "zero-length packet",
+                |bus, expected, _| {
+                    for id in 1..=2 {
+                        bus.send(&leader(id, expected as u32, 1));
+                        bus.send(&image(id, expected));
+                        bus.send(&[]);
+                        bus.send(&trailer(id, expected));
+                    }
+                },
+                3,
+            ),
+            (
+                "image like a header",
+                |bus, expected, request| {
+                    for (id, header) in [(1, leader(9, 4, 2)), (2, trailer(9, 8))] {
+                        let mut pixels = image(id, expected);
+                        let at = expected.saturating_sub(64);
+                        let n = header.len().min(expected - at);
+                        pixels[at..at + n].copy_from_slice(&header[..n]);
+                        bus.frame(id, &pixels, request);
+                    }
+                },
+                3,
+            ),
+            (
+                "short image",
+                |bus, expected, request| {
+                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&image(1, expected / 2 + 3));
+                    bus.send(&trailer(1, expected / 2 + 3));
+                    bus.frame(2, &image(2, expected), request);
+                },
+                3,
+            ),
+            (
+                "no trailer",
+                |bus, expected, request| {
+                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&image(1, expected));
+                    bus.frame(2, &image(2, expected), request);
+                },
+                3,
+            ),
+            (
+                "wrong size in the trailer",
+                |bus, expected, request| {
+                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&image(1, expected));
+                    bus.send(&trailer(1, expected + 1));
+                    bus.frame(2, &image(2, expected), request);
+                },
+                3,
+            ),
+            (
+                "left over from before",
+                |bus, expected, request| {
+                    bus.send(&image(9, expected / 3));
+                    bus.send(&trailer(0, expected));
+                    bus.frame(1, &image(1, expected), request);
+                },
+                2,
+            ),
+            (
+                "transfer error",
+                |bus, expected, request| {
+                    bus.send(&leader(1, expected as u32, 1));
+                    bus.fault = true;
+                    bus.send(&image(1, expected));
+                    bus.send(&trailer(1, expected));
+                    bus.frame(2, &image(2, expected), request);
+                },
+                3,
+            ),
+            (
+                "two images in a row",
+                |bus, expected, request| {
+                    bus.send(&leader(1, expected as u32, 1));
+                    bus.send(&image(1, expected));
+                    bus.send(&image(1, expected));
+                    bus.send(&trailer(1, expected));
+                    bus.frame(2, &image(2, expected), request);
+                },
+                3,
+            ),
+        ];
+        // An image of whole packets in a transfer of its own, one that ends
+        // in a short packet, one the trailer follows in the same transfer
+        // (the transfer is longer than the image), and one smaller than a
+        // leader.
+        let mut taken = 0;
+        for (expected, request) in [
+            (8 * MPS, 8 * MPS),
+            (8 * MPS + 300, 9 * MPS),
+            (6 * MPS, 8 * MPS),
+            (64, MPS),
+        ] {
+            for (name, script, calls) in scripts {
+                let mut runs = [true, false].map(|whole| {
+                    let (mut stream, mut bus) = requesting(expected, request, whole);
+                    script(&mut bus, expected, request);
+                    received(&mut stream, &mut bus, calls)
+                });
+                let [whole, copied] = &mut runs;
+                // Copied images are never a transfer's buffer; whole ones
+                // always are.
+                assert!(copied.iter().all(|(_, own)| !own), "{name}");
+                assert!(
+                    whole.iter().all(|(frame, own)| frame.is_ok() == *own),
+                    "{name} at {expected}/{request}: {whole:?}"
+                );
+                let frames = |run: &[Received]| {
+                    run.iter()
+                        .map(|(frame, _)| frame.clone())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    frames(whole),
+                    frames(copied),
+                    "{name} at {expected}/{request}"
+                );
+                taken += whole.iter().filter(|(_, own)| *own).count();
+            }
+        }
+        assert!(taken >= 40, "{taken}");
+    }
+    #[test]
+    fn whole_image_buffers_are_replaced_and_recycled() {
+        let (expected, request) = (8 * MPS + 300, 9 * MPS);
+        let (mut stream, mut bus) = requesting(expected, request, true);
+        let mut kept = Vec::new();
+        for id in 1..=6 {
+            bus.frame(id, &image(id, expected), request);
+            let frame = stream
+                .next(&mut bus, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!((frame.id, frame.data.to_vec()), (id, image(id, expected)));
+            assert!(bus.buffers.contains(&(frame.data.as_ptr() as usize)));
+            // Transfers keep their length; four stay submitted.
+            assert!(
+                bus.submitted
+                    .iter()
+                    .all(|(buffer, _)| buffer.requested_len() == request)
+            );
+            assert_eq!(bus.submitted.len() + stream.idle.len(), 4);
+            kept.push(frame);
+        }
+        // Frames that are dropped give their buffers back for transfers.
+        let addresses: std::collections::HashSet<_> = kept
+            .iter()
+            .map(|frame| frame.data.as_ptr() as usize)
+            .collect();
+        drop(kept);
+        bus.buffers.clear();
+        for id in 7..=12 {
+            bus.frame(id, &image(id, expected), request);
+            stream
+                .next(&mut bus, Instant::now() + Duration::from_secs(1))
+                .unwrap();
+        }
+        assert!(
+            bus.buffers
+                .iter()
+                .any(|address| addresses.contains(address))
+        );
+        assert_eq!(bus.allocated, 0, "no endpoint allocations");
     }
     #[test]
     fn stream_endpoint_reset_halts_it_first() {
