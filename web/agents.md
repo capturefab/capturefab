@@ -54,12 +54,14 @@ Put the command first and flags after it, so a harness can allow commands by pre
 Flags can make a command a camera write: `--set` on `inspect`, `capture` and `record`, and
 `--auto` on `capture` and `record`, change camera settings as `set` and `auto` do and leave them
 changed; `network --tune` writes camera network settings that last until the camera powers off.
+Two read commands become file writes with a path: `inspect --preview PATH` and `debug xml -o FILE`
+write that file (never over an existing one), so treat them as `file_write`.
 A prefix also covers subcommands: a rule for `capturefab jobs` matches `capturefab jobs stop all`,
 and one for `capturefab preset` matches `preset apply`. So allow exact prefixes
 (`capturefab jobs list`, `capturefab jobs wait`, `capturefab preset list`), and ask before any
 call with `--set`, `--auto` or `--tune` unless the task owns the camera.
 
-`inspect` writes a small JPEG preview into a private folder, `dirs.inspect` in
+`inspect` writes a small JPEG preview into a private folder, `inspect_dir` in
 `capturefab --json doctor`; allow reading files there, or pass `--preview PATH` to put it in
 the task's folder, or `--preview none` for no image. Captures go where `-o` says (the working
 directory by default).
@@ -183,12 +185,15 @@ capturefab jobs wait --json auto-1 --timeout 10m
 ```
 
 `--background` returns `{"job":{"id","state","saved","planned","next_at",…}}` once the job is
-armed, and a session (started on demand) keeps running it. `jobs wait ID` exits 0 when the job is done,
-with the job's own error code if it failed, and 4 if it is still running when `--timeout`
-ends; call it again to keep waiting. `jobs --json` lists every job; `jobs stop ID` ends one and
-keeps the files saved so far. A job's `state` is `armed`, `running` or `stopping`, then `done`,
-`failed`, `cancelled`, `interrupted`, or `lost` when its session died. `--at 14:30` or `--in 5m`
-delays the start.
+armed or has saved its first frame, and a session (started on demand) keeps running it; on a
+triggered camera that first frame waits for a trigger, up to `--timeout`. `jobs wait ID...`
+exits 0 when the jobs are done (`job`, or `jobs` for several IDs, as a capture of several cameras
+returns), with a failed job's own error code, and 4 if one is still running when `--timeout`
+ends; call it again to keep waiting. `jobs list ID...` shows jobs as they are now without
+waiting, and `--running` only those that have not ended; `jobs --json` lists every job, finished
+ones included. `jobs stop ID` ends one and keeps the files saved so far. A job's `state` is
+`armed`, `running` or `stopping`, then `done`, `failed`, `cancelled`, `interrupted`, or `lost`
+when its session died. `--at 14:30` or `--in 5m` delays the start.
 
 ### Triggered capture
 
@@ -225,9 +230,11 @@ camera's mosaic as gray samples. An H.264 or HEVC stream, file or webcam mode is
 re-encoding (`"encoder":"copy"`, `codec` the source's), from its last key frame, unless `--codec`
 names another codec or `--fps` or `--bitrate` is given (Linux and macOS; Windows encodes). Without
 `--for`, a recording started with `--background` runs until `jobs stop ID`; while it runs, its job
-shows the file it writes as `last_file` and its size so far as `bytes`. When the camera's worker
-dies, the error's `details.job` and `output` name the file it left, which plays up to its last
-complete part (`finalized: false`).
+shows the file it writes as `last_file` and its size so far as `bytes`. A recording that ends
+before its first frame, as on a camera still waiting for a trigger, recorded nothing and left no
+file: a signal then exits 130 with `interrupted`, and `jobs stop` makes it exit 1 with
+`incomplete`. When the camera's worker dies, the error's `details.job` and `output` name the file
+it left, which plays up to its last complete part (`finalized: false`).
 
 ### Keep settings for later
 
@@ -258,7 +265,7 @@ FFmpeg on its standard input. Results and errors never show credentials. `onvif 
 | `camera_not_found` | 3 | Run `list`; check the cable, network or address. `details.candidates` lists what answered. |
 | `camera_busy` | 3 | Another process or job holds it (`details.held_by`); use its session (`--session`), wait, or `jobs stop`. |
 | `feature_not_found` | 2 | Use a name from `details.did_you_mean`, or search with `features -c CAM PATTERN`. |
-| `out_of_range` | 2 | Use `details.nearest`, or a value between `details.min` and `details.max`. |
+| `out_of_range` | 2 | Send the value `hint` names, which `set` takes as written (a time is a duration such as `1s`), or `details.nearest` in `details.unit`, or a value between `details.min` and `details.max`. |
 | `invalid_choice` | 2 | Use one of `details.choices`. |
 | `not_writable`, `feature_locked` | 2, 1 | The feature is read-only, or `details.locked_by` locks it now: change that first. |
 | `invalid_duration`, `usage` | 2 | Fix the command; read `capturefab schema COMMAND`. |

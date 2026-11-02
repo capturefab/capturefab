@@ -104,7 +104,7 @@ shares the link's bandwidth between cameras.
 | Cache: the extracted FFmpeg and encoder probe results | `$XDG_CACHE_HOME/capturefab`, normally `~/.cache/capturefab` | Safe to delete |
 | Captures | Where `-o` says, relative to the directory the command ran in | Never overwritten |
 
-`capturefab --json doctor` prints these folders in `dirs`. `CAPTUREFAB_SESSION_DIR=/some/folder`
+`capturefab --json doctor` prints these folders in `folders`. `CAPTUREFAB_SESSION_DIR=/some/folder`
 puts runtime and state together in one folder; every process that should see the same sessions
 must then set the same value, including your SSH shell. `CAPTUREFAB_CACHE_DIR` moves the cache.
 

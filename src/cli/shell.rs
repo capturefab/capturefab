@@ -103,7 +103,7 @@ pub fn main(global: Global, args: ShellArgs, matches: &clap::ArgMatches) -> i32 
     let keep = args
         .keep
         .filter(|_| typed("keep"))
-        .map(super::args::duration_text);
+        .map(crate::types::duration_text);
     let script = !args.execute.is_empty();
     let interactive = !script && term::stdin_is_tty();
     let session_typed = matches.value_source("session") == Some(ValueSource::CommandLine);

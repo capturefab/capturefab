@@ -241,7 +241,7 @@ capturefab exec -c gige:00c0df123456 &#x27;UserSetSave[UserSet1]&#x27;</code></p
 <tr><td><code>--on-exists</code> ON_EXISTS</td><td>When a file name without {seq} exists: fail, or number (-0001, -0002, ...)</td><td>one of <code>fail</code>, <code>number</code>; default <code>fail</code></td></tr>
 <tr><td><code>--manifest</code> FILE</td><td>Append one JSON line per saved file (path, time, size, SHA-256, settings, tags) to this file</td><td>—</td></tr>
 <tr><td><code>--sync</code> SYNC</td><td>file: each file reaches the disk before it is reported; none: skip that, for scratch captures</td><td>one of <code>file</code>, <code>none</code>; default <code>file</code></td></tr>
-<tr><td><code>--background</code></td><td>Leave the capture running in a session and print its job at once</td><td>—</td></tr>
+<tr><td><code>--background</code></td><td>Leave the capture running in a session; print its job once it is armed or has saved its first frame (up to --timeout; with --timeout none, after 2s without waiting for a trigger)</td><td>—</td></tr>
 <tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>—</td></tr>
 <tr><td><code>--keep</code> DUR</td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)</td><td>env <code>CAPTUREFAB_KEEP</code></td></tr>
 <tr><td><code>--dry-run</code></td><td>Show the camera, files, settings and timing; capture nothing</td><td>—</td></tr>
@@ -345,7 +345,7 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <tr><td><code>--region</code> X,Y,W,H</td><td>Measure only this part of the frame: X,Y,W,H as fractions 0..1</td><td>—</td></tr>
 <tr><td><code>--preview</code> PATH</td><td>Where to write the preview (it must not exist), or none (default: a private folder doctor shows)</td><td>—</td></tr>
 <tr><td><code>--size</code> PX</td><td>The preview&#x27;s longest edge in pixels, 64..2048</td><td>default <code>768</code></td></tr>
-<tr><td><code>--fresh</code> N</td><td>Frames to let pass after the first one exposed after the last settings change, 0..9</td><td>default <code>0</code></td></tr>
+<tr><td><code>--fresh</code> N</td><td>Frames to let pass after the first one exposed after the last settings change, 0..10</td><td>default <code>0</code></td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped</td><td>—</td></tr>
 <tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 measures at once</td><td>default <code>2s</code></td></tr>
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does), then measure; repeatable</td><td>repeatable</td></tr>
@@ -657,15 +657,21 @@ capturefab serve -c gige:00c0df123456 --live</code></pre><button class="copy-but
 capturefab jobs wait auto-1 --timeout 10m
 capturefab jobs stop all</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session&#x27;s, and those of a session that died, as lost</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session&#x27;s, and those of a session that died, as lost; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs-list"><code>capturefab jobs list</code></h3>
-<p>Every running session&#x27;s jobs, finished ones included. Effect: <code>read</code>.</p>
+<p>Every running session&#x27;s jobs, finished ones included; or the jobs named, as they are now. Effect: <code>read</code>.</p>
+<div class="table-scroll"><table><caption>capturefab jobs list arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Values</th></tr></thead><tbody>
+<tr><td><code>[ID...]</code></td><td>Job IDs such as auto-1: only these, in this order; without waiting, unlike jobs wait</td><td>—</td></tr>
+<tr><td><code>--running</code></td><td>Only jobs that have not ended: armed, running or stopping</td><td>—</td></tr>
+</tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab jobs list
+capturefab jobs list --running
+capturefab --json jobs list auto-1 auto-2
 capturefab --json jobs</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs list examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs list JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session&#x27;s, and those of a session that died, as lost</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session&#x27;s, and those of a session that died, as lost; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs-stop"><code>capturefab jobs stop</code></h3>
@@ -680,16 +686,18 @@ capturefab jobs stop all</code></pre><button class="copy-button" type="button" a
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs-wait"><code>capturefab jobs wait</code></h3>
-<p>Wait for a job: exit 0 when done, its own code if it failed, 4 if still running. Effect: <code>read</code>.</p>
+<p>Wait for jobs: exit 0 when all are done, a failed one&#x27;s own code, 4 if one is still running. Effect: <code>read</code>.</p>
 <div class="table-scroll"><table><caption>capturefab jobs wait arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Values</th></tr></thead><tbody>
-<tr><td><code>ID</code></td><td>A job ID such as auto-1</td><td>—</td></tr>
-<tr><td><code>--timeout</code> DUR</td><td>How long to wait; none waits until the job ends</td><td>default <code>none</code></td></tr>
+<tr><td><code>ID...</code></td><td>Job IDs such as auto-1; several are waited for together</td><td>—</td></tr>
+<tr><td><code>--timeout</code> DUR</td><td>How long to wait; none waits until the jobs end</td><td>default <code>none</code></td></tr>
 <tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>—</td></tr>
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab jobs wait auto-1
-capturefab --json jobs wait auto-1 --timeout 10m</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs wait examples">Copy</button></div>
+capturefab --json jobs wait auto-1 --timeout 10m
+capturefab --json jobs wait auto-2 auto-3 auto-4</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs wait examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs wait JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — done; a failed job exits with its own error code and details.job</td></tr>
+<tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with one ID: done; a failed job exits with its own error code and details.job</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with several IDs, in the order given, once all have ended: all done; else the first that is not exits with its own error code, and details.jobs holds them all</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-timeout"><code>timeout</code></a>, <a href="#error-interrupted"><code>interrupted</code></a>, <a href="#error-incomplete"><code>incomplete</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-storage_full"><code>storage_full</code></a>, <a href="#error-frame_timeout"><code>frame_timeout</code></a>, <a href="#error-trigger_timeout"><code>trigger_timeout</code></a>, <a href="#error-exists"><code>exists</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>.</p></article>
 <article class="doc-section" id="cli-network" data-doc-section data-doc-title="Sign-ins and networks" data-doc-category="Command reference" data-doc-tags="login,login add,login list,login rm,network,onvif,onvif resolve"><h2>Sign-ins and networks</h2><p class="doc-summary">Save camera passwords, resolve ONVIF streams and check GigE paths.</p>
@@ -778,13 +786,13 @@ capturefab --json doctor</code></pre><button class="copy-button" type="button" a
 <div class="table-scroll"><table><caption>capturefab doctor JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>arch</code></td><td>string</td></tr>
 <tr><td><code>checks</code></td><td>[{name,status:ok|warn|fail,message,fix?}] — fix is a command or step that resolves a warning</td></tr>
-<tr><td><code>dirs</code></td><td>{runtime,state,cache,inspect} — runtime: sessions; state: presets, sign-ins; cache: FFmpeg; inspect: previews; null when there is none</td></tr>
 <tr><td><code>features</code></td><td>{usb,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell} — what this build includes</td></tr>
 <tr><td><code>ffmpeg</code></td><td>{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted</td></tr>
-<tr><td><code>folders</code></td><td>{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over</td></tr>
+<tr><td><code>folders</code></td><td>{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path null when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over</td></tr>
 <tr><td><code>host</code></td><td>{cpus,threads,cpu_quota,memory:{total_bytes,available_bytes,cgroup_limit_bytes,cgroup_used_bytes,budget_bytes}} — what cgroups leave this process</td></tr>
 <tr><td><code>hwdec</code></td><td>{selected:auto|none|METHOD,methods:{METHOD:{built,works,reason?}}} — hardware decoding CAPTUREFAB_HWDEC selects, and each method of this platform: in this FFmpeg (built) and proved to decode here (works); only with FFmpeg</td></tr>
-<tr><td><code>jpeg</code></td><td>{selected:auto|cpu|videotoolbox|nvjpeg|vaapi,backends:{libjpeg_turbo:{compiled,simd},videotoolbox|nvjpeg|vaapi:{compiled,available,verified?,reason?,version?,driver?,device?,integrated?,upload?:in-place|dma|copy}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: the engine encoded a test frame as accurately as libjpeg-turbo; nvjpeg and vaapi (Linux) run in a helper process; upload: how frames reach the GPU (read where the camera wrote them, one DMA, or written into its memory)</td></tr>
+<tr><td><code>inspect_dir</code></td><td>string or null — the private folder inspect writes previews to without --preview PATH</td></tr>
+<tr><td><code>jpeg</code></td><td>{selected:auto|cpu|videotoolbox|nvjpeg|vaapi,backends:{libjpeg_turbo:{compiled,simd},videotoolbox|nvjpeg|vaapi:{compiled,available,verified?,reason?,version?,driver?,device?,integrated?,upload?:in-place|dma|copy}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: the engine encoded a test frame as accurately as libjpeg-turbo, checked once a boot (a failure again after five minutes) and kept in the cache; nvjpeg and vaapi (Linux) run in a helper process; upload: how frames reach the GPU (read where the camera wrote them, one DMA, or written into its memory)</td></tr>
 <tr><td><code>os</code></td><td>string</td></tr>
 <tr><td><code>read_only_root</code></td><td>bool or null — the root file system is mounted read-only (Linux)</td></tr>
 <tr><td><code>version</code></td><td>string — Capturefab version</td></tr>

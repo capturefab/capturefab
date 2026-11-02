@@ -638,7 +638,7 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
     let text = text.trim();
     let invalid = |message: String| -> anyhow::Error {
         Categorized::new(ErrorKind::InvalidDuration, message)
-            .hint("durations need a unit: 250ms, 2s, 1.5s, 5m, 1h30m")
+            .hint("durations need a unit: 500us, 250ms, 2s, 1.5s, 5m, 1h30m")
             .into()
     };
     if text == "0" {
@@ -648,8 +648,11 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
         return Err(invalid("a duration cannot be empty".into()));
     }
     if !text.is_empty() && text.parse::<f64>().is_ok() {
+        // Which unit was meant depends on the flag or feature: an exposure
+        // in microseconds, a timeout in seconds. A guess would be wrong by
+        // a factor of a thousand as often as not.
         return Err(invalid(format!(
-            "'{text}' has no unit; did you mean {text}ms or {text}s?"
+            "'{text}' has no unit; add one of us, ms, s, m or h"
         )));
     }
     let mut rest = text;
@@ -688,6 +691,46 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
         return Err(invalid(format!("'{text}' is longer than ten years")));
     }
     Ok(Duration::from_nanos(nanos.round() as u64))
+}
+
+/// A duration as [`parse_duration`] reads it back, exactly: `1h30m`, `2s`,
+/// `1m30.25s`, `250ms`, `1.5ms`, `500us`, `0`. Every duration a message
+/// shows is written this way, so it can be pasted into a flag.
+pub fn duration_text(duration: Duration) -> String {
+    /// `whole` and `part` billionths, without trailing zeros.
+    fn decimal(whole: u128, part: u128) -> String {
+        if part == 0 {
+            return whole.to_string();
+        }
+        let digits = format!("{part:09}");
+        format!("{whole}.{}", digits.trim_end_matches('0'))
+    }
+    let nanos = duration.as_nanos();
+    if nanos == 0 {
+        return "0".into();
+    }
+    if nanos < 1_000_000 {
+        return format!("{}us", decimal(nanos / 1000, (nanos % 1000) * 1_000_000));
+    }
+    if nanos < 1_000_000_000 {
+        return format!(
+            "{}ms",
+            decimal(nanos / 1_000_000, (nanos % 1_000_000) * 1000)
+        );
+    }
+    let mut seconds = nanos / 1_000_000_000;
+    let mut text = String::new();
+    for (unit, size) in [("h", 3600), ("m", 60)] {
+        if seconds >= size {
+            text.push_str(&format!("{}{unit}", seconds / size));
+            seconds %= size;
+        }
+    }
+    let part = nanos % 1_000_000_000;
+    if seconds > 0 || part > 0 {
+        text.push_str(&format!("{}s", decimal(seconds, part)));
+    }
+    text
 }
 
 /// `error` as one message, `message: cause`, keeping its reason, hint and
@@ -803,8 +846,41 @@ mod tests {
             let error = parse_duration(text).unwrap_err();
             assert_eq!(classify(&error).kind, ErrorKind::InvalidDuration, "{text}");
         }
-        let bare = parse_duration("5000").unwrap_err().to_string();
-        assert!(bare.contains("did you mean 5000ms or 5000s?"), "{bare}");
+        // A bare number gets no guessed unit: for an exposure in
+        // microseconds, 5000ms or 5000s would both be wrong.
+        let bare = parse_duration("5000").unwrap_err();
+        assert!(
+            bare.to_string()
+                .contains("'5000' has no unit; add one of us, ms, s, m or h"),
+            "{bare}"
+        );
+        assert!(classify(&bare).hint.unwrap().contains("500us"));
+    }
+
+    #[test]
+    fn durations_are_written_as_flags_read_them() {
+        let ns = Duration::from_nanos;
+        for (duration, text) in [
+            (Duration::ZERO, "0"),
+            (Duration::from_micros(500), "500us"),
+            (ns(1500), "1.5us"),
+            (Duration::from_micros(1500), "1.5ms"),
+            (Duration::from_millis(250), "250ms"),
+            (Duration::from_secs(2), "2s"),
+            (Duration::from_millis(3971), "3.971s"),
+            (Duration::from_millis(90_250), "1m30.25s"),
+            (Duration::from_secs(5400), "1h30m"),
+            (Duration::from_secs(3605), "1h5s"),
+            (Duration::from_secs(86_401), "24h1s"),
+        ] {
+            assert_eq!(duration_text(duration), text, "{duration:?}");
+            assert_eq!(parse_duration(text).unwrap(), duration, "{text}");
+        }
+        // Whatever it writes reads back as it was, to the nanosecond.
+        for nanos in [1u64, 999, 1_000_001, 59_999_999_999, 3_600_000_000_001] {
+            let duration = ns(nanos);
+            assert_eq!(parse_duration(&duration_text(duration)).unwrap(), duration);
+        }
     }
 
     #[test]

@@ -1041,7 +1041,7 @@ pub(crate) fn encode(frame: &Frame, quality: Option<u8>) -> Result<Body<'static>
 
 /// `doctor`'s `jpeg` object: what `CAPTUREFAB_JPEG` selects and every
 /// encoder this build knows, checking each hardware engine this host has
-/// on a test frame.
+/// on a test frame once a boot (`checked`).
 pub(crate) fn report() -> Value {
     let selected = match choice() {
         Ok(choice) => serde_json::json!(choice.name()),
@@ -1056,22 +1056,19 @@ pub(crate) fn report() -> Value {
             "available": false,
         });
         match engines().iter().find(|engine| engine.kind() == kind) {
-            Some(engine) => match engine.unavailable() {
-                Some(reason) => entry["reason"] = reason.into(),
-                None => {
-                    entry["available"] = true.into();
-                    match engine.self_test() {
-                        Ok(()) => entry["verified"] = true.into(),
-                        Err(reason) => {
-                            entry["verified"] = false.into();
-                            entry["reason"] = reason.into();
-                        }
-                    }
-                    for (key, value) in engine.about() {
+            Some(engine) => {
+                let found = checked::recall(kind.name()).unwrap_or_else(|| {
+                    let found = check(engine);
+                    let ok = found["verified"] == true;
+                    checked::remember(kind.name(), &found, ok);
+                    found
+                });
+                if let Value::Object(found) = found {
+                    for (key, value) in found {
                         entry[key] = value;
                     }
                 }
-            },
+            }
             None => entry["reason"] = missing(kind).into(),
         }
         backends[kind.name()] = entry;
@@ -1080,6 +1077,130 @@ pub(crate) fn report() -> Value {
         "selected": selected,
         "backends": backends,
     })
+}
+
+/// Open `engine` and encode the test frame on it: whether it is available
+/// and verified, why not, and what it says of itself.
+fn check(engine: &Engine) -> Value {
+    let mut entry = serde_json::json!({"available": false});
+    match engine.unavailable() {
+        Some(reason) => entry["reason"] = reason.into(),
+        None => {
+            entry["available"] = true.into();
+            match engine.self_test() {
+                Ok(()) => entry["verified"] = true.into(),
+                Err(reason) => {
+                    entry["verified"] = false.into();
+                    entry["reason"] = reason.into();
+                }
+            }
+            for (key, value) in engine.about() {
+                entry[key] = value;
+            }
+        }
+    }
+    entry
+}
+
+/// What `doctor` found of each engine, kept in the cache for the boot, so
+/// a later `doctor` neither opens the hardware nor encodes its test frame
+/// again: under this build and the variables that choose a device, and a
+/// failure for five minutes only, as FFmpeg's probes are.
+mod checked {
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use std::{collections::BTreeMap, path::PathBuf};
+
+    #[derive(Default, Serialize, Deserialize)]
+    struct Checks {
+        /// The boot, build and settings the checks hold for.
+        key: String,
+        engines: BTreeMap<String, Check>,
+    }
+    #[derive(Clone, Serialize, Deserialize)]
+    struct Check {
+        found: Value,
+        ok: bool,
+        at_ms: u64,
+    }
+
+    /// How long a check that failed is believed: a busy GPU may refuse
+    /// once and work soon after.
+    const FAILURE_KEPT_MS: u64 = 300_000;
+    /// What else chooses an engine's device or helper.
+    const SETTINGS: [&str; 3] = [
+        "CAPTUREFAB_CUDA_LIB_DIR",
+        "CAPTUREFAB_VAAPI_DEVICE",
+        "CAPTUREFAB_EXECUTABLE",
+    ];
+
+    /// This boot, this executable (its path, size and time, which a new
+    /// build changes) and the settings; None where there is no boot ID.
+    fn key() -> Option<String> {
+        let boot = crate::media::boot_id()?;
+        let exe = std::env::current_exe().ok()?;
+        let meta = std::fs::metadata(&exe).ok()?;
+        let modified = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let mut key = format!(
+            "{}\n{}\n{}\n{modified}",
+            boot.trim(),
+            exe.display(),
+            meta.len()
+        );
+        for name in SETTINGS {
+            let value = std::env::var_os(name).unwrap_or_default();
+            key.push_str(&format!("\n{name}={}", value.to_string_lossy()));
+        }
+        Some(key)
+    }
+    fn path() -> Option<PathBuf> {
+        Some(crate::dirs::cache()?.join("jpeg-engines.json"))
+    }
+    /// The checks kept for `key`.
+    fn read(path: &PathBuf, key: &str) -> Checks {
+        std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Checks>(&bytes).ok())
+            .filter(|checks| checks.key == key)
+            .unwrap_or_default()
+    }
+    /// What a check of engine `name` found this boot, while it holds.
+    pub(super) fn recall(name: &str) -> Option<Value> {
+        let checks = read(&path()?, &key()?);
+        let check = checks.engines.get(name)?;
+        let age = crate::scheduling::now_ms().checked_sub(check.at_ms)?;
+        (check.ok || age < FAILURE_KEPT_MS).then(|| check.found.clone())
+    }
+    /// Keep what a check of engine `name` found; `ok` when it passed.
+    pub(super) fn remember(name: &str, found: &Value, ok: bool) {
+        let (Some(path), Some(key)) = (path(), key()) else {
+            return;
+        };
+        let mut checks = read(&path, &key);
+        checks.key = key;
+        checks.engines.insert(
+            name.to_owned(),
+            Check {
+                found: found.clone(),
+                ok,
+                at_ms: crate::scheduling::now_ms(),
+            },
+        );
+        let Ok(bytes) = serde_json::to_vec(&checks) else {
+            return;
+        };
+        if let Some(dir) = path.parent()
+            && crate::dirs::ensure_private_dir(dir).is_err()
+        {
+            return;
+        }
+        let _ = crate::dirs::write_private(&path, &bytes, false);
+    }
 }
 
 #[cfg(all(test, feature = "jpeg"))]
@@ -1185,6 +1306,23 @@ mod tests {
         let error = Choice::parse(Some("gpu")).unwrap_err();
         assert_eq!(crate::types::classify(&error).kind, ErrorKind::Usage);
         assert!(format!("{error:#}").contains("nvjpeg or vaapi"));
+    }
+
+    #[test]
+    fn doctor_keeps_what_it_found_of_an_engine_for_the_boot() {
+        // Without a boot to key them to, checks are not kept.
+        if crate::media::boot_id().is_none() {
+            return;
+        }
+        let name = format!("test-engine-{}", std::process::id());
+        assert_eq!(checked::recall(&name), None);
+        let found = serde_json::json!({"available": true, "verified": true});
+        checked::remember(&name, &found, true);
+        assert_eq!(checked::recall(&name), Some(found));
+        // A failure is believed for a while too, not opened again at once.
+        let failed = serde_json::json!({"available": false, "reason": "busy"});
+        checked::remember(&name, &failed, false);
+        assert_eq!(checked::recall(&name), Some(failed));
     }
 
     #[test]

@@ -1061,7 +1061,7 @@ fn finish_timed_forward_at(
     } else {
         "Forwarding"
     };
-    let length = crate::scheduling::format_duration(duration_ms);
+    let length = crate::types::duration_text(Duration::from_millis(duration_ms));
     let _ = end_forward(h, forwarder, auto, Ended::Duration, None, |stopped| {
         Some(match stopped {
             Ok(_) => ("info", format!("{what} finished after {length}")),
@@ -3204,8 +3204,7 @@ fn deadline_after(wait: Duration) -> Instant {
 /// camera waits for one from a line, with its configuration, else a plain
 /// frame timeout. Read only once the wait has expired.
 pub(crate) fn frame_wait_error(c: &mut Camera, waited: Duration) -> anyhow::Error {
-    let wait =
-        crate::scheduling::format_duration(u64::try_from(waited.as_millis()).unwrap_or(u64::MAX));
+    let wait = crate::types::duration_text(waited);
     match crate::controls::trigger_state(c) {
         Ok(trigger) if hardware(&trigger) => {
             let source = trigger.source.clone().unwrap_or_default();
@@ -3384,7 +3383,7 @@ fn warm_up(
 pub(crate) fn unsettled_warning(warmup_ms: u64) -> String {
     format!(
         "the camera's exposure was still changing after {}; frames may be too dark or too bright (raise --warmup)",
-        crate::scheduling::format_duration(warmup_ms)
+        crate::types::duration_text(Duration::from_millis(warmup_ms))
     )
 }
 
@@ -4169,7 +4168,7 @@ mod tests {
         assert!(h.snapshot().forwarding_until_ms.is_none());
         assert_eq!(
             h.snapshot().logs.last().unwrap().message,
-            "Forwarding finished after 2 s"
+            "Forwarding finished after 2s"
         );
         run(
             &mut camera,
@@ -4314,7 +4313,7 @@ mod tests {
         assert_eq!(snapshot.last_error, None);
         assert_eq!(
             snapshot.logs.last().map(|entry| entry.message.as_str()),
-            Some("Recording finished after 1 min 30 s")
+            Some("Recording finished after 1m30s")
         );
         h.shutdown();
         let _ = std::fs::remove_dir_all(root);
@@ -4453,7 +4452,7 @@ mod tests {
             ended
                 .logs
                 .iter()
-                .any(|entry| entry.message == "Recording finished after 1 s"),
+                .any(|entry| entry.message == "Recording finished after 1s"),
             "{:?}",
             ended.logs
         );

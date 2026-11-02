@@ -58,7 +58,8 @@ const EFFECTS: &[(&str, &str)] = &[
 
 /// Flags that widen a command's effect: inspect, capture and record with
 /// `--set` or `--auto` change the camera first, and so does network with
-/// `--tune`.
+/// `--tune`; inspect with `--preview PATH` and debug xml with `-o` write a
+/// file where the caller says.
 const EFFECT_WITH: &[(&str, &[(&str, &str)])] = &[
     (
         "capture",
@@ -68,8 +69,12 @@ const EFFECT_WITH: &[(&str, &[(&str, &str)])] = &[
         "record",
         &[("--set", "camera_write"), ("--auto", "camera_write")],
     ),
-    ("inspect", &[("--set", "camera_write")]),
+    (
+        "inspect",
+        &[("--set", "camera_write"), ("--preview", "file_write")],
+    ),
     ("network", &[("--tune", "camera_write")]),
+    ("debug xml", &[("--output", "file_write")]),
 ];
 
 /// A saved preset document, as `preset show` prints it.
@@ -711,6 +716,31 @@ mod tests {
         assert_eq!(
             super::command("capture").unwrap()["effect_with"]["--set"],
             "camera_write"
+        );
+        // A read command's flag that names a file or path writes there: it
+        // widens the command to a file write, which a harness that allows
+        // reads must be told.
+        for (name, command) in commands() {
+            if super::effect(&name) != "read" {
+                continue;
+            }
+            for arg in command.get_arguments() {
+                let names_file = arg
+                    .get_value_names()
+                    .is_some_and(|names| names.iter().any(|n| n == "FILE" || n == "PATH"));
+                if let (true, Some(long)) = (names_file, arg.get_long()) {
+                    let widened = super::effect_with(&name).unwrap_or_default();
+                    assert_eq!(
+                        widened[format!("--{long}")],
+                        "file_write",
+                        "{name} --{long}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            super::command("debug xml").unwrap()["effect_with"]["--output"],
+            "file_write"
         );
     }
 

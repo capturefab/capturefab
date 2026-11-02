@@ -101,7 +101,9 @@ fn busy(info: &CameraInfo, mut owner: Value) -> anyhow::Error {
         .map(|left| {
             format!(
                 ", which lets it go after {} unused",
-                crate::scheduling::format_duration(left.as_millis().div_ceil(1000) as u64 * 1000)
+                crate::types::duration_text(Duration::from_secs(
+                    left.as_millis().div_ceil(1000) as u64
+                ))
             )
         })
         .unwrap_or_default();

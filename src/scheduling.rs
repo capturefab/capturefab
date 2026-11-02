@@ -177,29 +177,6 @@ fn frame_count(count: u64) -> Result<u32> {
     );
     Ok(count as u32)
 }
-/// A duration in words for messages and labels: "500 ms", "1 min 30 s",
-/// "1 h". Every nonzero unit is kept, so the text is exact.
-pub fn format_duration(duration_ms: u64) -> String {
-    if duration_ms == 0 {
-        return "0 ms".into();
-    }
-    let units = [
-        (86_400_000, "d"),
-        (3_600_000, "h"),
-        (60_000, "min"),
-        (1000, "s"),
-        (1, "ms"),
-    ];
-    let mut rest = duration_ms;
-    let mut parts = Vec::new();
-    for (size, unit) in units {
-        if rest >= size {
-            parts.push(format!("{} {unit}", rest / size));
-            rest %= size;
-        }
-    }
-    parts.join(" ")
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,14 +212,5 @@ mod tests {
                 .to_string()
                 .contains("needs 1000000 frames")
         );
-    }
-    #[test]
-    fn durations_read_in_exact_units() {
-        assert_eq!(format_duration(0), "0 ms");
-        assert_eq!(format_duration(500), "500 ms");
-        assert_eq!(format_duration(1000), "1 s");
-        assert_eq!(format_duration(90_000), "1 min 30 s");
-        assert_eq!(format_duration(3_600_000), "1 h");
-        assert_eq!(format_duration(86_400_000 + 1001), "1 d 1 s 1 ms");
     }
 }

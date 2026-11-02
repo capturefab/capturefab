@@ -341,7 +341,12 @@ pub fn auth_error(address: &str, had_credentials: bool) -> anyhow::Error {
         );
     }
     let advice = if can_remember() {
-        format!("run `capturefab login add {address} --user USER --password-stdin`")
+        // Quoted for a shell: the address may come from a device on the
+        // network, and holds `&` or `;` as often as not.
+        format!(
+            "run `capturefab login add {} --user USER --password-stdin`",
+            crate::hint::shell_quote(&address)
+        )
     } else {
         let scheme = address.split("://").next().unwrap_or("rtsp");
         format!("include them in the address ({scheme}://USER:PASSWORD@…)")
@@ -925,6 +930,20 @@ mod tests {
         );
         assert!(format!("{rejected:#}").contains("refused"));
         assert!(is_auth_error(&rejected.context("connect")));
+        // An address with shell syntax, as a device on the network may
+        // send, is quoted in the command the hint suggests.
+        if can_remember() {
+            let text = format!(
+                "{:#}",
+                auth_error("onvif:http://10.0.0.9/onvif/device_service;id>x", false)
+            );
+            assert!(
+                text.contains(
+                    "`capturefab login add 'onvif:http://10.0.0.9/onvif/device_service;id>x' --user"
+                ),
+                "{text}"
+            );
+        }
         assert_eq!(crate::cli::error_code(&required), ("auth_required", 3));
     }
 

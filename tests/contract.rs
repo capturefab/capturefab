@@ -119,6 +119,27 @@ fn argument_errors_are_usage_documents_and_help_stays_text() {
     let version = home.run(&["--json", "--version"]);
     assert_eq!(version.code, Some(0));
     assert!(version.stdout.starts_with("capturefab "));
+    // `help COMMAND`, the usual first guess, is COMMAND --help; with --json
+    // it is the command's schema, never a pointer to `shell`.
+    for args in [&["help", "set"][..], &["session", "help", "start"]] {
+        let help = home.run(args);
+        assert_eq!(help.code, Some(0), "{args:?}: {}", help.stderr);
+        let usage = format!(
+            "Usage: capturefab {}",
+            args.iter()
+                .filter(|w| **w != "help")
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert!(help.stdout.contains(&usage), "{args:?}: {}", help.stdout);
+    }
+    assert!(home.run(&["help"]).stdout.contains("Examples:"));
+    assert_eq!(home.ok(&["help", "set"]), home.ok(&["schema", "set"]));
+    assert_eq!(
+        home.ok(&["session", "help", "start"]),
+        home.ok(&["schema", "session", "start"])
+    );
     // Bare: an overview for people, a usage error for agents.
     let bare = home.run(&[]);
     assert_eq!(bare.code, Some(0));
@@ -136,7 +157,7 @@ fn durations_need_units() {
         error["message"]
             .as_str()
             .unwrap()
-            .contains("did you mean 5000ms or 5000s?"),
+            .contains("'5000' has no unit; add one of us, ms, s, m or h"),
         "{error}"
     );
     for good in ["250ms", "0", "1.5s"] {
@@ -1326,14 +1347,10 @@ fn doctor_and_licenses() {
     }));
     assert!(checks.iter().any(|check| check["name"] == "ffmpeg"));
     let path = Value::from(home.sessions.to_string_lossy().into_owned());
-    assert_eq!(doctor["dirs"]["runtime"], path);
-    assert_eq!(doctor["dirs"]["state"], path);
-    assert!(
-        doctor["dirs"]["inspect"]
-            .as_str()
-            .unwrap()
-            .ends_with("inspect")
-    );
+    assert_eq!(doctor["folders"]["runtime"]["path"], path);
+    assert_eq!(doctor["folders"]["state"]["path"], path);
+    assert!(doctor.get("dirs").is_none(), "folders names each once");
+    assert!(doctor["inspect_dir"].as_str().unwrap().ends_with("inspect"));
     assert_eq!(
         doctor["features"]["keychain"].as_bool(),
         Some(cfg!(feature = "keychain"))

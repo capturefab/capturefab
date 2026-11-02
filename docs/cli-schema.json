@@ -308,7 +308,7 @@
     },
     {
      "default": "false",
-     "help": "Leave the capture running in a session and print its job at once",
+     "help": "Leave the capture running in a session; print its job once it is armed or has saved its first frame (up to --timeout; with --timeout none, after 2s without waiting for a trigger)",
      "long": "--background",
      "name": "background",
      "repeatable": false,
@@ -658,6 +658,9 @@
    "command": "debug xml",
    "contract_version": 1,
    "effect": "read",
+   "effect_with": {
+    "--output": "file_write"
+   },
    "errors": [
     "usage",
     "failed",
@@ -706,13 +709,13 @@
    "result": {
     "arch": "string",
     "checks": "[{name,status:ok|warn|fail,message,fix?}] — fix is a command or step that resolves a warning",
-    "dirs": "{runtime,state,cache,inspect} — runtime: sessions; state: presets, sign-ins; cache: FFmpeg; inspect: previews; null when there is none",
     "features": "{usb,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell} — what this build includes",
     "ffmpeg": "{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted",
-    "folders": "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
+    "folders": "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path null when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
     "host": "{cpus,threads,cpu_quota,memory:{total_bytes,available_bytes,cgroup_limit_bytes,cgroup_used_bytes,budget_bytes}} — what cgroups leave this process",
     "hwdec": "{selected:auto|none|METHOD,methods:{METHOD:{built,works,reason?}}} — hardware decoding CAPTUREFAB_HWDEC selects, and each method of this platform: in this FFmpeg (built) and proved to decode here (works); only with FFmpeg",
-    "jpeg": "{selected:auto|cpu|videotoolbox|nvjpeg|vaapi,backends:{libjpeg_turbo:{compiled,simd},videotoolbox|nvjpeg|vaapi:{compiled,available,verified?,reason?,version?,driver?,device?,integrated?,upload?:in-place|dma|copy}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: the engine encoded a test frame as accurately as libjpeg-turbo; nvjpeg and vaapi (Linux) run in a helper process; upload: how frames reach the GPU (read where the camera wrote them, one DMA, or written into its memory)",
+    "inspect_dir": "string or null — the private folder inspect writes previews to without --preview PATH",
+    "jpeg": "{selected:auto|cpu|videotoolbox|nvjpeg|vaapi,backends:{libjpeg_turbo:{compiled,simd},videotoolbox|nvjpeg|vaapi:{compiled,available,verified?,reason?,version?,driver?,device?,integrated?,upload?:in-place|dma|copy}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: the engine encoded a test frame as accurately as libjpeg-turbo, checked once a boot (a failure again after five minutes) and kept in the cache; nvjpeg and vaapi (Linux) run in a helper process; upload: how frames reach the GPU (read where the camera wrote them, one DMA, or written into its memory)",
     "os": "string",
     "read_only_root": "bool or null — the root file system is mounted read-only (Linux)",
     "version": "string — Capturefab version",
@@ -1037,7 +1040,7 @@
     },
     {
      "default": "0",
-     "help": "Frames to let pass after the first one exposed after the last settings change, 0..9",
+     "help": "Frames to let pass after the first one exposed after the last settings change, 0..10",
      "long": "--fresh",
      "name": "fresh",
      "repeatable": false,
@@ -1125,6 +1128,7 @@
    "contract_version": 1,
    "effect": "read",
    "effect_with": {
+    "--preview": "file_write",
     "--set": "camera_write"
    },
    "errors": [
@@ -1197,12 +1201,31 @@
    ],
    "notes": [],
    "result": {
-    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session's, and those of a session that died, as lost"
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session's, and those of a session that died, as lost; with IDs, those jobs in that order; with --running, only those that have not ended"
    },
    "summary": "Captures and recordings running in sessions: list, stop, wait"
   },
   "jobs list": {
-   "args": [],
+   "args": [
+    {
+     "help": "Job IDs such as auto-1: only these, in this order; without waiting, unlike jobs wait",
+     "name": "ids",
+     "repeatable": true,
+     "required": false,
+     "type": "string",
+     "value_name": "ID"
+    },
+    {
+     "default": "false",
+     "help": "Only jobs that have not ended: armed, running or stopping",
+     "long": "--running",
+     "name": "running",
+     "repeatable": false,
+     "required": false,
+     "type": "flag",
+     "value_name": "RUNNING"
+    }
+   ],
    "command": "jobs list",
    "contract_version": 1,
    "effect": "read",
@@ -1215,13 +1238,15 @@
    ],
    "examples": [
     "capturefab jobs list",
+    "capturefab jobs list --running",
+    "capturefab --json jobs list auto-1 auto-2",
     "capturefab --json jobs"
    ],
    "notes": [],
    "result": {
-    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session's, and those of a session that died, as lost"
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session's, and those of a session that died, as lost; with IDs, those jobs in that order; with --running, only those that have not ended"
    },
-   "summary": "Every running session's jobs, finished ones included"
+   "summary": "Every running session's jobs, finished ones included; or the jobs named, as they are now"
   },
   "jobs stop": {
    "args": [
@@ -1257,16 +1282,16 @@
   "jobs wait": {
    "args": [
     {
-     "help": "A job ID such as auto-1",
-     "name": "id",
-     "repeatable": false,
+     "help": "Job IDs such as auto-1; several are waited for together",
+     "name": "ids",
+     "repeatable": true,
      "required": true,
      "type": "string",
      "value_name": "ID"
     },
     {
      "default": "none",
-     "help": "How long to wait; none waits until the job ends",
+     "help": "How long to wait; none waits until the jobs end",
      "long": "--timeout",
      "name": "timeout",
      "repeatable": false,
@@ -1303,13 +1328,15 @@
    ],
    "examples": [
     "capturefab jobs wait auto-1",
-    "capturefab --json jobs wait auto-1 --timeout 10m"
+    "capturefab --json jobs wait auto-1 --timeout 10m",
+    "capturefab --json jobs wait auto-2 auto-3 auto-4"
    ],
    "notes": [],
    "result": {
-    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — done; a failed job exits with its own error code and details.job"
+    "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with one ID: done; a failed job exits with its own error code and details.job",
+    "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with several IDs, in the order given, once all have ended: all done; else the first that is not exits with its own error code, and details.jobs holds them all"
    },
-   "summary": "Wait for a job: exit 0 when done, its own code if it failed, 4 if still running"
+   "summary": "Wait for jobs: exit 0 when all are done, a failed one's own code, 4 if one is still running"
   },
   "licenses": {
    "args": [],
@@ -2969,7 +2996,7 @@
    ],
    "jobs list": [
     "read",
-    "Every running session's jobs, finished ones included"
+    "Every running session's jobs, finished ones included; or the jobs named, as they are now"
    ],
    "jobs stop": [
     "camera_write",
@@ -2977,7 +3004,7 @@
    ],
    "jobs wait": [
     "read",
-    "Wait for a job: exit 0 when done, its own code if it failed, 4 if still running"
+    "Wait for jobs: exit 0 when all are done, a failed one's own code, 4 if one is still running"
    ],
    "licenses": [
     "read",
@@ -3093,7 +3120,11 @@
     "--auto": "camera_write",
     "--set": "camera_write"
    },
+   "debug xml": {
+    "--output": "file_write"
+   },
    "inspect": {
+    "--preview": "file_write",
     "--set": "camera_write"
    },
    "network": {

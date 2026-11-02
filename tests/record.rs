@@ -252,6 +252,83 @@ fn a_signal_ends_an_open_ended_recording_normally() {
     assert!(decodes(&home.path("cut.mkv")));
 }
 
+/// A recording that ends before its first frame, as on a camera that waits
+/// for a trigger, recorded nothing: it says so, and names no file.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_recording_ended_before_its_first_frame_reports_no_file() {
+    let home = Home::new("record-no-frame");
+    let triggered = [
+        "--set",
+        "TriggerMode=On",
+        "--set",
+        "TriggerSource=Software",
+        "--timeout",
+        "none",
+    ];
+    let mut child = home
+        .command()
+        .args(["--json", "record", "-c", "sim:5", "-o", "signal.mkv"])
+        .args(triggered)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    support::cli::signal_and_wait(&mut child, libc::SIGINT);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(130),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "interrupted", "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was recorded")
+    );
+    assert!(error["details"].get("output").is_none(), "{error}");
+    assert!(!home.path("signal.mkv").exists());
+    // Stopped by another command, it is incomplete.
+    let _session = home.serve("bench", &["sim:6"]);
+    let child = home
+        .command()
+        .args([
+            "--json",
+            "--session",
+            "bench",
+            "record",
+            "-c",
+            "sim:6",
+            "-o",
+            "stopped.mkv",
+        ])
+        .args(triggered)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while home.ok(&["jobs", "list", "--running"])["jobs"]
+        .as_array()
+        .unwrap()
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "the recording did not start");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    home.ok(&["jobs", "stop", "all"]);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "incomplete", "{error}");
+    assert!(!home.path("stopped.mkv").exists());
+}
+
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
 fn a_background_recording_is_a_job_until_stopped() {
@@ -320,6 +397,54 @@ fn serve_finishes_a_recording_on_a_signal() {
         assert!(std::fs::metadata(&clip).unwrap().len() > 0);
         assert!(decodes(std::path::Path::new(&clip)), "{name}");
     }
+}
+
+/// A session records with its own FFmpeg: a shell whose FFmpeg setting
+/// would not work, as one without FFmpeg, still records through it. A
+/// command's own worker records with the command's, which is checked
+/// before its camera opens.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_session_records_with_its_own_ffmpeg() {
+    let home = Home::new("record-session-ffmpeg");
+    let _session = home.serve("svc", &["sim:0"]);
+    // A relative path is no FFmpeg this command could run.
+    let unusable = [("CAPTUREFAB_FFMPEG", "ffmpeg")];
+    let recorded = home
+        .run_env(
+            &unusable,
+            &[
+                "--json",
+                "--session",
+                "svc",
+                "record",
+                "-c",
+                "sim:0",
+                "-o",
+                "clip.mkv",
+                "--for",
+                "1s",
+            ],
+        )
+        .success();
+    assert_eq!(recorded["ended"], "duration", "{recorded}");
+    assert!(decodes(&home.path("clip.mkv")));
+    let alone = home.run_env(
+        &unusable,
+        &[
+            "--json",
+            "--no-session",
+            "record",
+            "-c",
+            "sim:1",
+            "-o",
+            "alone.mkv",
+            "--for",
+            "1s",
+        ],
+    );
+    assert_eq!(alone.failure(2)["code"], "usage");
+    assert!(!home.path("alone.mkv").exists());
 }
 
 /// A timed recording in a session ends on time, by the session, while other

@@ -184,7 +184,7 @@ pub(super) fn save_probes(exe: &Executable, probes: &mut Probes) {
 }
 /// Identifies this boot, so remembered probes do not outlive a driver or
 /// hardware change. Without one, probes are remembered by the process only.
-pub(super) fn boot_id() -> Option<&'static str> {
+pub(crate) fn boot_id() -> Option<&'static str> {
     static BOOT: OnceLock<Option<String>> = OnceLock::new();
     BOOT.get_or_init(|| {
         let id = if cfg!(target_os = "linux") {

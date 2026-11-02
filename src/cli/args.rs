@@ -114,30 +114,6 @@ pub fn time(text: &str) -> Result<chrono::DateTime<chrono::Utc>, Categorized> {
         })
 }
 
-/// A duration as the grammar writes it: `1h30m`, `2s`, `250ms`.
-pub fn duration_text(duration: Duration) -> String {
-    let millis = duration.as_millis();
-    if millis == 0 {
-        return if duration.is_zero() {
-            "0".into()
-        } else {
-            format!("{}us", duration.as_micros())
-        };
-    }
-    if !millis.is_multiple_of(1000) {
-        return format!("{millis}ms");
-    }
-    let mut seconds = millis / 1000;
-    let mut text = String::new();
-    for (unit, size) in [("h", 3600), ("m", 60), ("s", 1)] {
-        if seconds >= size {
-            text.push_str(&format!("{}{unit}", seconds / size));
-            seconds %= size;
-        }
-    }
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,9 +123,6 @@ mod tests {
         assert_eq!(wait("none").unwrap(), Wait::Forever);
         assert_eq!(wait("2s").unwrap(), Wait::For(Duration::from_secs(2)));
         assert_eq!(wait("5000").unwrap_err().kind, ErrorKind::InvalidDuration);
-        assert_eq!(duration_text(Duration::from_secs(5400)), "1h30m");
-        assert_eq!(duration_text(Duration::from_millis(250)), "250ms");
-        assert_eq!(duration_text(Duration::ZERO), "0");
     }
 
     #[test]

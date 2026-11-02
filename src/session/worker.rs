@@ -199,7 +199,7 @@ impl Worker {
                 ErrorKind::Timeout,
                 format!(
                     "the camera worker did not start within {}",
-                    crate::scheduling::format_duration(HELLO.as_millis() as u64)
+                    crate::types::duration_text(HELLO)
                 ),
             )
             .into()),

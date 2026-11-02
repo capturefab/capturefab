@@ -203,9 +203,9 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         copy: args.copy(),
     };
     // Everything that can be checked here is, before a camera is opened:
-    // the request, a taken file, FFmpeg and an encoder for the codec. A
-    // source that may be copied needs no encoder: the worker checks for one
-    // once it is not.
+    // the request and a taken file; FFmpeg and an encoder for the codec
+    // below. A source that may be copied needs no encoder: the worker
+    // checks for one once it is not.
     request(args.fps.unwrap_or(30.0))
         .validate()
         .map_err(super::input)?;
@@ -221,17 +221,27 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
             }
         })?;
     }
-    crate::media::executable()?;
-    if args.copy() == StreamCopy::Never {
-        crate::media::check_codec(&crate::media::ForwardConfig {
-            output: output.clone(),
-            codec: args.codec().name().into(),
-            encoder: "auto".into(),
-            fps: args.fps.unwrap_or(30.0),
-            bitrate: args.bitrate(),
-            max_file_bytes,
-            min_free,
-        })?;
+    // FFmpeg and its encoders are those of the process that records: this
+    // command's own worker shares its environment, while a session runs
+    // its own FFmpeg and checks it there. So they are checked here only for
+    // a worker of this command, before its camera opens when that is sure.
+    let preflight = || -> Result<()> {
+        crate::media::executable()?;
+        if args.copy() == StreamCopy::Never {
+            crate::media::check_codec(&crate::media::ForwardConfig {
+                output: output.clone(),
+                codec: args.codec().name().into(),
+                encoder: "auto".into(),
+                fps: args.fps.unwrap_or(30.0),
+                bitrate: args.bitrate(),
+                max_file_bytes,
+                min_free,
+            })?;
+        }
+        Ok(())
+    };
+    if global.no_session {
+        preflight()?;
     }
     signals::take_over();
     let client = Client::open_with(
@@ -243,6 +253,9 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         }
         .waiting(args.timeout),
     )?;
+    if client.session().is_none() && !global.no_session {
+        preflight()?;
+    }
     if !settings.is_empty() {
         client.call(SessionCommand::SetValues {
             values: settings,
@@ -388,7 +401,7 @@ impl Recording<'_> {
     fn no_frames(&self) -> anyhow::Error {
         crate::types::frame_timeout(format!(
             "no frame reached the encoder within {}",
-            super::args::duration_text(self.first_frame_wait().unwrap_or_default())
+            crate::types::duration_text(self.first_frame_wait().unwrap_or_default())
         ))
     }
     /// The recording's error, as its job ended with it, with its reason,
@@ -438,6 +451,25 @@ impl Recording<'_> {
                     _ if signal => Ended::Signal,
                     _ => Ended::Stopped,
                 };
+                // Stopped before its first frame, it recorded nothing and
+                // left no file: no result can name one.
+                if matches!(ended, Ended::Signal | Ended::Stopped)
+                    && detail["written"].as_u64().unwrap_or(0) == 0
+                {
+                    return Err(if ended == Ended::Signal {
+                        Categorized::new(
+                            ErrorKind::Interrupted,
+                            "interrupted before the recording started; nothing was recorded",
+                        )
+                    } else {
+                        Categorized::new(
+                            ErrorKind::Incomplete,
+                            "the recording was stopped before its first frame; nothing was recorded",
+                        )
+                    }
+                    .details(json!({ "job": job, "frames": 0 }))
+                    .into());
+                }
                 let value = self.result(&job, &detail, ended);
                 // A recording asked to run for a time and cut short is
                 // interrupted, by a signal, or incomplete; an open-ended
@@ -445,7 +477,9 @@ impl Recording<'_> {
                 if let Some(duration) = duration
                     && matches!(ended, Ended::Signal | Ended::Stopped)
                 {
-                    let ran = crate::scheduling::format_duration(millis(self.started.elapsed()));
+                    let ran = crate::types::duration_text(Duration::from_millis(millis(
+                        self.started.elapsed(),
+                    )));
                     return Err(if ended == Ended::Signal {
                         Categorized::new(
                             ErrorKind::Interrupted,
@@ -456,7 +490,7 @@ impl Recording<'_> {
                             ErrorKind::Incomplete,
                             format!(
                                 "the recording was stopped after {ran} of {}",
-                                super::args::duration_text(duration)
+                                crate::types::duration_text(duration)
                             ),
                         )
                     }

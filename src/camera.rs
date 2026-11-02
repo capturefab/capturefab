@@ -168,9 +168,7 @@ fn search(
         for label in asked.iter().filter(|label| !answered.contains(label)) {
             warnings.push(format!(
                 "{label} discovery did not answer within {}; listed without it",
-                crate::scheduling::format_duration(
-                    u64::try_from((timeout + DISCOVERY_GRACE).as_millis()).unwrap_or(u64::MAX)
-                )
+                crate::types::duration_text(timeout + DISCOVERY_GRACE)
             ));
         }
     }

@@ -256,7 +256,8 @@ pub enum SessionCommand {
     /// acquires its frames and stays stopped.
     Frame {
         /// Frames to let pass after the request before the one measured; 0
-        /// and 1 measure the next frame.
+        /// and 1 measure the next frame. Up to one more than a capture's
+        /// `fresh`, which does not count the frame it saves.
         #[serde(default = "crate::inspect::default_fresh")]
         fresh: u32,
         #[serde(default = "crate::inspect::default_wait_ms")]
@@ -526,7 +527,14 @@ impl SessionCommand {
                 warmup_ms,
                 ..
             } => {
-                crate::inspect::validate(*fresh, *timeout_ms, *max_dimension, *region)?;
+                // Its count takes in the frame measured, so it may be one
+                // more than the frames a capture lets pass.
+                crate::inspect::validate(
+                    fresh.saturating_sub(1),
+                    *timeout_ms,
+                    *max_dimension,
+                    *region,
+                )?;
                 validate_warmup(*warmup_ms)?;
                 if let Some(preview) = preview {
                     ensure!(
@@ -1934,9 +1942,7 @@ impl SessionHandle {
                 "info",
                 format!(
                     "Closed {camera}: unused for {}",
-                    crate::scheduling::format_duration(
-                        u64::try_from(keep.as_millis()).unwrap_or(u64::MAX)
-                    )
+                    crate::types::duration_text(keep)
                 ),
             ),
             Err(error) => self.note(
@@ -2154,7 +2160,7 @@ impl SessionHandle {
             )
             .hint(format!(
                 "connect it again with capturefab session start -c {}",
-                crate::media::redact_url(&held.spec.selector)
+                crate::hint::shell_quote(&crate::media::redact_url(&held.spec.selector))
             ))
             .details(crash["details"].clone())
             .into());
@@ -3261,6 +3267,27 @@ mod tests {
         );
         let bare = SessionCommand::from_json_slice(br#"{"op":"frame"}"#).unwrap();
         assert!(serde_json::to_value(bare).unwrap().get("region").is_none());
+        // inspect --fresh 10 lets as many frames pass as capture --fresh 10:
+        // the frame's count takes in the frame measured.
+        let frame = |fresh: u32| {
+            let json = format!(r#"{{"op":"frame","fresh":{fresh}}}"#);
+            SessionCommand::from_json_slice(json.as_bytes())
+                .unwrap()
+                .validate()
+        };
+        let capture = |fresh: u32| {
+            let json = format!(
+                r#"{{"op":"capture","output":"a.png","count":1,"timeout_ms":0,"format":"png","fresh":{fresh}}}"#
+            );
+            SessionCommand::from_json_slice(json.as_bytes())
+                .unwrap()
+                .validate()
+        };
+        let most = crate::inspect::MAX_FRESH;
+        frame(most + 1).unwrap();
+        capture(most).unwrap();
+        assert!(frame(most + 2).is_err());
+        assert!(capture(most + 1).is_err());
         for invalid in [
             r#"{"op":"frame","unknown":1}"#,
             r#"{"op":"frame","fresh":1,"fresh":2}"#,
@@ -3322,7 +3349,7 @@ mod tests {
             },
             SessionCommand::Frame {
                 min_free: None,
-                fresh: 11,
+                fresh: 12,
                 timeout_ms: 3000,
                 max_dimension: 1024,
                 format: Default::default(),

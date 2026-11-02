@@ -16,15 +16,15 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "jpeg",
-        "{selected:auto|cpu|videotoolbox|nvjpeg|vaapi,backends:{libjpeg_turbo:{compiled,simd},videotoolbox|nvjpeg|vaapi:{compiled,available,verified?,reason?,version?,driver?,device?,integrated?,upload?:in-place|dma|copy}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: the engine encoded a test frame as accurately as libjpeg-turbo; nvjpeg and vaapi (Linux) run in a helper process; upload: how frames reach the GPU (read where the camera wrote them, one DMA, or written into its memory)",
-    ),
-    (
-        "dirs",
-        "{runtime,state,cache,inspect} — runtime: sessions; state: presets, sign-ins; cache: FFmpeg; inspect: previews; null when there is none",
+        "{selected:auto|cpu|videotoolbox|nvjpeg|vaapi,backends:{libjpeg_turbo:{compiled,simd},videotoolbox|nvjpeg|vaapi:{compiled,available,verified?,reason?,version?,driver?,device?,integrated?,upload?:in-place|dma|copy}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: the engine encoded a test frame as accurately as libjpeg-turbo, checked once a boot (a failure again after five minutes) and kept in the cache; nvjpeg and vaapi (Linux) run in a helper process; upload: how frames reach the GPU (read where the camera wrote them, one DMA, or written into its memory)",
     ),
     (
         "folders",
-        "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
+        "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path null when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
+    ),
+    (
+        "inspect_dir",
+        "string or null — the private folder inspect writes previews to without --preview PATH",
     ),
     (
         "warm_sessions",

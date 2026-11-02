@@ -99,6 +99,14 @@ fn xml_document(body: &str) -> Result<roxmltree::Document<'_>> {
     }
     Ok(doc)
 }
+/// Whether `url` is made only of the characters a URI may hold (RFC 3986:
+/// unreserved, reserved and `%`). A device on the network chooses its
+/// addresses, which reach messages and the commands hints suggest; one
+/// with `<`, `>`, `|`, a backtick or a quote in it is no address.
+fn uri_characters(url: &str) -> bool {
+    url.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c))
+}
 fn parse_discovery(xml: &str, source: SocketAddr) -> Result<Vec<OnvifDevice>> {
     let doc = xml_document(xml)?;
     let mut result = Vec::new();
@@ -110,6 +118,7 @@ fn parse_discovery(xml: &str, source: SocketAddr) -> Result<Vec<OnvifDevice>> {
             .unwrap_or("")
             .split_whitespace()
             .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+            .filter(|url| uri_characters(url))
             .map(str::to_string)
             .collect::<Vec<_>>();
         let Some(endpoint) = device_endpoint(&addresses, source.ip()) else {
@@ -1770,6 +1779,22 @@ mod tests {
         let devices = parse_discovery(xml, "192.168.1.3:3702".parse().unwrap()).unwrap();
         assert_eq!(devices[0].uuid, "urn:uuid:test");
         assert_eq!(devices[0].addresses.len(), 2);
+    }
+    #[test]
+    fn discovery_drops_addresses_no_uri_could_hold() {
+        // Shell syntax a device on the network sends is no address; the
+        // characters RFC 3986 allows stay, and hints quote them.
+        // As XML escapes them: `;id>x`, and `?a=1&b=$c`.
+        let xaddrs = "http://192.168.1.3/onvif/device_service;id&gt;x http://192.168.1.3/a|b http://192.168.1.3/`id` http://192.168.1.3/onvif/device_service?a=1&amp;b=$c";
+        let devices = parse_discovery(
+            &probe_match("tds:Device", "urn:uuid:x", xaddrs),
+            "192.168.1.3:3702".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            devices[0].addresses,
+            ["http://192.168.1.3/onvif/device_service?a=1&b=$c"]
+        );
     }
     fn probe_match(types: &str, address: &str, xaddrs: &str) -> String {
         format!(

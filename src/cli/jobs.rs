@@ -24,9 +24,18 @@ pub struct JobsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum JobsAction {
-    /// Every running session's jobs, finished ones included
-    #[command(after_help = "Examples:\n  capturefab jobs list\n  capturefab --json jobs")]
-    List,
+    /// Every running session's jobs, finished ones included; or the jobs named, as they are now
+    #[command(
+        after_help = "Examples:\n  capturefab jobs list\n  capturefab jobs list --running\n  capturefab --json jobs list auto-1 auto-2\n  capturefab --json jobs"
+    )]
+    List {
+        /// Job IDs such as auto-1: only these, in this order; without waiting, unlike jobs wait
+        #[arg(value_name = "ID")]
+        ids: Vec<String>,
+        /// Only jobs that have not ended: armed, running or stopping
+        #[arg(long)]
+        running: bool,
+    },
     /// Stop a job, or all of them; files saved so far stay
     #[command(after_help = "Examples:\n  capturefab jobs stop auto-1\n  capturefab jobs stop all")]
     Stop {
@@ -34,15 +43,15 @@ pub enum JobsAction {
         #[arg(value_name = "ID")]
         id: String,
     },
-    /// Wait for a job: exit 0 when done, its own code if it failed, 4 if still running
+    /// Wait for jobs: exit 0 when all are done, a failed one's own code, 4 if one is still running
     #[command(
-        after_help = "Examples:\n  capturefab jobs wait auto-1\n  capturefab --json jobs wait auto-1 --timeout 10m"
+        after_help = "Examples:\n  capturefab jobs wait auto-1\n  capturefab --json jobs wait auto-1 --timeout 10m\n  capturefab --json jobs wait auto-2 auto-3 auto-4"
     )]
     Wait {
-        /// A job ID such as auto-1
-        #[arg(value_name = "ID")]
-        id: String,
-        /// How long to wait; none waits until the job ends
+        /// Job IDs such as auto-1; several are waited for together
+        #[arg(value_name = "ID", required = true)]
+        ids: Vec<String>,
+        /// How long to wait; none waits until the jobs end
         #[arg(long, default_value = "none", value_name = "DUR", value_parser = super::args::wait)]
         timeout: super::args::Wait,
         #[command(flatten)]
@@ -59,14 +68,18 @@ pub struct ProgressArg {
 }
 
 pub fn run(global: &Global, args: JobsArgs) -> Result<Report> {
-    match args.action.unwrap_or(JobsAction::List) {
-        JobsAction::List => list(global),
+    let action = args.action.unwrap_or(JobsAction::List {
+        ids: Vec::new(),
+        running: false,
+    });
+    match action {
+        JobsAction::List { ids, running } => list(global, &ids, running),
         JobsAction::Stop { id } => stop(global, &id),
         JobsAction::Wait {
-            id,
+            ids,
             timeout,
             progress,
-        } => wait(&id, timeout, progress),
+        } => wait(&ids, timeout, progress),
     }
 }
 
@@ -142,11 +155,28 @@ fn every_job(global: &Global) -> Vec<(String, Vec<Value>)> {
     all
 }
 
-fn list(global: &Global) -> Result<Report> {
-    let jobs = every_job(global)
+/// Every job, or those `ids` name in that order; with `running`, only
+/// those that have not ended.
+fn list(global: &Global, ids: &[String], running: bool) -> Result<Report> {
+    let every = every_job(global)
         .into_iter()
         .flat_map(|(_, jobs)| jobs)
         .collect::<Vec<_>>();
+    let mut jobs = if ids.is_empty() {
+        every
+    } else {
+        ids.iter()
+            .map(
+                |id| match every.iter().find(|job| job["id"] == id.as_str()) {
+                    Some(job) => Ok(job.clone()),
+                    None => named_job(id),
+                },
+            )
+            .collect::<Result<Vec<_>>>()?
+    };
+    if running {
+        jobs.retain(|job| !ended(job));
+    }
     let mut text = String::new();
     if jobs.is_empty() {
         text.push_str("No jobs.\n");
@@ -196,6 +226,21 @@ fn saved_job(session: &str, id: &str) -> Result<Value> {
         })
 }
 
+/// Job `id`, which no list had: of a session that ended, as it saved it,
+/// or none.
+fn named_job(id: &str) -> Result<Value> {
+    let session = session_of(id)?;
+    if ipc::running_session(&session).is_some() {
+        return Err(Categorized::new(
+            ErrorKind::Usage,
+            format!("session {session} has no job {id}"),
+        )
+        .hint("capturefab jobs lists the jobs of every running session")
+        .into());
+    }
+    saved_job(&session, id)
+}
+
 fn stop(global: &Global, id: &str) -> Result<Report> {
     let targets = if id == "all" {
         every_job(global)
@@ -234,51 +279,143 @@ fn stop(global: &Global, id: &str) -> Result<Report> {
     Ok(Report::json(json!({ "stopped": stopped })).text(text))
 }
 
-fn wait(id: &str, timeout: super::args::Wait, progress: ProgressArg) -> Result<Report> {
-    super::signals::take_over();
-    let session = session_of(id)?;
-    if ipc::running_session(&session).is_none() {
-        return finished(saved_job(&session, id)?);
+/// A job `jobs wait` follows: where it runs, how far its changes were
+/// read, and the job as last seen.
+struct Followed {
+    id: String,
+    /// None for a job of a session that ended, which changes no more.
+    host: Option<super::JobHost>,
+    seq: u64,
+    job: Value,
+}
+impl Followed {
+    fn waiting(&self) -> bool {
+        self.host.is_some() && (self.job.is_null() || !ended(&self.job))
     }
-    let host = super::JobHost::Session(session);
+}
+
+/// Wait for every job `ids` names until all have ended or `timeout` runs
+/// out. One ID gives `{job}`, several `{jobs}` in the order given.
+fn wait(ids: &[String], timeout: super::args::Wait, progress: ProgressArg) -> Result<Report> {
+    super::signals::take_over();
+    let mut followed = Vec::with_capacity(ids.len());
+    for id in ids {
+        let session = session_of(id)?;
+        let (host, job) = if ipc::running_session(&session).is_none() {
+            (None, saved_job(&session, id)?)
+        } else {
+            (Some(super::JobHost::Session(session)), Value::Null)
+        };
+        followed.push(Followed {
+            id: id.clone(),
+            host,
+            seq: 0,
+            job,
+        });
+    }
     let deadline = match timeout {
         super::args::Wait::For(wait) => Instant::now().checked_add(wait),
         super::args::Wait::Forever => None,
     };
     let began = Instant::now();
-    let mut shown = Progress::new(format!("waiting for job {id}…"), progress);
-    let mut seq = 0;
+    let label = match ids {
+        [id] => format!("waiting for job {id}…"),
+        _ => format!("waiting for {} jobs…", ids.len()),
+    };
+    let mut shown = Progress::new(label, progress);
     loop {
+        let waiting = followed.iter().filter(|job| job.waiting()).count();
+        if waiting == 0 {
+            return waited(followed);
+        }
         let left = deadline.map_or(Duration::MAX, |deadline| {
             deadline.saturating_duration_since(Instant::now())
         });
-        let reply = host.wait(id, seq, left.min(Duration::from_secs(1)))?;
-        seq = reply["seq"].as_u64().unwrap_or(seq);
-        let job = reply["job"].clone();
-        if ended(&job) {
-            return finished(job);
+        // Each job in turn, so one that ends is seen within a second.
+        let turn =
+            (left.min(Duration::from_secs(1)) / waiting as u32).max(Duration::from_millis(1));
+        for job in followed.iter_mut().filter(|job| job.waiting()) {
+            let host = job.host.as_ref().expect("a job waited for runs");
+            let reply = host.wait(&job.id, job.seq, turn)?;
+            job.seq = reply["seq"].as_u64().unwrap_or(job.seq);
+            job.job = reply["job"].clone();
         }
-        shown.show(&job, began);
+        let Some(first) = followed.iter().find(|job| job.waiting()) else {
+            return waited(followed);
+        };
+        shown.show(&first.job, began);
         if left.is_zero() {
-            return Err(Categorized::new(
-                ErrorKind::Timeout,
-                format!(
-                    "job {id} is still {}",
-                    job["state"].as_str().unwrap_or("running")
-                ),
-            )
-            .hint(format!("wait again with capturefab jobs wait {id}"))
-            .details(json!({ "job": job }))
-            .into());
+            return Err(still_running(&followed));
         }
         if super::signals::interrupted() {
-            return Err(
-                Categorized::new(ErrorKind::Interrupted, "interrupted; the job runs on")
-                    .details(json!({ "job": job }))
-                    .into(),
-            );
+            let message = match ids {
+                [_] => "interrupted; the job runs on",
+                _ => "interrupted; the jobs run on",
+            };
+            return Err(Categorized::new(ErrorKind::Interrupted, message)
+                .details(followed_details(&followed))
+                .into());
         }
     }
+}
+
+/// `{job}` for one job followed, `{jobs}` for several.
+fn followed_details(followed: &[Followed]) -> Value {
+    match followed {
+        [one] => json!({ "job": one.job }),
+        _ => json!({ "jobs": followed.iter().map(|job| &job.job).collect::<Vec<_>>() }),
+    }
+}
+
+/// The jobs that have all ended: the result when every one is done, else
+/// the first that is not as its own error.
+fn waited(followed: Vec<Followed>) -> Result<Report> {
+    if let [one] = followed.as_slice() {
+        return finished(one.job.clone());
+    }
+    let details = followed_details(&followed);
+    let jobs = followed.into_iter().map(|job| job.job).collect::<Vec<_>>();
+    if let Some(failed) = jobs.iter().find(|job| job["state"] != "done") {
+        return match finished(failed.clone()) {
+            Ok(_) => unreachable!("only a done job is a result"),
+            Err(error) => Err(crate::types::with_details(error, details)),
+        };
+    }
+    let mut text = String::new();
+    for job in &jobs {
+        let _ = writeln!(text, "{}", line(job));
+    }
+    Ok(Report::json(json!({ "jobs": jobs })).text(text))
+}
+
+/// The timeout of a wait that ran out with jobs running.
+fn still_running(followed: &[Followed]) -> anyhow::Error {
+    let running = followed
+        .iter()
+        .filter(|job| job.waiting())
+        .map(|job| job.id.as_str())
+        .collect::<Vec<_>>();
+    let message = match followed {
+        [one] => format!(
+            "job {} is still {}",
+            one.id,
+            one.job["state"].as_str().unwrap_or("running")
+        ),
+        _ => format!(
+            "{} of {} jobs are still running: {}",
+            running.len(),
+            followed.len(),
+            running.join(", ")
+        ),
+    };
+    Categorized::new(ErrorKind::Timeout, message)
+        .hint(format!(
+            "wait again with capturefab jobs wait {}, or look without waiting with capturefab jobs list {}",
+            running.join(" "),
+            running.join(" ")
+        ))
+        .details(followed_details(followed))
+        .into()
 }
 
 /// How far a job is: how long it has run, and how long it has left or
@@ -485,20 +622,30 @@ pub const LIST_FIELDS: &[(&str, &str)] = &[(
     concat!(
         "[",
         job_row!(),
-        "] — every running session's, and those of a session that died, as lost"
+        "] — every running session's, and those of a session that died, as lost; with IDs, those jobs in that order; with --running, only those that have not ended"
     ),
 )];
 pub const STOP_FIELDS: &[(&str, &str)] = &[(
     "stopped",
     concat!("[", job_row!(), "] — the jobs as they are after stopping"),
 )];
-pub const WAIT_FIELDS: &[(&str, &str)] = &[(
-    "job",
-    concat!(
-        job_row!(),
-        " — done; a failed job exits with its own error code and details.job"
+pub const WAIT_FIELDS: &[(&str, &str)] = &[
+    (
+        "job",
+        concat!(
+            job_row!(),
+            " — with one ID: done; a failed job exits with its own error code and details.job"
+        ),
     ),
-)];
+    (
+        "jobs",
+        concat!(
+            "[",
+            job_row!(),
+            "] — with several IDs, in the order given, once all have ended: all done; else the first that is not exits with its own error code, and details.jobs holds them all"
+        ),
+    ),
+];
 
 #[cfg(test)]
 mod tests {

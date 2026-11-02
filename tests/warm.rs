@@ -489,3 +489,56 @@ fn a_live_stream_decodes_only_while_frames_are_needed_and_a_moment_after() {
         assert_eq!(state(), "idle");
     }
 }
+
+/// A camera command that finds the auto session ending, as when its idle
+/// time ran out or `session stop` was given, opens its camera itself, as
+/// where no session can start, instead of failing with the session.
+#[cfg(unix)]
+#[test]
+fn a_command_goes_on_without_an_auto_session_that_is_ending() {
+    let home = Home::new("warm-ending");
+    home.warm(&["--json", "get", "-c", "sim:1", "Width"])
+        .success();
+    let status = home
+        .run_stdin(
+            r#"{"op":"status"}"#,
+            &["--json", "--session", "auto", "debug", "rpc"],
+        )
+        .success();
+    let worker = status["cameras"][0]["worker_pid"].as_i64().unwrap() as i32;
+    let signal = |signal| {
+        // SAFETY: kill only sends a signal to a worker this test started.
+        assert_eq!(unsafe { libc::kill(worker, signal) }, 0);
+    };
+    // A stopped worker keeps the session ending for as long as it takes.
+    signal(libc::SIGSTOP);
+    let mut stop = home
+        .command()
+        .args(["--json", "session", "stop", "auto"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let asked = home.run_stdin(
+            r#"{"op":"status"}"#,
+            &["--json", "--session", "auto", "debug", "rpc"],
+        );
+        if asked.code != Some(0) && asked.stdout.contains("stopping") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the session did not start ending"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The camera it held, and one it did not.
+    for camera in ["sim:1", "sim:2"] {
+        let got = home.warm(&["--json", "get", "-c", camera, "Width"]);
+        assert_eq!(got.success()["values"]["Width"], 640, "{camera}");
+    }
+    signal(libc::SIGCONT);
+    assert!(stop.wait().unwrap().success());
+    assert!(sessions(&home).is_empty());
+}

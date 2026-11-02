@@ -30,8 +30,8 @@ pub struct InspectArgs {
     /// The preview's longest edge in pixels, 64..2048
     #[arg(long, default_value_t = 768, value_name = "PX", value_parser = clap::value_parser!(u32).range(64..=2048))]
     pub size: u32,
-    /// Frames to let pass after the first one exposed after the last settings change, 0..9
-    #[arg(long, default_value_t = 0, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=9))]
+    /// Frames to let pass after the first one exposed after the last settings change, 0..10
+    #[arg(long, default_value_t = 0, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=10))]
     pub fresh: u32,
     /// How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped
     #[arg(long, value_name = "DUR", value_parser = super::args::wait)]
@@ -117,9 +117,9 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
         if samples > MAX_SAMPLES {
             return Err(Usage(format!(
                 "--for {} --every {} takes {samples} samples; at most {MAX_SAMPLES}: use --every {}",
-                super::args::duration_text(duration),
-                super::args::duration_text(every),
-                super::args::duration_text(Duration::from_millis(
+                crate::types::duration_text(duration),
+                crate::types::duration_text(every),
+                crate::types::duration_text(Duration::from_millis(
                     millis(duration).div_ceil(MAX_SAMPLES - 1)
                 ))
             ))

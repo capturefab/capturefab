@@ -186,6 +186,11 @@ impl Shared {
         Self::locked(quit).get_or_insert(why);
         changed.notify_all();
     }
+    /// Whether the session is ending: it answers until its cameras are
+    /// let go, but takes no more use.
+    fn quitting(&self) -> bool {
+        Self::locked(&self.quit.0).is_some()
+    }
     /// Keep the session at least `keep` after its last use; a session that
     /// never idles out stays that way.
     fn keep(&self, keep: Duration) {
@@ -801,6 +806,12 @@ fn answer(
         );
         shared.quit(Quit::Stop);
         return Ok(json!({"stopping":true}));
+    }
+    // A session that is ending takes no keep and holds no camera for a
+    // command about to use it: told so, a client that did not choose this
+    // session goes on without it, as when it is gone.
+    if request.command.is_none() && shared.quitting() {
+        return Err(crate::session::stopping());
     }
     if let Some(keep) = keep {
         shared.keep(keep);
@@ -1737,6 +1748,36 @@ mod tests {
         assert!(snapshot.cameras.is_empty());
         drop(server);
         assert!(!descriptor_path_in(&dir.0, "bench").unwrap().exists());
+        handle.shutdown();
+    }
+    #[test]
+    fn a_session_that_is_ending_takes_no_keep_and_holds_no_camera() {
+        let dir = TestDir::new();
+        let handle = SessionHandle::new();
+        let server = Server::start_in(handle.clone(), "ending", &dir.0, None).unwrap();
+        let descriptor = read_descriptor_in(&dir.0, "ending").unwrap();
+        let keep = |camera: Option<&str>| {
+            send(
+                &descriptor,
+                Request {
+                    camera: camera.map(str::to_owned),
+                    keep_ms: Some(60_000),
+                    ..Request::to(&descriptor)
+                },
+                Duration::from_secs(2),
+            )
+        };
+        keep(None).unwrap();
+        server.quitter().quit(Quit::Stop);
+        // As it lets its cameras go, it still answers, but a client that
+        // would keep it, or use a camera it holds, is told it is stopping,
+        // and goes on without it.
+        for camera in [None, Some("sim:0")] {
+            let error = keep(camera).unwrap_err();
+            assert!(crate::session::is_stopping(&error), "{error:#}");
+        }
+        assert!(descriptor_active(&descriptor));
+        drop(server);
         handle.shutdown();
     }
     #[test]

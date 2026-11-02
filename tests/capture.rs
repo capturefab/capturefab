@@ -241,6 +241,31 @@ fn several_cameras_capture_at_once() {
         &["capture", "-c", "sim:0", "-c", "sim:1", "-o", "same.png"],
     );
     assert!(one_file["message"].as_str().unwrap().contains("{camera}"));
+    // A template whose names do not say the camera is refused the same way
+    // before anything is saved: with {frame} or {date} the cameras would
+    // take each other's names, and with {seq} share one sequence.
+    for shared in [
+        "shared/{frame}.png",
+        "shared/{seq}.png",
+        "shared/{date}.png",
+    ] {
+        let refused = home.fails(2, &["capture", "-c", "sim:0", "-c", "sim:1", "-o", shared]);
+        assert!(
+            refused["message"].as_str().unwrap().contains("{serial}"),
+            "{refused}"
+        );
+    }
+    assert!(!home.path("shared").exists());
+    let serials = home.ok(&[
+        "capture",
+        "-c",
+        "sim:0",
+        "-c",
+        "sim:1",
+        "-o",
+        "by-serial/{serial}-{seq}.png",
+    ]);
+    assert_eq!(serials["cameras"].as_array().unwrap().len(), 2);
     // A camera that fails is reported beside the ones that worked.
     let failed = home.fails(3, &["capture", "-c", "sim:0", "-c", "sim9", "-o", "mixed/"]);
     let shown = failed["details"]["cameras"].as_array().unwrap();
@@ -1152,6 +1177,87 @@ fn progress_lines_say_how_far_a_capture_is() {
     let waited = home.run(&["--json", "jobs", "wait", id, "--progress"]);
     assert_eq!(waited.success()["job"]["state"], "done");
     assert!(!progress(&waited.stderr).is_empty(), "{}", waited.stderr);
+}
+
+/// The jobs a capture of several cameras leaves running are looked at
+/// without waiting (`jobs list ID...`, `--running`) and waited for together
+/// (`jobs wait ID...`).
+#[test]
+fn several_background_jobs_are_listed_and_waited_for_together() {
+    let home = Home::new("jobs-several");
+    let _session = home.serve("bench", &["sim:0", "sim:1"]);
+    let one = home.ok(&[
+        "--session",
+        "bench",
+        "capture",
+        "-c",
+        "sim:0",
+        "-o",
+        "one.png",
+    ]);
+    assert_eq!(one["count"], 1, "{one}");
+    let started = home.ok(&[
+        "--session",
+        "bench",
+        "capture",
+        "-c",
+        "sim:0",
+        "-c",
+        "sim:1",
+        "-n",
+        "3",
+        "--every",
+        "1s",
+        "--background",
+        "-o",
+        "lapse/",
+    ]);
+    let ids = started["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    // The cameras are armed together, so either may be numbered first.
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(sorted, ["bench-2", "bench-3"], "{started}");
+    let ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
+    // Named jobs, in the order asked, as they are now: a check that a
+    // running job is no error.
+    let listed = home.ok(&[&["jobs", "list", ids[1], "bench-1"][..]].concat());
+    let listed = listed["jobs"].as_array().unwrap();
+    assert_eq!(listed[0]["id"], ids[1]);
+    assert_eq!(listed[1]["state"], "done");
+    let running = home.ok(&["jobs", "list", "--running"]);
+    let running = running["jobs"].as_array().unwrap();
+    assert!(
+        running.iter().all(|job| job["state"] != "done"),
+        "{running:?}"
+    );
+    assert!(!running.iter().any(|job| job["id"] == "bench-1"));
+    assert_eq!(home.fails(2, &["jobs", "list", "bench-9"])["code"], "usage");
+    // Waiting for both runs out while they run, naming those that do.
+    let early = home.fails(
+        4,
+        &[&["jobs", "wait"][..], &ids, &["--timeout", "0"]].concat(),
+    );
+    assert_eq!(early["code"], "timeout");
+    assert_eq!(early["details"]["jobs"].as_array().unwrap().len(), 2);
+    assert!(
+        early["hint"].as_str().unwrap().contains("jobs list"),
+        "{early}"
+    );
+    let waited = home.ok(&[&["jobs", "wait"][..], &ids].concat());
+    let waited = waited["jobs"].as_array().unwrap();
+    assert_eq!(waited.len(), 2);
+    for (job, id) in waited.iter().zip(&ids) {
+        assert_eq!(job["id"], *id);
+        assert_eq!(job["state"], "done");
+        assert_eq!(job["saved"], 3);
+    }
+    // One ID keeps its own shape.
+    assert_eq!(home.ok(&["jobs", "wait", ids[0]])["job"]["id"], ids[0]);
 }
 
 /// A JPEG still of a Motion JPEG source is the JPEG it sent, as it was,

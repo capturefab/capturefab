@@ -507,6 +507,19 @@ impl Plan {
             Plan::Stdout | Plan::Directory { .. } => false,
         }
     }
+    /// Whether each camera's frames get names of their own: a folder's
+    /// names, or a template with {camera} or {serial}.
+    pub fn names_camera(&self) -> bool {
+        match self {
+            Plan::Directory { .. } => true,
+            Plan::Template(t) => tokens(t).is_ok_and(|tokens| {
+                tokens
+                    .iter()
+                    .any(|t| matches!(t, Token::Camera | Token::Serial))
+            }),
+            Plan::Stdout | Plan::File(_) => false,
+        }
+    }
     fn describe(&self) -> String {
         match self {
             Plan::Stdout => "-".into(),
@@ -1263,6 +1276,18 @@ mod tests {
             Plan::Template("{tag:label}/x.png".into())
         );
         assert!(!Plan::new("{tag:label}/x.png", 1, "png").is_static());
+        // Several cameras each need names of their own.
+        for (output, own) in [
+            ("{camera}-{seq}.png", true),
+            ("by/{serial}/{frame}.png", true),
+            ("frames/", true),
+            ("{seq}.png", false),
+            ("{frame}.png", false),
+            ("{tag:label}-{date}.png", false),
+            ("x.png", false),
+        ] {
+            assert_eq!(Plan::new(output, 1, "png").names_camera(), own, "{output}");
+        }
     }
 
     #[test]

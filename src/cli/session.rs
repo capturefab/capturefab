@@ -188,6 +188,8 @@ pub(super) fn ensure(
             // It ended unused just now: start another once it is gone.
             Err(error) if super::session_gone(&error) => {
                 if !ipc::wait_ended(name, ENDING) {
+                    // Still stopping, as `stopping()` says: the warm
+                    // default goes on without a session.
                     return Err(Categorized::new(
                         ErrorKind::Timeout,
                         format!("session {name} is still ending"),
@@ -195,6 +197,7 @@ pub(super) fn ensure(
                     .hint(format!(
                         "try again, or stop it with capturefab session stop {name}"
                     ))
+                    .details(json!({"session": "stopping"}))
                     .into());
                 }
             }
@@ -320,7 +323,7 @@ fn detach(
     let mut command = Command::new(executable);
     command
         .args(["--json", "serve", "--name", name, "--idle"])
-        .arg(super::args::duration_text(idle));
+        .arg(crate::types::duration_text(idle));
     // The cameras go on its stdin: an address may hold a password, and a
     // process's arguments are there for every user of the machine to read
     // for as long as it runs.
@@ -333,7 +336,7 @@ fn detach(
     if let Some(keep) = camera_keep {
         command
             .arg("--camera-keep")
-            .arg(super::args::duration_text(keep));
+            .arg(crate::types::duration_text(keep));
     }
     for variable in [
         "CAPTUREFAB_SESSION",
@@ -381,7 +384,7 @@ fn detach(
                 ErrorKind::Timeout,
                 format!(
                     "session {name} did not start within {}",
-                    super::args::duration_text(wait)
+                    crate::types::duration_text(wait)
                 ),
             )
             .hint(see_log(name))
@@ -556,7 +559,7 @@ fn stop(global: &Global, name: Option<String>) -> Result<Report> {
             ErrorKind::Timeout,
             format!(
                 "session {name} is still finishing after {}",
-                super::args::duration_text(STOP_WAIT)
+                crate::types::duration_text(STOP_WAIT)
             ),
         )
         .hint(see_log(&name))
@@ -639,7 +642,7 @@ fn status(global: &Global, name: Option<String>) -> Result<Report> {
     let mut text = format!(
         "Session {name} (pid {}, up {}):\n",
         descriptor.pid,
-        crate::scheduling::format_duration(uptime(&descriptor) * 1000)
+        crate::types::duration_text(Duration::from_secs(uptime(&descriptor)))
     );
     if cameras.is_empty() {
         text.push_str("  no cameras\n");

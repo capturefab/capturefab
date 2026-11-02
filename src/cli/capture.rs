@@ -99,7 +99,7 @@ pub struct CaptureArgs {
     /// file: each file reaches the disk before it is reported; none: skip that, for scratch captures
     #[arg(long, value_enum, default_value_t = crate::storage::SyncMode::File)]
     pub sync: crate::storage::SyncMode,
-    /// Leave the capture running in a session and print its job at once
+    /// Leave the capture running in a session; print its job once it is armed or has saved its first frame (up to --timeout; with --timeout none, after 2s without waiting for a trigger)
     #[arg(long)]
     pub background: bool,
     #[command(flatten)]
@@ -350,14 +350,14 @@ pub fn run(global: &Global, args: CaptureArgs) -> Result<Option<Report>> {
         [] => vec![None],
         cameras => cameras.iter().map(|camera| Some(camera.as_str())).collect(),
     };
+    // Cameras sharing names would take each other's ({frame}, {date}) or
+    // share one sequence ({seq}), so no name would say which took a file.
     if cameras.len() > 1
-        && matches!(
-            crate::naming::Plan::new(&plan.output, plan.count, plan.format),
-            crate::naming::Plan::File(_)
-        )
+        && !crate::naming::Plan::new(&plan.output, plan.count, plan.format).names_camera()
     {
         return Err(Usage(
-            "several cameras need {camera} in -o, or a folder, so each saves its own files".into(),
+            "several cameras need {camera} or {serial} in -o, or a folder, so each saves its own files"
+                .into(),
         )
         .into());
     }

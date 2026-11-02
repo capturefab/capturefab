@@ -100,8 +100,10 @@ commands, so repeated calls skip connecting and starting the stream:
   alone, as does a computer without a writable runtime folder. Results are the same either way.
 - `capturefab shell` runs many commands with the cameras kept connected: a prompt with history and
   Tab completion in a terminal, or one command per line of stdin (or `-e`), one result per line.
-- `capture --background` and `record --background` return a job at once. `capturefab jobs` lists
-  jobs, `jobs wait ID` waits for one and `jobs stop ID` ends it; files saved so far stay.
+- `capture --background` and `record --background` return a job once it is armed or has its
+  first frame, which on a triggered camera waits for a trigger up to `--timeout`: add
+  `--timeout none` to return without one. `capturefab jobs` lists jobs (`jobs list ID` one of
+  them), `jobs wait ID...` waits for them and `jobs stop ID` ends one; files saved so far stay.
 - `capturefab session start -c CAM --live` starts a named session in the background, and
   `capturefab serve` runs one in the foreground, for example under systemd (see the
   [line computer guide](docs/line-computer.md)). Commands use a session that holds their camera
@@ -193,8 +195,8 @@ or use `--no-session` for a command to use other values. A command's own `CAPTUR
 raises the free-space floor for the files a session writes for it, but does not lower the floor
 the session started with.
 
-`capturefab --json doctor` prints the folders in use (`dirs`, and under `folders` the fallbacks
-it passed over), including the private folder that holds `inspect` previews, the JPEG encoders
+`capturefab --json doctor` prints the folders in use and the fallbacks it passed over
+(`folders`), the private folder that holds `inspect` previews (`inspect_dir`), the JPEG encoders
 (`jpeg`) and the hardware decoding methods that work here (`hwdec`). Where a default
 folder cannot be written, as on a read-only root file system, Capturefab falls back to a private
 folder in a tmpfs and turns off only what needs the missing folder; see

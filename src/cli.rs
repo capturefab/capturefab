@@ -261,6 +261,7 @@ pub enum Command {
 pub fn main() -> i32 {
     let args = std::env::args_os().collect::<Vec<_>>();
     let json = output::json_requested(&args);
+    let args = help_words(args, json);
     let mut command = Cli::command();
     let matches = match command.try_get_matches_from_mut(&args) {
         Ok(matches) => matches,
@@ -295,6 +296,56 @@ pub fn main() -> i32 {
         Ok(None) => 0,
         Err(error) => out.error(&error),
     }
+}
+
+/// `capturefab [GROUP] help [COMMAND...]`, which people and agents try
+/// first, as `COMMAND --help`; with --json as `schema COMMAND`, the help
+/// an agent reads as JSON. Any other arguments are left as they are.
+fn help_words(args: Vec<std::ffi::OsString>, json: bool) -> Vec<std::ffi::OsString> {
+    let mut command = Cli::tree();
+    // The words naming a command group before `help`, such as `session`.
+    let mut groups = Vec::new();
+    let mut index = 1;
+    while let Some(arg) = args.get(index).and_then(|arg| arg.to_str()) {
+        if arg == "--session" {
+            index += 2;
+            continue;
+        }
+        if arg == "--" || !command.has_subcommands() {
+            break;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        if arg == "help" && command.find_subcommand(arg).is_none() {
+            let (before, after) = (&args[..index], &args[index + 1..]);
+            if !json {
+                let mut words = [before, after].concat();
+                words.push("--help".into());
+                return words;
+            }
+            let mut words = before
+                .iter()
+                .enumerate()
+                .filter(|(at, _)| !groups.contains(at))
+                .map(|(_, arg)| arg.clone())
+                .collect::<Vec<_>>();
+            words.push("schema".into());
+            words.extend(groups.iter().map(|at| args[*at].clone()));
+            words.extend_from_slice(after);
+            return words;
+        }
+        match command.find_subcommand(arg) {
+            Some(sub) => {
+                command = sub.clone();
+                groups.push(index);
+                index += 1;
+            }
+            None => break,
+        }
+    }
+    args
 }
 
 /// The command `matches` names, with its subcommands: `preset apply`.
@@ -657,20 +708,30 @@ impl Client {
             }
             route = route.cold();
         }
-        if route.needs_session() {
-            let selector = match selector {
-                Some(selector) => selector,
-                None => default_camera(out)?,
-            };
-            let started = session::ensure(AUTO_SESSION, Some(&selector), route.idle(), global)?;
-            let found = Found::of(started);
-            return Self::in_session(out, AUTO_SESSION, Some(selector), route, since_ms, found)
-                .map_err(Unusable::error);
-        }
         let selector = match selector {
             Some(selector) => selector,
             None => default_camera(out)?,
         };
+        if route.needs_session() {
+            let started = session::ensure(AUTO_SESSION, Some(&selector), route.idle(), global);
+            let found = match started {
+                Ok(started) => Some(Found::of(started)),
+                // The auto session is ending, as when its idle time ran out
+                // just now: the warm default opens the camera in this
+                // command instead, as where no session can start.
+                Err(error) if route.warm && session_gone(&error) => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(found) = found {
+                let selector = Some(selector.clone());
+                match Self::in_session(out, AUTO_SESSION, selector, route, since_ms, found) {
+                    Ok(client) => return Ok(client),
+                    Err(Unusable::Gone(_)) if route.warm => {}
+                    Err(unusable) => return Err(unusable.error()),
+                }
+            }
+            route = route.cold();
+        }
         crate::camera::validate_selector(&selector)?;
         if let Some(held) = HELD.get().filter(|_| !route.stdout) {
             return Self::held(out, held, selector, route, since_ms);

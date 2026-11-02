@@ -324,8 +324,6 @@ impl Facts {
 /// it runs. `warm_sessions`: whether a camera command can start a session.
 pub fn report(warm_sessions: bool) -> Value {
     let facts = Facts::gather(true, Some(warm_sessions));
-    let path = |folder: &Folder| folder.place.as_ref().map(|place| place.path.clone());
-    let runtime = path(&facts.runtime);
     let mut report = json!({
         "checks": checks(&facts),
         "version": env!("CARGO_PKG_VERSION"),
@@ -341,12 +339,7 @@ pub fn report(warm_sessions: bool) -> Value {
             "shell": cfg!(feature = "shell"),
         },
         "jpeg": crate::jpeg::backend::report(),
-        "dirs": {
-            "inspect": crate::dirs::scratch().ok().map(|dir| dir.join("inspect")),
-            "runtime": runtime,
-            "state": path(&facts.state),
-            "cache": path(&facts.cache),
-        },
+        "inspect_dir": crate::dirs::scratch().ok().map(|dir| dir.join("inspect")),
         "folders": {
             "runtime": facts.runtime.json(),
             "state": facts.state.json(),

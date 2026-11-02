@@ -484,12 +484,12 @@ fn missing_frame(c: &mut Camera, wait: Duration) -> anyhow::Error {
 
 /// An inspection without a frame; "timed out" makes the CLI exit 4.
 pub(super) fn no_new_frame(camera: &str, wait: Duration) -> anyhow::Error {
-    // Rounded up, so a deadline set for 3 s just before reads "3 s".
+    // Rounded up, so a deadline set for 3s just before reads "3s".
     let ms = u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
     crate::types::frame_timeout(format!(
         "no new frame from {} within {} (timed out); a triggered camera needs TriggerSoftware",
         crate::media::redact_url(camera),
-        crate::scheduling::format_duration(ms)
+        crate::types::duration_text(Duration::from_millis(ms))
     ))
 }
 
@@ -767,7 +767,7 @@ mod tests {
         let error = no_new_frame("rtsp://user:secret@cam/live", Duration::from_millis(3000));
         assert_eq!(
             error.to_string(),
-            "no new frame from rtsp://<redacted>@cam/live within 3 s (timed out); a triggered camera needs TriggerSoftware"
+            "no new frame from rtsp://<redacted>@cam/live within 3s (timed out); a triggered camera needs TriggerSoftware"
         );
         assert_eq!(crate::cli::error_code(&error), ("frame_timeout", 4));
     }

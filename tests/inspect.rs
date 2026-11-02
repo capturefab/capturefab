@@ -66,7 +66,7 @@ fn inspect_measures_a_fresh_frame_and_leaves_a_private_preview() {
     }
     // doctor names the folder, so a person can allow reading it once.
     let doctor = home.ok(&["doctor"]);
-    assert_eq!(doctor["dirs"]["inspect"], json!(preview.parent().unwrap()));
+    assert_eq!(doctor["inspect_dir"], json!(preview.parent().unwrap()));
     // No captures are saved.
     assert_eq!(std::fs::read_dir(&home.work).unwrap().count(), 0);
     // A preview where it was asked for, never over a file.

@@ -559,13 +559,13 @@ fn number_text(value: f64) -> String {
     }
 }
 
-/// An exposure time in µs as a duration `set` takes back.
-fn duration_text(us: f64) -> String {
-    if us >= 1000.0 && (us / 1000.0).fract() == 0.0 {
-        format!("{}ms", number_text(us / 1000.0))
-    } else {
-        format!("{}us", number_text(us))
-    }
+/// `amount` of time `unit` (`us`, `ms`, `s`, `ns`) as a duration `set`
+/// takes back, to the nanosecond; None for any other unit.
+fn time_text(amount: f64, unit: &str) -> Option<String> {
+    let per_second = in_time_unit(Duration::from_secs(1), unit)?;
+    let nanos = (amount * 1e9 / per_second).round();
+    (nanos.is_finite() && nanos >= 0.0 && nanos <= u64::MAX as f64)
+        .then(|| crate::types::duration_text(Duration::from_nanos(nanos as u64)))
 }
 
 /// One write of a planned change.
@@ -1168,11 +1168,15 @@ fn out_of_range(named: &str, value: &str, min: Option<f64>, max: Option<f64>) ->
         (None, Some(max)) => format!("at most {}", number_text(max)),
         (None, None) => String::new(),
     };
+    let nearest = value.trim().parse::<f64>().ok().map(|number| {
+        let number = min.map_or(number, |min| number.max(min));
+        max.map_or(number, |max| number.min(max))
+    });
     Categorized::new(
         ErrorKind::OutOfRange,
         format!("{named} cannot be {value}: it takes {limit}"),
     )
-    .details(json!({"feature": named, "value": value, "min": min, "max": max}))
+    .details(json!({"feature": named, "value": value, "min": min, "max": max, "nearest": nearest}))
     .into()
 }
 
@@ -1260,7 +1264,11 @@ fn check(
                 && let Some(max) = outer_max(camera, feature, earlier)
                 && number > max
             {
-                return Err(out_of_range(&named, &value, None, Some(max)));
+                return Err(with_unit(
+                    camera,
+                    feature,
+                    out_of_range(&named, &value, None, Some(max)),
+                ));
             }
             Ok(Some(format!(
                 "{named}={value} is outside its current range; set checks it again after the writes before it"
@@ -1271,23 +1279,55 @@ fn check(
     }
 }
 
-/// Add the feature's unit to an out-of-range error's details.
+/// Add the feature's unit to an out-of-range error's details, and a hint
+/// with the nearest value it takes, written so `set` takes it back: a time
+/// as a duration (`1s`, `10us`), which the exposure control and the feature
+/// both read, and a number in another unit with that unit beside it.
 fn with_unit(camera: &Camera, feature: &str, error: anyhow::Error) -> anyhow::Error {
     let classified = crate::types::classify(&error);
     if classified.kind != ErrorKind::OutOfRange {
         return error;
     }
     let mut details = classified.details.unwrap_or_else(|| json!({}));
-    if let Some(unit) = camera.feature_unit(feature) {
+    let unit = camera.feature_unit(feature).map(str::to_owned);
+    if let Some(unit) = &unit {
         details["unit"] = json!(unit);
     }
-    let nearest = details["nearest"].clone();
+    let hint = out_of_range_hint(&details, unit.as_deref());
     let mut categorized =
         Categorized::new(ErrorKind::OutOfRange, format!("{error:#}")).details(details);
-    if !nearest.is_null() {
-        categorized = categorized.hint(format!("the nearest accepted value is {nearest}"));
+    if let Some(hint) = hint {
+        categorized = categorized.hint(hint);
     }
     categorized.into()
+}
+
+/// What an out-of-range error with `details` (feature, min, max, nearest)
+/// tells a caller to send instead, for a feature in `unit`.
+fn out_of_range_hint(details: &Value, unit: Option<&str>) -> Option<String> {
+    let nearest = details["nearest"].as_f64()?;
+    let time = |value: f64| unit.and_then(|unit| time_text(value, unit));
+    let Some(nearest_time) = time(nearest) else {
+        return Some(match unit {
+            Some(unit) => format!(
+                "the nearest accepted value is {} ({unit})",
+                number_text(nearest)
+            ),
+            None => format!("the nearest accepted value is {}", number_text(nearest)),
+        });
+    };
+    let mut hint = format!("the nearest accepted value is {nearest_time}");
+    let feature = details["feature"].as_str().unwrap_or("it");
+    match (
+        details["min"].as_f64().and_then(time),
+        details["max"].as_f64().and_then(time),
+    ) {
+        (Some(min), Some(max)) => hint.push_str(&format!("; {feature} takes {min} to {max}")),
+        (Some(min), None) => hint.push_str(&format!("; {feature} takes {min} or more")),
+        (None, Some(max)) => hint.push_str(&format!("; {feature} takes up to {max}")),
+        (None, None) => {}
+    }
+    Some(hint)
 }
 
 /// One row of a change: what it was and what it is now.
@@ -1561,9 +1601,7 @@ fn control_value(camera: &mut Camera, control: &str) -> Result<Value> {
                 .ok_or_else(|| unsupported(camera, control, "exposure"))?;
             let unit = camera.feature_unit(feature).unwrap_or("us").to_owned();
             let value = read_f64(camera, feature)?;
-            let us = in_time_unit(Duration::from_secs(1), &unit)
-                .map_or(value, |per_second| value * 1e6 / per_second);
-            json!(duration_text(us))
+            json!(time_text(value, &unit).unwrap_or_else(|| time_text(value, "us").unwrap()))
         }
         "gain" => {
             let feature = first_present(camera, &GAIN)
@@ -2323,6 +2361,38 @@ mod tests {
         assert_eq!(camera.get("TriggerSelector").unwrap(), "FrameStart");
         let values = get(&mut camera, &[Name::parse("trigger").unwrap()]).unwrap();
         assert_eq!(values["trigger"], "line0:falling");
+    }
+
+    #[test]
+    fn an_exposure_out_of_range_says_the_nearest_as_a_duration_set_takes() {
+        let mut camera = sim();
+        for (asked, nearest) in [("exposure=5s", "1s"), ("exposure=1us", "10us")] {
+            let error = set(&mut camera, &[assign(asked)], false).unwrap_err();
+            let classified = crate::types::classify(&error);
+            assert_eq!(classified.kind, ErrorKind::OutOfRange, "{error:#}");
+            let details = classified.details.unwrap();
+            assert_eq!(details["unit"], "us");
+            assert_eq!(
+                classified.hint.unwrap(),
+                format!("the nearest accepted value is {nearest}; ExposureTime takes 10us to 1s")
+            );
+            // What the hint says is what set takes, for the control and
+            // for the feature, and it lands on the bound in microseconds.
+            for name in ["exposure", "ExposureTime"] {
+                set(&mut camera, &[assign(&format!("{name}={nearest}"))], false).unwrap();
+                assert_eq!(
+                    camera.get("ExposureTime").unwrap(),
+                    details["nearest"],
+                    "{name}={nearest}"
+                );
+            }
+        }
+        // A number in another unit keeps it beside the number.
+        let error = set(&mut camera, &[assign("Gain=99")], false).unwrap_err();
+        assert_eq!(
+            crate::types::classify(&error).hint.unwrap(),
+            "the nearest accepted value is 24 (dB)"
+        );
     }
 
     #[test]
