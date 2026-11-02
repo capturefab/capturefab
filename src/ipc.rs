@@ -1572,7 +1572,29 @@ pub(crate) fn process_alive(pid: u32) -> bool {
         let sent = unsafe { libc::kill(pid, 0) };
         sent == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError, WAIT_TIMEOUT},
+            System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+        };
+        // SAFETY: the handle opened is only waited on, without waiting,
+        // and closed.
+        unsafe {
+            let process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+            if process.is_null() {
+                // One this user may not open runs all the same; a pid
+                // that names no process is an invalid parameter.
+                return GetLastError() == ERROR_ACCESS_DENIED;
+            }
+            // A process that exited is still there while a handle to it
+            // is open, signalled.
+            let running = WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+            CloseHandle(process);
+            running
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         true
@@ -1969,6 +1991,19 @@ mod tests {
         drop(claims);
         assert!(!descriptor_path_in(&dir.0, "stale").unwrap().exists());
         handle.shutdown();
+    }
+    #[test]
+    fn a_process_lives_until_it_exits() {
+        assert!(process_alive(std::process::id()));
+        // This test program, listing none of its tests, ends at once.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--list", "--exact", "no-test-has-this-name"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success());
+        assert!(!process_alive(pid));
     }
     #[test]
     fn rpc_deadline_bounds_a_response_that_trickles_bytes() {
