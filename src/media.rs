@@ -3787,21 +3787,32 @@ impl WriterQueue {
         let arrived = Duration::from_millis(self.arrived_ms.load(Ordering::Relaxed));
         self.epoch.elapsed().saturating_sub(arrived) >= STALL
     }
-    /// Wait until `slot` and a new frame. With `repeat` the slot alone is
-    /// enough, and `Some(None)` asks for the previous frame again. `None`
-    /// once the writer stops.
-    fn take(&self, slot: Instant, repeat: bool) -> Option<Option<Frame>> {
+    /// When the newest frame arrived.
+    fn arrived(&self) -> Instant {
+        self.epoch + Duration::from_millis(self.arrived_ms.load(Ordering::Relaxed))
+    }
+    /// Wait until `slot` and a new frame. From `repeat_from` on the slot
+    /// alone is enough, and `Some(None)` asks for the previous frame again.
+    /// `None` once the writer stops.
+    fn take(&self, slot: Instant, repeat_from: Option<Instant>) -> Option<Option<Frame>> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if !self.running.load(Ordering::Acquire) {
                 return None;
             }
-            let ready = repeat || state.latest.is_some();
-            let wait = slot.saturating_duration_since(Instant::now());
+            let now = Instant::now();
+            let ready = state.latest.is_some() || repeat_from.is_some_and(|from| now >= from);
+            let wait = slot.saturating_duration_since(now);
             if ready && wait.is_zero() {
                 return Some(state.latest.take());
             }
-            let wait = if ready { wait } else { Duration::from_secs(1) };
+            let wait = if ready {
+                wait
+            } else {
+                repeat_from.map_or(Duration::from_secs(1), |from| {
+                    from.saturating_duration_since(now).max(wait)
+                })
+            };
             state = self
                 .changed
                 .wait_timeout(state, wait)
@@ -3817,26 +3828,47 @@ impl WriterQueue {
             .get_or_insert(error);
     }
 }
+/// When a writer sends the last frame again on a slot without a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Repeat {
+    /// Never: FFmpeg stamps a recording's frames itself, so a stall leaves
+    /// a gap.
+    Never,
+    /// While the camera streams: GStreamer stamps frames by count.
+    UntilStalled,
+    /// Once no new frame has come for `KEEP_ALIVE`, on every slot after:
+    /// a stream's FFmpeg repeats frames to keep its rate (`-fps_mode cfr`),
+    /// but its receivers may drop a publisher silent for long.
+    AfterSilence,
+}
+/// How long a stream goes without a new frame before its writer sends the
+/// last one again.
+const KEEP_ALIVE: Duration = Duration::from_millis(500);
 /// The writer thread's loop, until the queue stops or a frame cannot be
 /// converted or written: on each slot of `interval`, the newest frame the
 /// queue holds goes to `input`, converted first where the encoder cannot
-/// read it. With `repeat` a slot without a new frame sends the last one
-/// again, while the camera streams or, with `through_stalls`, throughout.
-/// How many frames it took from the queue, each converted at most once.
+/// read it, and a slot without a new frame sends the last one again as
+/// `repeat` says. How many frames it took from the queue, each converted
+/// at most once.
 fn write_frames(
     shared: &WriterQueue,
     input: &mut impl Write,
     (raw, jetson): (RawInput, Option<JetsonInput>),
     interval: Duration,
-    (repeat, through_stalls): (bool, bool),
+    repeat: Repeat,
 ) -> u64 {
     let mut next = Instant::now();
     let mut last: Option<Frame> = None;
     let mut scratch = Scratch::default();
     let mut taken = 0;
     loop {
-        let again = repeat && last.is_some() && (through_stalls || !shared.stalled());
-        let Some(fresh) = shared.take(next, again) else {
+        let repeat_from = match repeat {
+            _ if last.is_none() => None,
+            Repeat::Never => None,
+            Repeat::UntilStalled => (!shared.stalled()).then(Instant::now),
+            Repeat::AfterSilence => Some(shared.arrived() + KEEP_ALIVE),
+        };
+        let Some(fresh) = shared.take(next, repeat_from) else {
             break;
         };
         if let Some(frame) = fresh {
@@ -3870,7 +3902,7 @@ fn write_frames(
             break;
         }
         shared.written.fetch_add(1, Ordering::Relaxed);
-        if !repeat {
+        if repeat == Repeat::Never {
             last = None;
         }
         // Slots stay on a fixed grid; a writer that fell behind skips the
@@ -4334,7 +4366,13 @@ fn select_encoder(
     }
     for candidate in encoder_candidates(family) {
         if !skip.iter().any(|failed| failed == candidate)
-            && usable(exe, candidate, width, height, Some(raw))?
+            && usable(
+                exe,
+                candidate,
+                width,
+                height,
+                Some(&raw.for_encoder(candidate)),
+            )?
         {
             return Ok(candidate.into());
         }
@@ -5007,6 +5045,10 @@ struct RawInput {
     yuv: Option<(&'static str, &'static str)>,
     /// Planar or semiplanar: the frame is its planes, not equal rows.
     planes: bool,
+    /// Samples narrowed to 8 bits in the pass that unpacks or widens them,
+    /// by this shift, for an encoder that keeps 8 bits (`for_encoder`):
+    /// `ffmpeg` and `bytes_per_pixel` then describe the 8-bit samples.
+    narrow: Option<u32>,
 }
 /// FFmpeg's planar and semiplanar Y'CbCr layouts.
 fn planes(pix_fmt: &str) -> bool {
@@ -5094,7 +5136,37 @@ impl RawInput {
                 _ => None,
             },
             planes: planes(ffmpeg),
+            narrow: None,
         })
+    }
+    /// What `encoder` reads: frames FFmpeg gets only after a pass that
+    /// unpacks or widens 10- to 16-bit samples (packed monochrome, and
+    /// Bayer mosaics deeper than 8 bits) are narrowed to 8 bits in that
+    /// pass for any encoder but FFV1, which keeps every bit: every other
+    /// encoder's input is 8-bit 4:2:0 or RGB, so the pipe and FFmpeg's
+    /// conversion take half the bytes. Samples keep their top 8 bits, as
+    /// stills do.
+    fn for_encoder(self, encoder: &str) -> Self {
+        let base = Self::for_format(self.pixel_format).unwrap_or(self);
+        if encoder == "ffv1"
+            || jetson_encoder(encoder)
+            || base.convert
+            || !(base.unpack || base.widen > 0)
+        {
+            return base;
+        }
+        match crate::frame::reduced(self.pixel_format)
+            .and_then(|(eight, shift)| Some((Self::for_format(eight).ok()?, shift)))
+        {
+            Some((eight, shift)) => Self {
+                ffmpeg: eight.ffmpeg,
+                bytes_per_pixel: 1,
+                widen: 0,
+                narrow: Some(shift),
+                ..base
+            },
+            None => base,
+        }
     }
     /// The pixel format FFmpeg reads these frames as for `encoder`: their
     /// own, except that FFV1 gets a Bayer mosaic as gray, which it stores
@@ -5163,7 +5235,7 @@ impl RawInput {
         if self.convert {
             return crate::frame::validate_source(frame);
         }
-        let needed = if self.unpack {
+        let needed = if self.unpack || self.narrow.is_some() {
             crate::frame::row_bytes(frame.width, frame.pixel_format)
                 .checked_mul(frame.height as usize)
                 .context("forwarding frame exceeds size limit")?
@@ -5181,7 +5253,7 @@ impl RawInput {
     }
     /// Whether FFmpeg reads a conversion of the frame rather than its bytes.
     fn converts(&self) -> bool {
-        self.convert || self.unpack || self.widen > 0
+        self.convert || self.unpack || self.widen > 0 || self.narrow.is_some()
     }
     /// Convert a checked `frame` into `scratch` when FFmpeg cannot read its
     /// bytes: packed samples are unpacked and widened in one pass a row at
@@ -5191,7 +5263,30 @@ impl RawInput {
             return Ok(());
         }
         let length = self.frame_len(frame.width, frame.height)?;
-        if self.convert {
+        if let Some(shift) = self.narrow {
+            scratch.resize(length, 0);
+            let width = frame.width as usize;
+            let eight = |sample: &[u8; 2]| (u16::from_le_bytes(*sample) >> shift).min(255) as u8;
+            match crate::frame::packing(frame.pixel_format) {
+                Some((_, bits, packing)) => {
+                    let row = crate::frame::row_bytes(frame.width, frame.pixel_format);
+                    let rows = frame.data[..row * frame.height as usize].chunks_exact(row);
+                    let mut samples = vec![[0; 2]; width];
+                    for (line, out) in rows.zip(scratch.chunks_exact_mut(width)) {
+                        crate::frame::unpack_row(line, bits, packing, &mut samples);
+                        for (value, sample) in out.iter_mut().zip(&samples) {
+                            *value = eight(sample);
+                        }
+                    }
+                }
+                None => {
+                    let source = frame.data[..2 * length].as_chunks::<2>().0;
+                    for (value, sample) in scratch.iter_mut().zip(source) {
+                        *value = eight(sample);
+                    }
+                }
+            }
+        } else if self.convert {
             let channels = if self.color {
                 crate::frame::Channels::Rgb
             } else {
@@ -5353,6 +5448,7 @@ impl Forwarder {
         let exe = executable()?;
         let skip = self.failed.as_slice();
         let encoder = select_encoder(&exe, &self.config, (width, height), &raw, skip)?;
+        let raw = raw.for_encoder(&encoder);
         let jetson = jetson_encoder(&encoder).then_some(if raw.color {
             JetsonInput::Rgba
         } else {
@@ -5420,8 +5516,8 @@ impl Forwarder {
             let input = encoder_input(&exe, &encoder, &raw, (width, height))?;
             let pix_fmt = raw.input_pix_fmt(&encoder);
             cmd.args(encoder_device_options(&encoder));
-            // Each frame is stamped when FFmpeg reads it and keeps that time
-            // in the output, so the file lasts as long as the recording did
+            // Each frame is stamped when FFmpeg reads it and a recording keeps
+            // that time in the output, so the file lasts as long as it did
             // even when frames arrive late, slower than `fps`, or not at all
             // for a while. Repeating frames instead would make FFmpeg encode
             // a whole outage's worth of copies at once when frames return.
@@ -5454,7 +5550,15 @@ impl Forwarder {
                 &((self.config.fps * 2.0).round().max(1.0) as u32).to_string(),
             ]);
             cmd.args(encoder_output_options(&encoder, input, pix_fmt));
-            cmd.args(["-fps_mode", "vfr"]);
+            if is_recording(&self.config.output) {
+                cmd.args(["-fps_mode", "vfr"]);
+            } else {
+                // A stream keeps its rate: FFmpeg repeats a frame for the
+                // slots it lasted, so the writer sends each one once, and
+                // the last again only after `KEEP_ALIVE` without one, so
+                // FFmpeg never has more than that to fill at once.
+                cmd.args(["-fps_mode", "cfr", "-r", &fps]);
+            }
             if matches!(encoder.as_str(), "libx264" | "libx265") {
                 let cores = cores();
                 let preset = x264_preset(width, height, self.config.fps, cores);
@@ -5593,21 +5697,13 @@ impl Forwarder {
         let writer = thread::spawn(move || {
             match input {
                 Input::Frames(raw, jetson) => {
-                    // FFmpeg stamps a recording's frames itself, so it gets
-                    // each new frame once, at most one per slot, and a stall
-                    // leaves a gap. GStreamer stamps frames by count, so the
-                    // Jetson writer sends one on every slot, repeating the
-                    // last until the camera stalls. A stream's receivers may
-                    // drop a silent publisher, so it gets the last picture
-                    // on every slot throughout.
-                    let (repeat, through_stalls) = (jetson.is_some() || !local, !local);
-                    write_frames(
-                        &shared,
-                        &mut input_pipe,
-                        (raw, jetson),
-                        interval,
-                        (repeat, through_stalls),
-                    );
+                    // Each new frame once, at most one per slot.
+                    let repeat = match (jetson, local) {
+                        (Some(_), _) => Repeat::UntilStalled,
+                        (None, true) => Repeat::Never,
+                        (None, false) => Repeat::AfterSilence,
+                    };
+                    write_frames(&shared, &mut input_pipe, (raw, jetson), interval, repeat);
                 }
                 Input::Copied(tap, feed) => {
                     tap.attach(feed.clone());
@@ -7048,6 +7144,34 @@ esac"#,
         );
         assert!(!fake.read("argv").contains(" -r "));
     }
+    /// A stream gets each new frame once while frames come, even slower
+    /// than its rate: FFmpeg repeats them to keep the rate.
+    #[test]
+    #[cfg(unix)]
+    fn streams_get_each_frame_once_and_ffmpeg_keeps_their_rate() {
+        let fake = Fake::new(
+            "cfr",
+            r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-encoders*) printf ' V....D libx264 x264 (codec h264)\n' ;;
+*"-f null"*) ;;
+*) cat > "$dir/encoded" ;;
+esac"#,
+        );
+        let mut forward = Forwarder::new(stream("libx264", 60.0)).unwrap();
+        for _ in 0..20 {
+            forward.push(tiny(8, 4)).unwrap();
+            thread::sleep(Duration::from_millis(40));
+        }
+        let stats = forward.stats();
+        forward.stop().unwrap();
+        assert_eq!((stats.accepted, stats.written), (20, 20), "{stats:?}");
+        assert_eq!(
+            fake.launches(&["-fps_mode cfr -r 60", "tcp://127.0.0.1:9"]),
+            1
+        );
+        assert_eq!(fake.read("encoded").len(), 20 * 8 * 4 * 3);
+    }
     #[test]
     #[cfg(unix)]
     fn streams_get_the_last_frame_again_through_a_stall() {
@@ -7604,6 +7728,67 @@ esac"#
         );
         assert!(jetson_encoder("nvv4l2h264enc") && !jetson_encoder("h264_nvenc"));
     }
+    /// Frames converted on their way to FFmpeg anyway, packed or wide, are
+    /// narrowed to 8 bits in that pass for an 8-bit encoder, as stills
+    /// reduce them; FFV1 keeps every bit and frames FFmpeg reads as they
+    /// are stay as they are.
+    #[test]
+    fn deep_frames_are_narrowed_for_eight_bit_encoders_in_their_one_pass() {
+        let (width, height) = (6u32, 4u32);
+        for (format, ffmpeg) in [
+            (0x010c_0047, "gray"),        // Mono12p
+            (0x010a_0046, "gray"),        // Mono10p
+            (0x010c_0006, "gray"),        // Mono12Packed
+            (0x010c_0059, "bayer_rggb8"), // BayerRG12p
+            (0x010a_0058, "bayer_rggb8"), // BayerRG10p
+            (0x0110_0011, "bayer_rggb8"), // BayerRG12
+            (0x0110_000d, "bayer_rggb8"), // BayerRG10
+        ] {
+            let frame = crate::frame::noise_frame(format, width, height);
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!(raw.for_encoder("ffv1"), raw, "{format:x}");
+            let narrowed = raw.for_encoder("libx264");
+            assert_eq!(
+                (narrowed.ffmpeg, narrowed.bytes_per_pixel),
+                (ffmpeg, 1),
+                "{format:x}"
+            );
+            assert_eq!(narrowed.input_pix_fmt("libx264"), ffmpeg);
+            assert_eq!(narrowed.pipe_len(width, height).unwrap(), 24);
+            // The top 8 bits of every sample, as a still keeps them.
+            let shift = crate::frame::reduced(format).unwrap().1;
+            let expected: Vec<u8> = (0..height as usize)
+                .flat_map(|y| (0..width as usize).map(move |x| (y, x)))
+                .map(|(y, x)| (crate::frame::native_sample(&frame, x, y) >> shift).min(255) as u8)
+                .collect();
+            assert_eq!(
+                narrowed.bytes(frame.clone()).unwrap(),
+                expected,
+                "{format:x}"
+            );
+            // Once narrowed, another encoder starts from the frame again.
+            assert_eq!(narrowed.for_encoder("ffv1"), raw);
+        }
+        // Read by FFmpeg as they are, BayerRG16 among them: not narrowed.
+        for format in [
+            crate::types::MONO8,
+            0x0110_0005,
+            0x0110_0007,
+            0x0110_002f,
+            0x0108_0009,
+            crate::types::RGB8,
+        ] {
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!(raw.for_encoder("libx264"), raw, "{format:x}");
+        }
+        assert!(
+            !RawInput::for_format(0x010c_0059)
+                .unwrap()
+                .for_encoder("nvv4l2h264enc")
+                .narrow
+                .is_some()
+        );
+    }
     #[test]
     fn raw_inputs_unpack_and_widen_what_ffmpeg_cannot_read() {
         let frame = |pixel_format, width, data| Frame {
@@ -7955,8 +8140,12 @@ esac"#
                         gate: Some((writing, gate)),
                     };
                     let interval = Duration::from_millis(1);
-                    let taken =
-                        write_frames(&queue, &mut pipe, (raw, None), interval, (repeat, true));
+                    let repeat = if repeat {
+                        Repeat::UntilStalled
+                    } else {
+                        Repeat::Never
+                    };
+                    let taken = write_frames(&queue, &mut pipe, (raw, None), interval, repeat);
                     (pipe.bytes, taken)
                 }
             });
@@ -8815,6 +9004,56 @@ esac"#
     }
     /// A mosaic recorded to a 4:2:0 encoder is demosaicked once, to RGB24,
     /// and never widened to RGB48 on its way.
+    /// A stream from a camera slower than its rate gets each frame once and
+    /// still carries the rate asked for: FFmpeg repeats the frames.
+    #[test]
+    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
+    fn ffmpeg_streams_keep_their_rate_from_slower_cameras() {
+        let exe = executable().unwrap();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let receiver = command(&exe)
+            .args(["-v", "error", "-i"])
+            .arg(format!("udp://127.0.0.1:{port}?timeout=2000000"))
+            .args(["-f", "framemd5", "-"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let mut forward = Forwarder::new(ForwardConfig {
+            output: format!("udp://127.0.0.1:{port}"),
+            ..stream("libx264", 60.0)
+        })
+        .unwrap();
+        let started = Instant::now();
+        let mut pushed = 0u64;
+        while started.elapsed() < Duration::from_secs(2) {
+            let mut frame = tiny(64, 48);
+            frame.data = vec![(pushed * 8) as u8; 64 * 48 * 3].into();
+            forward.push(frame).unwrap();
+            pushed += 1;
+            thread::sleep(Duration::from_millis(33));
+        }
+        let stats = forward.stats();
+        forward.stop().unwrap();
+        let output = receiver.wait_with_output().unwrap();
+        let received = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .count();
+        // About 60 written and 120 received.
+        assert!(stats.written <= pushed, "{stats:?}");
+        assert!(
+            received as u64 >= stats.written * 3 / 2,
+            "{received} frames received of {} written: {}",
+            stats.written,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     /// The decoded frames of a video, as FFmpeg's framemd5 checksums them.
     fn decoded_checksums(exe: &Executable, path: &std::path::Path) -> Vec<String> {
         let output = command(exe)
@@ -9089,7 +9328,6 @@ esac"#
             encoders.push("h264_videotoolbox");
         }
         for format in [0x0108_0009, 0x010c_0059] {
-            let raw = RawInput::for_format(format).unwrap();
             let frame = Frame {
                 width,
                 height,
@@ -9097,9 +9335,12 @@ esac"#
                 data: vec![0x5a; crate::frame::row_bytes(width, format) * height as usize].into(),
                 ..Frame::default()
             };
-            let bytes = raw.bytes(frame).unwrap();
             for encoder in &encoders {
+                // As a recording hands it over: BayerRG12p narrowed to 8 bits.
+                let raw = RawInput::for_format(format).unwrap().for_encoder(encoder);
+                let bytes = raw.bytes(frame.clone()).unwrap();
                 let pix_fmt = raw.input_pix_fmt(encoder);
+                assert_eq!(pix_fmt, "bayer_rggb8");
                 let mut child = command(&exe)
                     .args([
                         "-hide_banner",

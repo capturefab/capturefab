@@ -537,7 +537,8 @@ fn recordings_pipe_the_frame_or_unpack_it_once() {
         show(&format!("record {format}"), &report, written.max(1));
         assert_no_avoidable(&format!("record {format}"), &report);
         // Packed and widened frames are converted on the writer thread,
-        // once per frame written; the rest go to FFmpeg as they are.
+        // once per frame written, and narrowed to 8 bits for the 8-bit
+        // encoder on the way; the rest go to FFmpeg as they are.
         let converted = matches!(format, "Mono12p" | "BayerRG12" | "BayerRG12p");
         let unpacked = if converted { written } else { 0 };
         assert_eq!(
@@ -545,6 +546,15 @@ fn recordings_pipe_the_frame_or_unpack_it_once() {
             unpacked,
             "{format}: {report}"
         );
+        if converted {
+            let narrowed = (WIDTH * HEIGHT) as i64 * written;
+            assert_eq!(
+                site(&report, "ffmpeg_unpack"),
+                narrowed,
+                "{format}: {report}"
+            );
+            assert_eq!(site(&report, "pipe_write"), narrowed, "{format}: {report}");
+        }
         assert_eq!(calls(&report, "pipe_write"), written, "{format}: {report}");
     }
 }

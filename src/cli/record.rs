@@ -560,7 +560,10 @@ pub const FIELDS: &[(&str, &str)] = &[
     ),
     ("bytes", "int — the file's size"),
     ("duration_s", "float"),
-    ("frames", "int — frames encoded, or copied"),
+    (
+        "frames",
+        "int — frames encoded, or copied; for a stream, the camera's frames handed to the encoder, which repeats them to keep --fps",
+    ),
     (
         "dropped",
         "int — frames the encoder could not take, and frames the transport lost",
@@ -575,7 +578,10 @@ pub const FIELDS: &[(&str, &str)] = &[
     ),
     ("width", "int"),
     ("height", "int"),
-    ("fps_actual", "float — frames per second encoded, or copied"),
+    (
+        "fps_actual",
+        "float — frames per second, as frames counts them",
+    ),
     (
         "fps",
         "float — the frame rate written: --fps, or the camera's",

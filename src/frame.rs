@@ -382,7 +382,7 @@ fn bayer8(pixel_format: u32) -> Option<u32> {
 /// The 8-bit format a row reader reduces `pixel_format` to, and the shift
 /// that brings its samples there: Bayer8 for a 10- to 16-bit mosaic, packed
 /// or not, and Mono8 for packed monochrome. None for every other format.
-fn reduced(pixel_format: u32) -> Option<(u32, u32)> {
+pub(crate) fn reduced(pixel_format: u32) -> Option<(u32, u32)> {
     let unpacked = unpacked_format(pixel_format);
     wide_bayer(unpacked).or_else(|| {
         packing(pixel_format)

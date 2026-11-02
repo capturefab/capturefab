@@ -325,8 +325,8 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <tr><td><code>ended</code></td><td>duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it</td></tr>
 <tr><td><code>finalized</code></td><td>bool — the file was closed and is complete</td></tr>
 <tr><td><code>fps</code></td><td>float — the frame rate written: --fps, or the camera&#x27;s</td></tr>
-<tr><td><code>fps_actual</code></td><td>float — frames per second encoded, or copied</td></tr>
-<tr><td><code>frames</code></td><td>int — frames encoded, or copied</td></tr>
+<tr><td><code>fps_actual</code></td><td>float — frames per second, as frames counts them</td></tr>
+<tr><td><code>frames</code></td><td>int — frames encoded, or copied; for a stream, the camera&#x27;s frames handed to the encoder, which repeats them to keep --fps</td></tr>
 <tr><td><code>height</code></td><td>int</td></tr>
 <tr><td><code>incomplete</code></td><td>int — frames that arrived incomplete, where the transport counts them</td></tr>
 <tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded</td></tr>
