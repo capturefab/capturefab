@@ -1469,8 +1469,10 @@ mod tests {
         gated.next_frame(Duration::from_millis(500)).unwrap();
         gated.next_frame(Duration::from_millis(500)).unwrap();
         // The frames after a line started the acquisition keep to the frame
-        // rate from that frame on.
+        // rate from that frame on: one slow enough that a busy host draws
+        // every frame in time, and apart from the line's.
         let mut lined = camera("sim:0?line0=every:300ms");
+        lined.set("AcquisitionFrameRate", "5").unwrap();
         lined.set("TriggerSelector", "AcquisitionStart").unwrap();
         lined.set("TriggerMode", "On").unwrap();
         lined.set("TriggerSource", "Line0").unwrap();
@@ -1484,7 +1486,7 @@ mod tests {
                     .unwrap()
             })
             .collect::<Vec<_>>();
-        let period = 1e9 / 30.0;
+        let period = 1e9 / 5.0;
         for pair in times.windows(2) {
             let gap = (pair[1] - pair[0]) as f64;
             assert!((gap - period).abs() < period * 0.2, "{times:?}");

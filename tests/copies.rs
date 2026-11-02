@@ -85,6 +85,12 @@ fn calls(report: &Value, name: &str) -> i64 {
 fn large(report: &Value) -> i64 {
     report["large_allocs"]["count"].as_i64().unwrap_or(0)
 }
+/// Large allocations besides the frame pool's. A burst holds a pooled
+/// buffer for each frame waiting for an encoder, so how many the pool
+/// makes depends on how far the encoders fall behind on the host.
+fn large_beside_pool(report: &Value) -> i64 {
+    large(report) - report["pool"]["allocations"].as_i64().unwrap_or(0)
+}
 /// The largest allocation size class with any allocations in `report`.
 fn largest_class(report: &Value) -> i64 {
     report["large_allocs"]["sizes"]
@@ -261,10 +267,11 @@ fn still_captures_encode_from_the_frame_in_place() {
             if name == "png" {
                 // The PNG encoder's own compressed-data buffer grows by
                 // doubling inside the png crate, beside the one output
-                // buffer: one allocation per doubling past 256 KiB.
-                // Plus one: a pool miss under load adds a large allocation.
+                // buffer: one allocation per doubling past 256 KiB. The
+                // frames that wait for it hold pooled buffers.
                 let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
-                assert!(per_file <= f64::from(doublings) + 2.0, "{format}: {delta}");
+                let per_file = large_beside_pool(&delta) as f64 / n as f64;
+                assert!(per_file <= f64::from(doublings) + 1.0, "{format}: {delta}");
             } else {
                 // libjpeg-turbo writes into its own (C) buffer.
                 assert!(per_file <= LARGE_PER_FRAME, "{format} {name}: {delta}");
@@ -410,9 +417,11 @@ fn every_format_converts_once_into_its_encoder() {
             match name {
                 "raw" => assert_eq!(class_bytes(&delta, "transform"), 0, "{label}"),
                 // The png crate's compressed-data buffer grows by doubling
-                // beside the one output buffer (see above).
+                // beside the one output buffer, and the frames that wait
+                // for it hold pooled buffers (see above).
                 "png" => {
                     let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
+                    let per_file = large_beside_pool(&delta) as f64 / n as f64;
                     assert!(per_file <= f64::from(doublings) + 1.0, "{label}: {delta}");
                 }
                 _ => assert!(per_file <= LARGE_PER_FRAME, "{label}: {delta}"),

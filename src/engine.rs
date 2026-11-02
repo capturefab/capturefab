@@ -4927,12 +4927,19 @@ mod tests {
     }
     #[test]
     fn slow_saves_hold_up_no_frames_and_a_full_queue_drops_frames() {
+        // Saves finish only once the test lets them, so every frame is
+        // offered while they are still being written.
+        static FINISH: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
         fn slow(
             _: &WorkerHandle,
             shot: &saver::Shot,
             save: &saver::Save,
         ) -> Result<saver::Written> {
-            std::thread::sleep(Duration::from_millis(300));
+            let (finish, finished) = &FINISH;
+            let waiting = finish
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = finished.wait_timeout_while(waiting, Duration::from_secs(30), |go| !*go);
             Ok(written(shot, save))
         }
         let h = WorkerHandle::new();
@@ -4948,18 +4955,20 @@ mod tests {
             let job = &mut jobs[id as usize - 1];
             job.deadline
                 .get_or_insert(Instant::now() + Duration::from_secs(10));
-            let started = Instant::now();
             offer(&h, &mut saver, &mut jobs, small_frame(id));
-            let took = started.elapsed();
-            assert!(took < Duration::from_millis(50), "frame {id} took {took:?}");
         }
-        // Two shots fill the queue; the third job's frame is dropped and it
-        // takes another at its next interval.
+        // Two shots fill the queue, still saving; the third job's frame is
+        // dropped and it takes another at its next interval.
         assert_eq!((jobs[0].saving, jobs[1].saving, jobs[2].saving), (1, 1, 0));
         assert_eq!(jobs[2].info.skipped, 1);
         assert_eq!(jobs[2].info.status, CaptureStatus::Pending);
         assert_eq!(jobs[2].info.next_at_ms, 60_000);
         assert!(jobs[2].deadline.is_none());
+        *FINISH
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        FINISH.1.notify_all();
         drain(&h, &saver, &mut jobs);
         for job in &jobs[..2] {
             assert_eq!(
