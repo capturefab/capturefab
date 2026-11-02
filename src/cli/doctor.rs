@@ -12,11 +12,11 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ("arch", "string"),
     (
         "features",
-        "{usb,jpeg,videotoolbox,keychain,shell} — what this build includes",
+        "{usb,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell} — what this build includes",
     ),
     (
         "jpeg",
-        "{selected:auto|cpu|videotoolbox,backends:{libjpeg_turbo:{compiled,simd},videotoolbox:{compiled,available,verified?,reason?}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: Apple's JPEG engine encoded a test frame as accurately as libjpeg-turbo",
+        "{selected:auto|cpu|videotoolbox|nvjpeg|vaapi,backends:{libjpeg_turbo:{compiled,simd},videotoolbox|nvjpeg|vaapi:{compiled,available,verified?,reason?,version?,driver?,device?,integrated?,upload?:in-place|dma|copy}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: the engine encoded a test frame as accurately as libjpeg-turbo; nvjpeg and vaapi (Linux) run in a helper process; upload: how frames reach the GPU (read where the camera wrote them, one DMA, or written into its memory)",
     ),
     (
         "dirs",

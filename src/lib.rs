@@ -57,12 +57,22 @@ pub(crate) mod xml_cache;
 #[global_allocator]
 static ALLOCATOR: copies::Counting = copies::Counting;
 
-/// The `capturefab` executable: the hidden camera worker mode, or the CLI.
+/// The `capturefab` executable: the hidden camera worker and GPU JPEG
+/// helper modes, or the CLI.
 pub fn run() {
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__worker")) {
+    let mode = std::env::args_os().nth(1);
+    if mode.as_deref() == Some(std::ffi::OsStr::new("__worker")) {
         let result = session::run_worker(std::env::args_os().skip(2));
         if let Err(e) = result {
             eprintln!("capturefab worker: {}", scrub::scrub(&format!("{e:#}")));
+            std::process::exit(1)
+        }
+        return;
+    }
+    #[cfg(jpeg_helper)]
+    if mode.as_deref() == Some(std::ffi::OsStr::new(jpeg::helper::ARG)) {
+        if let Err(e) = jpeg::helper::run(std::env::args_os().skip(2)) {
+            eprintln!("capturefab JPEG helper: {e:#}");
             std::process::exit(1)
         }
         return;

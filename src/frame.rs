@@ -9,10 +9,12 @@ mod rows;
 mod view;
 pub(crate) use encoded::write_all_vectored;
 pub use encoded::{Body, Encoded};
+#[cfg(all(jpeg_helper, feature = "nvjpeg"))]
+pub(crate) use rows::decode as decode_rows;
 #[cfg(test)]
 pub(crate) use rows::tests::noise_frame;
 pub(crate) use rows::{Channels, RowReader};
-#[cfg(feature = "jpeg")]
+#[cfg(any(feature = "jpeg", jpeg_helper))]
 pub(crate) use rows::{Chroma, Yuv420, ycbcr420};
 pub use view::FrameRef;
 

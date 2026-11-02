@@ -455,7 +455,7 @@ pub(crate) fn map<P: Send>(
     }
 }
 
-#[cfg(feature = "jpeg")]
+#[cfg(any(feature = "jpeg", jpeg_helper))]
 /// Where `ycbcr420` writes JFIF (full-range BT.601) Y'CbCr 4:2:0: a luma
 /// plane and the chroma either as two planes (as libjpeg-turbo reads them)
 /// or interleaved (NV12, as a video encoder's surface holds it), each plane
@@ -466,30 +466,38 @@ pub(crate) struct Yuv420<'a> {
     pub(crate) chroma: Chroma<'a>,
 }
 
-#[cfg(feature = "jpeg")]
+#[cfg(any(feature = "jpeg", jpeg_helper))]
 /// A 4:2:0 image's chroma planes.
 pub(crate) enum Chroma<'a> {
+    // libjpeg-turbo and nvJPEG read planar chroma.
+    #[cfg_attr(
+        not(any(feature = "jpeg", all(jpeg_helper, feature = "nvjpeg"))),
+        allow(dead_code)
+    )]
     Planar {
         cb: &'a mut [u8],
         cr: &'a mut [u8],
         stride: usize,
     },
-    // Only the VideoToolbox engine writes NV12 surfaces.
+    // Only Apple's JPEG engine and VA-API write NV12 surfaces.
     #[cfg_attr(
-        not(all(feature = "videotoolbox", target_os = "macos")),
+        not(any(
+            all(feature = "videotoolbox", target_os = "macos"),
+            all(jpeg_helper, feature = "vaapi")
+        )),
         allow(dead_code)
     )]
     Interleaved { cbcr: &'a mut [u8], stride: usize },
 }
 
-#[cfg(feature = "jpeg")]
+#[cfg(any(feature = "jpeg", jpeg_helper))]
 /// One block of chroma rows of a `Yuv420` image, for one thread.
 enum ChromaRows<'a> {
     Planar(&'a mut [u8], &'a mut [u8], usize),
     Interleaved(&'a mut [u8], usize),
 }
 
-#[cfg(feature = "jpeg")]
+#[cfg(any(feature = "jpeg", jpeg_helper))]
 /// `view` as JFIF Y'CbCr 4:2:0, written straight into `out` from its RGB
 /// rows two at a time: luma for each pixel and chroma from each 2x2 block's
 /// mean, with the fixed-point coefficients of libjpeg's jccolor.c. An odd
@@ -590,7 +598,7 @@ pub(crate) fn ycbcr420(view: FrameRef<'_>, out: Yuv420<'_>) {
     }
 }
 
-#[cfg(feature = "jpeg")]
+#[cfg(any(feature = "jpeg", jpeg_helper))]
 /// JFIF luma of each RGB pixel of `rgb`.
 fn write_luma(rgb: &[u8], out: &mut [u8]) {
     for (y, p) in out.iter_mut().zip(rgb.as_chunks::<3>().0) {
@@ -599,7 +607,7 @@ fn write_luma(rgb: &[u8], out: &mut [u8]) {
     }
 }
 
-#[cfg(feature = "jpeg")]
+#[cfg(any(feature = "jpeg", jpeg_helper))]
 /// JFIF Cb and Cr of the 2x2 block whose top and bottom halves are `top`
 /// and `bottom` (one or two RGB pixels each), from the block's mean.
 fn chroma_of(top: &[u8], bottom: &[u8]) -> [u8; 2] {

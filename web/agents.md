@@ -120,8 +120,9 @@ exact bytes with a `NAME.json` sidecar (`pixel_format`, `pfnc_code`, `width`, `h
 `row_bytes`). Every common PFNC pixel format converts; see the
 [pixel format table](guides/camera-compatibility.md#pixel-formats). Webcams, streams and files
 arrive as FFmpeg decodes them (gray, YUV such as `YCbCr709_420_8_Planar`, or RGB8 for RGB
-sources), so their `.raw` bytes are in that format. Color JPEGs may come from Apple's JPEG engine
-on macOS (`CAPTUREFAB_JPEG=cpu` keeps libjpeg-turbo; `doctor` reports both under `jpeg`).
+sources), so their `.raw` bytes are in that format. JPEGs may come from Apple's JPEG engine on
+macOS, or nvJPEG or VA-API on Linux, each checked against libjpeg-turbo first
+(`CAPTUREFAB_JPEG=cpu` keeps libjpeg-turbo; `doctor` reports them under `jpeg`).
 Compressed streams and webcams other than Motion JPEG, which libjpeg-turbo decodes, are decoded
 in hardware where it works in a session, and files and `--no-session` commands in software
 (`CAPTUREFAB_HWDEC=auto|none|METHOD`; `doctor --json` reports the methods under `hwdec`). A

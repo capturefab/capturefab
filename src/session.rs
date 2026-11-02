@@ -23,6 +23,8 @@ mod worker;
 use jobs::{JobBook, JobKind};
 use protocol::WorkerCommand;
 pub use run::run_worker;
+#[cfg(jpeg_helper)]
+pub(crate) use worker::executable;
 use worker::{Signal, Worker};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -55,6 +55,11 @@ pub(crate) enum Site {
     PreviewTransform,
     /// A frame converted to the layout a Jetson encoder reads.
     JetsonInput,
+    /// A frame copied where a GPU JPEG encoder reads it: into shared memory
+    /// its helper maps, for a frame from before the helper started or in a
+    /// USB transfer's own buffer, or into a VA-API surface that could not
+    /// take the frame's own memory.
+    GpuUpload,
     /// A PNG encoder's output.
     PngEncode,
     /// A JPEG encoder's output.
@@ -87,7 +92,7 @@ pub(crate) enum Class {
 }
 
 impl Site {
-    pub(crate) const ALL: [Site; 24] = [
+    pub(crate) const ALL: [Site; 25] = [
         Site::GvspReceive,
         Site::PipeRead,
         Site::PipeWrite,
@@ -102,6 +107,7 @@ impl Site {
         Site::StillTransform,
         Site::PreviewTransform,
         Site::JetsonInput,
+        Site::GpuUpload,
         Site::PngEncode,
         Site::JpegEncode,
         Site::FrameClone,
@@ -129,6 +135,7 @@ impl Site {
             Site::StillTransform => "still_transform",
             Site::PreviewTransform => "preview_transform",
             Site::JetsonInput => "jetson_input",
+            Site::GpuUpload => "gpu_upload",
             Site::PngEncode => "png_encode",
             Site::JpegEncode => "jpeg_encode",
             Site::FrameClone => "frame_clone",
@@ -150,7 +157,9 @@ impl Site {
             | Site::FileWrite
             | Site::StdoutWrite
             | Site::StreamCopy => Class::Boundary,
-            Site::UsbAssemble | Site::GvspFallback | Site::GigeRowCompact => Class::Necessary,
+            Site::UsbAssemble | Site::GvspFallback | Site::GigeRowCompact | Site::GpuUpload => {
+                Class::Necessary
+            }
             Site::FfmpegUnpack
             | Site::StillTransform
             | Site::PreviewTransform

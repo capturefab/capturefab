@@ -14,6 +14,7 @@ cargo build --release --target aarch64-unknown-linux-gnu --no-default-features -
 |---|---|---|
 | `usb` | on | Keep for USB3 Vision cameras. Pure Rust; the image needs read/write access to `/dev/bus/usb` (see the udev rule `capturefab doctor` prints). |
 | `jpeg` | on | libjpeg-turbo, built from source with CMake (and NASM on x86). Keep it when the cross toolchain has them; without it captures are PNG or raw and previews PNG. |
+| `nvjpeg`, `vaapi` | on | GPU JPEG encoders (NVIDIA's nvJPEG, including on Jetson, and VA-API), pure Rust: their libraries are loaded when the host has the device, in a helper process the camera worker starts. Their output is checked against libjpeg-turbo, so they need `jpeg` to be used. |
 | `keychain` | on | Saves camera passwords in the Secret Service over D-Bus, which images rarely run. Without it, `login add` is unsupported: put credentials in the camera address. |
 
 The same features build for 32-bit ARM (`armv7-unknown-linux-gnueabihf`) and musl (`aarch64-unknown-linux-musl`, `x86_64-unknown-linux-musl`), for a static executable with no glibc dependency. In a Yocto layer, build it with the `cargo` class and pass the features through `CARGO_BUILD_FLAGS`, or cross-compile it outside and install the executable with its license files.

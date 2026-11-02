@@ -7,6 +7,16 @@ use std::{
 fn main() {
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_BINARY");
     println!("cargo:rerun-if-env-changed=CAPTUREFAB_FFMPEG_LICENSE");
+    // `jpeg_helper`: the GPU JPEG encoders' helper process, and the shared
+    // memory frames reach it in (the nvjpeg or vaapi feature, on Unix).
+    println!("cargo:rustc-check-cfg=cfg(jpeg_helper)");
+    if env::var_os("CARGO_CFG_UNIX").is_some()
+        && ["CARGO_FEATURE_NVJPEG", "CARGO_FEATURE_VAAPI"]
+            .iter()
+            .any(|feature| env::var_os(feature).is_some())
+    {
+        println!("cargo:rustc-cfg=jpeg_helper");
+    }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
     let target = env::var("TARGET").expect("Cargo TARGET");
     let manifest =

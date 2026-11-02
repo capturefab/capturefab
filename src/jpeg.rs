@@ -10,6 +10,12 @@ use anyhow::Result;
 use anyhow::bail;
 
 pub(crate) mod backend;
+#[cfg(jpeg_helper)]
+pub(crate) mod helper;
+#[cfg(all(jpeg_helper, feature = "nvjpeg"))]
+pub(crate) mod nvjpeg;
+#[cfg(all(jpeg_helper, feature = "vaapi"))]
+pub(crate) mod vaapi;
 #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
 pub(crate) mod videotoolbox;
 
@@ -187,46 +193,86 @@ fn compress_yuv(
 /// Bayer frame encodes in about 17.5 ms instead of 19.4 through RGB.
 #[cfg(feature = "jpeg")]
 fn encode_planes(frame: &Frame, quality: i32) -> Result<Body<'static>> {
-    use crate::frame::{Chroma, FrameRef, Yuv420};
     crate::frame::validate_source(frame)?;
-    let view = FrameRef::whole(frame);
-    let (width, height) = (view.width, view.height);
-    // libjpeg-turbo reads luma in whole 2x2 blocks: an odd last column or
-    // row is repeated into the padding, as it pads RGB itself.
-    let (luma_width, luma_rows) = (width.next_multiple_of(2), height.next_multiple_of(2));
-    let (chroma_width, chroma_rows) = (luma_width / 2, luma_rows / 2);
-    let luma_len = luma_width * luma_rows;
-    let chroma_len = chroma_width * chroma_rows;
-    let mut planes = crate::framebuf::transforms().take_stale(luma_len + 2 * chroma_len);
-    let (luma, chroma) = planes.split_at_mut(luma_len);
-    let (cb, cr) = chroma.split_at_mut(chroma_len);
-    crate::frame::ycbcr420(
-        view,
-        Yuv420 {
-            luma: &mut *luma,
-            luma_stride: luma_width,
-            chroma: Chroma::Planar {
-                cb,
-                cr,
-                stride: chroma_width,
-            },
-        },
-    );
-    if width < luma_width {
-        for row in luma.chunks_exact_mut(luma_width).take(height) {
-            row[width] = row[width - 1];
+    let view = crate::frame::FrameRef::whole(frame);
+    let layout = Planes::of(view.width, view.height);
+    let mut planes = crate::framebuf::transforms().take_stale(layout.len());
+    layout.write(view, &mut planes);
+    crate::copies::record(crate::copies::Site::StillTransform, planes.len());
+    let (luma, chroma) = planes.split_at(layout.luma_len());
+    let (cb, cr) = chroma.split_at(layout.chroma_len());
+    compress_yuv(
+        luma,
+        cb,
+        cr,
+        view.width,
+        view.height,
+        layout.luma_width,
+        quality,
+    )
+}
+
+/// The layout of a frame's JFIF Y'CbCr 4:2:0 planes in one buffer, as
+/// libjpeg-turbo and nvJPEG read them: luma in whole 2x2 blocks (an odd
+/// last column or row repeated into the padding, as libjpeg-turbo pads RGB
+/// itself), then Cb, then Cr.
+#[cfg(any(feature = "jpeg", all(jpeg_helper, feature = "nvjpeg")))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Planes {
+    pub(crate) luma_width: usize,
+    pub(crate) luma_rows: usize,
+}
+
+#[cfg(any(feature = "jpeg", all(jpeg_helper, feature = "nvjpeg")))]
+impl Planes {
+    pub(crate) fn of(width: usize, height: usize) -> Self {
+        Self {
+            luma_width: width.next_multiple_of(2),
+            luma_rows: height.next_multiple_of(2),
         }
     }
-    if height < luma_rows {
-        luma.copy_within(
-            (height - 1) * luma_width..height * luma_width,
-            height * luma_width,
-        );
+    pub(crate) fn luma_len(&self) -> usize {
+        self.luma_width * self.luma_rows
     }
-    crate::copies::record(crate::copies::Site::StillTransform, planes.len());
-    let (luma, chroma) = planes.split_at(luma_len);
-    let (cb, cr) = chroma.split_at(chroma_len);
-    compress_yuv(luma, cb, cr, width, height, luma_width, quality)
+    pub(crate) fn chroma_width(&self) -> usize {
+        self.luma_width / 2
+    }
+    pub(crate) fn chroma_len(&self) -> usize {
+        self.chroma_width() * self.luma_rows / 2
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.luma_len() + 2 * self.chroma_len()
+    }
+    /// `view`'s planes, written from its rows into `planes`.
+    pub(crate) fn write(&self, view: crate::frame::FrameRef<'_>, planes: &mut [u8]) {
+        use crate::frame::{Chroma, Yuv420};
+        let (width, height) = (view.width, view.height);
+        let (luma, chroma) = planes[..self.len()].split_at_mut(self.luma_len());
+        let (cb, cr) = chroma.split_at_mut(self.chroma_len());
+        crate::frame::ycbcr420(
+            view,
+            Yuv420 {
+                luma: &mut *luma,
+                luma_stride: self.luma_width,
+                chroma: Chroma::Planar {
+                    cb,
+                    cr,
+                    stride: self.chroma_width(),
+                },
+            },
+        );
+        if width < self.luma_width {
+            for row in luma.chunks_exact_mut(self.luma_width).take(height) {
+                row[width] = row[width - 1];
+            }
+        }
+        if height < self.luma_rows {
+            luma.copy_within(
+                (height - 1) * self.luma_width..height * self.luma_width,
+                height * self.luma_width,
+            );
+        }
+    }
 }
 
 pub fn software(raster: &Raster) -> Result<Body<'static>> {
@@ -329,14 +375,14 @@ pub fn has_huffman_tables(jpeg: &[u8]) -> bool {
     false
 }
 
-/// The typical Huffman tables of ITU-T T.81 annex K.3 as one DHT segment:
-/// what a JPEG without tables of its own is decoded with.
-pub fn standard_huffman_tables() -> Vec<u8> {
-    const DC_LUMINANCE: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
-    const DC_CHROMINANCE: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
-    const DC_VALUES: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-    const AC_LUMINANCE: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
-    const AC_LUMINANCE_VALUES: [u8; 162] = [
+/// The typical Huffman tables of ITU-T T.81 annex K.3: code counts for each
+/// length, then the values.
+pub(crate) mod huffman {
+    pub(crate) const DC_LUMINANCE: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+    pub(crate) const DC_CHROMINANCE: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+    pub(crate) const DC_VALUES: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+    pub(crate) const AC_LUMINANCE: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
+    pub(crate) const AC_LUMINANCE_VALUES: [u8; 162] = [
         0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61,
         0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52,
         0xd1, 0xf0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25,
@@ -349,8 +395,8 @@ pub fn standard_huffman_tables() -> Vec<u8> {
         0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8,
         0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
     ];
-    const AC_CHROMINANCE: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
-    const AC_CHROMINANCE_VALUES: [u8; 162] = [
+    pub(crate) const AC_CHROMINANCE: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
+    pub(crate) const AC_CHROMINANCE_VALUES: [u8; 162] = [
         0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61,
         0x71, 0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33,
         0x52, 0xf0, 0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18,
@@ -363,6 +409,12 @@ pub fn standard_huffman_tables() -> Vec<u8> {
         0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6, 0xe7,
         0xe8, 0xe9, 0xea, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa,
     ];
+}
+
+/// The typical Huffman tables of ITU-T T.81 annex K.3 as one DHT segment:
+/// what a JPEG without tables of its own is decoded with.
+pub fn standard_huffman_tables() -> Vec<u8> {
+    use huffman::*;
     // Table class and destination, then the code counts and values.
     let tables: [(u8, &[u8], &[u8]); 4] = [
         (0x00, &DC_LUMINANCE, &DC_VALUES),

@@ -1683,3 +1683,82 @@ fn unreadable_presets_are_listed_and_can_be_removed() {
     home.ok(&["preset", "rm", "broken"]);
     assert_eq!(home.ok(&["preset", "list"])["presets"], json!([]));
 }
+
+/// The GPU JPEG encoders are in `doctor`, which says why one cannot be
+/// used here; naming one this host cannot use fails a still with exit 3
+/// rather than falling back to the CPU.
+#[test]
+fn gpu_jpeg_encoders_say_why_they_cannot_be_used() {
+    let home = Home::new("gpu-jpeg");
+    let doctor = home.ok(&["doctor"]);
+    for (kind, compiled) in [
+        ("nvjpeg", cfg!(feature = "nvjpeg")),
+        ("vaapi", cfg!(feature = "vaapi")),
+    ] {
+        assert_eq!(doctor["features"][kind], compiled, "{doctor}");
+        let backend = &doctor["jpeg"]["backends"][kind];
+        assert_eq!(
+            backend["compiled"],
+            compiled && cfg!(target_os = "linux"),
+            "{backend}"
+        );
+        if backend["available"] == true {
+            // A host with the device: it was checked on a test frame.
+            assert!(backend["verified"].is_boolean(), "{backend}");
+            continue;
+        }
+        assert!(backend["reason"].is_string(), "{backend}");
+        let error = home
+            .run_env(
+                &[("CAPTUREFAB_JPEG", kind)],
+                &[
+                    "--json", "capture", "-c", "sim:0", "-f", "jpg", "-o", "x.jpg",
+                ],
+            )
+            .failure(3);
+        let message = error["message"].as_str().unwrap();
+        assert!(message.contains(kind), "{message}");
+        assert!(!home.work.join("x.jpg").exists());
+    }
+}
+
+/// The helper a camera worker starts for a GPU encoder says hello on the
+/// socket it is given, or why it cannot encode here, and ends when the
+/// socket closes.
+#[cfg(all(unix, any(feature = "nvjpeg", feature = "vaapi")))]
+#[test]
+fn the_jpeg_helper_says_hello_on_its_socket() {
+    use std::{
+        io::{BufRead, BufReader},
+        os::{fd::OwnedFd, unix::net::UnixStream},
+        process::{Command, Stdio},
+        time::Duration,
+    };
+    for kind in ["nvjpeg", "vaapi", "none"] {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let mut helper = Command::new(env!("CARGO_BIN_EXE_capturefab"))
+            .args(["__jpeg-helper", kind, &std::process::id().to_string()])
+            .stdin(Stdio::from(OwnedFd::from(theirs)))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        ours.set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        let mut hello = String::new();
+        BufReader::new(&ours).read_line(&mut hello).unwrap();
+        let hello: Value = serde_json::from_str(&hello).unwrap_or_else(|e| panic!("{hello}: {e}"));
+        if hello["ok"] != true {
+            let error = hello["error"].as_str().unwrap();
+            assert!(!error.is_empty(), "{kind}: {hello}");
+            if kind == "none" {
+                assert!(error.contains("no none JPEG helper"), "{error}");
+            }
+        } else {
+            assert!(hello["about"].is_object(), "{hello}");
+        }
+        drop(ours);
+        let status = helper.wait().unwrap();
+        assert!(status.success(), "{kind}: {status}");
+    }
+}

@@ -130,7 +130,12 @@ webcams in a compressed mode other than Motion JPEG are decoded in hardware wher
 JPEG stills of color frames go to Apple's JPEG engine on macOS where it is faster and as accurate
 as libjpeg-turbo (checked beside the first frame of each size and format, which libjpeg-turbo
 writes; frames under 512K pixels, monochrome frames and `--quality` other than 90 stay on
-libjpeg-turbo); `CAPTUREFAB_JPEG` chooses.
+libjpeg-turbo); `CAPTUREFAB_JPEG` chooses. On Linux, NVIDIA's nvJPEG (CUDA) or a VA-API
+driver's JPEG encoder takes frames of at least 512K pixels, of any format and quality, on the
+same terms: the camera worker starts a helper process that loads the vendor's libraries, reads
+each frame from the shared memory the camera wrote it to, and is stopped after a minute unused.
+Under `auto`, a helper that crashes or stops answering is ended, its frame and later ones are
+encoded by libjpeg-turbo, and the worker says so on stderr.
 A Motion JPEG webcam, stream or file is read as the JPEGs it sends, decoded with libjpeg-turbo:
 a JPEG still of it without `--quality` is that JPEG as it was, with the provenance comment
 (`"passthrough": true`).
@@ -166,7 +171,9 @@ network paths. More: [CLI workflows](docs/cli-workflows.md),
 | `CAPTUREFAB_IMAGES` | how `--show` draws frames: `kitty`, `iterm`, `truecolor`, `256` or `none` |
 | `CAPTUREFAB_MAX_CAMERAS` | cameras one session may hold, 1–64 (default 16) |
 | `CAPTUREFAB_GVSP_SCATTER=0` | GigE Vision packets are received whole and copied into their frames, rather than received straight into them |
-| `CAPTUREFAB_JPEG` | the JPEG encoder: `auto` (default), `cpu` (libjpeg-turbo) or `videotoolbox`; a named engine that is missing or fails its accuracy check is exit 3 `unavailable` |
+| `CAPTUREFAB_JPEG` | the JPEG encoder: `auto` (default), `cpu` (libjpeg-turbo), `videotoolbox` (macOS), `nvjpeg` or `vaapi` (Linux); a named engine that is missing or fails its accuracy check is exit 3 `unavailable` |
+| `CAPTUREFAB_CUDA_LIB_DIR` | a folder holding the CUDA runtime and nvJPEG libraries, tried before the loader's paths |
+| `CAPTUREFAB_VAAPI_DEVICE` | the DRM render node VA-API JPEG encoding uses, instead of the first `/dev/dri/renderD*` that encodes JPEG |
 | `CAPTUREFAB_HWDEC` | hardware decoding of H.264, HEVC and other compressed video: `auto` (default: streams and webcams, in a session), `none`, or a method such as `videotoolbox`, `cuda`, `vulkan` or `d3d11va`, used for files and `--no-session` too; one this FFmpeg lacks or that fails its probe is exit 3 `unavailable`. Motion JPEG is decoded with libjpeg-turbo whatever it says |
 
 A session's cameras keep the `CAPTUREFAB_JPEG` and `CAPTUREFAB_HWDEC` the session started with,
@@ -201,9 +208,10 @@ python3 scripts/test-site.py && python3 -m unittest discover -s scripts
 ```
 
 The default features are `usb` (USB3 Vision), `jpeg` (libjpeg-turbo), `videotoolbox` (Apple's
-JPEG engine on macOS; nothing elsewhere), `keychain` (the OS credential store for `login`) and
-`shell` (line editing, history and completion in `capturefab shell`); `--no-default-features`
-builds without them. Releases are built
+JPEG engine on macOS; nothing elsewhere), `nvjpeg` and `vaapi` (the GPU JPEG encoders on Linux,
+whose libraries are loaded at run time, so the build needs no SDK; nothing elsewhere), `keychain`
+(the OS credential store for `login`) and `shell` (line editing, history and completion in
+`capturefab shell`); `--no-default-features` builds without them. Releases are built
 and packaged as described in [docs/release.md](docs/release.md).
 
 ## License

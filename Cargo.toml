@@ -8,7 +8,7 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["usb", "jpeg", "videotoolbox", "keychain", "shell"]
+default = ["usb", "jpeg", "videotoolbox", "nvjpeg", "vaapi", "keychain", "shell"]
 usb = ["dep:nusb"]
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
@@ -16,6 +16,13 @@ jpeg = ["dep:turbojpeg"]
 # stills on macOS (`CAPTUREFAB_JPEG`); a no-op elsewhere. libjpeg-turbo
 # checks its output.
 videotoolbox = ["jpeg"]
+# GPU JPEG encoders on Linux, NVIDIA's nvJPEG (CUDA) and VA-API (Intel and
+# other drivers with JPEG encoding), in a helper process that maps the
+# frames' shared memory (`CAPTUREFAB_JPEG`). Their libraries are loaded when
+# a host has the device, so a build needs no SDK; libjpeg-turbo (the jpeg
+# feature) checks their output. No-ops elsewhere.
+nvjpeg = []
+vaapi = []
 # OS credential store (Keychain / Credential Manager / Secret Service) for
 # saved camera sign-ins.
 keychain = ["dep:keyring"]

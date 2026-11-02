@@ -792,7 +792,7 @@ impl Stream {
 /// A transfer of `len` bytes whose buffer is the frame pool's, so a frame
 /// can take it.
 fn whole_buffer(len: usize) -> Buffer {
-    let mut buffer = Buffer::from(pool().take_stale(len).into_vec());
+    let mut buffer = Buffer::from(pool().take_vec(len));
     // An IN transfer requests `len` bytes and starts empty.
     buffer.clear();
     buffer

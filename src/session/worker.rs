@@ -91,9 +91,10 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// This program, to run as a camera worker. On Linux the running image, so
-/// a session outlives an upgrade of the file it was started from.
-fn executable() -> Result<std::path::PathBuf> {
+/// This program, to run as a camera worker or a worker's helper. On Linux
+/// the running image, so a session outlives an upgrade of the file it was
+/// started from.
+pub(crate) fn executable() -> Result<std::path::PathBuf> {
     if let Some(path) = std::env::var_os("CAPTUREFAB_EXECUTABLE") {
         return Ok(path.into());
     }

@@ -334,6 +334,8 @@ pub fn report(warm_sessions: bool) -> Value {
             "usb": cfg!(feature = "usb"),
             "jpeg": cfg!(feature = "jpeg"),
             "videotoolbox": cfg!(feature = "videotoolbox"),
+            "nvjpeg": cfg!(feature = "nvjpeg"),
+            "vaapi": cfg!(feature = "vaapi"),
             "keychain": cfg!(feature = "keychain"),
             "shell": cfg!(feature = "shell"),
         },
