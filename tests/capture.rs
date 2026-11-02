@@ -274,12 +274,17 @@ fn bursts_time_lapses_and_names_that_never_overwrite() {
 #[test]
 fn several_cameras_capture_at_once() {
     let home = Home::new("several");
+    // Frames small enough that a busy host draws them at the frame rate.
     let both = home.ok(&[
         "capture",
         "-c",
         "sim:0",
         "-c",
         "sim:1",
+        "--set",
+        "Width=160",
+        "--set",
+        "Height=120",
         "-o",
         "both/{camera}.png",
     ]);
