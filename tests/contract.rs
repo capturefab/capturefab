@@ -1579,8 +1579,10 @@ fn unreachable_cameras_say_what_to_try() {
     assert!(error["hint"].as_str().unwrap().contains("sim:0"), "{error}");
     assert_eq!(error["details"]["candidates"], json!([]), "{error}");
     // ONVIF hosts that do not resolve or refuse are unavailable too.
+    // Windows tries a refused connection again for about two seconds
+    // before it says so, which a shorter timeout cuts off.
     for host in ["nonexistent.invalid", "127.0.0.1:1"] {
-        let error = home.fails(3, &["onvif", "resolve", host, "--timeout", "2s"]);
+        let error = home.fails(3, &["onvif", "resolve", host, "--timeout", "10s"]);
         assert_eq!(error["code"], "unavailable", "{host}: {error}");
     }
     // A capture to an external drive that is not mounted.

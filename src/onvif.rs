@@ -1765,11 +1765,16 @@ mod tests {
             crate::cli::output::error_code(&error)
         };
         // A port nothing listens on, and a name that never resolves.
+        // Windows tries a refused connection again for about two seconds
+        // before it says so, which a shorter timeout cuts off.
         let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = refused.local_addr().unwrap().port();
         drop(refused);
         assert_eq!(
-            code(&format!("http://127.0.0.1:{port}/"), Duration::from_secs(2)),
+            code(
+                &format!("http://127.0.0.1:{port}/"),
+                Duration::from_secs(10)
+            ),
             ("unavailable", 3)
         );
         assert_eq!(

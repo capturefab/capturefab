@@ -1983,20 +1983,25 @@ mod tests {
                 MAX_REQUEST,
             )
             .unwrap();
-            for _ in 0..30 {
+            // A byte at a time, well within any one read's timeout, for
+            // far longer than the deadline, until the client hangs up.
+            let trickle = Instant::now();
+            while trickle.elapsed() < Duration::from_secs(20) {
                 if stream.write_all(b" ").is_err() {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(15));
             }
         });
+        // The deadline leaves a busy runner time to connect and greet, so
+        // it runs out while the response trickles.
         let started = Instant::now();
         let error = send_request(
             &descriptor,
             None,
             Some(SessionCommand::Status),
             false,
-            Duration::from_millis(50),
+            Duration::from_secs(1),
         )
         .unwrap_err();
         let elapsed = started.elapsed();
@@ -2005,7 +2010,7 @@ mod tests {
             "{error:#}"
         );
         assert!(format!("{error:#}").contains("may still complete"));
-        assert!(elapsed < Duration::from_millis(300), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
         peer.join().unwrap();
     }
     #[test]

@@ -4832,7 +4832,6 @@ mod tests {
             fake.send(1, false, &[3, 7]);
             assert!(gige.next_frame(Duration::from_millis(300)).is_err());
             assert!(gige.next_frame(Duration::from_millis(100)).is_err());
-            assert_eq!(fake.camera.lock().unwrap().requests.len(), requests);
             let stats = gige.stats().unwrap();
             assert_eq!(
                 (
@@ -4842,6 +4841,17 @@ mod tests {
                 ),
                 (requests as u64, 0, 1)
             );
+            // The fake camera takes the requests in on its own thread, which
+            // a busy runner may not have run since the last one was sent.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let seen = loop {
+                let seen = fake.camera.lock().unwrap().requests.len();
+                if seen >= requests || Instant::now() >= deadline {
+                    break seen;
+                }
+                thread::sleep(Duration::from_millis(5));
+            };
+            assert_eq!(seen, requests);
         }
     }
     #[test]
