@@ -1,7 +1,8 @@
 //! Where a frame's bytes are copied on their way through the simulator's
-//! commands, from the counts a `copy-audit` build's camera workers write
-//! (`src/copies.rs`). Each scenario runs twice, with N and 2N frames, and the
-//! difference is divided by N: what one more frame costs, without start-up.
+//! commands, from the counts a `copy-audit` build's camera workers, and
+//! their GPU JPEG helpers, write (`src/copies.rs`). Each scenario runs
+//! twice, with N and 2N frames, and the difference is divided by N: what
+//! one more frame costs, without start-up.
 //!
 //! `cargo test --features copy-audit --test copies -- --nocapture` prints
 //! the per-frame numbers.
@@ -15,7 +16,8 @@ use support::cli::Home;
 const WIDTH: usize = 1920;
 const HEIGHT: usize = 1080;
 
-/// The counts of every worker that wrote a report to `folder`, added up.
+/// The counts of every worker and helper that wrote a report to `folder`,
+/// added up.
 fn counts(folder: &Path) -> Value {
     let mut total = json!({});
     for entry in std::fs::read_dir(folder).unwrap().flatten() {
@@ -455,6 +457,64 @@ fn the_jpeg_engine_encodes_from_the_frame() {
             large(&delta) as f64 / n as f64 <= LARGE_PER_FRAME,
             "{label}: {delta}"
         );
+    }
+}
+
+/// The reports GPU JPEG helpers wrote under `home`'s report folders.
+#[cfg(target_os = "linux")]
+fn helper_reports(home: &Home) -> usize {
+    std::fs::read_dir(&home.root)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("report-"))
+        .flat_map(|folder| std::fs::read_dir(folder.path()).unwrap().flatten())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("helper-") && name.ends_with(".json")
+        })
+        .count()
+}
+
+/// nvJPEG and VA-API, named: frames reach the helper in the shared memory
+/// the camera wrote them to, and the copies the helper makes (a Bayer
+/// frame converted once for the GPU) are in its own report. Skipped where
+/// the engine is missing or fails its check.
+#[test]
+#[cfg(target_os = "linux")]
+fn the_gpu_jpeg_engines_encode_from_the_frame() {
+    for name in ["nvjpeg", "vaapi"] {
+        let home = Home::new(&format!("copies-{name}"));
+        let engine = [("CAPTUREFAB_JPEG", name)];
+        let settings = settings("RGB8");
+        let settings: Vec<&str> = settings.iter().map(String::as_str).collect();
+        let probe = home.run_env(
+            &engine,
+            &[
+                &["--json", "capture", "-c", "sim:0", "-o", "probe.jpg"][..],
+                &settings,
+            ]
+            .concat(),
+        );
+        if probe.code != Some(0) {
+            eprintln!("no {name} JPEG engine here; skipped: {}", probe.stdout);
+            continue;
+        }
+        for format in ["RGB8", "BayerRG8"] {
+            let n = 20;
+            let (delta, files) = capture_delta_env(&home, &engine, format, &["-f", "jpg"], n);
+            let label = format!("capture -f jpg {format} ({name})");
+            show(&label, &delta, n as i64);
+            assert_no_avoidable(&label, &delta);
+            assert_eq!(site(&delta, "file_write"), files, "{label}");
+            // Frames are read where the camera wrote them: none is copied
+            // for the helper once it runs.
+            assert!(
+                site(&delta, "gpu_upload") <= frame_bytes(format) as i64,
+                "{label}: {delta}"
+            );
+        }
+        assert!(helper_reports(&home) > 0, "{name}: no helper report");
     }
 }
 

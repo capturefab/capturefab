@@ -30,8 +30,9 @@ use super::{
 use crate::{framebuf::shared::Segment, types::Frame};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::{CStr, c_char, c_int, c_uint, c_void},
+    sync::{Mutex, PoisonError},
 };
 
 /// Render nodes to try, in order.
@@ -179,6 +180,11 @@ fn header(width: u16, height: u16, channels: usize, quality: i32) -> Vec<u8> {
 
 type Display = *mut c_void;
 type Status = c_int;
+/// VAMessageCallback: a message for the callback's user context.
+type MessageCallback = unsafe extern "C" fn(*mut c_void, *const c_char);
+/// vaSetErrorCallback and vaSetInfoCallback: per display since libva 2.
+type SetCallback =
+    unsafe extern "C" fn(Display, Option<MessageCallback>, *mut c_void) -> Option<MessageCallback>;
 const SUCCESS: Status = 0;
 const PROFILE_JPEG_BASELINE: c_int = 12;
 const ENTRYPOINT_ENC_PICTURE: c_int = 7;
@@ -438,9 +444,54 @@ pub(crate) struct Api {
     render_picture: unsafe extern "C" fn(Display, u32, *mut u32, c_int) -> Status,
     end_picture: unsafe extern "C" fn(Display, u32) -> Status,
     sync_surface: unsafe extern "C" fn(Display, u32) -> Status,
+    set_error_callback: SetCallback,
+    set_info_callback: SetCallback,
+    /// What libva has said of the displays opened with these entry points
+    /// since the last call was checked.
+    messages: Box<Messages>,
     /// Kept loaded while the entry points are used.
     _libraries: Vec<Library>,
 }
+
+/// libva's error messages, the last few. libva would print them on
+/// stderr, which the worker passes on to the user: under `auto`, a host
+/// with a render node whose driver does not load would print them with
+/// every capture. They go in the error of the call that failed instead,
+/// which `doctor` and a named engine's failure show.
+#[derive(Default)]
+struct Messages(Mutex<VecDeque<String>>);
+
+impl Messages {
+    const KEPT: usize = 8;
+    /// What was said since the last call, and no longer kept.
+    fn take(&self) -> Vec<String> {
+        let mut kept = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.drain(..).collect()
+    }
+}
+
+/// Keep one of libva's error messages; `context` is the `Messages` of the
+/// display's entry points.
+unsafe extern "C" fn keep_message(context: *mut c_void, message: *const c_char) {
+    if context.is_null() || message.is_null() {
+        return;
+    }
+    // SAFETY: the context is the `Messages` boxed in the display's `Api`,
+    // which outlives the display (`Va` terminates it first).
+    let messages = unsafe { &*context.cast::<Messages>() };
+    // SAFETY: libva passes a NUL-terminated message.
+    let text = unsafe { CStr::from_ptr(message) }.to_string_lossy();
+    let text: String = text.trim().chars().take(300).collect();
+    let mut kept = messages.0.lock().unwrap_or_else(PoisonError::into_inner);
+    if kept.len() == Messages::KEPT {
+        kept.pop_front();
+    }
+    kept.push_back(text);
+}
+
+/// Drop one of libva's informational messages (its version, the driver it
+/// tries).
+unsafe extern "C" fn drop_message(_: *mut c_void, _: *const c_char) {}
 
 impl Api {
     fn load() -> Result<Self> {
@@ -481,13 +532,30 @@ impl Api {
                 render_picture: va.symbol(c"vaRenderPicture")?,
                 end_picture: va.symbol(c"vaEndPicture")?,
                 sync_surface: va.symbol(c"vaSyncSurface")?,
+                set_error_callback: va.symbol(c"vaSetErrorCallback")?,
+                set_info_callback: va.symbol(c"vaSetInfoCallback")?,
+                messages: Box::default(),
                 _libraries: vec![va, drm],
             })
         }
     }
 
-    /// A VA status as an error naming the call.
+    /// Send libva's messages about `display` to `messages`, not stderr.
+    fn listen(&self, display: Display) {
+        let context = std::ptr::from_ref::<Messages>(&self.messages);
+        // SAFETY: a display of this libva, before anything else is done
+        // with it; `messages` lives as long as these entry points, which
+        // outlive the display.
+        unsafe {
+            (self.set_error_callback)(display, Some(keep_message), context.cast_mut().cast());
+            (self.set_info_callback)(display, Some(drop_message), std::ptr::null_mut());
+        }
+    }
+
+    /// A VA status as an error naming the call, with what libva said
+    /// meanwhile.
     fn check(&self, what: &str, status: Status) -> Result<()> {
+        let said = self.messages.take();
         if status == SUCCESS {
             return Ok(());
         }
@@ -499,7 +567,12 @@ impl Api {
             // SAFETY: non-null, NUL-terminated and static.
             unsafe { CStr::from_ptr(text) }.to_string_lossy()
         };
-        bail!("{what} failed: {text} (status {status})")
+        let said = if said.is_empty() {
+            String::new()
+        } else {
+            format!("; libva: {}", said.join("; "))
+        };
+        bail!("{what} failed: {text} (status {status}){said}")
     }
 }
 
@@ -602,6 +675,7 @@ impl Va {
             imported: HashMap::new(),
             userptr: false,
         };
+        va.api.listen(display);
         let (mut major, mut minor) = (0, 0);
         // SAFETY: a fresh display and valid out-pointers.
         let status = unsafe { (va.api.initialize)(display, &mut major, &mut minor) };
@@ -1558,6 +1632,11 @@ mod tests {
         derived: usize,
         put: usize,
         encoded_from: Vec<u32>,
+        /// What vaInitialize reports to the error callback, and then fails.
+        init_errors: Vec<&'static CStr>,
+        /// The error and info callbacks, with their contexts.
+        error_callback: Option<(MessageCallback, usize)>,
+        info_callback: Option<(MessageCallback, usize)>,
     }
     // SAFETY: as for Memory; the coded segments point into their own
     // vectors.
@@ -1582,8 +1661,38 @@ mod tests {
         std::ptr::dangling_mut()
     }
     unsafe extern "C" fn initialize(_: Display, major: *mut c_int, minor: *mut c_int) -> Status {
+        let (errors, error, info) = fake(|fake| {
+            let errors = std::mem::take(&mut fake.init_errors);
+            (errors, fake.error_callback, fake.info_callback)
+        });
+        if !errors.is_empty() {
+            // As libva does when a driver does not load.
+            let (info, context) = info.expect("an info callback");
+            unsafe { info(context as *mut c_void, c"VA-API version 1.22.0\n".as_ptr()) };
+            let (error, context) = error.expect("an error callback");
+            for message in errors {
+                unsafe { error(context as *mut c_void, message.as_ptr()) };
+            }
+            return -1;
+        }
         unsafe { (*major, *minor) = (1, 22) };
         SUCCESS
+    }
+    unsafe extern "C" fn set_error_callback(
+        _: Display,
+        callback: Option<MessageCallback>,
+        context: *mut c_void,
+    ) -> Option<MessageCallback> {
+        fake(|fake| fake.error_callback = callback.map(|callback| (callback, context as usize)));
+        None
+    }
+    unsafe extern "C" fn set_info_callback(
+        _: Display,
+        callback: Option<MessageCallback>,
+        context: *mut c_void,
+    ) -> Option<MessageCallback> {
+        fake(|fake| fake.info_callback = callback.map(|callback| (callback, context as usize)));
+        None
     }
     unsafe extern "C" fn terminate(_: Display) -> Status {
         SUCCESS
@@ -2022,6 +2131,9 @@ mod tests {
             render_picture,
             end_picture,
             sync_surface,
+            set_error_callback,
+            set_info_callback,
+            messages: Box::default(),
             _libraries: Vec::new(),
         }
     }
@@ -2148,6 +2260,40 @@ mod tests {
             .encode(&frame, &segment, QUALITY, &mut [0; 10])
             .unwrap_err();
         assert!(error.is::<Unsupported>(), "{error:#}");
+    }
+
+    /// libva's messages do not reach stderr, which the worker passes on to
+    /// the user: its errors explain the call that failed, and the rest are
+    /// dropped.
+    #[test]
+    fn libva_messages_explain_failures_instead_of_printing() {
+        let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        *FAKE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Fake {
+            init_errors: vec![
+                c"/usr/lib/dri/nvidia_drv_video.so init failed\n",
+                c"va_openDriver() returns 1\n",
+            ],
+            ..Fake::default()
+        });
+        let error = Va::on_display(api(), std::ptr::dangling_mut(), None)
+            .err()
+            .unwrap();
+        let text = format!("{error:#}");
+        assert!(
+            text.ends_with(
+                "(status -1); libva: /usr/lib/dri/nvidia_drv_video.so init failed; \
+                 va_openDriver() returns 1"
+            ),
+            "{text}"
+        );
+        assert!(text.starts_with("vaInitialize failed"), "{text}");
+        assert!(!text.contains("VA-API version"), "{text}");
+        // What a call said is not left for the next one's error.
+        let api = api();
+        api.messages.0.lock().unwrap().push_back("earlier".into());
+        api.check("vaSyncSurface", SUCCESS).unwrap();
+        let error = api.check("vaEndPicture", -1).unwrap_err();
+        assert!(!format!("{error:#}").contains("earlier"), "{error:#}");
     }
 
     #[test]

@@ -3,24 +3,27 @@
 //!
 //! The helper loads the vendor's libraries when it starts, so a build needs
 //! no SDK, and a driver that crashes or hangs takes down only the helper:
-//! the worker kills a helper that misses its deadline, and a frame it held
-//! up, and every later one, is encoded on the CPU (`backend.rs`).
+//! the worker kills a helper that misses its deadline, and under `auto` a
+//! frame it held up, and every later one, is encoded on the CPU
+//! (`backend.rs`); a named engine's still fails instead.
 //!
-//! Frames do not travel. While a helper runs, the worker's frame pools hand
-//! out shared memory segments (`framebuf::share`): a camera writes each
-//! frame into one, and the helper maps each segment once, from the
-//! descriptor sent with the first request that names it, over the helper's
-//! control socket (its standard input). A request names the frame's
-//! segment and an output segment, and the reply says how long the JPEG the
-//! helper wrote there is: one JSON line each way. A frame from before the
-//! helper started, or in a USB transfer's own buffer, is copied into a
-//! segment first (`gpu_upload`).
+//! Frames do not travel. While a GPU engine is open in the worker (its
+//! `Client`), the worker's frame pools hand out shared memory segments
+//! (`framebuf::share`): a camera writes each frame into one, and the helper
+//! maps each segment once, from the descriptor sent with the first request
+//! that names it, over the helper's control socket (its standard input). A
+//! request names the frame's segment and an output segment, and the reply
+//! says how long the JPEG the helper wrote there is: one JSON line each
+//! way. A frame from before the engine opened, or in a USB transfer's own
+//! buffer, is copied into a segment first (`gpu_upload`).
 //!
 //! A segment lent to the helper is not reused until it has answered or
 //! ended: one killed for missing its deadline keeps what it was lent until
 //! the process is reaped, and forever if it cannot be (a process stuck in a
 //! GPU driver can outlive SIGKILL). A helper unused for a minute stops,
-//! releasing its driver, and starts again for the next frame.
+//! releasing its driver, and starts again for the next frame; the pools
+//! keep sharing meanwhile, so the frames written while it rests need no
+//! copy when it starts again.
 #![allow(unsafe_code)]
 // Engines use helpers on Linux; elsewhere the code is built for its tests.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -482,6 +485,9 @@ pub(crate) fn serve(socket: UnixStream, opened: Opened) -> Result<()> {
                     ..Reply::default()
                 },
             };
+            // Before the answer, so a command never ends before the copies
+            // made for it are reported.
+            copies::report_as("helper");
             output.write_all(&line(&reply)?)?;
         }
         Ok(())
@@ -636,10 +642,8 @@ impl Helper {
                     .arg(ARG)
                     .arg(kind.name())
                     .arg(std::process::id().to_string());
-                if kind == Kind::Vaapi && std::env::var_os("LIBVA_MESSAGING_LEVEL").is_none() {
-                    // libva reports its driver on stderr; keep errors only.
-                    command.env("LIBVA_MESSAGING_LEVEL", "1");
-                }
+                // Its stderr is the worker's, which passes it on to the
+                // user, so libva's messages go in its errors (`vaapi.rs`).
                 Process::Child(spawn(command, theirs)?)
             }
             #[cfg(test)]
@@ -872,8 +876,9 @@ impl Backend for Client {
     fn encode(&mut self, view: FrameRef<'_>, quality: i32) -> Result<Body<'static>> {
         let frame = view.frame;
         if !view.is_whole() || crate::frame::validate_source(frame).is_err() {
-            // The CPU says what is wrong with it.
-            return Err(Unsupported("not a whole, valid frame".into()).into());
+            // The CPU says what is wrong with it. A fault of this frame, not
+            // of its size or format: the engine learns nothing from it.
+            return Err(Unready("not a whole, valid frame".into()).into());
         }
         if crate::jpeg::monochrome(frame.pixel_format) && !self.hello.gray {
             return Err(Unsupported("it does not encode gray JPEGs here".into()).into());
@@ -1205,7 +1210,17 @@ pub(crate) mod tests {
         let mono = shared_frame(crate::types::MONO8, 64, 16, 1);
         let error = client.encode(FrameRef::whole(&mono), QUALITY).unwrap_err();
         assert!(error.is::<Unsupported>(), "{error:#}");
+        // A truncated frame is a fault of that frame, not a decline of its
+        // size: the engine keeps no verdict for it.
         let frame = shared_frame(crate::types::RGB8, 64, 16, 1);
+        let truncated = Frame {
+            height: 32,
+            ..frame.clone()
+        };
+        let error = client
+            .encode(FrameRef::whole(&truncated), QUALITY)
+            .unwrap_err();
+        assert!(error.is::<Unready>(), "{error:#}");
         assert!(client.encode(FrameRef::whole(&frame), QUALITY).is_ok());
     }
 

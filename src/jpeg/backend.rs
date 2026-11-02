@@ -32,8 +32,9 @@
 //!
 //! An engine runs on a thread of its own, so a driver that hangs costs one
 //! abandoned thread, not the camera worker; frames reach it shared, not
-//! copied. One unused for a minute rests (releases its sessions, or stops
-//! its helper); under `auto` the next frame is the CPU's while it wakes.
+//! copied. A GPU engine unused for a minute rests: its helper stops,
+//! releasing the GPU, and under `auto` the next frame is the CPU's while it
+//! starts again. Apple's engine keeps its sessions.
 // Builds without a hardware engine for their platform use only the CPU.
 #![cfg_attr(
     not(any(
@@ -703,7 +704,10 @@ impl Engine {
         let view = FrameRef::whole(frame);
         let takes = (self.accepts)(view, quality)
             && (named || self.any_size || view.pixels() >= MIN_PIXELS);
-        if !takes {
+        // An invalid frame (a truncated one) says nothing of the engine: the
+        // CPU says what is wrong with it, and the next frame of its size is
+        // the engine's as before.
+        if !takes || crate::frame::validate_source(frame).is_err() {
             return cpu(frame, quality);
         }
         // One frame at a time: under `auto` another thread's frame goes to
@@ -1465,6 +1469,34 @@ mod tests {
         // Once it can, the next frame is checked and passes.
         engine.encode(&frame, QUALITY, true).unwrap();
         assert_eq!(engine.verified(), Some(true));
+    }
+
+    /// A truncated frame is the CPU's, which says what is wrong with it; the
+    /// engine never sees it and keeps the next valid frame of its size,
+    /// named or not.
+    #[test]
+    fn invalid_frames_leave_the_engine_as_it_was() {
+        for named in [true, false] {
+            let (engine, calls) = engine(Scenario::Echo(Arc::default()));
+            let frame = frame(0x0108_0009);
+            let truncated = Frame {
+                data: frame.data[..frame.data.len() / 2].to_vec().into(),
+                ..frame.clone()
+            };
+            let error = engine.encode(&truncated, QUALITY, named).unwrap_err();
+            assert!(format!("{error:#}").contains("truncated"), "{error:#}");
+            assert_ne!(
+                crate::types::classify(&error).kind,
+                ErrorKind::Unavailable,
+                "{error:#}"
+            );
+            assert_eq!(calls.load(Ordering::Relaxed), 0);
+            assert_eq!(engine.verified(), None, "nothing learned");
+            engine.encode(&frame, QUALITY, named).unwrap();
+            assert_eq!(engine.settled().verified(), Some(true));
+            assert!(calls.load(Ordering::Relaxed) > 0);
+            assert!(engine.unavailable().is_none());
+        }
     }
 
     /// An engine unused for its idle time rests; under `auto` the next

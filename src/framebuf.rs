@@ -20,9 +20,10 @@
 //! Y'CbCr planes for a JPEG) come from a second pool, [`transforms`], so
 //! they never push a camera's frames out of this one.
 //!
-//! While a GPU JPEG helper process reads this process's frames, both pools
-//! hand out shared memory segments ([`shared`]) instead of heap vectors, so
-//! the helper reads a frame where the camera wrote it ([`share`]).
+//! While a GPU JPEG engine is open in this process, its helper resting
+//! included, both pools hand out shared memory segments ([`shared`])
+//! instead of heap vectors, so the helper reads a frame where the camera
+//! wrote it ([`share`]).
 #[cfg(jpeg_helper)]
 pub(crate) mod shared;
 

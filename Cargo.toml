@@ -30,8 +30,8 @@ keychain = ["dep:keyring"]
 # the shell reads plain lines.
 shell = ["dep:rustyline"]
 # Count where camera frames are copied and the large allocations made, and
-# write each camera worker's counts to $CAPTUREFAB_COPY_REPORT
-# (tests/copies.rs). Off in every release build.
+# write each camera worker's and GPU JPEG helper's counts to
+# $CAPTUREFAB_COPY_REPORT (tests/copies.rs). Off in every release build.
 copy-audit = []
 
 [dependencies]

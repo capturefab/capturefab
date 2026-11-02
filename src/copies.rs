@@ -3,7 +3,9 @@
 //! [`record`] with the bytes it copied; the call does nothing unless the
 //! `copy-audit` feature is on. A `copy-audit` worker writes what it counted
 //! to `$CAPTUREFAB_COPY_REPORT/worker-PID.json` whenever it answers a request
-//! or ends a job, and when it exits (`tests/copies.rs` reads them).
+//! or ends a job, and when it exits, and a GPU JPEG helper process
+//! (`jpeg/helper.rs`) to `helper-PID.json` before each answer, for the copies
+//! it makes for its worker (`tests/copies.rs` adds them all up).
 //!
 //! A copy is any duplication of pixel bytes in user space: a memcpy, a
 //! clone, an extend, a zero fill about to be overwritten, an intermediate
@@ -208,8 +210,15 @@ pub(crate) fn frame() {
 /// Write what this process counted to `$CAPTUREFAB_COPY_REPORT`, when it is
 /// set in a `copy-audit` build.
 pub(crate) fn report() {
+    report_as("worker");
+}
+
+/// `report`, for a process in `role`: its file is `ROLE-PID.json`.
+pub(crate) fn report_as(role: &str) {
     #[cfg(feature = "copy-audit")]
-    audit::report();
+    audit::report(role);
+    #[cfg(not(feature = "copy-audit"))]
+    let _ = role;
 }
 
 #[cfg(feature = "copy-audit")]
@@ -254,12 +263,12 @@ mod audit {
         })
     }
 
-    pub(super) fn report() {
+    pub(super) fn report(role: &str) {
         let Some(folder) = std::env::var_os("CAPTUREFAB_COPY_REPORT") else {
             return;
         };
         let path =
-            std::path::Path::new(&folder).join(format!("worker-{}.json", std::process::id()));
+            std::path::Path::new(&folder).join(format!("{role}-{}.json", std::process::id()));
         // A reader never sees half a report: it is renamed into place.
         let partial = path.with_extension("json.partial");
         let written = serde_json::to_vec(&counts())
