@@ -40,18 +40,35 @@ pub(crate) fn resolve_selector(selector: &mut String, base: &Path) -> Result<()>
 /// A local source made absolute, and canonical when it exists.
 fn resolve_source(path: &mut String, base: &Path) -> Result<()> {
     resolve_path(path, base)?;
-    if let Ok(canonical) = std::fs::canonicalize(&*path)
+    if let Ok(canonical) = canonical(Path::new(&*path))
         && let Some(canonical) = canonical.to_str()
     {
-        // Windows canonical paths are verbatim (\\?\C:\...); keep the
-        // plain form a person would type.
-        *path = canonical
-            .strip_prefix(r"\\?\")
-            .filter(|plain| Path::new(plain).is_absolute())
-            .unwrap_or(canonical)
-            .to_owned();
+        *path = canonical.to_owned();
     }
     Ok(())
+}
+
+/// `path` canonical, in the form a person would type. Windows names its
+/// canonical paths verbatim, as `\\?\C:\x` and `\\?\UNC\server\share\x`;
+/// the plain `C:\x` and `\\server\share\x` replace them where the system
+/// reads the plain form as the same path, which it does unless a name
+/// ends in a dot or a space or is a device's, such as `NUL`.
+pub(crate) fn canonical(path: &Path) -> std::io::Result<PathBuf> {
+    let canonical = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    if let Some(text) = canonical.to_str() {
+        let plain = match text.strip_prefix(r"\\?\UNC\") {
+            Some(share) => Some(format!(r"\\{share}")),
+            None => text.strip_prefix(r"\\?\").map(str::to_owned),
+        };
+        if let Some(plain) = plain.map(PathBuf::from)
+            && plain.is_absolute()
+            && std::path::absolute(&plain).is_ok_and(|read| read == plain)
+        {
+            return Ok(plain);
+        }
+    }
+    Ok(canonical)
 }
 
 /// Resolve a command's relative local outputs against `base`; stream URLs
@@ -195,7 +212,7 @@ mod tests {
             resolve_selector(&mut selector, base).unwrap();
             selector
         };
-        let canonical = std::fs::canonicalize(base.join("a.png")).unwrap();
+        let canonical = canonical(&base.join("a.png")).unwrap();
         for (selector, from) in [
             ("a.png", base.clone()),
             ("./a.png", base.clone()),
@@ -221,6 +238,33 @@ mod tests {
             resolve_path(&mut output, Path::new("/elsewhere")).unwrap();
             assert_eq!(output, "/y.png");
         }
+    }
+
+    /// A canonical path is the system's, without Windows's verbatim prefix
+    /// where the plain form names the same file.
+    #[test]
+    fn canonical_paths_are_plain_where_they_can_be() {
+        let base =
+            std::env::temp_dir().join(format!("capturefab-canonical-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let named = canonical(&base).unwrap();
+        assert!(named.is_absolute(), "{named:?}");
+        assert_eq!(
+            std::fs::canonicalize(&named).unwrap(),
+            std::fs::canonicalize(&base).unwrap()
+        );
+        #[cfg(windows)]
+        {
+            assert!(!named.to_str().unwrap().starts_with(r"\\?\"), "{named:?}");
+            // The plain form of a name ending in a dot names the name
+            // without it, so that path stays verbatim.
+            let dotted = std::fs::canonicalize(&base).unwrap().join("dotted.");
+            std::fs::create_dir(&dotted).unwrap();
+            let named = canonical(&dotted).unwrap();
+            assert!(named.to_str().unwrap().starts_with(r"\\?\"), "{named:?}");
+            assert!(named.to_str().unwrap().ends_with("dotted."), "{named:?}");
+        }
+        std::fs::remove_dir_all(std::fs::canonicalize(&base).unwrap()).unwrap();
     }
 
     /// A `..` after a symbolic link leads to the parent of where the link
@@ -337,7 +381,10 @@ mod tests {
         let SessionCommand::Schedule { output, .. } = &capture else {
             unreachable!()
         };
-        assert_eq!(output, &base.join("frames/shot.png").display().to_string());
+        assert_eq!(
+            output,
+            &base.join("frames").join("shot.png").display().to_string()
+        );
         let mut recording =
             SessionCommand::from_json_slice(br#"{"op":"forward","output":"file:clip.mkv","codec":"h264","encoder":"auto","fps":30.0,"bitrate":"4M"}"#)
                 .unwrap();

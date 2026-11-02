@@ -152,10 +152,16 @@ impl Home {
     pub fn path(&self, name: &str) -> PathBuf {
         self.work.join(name)
     }
-    /// `path`, as the binary sees it: with symlinks resolved, as in
-    /// macOS's /private/var for /var.
+    /// `path`, `/`-separated, as the binary sees it in the folder it runs
+    /// in: Unix names that folder by its real path, as macOS's
+    /// /private/var for /var, while Windows keeps the name it was given,
+    /// such as a temporary folder's short `C:\Users\RUNNER~1`.
     pub fn real(&self, name: &str) -> PathBuf {
-        self.work.canonicalize().unwrap().join(name)
+        #[cfg(unix)]
+        let folder = self.work.canonicalize().unwrap();
+        #[cfg(not(unix))]
+        let folder = self.work.clone();
+        name.split('/').fold(folder, |path, part| path.join(part))
     }
 }
 impl Drop for Home {
