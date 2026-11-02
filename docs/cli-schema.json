@@ -2589,7 +2589,7 @@
    "examples": [
     "capturefab set -c sim:0 exposure=5ms gain=3",
     "capturefab set -c sim:0 ExposureTime=10ms Width=640",
-    "capturefab set -c sim:0 'TriggerMode[FrameStart]=On' trigger=line0:rising",
+    "capturefab set -c sim:0 'TriggerMode[FrameStart]=On' 'TriggerSource[FrameStart]=Line0'",
     "capturefab set -c sim:0 roi=0,0,320,240 --dry-run"
    ],
    "notes": [],

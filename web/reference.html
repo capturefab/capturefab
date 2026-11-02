@@ -194,7 +194,7 @@ capturefab get -c sim:0 -c sim:1 Width</code></pre><button class="copy-button" t
 </tbody></table></div>
 <div class="code-wrap"><pre><code>capturefab set -c sim:0 exposure=5ms gain=3
 capturefab set -c sim:0 ExposureTime=10ms Width=640
-capturefab set -c sim:0 &#x27;TriggerMode[FrameStart]=On&#x27; trigger=line0:rising
+capturefab set -c sim:0 &#x27;TriggerMode[FrameStart]=On&#x27; &#x27;TriggerSource[FrameStart]=Line0&#x27;
 capturefab set -c sim:0 roi=0,0,320,240 --dry-run</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab set examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab set JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>

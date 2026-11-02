@@ -25,6 +25,7 @@ capturefab info -c sim:0
 capturefab set -c sim:0 exposure=20ms PixelFormat=BayerRG8
 capturefab inspect -c sim:0 --set exposure=40ms            # verdict: clipped_high, bright
 capturefab capture -c sim:0 --set trigger=software -o triggered.png   # capture fires the trigger
+capturefab set -c sim:0 trigger=off PixelFormat=Mono8      # back to free running, as it started
 capturefab capture -c sim:line -o line-block.png
 capturefab get -c sim:depth PixelFormat Scan3dCoordinateScale Scan3dCoordinateOffset
 capturefab capture -c sim:depth -o depth.raw               # the 16-bit samples as they are

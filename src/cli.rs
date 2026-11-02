@@ -151,7 +151,7 @@ pub enum Command {
     Get(camera::GetArgs),
     /// Change features or controls as one atomic change; a failure restores every value
     #[command(
-        after_help = "Examples:\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab set -c sim:0 ExposureTime=10ms Width=640\n  capturefab set -c sim:0 'TriggerMode[FrameStart]=On' trigger=line0:rising\n  capturefab set -c sim:0 roi=0,0,320,240 --dry-run"
+        after_help = "Examples:\n  capturefab set -c sim:0 exposure=5ms gain=3\n  capturefab set -c sim:0 ExposureTime=10ms Width=640\n  capturefab set -c sim:0 'TriggerMode[FrameStart]=On' 'TriggerSource[FrameStart]=Line0'\n  capturefab set -c sim:0 roi=0,0,320,240 --dry-run"
     )]
     Set(camera::SetArgs),
     /// Run a command feature, such as UserSetSave[UserSet1]

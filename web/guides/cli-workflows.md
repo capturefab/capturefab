@@ -59,6 +59,9 @@ capturefab session start --name station -c sim:0 --live --idle 8h
 capturefab set -c sim:0 trigger=line0:rising exposure=2ms
 capturefab capture -c sim:0 -n 1000 -o 'station/{time}.png' --timeout none --background
 capturefab session status station
+capturefab jobs stop all                # at the end of the shift; files saved so far stay
+capturefab session stop station
+capturefab set -c sim:0 trigger=off     # back to free running
 ```
 
 With a hardware trigger, `capture` saves one frame per trigger and waits for the next;
