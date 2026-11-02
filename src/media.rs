@@ -4176,6 +4176,15 @@ impl RawInput {
             full_range: matches!(ffmpeg, "uyvy422" | "yuyv422"),
         })
     }
+    /// The pixel format `encoder` must store these frames in, when FFmpeg's
+    /// own choice would fail. FFV1 keeps a 16-bit Bayer mosaic only in its
+    /// experimental version 4, so a wide mosaic is stored as 16-bit planar
+    /// RGB, which keeps every widened sample, as FFmpeg itself stores 8-bit
+    /// Bayer as 8-bit RGB.
+    fn output_pix_fmt(&self, encoder: &str) -> Option<&'static str> {
+        (encoder == "ffv1" && self.ffmpeg.starts_with("bayer_") && self.bytes_per_pixel == 2)
+            .then_some("gbrp16le")
+    }
     /// YUV 4:2:2, where each two pixels share one Cb and one Cr.
     fn pairs(&self) -> bool {
         matches!(self.ffmpeg, "uyvy422" | "yuyv422")
@@ -4396,6 +4405,9 @@ impl Forwarder {
                 &((self.config.fps * 2.0).round().max(1.0) as u32).to_string(),
             ]);
             cmd.args(encoder_output_options(&encoder, input));
+            if let Some(pix_fmt) = raw.output_pix_fmt(&encoder) {
+                cmd.args(["-pix_fmt", pix_fmt]);
+            }
             cmd.args(["-fps_mode", "vfr"]);
             if matches!(encoder.as_str(), "libx264" | "libx265") {
                 let cores = cores();
@@ -6222,6 +6234,29 @@ esac"#
         }
         let error = RawInput::for_format(0x0110_0099).unwrap_err().to_string();
         assert!(error.contains("0x01100099") && error.contains("--format raw"));
+    }
+    #[test]
+    fn ffv1_stores_wide_bayer_as_sixteen_bit_rgb() {
+        let bayer = (0x0108_0000..=0x0110_0200)
+            .filter(|&v| crate::frame::is_bayer(v))
+            .filter_map(|v| RawInput::for_format(v).ok())
+            .collect::<Vec<_>>();
+        assert_eq!(bayer.len(), 40);
+        for raw in bayer {
+            let wide = crate::frame::sample_bits(raw.pixel_format).unwrap() > 8;
+            let expected = wide.then_some("gbrp16le");
+            assert_eq!(
+                raw.output_pix_fmt("ffv1"),
+                expected,
+                "{:x}",
+                raw.pixel_format
+            );
+            assert_eq!(raw.output_pix_fmt("libx264"), None);
+        }
+        for format in [crate::types::MONO8, 0x010e_0104, 0x0110_0007, 0x0230_001a] {
+            let raw = RawInput::for_format(format).unwrap();
+            assert_eq!(raw.output_pix_fmt("ffv1"), None, "{format:x}");
+        }
     }
     #[test]
     fn raw_inputs_keep_fourteen_bit_precision() {

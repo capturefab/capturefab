@@ -26,16 +26,16 @@ SITE = 'https://capturefab.com/'
 GROUPS = [
     ('cli-cameras', 'Cameras and settings', 'Find a camera, read what it can do and change its settings.',
      ['list', 'info', 'features', 'get', 'set', 'exec']),
-    ('cli-capture', 'Capture, record and measure', 'Save images and video, measure exposure and focus, settle auto exposure.',
-     ['capture', 'record', 'inspect', 'auto']),
+    ('cli-capture', 'Capture, record and measure', 'Save images and video, measure exposure and focus once or live, settle auto exposure.',
+     ['capture', 'record', 'inspect', 'watch', 'auto']),
     ('cli-presets', 'Presets', 'Save a camera\'s settings on this computer and restore them as one change.',
      ['preset']),
     ('cli-sessions', 'Sessions and jobs', 'Keep cameras open between commands and run captures and recordings in the background.',
      ['session', 'serve', 'jobs']),
     ('cli-network', 'Sign-ins and networks', 'Save camera passwords, resolve ONVIF streams and check GigE paths.',
      ['login', 'onvif', 'network']),
-    ('cli-tools', 'Diagnostics and tools', 'Check this computer, describe the CLI, complete commands and talk to camera registers.',
-     ['doctor', 'schema', 'completions', 'debug', 'licenses']),
+    ('cli-tools', 'Diagnostics and tools', 'Check this computer, describe the CLI, run commands one after another in a shell, complete them and talk to camera registers.',
+     ['doctor', 'schema', 'shell', 'completions', 'debug', 'licenses']),
 ]
 OTHER = ('cli-more', 'More commands', 'Commands without a section of their own yet.')
 GROUP_IDS = [group[0] for group in GROUPS] + [OTHER[0]]

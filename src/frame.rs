@@ -219,11 +219,14 @@ fn unpack_row(row: &[u8], bits: u32, packing: Packing, out: &mut [[u8; 2]]) {
         }
     }
     match (packing, bits) {
-        (Packing::Lsb, 14) => {
-            for (x, sample) in out.iter_mut().enumerate() {
-                *sample = packed_sample(row, x, bits, packing).to_le_bytes();
-            }
-        }
+        (Packing::Lsb, 14) => groups(row, out, |[b0, b1, b2, b3, b4, b5, b6]| {
+            [
+                b0 | (b1 & 0x3f) << 8,
+                b1 >> 6 | b2 << 2 | (b3 & 0x0f) << 10,
+                b3 >> 4 | b4 << 4 | (b5 & 0x03) << 12,
+                b5 >> 2 | b6 << 6,
+            ]
+        }),
         (Packing::Lsb, 10) => groups(row, out, |[b0, b1, b2, b3, b4]| {
             [
                 b0 | (b1 & 0x03) << 8,
@@ -356,28 +359,64 @@ fn bayer8(pixel_format: u32) -> Option<u32> {
         v => wide_bayer(v).map(|(bayer8, _)| bayer8),
     }
 }
+/// The 8-bit format `eight_bit` reduces `pixel_format` to, and the shift
+/// that brings its samples there: Bayer8 for a 10- to 16-bit mosaic, packed
+/// or not, and Mono8 for packed monochrome. None for every other format.
+fn reduced(pixel_format: u32) -> Option<(u32, u32)> {
+    let unpacked = unpacked_format(pixel_format);
+    wide_bayer(unpacked).or_else(|| {
+        packing(pixel_format)
+            .and_then(|_| unpacked_shift(unpacked))
+            .map(|shift| (MONO8, shift))
+    })
+}
 /// The format `eight_bit` turns `pixel_format` into.
 fn eight_bit_format(pixel_format: u32) -> u32 {
-    let unpacked = unpacked_format(pixel_format);
-    wide_bayer(unpacked).map_or(unpacked, |(bayer8, _)| bayer8)
+    reduced(pixel_format).map_or_else(|| unpacked_format(pixel_format), |(format, _)| format)
 }
-/// `frame` in a format the converters read directly: `unpacked`, then a
-/// 10- to 16-bit Bayer mosaic reduced to Bayer8.
+/// `frame` in a format the converters read directly: `unpacked`, except
+/// that packed monochrome becomes Mono8 and a 10- to 16-bit Bayer mosaic
+/// Bayer8, with the bits `sample8` keeps. Packed rows are unpacked a group
+/// at a time into one reused row, so no 16-bit image is built.
 fn eight_bit(frame: &Frame) -> Result<Cow<'_, Frame>> {
-    let Some((pixel_format, _)) = wide_bayer(unpacked_format(frame.pixel_format)) else {
+    let format = frame.pixel_format;
+    let Some((pixel_format, shift)) = reduced(format) else {
         return unpacked(frame);
     };
     validate_source(frame)?;
     let pixels = checked_pixels(frame)?;
-    let width = frame.width as usize;
-    let data = (0..pixels)
-        .map(|i| sample8(frame, i % width, i / width))
-        .collect();
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let stride = row_bytes(frame.width, format);
+    let packed = packing(format);
+    let mut row = vec![[0; 2]; if packed.is_some() { width } else { 0 }];
+    let mut data = vec![0; pixels];
+    let lines = frame.data[..stride * height].chunks_exact(stride);
+    for (line, out) in lines.zip(data.chunks_exact_mut(width)) {
+        let samples = match packed {
+            Some((_, bits, packing)) => {
+                unpack_row(line, bits, packing, &mut row);
+                &row[..]
+            }
+            None => line.as_chunks::<2>().0,
+        };
+        for (value, sample) in out.iter_mut().zip(samples) {
+            *value = (u16::from_le_bytes(*sample) >> shift).min(255) as u8;
+        }
+    }
     Ok(Cow::Owned(Frame {
         pixel_format,
         data,
         ..*frame
     }))
+}
+/// Formats converted pixel by pixel straight into the caller's storage: the
+/// `formats` layouts, alpha-padded RGB and YUV 4:2:2. Packed monochrome and
+/// Bayer go through `eight_bit`, whose group-wise unpacking is many times
+/// faster than reading each sample on its own.
+fn streamed(pixel_format: u32) -> bool {
+    packing(pixel_format).is_none()
+        && !is_bayer(pixel_format)
+        && unpacked_format(pixel_format) != pixel_format
 }
 /// One-channel formats: the 8-bit monochrome family, the unpacked 16-bit one
 /// of [`unpacked_shift`], and the packed formats that unpack into it.
@@ -396,7 +435,7 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
     validate_source(frame)?;
     // Bayer conversion owns its output; avoid allocating an unused RGB image
     // before dispatching to the demosaic.
-    if is_bayer(frame.pixel_format) || unpacked_format(frame.pixel_format) != frame.pixel_format {
+    if is_bayer(frame.pixel_format) || streamed(frame.pixel_format) {
         return Ok(convert(frame, |p| p)?.into_flattened());
     }
     let frame = &*eight_bit(frame)?;
@@ -456,7 +495,7 @@ pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
     if !monochrome(frame.pixel_format) {
         return Ok(None);
     }
-    if unpacked_format(frame.pixel_format) != frame.pixel_format {
+    if streamed(frame.pixel_format) {
         validate_source(frame)?;
         let width = frame.width as usize;
         return Ok(Some(
@@ -465,10 +504,16 @@ pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
                 .collect(),
         ));
     }
-    let frame = &*unpacked(frame)?;
+    let frame = eight_bit(frame)?;
     if matches!(frame.pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6) {
         ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
-        return Ok(Some(frame.data[..pixels].to_vec()));
+        return Ok(Some(match frame {
+            Cow::Owned(Frame { mut data, .. }) => {
+                data.truncate(pixels);
+                data
+            }
+            Cow::Borrowed(frame) => frame.data[..pixels].to_vec(),
+        }));
     }
     let Some(shift) = unpacked_shift(frame.pixel_format) else {
         return Ok(None);
@@ -617,9 +662,9 @@ fn convert_to<'a, P: Copy + Default + Send + 'a>(
     out: impl Sink<'a, P>,
     pixel: impl Fn([u8; 3]) -> P + Sync,
 ) -> Result<()> {
-    // Packed monochrome, alpha-padded RGB and YUV stream straight to the
-    // caller's storage. Reused conversion buffers need no temporary image.
-    if !is_bayer(frame.pixel_format) && unpacked_format(frame.pixel_format) != frame.pixel_format {
+    // The `formats` layouts, alpha-padded RGB and YUV stream straight to
+    // the caller's storage. Reused conversion buffers need no temporary image.
+    if streamed(frame.pixel_format) {
         validate_source(frame)?;
         let width = frame.width as usize;
         out.stream(
@@ -1573,6 +1618,50 @@ mod tests {
         }
         assert!(rgba(&f(RGB8, vec![0])).is_err());
         assert!(convert(&f(0, vec![0; 6]), |p| p).is_err());
+    }
+    #[test]
+    fn packed_and_wide_conversions_match_the_per_pixel_reference() {
+        // Every packed mono/Bayer layout and every unpacked wide mosaic goes
+        // through `eight_bit`'s group-wise rows; `pixel_at` reads each
+        // sample on its own and is the reference for all of them.
+        let formats = (0x0100_0000..=0x0110_0200)
+            .filter(|&v| packing(v).is_some() || wide_bayer(v).is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(formats.len(), 41);
+        for format in formats {
+            assert!(!streamed(format) && convertible(format), "{format:x}");
+            for (width, height) in [(1, 1), (2, 3), (3, 2), (5, 7), (33, 17)] {
+                let bytes = row_bytes(width, format) * height as usize;
+                let frame = Frame {
+                    width,
+                    height,
+                    ..f(format, random(u64::from(format ^ width), bytes))
+                };
+                let reference = (0..height as usize)
+                    .flat_map(|y| (0..width as usize).map(move |x| (x, y)))
+                    .flat_map(|(x, y)| pixel_at(&frame, x, y))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    rgb(&frame).unwrap(),
+                    reference,
+                    "{format:x} {width}x{height}"
+                );
+                let mut reused = vec![[9; 4]; 3];
+                convert_into(&frame, &mut reused, |[r, g, b]| [r, g, b, 255]).unwrap();
+                let opaque = reference.as_chunks::<3>().0.iter();
+                let expected = opaque
+                    .flat_map(|&[r, g, b]| [r, g, b, 255])
+                    .collect::<Vec<_>>();
+                assert_eq!(reused.into_flattened(), expected, "{format:x}");
+                let gray = reference.iter().step_by(3).copied().collect();
+                let expected = (!is_bayer(format)).then_some(gray);
+                assert_eq!(gray8(&frame).unwrap(), expected, "{format:x}");
+                let mut short = frame;
+                short.data.pop();
+                assert!(rgb(&short).is_err(), "{format:x}");
+                assert!(is_bayer(format) || gray8(&short).is_err(), "{format:x}");
+            }
+        }
     }
     #[test]
     fn sparse_sampling_matches_full_conversion() {

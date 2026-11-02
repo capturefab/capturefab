@@ -91,6 +91,36 @@ fn a_timed_recording_ends_on_its_duration() {
 
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn lossless_recordings_keep_wide_bayer_mosaics() {
+    let home = Home::new("record-ffv1-bayer");
+    // FFV1 stores a 16-bit mosaic only in its experimental version 4; wide
+    // Bayer, packed or not, is kept as 16-bit RGB instead.
+    for format in ["BayerRG12p", "BayerRG12"] {
+        let output = format!("{format}.mkv");
+        let setting = format!("PixelFormat={format}");
+        let result = home.ok(&[
+            "record", "-c", "sim:0", "-o", &output, "--codec", "ffv1", "--for", "1s", "--set",
+            &setting,
+        ]);
+        assert_eq!(result["encoder"], "ffv1", "{result}");
+        assert!(result["frames"].as_u64().unwrap() > 0, "{result}");
+        let path = home.path(&output);
+        assert!(decodes(&path), "{format}");
+        let probe = std::process::Command::new(support::cli::ffmpeg())
+            .args(["-hide_banner", "-i"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let described = String::from_utf8_lossy(&probe.stderr);
+        assert!(
+            described.contains("ffv1") && described.contains("gbrp16le"),
+            "{described}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
 fn a_recording_reports_its_warm_up() {
     let home = Home::new("record-warm-up");
     // Far too dark, with the camera's own continuous auto exposure.

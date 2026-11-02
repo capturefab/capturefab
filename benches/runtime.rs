@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FORMATS: [(&str, u32); 19] = [
+const FORMATS: [(&str, u32); 20] = [
     ("Mono8", MONO8),
     ("RGB8", RGB8),
     ("BGR8", 0x0218_0015),
@@ -21,6 +21,7 @@ const FORMATS: [(&str, u32); 19] = [
     ("Mono12", 0x0110_0005),
     ("Mono16", 0x0110_0007),
     ("BayerRG8", 0x0108_0009),
+    ("BayerRG12", 0x0110_0011),
     ("Mono10p", 0x010a_0046),
     ("Mono12Packed", 0x010c_0006),
     ("Mono14p", 0x010e_0104),
@@ -134,13 +135,13 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                 .collect();
             packed_rows(&samples, width as usize * 3, 12, false)
         }
-        0x010a_0046 | 0x010c_0006 | 0x010e_0104 | 0x010c_0059 | 0x010e_0106 => {
+        0x010a_0046 | 0x010c_0006 | 0x010e_0104 | 0x010c_0059 | 0x010e_0106 | 0x0110_0011 => {
             let bits = match pixel_format {
                 0x010a_0046 => 10,
-                0x010c_0006 | 0x010c_0059 => 12,
+                0x010c_0006 | 0x010c_0059 | 0x0110_0011 => 12,
                 _ => 14,
             };
-            let bayer = matches!(pixel_format, 0x010c_0059 | 0x010e_0106);
+            let bayer = matches!(pixel_format, 0x010c_0059 | 0x010e_0106 | 0x0110_0011);
             let samples: Vec<u16> = pixels
                 .iter()
                 .enumerate()
@@ -154,7 +155,11 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                     (value << (bits - 8)) | (i as u16 & ((1 << (bits - 8)) - 1))
                 })
                 .collect();
-            packed_rows(&samples, width as usize, bits, pixel_format == 0x010c_0006)
+            if pixel_format == 0x0110_0011 {
+                samples.iter().flat_map(|v| v.to_le_bytes()).collect()
+            } else {
+                packed_rows(&samples, width as usize, bits, pixel_format == 0x010c_0006)
+            }
         }
         0x0218_0020 | 0x0210_0041 => {
             let limited = pixel_format == 0x0210_0041;
@@ -238,9 +243,10 @@ impl Bench {
     fn selected(&self, name: &str) -> bool {
         self.filter.is_empty() || self.filter.iter().any(|f| name.contains(f.as_str()))
     }
-    fn run<T>(&self, name: &str, bytes: usize, mut f: impl FnMut() -> T) {
+    /// The median time in seconds, None when `name` is filtered out.
+    fn run<T>(&self, name: &str, bytes: usize, mut f: impl FnMut() -> T) -> Option<f64> {
         if !self.selected(name) {
-            return;
+            return None;
         }
         black_box(f());
         let mut samples = Vec::new();
@@ -261,8 +267,22 @@ impl Bench {
             bytes as f64 / median / 1e6,
             samples.len()
         );
+        Some(median)
     }
 }
+
+/// Packed formats and the unpacked format each must convert within
+/// `PACKED_LIMIT` times the time of, when both are benchmarked. Packed
+/// samples are unpacked a group at a time per row; reading each one on its
+/// own made `rgb` of Mono10p 15 times slower than Mono10.
+const PACKED_BASELINES: [(&str, &str); 5] = [
+    ("Mono10p", "Mono10"),
+    ("Mono12Packed", "Mono12"),
+    ("Mono14p", "Mono12"),
+    ("BayerRG12p", "BayerRG12"),
+    ("BayerRG14p", "BayerRG12"),
+];
+const PACKED_LIMIT: f64 = 6.0;
 
 fn png(
     rgb: &[u8],
@@ -310,13 +330,27 @@ fn main() {
         filter: args.into_iter().filter(|a| !a.starts_with("--")).collect(),
     };
     for (width, height) in [(1920, 1200), (640, 480)] {
+        let mut medians = std::collections::HashMap::new();
         for (name, format) in FORMATS {
             let label = format!("rgb/{name}/{width}x{height}");
             if !b.selected(&label) {
                 continue;
             }
             let f = frame(width, height, format);
-            b.run(&label, f.data.len(), || frame::rgb(&f).unwrap());
+            if let Some(median) = b.run(&label, f.data.len(), || frame::rgb(&f).unwrap()) {
+                medians.insert(name, median);
+            }
+        }
+        for (packed, baseline) in PACKED_BASELINES {
+            if let (Some(packed_time), Some(baseline_time)) =
+                (medians.get(packed), medians.get(baseline))
+            {
+                let ratio = packed_time / baseline_time;
+                assert!(
+                    ratio <= PACKED_LIMIT,
+                    "rgb/{packed}/{width}x{height} takes {ratio:.1} times rgb/{baseline}"
+                );
+            }
         }
     }
     // Sparse consumers decode the samples they use from the sensor layout.

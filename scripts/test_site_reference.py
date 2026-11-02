@@ -174,6 +174,15 @@ class CommandLineTests(unittest.TestCase):
     def test_repository_reference_is_current(self):
         self.assertEqual(self.run_script('--check').returncode, 0, 'run scripts/site-reference.py')
 
+    def test_every_repository_command_has_a_section(self):
+        # "More commands" is a fallback for a command added since the last
+        # release of the page, not a home for one.
+        recorded = json.loads(reference.SNAPSHOT.read_text())
+        placed = {root for *_, roots in reference.GROUPS for root in roots}
+        roots = {name.split()[0] for name in recorded['commands']} | set(recorded['groups'])
+        self.assertEqual(sorted(roots - placed), [], 'add them to GROUPS in scripts/site-reference.py')
+        self.assertNotIn('id="cli-more"', reference.PAGE.read_text())
+
 
 if __name__ == '__main__':
     unittest.main()

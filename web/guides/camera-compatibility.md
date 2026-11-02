@@ -81,8 +81,10 @@ its native component precision, and its sidecar names the PFNC format and code. 
 layouts fail explicitly and can still be saved as raw.
 
 Recording passes the sensor layouts FFmpeg accepts and converts the remaining supported formats to
-gray/RGB24. These checks establish conversion behavior with synthetic payloads; they do not
-establish compatibility with a physical camera model.
+gray/RGB24. `--codec ffv1` stores Bayer frames as RGB, 16 bits per channel for 10- to 16-bit
+mosaics; `capture --format raw` keeps the mosaic itself. These checks establish conversion
+behavior with synthetic payloads; they do not establish compatibility with a physical camera
+model.
 
 ## Webcams and capture devices
 
