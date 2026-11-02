@@ -4213,9 +4213,10 @@ mod tests {
         assert_eq!(forward_due(&state(None, Some(4600)), 4600), Some(0));
         // Commands run here without the worker loop, so no frame reaches the
         // encoder: FFmpeg, which starts with the first frame, is not needed,
-        // and only these commands or the deadline end the forward.
+        // and only these commands or the deadline end the forward. No camera
+        // thread runs either, which would take the job's stop for itself.
         let root = temp_dir("timed-forward");
-        let h = WorkerHandle::new();
+        let h = WorkerHandle::idle();
         let mut camera = None;
         let mut forwarder = None;
         let mut auto = None;
@@ -5048,7 +5049,9 @@ mod tests {
         }
         let encoders = crate::host::threads(usize::MAX);
         let stop = |count: usize| {
-            let h = WorkerHandle::new();
+            // No camera thread, which would take the stop for itself: the
+            // test does what it does.
+            let h = WorkerHandle::idle();
             let mut saver = saver::Saver::with(h.clone(), slow, saver::QUEUE_BYTES);
             let dir = temp_dir("stopped-burst");
             let mut burst = armed(1, &dir);
