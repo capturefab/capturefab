@@ -261,7 +261,7 @@
     },
     {
      "default": "2s",
-     "help": "How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 takes frames at once",
+     "help": "How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 takes frames at once",
      "long": "--warmup",
      "name": "warmup",
      "repeatable": false,
@@ -1056,7 +1056,7 @@
     },
     {
      "default": "2s",
-     "help": "How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 measures at once",
+     "help": "How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 measures at once",
      "long": "--warmup",
      "name": "warmup",
      "repeatable": false,
@@ -2120,7 +2120,7 @@
      "value_name": "RATE"
     },
     {
-     "help": "End the recording, successfully, when the file reaches this size, such as 2G",
+     "help": "End the recording, successfully, before the file outgrows this size, such as 2G",
      "long": "--max-size",
      "name": "max_size",
      "repeatable": false,
@@ -2159,7 +2159,7 @@
     },
     {
      "default": "2s",
-     "help": "How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle before recording; 0 records at once",
+     "help": "How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle before recording; 0 records at once",
      "long": "--warmup",
      "name": "warmup",
      "repeatable": false,
@@ -2238,10 +2238,10 @@
     "duration_s": "float",
     "encoder": "string — the FFmpeg encoder used; copy: an H.264 or HEVC source recorded as it arrived, without re-encoding",
     "ended": "duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it",
-    "finalized": "bool — the file was closed and is complete",
+    "finalized": "bool — the file was closed and is complete; false when it was cut at --max-size before FFmpeg could finish it (with a warning), or its worker died",
     "fps": "float — the frame rate written: --fps, or the camera's",
     "fps_actual": "float — frames per second, as frames counts them",
-    "frames": "int — frames encoded, or copied; for a stream, the camera's frames handed to the encoder, which repeats them to keep --fps",
+    "frames": "int — frames encoded, or copied; for a stream, the camera's frames handed to the encoder, which repeats them to keep --fps; absent when the file was cut at --max-size",
     "height": "int",
     "incomplete": "int — frames that arrived incomplete, where the transport counts them",
     "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded",

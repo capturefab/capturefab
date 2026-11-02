@@ -282,7 +282,8 @@ impl Facts {
             interfaces: report.then(|| crate::network::interfaces().unwrap_or_default()),
             ffmpeg: report
                 .then(|| crate::media::ffmpeg_health().map_err(|error| format!("{error:#}"))),
-            ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG").is_some(),
+            ffmpeg_overridden: std::env::var_os("CAPTUREFAB_FFMPEG")
+                .is_some_and(|path| !path.is_empty()),
             private_dirs,
             runtime,
             state,

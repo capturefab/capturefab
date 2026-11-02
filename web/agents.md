@@ -217,9 +217,11 @@ capturefab record --json -c sim:0 -o rtsp://localhost:8554/cam --background
 
 The result has `output`, `bytes`, `frames`, `dropped`, `fps_actual`, `codec`, `encoder`, `ended`
 (`duration`, `signal`, `max_size` or `stopped`) and `finalized`. `--max-size 2G` ends the file
-successfully at that size. `hevc` and `av1` need a hardware encoder unless the source is copied, and
-fail with exit 5 before recording otherwise; `ffv1` is lossless, and stores a Bayer camera's mosaic
-as gray samples. An H.264 or HEVC stream, file or webcam mode is copied as it arrives, without
+successfully before that size, leaving FFmpeg room to finish it; a limit too small for that cuts the
+file at the size, with `finalized: false`, no `frames` and a warning. `hevc` and `av1` need a
+hardware encoder unless the source is copied, and fail with exit 5 before recording otherwise;
+`ffv1` is lossless, keeps every bit of a deep RGB format (as planar GBR), and stores a Bayer
+camera's mosaic as gray samples. An H.264 or HEVC stream, file or webcam mode is copied as it arrives, without
 re-encoding (`"encoder":"copy"`, `codec` the source's), from its last key frame, unless `--codec`
 names another codec or `--fps` or `--bitrate` is given (Linux and macOS; Windows encodes). Without
 `--for`, a recording started with `--background` runs until `jobs stop ID`; while it runs, its job
@@ -245,8 +247,8 @@ printf '%s\n' "$PASSWORD" | capturefab login add --json rtsp://cam.local/stream 
 capturefab capture --json -c rtsp://cam.local/stream -o door.png
 ```
 
-The password goes to the OS credential store, never to a file or the command line. Results and
-errors never show credentials. `onvif resolve HOST` lists an ONVIF camera's RTSP streams.
+The password goes to the OS credential store, never to a file or the command line, and reaches
+FFmpeg on its standard input. Results and errors never show credentials. `onvif resolve HOST` lists an ONVIF camera's RTSP streams.
 
 ## Errors and what to do
 

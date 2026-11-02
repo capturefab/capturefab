@@ -1620,6 +1620,43 @@ fn a_refused_rtsp_stream_explains_itself_in_one_line() {
     );
 }
 
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_camera_password_parameter_stays_out_of_results_and_logs() {
+    let home = Home::new("pass-redacted");
+    let camera = "http://127.0.0.1:9/video.cgi?user=admin&pass=hunter2secret";
+    // Through the auto session, which logs what its camera said.
+    let run = home.warm(&["--json", "info", "-c", camera]);
+    let _ = home.run(&["--json", "session", "stop", "auto"]);
+    let error = run.failure(3);
+    assert!(
+        !run.stdout.contains("hunter2") && !run.stderr.contains("hunter2"),
+        "{error}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("pass=<redacted>"),
+        "{error}"
+    );
+    let mut folders = vec![home.root.clone()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if let Ok(text) = std::fs::read(&path) {
+                assert!(
+                    !String::from_utf8_lossy(&text).contains("hunter2"),
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_says_how_to_make_shared_folders_private() {

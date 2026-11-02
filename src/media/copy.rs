@@ -17,6 +17,11 @@
 //! into a continuous timeline. Nothing the tap does blocks the decoder: a
 //! recording whose writer falls behind loses frames up to the next key
 //! frame instead.
+//!
+//! Frames arrive in decode order. With B-frames, a recording asked to end
+//! just after a reference frame would leave out the frames shown before
+//! it, which come next: it goes on taking those ([`Order`]) and ends
+//! before the next frame shown after everything it wrote.
 // Windows FFmpeg cannot be handed a pipe of its own, so nothing taps a
 // source there.
 #![cfg_attr(not(unix), allow(dead_code))]
@@ -114,6 +119,9 @@ pub(crate) struct TsFrame {
     pub(crate) tables: Tables,
     /// When it arrived, UTC Unix milliseconds.
     pub(crate) arrived_ms: u64,
+    /// Its presentation time, in MPEG-TS's 90 kHz units (33 bits), when
+    /// its PES header has one.
+    pub(crate) pts: Option<u64>,
 }
 
 /// MPEG-TS from a tap's pipe, cut into frames.
@@ -203,6 +211,7 @@ impl Framer {
                 key,
                 tables,
                 arrived_ms: 0,
+                pts: pts(payload),
             });
         }
         // Packets before the first frame are only the tables, kept above.
@@ -210,6 +219,60 @@ impl Framer {
             frame.data.extend_from_slice(packet);
         }
     }
+}
+
+/// The presentation time in the PES header a packet's payload starts with.
+fn pts(payload: &[u8]) -> Option<u64> {
+    if payload.get(..3)? != [0, 0, 1] || payload.get(7)? & 0x80 == 0 {
+        return None;
+    }
+    let b = payload.get(9..14)?;
+    Some(
+        (u64::from(b[0] >> 1) & 0x07) << 30
+            | u64::from(b[1]) << 22
+            | u64::from(b[2] >> 1) << 15
+            | u64::from(b[3]) << 7
+            | u64::from(b[4] >> 1),
+    )
+}
+
+/// The display order of the frames a recording wrote: the latest
+/// presentation time, and whether any frame came after one shown later
+/// (B-frames).
+#[derive(Default)]
+pub(crate) struct Order {
+    latest: Option<u64>,
+    reordered: bool,
+}
+impl Order {
+    /// `frame` was written.
+    pub(crate) fn wrote(&mut self, frame: &TsFrame) {
+        let Some(pts) = frame.pts else {
+            return;
+        };
+        match self.latest {
+            Some(latest) if before(pts, latest) => self.reordered = true,
+            _ => self.latest = Some(pts),
+        }
+    }
+    /// Frames may yet come that are shown before one written.
+    pub(crate) fn reordered(&self) -> bool {
+        self.reordered
+    }
+    /// `frame` is shown before a frame written: a recording that ends
+    /// keeps it, so it ends with no frame missing.
+    pub(crate) fn completes(&self, frame: &TsFrame) -> bool {
+        self.reordered
+            && frame
+                .pts
+                .zip(self.latest)
+                .is_some_and(|(pts, latest)| before(pts, latest))
+    }
+}
+/// Whether 33-bit time `a` comes before `b`, across a wrap.
+fn before(a: u64, b: u64) -> bool {
+    const BITS: u64 = (1 << 33) - 1;
+    a != b && b.wrapping_sub(a) & BITS < 1 << 32
 }
 
 /// The PSI section of `table` a packet's payload starts, up to its CRC.
@@ -367,8 +430,12 @@ pub(crate) struct Feed {
 }
 #[derive(Default)]
 struct FeedState {
-    /// Each frame, after the tables when it starts the stream again.
-    queue: VecDeque<(Tables, Arc<TsFrame>)>,
+    /// Each frame, after the tables when it starts the stream again, with
+    /// how many were queued before it.
+    queue: VecDeque<(u64, Tables, Arc<TsFrame>)>,
+    /// How many frames were queued when the recording was asked to end
+    /// (`end`): those after came later.
+    ending: Option<u64>,
     bytes: usize,
     /// It has a key frame to go on from: not until its first, nor after
     /// frames were dropped or the source's FFmpeg started again.
@@ -383,8 +450,9 @@ struct FeedState {
 pub(crate) type Tables = Option<Arc<[u8]>>;
 /// What a recording's writer takes from its feed.
 pub(crate) enum Taken {
-    /// A frame, after the program tables when it starts the stream again.
-    Frame(Tables, Arc<TsFrame>),
+    /// A frame, after the program tables when it starts the stream again,
+    /// and whether it was queued after the recording was asked to end.
+    Frame(Tables, Arc<TsFrame>, bool),
     /// Nothing arrived in time.
     Waiting,
     /// The feed is closed and every frame it queued taken.
@@ -427,9 +495,10 @@ impl Feed {
             frame.tables.clone()
         };
         state.synced = true;
+        let index = state.queued;
         state.queued += 1;
         state.bytes += frame.data.len();
-        state.queue.push_back((tables, frame.clone()));
+        state.queue.push_back((index, tables, frame.clone()));
         drop(state);
         self.changed.notify_one();
     }
@@ -447,13 +516,21 @@ impl Feed {
                 .0;
         }
         match state.queue.pop_front() {
-            Some((tables, frame)) => {
+            Some((index, tables, frame)) => {
                 state.bytes -= frame.data.len();
-                Taken::Frame(tables, frame)
+                let late = state.ending.is_some_and(|ending| index >= ending);
+                Taken::Frame(tables, frame, late)
             }
             None if state.closed => Taken::Closed,
             None => Taken::Waiting,
         }
+    }
+    /// The recording is asked to end: frames queued from now on are taken
+    /// as late ones.
+    pub(crate) fn end(&self) {
+        let mut state = self.lock();
+        let queued = state.queued;
+        state.ending.get_or_insert(queued);
     }
     /// Take no more frames; those queued can still be taken.
     pub(crate) fn close(&self) {
@@ -582,14 +659,87 @@ pub(crate) mod tests {
             key,
             tables: key.then(|| tables().into()),
             arrived_ms: 0,
+            pts: None,
         }
     }
     fn taken(feed: &Feed) -> Vec<(bool, u8)> {
         let mut ids = Vec::new();
-        while let Taken::Frame(tables, frame) = feed.take(Duration::ZERO) {
+        while let Taken::Frame(tables, frame, _) = feed.take(Duration::ZERO) {
             ids.push((tables.is_some(), frame.data[10]));
         }
         ids
+    }
+
+    /// A PES header carrying presentation time `pts`.
+    fn pes(pts: u64) -> Vec<u8> {
+        vec![
+            0,
+            0,
+            1,
+            0xe0,
+            0,
+            0,
+            0x80,
+            0x80,
+            5,
+            0x21 | ((pts >> 29) & 0x0e) as u8,
+            (pts >> 22) as u8,
+            0x01 | ((pts >> 14) & 0xfe) as u8,
+            (pts >> 7) as u8,
+            0x01 | ((pts << 1) & 0xfe) as u8,
+        ]
+    }
+
+    #[test]
+    fn frames_keep_their_presentation_time_and_order() {
+        let stream = [
+            tables(),
+            packet(0x100, true, true, &pes(3600)),
+            packet(0x100, true, false, &pes((1 << 33) - 3600)),
+            packet(0x100, true, false, &[0, 0, 1, 0xe0, 0, 0, 0x80, 0, 0]),
+        ]
+        .concat();
+        let frames = cut(&stream, PACKET);
+        assert_eq!(
+            frames.iter().map(|f| f.pts).collect::<Vec<_>>(),
+            [Some(3600), Some((1 << 33) - 3600), None]
+        );
+        // Decode order I0 P3 B1 B2 P6 B4 B5, in 90 kHz ticks a frame.
+        let at = |frame: u64| TsFrame {
+            pts: Some(frame * 3600),
+            ..ts(frame as u8, frame == 0)
+        };
+        let mut order = Order::default();
+        for frame in [0, 3, 1, 2, 6] {
+            order.wrote(&at(frame));
+        }
+        assert!(order.reordered());
+        // After P6, B4 and B5 complete it; P9 does not.
+        assert!(order.completes(&at(4)) && order.completes(&at(5)));
+        assert!(!order.completes(&at(9)));
+        // Without B-frames nothing is waited for.
+        let mut plain = Order::default();
+        for frame in [0, 1, 2] {
+            plain.wrote(&at(frame));
+        }
+        assert!(!plain.reordered() && !plain.completes(&at(1)));
+        // Across the 33-bit wrap.
+        assert!(before((1 << 33) - 3600, 3600) && !before(3600, (1 << 33) - 3600));
+    }
+
+    #[test]
+    fn frames_queued_after_the_end_was_asked_are_late() {
+        let feed = Feed::new();
+        feed.offer(&Arc::new(ts(1, true)));
+        feed.end();
+        feed.offer(&Arc::new(ts(2, false)));
+        let late = |feed: &Feed| match feed.take(Duration::ZERO) {
+            Taken::Frame(_, _, late) => Some(late),
+            _ => None,
+        };
+        assert_eq!(late(&feed), Some(false));
+        assert_eq!(late(&feed), Some(true));
+        assert_eq!(late(&feed), None);
     }
 
     #[test]

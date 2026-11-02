@@ -30,6 +30,23 @@ pub struct ServeArgs {
     /// Let the cameras go after this long unused, as the command that started it for them asked (--keep, --background)
     #[arg(long, value_name = "DUR", hide = true, value_parser = super::args::duration)]
     pub camera_keep: Option<Duration>,
+    /// Read more cameras as a JSON array of strings on stdin (session start), which keeps their addresses out of the process list
+    #[arg(long, hide = true)]
+    pub cameras_stdin: bool,
+}
+
+/// The most bytes of cameras `session start` hands over on stdin.
+const MOST_CAMERAS: u64 = 1 << 20;
+
+/// The cameras `session start` wrote to stdin, and closed it.
+fn stdin_cameras() -> Result<Vec<String>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::io::stdin()
+        .take(MOST_CAMERAS)
+        .read_to_end(&mut bytes)
+        .context("reading the cameras on stdin")?;
+    serde_json::from_slice(&bytes).context("the cameras on stdin are not a JSON list of strings")
 }
 
 /// Where `session start` waits to hear whether the session came up.
@@ -101,9 +118,13 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
     };
     signals::on_second(handle.killer());
     let started = (|| -> Result<ipc::Server> {
+        let mut cameras = args.cameras.cameras.clone();
+        if args.cameras_stdin {
+            cameras.extend(stdin_cameras()?);
+        }
         // Cameras connect before the session is announced: one that fails
         // ends it, as the person who named it asked for all of them.
-        for selector in &args.cameras.cameras {
+        for selector in &cameras {
             let selector = super::caller_selector(selector)?;
             let connected =
                 handle.request(SessionCommand::connect(selector, millis(CONNECT_TIMEOUT)))?;

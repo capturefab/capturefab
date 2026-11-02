@@ -95,8 +95,9 @@ encoder where one works (VideoToolbox, NVENC, Jetson's GStreamer encoder, AMF, Q
 Vulkan, Media Foundation or V4L2) and libx264 otherwise; `hevc` and `av1` need a hardware
 encoder. An H.264 or HEVC stream, file or webcam mode is copied as it arrives, without
 re-encoding or an encoder (`"encoder":"copy"`), unless `--codec` names another codec or `--fps`
-or `--bitrate` is given; Windows encodes. `--max-size 2G` ends a file at that size; Ctrl-C ends
-an open-ended recording normally.
+or `--bitrate` is given; Windows encodes. `--max-size 2G` ends a file before that size, leaving
+FFmpeg room to finish it; Ctrl-C ends an open-ended recording normally. `.mkv` files get their
+length and seek index once the recording ends.
 
 ## Password-protected cameras
 
@@ -114,8 +115,10 @@ never the command line, and goes to the OS credential store; addresses and user 
 in the state folder without secrets. Every later command for that address, `onvif://` included,
 uses the saved sign-in. Know the trade-offs before saving one:
 
-- FFmpeg's RTSP reader takes credentials only in its input URL, so they appear in its command
-  line, which other local users can read.
+- FFmpeg's RTSP reader takes credentials only in its input URL. Capturefab hands FFmpeg that
+  URL on its standard input, and a session the cameras it holds the same way, so neither process's
+  command line shows them; a command you type with `-c rtsp://USER:PASS@...` still shows the
+  password in that command's own command line while it runs.
 - A saved password is sent to whatever answers at that host, port and path. Plain RTSP Basic
   authentication and ONVIF over `http://` expose it on the network; prefer `rtsps://`, Digest
   authentication and fixed addresses on trusted networks.

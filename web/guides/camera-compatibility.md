@@ -86,7 +86,9 @@ layouts fail explicitly and can still be saved as raw.
 
 Recording passes the sensor layouts FFmpeg accepts and converts the remaining supported formats to
 gray/RGB24. `--codec ffv1` stores a Bayer mosaic itself as 8- or 16-bit gray (10- to 16-bit
-mosaics as 16-bit), which decodes back to the exact mosaic; players show it in gray. These checks establish conversion
+mosaics as 16-bit), which decodes back to the exact mosaic; players show it in gray. It stores
+RGB and BGR deeper than 8 bits, packed or not, as planar GBR of their own depth (`gbrp10le` to
+`gbrp16le`), every bit kept. These checks establish conversion
 behavior with synthetic payloads; they do not establish compatibility with a physical camera
 model.
 
@@ -100,8 +102,10 @@ camera stays bound to it when node numbers change. Exposure, focus and white bal
 cameras are not exposed; such cameras adjust themselves, so let them settle (`inspect` reports
 `not_settled` while they do).
 
-A video file used as a camera plays at its own frame rate for recordings; a capture reads it as
-fast as it asks. Streams reconnect by themselves when they end, backing off from 1 s to 30 s.
+A video file used as a camera plays at its own frame rate for recordings, which `info` reports and
+`record` uses by default, and a recording that encodes it waits for its encoder rather than drop a
+frame; a capture reads it as fast as it asks. A network stream is already running when a command
+connects to it, so it gets no `--warmup`. Streams reconnect by themselves when they end, backing off from 1 s to 30 s.
 
 ## Raspberry Pi and Jetson CSI cameras
 

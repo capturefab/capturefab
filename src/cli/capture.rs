@@ -87,7 +87,7 @@ pub struct CaptureArgs {
     /// Frames to let pass after the first one exposed after the last settings change, 0..10
     #[arg(long, default_value_t = 0, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=10))]
     pub fresh: u32,
-    /// How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 takes frames at once
+    /// How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 takes frames at once
     #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
     pub warmup: Duration,
     /// When a file name without {seq} exists: fail, or number (-0001, -0002, ...)

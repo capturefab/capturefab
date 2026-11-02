@@ -56,6 +56,11 @@ pub struct RecordedFile {
     pub ended_ms: u64,
     pub codec: String,
     pub encoder: String,
+    /// The file reached its maximum size before FFmpeg finished it, and was
+    /// cut there: it plays up to its last whole part, and holds fewer
+    /// frames than were encoded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 impl SavedFile {
@@ -116,7 +121,8 @@ pub fn settings(features: &Value) -> Value {
         "gain": features["Gain"].is_null().then(|| number(&["GainRaw"])).flatten(),
         "auto_gain": mode("GainAuto"),
         "auto_wb": mode("BalanceWhiteAuto"),
-        "fps": number(&["AcquisitionFrameRate", "AcquisitionFrameRateAbs"]),
+        // A stream that does not say its rate has none (0).
+        "fps": number(&["AcquisitionFrameRate", "AcquisitionFrameRateAbs"]).filter(|fps| *fps > 0.0),
         "trigger": trigger,
         "black_level": number(&["BlackLevel"]),
         "gamma": number(&["Gamma"]),

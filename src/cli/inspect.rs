@@ -36,7 +36,7 @@ pub struct InspectArgs {
     /// How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped
     #[arg(long, value_name = "DUR", value_parser = super::args::wait)]
     pub timeout: Option<Wait>,
-    /// How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 measures at once
+    /// How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 measures at once
     #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
     pub warmup: Duration,
     /// Change settings first, as one atomic change (as set does), then measure; repeatable

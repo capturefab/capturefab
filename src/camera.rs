@@ -1397,6 +1397,10 @@ impl Camera {
     pub(crate) fn lingers(&self) -> bool {
         self.backend.lingers()
     }
+    /// See `Backend::frames_wait`.
+    pub(crate) fn frames_wait(&self) -> bool {
+        self.backend.frames_wait()
+    }
     /// See `Backend::rest`; a streaming camera keeps what it streams with.
     pub(crate) fn rest(&mut self) {
         if !self.streaming {

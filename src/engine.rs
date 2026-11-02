@@ -985,8 +985,10 @@ fn end_forward(
             summary["until_ms"] = json!(until_ms);
         }
         summary["ended_ms"] = json!(crate::scheduling::now_ms());
-        summary["finalized"] =
-            json!(stopped.is_ok() && (!local || summary.get("recording").is_some()));
+        // A file cut at its maximum size before FFmpeg finished it is not.
+        let finished =
+            summary.get("recording").is_some() && summary["recording"]["truncated"] != true;
+        summary["finalized"] = json!(stopped.is_ok() && (!local || finished));
         let (status, error) = match (cause, &stopped) {
             (Some(cause), _) => (ended.status(), Some(cause)),
             (None, Err(error)) => (JobStatus::Failed, Some(error)),
@@ -1503,13 +1505,17 @@ fn process_plain(
             } else {
                 None
             };
-            let f = match (copied, reserved) {
+            let mut f = match (copied, reserved) {
                 (Some(tap), reserved) => Forwarder::copying(config, reserved, tap)?,
                 (None, Some(reserved)) => Forwarder::with_resolved(config, Some(reserved))?,
                 (None, None) => Forwarder::new(config)?,
             };
             let f_path = f.recording_path().map(|p| absolute_path(&p));
             let c = camera_mut(camera)?;
+            // A file's frames wait for the encoder: it records every one.
+            if c.frames_wait() {
+                f.wait_for_writer();
+            }
             let was_streaming = c.is_streaming();
             c.start()?;
             // A camera this started streams only while something needs its
@@ -3315,10 +3321,12 @@ const SETTLED_CHANGE: f32 = 0.03;
 /// Frames whose brightness must hold still.
 const SETTLED_FRAMES: usize = 3;
 /// Whether the camera sets its own exposure, so its first frames after it
-/// starts may be too dark or too bright: webcams and network streams read
-/// through FFmpeg, and cameras whose own auto exposure runs continuously.
+/// starts may be too dark or too bright: webcams, and cameras whose own
+/// auto exposure runs continuously. A network stream's camera was running
+/// before this connected, its exposure long settled: waiting for it would
+/// only wait out the stream's own frame rate.
 fn sets_own_exposure(c: &mut Camera) -> bool {
-    matches!(crate::camera::kind(&c.info), "webcam" | "stream" | "onvif")
+    crate::camera::kind(&c.info) == "webcam"
         || (c.has("ExposureAuto") && c.get("ExposureAuto").is_ok_and(|mode| mode == "Continuous"))
 }
 /// Let a camera that has just started, and sets its own exposure, settle:
@@ -6211,7 +6219,7 @@ mod tests {
             // Two launches that end after half a second, then a steady one.
             let ffmpeg = dir.join("ffmpeg");
             // Raw video as FFmpeg describes it, else PPM.
-            let script = r#"case "$*" in *rtsp*) ;; *) exit 0 ;; esac
+            let script = r#"case "$*" in *rtsp*|*"-f concat"*) ;; *) exit 0 ;; esac
 n=$(($(cat "$dir/launches" 2>/dev/null || echo 0) + 1)); echo $n > "$dir/launches"
 case "$*" in
 *rawvideo*) printf "[info] Output #0, rawvideo, to 'pipe:1':\n[info]   Stream #0:0: Video: rawvideo, rgb24, 2x2\n" >&2

@@ -7,6 +7,41 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 use support::cli::Home;
 
+/// A started session gets its cameras on stdin: an address can hold a
+/// password, and a process's arguments are for every user to read.
+#[cfg(unix)]
+#[test]
+fn a_started_session_keeps_its_cameras_out_of_its_arguments() {
+    let home = Home::new("quiet-args");
+    let started = home.ok(&[
+        "session",
+        "start",
+        "--name",
+        "quiet",
+        "-c",
+        "sim:3?drop=0.0001",
+        "--idle",
+        "1m",
+    ]);
+    assert_eq!(
+        started["cameras"],
+        json!(["sim:3?drop=0.0001"]),
+        "{started}"
+    );
+    let pid = started["pid"].as_i64().unwrap().to_string();
+    let args = std::process::Command::new("ps")
+        .args(["-o", "args=", "-p", &pid])
+        .output()
+        .unwrap();
+    let args = String::from_utf8_lossy(&args.stdout);
+    assert!(
+        args.contains("serve") && args.contains("--cameras-stdin"),
+        "{args}"
+    );
+    assert!(!args.contains("sim:3"), "{args}");
+    home.ok(&["session", "stop", "quiet"]);
+}
+
 #[test]
 fn a_session_starts_answers_and_stops() {
     let home = Home::new("lifecycle");

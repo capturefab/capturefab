@@ -23,7 +23,7 @@ The same features build for 32-bit ARM (`armv7-unknown-linux-gnueabihf`) and mus
 
 Webcams, RTSP/SRT streams, video files and `record` use an FFmpeg executable. Capturefab looks for it in this order:
 
-1. `CAPTUREFAB_FFMPEG`, an absolute path;
+1. `CAPTUREFAB_FFMPEG`, an absolute path (a relative one is a usage error, and an empty one counts as unset);
 2. the copy built into the executable, when the build embedded one (`CAPTUREFAB_FFMPEG_BINARY` at build time);
 3. an `ffmpeg` next to the `capturefab` executable;
 4. the first `ffmpeg` on `PATH`.

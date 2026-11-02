@@ -350,6 +350,37 @@ pub(crate) fn native_sample(frame: &Frame, x: usize, y: usize) -> u16 {
 pub(crate) fn native_color(frame: &Frame, x: usize, y: usize) -> Option<([u16; 3], u32)> {
     formats::native_color(frame, x, y)
 }
+/// The component depth of an RGB or BGR layout deeper than 8 bits, which
+/// only [`gbr_planes`] keeps whole.
+pub(crate) fn deep_color_bits(pixel_format: u32) -> Option<u32> {
+    formats::color_bits(pixel_format).filter(|bits| *bits > 8)
+}
+/// A frame in a layout [`deep_color_bits`] names, as FFmpeg's planar
+/// `gbrpNNle`: a G, a B and an R plane of 16-bit little-endian samples
+/// holding each component's own bits, so nothing of them is lost.
+pub(crate) fn gbr_planes(frame: &Frame, out: &mut Vec<u8>) -> Result<()> {
+    let bits =
+        deep_color_bits(frame.pixel_format).context("not an RGB layout deeper than 8 bits")?;
+    let pixels = checked_pixels(frame)?;
+    validate_source(frame)?;
+    let mask = (u32::from(u16::MAX) >> (16 - bits)) as u16;
+    out.clear();
+    out.resize(pixels * 6, 0);
+    let (g, rest) = out.split_at_mut(pixels * 2);
+    let (b, r) = rest.split_at_mut(pixels * 2);
+    let width = frame.width as usize;
+    for y in 0..frame.height as usize {
+        for x in 0..width {
+            let ([red, green, blue], _) =
+                formats::native_color(frame, x, y).context("not an RGB layout")?;
+            let at = 2 * (y * width + x);
+            g[at..at + 2].copy_from_slice(&(green & mask).to_le_bytes());
+            b[at..at + 2].copy_from_slice(&(blue & mask).to_le_bytes());
+            r[at..at + 2].copy_from_slice(&(red & mask).to_le_bytes());
+        }
+    }
+    Ok(())
+}
 /// Full-range BT.601 Y'CbCr as R'G'B', as PFNC defines its YCbCr formats
 /// and, with U as Cb and V as Cr, its YUV ones; 16-bit fixed point as JFIF
 /// decoders compute it.

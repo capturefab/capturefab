@@ -211,4 +211,21 @@ mod tests {
         );
         assert_eq!(redact_urls("no address here\n"), "no address here\n");
     }
+    #[test]
+    fn camera_password_parameters_are_redacted_in_diagnostics() {
+        let text = redact_urls(
+            "Nothing accepted a connection at 127.0.0.1:9 (http://127.0.0.1:9/video.cgi?user=admin&pass=hunter2secret). \
+             srt://127.0.0.1:9?passphrase=SECRETPASS12345&pass=ALSOSECRET99 and http://cam/snap?loginuse=a&loginpas=LOGINSECRET",
+        );
+        for secret in [
+            "hunter2secret",
+            "SECRETPASS12345",
+            "ALSOSECRET99",
+            "LOGINSECRET",
+        ] {
+            assert!(!text.contains(secret), "{text}");
+        }
+        assert!(text.contains("user=admin&pass=<redacted>"), "{text}");
+        assert!(text.contains("loginuse=a&loginpas=<redacted>"), "{text}");
+    }
 }

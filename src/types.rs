@@ -137,6 +137,11 @@ pub trait Backend: RegisterIo {
     fn lingers(&self) -> bool {
         false
     }
+    /// Whether its frames can wait for a recording's encoder, as a video
+    /// file's do: nothing goes by while the next one is not taken.
+    fn frames_wait(&self) -> bool {
+        false
+    }
     /// Let go of what it opened to connect and still holds while it does
     /// not stream: FFmpeg, which read a source's first frame and went on
     /// decoding. The next start opens it again.

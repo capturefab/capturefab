@@ -321,8 +321,11 @@ fn detach(
     command
         .args(["--json", "serve", "--name", name, "--idle"])
         .arg(super::args::duration_text(idle));
-    for camera in cameras {
-        command.args(["-c", camera]);
+    // The cameras go on its stdin: an address may hold a password, and a
+    // process's arguments are there for every user of the machine to read
+    // for as long as it runs.
+    if !cameras.is_empty() {
+        command.arg("--cameras-stdin");
     }
     if live {
         command.arg("--live");
@@ -341,10 +344,18 @@ fn detach(
         command.env_remove(variable);
     }
     command
-        .stdin(Stdio::null())
+        .stdin(if cameras.is_empty() {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(log.try_clone()?)
         .stderr(log);
     let mut child = platform::spawn(&mut command, &writer, warnings)?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A session that exits first says why on its ready pipe.
+        let _ = serde_json::to_writer(&mut stdin, cameras);
+    }
     // Only the session holds the write end now: a session that dies
     // before it is ready closes the pipe.
     drop(writer);

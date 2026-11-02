@@ -123,6 +123,59 @@ fn lossless_recordings_keep_bayer_mosaics() {
     }
 }
 
+/// A Matroska recording, which FFmpeg writes through a pipe, has its
+/// length and an index as a file FFmpeg wrote itself would; and deep RGB
+/// keeps every bit in FFV1.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn matroska_recordings_have_a_length_and_an_index() {
+    let home = Home::new("record-mkv-index");
+    for (output, extra) in [
+        ("h264.mkv", &[][..]),
+        ("ffv1.mkv", &["--codec", "ffv1"][..]),
+        (
+            "rgb12.mkv",
+            &["--codec", "ffv1", "--set", "PixelFormat=RGB12"][..],
+        ),
+    ] {
+        let mut args = vec!["record", "-c", "sim:0", "-o", output, "--for", "2s"];
+        args.extend(extra);
+        let result = home.ok(&args);
+        assert_eq!(result["finalized"], true, "{result}");
+        let path = home.path(output);
+        let probe = std::process::Command::new(support::cli::ffmpeg())
+            .args(["-hide_banner", "-i"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let described = String::from_utf8_lossy(&probe.stderr);
+        let length = described
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("Duration: "))
+            .unwrap_or_default();
+        assert!(length.starts_with("00:00:0"), "{output}: {described}");
+        if output == "rgb12.mkv" {
+            assert!(described.contains("gbrp12le"), "{described}");
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.windows(4).any(|id| id == [0x1C, 0x53, 0xBB, 0x6B]),
+            "{output} has no Cues"
+        );
+        let checked = std::process::Command::new(support::cli::ffmpeg())
+            .args(["-v", "error", "-err_detect", "crccheck", "-i"])
+            .arg(&path)
+            .args(["-f", "null", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            checked.stderr.is_empty(),
+            "{output}: {}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
 fn a_recording_reports_its_warm_up() {
@@ -451,42 +504,75 @@ fn a_session_recording_leaves_its_commands_free_space_floor() {
     assert!(home.path("fits.mkv").exists());
 }
 
-/// --max-size ends a recording successfully, at exactly that size, with
-/// the video before it playable; without it nothing caps a recording.
+/// --max-size ends a recording successfully before that size, its file
+/// finished by FFmpeg, every frame it reports in it; one too small for
+/// FFmpeg to finish within is cut at the size and says so. Without it
+/// nothing caps a recording.
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
 fn a_recording_ends_as_asked_at_its_maximum_size() {
     let home = Home::new("record-max-size");
-    let capped = home.ok(&[
+    let played = |name: &str| {
+        let played = std::process::Command::new(support::cli::ffmpeg())
+            .args(["-v", "error", "-i"])
+            .arg(home.path(name))
+            .args(["-f", "framemd5", "-"])
+            .output()
+            .unwrap();
+        let frames = String::from_utf8_lossy(&played.stdout)
+            .lines()
+            .filter(|line| line.starts_with("0,"))
+            .count() as u64;
+        (frames, String::from_utf8_lossy(&played.stderr).into_owned())
+    };
+    for (name, limit) in [("capped.mkv", 3u64 << 20), ("capped.mp4", 3 << 20)] {
+        let capped = home.ok(&[
+            "record",
+            "-c",
+            "sim:0",
+            "-o",
+            name,
+            "--max-size",
+            "3MiB",
+            "--for",
+            "30s",
+        ]);
+        assert_eq!(capped["ended"], "max_size", "{capped}");
+        assert_eq!(capped["finalized"], true, "{capped}");
+        let bytes = capped["bytes"].as_u64().unwrap();
+        assert!(bytes <= limit, "{capped}");
+        assert_eq!(std::fs::metadata(home.path(name)).unwrap().len(), bytes);
+        let (frames, errors) = played(name);
+        assert!(errors.is_empty(), "{name}: {errors}");
+        // Every frame handed to the encoder is in the file, but for one a
+        // loaded host's encoder may drop now and then.
+        let reported = capped["frames"].as_u64().unwrap();
+        assert!(
+            frames <= reported && reported <= frames + 3,
+            "{frames} frames: {capped}"
+        );
+    }
+    // Too small for FFmpeg to finish: cut at a byte, it plays up to its
+    // last complete part, and reports no frame count it cannot vouch for.
+    let cut = home.ok(&[
         "record",
         "-c",
         "sim:0",
         "-o",
-        "capped.mkv",
+        "cut.mp4",
         "--max-size",
-        "64KiB",
+        "16KiB",
         "--for",
         "20s",
     ]);
-    assert_eq!(capped["ended"], "max_size", "{capped}");
-    assert_eq!(capped["bytes"], 64 * 1024, "{capped}");
-    assert_eq!(capped["finalized"], true, "{capped}");
-    assert_eq!(
-        std::fs::metadata(home.path("capped.mkv")).unwrap().len(),
-        64 * 1024
+    assert_eq!(cut["ended"], "max_size", "{cut}");
+    assert_eq!(cut["bytes"], 16 * 1024, "{cut}");
+    assert_eq!(cut["finalized"], false, "{cut}");
+    assert!(cut.get("frames").is_none(), "{cut}");
+    assert!(
+        cut["warnings"][0].as_str().unwrap().contains("--max-size"),
+        "{cut}"
     );
-    // Cut at a byte, it plays up to its last complete part.
-    let played = std::process::Command::new(support::cli::ffmpeg())
-        .args(["-v", "error", "-i"])
-        .arg(home.path("capped.mkv"))
-        .args(["-f", "framemd5", "-"])
-        .output()
-        .unwrap();
-    let frames = String::from_utf8_lossy(&played.stdout)
-        .lines()
-        .filter(|line| line.starts_with("0,"))
-        .count();
-    assert!(frames > 0, "{}", String::from_utf8_lossy(&played.stderr));
     let open = home.ok(&["record", "-c", "sim:0", "-o", "open.mkv", "--for", "1s"]);
     assert_eq!(open["ended"], "duration", "{open}");
 }
@@ -605,7 +691,7 @@ fn compressed_sources_are_copied_unless_asked_to_encode() {
     ]);
     assert_eq!(capped["ended"], "max_size", "{capped}");
     assert_eq!(capped["encoder"], "copy", "{capped}");
-    assert_eq!(capped["bytes"], 48 * 1024, "{capped}");
+    assert!(capped["bytes"].as_u64().unwrap() <= 48 * 1024, "{capped}");
     for asked in [["--bitrate", "1M"], ["--fps", "15"]] {
         let mut args = vec![
             "record",

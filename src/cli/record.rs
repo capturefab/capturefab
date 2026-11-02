@@ -58,7 +58,7 @@ pub struct RecordArgs {
     /// Target bitrate, such as 8M or 800k (default 8M; not for ffv1); re-encodes a source that would be copied
     #[arg(long, value_name = "RATE")]
     pub bitrate: Option<String>,
-    /// End the recording, successfully, when the file reaches this size, such as 2G
+    /// End the recording, successfully, before the file outgrows this size, such as 2G
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub max_size: Option<u64>,
     /// Change settings first, as one atomic change (as set does); repeatable
@@ -70,7 +70,7 @@ pub struct RecordArgs {
     /// How long to wait for the first frame; none waits for a trigger until stopped
     #[arg(long, default_value = "10s", value_name = "DUR", value_parser = super::args::wait)]
     pub timeout: Wait,
-    /// How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle before recording; 0 records at once
+    /// How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle before recording; 0 records at once
     #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
     pub warmup: Duration,
     /// Leave the recording running in a session and print its job once the first frame is encoded
@@ -498,7 +498,9 @@ impl Recording<'_> {
             || self.started.elapsed().as_secs_f64(),
             |ms| ms as f64 / 1000.0,
         );
-        let frames = detail["written"].as_u64();
+        // A file cut at --max-size holds fewer frames than were encoded.
+        let truncated = file["truncated"] == true;
+        let frames = detail["written"].as_u64().filter(|_| !truncated);
         let encoder = file["encoder"]
             .as_str()
             .or(detail["encoder"].as_str())
@@ -529,7 +531,17 @@ impl Recording<'_> {
             value["fps_actual"] = json!((frames as f64 / duration_s * 100.0).round() / 100.0);
         }
         value["fps"] = json!(self.fps);
-        crate::types::without_nulls(warmed(value, detail))
+        let mut value = warmed(value, detail);
+        if truncated {
+            let warning = json!(
+                "the file reached --max-size before FFmpeg could finish it and was cut there; it plays up to its last whole part"
+            );
+            match value["warnings"].as_array_mut() {
+                Some(warnings) => warnings.push(warning),
+                None => value["warnings"] = json!([warning]),
+            }
+        }
+        crate::types::without_nulls(value)
     }
 }
 
@@ -573,7 +585,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ("duration_s", "float"),
     (
         "frames",
-        "int — frames encoded, or copied; for a stream, the camera's frames handed to the encoder, which repeats them to keep --fps",
+        "int — frames encoded, or copied; for a stream, the camera's frames handed to the encoder, which repeats them to keep --fps; absent when the file was cut at --max-size",
     ),
     (
         "dropped",
@@ -606,7 +618,10 @@ pub const FIELDS: &[(&str, &str)] = &[
         "ended",
         "duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it",
     ),
-    ("finalized", "bool — the file was closed and is complete"),
+    (
+        "finalized",
+        "bool — the file was closed and is complete; false when it was cut at --max-size before FFmpeg could finish it (with a warning), or its worker died",
+    ),
     (
         "warmup_ms",
         "int — how long a camera that sets its own exposure took to settle before recording",

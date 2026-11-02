@@ -199,18 +199,19 @@ pub(super) fn read_frame(
     })
 }
 
-/// The video stream FFmpeg reads: its codec, size and whether its samples
-/// are wider than 8 bits.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The video stream FFmpeg reads: its codec, size, whether its samples
+/// are wider than 8 bits, and its average frame rate when FFmpeg knows it.
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Input {
     pub codec: String,
     pub width: u32,
     pub height: u32,
     pub deep: bool,
+    pub fps: Option<f64>,
 }
 
 /// What a line of FFmpeg's log says.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(super) enum Said {
     /// An error, its level tag dropped, as `-loglevel error` would print it.
     Error(Vec<u8>),
@@ -232,11 +233,18 @@ fn input(line: &str) -> Option<Input> {
     // byte order, such as `yuv420p10le`.
     let pix_fmt = rest.split(", ").nth(1).unwrap_or_default();
     let pix_fmt = pix_fmt.split(['(', ' ']).next().unwrap_or_default();
+    // `30 fps` or `29.97 fps`: the average rate, which FFmpeg prints only
+    // when it knows it (`tbr` is a guess, such as Motion JPEG's 25).
+    let fps = rest
+        .split(", ")
+        .find_map(|part| part.strip_suffix(" fps")?.parse::<f64>().ok())
+        .filter(|fps| fps.is_finite() && *fps > 0.0);
     Some(Input {
         codec,
         width: width.parse().ok()?,
         height: height.parse().ok()?,
         deep: pix_fmt.ends_with("le") || pix_fmt.ends_with("be"),
+        fps,
     })
 }
 
@@ -457,6 +465,7 @@ mod tests {
                 width: 1920,
                 height: 1080,
                 deep: false,
+                fps: Some(30.0),
             })
         );
         let deep = input(
@@ -469,6 +478,11 @@ mod tests {
         );
         let plain = input("Stream #0:0: Video: mjpeg (Baseline), yuvj422p(pc, bt470bg/unknown/unknown), 1280x720, 30 fps").unwrap();
         assert!(!plain.deep);
+        // A file's own rate, and none where FFmpeg only guesses one.
+        let file = input("[info]   Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(progressive), 1280x720 [SAR 1:1 DAR 16:9], 1013 kb/s, 29.97 fps, 29.97 tbr, 30k tbn (default)").unwrap();
+        assert_eq!(file.fps, Some(29.97));
+        let guessed = input("[info]   Stream #0:0: Video: mjpeg, yuvj422p(pc, bt470bg/unknown/unknown), 640x480, 25 tbr, 25 tbn").unwrap();
+        assert_eq!(guessed.fps, None);
         let outputs: Vec<_> = said
             .iter()
             .filter_map(|said| match said {

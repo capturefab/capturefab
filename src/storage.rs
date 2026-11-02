@@ -635,7 +635,9 @@ impl Recording {
             "a recording's maximum size must be positive"
         );
         folder(path, 0, SyncMode::File, min_free)?;
+        // Read too, so its container can be finished in place (`amend`).
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(path)
@@ -682,6 +684,25 @@ impl Recording {
             let free = space.free;
             self.alarm.raise(NoRoom::Floor { free, floor, own });
         }
+    }
+    /// Read and change the bytes written so far before the file is
+    /// finished, as a container's index and length written after its video:
+    /// `edit` gets the file and the bytes it may still grow by, and leaves
+    /// its position anywhere.
+    pub fn amend<T>(&mut self, edit: impl FnOnce(&mut File, u64) -> io::Result<T>) -> Result<T> {
+        let file = self.file.as_mut().context("recording already finished")?;
+        let room = self.limit.map_or(u64::MAX, |limit| limit - self.written);
+        let cannot = || format!("cannot finish recording {}", self.path.display());
+        let result = edit(file, room).with_context(cannot);
+        // Its size, whatever the edit managed.
+        let len = io::Seek::seek(file, io::SeekFrom::End(0)).with_context(cannot)?;
+        self.written = len;
+        ensure!(
+            self.limit.is_none_or(|limit| len <= limit),
+            "recording {} outgrew its maximum size",
+            self.path.display()
+        );
+        result
     }
     /// Close the file with its bytes on disk, and its folder: its size. A
     /// file cut short keeps the bytes before the cut, as every recording
@@ -1146,6 +1167,43 @@ mod tests {
         // Its name is its own: a second recording cannot take it.
         let taken = Recording::create(&path, None, None).err().unwrap();
         assert_eq!(reason(&taken), ErrorKind::Exists);
+    }
+
+    /// A container's index and length go in after its video, within the
+    /// recording's size, which counts them.
+    #[test]
+    fn a_recording_is_amended_in_place_within_its_size() {
+        use std::io::{Read, Seek, SeekFrom};
+        let temp = Temp::new("recording-amend");
+        let path = temp.path("clip.mkv");
+        let mut recording = Recording::create(&path, Some(16), None).unwrap();
+        recording.write_all(b"head0123").unwrap();
+        let read = recording
+            .amend(|file, room| {
+                assert_eq!(room, 8);
+                let mut start = [0; 4];
+                file.seek(SeekFrom::Start(0))?;
+                file.read_exact(&mut start)?;
+                file.seek(SeekFrom::Start(0))?;
+                file.write_all(b"HEAD")?;
+                file.seek(SeekFrom::End(0))?;
+                file.write_all(b"cues")?;
+                Ok(start)
+            })
+            .unwrap();
+        assert_eq!(&read, b"head");
+        assert_eq!(recording.bytes_written(), 12);
+        // One that outgrows it fails, and still counts what it wrote.
+        let error = recording
+            .amend(|file, _| {
+                file.seek(SeekFrom::End(0))?;
+                file.write_all(b"too long!")
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("maximum size"), "{error:#}");
+        assert_eq!(recording.bytes_written(), 21);
+        assert_eq!(recording.finish().unwrap(), 21);
+        assert_eq!(fs::read(&path).unwrap(), b"HEAD0123cuestoo long!");
     }
 
     #[test]

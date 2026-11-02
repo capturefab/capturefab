@@ -1917,7 +1917,11 @@ pub(crate) fn info(camera: &mut Camera) -> Info {
                 .is_ok_and(|v| v == json!(true) || v == json!("On"))
         })
         .unwrap_or(true);
-    let fps_limit = limit_on.then(|| number(camera, &FRAME_RATE)).flatten();
+    // A stream that does not say its rate has none (0), not a limit.
+    let fps_limit = limit_on
+        .then(|| number(camera, &FRAME_RATE))
+        .flatten()
+        .filter(|fps| *fps > 0.0);
     let trigger = camera
         .has("TriggerMode")
         .then(|| trigger_state(camera).ok())

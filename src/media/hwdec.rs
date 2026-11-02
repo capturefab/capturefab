@@ -443,6 +443,7 @@ mod tests {
             width: 1920,
             height: 1080,
             deep,
+            fps: None,
         };
         assert_eq!(codec_key(&input(false)), "hevc");
         assert_eq!(codec_key(&input(true)), "hevc-deep");

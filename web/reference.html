@@ -237,7 +237,7 @@ capturefab exec -c gige:00c0df123456 &#x27;UserSetSave[UserSet1]&#x27;</code></p
 <tr><td><code>--tag</code> KEY=VALUE</td><td>Tag the files: {tag:KEY} in -o, and in each image&#x27;s metadata; repeatable</td><td>repeatable</td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long to wait for each frame (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped</td><td>—</td></tr>
 <tr><td><code>--fresh</code> N</td><td>Frames to let pass after the first one exposed after the last settings change, 0..10</td><td>default <code>0</code></td></tr>
-<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 takes frames at once</td><td>default <code>2s</code></td></tr>
+<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 takes frames at once</td><td>default <code>2s</code></td></tr>
 <tr><td><code>--on-exists</code> ON_EXISTS</td><td>When a file name without {seq} exists: fail, or number (-0001, -0002, ...)</td><td>one of <code>fail</code>, <code>number</code>; default <code>fail</code></td></tr>
 <tr><td><code>--manifest</code> FILE</td><td>Append one JSON line per saved file (path, time, size, SHA-256, settings, tags) to this file</td><td>—</td></tr>
 <tr><td><code>--sync</code> SYNC</td><td>file: each file reaches the disk before it is reported; none: skip that, for scratch captures</td><td>one of <code>file</code>, <code>none</code>; default <code>file</code></td></tr>
@@ -303,11 +303,11 @@ capturefab capture -c sim:0 -o - &gt; frame.png</code></pre><button class="copy-
 <tr><td><code>--fps</code> N</td><td>Frames per second written (default: the camera&#x27;s frame rate); re-encodes a source that would be copied</td><td>—</td></tr>
 <tr><td><code>--codec</code> CODEC</td><td>h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv). Default: an H.264 or HEVC stream, webcam or file is copied as it arrives, without re-encoding; anything else is encoded as h264</td><td>one of <code>h264</code>, <code>hevc</code>, <code>av1</code>, <code>ffv1</code></td></tr>
 <tr><td><code>--bitrate</code> RATE</td><td>Target bitrate, such as 8M or 800k (default 8M; not for ffv1); re-encodes a source that would be copied</td><td>—</td></tr>
-<tr><td><code>--max-size</code> SIZE</td><td>End the recording, successfully, when the file reaches this size, such as 2G</td><td>—</td></tr>
+<tr><td><code>--max-size</code> SIZE</td><td>End the recording, successfully, before the file outgrows this size, such as 2G</td><td>—</td></tr>
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>repeatable</td></tr>
 <tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>—</td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long to wait for the first frame; none waits for a trigger until stopped</td><td>default <code>10s</code></td></tr>
-<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle before recording; 0 records at once</td><td>default <code>2s</code></td></tr>
+<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle before recording; 0 records at once</td><td>default <code>2s</code></td></tr>
 <tr><td><code>--background</code></td><td>Leave the recording running in a session and print its job once the first frame is encoded</td><td>—</td></tr>
 <tr><td><code>--progress</code></td><td>Report progress on stderr, also without a terminal: a JSON line {progress:{job,camera,kind,state,saved,planned?,bytes?,elapsed_s,left_s?,next_s?}} as the job changes, at least each second</td><td>—</td></tr>
 <tr><td><code>--keep</code> DUR</td><td>Keep the camera open in a session for this long after the command, so the next one starts at once (default 60s; 0 opens and closes it in this command alone)</td><td>env <code>CAPTUREFAB_KEEP</code></td></tr>
@@ -323,10 +323,10 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <tr><td><code>duration_s</code></td><td>float</td></tr>
 <tr><td><code>encoder</code></td><td>string — the FFmpeg encoder used; copy: an H.264 or HEVC source recorded as it arrived, without re-encoding</td></tr>
 <tr><td><code>ended</code></td><td>duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it</td></tr>
-<tr><td><code>finalized</code></td><td>bool — the file was closed and is complete</td></tr>
+<tr><td><code>finalized</code></td><td>bool — the file was closed and is complete; false when it was cut at --max-size before FFmpeg could finish it (with a warning), or its worker died</td></tr>
 <tr><td><code>fps</code></td><td>float — the frame rate written: --fps, or the camera&#x27;s</td></tr>
 <tr><td><code>fps_actual</code></td><td>float — frames per second, as frames counts them</td></tr>
-<tr><td><code>frames</code></td><td>int — frames encoded, or copied; for a stream, the camera&#x27;s frames handed to the encoder, which repeats them to keep --fps</td></tr>
+<tr><td><code>frames</code></td><td>int — frames encoded, or copied; for a stream, the camera&#x27;s frames handed to the encoder, which repeats them to keep --fps; absent when the file was cut at --max-size</td></tr>
 <tr><td><code>height</code></td><td>int</td></tr>
 <tr><td><code>incomplete</code></td><td>int — frames that arrived incomplete, where the transport counts them</td></tr>
 <tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded</td></tr>
@@ -347,7 +347,7 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <tr><td><code>--size</code> PX</td><td>The preview&#x27;s longest edge in pixels, 64..2048</td><td>default <code>768</code></td></tr>
 <tr><td><code>--fresh</code> N</td><td>Frames to let pass after the first one exposed after the last settings change, 0..9</td><td>default <code>0</code></td></tr>
 <tr><td><code>--timeout</code> DUR</td><td>How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped</td><td>—</td></tr>
-<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 measures at once</td><td>default <code>2s</code></td></tr>
+<tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (a webcam, or ExposureAuto=Continuous; a network stream is already running) may take to settle after it starts; 0 measures at once</td><td>default <code>2s</code></td></tr>
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does), then measure; repeatable</td><td>repeatable</td></tr>
 <tr><td><code>--for</code> DUR</td><td>Measure a frame every --every for this long (at most 50 samples), as for focusing: the series, and the sharpest frame&#x27;s measurements and preview</td><td>—</td></tr>
 <tr><td><code>--every</code> DUR</td><td>Time between samples with --for (default 200ms)</td><td>—</td></tr>
