@@ -1374,6 +1374,15 @@ impl Camera {
         transport?;
         unlocked
     }
+    /// The source's own compressed video, for a recording in `codec` that
+    /// copies it rather than encoding frames (`Backend::copy_stream`).
+    pub fn copy_stream(
+        &mut self,
+        wanted: crate::media::StreamCopy,
+        codec: &str,
+    ) -> Result<Option<std::sync::Arc<crate::media::copy::Tap>>> {
+        self.backend.copy_stream(wanted, codec)
+    }
     pub fn xml(&self) -> &str {
         &self.xml
     }

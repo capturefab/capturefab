@@ -97,6 +97,17 @@ pub trait Backend: RegisterIo {
     }
     fn next_frame(&mut self, timeout: Duration) -> Result<Frame>;
     fn stop(&mut self) -> Result<()>;
+    /// The compressed video the source sends, tapped as it arrives so a
+    /// recording in `codec` can copy it instead of encoding its frames:
+    /// when the source has video `wanted` takes. Tapping may reopen the
+    /// source.
+    fn copy_stream(
+        &mut self,
+        _wanted: crate::media::StreamCopy,
+        _codec: &str,
+    ) -> Result<Option<std::sync::Arc<crate::media::copy::Tap>>> {
+        Ok(None)
+    }
     /// Re-evaluate transport settings while acquisition is stopped.
     fn optimize_network(&mut self, _payload_size: usize) -> Result<crate::network::NetworkTuning> {
         anyhow::bail!("network tuning is only available for GigE Vision cameras")

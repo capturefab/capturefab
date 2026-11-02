@@ -311,6 +311,11 @@ pub enum SessionCommand {
         /// The client waits for the recording, as for a capture job.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         lease: bool,
+        /// Whether a compressed source's own video is recorded as it
+        /// arrives, without decoding or encoding it: when it is in `codec`
+        /// (`same`), or in any codec a recording copies (`any`).
+        #[serde(default, skip_serializing_if = "crate::media::StreamCopy::is_never")]
+        copy: crate::media::StreamCopy,
     },
 }
 /// Most values one `SetValues` writes.
@@ -2893,6 +2898,7 @@ mod tests {
             utc_offset_s: None,
             job: None,
             lease: false,
+            copy: Default::default(),
             warmup_ms: None,
         };
         let max = crate::scheduling::MAX_DURATION_MS;

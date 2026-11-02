@@ -3,6 +3,7 @@
 //! directory that later processes reuse (`bundled`). No shell is involved in
 //! launching decoders or encoders.
 mod bundled;
+pub mod copy;
 pub(crate) mod hwdec;
 mod native;
 #[cfg(any(test, target_os = "linux"))]
@@ -12,6 +13,7 @@ use crate::types::{
     Backend, CameraInfo, Categorized, ErrorKind, Frame, RGB8, RegisterIo, Transport,
 };
 use anyhow::{Context, Result, anyhow, bail, ensure};
+pub use copy::StreamCopy;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -1050,6 +1052,8 @@ struct Decoder {
     child: Child,
     thread: Option<JoinHandle<()>>,
     log_thread: Option<JoinHandle<()>>,
+    /// Reads the video it copies for a recording (`copy`), if it does.
+    tap_thread: Option<JoinHandle<()>>,
     queue: Arc<DecoderQueue>,
     log: Arc<Log>,
     _exe: Arc<Executable>,
@@ -1130,20 +1134,25 @@ impl Decoder {
     fn spawn(source: &str, timeout: Duration) -> Result<Self> {
         Self::spawn_configured(source, timeout, &[], Output::Rgb)
     }
+    #[cfg(test)]
     fn spawn_configured(
         source: &str,
         timeout: Duration,
         options: &[String],
         output: Output,
     ) -> Result<Self> {
-        Self::spawn_with_output(source, timeout, options, &[], output)
+        Self::spawn_with_output(source, timeout, options, &[], output, None)
     }
+    /// FFmpeg decoding `source` with input `options`, writing `output`
+    /// frames after `output_options`, and with a `tap` also copying the
+    /// video it reads to the tap.
     fn spawn_with_output(
         source: &str,
         timeout: Duration,
         options: &[String],
         output_options: &[String],
         output: Output,
+        tap: Option<&Arc<copy::Tap>>,
     ) -> Result<Self> {
         validate_source(source)?;
         ensure!(
@@ -1213,7 +1222,25 @@ impl Decoder {
         cmd.args(["-avioflags", "direct", "pipe:1"])
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The second output, after the frames' (`native` reads the first's
+        // description): the video as it arrives, on a pipe of its own.
+        #[cfg(unix)]
+        let tapped = match tap {
+            Some(tap) => Some((tap.clone(), copy::pipe(&mut cmd)?)),
+            None => None,
+        };
+        #[cfg(not(unix))]
+        let tapped: Option<(Arc<copy::Tap>, copy::Pipe)> = {
+            ensure!(tap.is_none(), "stream copy needs a Unix pipe");
+            None
+        };
         let mut child = cmd.spawn().context(FfmpegUnavailable)?;
+        // The child holds the pipe's write end now; this process's copy
+        // goes, so the pipe ends when FFmpeg does.
+        let tap_thread = tapped.map(|(tap, (reader, writer))| {
+            drop(writer);
+            thread::spawn(move || tap.read(reader))
+        });
         let stdout = child.stdout.take().unwrap();
         let log = Log::new();
         let stderr = child.stderr.take().unwrap();
@@ -1316,6 +1343,7 @@ impl Decoder {
             child,
             thread: Some(thread),
             log_thread: Some(log_thread),
+            tap_thread,
             queue,
             log,
             _exe: exe,
@@ -1409,7 +1437,11 @@ impl Decoder {
         self.status.is_some_and(|status| status.success())
     }
     fn stop(&mut self) {
+        // Under the lock, so a reader between seeing it run and waiting for
+        // room cannot miss the wake-up.
+        let state = self.queue.state.lock().unwrap_or_else(|e| e.into_inner());
         self.queue.stopped.store(true, Ordering::Relaxed);
+        drop(state);
         self.queue.changed.notify_all();
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -1419,6 +1451,13 @@ impl Decoder {
         if let Some(thread) = self.log_thread.take() {
             let _ = thread.join();
         }
+        if let Some(thread) = self.tap_thread.take() {
+            let _ = thread.join();
+        }
+    }
+    /// It copies the video it reads to a tap.
+    fn tapped(&self) -> bool {
+        self.tap_thread.is_some()
     }
 }
 impl Drop for Decoder {
@@ -1531,7 +1570,7 @@ impl ReplayDecoder {
         let source = path
             .to_str()
             .context("simulation source path is not valid UTF-8")?;
-        Decoder::spawn_with_output(source, timeout, options, output, Output::Rgb).map(Self)
+        Decoder::spawn_with_output(source, timeout, options, output, Output::Rgb, None).map(Self)
     }
     pub(crate) fn next(&mut self, timeout: Duration) -> Result<Option<Frame>> {
         let deadline = Instant::now()
@@ -2448,6 +2487,10 @@ struct MediaBackend {
     software: bool,
     /// The video FFmpeg last said the source has.
     known: Option<native::Input>,
+    /// The source's video as it arrives, for a recording that copies it:
+    /// every FFmpeg it starts copies it here until the camera stops with no
+    /// recording attached.
+    tap: Option<Arc<copy::Tap>>,
 }
 /// How a media source's stream ended, for callers that act on the end rather
 /// than on the wording of its error.
@@ -2799,7 +2842,57 @@ impl MediaBackend {
                 self.hwdec = Some(method);
             }
         }
-        Decoder::spawn_configured(&self.source, self.timeout, &options, self.output)
+        Decoder::spawn_with_output(
+            &self.source,
+            self.timeout,
+            &options,
+            &[],
+            self.output,
+            self.tap.as_ref(),
+        )
+    }
+    /// The tap a recording copies the source from, when its codec is one
+    /// `wanted` takes for a recording in `codec`: a decoder that does not
+    /// copy yet is started again with the tap, from the source's next key
+    /// frame. A source that cannot be tapped is encoded instead.
+    fn copy_stream(&mut self, wanted: StreamCopy, codec: &str) -> Result<Option<Arc<copy::Tap>>> {
+        if cfg!(not(unix)) {
+            return Ok(None);
+        }
+        let Some(source) = self.codec().and_then(copy::copyable) else {
+            return Ok(None);
+        };
+        if !wanted.takes(source, codec) {
+            return Ok(None);
+        }
+        let tap = match &self.tap {
+            Some(tap) if tap.codec() == source => tap.clone(),
+            _ => copy::Tap::new(source),
+        };
+        self.tap = Some(tap.clone());
+        if self
+            .decoder
+            .as_ref()
+            .is_some_and(|decoder| !decoder.tapped())
+        {
+            self.decoder = None;
+            self.first = None;
+            if let Err(error) = self.launch() {
+                // FFmpeg could not copy this video as MPEG-TS: the
+                // recording encodes it instead.
+                self.tap = None;
+                self.launch().map_err(|_| error)?;
+                return Ok(None);
+            }
+        }
+        Ok(Some(tap))
+    }
+    /// A tap no recording is attached to goes once the camera lets its
+    /// FFmpeg go.
+    fn untap(&mut self) {
+        if self.tap.as_ref().is_some_and(|tap| !tap.attached()) {
+            self.tap = None;
+        }
     }
     /// How a source would decode in hardware, if it is one that can: a
     /// compressed stream or file, or a webcam in a compressed mode, whose
@@ -3070,6 +3163,7 @@ fn open_source(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
         hwdec: None,
         software: false,
         known: None,
+        tap: None,
     };
     if let Some(options) = options {
         (backend.modes, backend.formats) = probe(&backend.source);
@@ -3301,6 +3395,7 @@ impl Backend for MediaBackend {
             self.decoder = None;
             self.first = None;
             self.unpace = false;
+            self.untap();
         }
     }
     fn xml(&mut self) -> Result<String> {
@@ -3369,7 +3464,11 @@ impl Backend for MediaBackend {
         self.first = None;
         self.unpace = false;
         self.reconnect = None;
+        self.untap();
         Ok(())
+    }
+    fn copy_stream(&mut self, wanted: StreamCopy, codec: &str) -> Result<Option<Arc<copy::Tap>>> {
+        MediaBackend::copy_stream(self, wanted, codec)
     }
     /// A webcam's video mode, size and rate, and a file's playback speed,
     /// which FFmpeg is opened with: kept for the next process to open the
@@ -3486,6 +3585,9 @@ pub struct ForwardStats {
     #[serde(default)]
     pub stalled: bool,
     pub encoder: String,
+    /// The codec the recording is in: the source's own when it copies it.
+    #[serde(default)]
+    pub codec: String,
     pub error: Option<String>,
     /// The finished local recording, set once its file is complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3513,6 +3615,10 @@ struct WriterQueue {
     epoch: Instant,
     /// When the newest frame arrived, in milliseconds since `epoch`.
     arrived_ms: AtomicU64,
+    /// When the first frame a copy wrote arrived, UTC Unix milliseconds: it
+    /// can come from before the recording was asked for, back to the key
+    /// frame it starts at.
+    first_copied_ms: AtomicU64,
 }
 /// Without a new frame for this long a recording counts as stalled.
 const STALL: Duration = Duration::from_secs(2);
@@ -3536,6 +3642,7 @@ impl WriterQueue {
             full_size: AtomicBool::new(false),
             epoch: Instant::now(),
             arrived_ms: AtomicU64::new(0),
+            first_copied_ms: AtomicU64::new(0),
         }
     }
     fn stalled(&self) -> bool {
@@ -3635,6 +3742,50 @@ fn write_frames(
     }
     taken
 }
+/// The copying writer's loop: the source's frames from `feed` go to
+/// `input` as they come, until the feed is closed and empty or a write
+/// fails.
+fn write_copied(shared: &WriterQueue, feed: &copy::Feed, input: &mut impl Write) {
+    loop {
+        // Once stopped, what is queued still goes, without waiting for more.
+        let running = shared.running.load(Ordering::Acquire);
+        let wait = if running {
+            Duration::from_millis(100)
+        } else {
+            Duration::ZERO
+        };
+        let (tables, frame) = match feed.take(wait) {
+            copy::Taken::Frame(tables, frame) => (tables, frame),
+            copy::Taken::Waiting if running => continue,
+            copy::Taken::Waiting | copy::Taken::Closed => break,
+        };
+        shared.busy.store(true, Ordering::Relaxed);
+        let written = match &tables {
+            Some(tables) => input.write_all(tables),
+            None => Ok(()),
+        }
+        .and_then(|()| input.write_all(&frame.data));
+        shared.busy.store(false, Ordering::Relaxed);
+        if let Err(e) = written {
+            shared.fail(format!("FFmpeg input failed: {e}"));
+            break;
+        }
+        crate::copies::record(crate::copies::Site::StreamCopy, frame.data.len());
+        if shared.written.fetch_add(1, Ordering::Relaxed) == 0 {
+            shared
+                .first_copied_ms
+                .store(frame.arrived_ms, Ordering::Relaxed);
+        }
+    }
+}
+/// What a recording's FFmpeg reads.
+enum Input {
+    /// Camera frames, converted where it cannot read them; through a
+    /// Jetson encoder when there is one.
+    Frames(RawInput, Option<JetsonInput>),
+    /// The source's own video, from its tap through this feed.
+    Copied(Arc<copy::Tap>, Arc<copy::Feed>),
+}
 struct EncoderProcess {
     child: Child,
     writer: Option<JoinHandle<()>>,
@@ -3645,9 +3796,12 @@ struct EncoderProcess {
     _exe: Arc<Executable>,
     width: u32,
     height: u32,
-    raw: RawInput,
+    /// How frames reach FFmpeg; none when it copies the source's video.
+    raw: Option<RawInput>,
     /// Set when a GStreamer Jetson encoder process precedes FFmpeg.
     jetson: Option<JetsonInput>,
+    /// The source's tap and the feed FFmpeg copies from.
+    copied: Option<(Arc<copy::Tap>, Arc<copy::Feed>)>,
     stage: Option<Child>,
     stage_log: Option<JoinHandle<()>>,
     encoder: String,
@@ -3671,6 +3825,9 @@ pub struct Forwarder {
     /// An automatically chosen encoder that exited early; the recording
     /// falls back once to the next candidate.
     failed: Option<String>,
+    /// The source's tap, when the recording copies its video rather than
+    /// encoding frames.
+    copy: Option<Arc<copy::Tap>>,
 }
 fn codec_family(codec: &str) -> Result<&'static str> {
     match codec {
@@ -4991,6 +5148,7 @@ impl Forwarder {
             final_stats: ForwardStats::default(),
             reserved: None,
             failed: None,
+            copy: None,
         })
     }
     /// Use an output the caller already named. `reserved` is the already
@@ -5011,6 +5169,38 @@ impl Forwarder {
             final_stats: ForwardStats::default(),
             reserved,
             failed: None,
+            copy: None,
+        })
+    }
+    /// Record the source's own video from `tap` (`MediaBackend::copy_stream`)
+    /// in its codec, which `config` names: no encoder is needed. `reserved`
+    /// is the already created recording file, if any.
+    pub fn copying(
+        config: ForwardConfig,
+        reserved: Option<crate::storage::Recording>,
+        tap: Arc<copy::Tap>,
+    ) -> Result<Self> {
+        let checked = config.validate().and_then(|()| {
+            ensure!(
+                codec_family(&config.codec)? == tap.codec(),
+                "a copied recording keeps the source's {} video",
+                tap.codec()
+            );
+            Ok(())
+        });
+        if let Err(error) = checked {
+            if let Some(reserved) = reserved {
+                reserved.abort().context("remove unused recording output")?;
+            }
+            return Err(error);
+        }
+        Ok(Self {
+            config,
+            process: None,
+            final_stats: ForwardStats::default(),
+            reserved,
+            failed: None,
+            copy: Some(tap),
         })
     }
     /// The local file this forwarder records to, if it records.
@@ -5022,8 +5212,6 @@ impl Forwarder {
     }
     fn spawn(&mut self, width: u32, height: u32, raw: RawInput) -> Result<()> {
         raw.frame_len(width, height)?;
-        let recording = recording_output(&self.config.output)?;
-        let local = recording.is_some();
         let exe = executable()?;
         let skip = self.failed.as_slice();
         let encoder = select_encoder(&exe, &self.config, (width, height), &raw, skip)?;
@@ -5142,6 +5330,55 @@ impl Forwarder {
                 cmd.args(["-realtime", "1"]);
             }
         }
+        self.launch(
+            (exe, cmd, stage),
+            encoder,
+            (width, height),
+            Input::Frames(raw, jetson),
+        )
+    }
+    /// Record the source's own video from `tap`, as it arrives: FFmpeg
+    /// reads it as MPEG-TS and only remuxes it.
+    fn spawn_copy(&mut self, width: u32, height: u32, tap: Arc<copy::Tap>) -> Result<()> {
+        let exe = executable()?;
+        let mut cmd = command(&exe);
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-n",
+            "-f",
+            "mpegts",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:v:0",
+            "-an",
+            "-sn",
+            "-dn",
+            "-c:v",
+            "copy",
+        ]);
+        self.launch(
+            (exe, cmd, None),
+            "copy".into(),
+            (width, height),
+            Input::Copied(tap, copy::Feed::new()),
+        )
+    }
+    /// Start `cmd`, whose input options are set, writing to the output: its
+    /// container's options, then the frames' writer, the encoded output's
+    /// reader and its log. A GStreamer `stage`, when there is one, reads
+    /// the frames and feeds FFmpeg.
+    fn launch(
+        &mut self,
+        (exe, mut cmd, mut stage): (Arc<Executable>, Command, Option<Child>),
+        encoder: String,
+        (width, height): (u32, u32),
+        input: Input,
+    ) -> Result<()> {
+        let recording = recording_output(&self.config.output)?;
+        let local = recording.is_some();
         if let Some((_, container)) = &recording {
             if *container == "mp4" {
                 cmd.args(["-movflags", "frag_keyframe+empty_moov"]);
@@ -5178,7 +5415,7 @@ impl Forwarder {
         };
         let log = Log::new();
         // Frames go to the first process: GStreamer when it encodes, else FFmpeg.
-        let (mut input, stage_log) = match stage.as_mut() {
+        let (mut input_pipe, stage_log) = match stage.as_mut() {
             Some(stage) => (
                 stage.stdin.take().context("GStreamer stdin")?,
                 Some(log.collect(stage.stderr.take().context("GStreamer stderr")?)),
@@ -5211,23 +5448,37 @@ impl Forwarder {
         });
         let shared = queue.clone();
         let interval = Duration::from_secs_f64(1.0 / self.config.fps);
-        // FFmpeg stamps a recording's frames itself, so it gets each new
-        // frame once, at most one per slot, and a stall leaves a gap.
-        // GStreamer stamps frames by count, so the Jetson writer sends one on
-        // every slot, repeating the last until the camera stalls. A stream's
-        // receivers may drop a silent publisher, so it gets the last picture
-        // on every slot throughout.
-        let (repeat, through_stalls) = (jetson.is_some() || !local, !local);
+        let (raw, jetson, copied) = match &input {
+            Input::Frames(raw, jetson) => (Some(*raw), *jetson, None),
+            Input::Copied(tap, feed) => (None, None, Some((tap.clone(), feed.clone()))),
+        };
         let writer = thread::spawn(move || {
-            write_frames(
-                &shared,
-                &mut input,
-                (raw, jetson),
-                interval,
-                (repeat, through_stalls),
-            );
+            match input {
+                Input::Frames(raw, jetson) => {
+                    // FFmpeg stamps a recording's frames itself, so it gets
+                    // each new frame once, at most one per slot, and a stall
+                    // leaves a gap. GStreamer stamps frames by count, so the
+                    // Jetson writer sends one on every slot, repeating the
+                    // last until the camera stalls. A stream's receivers may
+                    // drop a silent publisher, so it gets the last picture
+                    // on every slot throughout.
+                    let (repeat, through_stalls) = (jetson.is_some() || !local, !local);
+                    write_frames(
+                        &shared,
+                        &mut input_pipe,
+                        (raw, jetson),
+                        interval,
+                        (repeat, through_stalls),
+                    );
+                }
+                Input::Copied(tap, feed) => {
+                    tap.attach(feed.clone());
+                    write_copied(&shared, &feed, &mut input_pipe);
+                    tap.detach(&feed);
+                }
+            }
             // Closing stdin lets FFmpeg flush its muxer and finalize files.
-            drop(input);
+            drop(input_pipe);
             shared.running.store(false, Ordering::Release);
             shared.changed.notify_all();
         });
@@ -5243,6 +5494,7 @@ impl Forwarder {
             height,
             raw,
             jetson,
+            copied,
             stage,
             stage_log,
             encoder,
@@ -5265,6 +5517,7 @@ impl Forwarder {
         };
         if status.success()
             || self.config.encoder != "auto"
+            || process.raw.is_none()
             || self.failed.is_some()
             || process.output_thread.is_none()
             || process.queue.output_failed.load(Ordering::Acquire)
@@ -5275,7 +5528,8 @@ impl Forwarder {
         self.final_stats = self.stats();
         let mut process = self.process.take().expect("encoder process");
         let encoder = process.encoder.clone();
-        let (width, height, raw) = (process.width, process.height, process.raw);
+        let (width, height) = (process.width, process.height);
+        let raw = process.raw.context("a copying recording has no encoder")?;
         let finished = finish(&mut process);
         match finished.1 {
             Some(output) if output.storage.bytes_written() <= HEADER_BYTES => output
@@ -5316,11 +5570,14 @@ impl Forwarder {
     }
     fn queue_frame(&mut self, frame: Frame) -> Result<bool> {
         if self.process.is_none() {
-            self.spawn(
-                frame.width,
-                frame.height,
-                RawInput::for_format(frame.pixel_format)?,
-            )?
+            match self.copy.clone() {
+                Some(tap) => self.spawn_copy(frame.width, frame.height, tap)?,
+                None => self.spawn(
+                    frame.width,
+                    frame.height,
+                    RawInput::for_format(frame.pixel_format)?,
+                )?,
+            }
         }
         let process = self.process.as_mut().unwrap();
         ensure!(
@@ -5331,8 +5588,12 @@ impl Forwarder {
             frame.width,
             frame.height
         );
+        // A copy records the video as it arrives, whatever its frames are
+        // decoded to.
         ensure!(
-            frame.pixel_format == process.raw.pixel_format,
+            process
+                .raw
+                .is_none_or(|raw| frame.pixel_format == raw.pixel_format),
             "the camera's pixel format changed; start a new recording to continue"
         );
         // A recording at its maximum size, or on a disk below its floor,
@@ -5373,9 +5634,17 @@ impl Forwarder {
         // hardware), so the camera's buffer itself is queued for the pipe.
         // What FFmpeg cannot read, and Jetson's RGBA or I420, the writer
         // builds from it in one pass; only what that reads is checked here.
-        match process.jetson {
-            Some(_) => crate::frame::validate_source(&frame)?,
-            None => process.raw.check(&frame)?,
+        match (process.jetson, process.raw) {
+            (Some(_), _) => crate::frame::validate_source(&frame)?,
+            (None, Some(raw)) => raw.check(&frame)?,
+            // A copied recording's frames only show the source is live.
+            (None, None) => {
+                let queue = &process.queue;
+                queue.accepted.fetch_add(1, Ordering::Relaxed);
+                let arrived = queue.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                queue.arrived_ms.store(arrived, Ordering::Relaxed);
+                return Ok(true);
+            }
         }
         let queue = &process.queue;
         let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -5413,13 +5682,15 @@ impl Forwarder {
     }
     pub fn stats(&self) -> ForwardStats {
         if let Some(p) = &self.process {
+            let lost = p.copied.as_ref().map_or(0, |(_, feed)| feed.dropped());
             ForwardStats {
                 accepted: p.queue.accepted.load(Ordering::Relaxed),
                 written: p.queue.written.load(Ordering::Relaxed),
-                dropped: p.queue.dropped.load(Ordering::Relaxed),
+                dropped: p.queue.dropped.load(Ordering::Relaxed) + lost,
                 late: p.queue.late.load(Ordering::Relaxed),
                 stalled: p.queue.stalled(),
                 encoder: p.encoder.clone(),
+                codec: self.config.codec.clone(),
                 error: p
                     .queue
                     .state
@@ -5482,7 +5753,11 @@ impl Forwarder {
                         path: path.display().to_string(),
                         bytes: stored.bytes,
                         sha256: stored.sha256,
-                        started_ms: process.started_ms,
+                        // A copy's video starts with its first frame.
+                        started_ms: match process.queue.first_copied_ms.load(Ordering::Relaxed) {
+                            0 => process.started_ms,
+                            first => first,
+                        },
                         ended_ms: crate::scheduling::now_ms(),
                         codec: self.config.codec.clone(),
                         encoder: process.encoder.clone(),
@@ -5530,6 +5805,11 @@ type Finished = (
 );
 /// Stop an encoder process and its threads.
 fn finish(process: &mut EncoderProcess) -> Finished {
+    // A copy takes no more of the source's video; what it queued is written.
+    if let Some((tap, feed)) = &process.copied {
+        tap.detach(feed);
+        feed.close();
+    }
     process.queue.running.store(false, Ordering::Release);
     process.queue.changed.notify_all();
     // A GStreamer stage must drain the hardware encoder before FFmpeg sees EOF.
@@ -8390,6 +8670,124 @@ esac"#
     }
     /// A mosaic recorded to a 4:2:0 encoder is demosaicked once, to RGB24,
     /// and never widened to RGB48 on its way.
+    /// The decoded frames of a video, as FFmpeg's framemd5 checksums them.
+    fn decoded_checksums(exe: &Executable, path: &std::path::Path) -> Vec<String> {
+        let output = command(exe)
+            .args(["-hide_banner", "-v", "error", "-i"])
+            .arg(path)
+            .args(["-map", "0:v:0", "-f", "framemd5", "-"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .map(|line| line.rsplit(',').next().unwrap().trim().to_owned())
+            .collect()
+    }
+    /// A copied recording is the source's own video: its frames decode to
+    /// exactly a run of the source's, from a key frame, in each container
+    /// it records to.
+    #[test]
+    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
+    fn ffmpeg_copies_compressed_video_frame_for_frame() {
+        let exe = executable().unwrap();
+        let listing = encoder_listing(&exe).unwrap();
+        let dir = temp_dir("stream-copy");
+        let mut sources = vec![("h264", "libx264")];
+        for hevc in ["libx265", "hevc_videotoolbox"] {
+            if listed(&listing, hevc) {
+                sources.push(("hevc", hevc));
+                break;
+            }
+        }
+        for (codec, encoder) in sources {
+            let source = dir.join(format!("{codec}.mp4"));
+            let (made, log) = bounded_output(
+                &exe,
+                &[
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "testsrc2=size=320x240:rate=30",
+                    "-t",
+                    "6",
+                    "-c:v",
+                    encoder,
+                    "-g",
+                    "15",
+                    // No B-frames, as cameras send: a stream cut after a
+                    // P-frame then misses none that display before it.
+                    "-bf",
+                    "0",
+                    "-pix_fmt",
+                    "yuv420p",
+                    source.to_str().unwrap(),
+                ]
+                .map(str::to_owned),
+                Duration::from_secs(20),
+            )
+            .unwrap();
+            assert!(made, "{log}");
+            let original = decoded_checksums(&exe, &source);
+            for container in ["mkv", "mp4", "ts"] {
+                let mut camera =
+                    open_url(source.to_str().unwrap(), Duration::from_secs(5)).unwrap();
+                let tap = camera
+                    .copy_stream(StreamCopy::Any, "h264")
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(tap.codec(), codec);
+                camera.start(0).unwrap();
+                let output = dir.join(format!("{codec}-copy.{container}"));
+                let mut forward = Forwarder::copying(
+                    ForwardConfig {
+                        output: output.to_string_lossy().into(),
+                        codec: codec.into(),
+                        encoder: "auto".into(),
+                        fps: 30.0,
+                        bitrate: "8M".into(),
+                        max_file_bytes: None,
+                    },
+                    None,
+                    tap,
+                )
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < deadline {
+                    forward
+                        .push(camera.next_frame(Duration::from_secs(3)).unwrap())
+                        .unwrap();
+                }
+                forward.stop().unwrap();
+                camera.stop().unwrap();
+                let stats = forward.stats();
+                assert_eq!(stats.encoder, "copy");
+                let copied = decoded_checksums(&exe, &output);
+                assert!(copied.len() >= 30, "{container}: {} frames", copied.len());
+                assert_eq!(copied.len() as u64, stats.written, "{container}");
+                let start = original
+                    .iter()
+                    .position(|frame| *frame == copied[0])
+                    .unwrap();
+                assert_eq!(start % 15, 0, "{codec} {container} starts at a key frame");
+                assert_eq!(
+                    copied,
+                    original[start..start + copied.len()],
+                    "{codec} {container}"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
     fn ffmpeg_demosaics_a_recorded_mosaic_once() {
@@ -9183,6 +9581,7 @@ Error opening input files: Input/output error
             hwdec: None,
             software: false,
             known: None,
+            tap: None,
         }
     }
     #[test]
@@ -9227,6 +9626,115 @@ while :; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; sleep 0.05; done"#,
         camera.rest();
         camera.next_frame(Duration::from_secs(2)).unwrap();
         assert_eq!(fake.launches(&[source]), opened + 1);
+        camera.stop().unwrap();
+    }
+    /// A recording copies a tapped H.264 stream from its last key frame,
+    /// through FFmpeg reading MPEG-TS, with no encoder; other codecs and
+    /// recordings that want frames are not tapped.
+    #[test]
+    #[cfg(unix)]
+    fn recordings_copy_a_compressed_source_from_its_last_key_frame() {
+        use copy::tests::{frame, tables};
+        let fake = Fake::native(
+            "copy",
+            r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*"-i pipe:0"*) exec cat ;;
+*-encoders*) exit 1 ;;
+esac
+printf '[info]   Stream #0:0: Video: h264 (High), yuv420p, 4x2, 30 fps\n[info] Output #0, rawvideo, to '"'"'pipe:1'"'"':\n[info]   Stream #0:0: Video: rawvideo, yuv420p(tv, bt709), 4x2\n' >&2
+fd=$(echo "$*" | sed -n 's/.*-f mpegts pipe:\([0-9]*\).*/\1/p')
+if [ -n "$fd" ]; then
+    eval "{ cat \"\$dir/ts1\"; sleep 0.5; cat \"\$dir/ts2\"; } >&$fd &"
+fi
+while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
+        );
+        let ts1 = [
+            tables(),
+            frame(1, true, 2),
+            frame(2, false, 1),
+            tables(),
+            frame(3, true, 3),
+            frame(4, false, 1),
+        ]
+        .concat();
+        let ts2 = [frame(5, false, 2), frame(6, true, 1), frame(7, false, 1)].concat();
+        fs::write(fake.dir.join("ts1"), &ts1).unwrap();
+        fs::write(fake.dir.join("ts2"), &ts2).unwrap();
+        let mut camera = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(5)).unwrap();
+        // Recordings that ask for another codec are encoded.
+        assert!(
+            camera
+                .copy_stream(StreamCopy::Same, "hevc")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(fake.launches(&["-f mpegts"]), 0);
+        let tap = camera
+            .copy_stream(StreamCopy::Any, "h264")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tap.codec(), "h264");
+        // The decoder started again, copying the video beside its frames.
+        assert_eq!(
+            fake.launches(&[
+                "-f rawvideo -avioflags direct pipe:1 -map 0:v:0 -an -sn -dn -c:v copy -flush_packets 1 -f mpegts pipe:"
+            ]),
+            1
+        );
+        camera.start(12).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let output = fake.dir.join("copy.mkv");
+        let mut forward = Forwarder::copying(
+            ForwardConfig {
+                output: output.to_string_lossy().into(),
+                codec: "h264".into(),
+                encoder: "auto".into(),
+                fps: 30.0,
+                bitrate: "8M".into(),
+                max_file_bytes: None,
+            },
+            None,
+            tap.clone(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_millis(1200);
+        while Instant::now() < deadline {
+            forward
+                .push(camera.next_frame(Duration::from_secs(1)).unwrap())
+                .unwrap();
+        }
+        assert!(tap.attached());
+        forward.stop().unwrap();
+        assert!(!tap.attached());
+        let stats = forward.stats();
+        assert_eq!(
+            (stats.encoder.as_str(), stats.codec.as_str()),
+            ("copy", "h264")
+        );
+        let recorded = stats.recording.unwrap();
+        assert_eq!(
+            (recorded.codec.as_str(), recorded.encoder.as_str()),
+            ("h264", "copy")
+        );
+        // From the last key frame before it started; the frame still
+        // being received when it stopped is not in it.
+        assert_eq!(
+            fs::read(&output).unwrap(),
+            [
+                tables(),
+                frame(3, true, 3),
+                frame(4, false, 1),
+                frame(5, false, 2),
+                frame(6, true, 1)
+            ]
+            .concat()
+        );
+        assert_eq!(stats.written, 4);
+        assert_eq!(
+            fake.launches(&["-f mpegts -i pipe:0", "-c:v copy -f matroska pipe:1"]),
+            1
+        );
         camera.stop().unwrap();
     }
     #[test]

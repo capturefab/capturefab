@@ -482,3 +482,104 @@ fn a_second_signal_ends_at_once_with_a_document() {
     let document: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(document["error"]["code"], "interrupted", "{document}");
 }
+
+/// An H.264 file `name` in the test's home, 10 s at 30 fps with a key frame
+/// each second and no B-frames, as a camera sends.
+fn h264_clip(home: &Home, name: &str) {
+    let made = std::process::Command::new(support::cli::ffmpeg())
+        .args(["-v", "error", "-f", "lavfi", "-i"])
+        .args([
+            "testsrc2=size=320x240:rate=30",
+            "-t",
+            "10",
+            "-c:v",
+            "libx264",
+        ])
+        .args(["-g", "30", "-bf", "0", "-pix_fmt", "yuv420p"])
+        .arg(home.path(name))
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+}
+
+/// An H.264 source is recorded as it arrives, in its own codec and with no
+/// encoder, up to a maximum size as asked; a rate or bitrate encodes it.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn compressed_sources_are_copied_unless_asked_to_encode() {
+    let home = Home::new("record-copy");
+    h264_clip(&home, "clip.mp4");
+    for (output, codec) in [("copy.mkv", None), ("same.mp4", Some("h264"))] {
+        let mut args = vec!["record", "-c", "clip.mp4", "-o", output, "--for", "2s"];
+        args.extend(codec.map(|codec| ["--codec", codec]).into_iter().flatten());
+        let copied = home.ok(&args);
+        assert_eq!(copied["encoder"], "copy", "{copied}");
+        assert_eq!(copied["codec"], "h264", "{copied}");
+        assert_eq!(copied["finalized"], true, "{copied}");
+        assert!(copied["frames"].as_u64().unwrap() >= 30, "{copied}");
+        assert!(decodes(&home.path(output)), "{output}");
+    }
+    let capped = home.ok(&[
+        "record",
+        "-c",
+        "clip.mp4",
+        "-o",
+        "capped.mkv",
+        "--max-size",
+        "48KiB",
+        "--for",
+        "20s",
+    ]);
+    assert_eq!(capped["ended"], "max_size", "{capped}");
+    assert_eq!(capped["encoder"], "copy", "{capped}");
+    assert_eq!(capped["bytes"], 48 * 1024, "{capped}");
+    for asked in [["--bitrate", "1M"], ["--fps", "15"]] {
+        let mut args = vec![
+            "record",
+            "-c",
+            "clip.mp4",
+            "-o",
+            "encoded-{seq}.mkv",
+            "--for",
+            "1s",
+        ];
+        args.extend(asked);
+        let encoded = home.ok(&args);
+        assert_ne!(encoded["encoder"], "copy", "{encoded}");
+        assert_eq!(encoded["codec"], "h264", "{encoded}");
+    }
+}
+
+/// A copy stopped by a signal ends normally, its file finished.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_signal_ends_a_copied_recording_normally() {
+    let home = Home::new("record-copy-signal");
+    h264_clip(&home, "clip.mp4");
+    let mut child = home
+        .command()
+        .args(["--json", "record", "-c", "clip.mp4", "-o", "copy.mp4"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    support::cli::signal_and_wait(&mut child, libc::SIGINT);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["ended"], "signal", "{result}");
+    assert_eq!(result["encoder"], "copy", "{result}");
+    assert_eq!(result["finalized"], true, "{result}");
+    assert!(decodes(&home.path("copy.mp4")));
+}

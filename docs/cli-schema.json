@@ -2086,7 +2086,7 @@
      "value_name": "DUR"
     },
     {
-     "help": "Frames per second written (default: the camera's frame rate)",
+     "help": "Frames per second written (default: the camera's frame rate); re-encodes a source that would be copied",
      "long": "--fps",
      "name": "fps",
      "repeatable": false,
@@ -2101,8 +2101,7 @@
       "av1",
       "ffv1"
      ],
-     "default": "h264",
-     "help": "h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv)",
+     "help": "h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv). Default: an H.264 or HEVC stream, webcam or file is copied as it arrives, without re-encoding; anything else is encoded as h264",
      "long": "--codec",
      "name": "codec",
      "repeatable": false,
@@ -2111,8 +2110,7 @@
      "value_name": "CODEC"
     },
     {
-     "default": "8M",
-     "help": "Target bitrate, such as 8M or 800k (not for ffv1)",
+     "help": "Target bitrate, such as 8M or 800k (default 8M; not for ffv1); re-encodes a source that would be copied",
      "long": "--bitrate",
      "name": "bitrate",
      "repeatable": false,
@@ -2234,15 +2232,15 @@
    "result": {
     "bytes": "int — the file's size",
     "camera": "string — camera ID",
-    "codec": "h264|hevc|av1|ffv1",
+    "codec": "h264|hevc|av1|ffv1 — the source's own when copied",
     "dropped": "int — frames the encoder could not take, and frames the transport lost",
     "duration_s": "float",
-    "encoder": "string — the FFmpeg encoder used",
+    "encoder": "string — the FFmpeg encoder used; copy: an H.264 or HEVC source recorded as it arrived, without re-encoding",
     "ended": "duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it",
     "finalized": "bool — the file was closed and is complete",
     "fps": "float — the frame rate written: --fps, or the camera's",
-    "fps_actual": "float — frames per second encoded",
-    "frames": "int — frames encoded",
+    "fps_actual": "float — frames per second encoded, or copied",
+    "frames": "int — frames encoded, or copied",
     "height": "int",
     "incomplete": "int — frames that arrived incomplete, where the transport counts them",
     "job": "{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded",

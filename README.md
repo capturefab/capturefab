@@ -132,7 +132,10 @@ as libjpeg-turbo (checked beside the first frame of each size and format, which 
 writes; frames under 512K pixels, monochrome frames and `--quality` other than 90 stay on
 libjpeg-turbo); `CAPTUREFAB_JPEG` chooses.
 `record --codec ffv1` of a Bayer camera stores the mosaic itself, losslessly, as 8- or 16-bit
-gray, which players show in gray.
+gray, which players show in gray. `record` of an H.264 or HEVC stream, file or webcam mode copies
+its video as it arrives (`"encoder":"copy"`, in the source's codec), starting at its last key
+frame, unless `--codec` names another codec or `--fps` or `--bitrate` is given; on Windows it is
+encoded. The source is still decoded meanwhile, for captures and inspection.
 
 Support depends on the device, its firmware, the connection and the operating system; this is an
 early implementation with less coverage than vendor SDKs. Sign-ins for password-protected streams

@@ -299,9 +299,9 @@ capturefab capture -c sim:0 -o - &gt; frame.png</code></pre><button class="copy-
 <tr><td><code>-c</code>, <code>--camera</code> CAM</td><td>Camera: list ID, serial, IP, rtsp://…, file path, sim:0[?drop=0.02&amp;line0=every:500ms] (default: the only one)</td><td>env <code>CAPTUREFAB_CAMERA</code></td></tr>
 <tr><td><code>-o</code>, <code>--output</code> FILE|URL</td><td>A file (.mkv, .mp4, .mov, .ts, .webm; it must not exist, or use {seq}) or a stream URL (rtsp://, srt://, rtmp://, udp://)</td><td>required</td></tr>
 <tr><td><code>--for</code> DUR</td><td>Stop after this long; without it, record until Ctrl-C (or jobs stop with --background)</td><td>—</td></tr>
-<tr><td><code>--fps</code> N</td><td>Frames per second written (default: the camera&#x27;s frame rate)</td><td>—</td></tr>
-<tr><td><code>--codec</code> CODEC</td><td>h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv)</td><td>one of <code>h264</code>, <code>hevc</code>, <code>av1</code>, <code>ffv1</code>; default <code>h264</code></td></tr>
-<tr><td><code>--bitrate</code> RATE</td><td>Target bitrate, such as 8M or 800k (not for ffv1)</td><td>default <code>8M</code></td></tr>
+<tr><td><code>--fps</code> N</td><td>Frames per second written (default: the camera&#x27;s frame rate); re-encodes a source that would be copied</td><td>—</td></tr>
+<tr><td><code>--codec</code> CODEC</td><td>h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv). Default: an H.264 or HEVC stream, webcam or file is copied as it arrives, without re-encoding; anything else is encoded as h264</td><td>one of <code>h264</code>, <code>hevc</code>, <code>av1</code>, <code>ffv1</code></td></tr>
+<tr><td><code>--bitrate</code> RATE</td><td>Target bitrate, such as 8M or 800k (default 8M; not for ffv1); re-encodes a source that would be copied</td><td>—</td></tr>
 <tr><td><code>--max-size</code> SIZE</td><td>End the recording, successfully, when the file reaches this size, such as 2G</td><td>—</td></tr>
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>repeatable</td></tr>
 <tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>—</td></tr>
@@ -317,15 +317,15 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <div class="table-scroll"><table><caption>capturefab record JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>bytes</code></td><td>int — the file&#x27;s size</td></tr>
 <tr><td><code>camera</code></td><td>string — camera ID</td></tr>
-<tr><td><code>codec</code></td><td>h264|hevc|av1|ffv1</td></tr>
+<tr><td><code>codec</code></td><td>h264|hevc|av1|ffv1 — the source&#x27;s own when copied</td></tr>
 <tr><td><code>dropped</code></td><td>int — frames the encoder could not take, and frames the transport lost</td></tr>
 <tr><td><code>duration_s</code></td><td>float</td></tr>
-<tr><td><code>encoder</code></td><td>string — the FFmpeg encoder used</td></tr>
+<tr><td><code>encoder</code></td><td>string — the FFmpeg encoder used; copy: an H.264 or HEVC source recorded as it arrived, without re-encoding</td></tr>
 <tr><td><code>ended</code></td><td>duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it</td></tr>
 <tr><td><code>finalized</code></td><td>bool — the file was closed and is complete</td></tr>
 <tr><td><code>fps</code></td><td>float — the frame rate written: --fps, or the camera&#x27;s</td></tr>
-<tr><td><code>fps_actual</code></td><td>float — frames per second encoded</td></tr>
-<tr><td><code>frames</code></td><td>int — frames encoded</td></tr>
+<tr><td><code>fps_actual</code></td><td>float — frames per second encoded, or copied</td></tr>
+<tr><td><code>frames</code></td><td>int — frames encoded, or copied</td></tr>
 <tr><td><code>height</code></td><td>int</td></tr>
 <tr><td><code>incomplete</code></td><td>int — frames that arrived incomplete, where the transport counts them</td></tr>
 <tr><td><code>job</code></td><td>{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}} — with --background: the job, as jobs lists it, once its first frame is encoded</td></tr>

@@ -11,6 +11,7 @@ use super::{
 };
 use crate::{
     controls::Assignment,
+    media::StreamCopy,
     session::SessionCommand,
     types::{Categorized, ErrorKind, Usage},
 };
@@ -48,15 +49,15 @@ pub struct RecordArgs {
     /// Stop after this long; without it, record until Ctrl-C (or jobs stop with --background)
     #[arg(long = "for", value_name = "DUR", value_parser = super::args::duration)]
     pub duration: Option<Duration>,
-    /// Frames per second written (default: the camera's frame rate)
+    /// Frames per second written (default: the camera's frame rate); re-encodes a source that would be copied
     #[arg(long, value_name = "N")]
     pub fps: Option<f64>,
-    /// h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv)
-    #[arg(long, value_enum, default_value_t = Codec::H264)]
-    pub codec: Codec,
-    /// Target bitrate, such as 8M or 800k (not for ffv1)
-    #[arg(long, default_value = "8M", value_name = "RATE")]
-    pub bitrate: String,
+    /// h264, hevc or av1 (where a hardware encoder has them), or ffv1 (lossless, .mkv). Default: an H.264 or HEVC stream, webcam or file is copied as it arrives, without re-encoding; anything else is encoded as h264
+    #[arg(long, value_enum)]
+    pub codec: Option<Codec>,
+    /// Target bitrate, such as 8M or 800k (default 8M; not for ffv1); re-encodes a source that would be copied
+    #[arg(long, value_name = "RATE")]
+    pub bitrate: Option<String>,
     /// End the recording, successfully, when the file reaches this size, such as 2G
     #[arg(long, value_name = "SIZE", value_parser = parse_size)]
     pub max_size: Option<u64>,
@@ -85,12 +86,33 @@ fn parse_size(text: &str) -> std::result::Result<u64, String> {
     crate::types::parse_bytes(text).map_err(|error| error.to_string())
 }
 
+impl RecordArgs {
+    /// The codec a recording that encodes is in.
+    fn codec(&self) -> Codec {
+        self.codec.unwrap_or(Codec::H264)
+    }
+    fn bitrate(&self) -> String {
+        self.bitrate.clone().unwrap_or_else(|| "8M".into())
+    }
+    /// Whether the source's own video may be recorded as it is: not when
+    /// the frames are asked for at another rate or bitrate, nor as FFV1;
+    /// in the codec asked for, or any a recording copies.
+    fn copy(&self) -> StreamCopy {
+        match self.codec {
+            _ if self.fps.is_some() || self.bitrate.is_some() => StreamCopy::Never,
+            Some(Codec::Ffv1) => StreamCopy::Never,
+            Some(_) => StreamCopy::Same,
+            None => StreamCopy::Any,
+        }
+    }
+}
+
 /// A local file's path, absolute; a stream URL as it is.
 fn output(args: &RecordArgs) -> Result<String> {
     let mut output = args.output.clone();
     crate::naming::validate_output(&output).map_err(super::input)?;
     if !crate::media::is_recording(&output) {
-        if args.codec == Codec::Ffv1 {
+        if args.codec == Some(Codec::Ffv1) {
             return Err(Usage("ffv1 recordings are .mkv files, not streams".into()).into());
         }
         return Ok(output);
@@ -117,7 +139,7 @@ fn output(args: &RecordArgs) -> Result<String> {
             .into());
         }
     }
-    if args.codec == Codec::Ffv1 && extension.as_deref() != Some("mkv") {
+    if args.codec == Some(Codec::Ffv1) && extension.as_deref() != Some("mkv") {
         return Err(Usage("ffv1 recordings are .mkv files".into()).into());
     }
     if output
@@ -163,10 +185,10 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
     let max_file_bytes = args.max_size;
     let request = |fps: f64| SessionCommand::Forward {
         output: output.clone(),
-        codec: args.codec.name().into(),
+        codec: args.codec().name().into(),
         encoder: "auto".into(),
         fps,
-        bitrate: args.bitrate.clone(),
+        bitrate: args.bitrate(),
         max_file_bytes,
         on_exists: Default::default(),
         context: Default::default(),
@@ -176,6 +198,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         job: None,
         // A recording this command waits for ends when it goes away.
         lease: !args.background,
+        copy: args.copy(),
     };
     // Everything that can be checked here is, before a camera is opened:
     // the request, a taken file, FFmpeg and an encoder for the codec.
@@ -197,10 +220,10 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
     crate::media::executable()?;
     crate::media::check_codec(&crate::media::ForwardConfig {
         output: output.clone(),
-        codec: args.codec.name().into(),
+        codec: args.codec().name().into(),
         encoder: "auto".into(),
         fps: args.fps.unwrap_or(30.0),
-        bitrate: args.bitrate.clone(),
+        bitrate: args.bitrate(),
         max_file_bytes,
     })?;
     signals::take_over();
@@ -483,7 +506,10 @@ impl Recording<'_> {
             "resent": detail["resent"],
             "width": self.info["width"],
             "height": self.info["height"],
-            "codec": self.args.codec.name(),
+            "codec": file["codec"]
+                .as_str()
+                .or(detail["codec"].as_str())
+                .unwrap_or(self.args.codec().name()),
             "encoder": encoder,
             "ended": ended.name(),
             "finalized": detail["finalized"].as_bool().unwrap_or(false),
@@ -534,7 +560,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ),
     ("bytes", "int — the file's size"),
     ("duration_s", "float"),
-    ("frames", "int — frames encoded"),
+    ("frames", "int — frames encoded, or copied"),
     (
         "dropped",
         "int — frames the encoder could not take, and frames the transport lost",
@@ -549,13 +575,16 @@ pub const FIELDS: &[(&str, &str)] = &[
     ),
     ("width", "int"),
     ("height", "int"),
-    ("fps_actual", "float — frames per second encoded"),
+    ("fps_actual", "float — frames per second encoded, or copied"),
     (
         "fps",
         "float — the frame rate written: --fps, or the camera's",
     ),
-    ("codec", "h264|hevc|av1|ffv1"),
-    ("encoder", "string — the FFmpeg encoder used"),
+    ("codec", "h264|hevc|av1|ffv1 — the source's own when copied"),
+    (
+        "encoder",
+        "string — the FFmpeg encoder used; copy: an H.264 or HEVC source recorded as it arrived, without re-encoding",
+    ),
     (
         "ended",
         "duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it",

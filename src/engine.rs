@@ -955,6 +955,7 @@ fn end_forward(
             }
             summary["accepted"] = json!(stats.accepted);
             summary["encoder"] = json!(stats.encoder);
+            summary["codec"] = json!(stats.codec);
             // A finished file is reported even when stopping reported an error.
             if let Some(file) = stats.recording.clone() {
                 let path = absolute_path(std::path::Path::new(&file.path));
@@ -963,6 +964,7 @@ fn end_forward(
                     "bytes": file.bytes,
                     "started_ms": file.started_ms,
                     "ended_ms": file.ended_ms,
+                    "codec": file.codec,
                     "encoder": file.encoder,
                 });
                 let context = meta.map(|m| m.context).unwrap_or_default();
@@ -1470,6 +1472,7 @@ fn process_plain(
             utc_offset_s,
             warmup_ms,
             job,
+            copy,
             ..
         } => {
             ensure!(
@@ -1497,20 +1500,37 @@ fn process_plain(
                 bitrate,
                 max_file_bytes,
             };
+            config.validate()?;
             let named = crate::media::is_recording(&output)
                 && (crate::naming::has_placeholder(&output) || !on_exists.is_fail());
-            let f = if named {
-                config.validate()?;
+            if !named {
+                // Refuse a taken file now, not after this reply looks like
+                // success; the writer still refuses it atomically.
+                preflight_recording_output(&output, on_exists)?;
+            }
+            // A compressed source in a codec the recording takes is
+            // recorded as it arrives, in its own codec, with no encoder.
+            let copied = match copy {
+                _ if config.encoder != "auto" => None,
+                crate::media::StreamCopy::Never => None,
+                wanted => camera_mut(camera)?.copy_stream(wanted, &config.codec)?,
+            };
+            if let Some(tap) = &copied {
+                config.codec = tap.codec().into();
+            }
+            let reserved = if named {
                 let label = crate::naming::camera_name(&camera_mut(camera)?.info);
                 let (path, reserved) =
                     name_recording(h, &config, &label, on_exists, &context, utc_offset_s)?;
                 config.output = path.to_string_lossy().into_owned();
-                Forwarder::with_resolved(config, Some(reserved))?
+                Some(reserved)
             } else {
-                // Refuse a taken file now, not after this reply looks like
-                // success; the writer still refuses it atomically.
-                preflight_recording_output(&output, on_exists)?;
-                Forwarder::new(config)?
+                None
+            };
+            let f = match (copied, reserved) {
+                (Some(tap), reserved) => Forwarder::copying(config, reserved, tap)?,
+                (None, Some(reserved)) => Forwarder::with_resolved(config, Some(reserved))?,
+                (None, None) => Forwarder::new(config)?,
             };
             let f_path = f.recording_path().map(|p| absolute_path(&p));
             let c = camera_mut(camera)?;
@@ -4018,6 +4038,7 @@ mod tests {
             utc_offset_s: None,
             job: None,
             lease: false,
+            copy: Default::default(),
             warmup_ms: None,
         };
         let mut paths = Vec::new();
@@ -4051,6 +4072,7 @@ mod tests {
             utc_offset_s: None,
             job: None,
             lease: false,
+            copy: Default::default(),
             warmup_ms: None,
         }
     }
@@ -4607,6 +4629,7 @@ mod tests {
                 utc_offset_s: None,
                 job: None,
                 lease: false,
+                copy: Default::default(),
                 warmup_ms: None,
             })
             .unwrap_err();

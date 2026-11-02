@@ -31,6 +31,9 @@ pub(crate) enum Site {
     FileWrite,
     /// An image written to the capture command's standard output.
     StdoutWrite,
+    /// A source's compressed frame passed, as it was sent, from its FFmpeg
+    /// to a recording's that copies it.
+    StreamCopy,
     /// A USB3 Vision payload transfer copied into its frame: transfers
     /// smaller than the frame are recycled mid-frame where the platform
     /// limits how much transfer memory one camera may hold.
@@ -81,12 +84,13 @@ pub(crate) enum Class {
 }
 
 impl Site {
-    pub(crate) const ALL: [Site; 22] = [
+    pub(crate) const ALL: [Site; 23] = [
         Site::GvspReceive,
         Site::PipeRead,
         Site::PipeWrite,
         Site::FileWrite,
         Site::StdoutWrite,
+        Site::StreamCopy,
         Site::UsbAssemble,
         Site::GvspFallback,
         Site::GigeRowCompact,
@@ -112,6 +116,7 @@ impl Site {
             Site::PipeWrite => "pipe_write",
             Site::FileWrite => "file_write",
             Site::StdoutWrite => "stdout_write",
+            Site::StreamCopy => "stream_copy",
             Site::UsbAssemble => "usb_assemble",
             Site::GvspFallback => "gvsp_fallback",
             Site::GigeRowCompact => "gige_row_compact",
@@ -137,7 +142,8 @@ impl Site {
             | Site::PipeRead
             | Site::PipeWrite
             | Site::FileWrite
-            | Site::StdoutWrite => Class::Boundary,
+            | Site::StdoutWrite
+            | Site::StreamCopy => Class::Boundary,
             Site::UsbAssemble | Site::GvspFallback | Site::GigeRowCompact => Class::Necessary,
             Site::FfmpegUnpack
             | Site::StillTransform

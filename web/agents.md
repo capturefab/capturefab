@@ -195,11 +195,14 @@ capturefab record --json -c sim:0 -o clip.mkv --codec ffv1 --for 1m
 capturefab record --json -c sim:0 -o rtsp://localhost:8554/cam --background
 ```
 
-The result has `output`, `bytes`, `frames`, `dropped`, `fps_actual`, `encoder`, `ended`
+The result has `output`, `bytes`, `frames`, `dropped`, `fps_actual`, `codec`, `encoder`, `ended`
 (`duration`, `signal`, `max_size` or `stopped`) and `finalized`. `--max-size 2G` ends the file
 successfully at that size. `hevc` and `av1` need a hardware encoder and fail up front with exit 5
-otherwise; `ffv1` is lossless, and stores a Bayer camera's mosaic as gray samples. Without
-`--for`, a recording started with `--background` runs until `jobs stop ID`.
+otherwise; `ffv1` is lossless, and stores a Bayer camera's mosaic as gray samples. An H.264 or HEVC
+stream, file or webcam mode is copied as it arrives, without re-encoding (`"encoder":"copy"`,
+`codec` the source's), from its last key frame, unless `--codec` names another codec or `--fps` or
+`--bitrate` is given (Linux and macOS; Windows encodes). Without `--for`, a recording started with
+`--background` runs until `jobs stop ID`.
 
 ### Keep settings for later
 
