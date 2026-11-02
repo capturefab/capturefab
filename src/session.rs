@@ -1996,7 +1996,6 @@ impl SessionHandle {
         std::thread::Builder::new()
             .name("capturefab-command".into())
             .spawn(move || {
-                let _slot = slot;
                 let _turn = turn;
                 if let Some(turn) = &_turn {
                     turn.wait();
@@ -2017,6 +2016,10 @@ impl SessionHandle {
                 {
                     h.note("error", crate::scrub::redact_urls(&format!("{e:#}")));
                 }
+                // Its slot is free once the reply comes: a caller that
+                // submits again at once is never told the queue is full
+                // with its own finished command.
+                drop(slot);
                 let _ = tx.send(result);
             })
             .context("start camera command thread")?;
