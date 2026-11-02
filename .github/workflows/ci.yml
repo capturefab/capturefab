@@ -49,7 +49,9 @@ jobs:
         # Every architecture a release ships, on free hosted runners.
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel, windows-2025, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 150
+    # A cold FFmpeg build takes up to 25 minutes on Windows; the test steps
+    # have limits of their own, so a test that hangs ends the run in time.
+    timeout-minutes: 90
     steps:
       - name: Keep LF line endings
         if: runner.os == 'Windows'
@@ -94,8 +96,10 @@ jobs:
           cache-on-failure: true
       # Every test binary runs, so one failure does not hide the rest.
       - run: cargo test --locked --no-fail-fast
+        timeout-minutes: 40
       # Where frames are copied: the budgets of the zero-copy frame path.
       - run: cargo test --locked --features copy-audit --test copies
+        timeout-minutes: 20
       # The command reference is generated from this binary's schema; the
       # committed snapshot must match it.
       - name: Command reference matches the CLI
