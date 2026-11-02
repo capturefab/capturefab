@@ -278,19 +278,29 @@ struct Saved {
     jobs: Vec<Job>,
 }
 
-/// What session `name` saved, as it was when it last saved it.
-fn load(name: &str) -> Saved {
-    let Some(data) = path(name).ok().and_then(|path| std::fs::read(path).ok()) else {
-        return Saved::default();
+/// What session `name` saved, as it was when it last saved it. `None`
+/// when a saved book exists but cannot be read (for example its
+/// permissions changed): its numbers are unknown, so it must not be
+/// written over.
+fn load(name: &str) -> Option<Saved> {
+    let Ok(path) = path(name) else {
+        return Some(Saved::default());
     };
-    match serde_json::from_slice::<Value>(&data) {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Some(Saved::default());
+        }
+        Err(_) => return None,
+    };
+    Some(match serde_json::from_slice::<Value>(&data) {
         Ok(file) => parse(file),
         // A file cut short or damaged keeps the numbers it shows.
         Err(_) => Saved {
             next: numbers_in(&String::from_utf8_lossy(&data)),
             jobs: Vec::new(),
         },
-    }
+    })
 }
 
 /// The highest number `text`, a saved book that is no longer JSON, still
@@ -344,7 +354,7 @@ fn parse(file: Value) -> Saved {
 
 /// The jobs a session saved, as they were when it last saved them.
 pub(crate) fn read(name: &str) -> Vec<Job> {
-    load(name).jobs
+    load(name).map(|saved| saved.jobs).unwrap_or_default()
 }
 
 /// The names of sessions that saved jobs.
@@ -399,13 +409,20 @@ impl JobBook {
     /// Without a writable state folder, as on a read-only system, the jobs
     /// are kept only while the session runs.
     pub(super) fn saved(name: &str) -> Self {
-        let Saved { next, jobs } = load(name);
+        let loaded = load(name);
+        let readable = loaded.is_some();
+        if !readable {
+            crate::eprintln!(
+                "capturefab: cannot read the saved jobs of session {name}; this run keeps its jobs in memory only"
+            );
+        }
+        let Saved { next, jobs } = loaded.unwrap_or_default();
         let jobs = orphaned(jobs);
         let writable = crate::dirs::found(crate::dirs::Kind::State)
             .chosen
             .as_ref()
             .is_some_and(|chosen| chosen.writable);
-        let file = path(name).ok().filter(|_| writable);
+        let file = path(name).ok().filter(|_| writable && readable);
         let book = Self::with(name, file, jobs.into(), next);
         book.lock().dirty = true;
         book
@@ -1043,6 +1060,32 @@ mod tests {
         let book = JobBook::saved(&name);
         assert!(book.all().is_empty());
         assert_eq!(book.start(JobKind::Capture, "sim:0", Some(1), false), 76);
+        std::fs::remove_file(file).unwrap();
+    }
+
+    /// A saved book that exists but cannot be read is never written over:
+    /// its numbers are unknown, so the run keeps its jobs in memory only.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_saved_book_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let name = format!("locked-{}", std::process::id());
+        let file = path(&name).unwrap();
+        crate::dirs::ensure_private_dir(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, br#"{"next": 50, "jobs": []}"#).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&file).is_ok() {
+            // Root reads it anyway; nothing to show.
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::remove_file(file).unwrap();
+            return;
+        }
+        let book = JobBook::saved(&name);
+        book.start(JobKind::Capture, "sim:0", Some(1), false);
+        book.lock().save(true);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(saved["next"], 50, "{saved}");
         std::fs::remove_file(file).unwrap();
     }
 

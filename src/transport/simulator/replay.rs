@@ -152,8 +152,11 @@ impl Manifest {
     fn images(files: &[PathBuf], fps: f64) -> Result<Self> {
         let nonce = crate::types::random_hex(16)
             .map_err(|e| anyhow::anyhow!("cannot name the simulation manifest: {e}"))?;
-        let manifest =
-            Self(std::env::temp_dir().join(format!("capturefab-replay-{nonce}.ffconcat")));
+        // Absolute even when TMPDIR is relative: FFmpeg opens only absolute
+        // local sources, and the worker's folder is not the caller's.
+        let folder = std::env::temp_dir();
+        let folder = std::path::absolute(&folder).unwrap_or(folder);
+        let manifest = Self(folder.join(format!("capturefab-replay-{nonce}.ffconcat")));
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
         #[cfg(unix)]
