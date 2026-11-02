@@ -90,7 +90,9 @@ fn text(value: &Value) -> String {
 }
 
 /// Refuse a camera whose exposure cannot be adjusted, or that sends frames
-/// only when triggered: there is nothing to meter between triggers.
+/// only when triggered: there is nothing to meter between triggers. A
+/// trigger whose source is the camera's own timing (Freerun, FixedRate)
+/// holds no frames back.
 fn adjustable(info: &Value) -> Result<()> {
     let camera = info["camera"].as_str().unwrap_or("the camera");
     if info["controls"].get("exposure").is_none() && info["controls"].get("gain").is_none() {
@@ -100,7 +102,11 @@ fn adjustable(info: &Value) -> Result<()> {
         )
         .into());
     }
-    if info["trigger"]["mode"] == "On" {
+    if info["trigger"]["mode"] == "On"
+        && !info["trigger"]["source"]
+            .as_str()
+            .is_some_and(crate::controls::camera_timed)
+    {
         return Err(Categorized::new(
             ErrorKind::Unsupported,
             format!(

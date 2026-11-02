@@ -214,9 +214,9 @@ const ANALOG_FEATURES: &str = r#"
  <IntReg Name="ExposureAutoReg"><Address>0x190</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
  <Enumeration Name="TriggerSelector"><EnumEntry Name="FrameStart"><Value>0</Value></EnumEntry><EnumEntry Name="AcquisitionStart"><Value>1</Value></EnumEntry><pValue>TriggerSelectorReg</pValue><pSelected>TriggerMode</pSelected><pSelected>TriggerSource</pSelected><pSelected>TriggerActivation</pSelected><pSelected>TriggerSoftware</pSelected></Enumeration>
  <IntReg Name="TriggerSelectorReg"><Address>0x160</Address><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
- <Enumeration Name="TriggerMode"><Description>On: the selected trigger starts each frame (FrameStart) or the acquisition (AcquisitionStart). Software fires on TriggerSoftware; Line0 fires only with the sim:N?line0=every:500ms option; Line1 never fires.</Description><EnumEntry Name="Off"><Value>0</Value></EnumEntry><EnumEntry Name="On"><Value>1</Value></EnumEntry><pValue>TriggerModeReg</pValue></Enumeration>
+ <Enumeration Name="TriggerMode"><Description>On: the selected trigger starts each frame (FrameStart) or the acquisition (AcquisitionStart). Software fires on TriggerSoftware; Line0 fires only with the sim:N?line0=every:500ms option; Line1 never fires; Freerun and FixedRate are the camera's own timing, which runs at AcquisitionFrameRate as with the trigger off.</Description><EnumEntry Name="Off"><Value>0</Value></EnumEntry><EnumEntry Name="On"><Value>1</Value></EnumEntry><pValue>TriggerModeReg</pValue></Enumeration>
  <IntReg Name="TriggerModeReg"><Address>0x168</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
- <Enumeration Name="TriggerSource"><EnumEntry Name="Software"><Value>0</Value></EnumEntry><EnumEntry Name="Line0"><Value>1</Value></EnumEntry><EnumEntry Name="Line1"><Value>2</Value></EnumEntry><pValue>TriggerSourceReg</pValue></Enumeration>
+ <Enumeration Name="TriggerSource"><EnumEntry Name="Software"><Value>0</Value></EnumEntry><EnumEntry Name="Line0"><Value>1</Value></EnumEntry><EnumEntry Name="Line1"><Value>2</Value></EnumEntry><EnumEntry Name="Freerun"><Value>3</Value></EnumEntry><EnumEntry Name="FixedRate"><Value>4</Value></EnumEntry><pValue>TriggerSourceReg</pValue></Enumeration>
  <IntReg Name="TriggerSourceReg"><Address>0x170</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
  <Enumeration Name="TriggerActivation"><EnumEntry Name="RisingEdge"><Value>0</Value></EnumEntry><EnumEntry Name="FallingEdge"><Value>1</Value></EnumEntry><pValue>TriggerActivationReg</pValue></Enumeration>
  <IntReg Name="TriggerActivationReg"><Address>0x178</Address><pIndex Offset="4">TriggerSelector</pIndex><Length>4</Length><AccessMode>RW</AccessMode><Sign>Unsigned</Sign><Endianess>LittleEndian</Endianess></IntReg>
@@ -336,9 +336,13 @@ const STREAMING: [(usize, usize); 4] = [
 /// The trigger selector values.
 const FRAME_START: usize = 0;
 const ACQUISITION_START: usize = 1;
-/// Trigger sources.
+/// Trigger sources: Software, Line0, then Line1, which never fires, and
+/// the camera's own timing, Freerun and FixedRate, as Allied Vision
+/// cameras have.
 const SOFTWARE: u32 = 0;
 const LINE0: u32 = 1;
+const FREERUN: u32 = 3;
+const FIXED_RATE: u32 = 4;
 /// The layout of saved settings; settings saved with another are ignored.
 const LAYOUT: u32 = 1;
 /// The brightness the camera's own auto exposure and gain aim for.
@@ -597,8 +601,8 @@ impl Simulator {
             (TRIGGER_SELECTOR, 1, "trigger selector"),
             (TRIGGER_MODE, 1, "trigger mode"),
             (TRIGGER_MODE + 4, 1, "trigger mode"),
-            (TRIGGER_SOURCE, 2, "trigger source"),
-            (TRIGGER_SOURCE + 4, 2, "trigger source"),
+            (TRIGGER_SOURCE, FIXED_RATE, "trigger source"),
+            (TRIGGER_SOURCE + 4, FIXED_RATE, "trigger source"),
             (EXPOSURE_AUTO, 2, "exposure auto"),
             (GAIN_AUTO, 2, "gain auto"),
             (GAIN_AUTO + 4, 1, "gain selector"),
@@ -664,8 +668,14 @@ impl Simulator {
         self.u32(TRIGGER_MODE + 4 * selector) == 1
             && self.u32(TRIGGER_SOURCE + 4 * selector) == source
     }
-    fn trigger_on(&self, selector: usize) -> bool {
+    /// Whether trigger `selector` holds frames back: it is On, with a
+    /// source other than the camera's own timing.
+    fn holds(&self, selector: usize) -> bool {
         self.u32(TRIGGER_MODE + 4 * selector) == 1
+            && !matches!(
+                self.u32(TRIGGER_SOURCE + 4 * selector),
+                FREERUN | FIXED_RATE
+            )
     }
     /// The first Line0 edge after `after`, when the line fires at all.
     fn line_edge_after(&self, after: Instant) -> Option<Instant> {
@@ -692,7 +702,7 @@ impl Simulator {
         } else {
             None
         };
-        if !self.trigger_on(FRAME_START) {
+        if !self.holds(FRAME_START) {
             let readout = gate.map_or(self.next, |edge| edge.max(self.next));
             return Some((readout, Start::FreeRun));
         }
@@ -897,7 +907,7 @@ impl Backend for Simulator {
         self.next = now;
         self.line_edge = now;
         self.triggers.clear();
-        self.armed = self.kind.analog() && self.trigger_on(ACQUISITION_START);
+        self.armed = self.kind.analog() && self.holds(ACQUISITION_START);
         Ok(())
     }
     fn stop(&mut self) -> Result<()> {
@@ -1484,6 +1494,32 @@ mod tests {
                 .iter()
                 .all(|selector| validate_selector_shape(selector).is_err())
         );
+    }
+
+    #[test]
+    fn a_trigger_on_the_cameras_own_timing_runs_at_the_frame_rate() {
+        let mut c = camera("sim:own-timing");
+        c.set("AcquisitionFrameRate", "50").unwrap();
+        c.set("ExposureTime", "1000").unwrap();
+        for selector in ["FrameStart", "AcquisitionStart"] {
+            c.set("TriggerSelector", selector).unwrap();
+            c.set("TriggerMode", "On").unwrap();
+            for source in ["Freerun", "FixedRate"] {
+                c.set("TriggerSource", source).unwrap();
+                c.start().unwrap();
+                assert!(!c.software_triggered());
+                let started = Instant::now();
+                for _ in 0..3 {
+                    c.next_frame(Duration::from_millis(500))
+                        .unwrap_or_else(|error| panic!("{selector} {source}: {error:#}"));
+                }
+                assert!(started.elapsed() < Duration::from_secs(1));
+                c.stop().unwrap();
+            }
+            c.set("TriggerMode", "Off").unwrap();
+        }
+        c.set("TriggerSelector", "FrameStart").unwrap();
+        assert!(c.set("TriggerSource", "Line2").is_err());
     }
 
     #[test]

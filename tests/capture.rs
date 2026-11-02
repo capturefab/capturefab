@@ -479,6 +479,40 @@ fn a_session_writes_where_the_caller_asked() {
     assert_eq!(explicit["files"][0], json!(home.real("second.png")));
 }
 
+/// `..` after a symbolic link is the parent of where the link leads, as
+/// the system has it, also through a session started elsewhere.
+#[cfg(unix)]
+#[test]
+fn a_parent_after_a_symbolic_link_is_where_the_link_leads() {
+    let home = Home::new("link-parent");
+    std::fs::create_dir_all(home.path("a")).unwrap();
+    std::fs::create_dir_all(home.path("b/sub")).unwrap();
+    std::os::unix::fs::symlink(home.path("b/sub"), home.path("a/link")).unwrap();
+    let shot = home.ok(&["capture", "-c", "sim:0", "-o", "a/link/../shot.png"]);
+    assert_eq!(shot["files"][0], json!(home.real("b/shot.png")), "{shot}");
+    assert!(home.path("b/shot.png").is_file());
+    assert!(!home.path("a/shot.png").exists());
+    let mut command = home.command();
+    command.current_dir("/");
+    let _session = home.serve_in(&mut command, "linked", &["sim:0"], &[]);
+    let manifest = home.ok(&[
+        "--session",
+        "linked",
+        "capture",
+        "-o",
+        "a/link/../../frames/",
+        "--manifest",
+        "a/link/../list.jsonl",
+    ]);
+    let file = manifest["files"][0].as_str().unwrap();
+    assert!(
+        Path::new(file).starts_with(home.real("frames")),
+        "{manifest}"
+    );
+    assert!(home.path("b/list.jsonl").is_file());
+    assert!(!home.path("a/list.jsonl").exists());
+}
+
 #[test]
 fn a_hardware_triggered_camera_times_out_with_its_trigger() {
     let home = Home::new("trigger");
@@ -1073,6 +1107,53 @@ fn hardware_triggers_wait_as_long_as_asked() {
         home.fails(5, &["auto", "-c", "sim:0?line0=every:300ms"])["code"],
         "unsupported"
     );
+}
+
+/// A trigger whose source is the camera's own timing, as Allied Vision
+/// cameras ship with, sends frames as they come: auto exposure meters them,
+/// alone or before a capture.
+#[test]
+fn a_trigger_on_the_cameras_own_timing_leaves_auto_exposure_on() {
+    let home = Home::new("own-timing");
+    let _session = home.serve("timed", &["sim:0"]);
+    for source in ["Freerun", "FixedRate"] {
+        home.ok(&[
+            "set",
+            "-c",
+            "sim:0",
+            "TriggerMode=On",
+            &format!("TriggerSource={source}"),
+            "ExposureTime=200",
+        ]);
+        let info = home.ok(&["info", "-c", "sim:0"]);
+        assert_eq!(
+            info["trigger"],
+            json!({"selector":"FrameStart","mode":"On","source":source,"activation":"RisingEdge"})
+        );
+        let settled = home.ok(&["auto", "-c", "sim:0", "--timeout", "5s"]);
+        assert_eq!(settled["settled"], true, "{source}: {settled}");
+        let shot = home.ok(&[
+            "capture",
+            "-c",
+            "sim:0",
+            "--auto",
+            "--set",
+            "ExposureTime=200",
+            "-o",
+            &format!("{source}.png"),
+        ]);
+        assert_eq!(shot["count"], 1, "{source}: {shot}");
+        assert!(
+            shot["settings"]["exposure_us"].as_f64().unwrap() > 200.0,
+            "{source}: {shot}"
+        );
+    }
+    // A line still holds every frame back.
+    home.ok(&["set", "-c", "sim:0", "TriggerSource=Line0"]);
+    let refused = home.fails(5, &["auto", "-c", "sim:0"]);
+    assert_eq!(refused["code"], "unsupported", "{refused}");
+    home.fails(5, &["capture", "-c", "sim:0", "--auto", "-o", "line.png"]);
+    home.ok(&["set", "-c", "sim:0", "trigger=off"]);
 }
 
 #[test]

@@ -58,6 +58,10 @@ capturefab set -c 'sim:0?line0=every:500ms' trigger=off
   takes the next frame it starts. Without this option Line0 never fires, and Line1 never does: a
   capture waiting for either ends at `--timeout` with exit 4 `trigger_timeout`.
 
+`TriggerSource` also offers `Freerun` and `FixedRate`, sources some cameras name for their own
+timing under `TriggerMode=On`: frames run at `AcquisitionFrameRate` as with the trigger off, so
+captures, recordings and `auto` treat the camera as free-running.
+
 Join them with `&`, as in `'sim:0?drop=0.02&line0=every:500ms'`, and quote the selector in the
 shell. A selector with options is a camera of its own that starts from the settings its base
 (`sim:0`) saved, so use the same selector for every command of a sequence.

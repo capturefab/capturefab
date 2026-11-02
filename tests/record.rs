@@ -447,6 +447,50 @@ fn a_session_records_with_its_own_ffmpeg() {
     assert!(!home.path("alone.mkv").exists());
 }
 
+/// A relative `file:` target is the caller's, as a plain path is, also when
+/// the session that records was started in another folder.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_session_records_a_relative_file_target_where_the_caller_is() {
+    let home = Home::new("record-file-target");
+    let elsewhere = home.root.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut command = home.command();
+    command.current_dir(&elsewhere);
+    let _session = home.serve_in(&mut command, "away", &["sim:0"], &[]);
+    let recorded = home.ok(&[
+        "--session",
+        "away",
+        "record",
+        "-o",
+        "file:clip.mkv",
+        "--for",
+        "1s",
+    ]);
+    assert_eq!(recorded["ended"], "duration", "{recorded}");
+    assert_eq!(
+        recorded["output"],
+        serde_json::json!(home.real("clip.mkv")),
+        "{recorded}"
+    );
+    assert!(decodes(&home.path("clip.mkv")));
+    assert!(!elsewhere.join("clip.mkv").exists());
+    // Its preflight is of the same file: one there is never overwritten.
+    let taken = home.fails(
+        1,
+        &[
+            "--session",
+            "away",
+            "record",
+            "-o",
+            "file:./clip.mkv",
+            "--for",
+            "1s",
+        ],
+    );
+    assert_eq!(taken["code"], "exists", "{taken}");
+}
+
 /// A timed recording in a session ends on time, by the session, while other
 /// cameras connect to that session.
 #[test]

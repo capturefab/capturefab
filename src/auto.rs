@@ -2020,7 +2020,7 @@ pub(crate) fn frame_triggered(camera: &mut Camera) -> bool {
         camera.get("TriggerMode").is_ok_and(|v| v == "On")
             && !camera
                 .get("TriggerSource")
-                .is_ok_and(|v| v == "Freerun" || v == "FixedRate")
+                .is_ok_and(|v| v.as_str().is_some_and(crate::controls::camera_timed))
     };
     if !camera.has("TriggerSelector") {
         return on(camera);

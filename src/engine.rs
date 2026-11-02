@@ -3186,11 +3186,11 @@ pub(crate) fn frame_wait_error(c: &mut Camera, waited: Duration) -> anyhow::Erro
 const NO_FRAME_HINT: &str = "raise --timeout; check info for the frame rate, exposure and trigger";
 /// Whether `trigger` waits for a hardware line, not software or a clock.
 fn hardware(trigger: &crate::controls::Trigger) -> bool {
-    trigger.mode == "On"
+    trigger.holds_frames()
         && trigger
             .source
             .as_deref()
-            .is_some_and(|source| !matches!(source, "Software" | "Freerun" | "FixedRate"))
+            .is_some_and(|source| source != "Software")
 }
 /// What reading a frame out after its exposure may take.
 const READOUT: Duration = Duration::from_millis(100);

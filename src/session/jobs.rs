@@ -268,13 +268,40 @@ pub(crate) fn path(name: &str) -> anyhow::Result<PathBuf> {
         .join(format!("{name}.json")))
 }
 
-/// The jobs a session saved, as they were when it last saved them.
-pub(crate) fn read(name: &str) -> Vec<Job> {
-    path(name)
+/// What a session saves: its jobs, and the last number it gave a job,
+/// which outlives the jobs it numbered so that a later run of the session
+/// never gives an earlier job's ID to a new one.
+#[derive(Debug, Default, Deserialize)]
+struct Saved {
+    #[serde(default)]
+    next: u64,
+    #[serde(default)]
+    jobs: Vec<Job>,
+}
+
+/// What session `name` saved, as it was when it last saved it.
+fn load(name: &str) -> Saved {
+    /// Files saved before the last number was kept hold the jobs alone.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum File {
+        Jobs(Vec<Job>),
+        Saved(Saved),
+    }
+    let file = path(name)
         .ok()
         .and_then(|path| std::fs::read(path).ok())
-        .and_then(|data| serde_json::from_slice::<Vec<Job>>(&data).ok())
-        .unwrap_or_default()
+        .and_then(|data| serde_json::from_slice::<File>(&data).ok());
+    match file {
+        Some(File::Saved(saved)) => saved,
+        Some(File::Jobs(jobs)) => Saved { next: 0, jobs },
+        None => Saved::default(),
+    }
+}
+
+/// The jobs a session saved, as they were when it last saved them.
+pub(crate) fn read(name: &str) -> Vec<Job> {
+    load(name).jobs
 }
 
 /// The names of sessions that saved jobs.
@@ -324,12 +351,18 @@ impl JobBook {
     }
     /// Session `name`'s jobs, saved as they change: those a session of the
     /// same name left are kept, as lost if they had not ended, and its
-    /// numbers go on after theirs.
+    /// numbers go on after every number it gave, also those of jobs since
+    /// forgotten.
     /// Without a writable state folder, as on a read-only system, the jobs
     /// are kept only while the session runs.
     pub(super) fn saved(name: &str) -> Self {
-        let jobs = orphaned(read(name));
-        let next = jobs.iter().map(|job| job.number).max().unwrap_or(0);
+        let saved = load(name);
+        let next = saved
+            .jobs
+            .iter()
+            .map(|job| job.number)
+            .fold(saved.next, u64::max);
+        let jobs = orphaned(saved.jobs);
         let writable = crate::dirs::found(crate::dirs::Kind::State)
             .chosen
             .as_ref()
@@ -655,7 +688,7 @@ impl Book {
         self.dirty = false;
         self.saved_at = Instant::now();
         let jobs = self.jobs.iter().collect::<Vec<_>>();
-        let Ok(data) = serde_json::to_vec(&jobs) else {
+        let Ok(data) = serde_json::to_vec(&json!({"next": self.next, "jobs": jobs})) else {
             return;
         };
         let write = || -> anyhow::Result<()> {
@@ -862,6 +895,62 @@ mod tests {
         assert_eq!(doc["bytes"], 4321, "{doc}");
         assert_eq!(job.detail()["files"], json!([path]));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Job `number`, which ended two hours ago, past `KEPT_MS`.
+    fn forgotten(number: u64) -> Job {
+        let book = JobBook::new("old");
+        book.start(JobKind::Capture, "sim:0", Some(1), false);
+        let mut job = book.all().remove(0);
+        let ended = crate::scheduling::now_ms() - 2 * KEPT_MS;
+        (job.number, job.state, job.started_ms, job.ended_ms) =
+            (number, JobState::Done, ended, Some(ended));
+        job
+    }
+
+    #[test]
+    fn a_sessions_numbers_go_on_after_jobs_it_forgot() {
+        let name = format!("numbers-{}", std::process::id());
+        let file = path(&name).unwrap();
+        crate::dirs::ensure_private_dir(file.parent().unwrap()).unwrap();
+        // A file of an earlier version, which holds the jobs alone: the last
+        // of them ended too long ago to be kept.
+        std::fs::write(&file, serde_json::to_vec(&[forgotten(42)]).unwrap()).unwrap();
+        let book = JobBook::saved(&name);
+        assert!(
+            book.all().is_empty(),
+            "an hour after its end a job is forgotten"
+        );
+        assert_eq!(
+            book.start(JobKind::Capture, "sim:0", Some(1), false),
+            43,
+            "bench-42 named another job"
+        );
+        // The number is saved on its own: once job 43 is forgotten too, the
+        // next run of the session goes on after it.
+        {
+            let mut saved = book.lock();
+            saved.jobs[0] = forgotten(43);
+            saved.dirty = true;
+            saved.save(true);
+        }
+        let saved: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(saved["next"], 43, "{saved}");
+        let again = JobBook::saved(&name);
+        assert!(again.all().is_empty());
+        assert_eq!(again.start(JobKind::Record, "sim:0", None, false), 44);
+        // A kept job's number counts too, past the saved one.
+        let mut kept = forgotten(60);
+        kept.ended_ms = Some(crate::scheduling::now_ms());
+        std::fs::write(
+            &file,
+            serde_json::to_vec(&json!({"next": 55, "jobs": [kept]})).unwrap(),
+        )
+        .unwrap();
+        let book = JobBook::saved(&name);
+        assert_eq!(book.all().len(), 1);
+        assert_eq!(book.start(JobKind::Auto, "sim:0", None, false), 61);
+        std::fs::remove_file(file).unwrap();
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! absolute before a command leaves this process.
 use crate::session::{SessionCommand, validate_selector};
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Local sources follow the same caller/file base as outputs, and an
 /// existing file or folder is named by its canonical path, so `a.png`,
@@ -59,23 +59,28 @@ fn resolve_source(path: &mut String, base: &Path) -> Result<()> {
 pub(crate) fn resolve_outputs(command: &mut SessionCommand, base: &Path) -> Result<()> {
     match command {
         SessionCommand::Schedule { output, .. } => resolve_path(output, base),
-        SessionCommand::Forward { output, .. } if crate::media::is_recording(output) => {
-            // `file:relative.mkv` is a local path, while `file:///...` and
-            // `file://localhost/...` are already absolute file URLs.
-            if let Some((scheme, path)) = output.split_once(':')
-                && scheme.eq_ignore_ascii_case("file")
-            {
-                if !path.starts_with("//") && Path::new(path).is_relative() {
-                    let mut path = path.to_owned();
-                    resolve_path(&mut path, base)?;
-                    *output = format!("file:{path}");
-                }
-                Ok(())
-            } else {
-                resolve_path(output, base)
-            }
-        }
+        SessionCommand::Forward { output, .. } => resolve_recording(output, base),
         _ => Ok(()),
+    }
+}
+
+/// A recording's local file made absolute against `base`, as a plain path
+/// or the path of `file:PATH`; `file://` URLs are absolute already, and
+/// stream URLs are left as they are.
+pub(crate) fn resolve_recording(output: &mut String, base: &Path) -> Result<()> {
+    if !crate::media::is_recording(output) {
+        return Ok(());
+    }
+    match output.split_once(':') {
+        Some((scheme, path)) if scheme.eq_ignore_ascii_case("file") => {
+            if !path.starts_with("//") {
+                let mut path = path.to_owned();
+                resolve_path(&mut path, base)?;
+                *output = format!("file:{path}");
+            }
+            Ok(())
+        }
+        _ => resolve_path(output, base),
     }
 }
 
@@ -107,25 +112,46 @@ pub(crate) fn resolve_path(output: &mut String, base: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `path` without `.` components, each `..` taking away the name before it:
-/// what the caller's words name, before any symbolic link is followed.
-fn normalize(path: &Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut normal = std::path::PathBuf::new();
+/// `path` without `.` and `..` components, naming what the system would
+/// open: the names the caller gave, except where a `..` follows one.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
-            Component::ParentDir
-                if matches!(normal.components().next_back(), Some(Component::Normal(_))) =>
-            {
-                normal.pop();
-            }
-            // Above the root is the root.
-            Component::ParentDir if normal.has_root() => {}
+            Component::ParentDir => up(&mut normal),
             component => normal.push(component),
         }
     }
     normal
+}
+
+/// Take `normal` to its parent, as the system resolves `..`: on Unix the
+/// folder holding where a symbolic link leads, not the one holding the
+/// link; Windows takes away the name before `..` as it is written.
+fn up(normal: &mut PathBuf) {
+    #[cfg(unix)]
+    if std::fs::symlink_metadata(&*normal).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        match std::fs::canonicalize(&*normal) {
+            Ok(target) => *normal = target,
+            // A link to nothing: the system resolves the `..`, or fails,
+            // once the path is used.
+            Err(_) => {
+                normal.push(Component::ParentDir);
+                return;
+            }
+        }
+    }
+    match normal.components().next_back() {
+        Some(Component::Normal(_)) => {
+            normal.pop();
+        }
+        // Above the root is the root.
+        Some(Component::RootDir | Component::Prefix(_)) => {}
+        // After a `..` kept for the system, or at the start of a relative
+        // path, one more.
+        _ => normal.push(Component::ParentDir),
+    }
 }
 
 #[cfg(test)]
@@ -195,6 +221,97 @@ mod tests {
             resolve_path(&mut output, Path::new("/elsewhere")).unwrap();
             assert_eq!(output, "/y.png");
         }
+    }
+
+    /// A `..` after a symbolic link leads to the parent of where the link
+    /// leads, as the system resolves it, for outputs and sources alike;
+    /// names before no `..` stay as the caller wrote them.
+    #[cfg(unix)]
+    #[test]
+    fn a_parent_after_a_symbolic_link_is_the_parent_of_its_target() {
+        let root = std::env::temp_dir().join(format!("capturefab-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b/sub/inner")).unwrap();
+        std::os::unix::fs::symlink(root.join("b/sub"), root.join("a/link")).unwrap();
+        std::os::unix::fs::symlink(root.join("a"), root.join("alias")).unwrap();
+        std::os::unix::fs::symlink(root.join("gone"), root.join("a/dangling")).unwrap();
+        let real = std::fs::canonicalize(&root).unwrap();
+        let resolved = |path: &str, base: &Path| {
+            let mut path = path.to_owned();
+            resolve_path(&mut path, base).unwrap();
+            path
+        };
+        let shown = |path: PathBuf| path.to_str().unwrap().to_owned();
+        let base = root.join("a");
+        assert_eq!(
+            resolved("link/../shot.png", &base),
+            shown(real.join("b/shot.png"))
+        );
+        assert_eq!(
+            resolved("./link/./../../shot.png", &base),
+            shown(real.join("shot.png"))
+        );
+        assert_eq!(
+            resolved(&format!("{}/a/link/../frames/", root.display()), &base),
+            format!("{}/", real.join("b/frames").display())
+        );
+        // A link to nothing keeps its `..` for the system to resolve.
+        assert_eq!(
+            resolved("dangling/../shot.png", &base),
+            shown(base.join("dangling/../shot.png"))
+        );
+        // Without a link before it, `..` takes away the name before it, and
+        // the caller's names stay, links among them.
+        let alias = root.join("alias");
+        assert_eq!(
+            resolved("out/../shot.png", &alias),
+            shown(alias.join("shot.png"))
+        );
+        assert_eq!(
+            resolved("link/inner/../shot.png", &alias),
+            shown(alias.join("link/shot.png"))
+        );
+        // A source through the same path is the file the system would open.
+        std::fs::write(root.join("b/clip.mp4"), b"x").unwrap();
+        std::fs::write(root.join("a/clip.mp4"), b"y").unwrap();
+        let mut source = "file:link/../clip.mp4".to_owned();
+        resolve_selector(&mut source, &base).unwrap();
+        assert_eq!(
+            source,
+            format!("file:{}", real.join("b/clip.mp4").display())
+        );
+        let mut replay = "sim:replay:link/..".to_owned();
+        resolve_selector(&mut replay, &base).unwrap();
+        assert_eq!(replay, format!("sim:replay:{}", real.join("b").display()));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recording_files_resolve_against_the_caller_as_paths_or_file_paths() {
+        let base = std::env::temp_dir().join("capturefab-path-recording-tests");
+        let resolved = |output: &str| {
+            let mut output = output.to_owned();
+            resolve_recording(&mut output, &base).unwrap();
+            output
+        };
+        let clip = base.join("clip.mkv").display().to_string();
+        assert_eq!(resolved("clip.mkv"), clip);
+        assert_eq!(resolved("file:clip.mkv"), format!("file:{clip}"));
+        assert_eq!(resolved("FILE:./out/../clip.mkv"), format!("file:{clip}"));
+        for kept in [
+            "file:///tmp/clip.mkv",
+            "file://localhost/tmp/clip.mkv",
+            "rtsp://localhost:8554/cam",
+            "srt://localhost:8890?streamid=publish:cam",
+        ] {
+            assert_eq!(resolved(kept), kept);
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            resolved("file:/data/./x/../clip.mkv"),
+            "file:/data/clip.mkv"
+        );
     }
 
     #[test]

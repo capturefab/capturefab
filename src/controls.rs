@@ -1669,22 +1669,43 @@ pub struct Trigger {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation: Option<String>,
 }
-/// The start trigger in effect: the FrameStart trigger, or when it is off
-/// an acquisition or burst start trigger that is on, as that one holds
-/// frames back too.
+impl Trigger {
+    /// Whether frames wait for this trigger: it is on, with a source other
+    /// than the camera's own timing.
+    pub(crate) fn holds_frames(&self) -> bool {
+        self.mode == "On" && !self.source.as_deref().is_some_and(camera_timed)
+    }
+}
+/// Whether trigger source `source` is the camera's own timing, which sends
+/// frames as they come with the trigger on: Allied Vision cameras ship with
+/// TriggerMode On and TriggerSource Freerun, or FixedRate to run at
+/// AcquisitionFrameRateAbs.
+pub(crate) fn camera_timed(source: &str) -> bool {
+    matches!(source, "Freerun" | "FixedRate")
+}
+/// The start trigger in effect: the FrameStart trigger, or when it holds
+/// no frames back an acquisition or burst start trigger that does, else
+/// the first that is on, as with a source that is the camera's own timing.
 pub(crate) fn trigger_state(camera: &mut Camera) -> Result<Trigger> {
     let bank = trigger_bank(camera);
     let frame = bank_trigger(camera, &bank)?;
-    if frame.mode == "On" {
+    if frame.holds_frames() {
         return Ok(frame);
     }
+    let mut on = None;
     for bank in other_start_banks(camera) {
         let trigger = bank_trigger(camera, &bank)?;
-        if trigger.mode == "On" {
+        if trigger.holds_frames() {
             return Ok(trigger);
         }
+        if trigger.mode == "On" && on.is_none() {
+            on = Some(trigger);
+        }
     }
-    Ok(frame)
+    Ok(match on {
+        Some(on) if frame.mode != "On" => on,
+        _ => frame,
+    })
 }
 /// The banks of the start triggers other than FrameStart that hold frames
 /// back: AcquisitionStart and FrameBurstStart.
@@ -2723,6 +2744,46 @@ mod tests {
             .unwrap(),
             "TriggerSoftware[FrameStart]"
         );
+    }
+
+    #[test]
+    fn a_trigger_on_the_cameras_own_timing_holds_no_frames_back() {
+        let mut camera = Camera::open("sim:camera-timed", &[], Duration::from_secs(2)).unwrap();
+        camera.set("TriggerMode", "On").unwrap();
+        for source in ["Freerun", "FixedRate"] {
+            camera.set("TriggerSource", source).unwrap();
+            let trigger = trigger_state(&mut camera).unwrap();
+            assert_eq!(
+                (trigger.mode.as_str(), trigger.source.as_deref()),
+                ("On", Some(source))
+            );
+            assert!(!trigger.holds_frames(), "{source}");
+            assert!(!crate::auto::frame_triggered(&mut camera), "{source}");
+        }
+        // An acquisition trigger on a line still holds frames back, and is
+        // the trigger in effect.
+        camera.set("TriggerSelector", "AcquisitionStart").unwrap();
+        camera.set("TriggerMode", "On").unwrap();
+        camera.set("TriggerSource", "Line0").unwrap();
+        camera.set("TriggerSelector", "FrameStart").unwrap();
+        let trigger = trigger_state(&mut camera).unwrap();
+        assert_eq!(trigger.selector.as_deref(), Some("AcquisitionStart"));
+        assert!(trigger.holds_frames());
+        // Once it runs on its own timing too, the frame trigger is shown.
+        camera.set("TriggerSelector", "AcquisitionStart").unwrap();
+        camera.set("TriggerSource", "Freerun").unwrap();
+        camera.set("TriggerSelector", "FrameStart").unwrap();
+        let trigger = trigger_state(&mut camera).unwrap();
+        assert_eq!(
+            (trigger.selector.as_deref(), trigger.source.as_deref()),
+            (Some("FrameStart"), Some("FixedRate"))
+        );
+        camera.set("TriggerSource", "Line1").unwrap();
+        assert!(trigger_state(&mut camera).unwrap().holds_frames());
+        for selector in ["AcquisitionStart", "FrameStart"] {
+            camera.set("TriggerSelector", selector).unwrap();
+            camera.set("TriggerMode", "Off").unwrap();
+        }
     }
 
     #[test]

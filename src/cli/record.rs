@@ -107,7 +107,8 @@ impl RecordArgs {
     }
 }
 
-/// A local file's path, absolute; a stream URL as it is.
+/// A local file's path, absolute, also as `file:PATH`; a stream URL as it
+/// is.
 fn output(args: &RecordArgs) -> Result<String> {
     let mut output = args.output.clone();
     crate::naming::validate_output(&output).map_err(super::input)?;
@@ -142,12 +143,9 @@ fn output(args: &RecordArgs) -> Result<String> {
     if args.codec == Some(Codec::Ffv1) && extension.as_deref() != Some("mkv") {
         return Err(Usage("ffv1 recordings are .mkv files".into()).into());
     }
-    if output
-        .get(..5)
-        .is_none_or(|scheme| !scheme.eq_ignore_ascii_case("file:"))
-    {
-        super::paths::resolve_path(&mut output, &std::env::current_dir()?).map_err(super::input)?;
-    }
+    // The caller's: a session started elsewhere writes where it is asked.
+    super::paths::resolve_recording(&mut output, &std::env::current_dir()?)
+        .map_err(super::input)?;
     Ok(output)
 }
 
