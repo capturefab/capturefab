@@ -746,13 +746,23 @@ fn probe_network_at(address: SocketAddrV4, timeout: Duration) -> Result<Ipv4Addr
     }
 }
 
+/// How soon a heartbeat that went unanswered is sent again.
+const HEARTBEAT_RETRY: Duration = Duration::from_millis(50);
+
 struct Heartbeat {
     shutdown: Arc<(Mutex<bool>, Condvar)>,
     failure: Arc<Mutex<Option<String>>>,
     thread: Option<JoinHandle<()>>,
 }
 impl Heartbeat {
-    fn start(control: Arc<Mutex<Control>>, period: Duration) -> Result<Self> {
+    /// Read the control privilege every `period`, the controller's
+    /// heartbeat. The camera lets its controller go only once no command
+    /// has reached it for its heartbeat timeout, `lost_after`, so a read
+    /// that goes unanswered, as on a link busy with the stream, is sent
+    /// again at once, and fails the camera only once none was answered
+    /// for that long; a camera that says the privilege is gone fails it
+    /// at once.
+    fn start(control: Arc<Mutex<Control>>, period: Duration, lost_after: Duration) -> Result<Self> {
         let shutdown = Arc::new((Mutex::new(false), Condvar::new()));
         let failure = Arc::new(Mutex::new(None));
         let worker_shutdown = shutdown.clone();
@@ -761,10 +771,12 @@ impl Heartbeat {
             .name("capturefab-gige-heartbeat".into())
             .spawn(move || {
                 let (lock, wake) = &*worker_shutdown;
+                let mut answered = Instant::now();
+                let mut wait = period;
                 loop {
                     let stop = lock.lock().unwrap_or_else(|e| e.into_inner());
                     let (stop, _) = wake
-                        .wait_timeout_while(stop, period, |stop| !*stop)
+                        .wait_timeout_while(stop, wait, |stop| !*stop)
                         .unwrap_or_else(|e| e.into_inner());
                     if *stop {
                         break;
@@ -774,9 +786,17 @@ impl Heartbeat {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .read_register(CONTROL_PRIVILEGE);
+                    wait = period;
                     let error = match result {
-                        Ok(value) if value & 3 != 0 => None,
+                        Ok(value) if value & 3 != 0 => {
+                            answered = Instant::now();
+                            None
+                        }
                         Ok(_) => Some("camera controller privilege was lost".to_owned()),
+                        Err(_) if answered.elapsed() < lost_after => {
+                            wait = HEARTBEAT_RETRY;
+                            continue;
+                        }
                         Err(error) => Some(format!("camera heartbeat failed: {error:#}")),
                     };
                     *worker_failure.lock().unwrap_or_else(|e| e.into_inner()) = error;
@@ -910,12 +930,12 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         };
         Ok((
             heartbeat_timeout,
-            Duration::from_millis((heartbeat_ms / 3).clamp(100, 1000) as u64),
+            Duration::from_millis(heartbeat_ms as u64),
             timestamp_frequency,
             resend,
         ))
     })();
-    let (heartbeat_timeout, period, timestamp_frequency, resend) = match initialized {
+    let (heartbeat_timeout, lost_after, timestamp_frequency, resend) = match initialized {
         Ok(values) => values,
         Err(error) => {
             if let Some(configuration) = control.restore_configuration.take() {
@@ -926,7 +946,8 @@ fn connect(address: SocketAddrV4, timeout: Duration) -> Result<GigE> {
         }
     };
     let control = Arc::new(Mutex::new(control));
-    let heartbeat = match Heartbeat::start(control.clone(), period) {
+    let period = (lost_after / 3).clamp(Duration::from_millis(100), Duration::from_secs(1));
+    let heartbeat = match Heartbeat::start(control.clone(), period, lost_after) {
         Ok(heartbeat) => heartbeat,
         Err(error) => {
             if let Ok(mut control) = control.lock() {
@@ -4761,6 +4782,79 @@ mod tests {
         );
         gige.timestamp_frequency = 0;
         assert_eq!(gige.device_time_ns(), None);
+    }
+    #[test]
+    fn heartbeats_fail_only_once_the_camera_would_let_go() {
+        let fake = Fake::new(|camera| {
+            camera.registers.insert(CONTROL_PRIVILEGE, 2);
+        });
+        let control = Control::connect(fake.address, Duration::from_millis(100)).unwrap();
+        let lost_after = Duration::from_secs(2);
+        let heartbeat = Heartbeat::start(
+            Arc::new(Mutex::new(control)),
+            Duration::from_millis(20),
+            lost_after,
+        )
+        .unwrap();
+        let answering = |answers: bool| {
+            let mut camera = fake.camera.lock().unwrap();
+            camera
+                .unreadable
+                .retain(|address| *address != CONTROL_PRIVILEGE);
+            if !answers {
+                camera.unreadable.push(CONTROL_PRIVILEGE);
+            }
+        };
+        thread::sleep(Duration::from_millis(100));
+        heartbeat.check().unwrap();
+        // Unanswered for a while, as on a busy link: the camera still
+        // counts this controller as its own.
+        answering(false);
+        let silent = Instant::now();
+        thread::sleep(Duration::from_millis(200));
+        heartbeat.check().unwrap();
+        let reads = || fake.camera.lock().unwrap().register_reads.len();
+        let before = reads();
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            reads() > before + 1,
+            "an unanswered heartbeat is sent again"
+        );
+        // Unanswered for the camera's heartbeat timeout: it let go.
+        let failed = loop {
+            if let Err(error) = heartbeat.check() {
+                break error;
+            }
+            assert!(silent.elapsed() < Duration::from_secs(10), "never failed");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(silent.elapsed() >= lost_after / 2, "{:?}", silent.elapsed());
+        assert!(
+            failed.to_string().starts_with("camera heartbeat failed"),
+            "{failed:#}"
+        );
+        // Answered again, it holds.
+        answering(true);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while heartbeat.check().is_err() {
+            assert!(Instant::now() < deadline, "never recovered");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // A camera that says the privilege is gone fails it at once.
+        fake.camera
+            .lock()
+            .unwrap()
+            .registers
+            .insert(CONTROL_PRIVILEGE, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let lost = loop {
+            if let Err(error) = heartbeat.check() {
+                break error;
+            }
+            assert!(Instant::now() < deadline, "privilege loss unnoticed");
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(lost.to_string().contains("privilege was lost"), "{lost:#}");
     }
     #[test]
     fn an_idle_stream_sleeps_until_the_timeout_and_polls_a_frame_in_flight() {
