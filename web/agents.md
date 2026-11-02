@@ -116,7 +116,10 @@ become 8-bit PNG or JPEG, and `source_bits` then says how many bits the frame ha
 `-f jpg --quality 85` or a `.jpg` name gives JPEG; `.raw` gives the frame's exact bytes with a
 `NAME.json` sidecar (`pixel_format`, `pfnc_code`, `width`, `height`, `row_bytes`). Every common
 PFNC pixel format converts; see the
-[pixel format table](guides/camera-compatibility.md#pixel-formats).
+[pixel format table](guides/camera-compatibility.md#pixel-formats). Webcams, streams and files
+arrive as FFmpeg decodes them (gray, YUV such as `YCbCr709_420_8_Planar`, or RGB8 for RGB
+sources), so their `.raw` bytes are in that format. Color JPEGs may come from Apple's JPEG engine
+on macOS (`CAPTUREFAB_JPEG=cpu` keeps libjpeg-turbo; `doctor` reports both under `jpeg`).
 
 ### Set and verify in one call
 
@@ -191,8 +194,8 @@ capturefab record --json -c sim:0 -o rtsp://localhost:8554/cam --background
 The result has `output`, `bytes`, `frames`, `dropped`, `fps_actual`, `encoder`, `ended`
 (`duration`, `signal`, `max_size` or `stopped`) and `finalized`. `--max-size 2G` ends the file
 successfully at that size. `hevc` and `av1` need a hardware encoder and fail up front with exit 5
-otherwise; `ffv1` is lossless. Without `--for`, a recording started with `--background` runs
-until `jobs stop ID`.
+otherwise; `ffv1` is lossless, and stores a Bayer camera's mosaic as gray samples. Without
+`--for`, a recording started with `--background` runs until `jobs stop ID`.
 
 ### Keep settings for later
 

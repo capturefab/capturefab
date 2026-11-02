@@ -19,7 +19,8 @@ Capturefab is one `capturefab` executable for macOS, Windows and Linux. GigE Vis
 - Durations need a unit (`250ms`, `2s`, `1h30m`); files are never overwritten (`{seq}` in `-o`, or `--on-exists number`).
 - Cameras stay open for 60 s between calls in the `auto` session (`--keep 5m` for longer, `--keep 0` or `--no-session` to close at once); `--background` returns a job (`jobs`, `jobs wait`, `jobs stop`).
 - Storage full (exit 6) means a write would take the disk below its free-space floor (`CAPTUREFAB_MIN_FREE`).
-- Every common PFNC pixel format converts; PNG keeps monochrome wider than 8 bits as 16-bit gray, results report `bit_depth` and `source_bits`, and `-f raw` keeps the exact bytes with a `NAME.json` sidecar.
+- Every common PFNC pixel format converts; PNG keeps monochrome wider than 8 bits as 16-bit gray, results report `bit_depth` and `source_bits`, and `-f raw` keeps the exact bytes with a `NAME.json` sidecar. Webcams, streams and files arrive in the format FFmpeg decodes them to (gray, YUV such as `YCbCr709_420_8_Planar`, or RGB8).
+- `CAPTUREFAB_JPEG=auto|cpu|videotoolbox` chooses the JPEG encoder and `CAPTUREFAB_HWDEC=auto|none|METHOD` hardware decoding; `doctor --json` reports both (`jpeg`, `hwdec`).
 
 ## Common calls
 

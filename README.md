@@ -116,6 +116,21 @@ says so (`bit_depth`, `source_bits`). `-f raw` saves the frame's exact bytes wit
 sidecar naming the pixel format, its PFNC code and the row size. Clipping counts and auto
 exposure metering use the frame's own bit depth.
 
+Webcams, streams and files arrive in the format FFmpeg decodes them to: gray, YUV 4:2:0, 4:2:2
+or 4:4:4 (planar, NV12 or YUYV/UYVY) with its color range and matrix, or RGB for RGB sources, so
+`-f raw` saves those bytes. Where PFNC has no code for a layout (planar Y'CbCr, limited-range
+NV12) the pixel format is one of Capturefab's own, named in PFNC's style: `YCbCr601_420_8_Planar`
+is limited-range BT.601 4:2:0 in three planes, `YCbCr709_…` limited-range BT.709 and plain
+`YCbCr…` full-range BT.601. Other color spaces are read as RGB. Compressed network streams and
+webcams in a compressed mode are decoded in hardware where it works (`CAPTUREFAB_HWDEC`); files
+are decoded in software, which delivers their first frame sooner.
+
+JPEG stills of color frames go to Apple's JPEG engine on macOS where it is faster and as accurate
+as libjpeg-turbo (checked on the first frame of each size and format; frames under 512K pixels,
+monochrome frames and `--quality` other than 90 stay on libjpeg-turbo); `CAPTUREFAB_JPEG` chooses.
+`record --codec ffv1` of a Bayer camera stores the mosaic itself, losslessly, as 8- or 16-bit
+gray, which players show in gray.
+
 Support depends on the device, its firmware, the connection and the operating system; this is an
 early implementation with less coverage than vendor SDKs. Sign-ins for password-protected streams
 are saved in the OS credential store with `capturefab login add`. `capturefab network` checks GigE
@@ -142,9 +157,12 @@ network paths. More: [CLI workflows](docs/cli-workflows.md),
 | `CAPTUREFAB_IMAGES` | how `--show` draws frames: `kitty`, `iterm`, `truecolor`, `256` or `none` |
 | `CAPTUREFAB_MAX_CAMERAS` | cameras one session may hold, 1–64 (default 16) |
 | `CAPTUREFAB_GVSP_SCATTER=0` | GigE Vision packets are received whole and copied into their frames, rather than received straight into them |
+| `CAPTUREFAB_JPEG` | the JPEG encoder: `auto` (default), `cpu` (libjpeg-turbo) or `videotoolbox`; a named engine that is missing or fails its accuracy check is exit 3 `unavailable` |
+| `CAPTUREFAB_HWDEC` | hardware decoding: `auto` (default: streams and webcams), `none`, or a method such as `videotoolbox`, `cuda`, `vulkan` or `d3d11va`, used for files too; one this FFmpeg lacks or that fails its probe is exit 3 `unavailable` |
 
 `capturefab --json doctor` prints the folders in use (`dirs`, and under `folders` the fallbacks
-it passed over), including the private folder that holds `inspect` previews. Where a default
+it passed over), including the private folder that holds `inspect` previews, the JPEG encoders
+(`jpeg`) and the hardware decoding methods that work here (`hwdec`). Where a default
 folder cannot be written, as on a read-only root file system, Capturefab falls back to a private
 folder in a tmpfs and turns off only what needs the missing folder; see
 [embedded and read-only hosts](docs/embedded.md).
@@ -169,9 +187,10 @@ cargo clippy --all-targets -- -D warnings
 python3 scripts/test-site.py && python3 -m unittest discover -s scripts
 ```
 
-The default features are `usb` (USB3 Vision), `jpeg` (libjpeg-turbo), `keychain` (the OS
-credential store for `login`) and `shell` (line editing, history and completion in
-`capturefab shell`); `--no-default-features` builds without them. Releases are built
+The default features are `usb` (USB3 Vision), `jpeg` (libjpeg-turbo), `videotoolbox` (Apple's
+JPEG engine on macOS; nothing elsewhere), `keychain` (the OS credential store for `login`) and
+`shell` (line editing, history and completion in `capturefab shell`); `--no-default-features`
+builds without them. Releases are built
 and packaged as described in [docs/release.md](docs/release.md).
 
 ## License

@@ -778,10 +778,12 @@ capturefab --json doctor</code></pre><button class="copy-button" type="button" a
 <tr><td><code>arch</code></td><td>string</td></tr>
 <tr><td><code>checks</code></td><td>[{name,status:ok|warn|fail,message,fix?}] — fix is a command or step that resolves a warning</td></tr>
 <tr><td><code>dirs</code></td><td>{runtime,state,cache,inspect} — runtime: sessions; state: presets, sign-ins; cache: FFmpeg; inspect: previews; null when there is none</td></tr>
-<tr><td><code>features</code></td><td>{usb,jpeg,keychain,shell} — what this build includes</td></tr>
+<tr><td><code>features</code></td><td>{usb,jpeg,videotoolbox,keychain,shell} — what this build includes</td></tr>
 <tr><td><code>ffmpeg</code></td><td>{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted</td></tr>
 <tr><td><code>folders</code></td><td>{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over</td></tr>
 <tr><td><code>host</code></td><td>{cpus,threads,cpu_quota,memory:{total_bytes,available_bytes,cgroup_limit_bytes,cgroup_used_bytes,budget_bytes}} — what cgroups leave this process</td></tr>
+<tr><td><code>hwdec</code></td><td>{selected:auto|none|METHOD,methods:{METHOD:{built,works,reason?}}} — hardware decoding CAPTUREFAB_HWDEC selects, and each method of this platform: in this FFmpeg (built) and proved to decode here (works); only with FFmpeg</td></tr>
+<tr><td><code>jpeg</code></td><td>{selected:auto|cpu|videotoolbox,backends:{libjpeg_turbo:{compiled,simd},videotoolbox:{compiled,available,verified?,reason?}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: Apple&#x27;s JPEG engine encoded a test frame as accurately as libjpeg-turbo</td></tr>
 <tr><td><code>os</code></td><td>string</td></tr>
 <tr><td><code>read_only_root</code></td><td>bool or null — the root file system is mounted read-only (Linux)</td></tr>
 <tr><td><code>version</code></td><td>string — Capturefab version</td></tr>
