@@ -86,10 +86,21 @@ fn large(report: &Value) -> i64 {
     report["large_allocs"]["count"].as_i64().unwrap_or(0)
 }
 /// Large allocations besides the frame pool's. A burst holds a pooled
-/// buffer for each frame waiting for an encoder, so how many the pool
-/// makes depends on how far the encoders fall behind on the host.
+/// buffer for each frame waiting for the disk or an encoder, and the pool
+/// keeps only a few idle, so how many it makes depends on how far the
+/// host's disk and encoders fall behind the camera.
 fn large_beside_pool(report: &Value) -> i64 {
     large(report) - report["pool"]["allocations"].as_i64().unwrap_or(0)
+}
+/// Every frame the camera delivered was written into a buffer from the
+/// frame pool, reused or new.
+fn assert_pooled(label: &str, delta: &Value) {
+    let pool = &delta["pool"];
+    assert_eq!(
+        pool["allocations"].as_i64().unwrap() + pool["reuses"].as_i64().unwrap(),
+        delta["frames"].as_i64().unwrap(),
+        "{label}: {delta}"
+    );
 }
 /// The largest allocation size class with any allocations in `report`.
 fn largest_class(report: &Value) -> i64 {
@@ -213,9 +224,11 @@ fn frame_bytes(format: &str) -> usize {
     }
 }
 
-/// Allocations of a frame's size or more, per frame: buffers come from the
-/// pool, so only the first frames allocate (two over 20 frames allows one
-/// pool miss on a loaded host).
+/// Allocations of a frame's size or more besides the frame pool's, per
+/// frame: frames are written and encoded from their own buffers, and the
+/// images they are converted into come from a pool of their own, so only
+/// the first frames allocate (two over 20 frames allows one more on a
+/// loaded host).
 const LARGE_PER_FRAME: f64 = 0.1;
 
 #[test]
@@ -236,8 +249,9 @@ fn raw_captures_copy_nothing_in_user_space() {
             "{format}: a raw file and its sidecar"
         );
         assert!(files > 20 * frame_bytes(format) as i64, "{format}");
+        assert_pooled(format, &delta);
         assert!(
-            large(&delta) as f64 / 20.0 <= LARGE_PER_FRAME,
+            large_beside_pool(&delta) as f64 / 20.0 <= LARGE_PER_FRAME,
             "{format}: {delta}"
         );
     }
@@ -252,8 +266,8 @@ fn still_captures_encode_from_the_frame_in_place() {
             ("jpg q75", &["-f", "jpg", "--quality", "75"][..]),
             ("png", &["-f", "png"][..]),
         ] {
-            // Enough frames that one more frame buffer, for a burst whose
-            // encoder fell behind on a busy host, stays within the budget.
+            // Enough frames that an allocation a busy host adds stays
+            // within the budget.
             let n = if name == "png" { 10 } else { 20 };
             let (delta, files) = capture_delta(&home, format, extra, n);
             show(&format!("capture -f {name} {format}"), &delta, n as i64);
@@ -263,14 +277,13 @@ fn still_captures_encode_from_the_frame_in_place() {
                 "{format} {name}: {delta}"
             );
             assert_eq!(site(&delta, "file_write"), files, "{format} {name}");
-            let per_file = large(&delta) as f64 / n as f64;
+            assert_pooled(&format!("{format} {name}"), &delta);
+            let per_file = large_beside_pool(&delta) as f64 / n as f64;
             if name == "png" {
                 // The PNG encoder's own compressed-data buffer grows by
                 // doubling inside the png crate, beside the one output
-                // buffer: one allocation per doubling past 256 KiB. The
-                // frames that wait for it hold pooled buffers.
+                // buffer: one allocation per doubling past 256 KiB.
                 let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
-                let per_file = large_beside_pool(&delta) as f64 / n as f64;
                 assert!(per_file <= f64::from(doublings) + 1.0, "{format}: {delta}");
             } else {
                 // libjpeg-turbo writes into its own (C) buffer.
@@ -405,23 +418,22 @@ fn every_format_converts_once_into_its_encoder() {
             ("jpg", &["-f", "jpg"][..]),
             ("png", &["-f", "png"][..]),
         ] {
-            // Enough frames that one more buffer for a burst that happened
-            // to encode more frames at once stays within the budget.
+            // Enough frames that an allocation a busy host adds stays
+            // within the budget.
             let n = if name == "png" { 5 } else { 20 };
             let (delta, files) = capture_delta(&home, format, extra, n);
             let label = format!("capture -f {name} {format}");
             show(&label, &delta, n as i64);
             assert_no_avoidable(&label, &delta);
             assert_eq!(site(&delta, "file_write"), files, "{label}");
-            let per_file = large(&delta) as f64 / n as f64;
+            assert_pooled(&label, &delta);
+            let per_file = large_beside_pool(&delta) as f64 / n as f64;
             match name {
                 "raw" => assert_eq!(class_bytes(&delta, "transform"), 0, "{label}"),
                 // The png crate's compressed-data buffer grows by doubling
-                // beside the one output buffer, and the frames that wait
-                // for it hold pooled buffers (see above).
+                // beside the one output buffer (see above).
                 "png" => {
                     let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
-                    let per_file = large_beside_pool(&delta) as f64 / n as f64;
                     assert!(per_file <= f64::from(doublings) + 1.0, "{label}: {delta}");
                 }
                 _ => assert!(per_file <= LARGE_PER_FRAME, "{label}: {delta}"),
@@ -464,8 +476,9 @@ fn the_jpeg_engine_encodes_from_the_frame() {
         assert_no_avoidable(&label, &delta);
         assert_eq!(calls(&delta, "output_copy"), 0, "{label}: {delta}");
         assert_eq!(site(&delta, "file_write"), files, "{label}");
+        assert_pooled(&label, &delta);
         assert!(
-            large(&delta) as f64 / n as f64 <= LARGE_PER_FRAME,
+            large_beside_pool(&delta) as f64 / n as f64 <= LARGE_PER_FRAME,
             "{label}: {delta}"
         );
     }
