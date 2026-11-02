@@ -1518,8 +1518,12 @@ fn process_plain(
                 crate::media::StreamCopy::Never => None,
                 wanted => camera_mut(camera)?.copy_stream(wanted, &config.codec)?,
             };
-            if let Some(tap) = &copied {
-                config.codec = tap.codec().into();
+            match &copied {
+                Some(tap) => config.codec = tap.codec().into(),
+                // The client left the encoder to be checked here, in case
+                // the source was copied.
+                None if !copy.is_never() => crate::media::check_codec(&config)?,
+                None => {}
             }
             let reserved = if named {
                 let label = crate::naming::camera_name(&camera_mut(camera)?.info);

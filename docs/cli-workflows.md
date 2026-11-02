@@ -87,7 +87,10 @@ Recordings go to `.mkv`, `.mp4`, `.mov`, `.ts` or `.webm` files, or to an `rtsp:
 `rtmp://` or `udp://` receiver such as MediaMTX. `--codec h264` (the default) uses a hardware
 encoder where one works (VideoToolbox, NVENC, Jetson's GStreamer encoder, AMF, Quick Sync,
 Vulkan, Media Foundation or V4L2) and libx264 otherwise; `hevc` and `av1` need a hardware
-encoder. `--max-size 2G` ends a file at that size; Ctrl-C ends an open-ended recording normally.
+encoder. An H.264 or HEVC stream, file or webcam mode is copied as it arrives, without
+re-encoding or an encoder (`"encoder":"copy"`), unless `--codec` names another codec or `--fps`
+or `--bitrate` is given; Windows encodes. `--max-size 2G` ends a file at that size; Ctrl-C ends
+an open-ended recording normally.
 
 ## Password-protected cameras
 

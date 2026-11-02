@@ -230,7 +230,7 @@ capturefab exec -c gige:00c0df123456 &#x27;UserSetSave[UserSet1]&#x27;</code></p
 <tr><td><code>--at</code> TIME</td><td>Begin at a time: HH:MM[:SS] here, or RFC 3339</td><td>—</td></tr>
 <tr><td><code>--in</code> DUR</td><td>Begin after a delay</td><td>—</td></tr>
 <tr><td><code>-f</code>, <code>--format</code> FORMAT</td><td>Image format when -o has no extension: png (default; 16-bit for Mono10..Mono16), jpg or raw (the exact bytes, with NAME.json beside)</td><td>one of <code>png</code>, <code>jpg</code>, <code>raw</code></td></tr>
-<tr><td><code>--quality</code> 1-100</td><td>JPEG quality, 1..100 (default 90)</td><td>—</td></tr>
+<tr><td><code>--quality</code> 1-100</td><td>JPEG quality, 1..100 (default 90; without it, a Motion JPEG source&#x27;s own JPEG is stored as it is)</td><td>—</td></tr>
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does); repeatable</td><td>repeatable</td></tr>
 <tr><td><code>--auto</code></td><td>Settle exposure and gain first, then hold them (as auto does)</td><td>—</td></tr>
 <tr><td><code>--inspect</code></td><td>Measure the last frame as inspect does, and preview it: the result&#x27;s inspect block</td><td>—</td></tr>

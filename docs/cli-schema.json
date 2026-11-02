@@ -194,7 +194,7 @@
      "value_name": "FORMAT"
     },
     {
-     "help": "JPEG quality, 1..100 (default 90)",
+     "help": "JPEG quality, 1..100 (default 90; without it, a Motion JPEG source's own JPEG is stored as it is)",
      "long": "--quality",
      "name": "quality",
      "repeatable": false,

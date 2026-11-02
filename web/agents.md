@@ -122,10 +122,11 @@ exact bytes with a `NAME.json` sidecar (`pixel_format`, `pfnc_code`, `width`, `h
 arrive as FFmpeg decodes them (gray, YUV such as `YCbCr709_420_8_Planar`, or RGB8 for RGB
 sources), so their `.raw` bytes are in that format. Color JPEGs may come from Apple's JPEG engine
 on macOS (`CAPTUREFAB_JPEG=cpu` keeps libjpeg-turbo; `doctor` reports both under `jpeg`).
-Compressed streams and webcams are decoded in hardware where it works in a session, and files
-and `--no-session` commands in software (`CAPTUREFAB_HWDEC=auto|none|METHOD`; `doctor --json`
-reports the methods under `hwdec`). A session's cameras keep the `CAPTUREFAB_JPEG` and
-`CAPTUREFAB_HWDEC` the session started with: stop it, or use `--no-session`, to change them.
+Compressed streams and webcams other than Motion JPEG, which libjpeg-turbo decodes, are decoded
+in hardware where it works in a session, and files and `--no-session` commands in software
+(`CAPTUREFAB_HWDEC=auto|none|METHOD`; `doctor --json` reports the methods under `hwdec`). A
+session's cameras keep the `CAPTUREFAB_JPEG` and `CAPTUREFAB_HWDEC` the session started with:
+stop it, or use `--no-session`, to change them.
 
 ### Set and verify in one call
 
@@ -199,12 +200,12 @@ capturefab record --json -c sim:0 -o rtsp://localhost:8554/cam --background
 
 The result has `output`, `bytes`, `frames`, `dropped`, `fps_actual`, `codec`, `encoder`, `ended`
 (`duration`, `signal`, `max_size` or `stopped`) and `finalized`. `--max-size 2G` ends the file
-successfully at that size. `hevc` and `av1` need a hardware encoder and fail up front with exit 5
-otherwise; `ffv1` is lossless, and stores a Bayer camera's mosaic as gray samples. An H.264 or HEVC
-stream, file or webcam mode is copied as it arrives, without re-encoding (`"encoder":"copy"`,
-`codec` the source's), from its last key frame, unless `--codec` names another codec or `--fps` or
-`--bitrate` is given (Linux and macOS; Windows encodes). Without `--for`, a recording started with
-`--background` runs until `jobs stop ID`.
+successfully at that size. `hevc` and `av1` need a hardware encoder unless the source is copied, and
+fail with exit 5 before recording otherwise; `ffv1` is lossless, and stores a Bayer camera's mosaic
+as gray samples. An H.264 or HEVC stream, file or webcam mode is copied as it arrives, without
+re-encoding (`"encoder":"copy"`, `codec` the source's), from its last key frame, unless `--codec`
+names another codec or `--fps` or `--bitrate` is given (Linux and macOS; Windows encodes). Without
+`--for`, a recording started with `--background` runs until `jobs stop ID`.
 
 ### Keep settings for later
 

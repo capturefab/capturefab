@@ -1152,12 +1152,14 @@ fn read_ppm(
     })
 }
 /// Frames from a Motion JPEG source's own JPEGs (`Output::Jpeg`). A JPEG
-/// that does not decode is skipped; a source none of whose first JPEGs
-/// decode goes back to FFmpeg's decoder (`NeedsDecoding`).
+/// that is not whole or does not decode is skipped; a source none of whose
+/// first JPEGs decode goes back to FFmpeg's decoder (`NeedsDecoding`).
 #[derive(Default)]
 struct JpegReader {
     #[cfg(feature = "jpeg")]
     decompressor: Option<turbojpeg::Decompressor>,
+    #[cfg(feature = "jpeg")]
+    jpegs: mjpeg::Splitter,
     #[cfg(feature = "jpeg")]
     delivered: bool,
 }
@@ -1183,24 +1185,27 @@ impl JpegReader {
             };
             let mut failures = 0;
             loop {
-                let jpeg = mjpeg::read_jpeg(reader)?.context("media stream ended")?;
-                match mjpeg::decode(decompressor, jpeg, id, pool) {
-                    Ok(frame) => {
-                        self.delivered = true;
-                        return Ok(frame);
-                    }
-                    Err(error) => {
-                        failures += 1;
-                        if failures >= Self::FAILURES[usize::from(self.delivered)] {
-                            if self.delivered {
-                                return Err(error.context("the source's JPEGs stopped decoding"));
-                            }
-                            return Err(NeedsDecoding(format!(
-                                "its JPEGs do not decode here ({error:#}); FFmpeg decodes them"
-                            ))
-                            .into());
+                let error = match self.jpegs.next(reader) {
+                    Ok(Some(jpeg)) => match mjpeg::decode(decompressor, jpeg, id, pool) {
+                        Ok(frame) => {
+                            self.delivered = true;
+                            return Ok(frame);
                         }
+                        Err(error) => error,
+                    },
+                    Ok(None) => bail!("media stream ended"),
+                    Err(error) if error.is::<mjpeg::Malformed>() => error,
+                    Err(error) => return Err(error),
+                };
+                failures += 1;
+                if failures >= Self::FAILURES[usize::from(self.delivered)] {
+                    if self.delivered {
+                        return Err(error.context("the source's JPEGs stopped decoding"));
                     }
+                    return Err(NeedsDecoding(format!(
+                        "its JPEGs do not decode here ({error:#}); FFmpeg decodes them"
+                    ))
+                    .into());
                 }
             }
         }
@@ -3852,12 +3857,28 @@ enum Repeat {
     /// Never: FFmpeg stamps a recording's frames itself, so a stall leaves
     /// a gap.
     Never,
-    /// While the camera streams: GStreamer stamps frames by count.
+    /// While the camera streams: GStreamer stamps a recording's frames by
+    /// count.
     UntilStalled,
+    /// On every slot, stalled or not: a Jetson stream's FFmpeg only copies
+    /// GStreamer's video, and its receivers may drop a silent publisher.
+    Always,
     /// Once no new frame has come for `KEEP_ALIVE`, on every slot after:
     /// a stream's FFmpeg repeats frames to keep its rate (`-fps_mode cfr`),
     /// but its receivers may drop a publisher silent for long.
     AfterSilence,
+}
+impl Repeat {
+    /// How the writer of a Jetson encoder or of FFmpeg's, for a local
+    /// recording or a stream, repeats.
+    fn of(jetson: bool, local: bool) -> Self {
+        match (jetson, local) {
+            (true, true) => Self::UntilStalled,
+            (true, false) => Self::Always,
+            (false, true) => Self::Never,
+            (false, false) => Self::AfterSilence,
+        }
+    }
 }
 /// How long a stream goes without a new frame before its writer sends the
 /// last one again.
@@ -3884,6 +3905,7 @@ fn write_frames(
             _ if last.is_none() => None,
             Repeat::Never => None,
             Repeat::UntilStalled => (!shared.stalled()).then(Instant::now),
+            Repeat::Always => Some(Instant::now()),
             Repeat::AfterSilence => Some(shared.arrived() + KEEP_ALIVE),
         };
         let Some(fresh) = shared.take(next, repeat_from) else {
@@ -5749,11 +5771,7 @@ impl Forwarder {
             let held = match input {
                 Input::Frames(raw, jetson) => {
                     // Each new frame once, at most one per slot.
-                    let repeat = match (jetson, local) {
-                        (Some(_), _) => Repeat::UntilStalled,
-                        (None, true) => Repeat::Never,
-                        (None, false) => Repeat::AfterSilence,
-                    };
+                    let repeat = Repeat::of(jetson.is_some(), local);
                     // FFmpeg reads a frame's own bytes straight from its
                     // pages, which stay as they are until it has.
                     #[cfg(target_os = "linux")]
@@ -8260,6 +8278,59 @@ esac"#
             assert_eq!(bytes, expected, "repeat {repeat}");
         }
     }
+    /// Once the camera has stalled, a Jetson stream's writer still sends
+    /// the last frame on every slot; a Jetson recording's waits for a new
+    /// one.
+    #[test]
+    fn a_jetson_stream_repeats_through_stalls() {
+        assert_eq!(Repeat::of(true, false), Repeat::Always);
+        assert_eq!(Repeat::of(true, true), Repeat::UntilStalled);
+        const MONO8: u32 = 0x0108_0001;
+        let raw = RawInput::for_format(MONO8).unwrap();
+        for repeat in [Repeat::Always, Repeat::UntilStalled] {
+            let mut queue = WriterQueue::new();
+            // The newest frame arrived well over `STALL` ago.
+            queue.epoch = Instant::now() - STALL * 2;
+            assert!(queue.stalled());
+            let queue = Arc::new(queue);
+            queue.state.lock().unwrap().latest = Some(Frame {
+                id: 1,
+                width: 4,
+                height: 2,
+                pixel_format: MONO8,
+                data: vec![7; 8].into(),
+                ..Frame::default()
+            });
+            let writer = thread::spawn({
+                let queue = queue.clone();
+                move || {
+                    let mut pipe = Vec::new();
+                    let interval = Duration::from_millis(1);
+                    write_frames(&queue, (&mut pipe, None), (raw, None), interval, repeat);
+                    pipe
+                }
+            });
+            if repeat == Repeat::Always {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while queue.written.load(Ordering::Relaxed) < 5 {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            } else {
+                // Fifty slots go by.
+                thread::sleep(Duration::from_millis(50));
+            }
+            queue.running.store(false, Ordering::Release);
+            queue.changed.notify_all();
+            let pipe = writer.join().unwrap();
+            let written = queue.written.load(Ordering::Relaxed);
+            match repeat {
+                Repeat::Always => assert!(written >= 5, "{written}"),
+                _ => assert_eq!(written, 1),
+            }
+            assert_eq!(pipe, vec![7; 8 * written as usize], "{repeat:?}");
+        }
+    }
     #[test]
     fn payloads_are_written_whole_through_short_writes() {
         /// A pipe that takes at most 5 bytes per write, gathered or not.
@@ -9178,6 +9249,36 @@ esac"#
         .unwrap()
         .to_vec()
     }
+    /// A JPEG without an EOI, as webcams send, is read whole, and one that
+    /// is not well formed is skipped like one that does not decode: the
+    /// stream goes on. A source whose first JPEGs are all broken goes back
+    /// to FFmpeg's decoder.
+    #[test]
+    #[cfg(feature = "jpeg")]
+    fn broken_motion_jpegs_are_skipped_and_open_ones_read_whole() {
+        let jpegs: Vec<Vec<u8>> = (0..4).map(|i| moving_jpeg(32, 16, i)).collect();
+        let open = &jpegs[1][..jpegs[1].len() - 2];
+        let broken = [0xFF, 0xD8, 0x12, 0x34];
+        let stream = [&jpegs[0][..], open, &jpegs[2], &broken, &jpegs[3]].concat();
+        let mut reader = std::io::BufReader::with_capacity(64, &stream[..]);
+        let pool = crate::framebuf::pool();
+        let mut jpeg_reader = JpegReader::default();
+        for (id, jpeg) in [&jpegs[0], &jpegs[1], &jpegs[2], &jpegs[3]]
+            .into_iter()
+            .enumerate()
+        {
+            let frame = jpeg_reader.next(&mut reader, id as u64, pool).unwrap();
+            assert_eq!(frame.jpeg.as_deref(), Some(&jpeg[..]), "frame {id}");
+        }
+        let ended = jpeg_reader.next(&mut reader, 4, pool).unwrap_err();
+        assert!(!ended.is::<NeedsDecoding>(), "{ended:#}");
+        let stream = [&broken[..], &broken, &broken, &jpegs[0]].concat();
+        let mut reader = std::io::BufReader::new(&stream[..]);
+        let error = JpegReader::default()
+            .next(&mut reader, 1, pool)
+            .unwrap_err();
+        assert!(error.is::<NeedsDecoding>(), "{error:#}");
+    }
     /// A Motion JPEG file, and a Motion JPEG stream over HTTP, are read as
     /// their own JPEGs: each frame keeps the one it was decoded from, and
     /// decodes as FFmpeg decodes it.
@@ -9409,7 +9510,12 @@ esac"#
         if cfg!(target_os = "macos") {
             encoders.push("h264_videotoolbox");
         }
-        for format in [0x0108_0009, 0x010c_0059] {
+        // BayerRG8, BayerRG12p and BayerRG16.
+        for (format, expected) in [
+            (0x0108_0009, "bayer_rggb8"),
+            (0x010c_0059, "bayer_rggb8"),
+            (0x0110_002f, "bayer_rggb16le"),
+        ] {
             let frame = Frame {
                 width,
                 height,
@@ -9418,11 +9524,12 @@ esac"#
                 ..Frame::default()
             };
             for encoder in &encoders {
-                // As a recording hands it over: BayerRG12p narrowed to 8 bits.
+                // As a recording hands it over: BayerRG12p narrowed to 8
+                // bits, BayerRG16 read by FFmpeg as it is.
                 let raw = RawInput::for_format(format).unwrap().for_encoder(encoder);
                 let bytes = raw.bytes(frame.clone()).unwrap();
                 let pix_fmt = raw.input_pix_fmt(encoder);
-                assert_eq!(pix_fmt, "bayer_rggb8");
+                assert_eq!(pix_fmt, expected);
                 let mut child = command(&exe)
                     .args([
                         "-hide_banner",

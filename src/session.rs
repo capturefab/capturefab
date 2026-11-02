@@ -157,7 +157,8 @@ pub enum SessionCommand {
         /// The caller's UTC offset in seconds, for {date} and {time}.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         utc_offset_s: Option<i32>,
-        /// JPEG quality 1..100; 90 when unset.
+        /// JPEG quality 1..100. Unset, a Motion JPEG source's own JPEG is
+        /// stored as it is, and other frames are encoded at 90.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<u8>,
         /// Frames to let pass after the first frame exposed after the
@@ -197,7 +198,8 @@ pub enum SessionCommand {
         /// The caller's UTC offset in seconds, for {date} and {time}.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         utc_offset_s: Option<i32>,
-        /// JPEG quality 1..100; 90 when unset.
+        /// JPEG quality 1..100. Unset, a Motion JPEG source's own JPEG is
+        /// stored as it is, and other frames are encoded at 90.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<u8>,
         /// Frames to let pass after the first frame exposed after the

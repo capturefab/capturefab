@@ -583,3 +583,56 @@ fn a_signal_ends_a_copied_recording_normally() {
     assert_eq!(result["finalized"], true, "{result}");
     assert!(decodes(&home.path("copy.mp4")));
 }
+
+/// Naming the source's own codec copies it, though no encoder for that
+/// codec works here; a source that is not copied then fails as unsupported
+/// before it records.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn naming_the_sources_codec_copies_it_without_an_encoder() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = Home::new("record-copy-no-encoder");
+    h264_clip(&home, "clip.mp4");
+    // FFmpeg, with every H.264 encoder failing.
+    let ffmpeg = home.root.join("ffmpeg");
+    let script = format!(
+        r#"#!/bin/sh
+previous=
+for arg in "$@"; do
+  case "$previous $arg" in
+    "-c:v libx264"|"-c:v h264_"*) echo 'no H.264 encoder here' >&2; exit 1 ;;
+  esac
+  previous=$arg
+done
+exec '{}' "$@"
+"#,
+        support::cli::ffmpeg()
+    );
+    std::fs::write(&ffmpeg, script).unwrap();
+    std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let env = [("CAPTUREFAB_FFMPEG", ffmpeg.to_str().unwrap())];
+    let copied = home
+        .run_env(
+            &env,
+            &[
+                "--json", "record", "-c", "clip.mp4", "-o", "same.mkv", "--codec", "h264", "--for",
+                "2s",
+            ],
+        )
+        .success();
+    assert_eq!(copied["encoder"], "copy", "{copied}");
+    assert_eq!(copied["codec"], "h264", "{copied}");
+    assert!(decodes(&home.path("same.mkv")));
+    let encoded = home
+        .run_env(
+            &env,
+            &[
+                "--json", "record", "-c", "sim:0", "-o", "sim.mkv", "--codec", "h264", "--for",
+                "1s",
+            ],
+        )
+        .failure(5);
+    assert_eq!(encoded["code"], "unsupported", "{encoded}");
+    assert!(!home.path("sim.mkv").exists());
+}

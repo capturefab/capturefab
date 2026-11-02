@@ -123,9 +123,9 @@ NV12, full-range BT.709) the pixel format is one of Capturefab's own, named in P
 `YCbCr601_420_8_Planar` is limited-range BT.601 4:2:0 in three planes, `YCbCr709_…` limited-range
 BT.709, `YCbCr709Full_…` full-range BT.709 and plain `YCbCr…` full-range BT.601. Other color
 spaces are read as RGB. In a session, the warm one included, compressed network streams and
-webcams in a compressed mode are decoded in hardware where it works (`CAPTUREFAB_HWDEC`), as
-the decoder runs on between commands; files, and commands with `--no-session`, decode in software,
-which delivers one frame sooner.
+webcams in a compressed mode other than Motion JPEG are decoded in hardware where it works
+(`CAPTUREFAB_HWDEC`), as the decoder runs on between commands; files, and commands with
+`--no-session`, decode in software, which delivers one frame sooner.
 
 JPEG stills of color frames go to Apple's JPEG engine on macOS where it is faster and as accurate
 as libjpeg-turbo (checked beside the first frame of each size and format, which libjpeg-turbo
@@ -167,7 +167,7 @@ network paths. More: [CLI workflows](docs/cli-workflows.md),
 | `CAPTUREFAB_MAX_CAMERAS` | cameras one session may hold, 1–64 (default 16) |
 | `CAPTUREFAB_GVSP_SCATTER=0` | GigE Vision packets are received whole and copied into their frames, rather than received straight into them |
 | `CAPTUREFAB_JPEG` | the JPEG encoder: `auto` (default), `cpu` (libjpeg-turbo) or `videotoolbox`; a named engine that is missing or fails its accuracy check is exit 3 `unavailable` |
-| `CAPTUREFAB_HWDEC` | hardware decoding: `auto` (default: streams and webcams, in a session), `none`, or a method such as `videotoolbox`, `cuda`, `vulkan` or `d3d11va`, used for files and `--no-session` too; one this FFmpeg lacks or that fails its probe is exit 3 `unavailable` |
+| `CAPTUREFAB_HWDEC` | hardware decoding of H.264, HEVC and other compressed video: `auto` (default: streams and webcams, in a session), `none`, or a method such as `videotoolbox`, `cuda`, `vulkan` or `d3d11va`, used for files and `--no-session` too; one this FFmpeg lacks or that fails its probe is exit 3 `unavailable`. Motion JPEG is decoded with libjpeg-turbo whatever it says |
 
 A session's cameras keep the `CAPTUREFAB_JPEG` and `CAPTUREFAB_HWDEC` the session started with,
 the warm `auto` session included: stop it (`capturefab session stop auto`) or use `--no-session`

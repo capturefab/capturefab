@@ -201,7 +201,9 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         copy: args.copy(),
     };
     // Everything that can be checked here is, before a camera is opened:
-    // the request, a taken file, FFmpeg and an encoder for the codec.
+    // the request, a taken file, FFmpeg and an encoder for the codec. A
+    // source that may be copied needs no encoder: the worker checks for one
+    // once it is not.
     request(args.fps.unwrap_or(30.0))
         .validate()
         .map_err(super::input)?;
@@ -218,14 +220,16 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         })?;
     }
     crate::media::executable()?;
-    crate::media::check_codec(&crate::media::ForwardConfig {
-        output: output.clone(),
-        codec: args.codec().name().into(),
-        encoder: "auto".into(),
-        fps: args.fps.unwrap_or(30.0),
-        bitrate: args.bitrate(),
-        max_file_bytes,
-    })?;
+    if args.copy() == StreamCopy::Never {
+        crate::media::check_codec(&crate::media::ForwardConfig {
+            output: output.clone(),
+            codec: args.codec().name().into(),
+            encoder: "auto".into(),
+            fps: args.fps.unwrap_or(30.0),
+            bitrate: args.bitrate(),
+            max_file_bytes,
+        })?;
+    }
     signals::take_over();
     let client = Client::open_with(
         global,

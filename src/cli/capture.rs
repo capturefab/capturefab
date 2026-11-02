@@ -66,7 +66,7 @@ pub struct CaptureArgs {
     /// Image format when -o has no extension: png (default; 16-bit for Mono10..Mono16), jpg or raw (the exact bytes, with NAME.json beside)
     #[arg(short = 'f', long, value_enum)]
     pub format: Option<Format>,
-    /// JPEG quality, 1..100 (default 90)
+    /// JPEG quality, 1..100 (default 90; without it, a Motion JPEG source's own JPEG is stored as it is)
     #[arg(long, value_name = "1-100", value_parser = clap::value_parser!(u8).range(1..=100))]
     pub quality: Option<u8>,
     /// Change settings first, as one atomic change (as set does); repeatable

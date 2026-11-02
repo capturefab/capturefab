@@ -8,93 +8,137 @@
 //! Y'CbCr planes at the JPEG's subsampling (4:2:0, 4:2:2 or 4:4:4), gray,
 //! or RGB for anything else.
 use crate::types::Frame;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use std::io::BufRead;
 
 /// The largest JPEG read from a source.
 const MAX_JPEG: usize = 64 * 1024 * 1024;
 
-/// The next whole JPEG in `reader`, SOI to EOI; None at the end of the
-/// stream between images. The segments before a scan are skipped by their
-/// lengths, so a thumbnail inside one does not end the image early, and a
-/// scan's entropy-coded data ends at the first marker that is not a
-/// restart.
-pub(super) fn read_jpeg(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
-    // Anything between images, which FFmpeg never writes, is skipped.
-    loop {
-        let available = reader.fill_buf()?;
-        if available.is_empty() {
+/// Cuts the stream of JPEGs FFmpeg writes into whole images.
+#[derive(Default)]
+pub(super) struct Splitter {
+    /// The last image ended at the next one's SOI, which is read already.
+    soi_read: bool,
+}
+impl Splitter {
+    /// The next whole JPEG in `reader`, SOI to EOI; None at the end of the
+    /// stream between images. The segments before a scan are skipped by
+    /// their lengths, so a thumbnail inside one does not end the image
+    /// early, and a scan's entropy-coded data ends at the first marker that
+    /// is not a restart. An image without an EOI, which webcams send and
+    /// FFmpeg's decoder accepts, ends where the next one starts, or at the
+    /// end of the stream after a scan, and is given one. A JPEG that is not
+    /// whole is `Malformed`; the next read starts at the next image.
+    pub(super) fn next(&mut self, reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
+        if !std::mem::take(&mut self.soi_read) && !soi(reader)? {
             return Ok(None);
         }
-        match available.iter().position(|&byte| byte == 0xFF) {
-            Some(at) => {
-                reader.consume(at);
-                break;
-            }
-            None => {
-                let skip = available.len();
-                reader.consume(skip);
-            }
-        }
-    }
-    let mut jpeg = Vec::new();
-    take(reader, &mut jpeg, 2)?;
-    ensure!(
-        jpeg == [0xFF, 0xD8],
-        "FFmpeg sent something other than a JPEG"
-    );
-    // A scan ends having read the 0xFF of the marker after it.
-    let mut scanned = false;
-    loop {
-        match marker(reader, &mut jpeg, std::mem::take(&mut scanned))? {
-            0xD9 => return Ok(Some(jpeg)),
-            // Standalone markers carry no length.
-            0x01 | 0xD0..=0xD7 => {}
-            marker => {
-                take(reader, &mut jpeg, 2)?;
-                let length = u16::from_be_bytes([jpeg[jpeg.len() - 2], jpeg[jpeg.len() - 1]]);
-                ensure!(length >= 2, "malformed JPEG segment");
-                take(reader, &mut jpeg, usize::from(length) - 2)?;
-                if marker == 0xDA {
-                    scan(reader, &mut jpeg)?;
-                    scanned = true;
+        let mut jpeg = vec![0xFF, 0xD8];
+        // A scan ends having read the 0xFF of the marker after it.
+        let mut scanned = false;
+        loop {
+            match marker(reader, &mut jpeg, std::mem::take(&mut scanned))? {
+                0xD9 => return Ok(Some(jpeg)),
+                0xD8 => {
+                    jpeg.truncate(jpeg.len() - 2);
+                    jpeg.extend_from_slice(&[0xFF, 0xD9]);
+                    self.soi_read = true;
+                    return Ok(Some(jpeg));
+                }
+                // Standalone markers carry no length.
+                0x01 | 0xD0..=0xD7 => {}
+                marker => {
+                    take(reader, &mut jpeg, 2)?;
+                    let length = u16::from_be_bytes([jpeg[jpeg.len() - 2], jpeg[jpeg.len() - 1]]);
+                    ensure!(length >= 2, Malformed("malformed JPEG segment"));
+                    take(reader, &mut jpeg, usize::from(length) - 2)?;
+                    if marker == 0xDA {
+                        if !scan(reader, &mut jpeg)? {
+                            jpeg.extend_from_slice(&[0xFF, 0xD9]);
+                            return Ok(Some(jpeg));
+                        }
+                        scanned = true;
+                    }
                 }
             }
         }
     }
 }
 
-/// Append exactly `count` bytes of `reader` to `jpeg`.
-fn take(reader: &mut impl BufRead, jpeg: &mut Vec<u8>, count: usize) -> Result<()> {
-    ensure!(jpeg.len() + count <= MAX_JPEG, "JPEG frame exceeds 64 MiB");
-    let start = jpeg.len();
-    jpeg.resize(start + count, 0);
-    reader
-        .read_exact(&mut jpeg[start..])
-        .context("truncated JPEG frame")
+/// A JPEG in the stream that is not whole or not well formed.
+#[derive(Debug)]
+pub(super) struct Malformed(&'static str);
+impl std::fmt::Display for Malformed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for Malformed {}
+
+/// Take the next SOI; false at the end of the stream. Anything before it,
+/// which FFmpeg writes only after a JPEG that was not whole, is skipped, up
+/// to the size of a JPEG.
+fn soi(reader: &mut impl BufRead) -> Result<bool> {
+    let mut skipped = 0;
+    // The last byte skipped was 0xFF.
+    let mut ff = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(false);
+        }
+        let found = available.iter().position(|&byte| {
+            let soi = ff && byte == 0xD8;
+            ff = byte == 0xFF;
+            soi
+        });
+        let count = found.map_or(available.len(), |at| at + 1);
+        reader.consume(count);
+        if found.is_some() {
+            return Ok(true);
+        }
+        skipped += count;
+        ensure!(
+            skipped <= MAX_JPEG,
+            Malformed("FFmpeg sent something other than JPEGs")
+        );
+    }
 }
 
-/// The next byte, without taking it.
-fn peek(reader: &mut impl BufRead) -> Result<u8> {
-    reader
-        .fill_buf()?
-        .first()
-        .copied()
-        .context("truncated JPEG frame")
+/// Append exactly `count` bytes of `reader` to `jpeg`.
+fn take(reader: &mut impl BufRead, jpeg: &mut Vec<u8>, count: usize) -> Result<()> {
+    ensure!(
+        jpeg.len() + count <= MAX_JPEG,
+        Malformed("JPEG frame exceeds 64 MiB")
+    );
+    let start = jpeg.len();
+    jpeg.resize(start + count, 0);
+    match reader.read_exact(&mut jpeg[start..]) {
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Err(Malformed("truncated JPEG frame").into())
+        }
+        read => Ok(read?),
+    }
+}
+
+/// The next byte, without taking it; None at the end of the stream.
+fn peek(reader: &mut impl BufRead) -> Result<Option<u8>> {
+    Ok(reader.fill_buf()?.first().copied())
 }
 
 /// The next marker's code, appended to `jpeg` with its 0xFF; fill bytes
 /// before it are dropped. `ff_read`: its first 0xFF was taken already.
 fn marker(reader: &mut impl BufRead, jpeg: &mut Vec<u8>, ff_read: bool) -> Result<u8> {
+    let truncated = || Malformed("truncated JPEG frame");
     if !ff_read {
         ensure!(
-            peek(reader)? == 0xFF,
-            "malformed JPEG: a segment does not start with a marker"
+            peek(reader)?.ok_or_else(truncated)? == 0xFF,
+            Malformed("malformed JPEG: a segment does not start with a marker")
         );
         reader.consume(1);
     }
     loop {
-        let code = peek(reader)?;
+        let code = peek(reader)?.ok_or_else(truncated)?;
         reader.consume(1);
         if code != 0xFF {
             jpeg.extend_from_slice(&[0xFF, code]);
@@ -105,26 +149,32 @@ fn marker(reader: &mut impl BufRead, jpeg: &mut Vec<u8>, ff_read: bool) -> Resul
 
 /// Append a scan's entropy-coded data, taking the 0xFF of the marker after
 /// it: 0xFF followed by 0 is a stuffed byte and by D0-D7 a restart marker,
-/// both part of the data.
-fn scan(reader: &mut impl BufRead, jpeg: &mut Vec<u8>) -> Result<()> {
+/// both part of the data. False when the stream ends instead.
+fn scan(reader: &mut impl BufRead, jpeg: &mut Vec<u8>) -> Result<bool> {
     loop {
         let available = reader.fill_buf()?;
-        ensure!(!available.is_empty(), "truncated JPEG frame");
+        if available.is_empty() {
+            return Ok(false);
+        }
         let at = available.iter().position(|&byte| byte == 0xFF);
         let count = at.unwrap_or(available.len());
-        ensure!(jpeg.len() + count <= MAX_JPEG, "JPEG frame exceeds 64 MiB");
+        ensure!(
+            jpeg.len() + count <= MAX_JPEG,
+            Malformed("JPEG frame exceeds 64 MiB")
+        );
         jpeg.extend_from_slice(&available[..count]);
         reader.consume(count);
         if at.is_none() {
             continue;
         }
         reader.consume(1);
-        let next = peek(reader)?;
-        if next == 0 || (0xD0..=0xD7).contains(&next) {
-            jpeg.extend_from_slice(&[0xFF, next]);
-            reader.consume(1);
-        } else {
-            return Ok(());
+        match peek(reader)? {
+            Some(next) if next == 0 || (0xD0..=0xD7).contains(&next) => {
+                jpeg.extend_from_slice(&[0xFF, next]);
+                reader.consume(1);
+            }
+            Some(_) => return Ok(true),
+            None => return Ok(false),
         }
     }
 }
@@ -229,36 +279,81 @@ mod tests {
         jpeg
     }
 
+    /// Every image `stream` holds, read through a buffer of `capacity`
+    /// bytes, and how the read after the last one ended.
+    fn cut(stream: &[u8], capacity: usize) -> (Vec<Vec<u8>>, Result<()>) {
+        let mut reader = BufReader::with_capacity(capacity, stream);
+        let mut splitter = Splitter::default();
+        let mut jpegs = Vec::new();
+        loop {
+            match splitter.next(&mut reader) {
+                Ok(Some(jpeg)) => jpegs.push(jpeg),
+                Ok(None) => return (jpegs, Ok(())),
+                Err(error) => return (jpegs, Err(error)),
+            }
+        }
+    }
+
     #[test]
     fn jpegs_are_cut_from_a_stream_however_it_is_read() {
         let (first, second) = (shaped(0x11), shaped(0x22));
         let stream = [&first[..], &second[..]].concat();
         for capacity in [1, 2, 3, 5, 8, 64, 4096] {
-            let mut reader = BufReader::with_capacity(capacity, &stream[..]);
-            assert_eq!(
-                read_jpeg(&mut reader).unwrap().unwrap(),
-                first,
-                "{capacity}"
-            );
-            assert_eq!(
-                read_jpeg(&mut reader).unwrap().unwrap(),
-                second,
-                "{capacity}"
-            );
-            assert!(read_jpeg(&mut reader).unwrap().is_none());
+            let (jpegs, end) = cut(&stream, capacity);
+            assert_eq!(jpegs, [first.clone(), second.clone()], "{capacity}");
+            end.unwrap();
         }
         // Fill bytes before a marker are dropped; bytes between images are
         // skipped.
         let mut filled = shaped(0x33);
         let eoi = filled.len() - 2;
         filled.insert(eoi, 0xFF);
-        let noisy = [&[0u8, 1, 2][..], &filled].concat();
-        let mut reader = BufReader::with_capacity(3, &noisy[..]);
-        assert_eq!(read_jpeg(&mut reader).unwrap().unwrap(), shaped(0x33));
-        // A stream that ends inside an image, or holds something else.
-        let cut = &first[..first.len() - 3];
-        assert!(read_jpeg(&mut BufReader::new(cut)).is_err());
-        assert!(read_jpeg(&mut BufReader::new(&[0xFF, 0x00, 1][..])).is_err());
+        let noisy = [&[0u8, 0xFF, 2][..], &filled, &[0xFF, 0x00, 1]].concat();
+        let (jpegs, end) = cut(&noisy, 3);
+        assert_eq!(jpegs, [shaped(0x33)]);
+        end.unwrap();
+        // A stream that ends inside an image's segments.
+        let (jpegs, end) = cut(&first[..20], 4096);
+        assert!(jpegs.is_empty());
+        assert!(end.unwrap_err().is::<Malformed>());
+    }
+
+    #[test]
+    fn a_jpeg_without_an_eoi_ends_where_the_next_starts() {
+        let (first, second, third) = (shaped(0x11), shaped(0x22), shaped(0x33));
+        let open = |jpeg: &[u8]| jpeg[..jpeg.len() - 2].to_vec();
+        // Its scan runs into the next image's SOI, or to the end of the
+        // stream, possibly through the 0xFF of a marker it lacks the rest of.
+        let stream = [&first[..], &open(&second), &third, &open(&first)].concat();
+        let ended = [&open(&second)[..], &[0xFF]].concat();
+        for capacity in [1, 2, 3, 5, 64, 4096] {
+            let (jpegs, end) = cut(&stream, capacity);
+            assert_eq!(
+                jpegs,
+                [first.clone(), second.clone(), third.clone(), first.clone()],
+                "{capacity}"
+            );
+            end.unwrap();
+            let (jpegs, end) = cut(&ended, capacity);
+            assert_eq!(jpegs, std::slice::from_ref(&second), "{capacity}");
+            end.unwrap();
+        }
+        // An image cut short between its segments ends there too.
+        let stream = [&first[..18], &second].concat();
+        let (jpegs, end) = cut(&stream, 4096);
+        assert_eq!(
+            jpegs,
+            [[&first[..18], &[0xFF, 0xD9]].concat(), second.clone()]
+        );
+        end.unwrap();
+        // One that is not well formed fails, and the stream goes on at the
+        // next image.
+        let stream = [&[0xFF, 0xD8, 0x12, 0x34][..], &second].concat();
+        let mut reader = BufReader::new(&stream[..]);
+        let mut splitter = Splitter::default();
+        assert!(splitter.next(&mut reader).unwrap_err().is::<Malformed>());
+        assert_eq!(splitter.next(&mut reader).unwrap().unwrap(), second);
+        assert!(splitter.next(&mut reader).unwrap().is_none());
     }
 
     #[test]
