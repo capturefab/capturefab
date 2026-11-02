@@ -2633,6 +2633,7 @@ impl Assembler {
             device_ts_ns,
             wall_ms: 0,
             data: data.freeze(),
+            jpeg: None,
         });
     }
 }

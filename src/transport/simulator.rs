@@ -1172,6 +1172,7 @@ impl Simulator {
             ),
             wall_ms: 0,
             data: data.freeze(),
+            jpeg: None,
         }
     }
 }

@@ -131,6 +131,9 @@ JPEG stills of color frames go to Apple's JPEG engine on macOS where it is faste
 as libjpeg-turbo (checked beside the first frame of each size and format, which libjpeg-turbo
 writes; frames under 512K pixels, monochrome frames and `--quality` other than 90 stay on
 libjpeg-turbo); `CAPTUREFAB_JPEG` chooses.
+A Motion JPEG webcam, stream or file is read as the JPEGs it sends, decoded with libjpeg-turbo:
+a JPEG still of it without `--quality` is that JPEG as it was, with the provenance comment
+(`"passthrough": true`).
 `record --codec ffv1` of a Bayer camera stores the mosaic itself, losslessly, as 8- or 16-bit
 gray, which players show in gray. `record` of an H.264 or HEVC stream, file or webcam mode copies
 its video as it arrives (`"encoder":"copy"`, in the source's codec), starting at its last key

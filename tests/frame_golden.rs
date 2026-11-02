@@ -187,6 +187,7 @@ fn frame_case(
         device_ts_ns: Some(99),
         wall_ms: 0,
         data: data.into(),
+        jpeg: None,
     };
     // Large frames skip the corner and quad-phase regions; small ones cover them.
     let small = width <= 64;
@@ -470,6 +471,7 @@ fn pngs() -> Vec<Value> {
             device_ts_ns: None,
             wall_ms: 0,
             data: generate(&generator, format, width, height).into(),
+            jpeg: None,
         };
         let bytes = frame::encode_with_meta(&frame, "png", meta).unwrap();
         // Decoded through the png crate: the pixels a viewer sees.
@@ -496,6 +498,7 @@ fn pngs() -> Vec<Value> {
         device_ts_ns: None,
         wall_ms: 0,
         data: vec![1, 2].into(),
+        jpeg: None,
     };
     cases.push(json!({
         "pixel_format": MONO8,

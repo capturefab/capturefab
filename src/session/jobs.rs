@@ -65,6 +65,10 @@ impl From<JobStatus> for JobState {
     }
 }
 
+fn is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
 /// One job, as the session follows it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Job {
@@ -83,6 +87,9 @@ pub(crate) struct Job {
     /// The first files saved, in order; `saved` counts them all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// Files that are the JPEG the source sent, as it was.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub passed_through: u64,
     pub started_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ended_ms: Option<u64>,
@@ -173,6 +180,9 @@ impl Job {
         detail["files"] = json!(self.files);
         if self.saved > self.files.len() as u64 {
             detail["truncated"] = json!(self.saved - self.files.len() as u64);
+        }
+        if self.saved > 0 && self.passed_through == self.saved {
+            detail["passthrough"] = json!(true);
         }
         // The whole error, with its hint and details, which the document
         // leaves out.
@@ -347,6 +357,7 @@ impl JobBook {
             bytes: None,
             last_file: None,
             files: Vec::new(),
+            passed_through: 0,
             started_ms: crate::scheduling::now_ms(),
             ended_ms: None,
             error: None,
@@ -402,6 +413,15 @@ impl JobBook {
                     return;
                 };
                 job.saved += 1;
+                if matches!(
+                    file.item,
+                    crate::engine::saved::SavedItem::Capture {
+                        passthrough: true,
+                        ..
+                    }
+                ) {
+                    job.passed_through += 1;
+                }
                 if job.files.len() < crate::scheduling::MAX_JOB_FILES {
                     job.files.push(file.path.clone());
                 }

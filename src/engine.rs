@@ -1293,11 +1293,13 @@ fn save_sidecar(
     Ok(())
 }
 /// A published image, as its `saved` line reports it.
+#[allow(clippy::too_many_arguments)]
 fn image_file(
     path: &std::path::Path,
     stored: &crate::storage::Stored,
     frame: &Frame,
     format: &str,
+    passthrough: bool,
     wall_ms: u64,
     job_id: Option<u64>,
     context: &crate::context::Context,
@@ -1322,6 +1324,7 @@ fn image_file(
             }
             .into(),
             job_id,
+            passthrough,
         },
     }
 }
@@ -2183,6 +2186,9 @@ fn process_plain(
                     let image = crate::frame::encode_parts(&frame, &format, quality, None)?;
                     h.write_stdout(stdout.as_deref(), &image)?;
                     metadata["file_bytes"] = json!(image.len());
+                    if image.passthrough() {
+                        metadata["passthrough"] = json!(true);
+                    }
                 }
                 if let Some(first) = first {
                     let meta = still_meta(&frame, wall_ms, &settings, &context);
@@ -2201,11 +2207,22 @@ fn process_plain(
                     }
                     folders.add(&path);
                     let file = path.to_string_lossy().into_owned();
-                    let saved =
-                        image_file(&path, &stored, &frame, &format, wall_ms, None, &context);
+                    let saved = image_file(
+                        &path,
+                        &stored,
+                        &frame,
+                        &format,
+                        bytes.passthrough(),
+                        wall_ms,
+                        None,
+                        &context,
+                    );
                     h.push_saved(None, saved);
                     metadata["file"] = json!(file);
                     metadata["file_bytes"] = json!(bytes.len());
+                    if bytes.passthrough() {
+                        metadata["passthrough"] = json!(true);
+                    }
                     files.push(file);
                 }
                 let mut value = json!({"files":files,"frame":metadata,"count":1});
@@ -4832,6 +4849,7 @@ mod tests {
                     format: "raw".into(),
                     origin: "schedule".into(),
                     job_id: Some(save.job),
+                    passthrough: false,
                 },
             },
             line: None,
@@ -4871,6 +4889,7 @@ mod tests {
             device_ts_ns: Some(id),
             wall_ms: 0,
             data: vec![id as u8; 64].into(),
+            jpeg: None,
         }
     }
     /// Offer `frame` to the jobs due, as the camera thread does.
@@ -5667,6 +5686,7 @@ mod tests {
             device_ts_ns: Some(9),
             wall_ms: 0,
             data: vec![0, 0].into(),
+            jpeg: None,
         };
         let context = crate::context::Context::from([("part".into(), "B-7".into())]);
         let meta = still_meta(&frame, 11, &acquired, &context);

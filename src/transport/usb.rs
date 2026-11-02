@@ -1255,6 +1255,7 @@ fn parse_leader(bytes: &[u8]) -> Result<Frame> {
         device_ts_ns: Some(le64(bytes, 20)?),
         wall_ms: 0,
         data: Vec::new().into(),
+        jpeg: None,
     })
 }
 fn validate_trailer(bytes: &[u8], frame: &Frame, expected: usize) -> Result<()> {

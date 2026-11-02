@@ -235,6 +235,7 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
         device_ts_ns: None,
         wall_ms: 0,
         data: data.into(),
+        jpeg: None,
     }
 }
 

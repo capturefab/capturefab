@@ -195,6 +195,7 @@ pub(super) fn read_frame(
         device_ts_ns: None,
         wall_ms: 0,
         data: data.freeze(),
+        jpeg: None,
     })
 }
 

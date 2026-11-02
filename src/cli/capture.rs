@@ -885,6 +885,9 @@ fn result(job: &Value, detail: &Value, format: &str) -> Value {
     if let Some(truncated) = detail["truncated"].as_u64() {
         value["truncated"] = json!(truncated);
     }
+    if detail["passthrough"] == true {
+        value["passthrough"] = json!(true);
+    }
     freshness(&mut value, detail);
     crate::types::without_nulls(value)
 }
@@ -1154,6 +1157,7 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         "dropped": reply["dropped"],
         "incomplete": reply["incomplete"],
         "resent": reply["resent"],
+        "passthrough": meta["passthrough"],
     }));
     freshness(&mut value, &reply);
     // The image owns stdout; the result goes to stderr in one write.
@@ -1320,6 +1324,10 @@ pub const FIELDS: &[(&str, &str)] = &[
         "{exposure,verdict,suggest?,focus?,preview?} — with --inspect: the last frame measured as inspect measures it",
     ),
     ("duration_s", "float — first to last frame, for several"),
+    (
+        "passthrough",
+        "true — the JPEG files are the ones the source sent (an MJPEG webcam, stream or file), as they were, with the provenance comment: not decoded and encoded again",
+    ),
     ("output", "\"-\" — with -o -: the image went to stdout"),
     ("bytes", "int — with -o -: the image's size"),
     (

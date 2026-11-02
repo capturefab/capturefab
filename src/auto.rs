@@ -2143,6 +2143,7 @@ mod tests {
             device_ts_ns: None,
             wall_ms: 0,
             data: data.into(),
+            jpeg: None,
         }
     }
     fn near(a: f64, b: f64) -> bool {

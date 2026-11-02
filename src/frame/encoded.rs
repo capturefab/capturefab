@@ -84,11 +84,17 @@ impl From<Vec<u8>> for Body<'_> {
 pub struct Encoded<'a> {
     body: Body<'a>,
     insert: Option<(usize, Vec<u8>)>,
+    /// The body is the JPEG the source sent the frame as.
+    passthrough: bool,
 }
 
 impl<'a> Encoded<'a> {
     pub(crate) fn new(body: Body<'a>) -> Self {
-        Self { body, insert: None }
+        Self {
+            body,
+            insert: None,
+            passthrough: false,
+        }
     }
     /// `bytes` placed before the body's byte at `at`, which must lie within
     /// the body.
@@ -97,7 +103,18 @@ impl<'a> Encoded<'a> {
         Self {
             body,
             insert: Some((at, bytes)),
+            passthrough: false,
         }
+    }
+    /// Its body is the JPEG the source sent, not an encoding of the frame.
+    pub(crate) fn passed_through(self) -> Self {
+        Self {
+            passthrough: true,
+            ..self
+        }
+    }
+    pub fn passthrough(&self) -> bool {
+        self.passthrough
     }
     pub fn len(&self) -> usize {
         self.body.len() + self.insert.as_ref().map_or(0, |(_, bytes)| bytes.len())

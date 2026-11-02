@@ -412,6 +412,7 @@
     "jobs": "[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with --background and -c repeated",
     "last_id": "int — a burst's last frame's block ID",
     "output": "\"-\" — with -o -: the image went to stdout",
+    "passthrough": "true — the JPEG files are the ones the source sent (an MJPEG webcam, stream or file), as they were, with the provenance comment: not decoded and encoded again",
     "pixel_format": "string — the camera's PFNC format",
     "resent": "int — packets the camera sent again, where the transport counts them",
     "settings": "{exposure_us?,auto_exposure?,gain_db?,gain?,auto_gain?,auto_wb?,fps?,trigger?,black_level?,gamma?,binning?,offset_x?,offset_y?,reverse_x?,reverse_y?} — the camera's settings when the first frame was taken, as the camera has them; trigger: off, or its source (software, line0)",

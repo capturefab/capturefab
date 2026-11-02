@@ -635,6 +635,7 @@ pub(super) fn unpacked(frame: &Frame) -> Result<Option<Frame>> {
     Ok(Some(Frame {
         data: data.into(),
         pixel_format: if mono { MONO8 } else { RGB8 },
+        jpeg: None,
         ..*frame
     }))
 }

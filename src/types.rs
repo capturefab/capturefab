@@ -52,6 +52,11 @@ pub struct Frame {
     /// The pixels, shared by every clone of the frame.
     #[serde(skip)]
     pub data: crate::framebuf::FrameBuf,
+    /// The JPEG the source sent the frame as (an MJPEG webcam, stream or
+    /// file), whose decoding `data` is: a JPEG still of the frame is this,
+    /// rather than a new encoding. A frame made from another never has it.
+    #[serde(skip)]
+    pub jpeg: Option<crate::framebuf::FrameBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

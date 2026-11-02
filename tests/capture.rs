@@ -1153,3 +1153,65 @@ fn progress_lines_say_how_far_a_capture_is() {
     assert_eq!(waited.success()["job"]["state"], "done");
     assert!(!progress(&waited.stderr).is_empty(), "{}", waited.stderr);
 }
+
+/// A JPEG still of a Motion JPEG source is the JPEG it sent, as it was,
+/// with the provenance comment; another quality encodes the frame again,
+/// and the frame still decodes for inspection and other formats.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn jpeg_stills_of_motion_jpeg_sources_are_their_jpegs() {
+    let home = Home::new("capture-passthrough");
+    // A Motion JPEG file made of the simulator's JPEGs, copied into Matroska.
+    home.ok(&["capture", "-c", "sim:0", "-n", "5", "-o", "src-{seq}.jpg"]);
+    let jpegs: Vec<Vec<u8>> = (1..=5)
+        .map(|n| std::fs::read(home.path(&format!("src-{n:04}.jpg"))).unwrap())
+        .collect();
+    std::fs::write(home.path("clip.mjpeg"), jpegs.concat()).unwrap();
+    let made = std::process::Command::new(support::cli::ffmpeg())
+        .args(["-v", "error", "-f", "mjpeg", "-framerate", "5", "-i"])
+        .arg(home.path("clip.mjpeg"))
+        .args(["-c:v", "copy"])
+        .arg(home.path("clip.mkv"))
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let still = home.ok(&["capture", "-c", "clip.mkv", "-o", "still.jpg"]);
+    assert_eq!(still["passthrough"], true, "{still}");
+    let file = std::fs::read(home.path("still.jpg")).unwrap();
+    // The source's JPEG with Capturefab's comment after its JFIF header.
+    let comment = file.windows(2).position(|w| w == [0xFF, 0xFE]).unwrap();
+    let length = usize::from(u16::from_be_bytes([file[comment + 2], file[comment + 3]]));
+    let json: Value = serde_json::from_slice(&file[comment + 4..comment + 2 + length]).unwrap();
+    assert_eq!(json["capturefab"], env!("CARGO_PKG_VERSION"), "{json}");
+    let without = [&file[..comment], &file[comment + 2 + length..]].concat();
+    assert!(jpegs.contains(&without), "the still is not a source JPEG");
+    let encoded = home.ok(&[
+        "capture",
+        "-c",
+        "clip.mkv",
+        "-o",
+        "q80.jpg",
+        "--quality",
+        "80",
+    ]);
+    assert!(encoded.get("passthrough").is_none(), "{encoded}");
+    let png = home.ok(&["capture", "-c", "clip.mkv", "-o", "still.png"]);
+    assert!(png.get("passthrough").is_none(), "{png}");
+    let inspected = home.ok(&["inspect", "-c", "clip.mkv"]);
+    assert!(
+        inspected["exposure"]["mean"].as_f64().unwrap() > 0.0,
+        "{inspected}"
+    );
+    // To stdout, too.
+    let out = home.run(&[
+        "--json", "capture", "-c", "clip.mkv", "-o", "-", "-f", "jpg",
+    ]);
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    let result: Value = serde_json::from_str(out.stderr.lines().last().unwrap()).unwrap();
+    assert_eq!(result["passthrough"], true, "{result}");
+    assert_eq!(&out.raw[..2], [0xFF, 0xD8]);
+}

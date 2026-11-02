@@ -181,6 +181,7 @@ pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
             height,
             pixel_format,
             data: data.into(),
+            jpeg: None,
             ..*frame
         });
     }
@@ -203,6 +204,7 @@ pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
         width,
         height,
         data: data.into(),
+        jpeg: None,
         ..*frame
     })
 }
@@ -819,6 +821,7 @@ mod tests {
             device_ts_ns: Some(99),
             wall_ms: 0,
             data: data.into(),
+            jpeg: None,
         }
     }
     /// A horizontal ramp from black to white with vertical bars, so it has

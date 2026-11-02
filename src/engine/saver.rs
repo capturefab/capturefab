@@ -408,6 +408,7 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
         &stored,
         &shot.frame,
         &save.format,
+        bytes.passthrough(),
         shot.wall_ms,
         Some(save.job),
         &save.context,

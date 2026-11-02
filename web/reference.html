@@ -280,6 +280,7 @@ capturefab capture -c sim:0 -o - &gt; frame.png</code></pre><button class="copy-
 <tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — with --background and -c repeated</td></tr>
 <tr><td><code>last_id</code></td><td>int — a burst&#x27;s last frame&#x27;s block ID</td></tr>
 <tr><td><code>output</code></td><td>&quot;-&quot; — with -o -: the image went to stdout</td></tr>
+<tr><td><code>passthrough</code></td><td>true — the JPEG files are the ones the source sent (an MJPEG webcam, stream or file), as they were, with the provenance comment: not decoded and encoded again</td></tr>
 <tr><td><code>pixel_format</code></td><td>string — the camera&#x27;s PFNC format</td></tr>
 <tr><td><code>resent</code></td><td>int — packets the camera sent again, where the transport counts them</td></tr>
 <tr><td><code>settings</code></td><td>{exposure_us?,auto_exposure?,gain_db?,gain?,auto_gain?,auto_wb?,fps?,trigger?,black_level?,gamma?,binning?,offset_x?,offset_y?,reverse_x?,reverse_y?} — the camera&#x27;s settings when the first frame was taken, as the camera has them; trigger: off, or its source (software, line0)</td></tr>

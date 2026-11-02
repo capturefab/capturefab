@@ -5,6 +5,8 @@
 mod bundled;
 pub mod copy;
 pub(crate) mod hwdec;
+#[cfg(feature = "jpeg")]
+mod mjpeg;
 mod native;
 #[cfg(any(test, target_os = "linux"))]
 mod v4l2;
@@ -1000,6 +1002,9 @@ struct Decoded {
     error: Option<String>,
     /// Why the frames must be asked for as RGB instead (`NeedsRgb`).
     needs_rgb: Option<String>,
+    /// Why the source's JPEGs must be decoded by FFmpeg instead
+    /// (`NeedsDecoding`).
+    needs_decoding: Option<String>,
 }
 /// What frames a decoder asks FFmpeg for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1008,6 +1013,9 @@ enum Output {
     Rgb,
     /// The decoder's own pixel format, as raw video (`native`).
     Native,
+    /// A Motion JPEG source's own JPEGs, copied as they arrive and decoded
+    /// here, each frame keeping its JPEG (`mjpeg`).
+    Jpeg,
 }
 /// FFmpeg would decode the source to frames Capturefab does not carry as
 /// they are, or did not say what it writes: the source is opened again
@@ -1020,6 +1028,15 @@ impl std::fmt::Display for NeedsRgb {
     }
 }
 impl std::error::Error for NeedsRgb {}
+/// The source's JPEGs did not decode here: FFmpeg decodes them instead.
+#[derive(Debug)]
+struct NeedsDecoding(String);
+impl std::fmt::Display for NeedsDecoding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for NeedsDecoding {}
 /// The decoder has exited: every later read fails the same way until the
 /// source is opened again. The engine counts it as a transport error even when
 /// FFmpeg's reason mentions a timeout.
@@ -1063,6 +1080,8 @@ struct Decoder {
     status: Option<std::process::ExitStatus>,
     /// Its first frame has been looked at (`MediaBackend::observe`).
     observed: bool,
+    /// What it asked FFmpeg for.
+    output: Output,
 }
 fn ppm_token(reader: &mut impl BufRead) -> Result<Vec<u8>> {
     let mut token = Vec::new();
@@ -1127,7 +1146,68 @@ fn read_ppm(
         device_ts_ns: None,
         wall_ms: 0,
         data: data.freeze(),
+        jpeg: None,
     })
+}
+/// Frames from a Motion JPEG source's own JPEGs (`Output::Jpeg`). A JPEG
+/// that does not decode is skipped; a source none of whose first JPEGs
+/// decode goes back to FFmpeg's decoder (`NeedsDecoding`).
+#[derive(Default)]
+struct JpegReader {
+    #[cfg(feature = "jpeg")]
+    decompressor: Option<turbojpeg::Decompressor>,
+    #[cfg(feature = "jpeg")]
+    delivered: bool,
+}
+impl JpegReader {
+    /// How many JPEGs in a row may fail to decode before a source that
+    /// delivered none goes back to FFmpeg, and one that did ends.
+    #[cfg(feature = "jpeg")]
+    const FAILURES: [u32; 2] = [3, 30];
+    fn next(
+        &mut self,
+        reader: &mut impl BufRead,
+        id: u64,
+        pool: &crate::framebuf::FramePool,
+    ) -> Result<Frame> {
+        #[cfg(feature = "jpeg")]
+        {
+            let decompressor = match &mut self.decompressor {
+                Some(decompressor) => decompressor,
+                None => self.decompressor.insert(
+                    turbojpeg::Decompressor::new()
+                        .map_err(|error| NeedsDecoding(format!("libjpeg-turbo: {error}")))?,
+                ),
+            };
+            let mut failures = 0;
+            loop {
+                let jpeg = mjpeg::read_jpeg(reader)?.context("media stream ended")?;
+                match mjpeg::decode(decompressor, jpeg, id, pool) {
+                    Ok(frame) => {
+                        self.delivered = true;
+                        return Ok(frame);
+                    }
+                    Err(error) => {
+                        failures += 1;
+                        if failures >= Self::FAILURES[usize::from(self.delivered)] {
+                            if self.delivered {
+                                return Err(error.context("the source's JPEGs stopped decoding"));
+                            }
+                            return Err(NeedsDecoding(format!(
+                                "its JPEGs do not decode here ({error:#}); FFmpeg decodes them"
+                            ))
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "jpeg"))]
+        {
+            let _ = (reader, id, pool);
+            Err(NeedsDecoding("this build has no JPEG decoder".into()).into())
+        }
+    }
 }
 impl Decoder {
     #[cfg(test)]
@@ -1164,8 +1244,9 @@ impl Decoder {
         cmd.args(["-nostdin", "-hide_banner"]);
         cmd.args(match output {
             Output::Rgb => &["-loglevel", "error"][..],
-            // The output's description is an info line (`native`).
-            Output::Native => &["-loglevel", "level+info", "-nostats"],
+            // The output's description is an info line (`native`), and the
+            // input's says what a source sends.
+            Output::Native | Output::Jpeg => &["-loglevel", "level+info", "-nostats"],
         });
         if !options.iter().any(|option| option == "-threads") {
             cmd.args(["-threads", &decoder_threads(cores()).to_string()]);
@@ -1216,6 +1297,7 @@ impl Decoder {
                 "-f",
                 "rawvideo",
             ]),
+            Output::Jpeg => cmd.args(["-c:v", "copy", "-f", "mjpeg"]),
         };
         // One packet per frame, written to the pipe as it is rather than
         // through FFmpeg's I/O buffer.
@@ -1246,13 +1328,14 @@ impl Decoder {
         let stderr = child.stderr.take().unwrap();
         let log_thread = match output {
             Output::Rgb => log.collect(stderr),
-            Output::Native => log.collect_lines(stderr),
+            Output::Native | Output::Jpeg => log.collect_lines(stderr),
         };
         let queue = Arc::new(DecoderQueue {
             state: Mutex::new(Decoded {
                 frames: VecDeque::new(),
                 error: None,
                 needs_rgb: None,
+                needs_decoding: None,
             }),
             changed: Condvar::new(),
             stopped: AtomicBool::new(false),
@@ -1264,7 +1347,7 @@ impl Decoder {
             let mut reader = BufReader::new(stdout);
             // Raw video is read at the size and format FFmpeg described.
             let native = match output {
-                Output::Rgb => None,
+                Output::Rgb | Output::Jpeg => None,
                 Output::Native => {
                     let fail = |error: Option<String>, needs_rgb: Option<String>| {
                         let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1295,6 +1378,7 @@ impl Decoder {
                 }
             };
             let mut id = 0;
+            let mut jpegs = JpegReader::default();
             while !shared.stopped.load(Ordering::Relaxed) {
                 id += 1;
                 let pool = crate::framebuf::pool();
@@ -1302,6 +1386,15 @@ impl Decoder {
                     Some((described, format)) => {
                         native::read_frame(&mut reader, id, *format, described, pool)
                     }
+                    None if output == Output::Jpeg => match jpegs.next(&mut reader, id, pool) {
+                        Err(error) if error.is::<NeedsDecoding>() => {
+                            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                            state.needs_decoding = Some(format!("{error:#}"));
+                            shared.changed.notify_all();
+                            break;
+                        }
+                        result => result,
+                    },
                     None => read_ppm(&mut reader, id, pool),
                 };
                 // Stamp a frame when it has arrived, not when it is taken.
@@ -1351,6 +1444,7 @@ impl Decoder {
             failure: None,
             status: None,
             observed: false,
+            output,
         })
     }
     /// The input video FFmpeg said it reads and the format it said it
@@ -1379,6 +1473,9 @@ impl Decoder {
             }
             if let Some(reason) = state.needs_rgb.clone() {
                 return Err(NeedsRgb(reason).into());
+            }
+            if let Some(reason) = state.needs_decoding.clone() {
+                return Err(NeedsDecoding(reason).into());
             }
             if let Some(error) = state.error.clone() {
                 drop(state);
@@ -2487,6 +2584,9 @@ struct MediaBackend {
     software: bool,
     /// The video FFmpeg last said the source has.
     known: Option<native::Input>,
+    /// A Motion JPEG source is read as its own JPEGs (`Output::Jpeg`) until
+    /// they turn out not to decode here.
+    passthrough: bool,
     /// The source's video as it arrives, for a recording that copies it:
     /// every FFmpeg it starts copies it here until the camera stops with no
     /// recording attached.
@@ -2609,6 +2709,11 @@ impl MediaBackend {
                 // A stream that came back decoding to another format.
                 if self.output == Output::Native && error.chain().any(|c| c.is::<NeedsRgb>()) {
                     self.output = Output::Rgb;
+                    self.decoder = Some(self.spawn()?);
+                    continue;
+                }
+                if error.chain().any(|c| c.is::<NeedsDecoding>()) {
+                    self.passthrough = false;
                     self.decoder = Some(self.spawn()?);
                     continue;
                 }
@@ -2847,9 +2952,27 @@ impl MediaBackend {
             self.timeout,
             &options,
             &[],
-            self.output,
+            self.launch_output(),
             self.tap.as_ref(),
         )
+    }
+    /// What a launch asks FFmpeg for: a Motion JPEG source's own JPEGs
+    /// while they decode here, else `output`.
+    fn launch_output(&self) -> Output {
+        if self.output == Output::Native && self.passthrough && self.codec() == Some("mjpeg") {
+            Output::Jpeg
+        } else {
+            self.output
+        }
+    }
+    /// The source's JPEGs do not decode here: FFmpeg decodes them from now
+    /// on.
+    fn needs_decoding(&mut self, error: &anyhow::Error) -> bool {
+        let needs = error.chain().any(|cause| cause.is::<NeedsDecoding>());
+        if needs {
+            self.passthrough = false;
+        }
+        needs
     }
     /// The tap a recording copies the source from, when its codec is one
     /// `wanted` takes for a recording in `codec`: a decoder that does not
@@ -2898,7 +3021,7 @@ impl MediaBackend {
     /// compressed stream or file, or a webcam in a compressed mode, whose
     /// frames are read as decoded.
     fn hwdec_source(&self) -> Option<hwdec::Source> {
-        if self.output != Output::Native || self.software {
+        if self.launch_output() != Output::Native || self.software {
             return None;
         }
         if self.native {
@@ -2958,7 +3081,7 @@ impl MediaBackend {
         };
         let mut first = decoder.next(timeout);
         if let Err(error) = &first
-            && self.needs_rgb(error)
+            && (self.needs_rgb(error) || self.needs_decoding(error))
         {
             decoder.stop();
             decoder = self.spawn()?;
@@ -2989,6 +3112,20 @@ impl MediaBackend {
             decoder.observed = true;
             let facts = decoder.facts();
             self.observe(facts);
+            // A stream or file found to be Motion JPEG is read again as its
+            // own JPEGs, once.
+            if decoder.output != Output::Jpeg && self.launch_output() == Output::Jpeg {
+                decoder.stop();
+                decoder = self.spawn()?;
+                first = decoder.next(timeout);
+                if let Err(error) = &first
+                    && self.needs_decoding(error)
+                {
+                    decoder.stop();
+                    decoder = self.spawn()?;
+                    first = decoder.next(timeout);
+                }
+            }
         }
         let first = if self.native {
             first.map_err(|error| {
@@ -3163,6 +3300,7 @@ fn open_source(source: &str, timeout: Duration) -> Result<Box<dyn Backend>> {
         hwdec: None,
         software: false,
         known: None,
+        passthrough: cfg!(feature = "jpeg"),
         tap: None,
     };
     if let Some(options) = options {
@@ -6850,6 +6988,7 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
             device_ts_ns: None,
             wall_ms: 0,
             data: vec![7; (width * height * 3) as usize].into(),
+            jpeg: None,
         }
     }
     #[cfg(unix)]
@@ -7428,6 +7567,7 @@ esac"#
             device_ts_ns: None,
             wall_ms: 0,
             data: (1..=9).collect(),
+            jpeg: None,
         };
         // Luma plane, then 2x2 U and V planes for odd dimensions.
         let i420 = JetsonInput::I420.bytes(&gray).unwrap();
@@ -7474,6 +7614,7 @@ esac"#
             device_ts_ns: None,
             wall_ms: 0,
             data,
+            jpeg: None,
         };
         let le =
             |samples: &[u16]| -> Vec<u8> { samples.iter().flat_map(|v| v.to_le_bytes()).collect() };
@@ -8138,6 +8279,7 @@ esac"#
                 device_ts_ns: None,
                 wall_ms: 0,
                 data,
+                jpeg: None,
             };
             let padded = raw.bytes(frame(3, 2, (1..=13).collect())).unwrap();
             assert_eq!(
@@ -8163,6 +8305,7 @@ esac"#
             device_ts_ns: None,
             wall_ms: 0,
             data: vec![1, 2, 3].into(),
+            jpeg: None,
         };
         assert_eq!(mono.bytes(odd).unwrap(), [1, 2, 3]);
     }
@@ -8194,6 +8337,7 @@ esac"#
                 device_ts_ns: None,
                 wall_ms: 0,
                 data: data.into(),
+                jpeg: None,
             };
             let expected = crate::frame::rgb(&frame).unwrap();
             let mut child = command(&exe)
@@ -8351,6 +8495,7 @@ esac"#
                 device_ts_ns: None,
                 wall_ms: 0,
                 data: data.into(),
+                jpeg: None,
             };
             let expected = crate::frame::rgb(&frame).unwrap();
             let mut child = command(&exe)
@@ -8688,6 +8833,152 @@ esac"#
             .filter(|line| !line.starts_with('#'))
             .map(|line| line.rsplit(',').next().unwrap().trim().to_owned())
             .collect()
+    }
+    /// JPEGs of a gradient that moves with `index`, 4:2:2 as webcams send.
+    #[cfg(feature = "jpeg")]
+    fn moving_jpeg(width: usize, height: usize, index: usize) -> Vec<u8> {
+        let pixels: Vec<u8> = (0..width * height * 3)
+            .map(|i| {
+                let (pixel, channel) = (i / 3, i % 3);
+                ((pixel % width + index * 4) * (channel + 1) + pixel / width) as u8
+            })
+            .collect();
+        turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: &pixels[..],
+                width,
+                pitch: width * 3,
+                height,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            90,
+            turbojpeg::Subsamp::Sub2x1,
+        )
+        .unwrap()
+        .to_vec()
+    }
+    /// A Motion JPEG file, and a Motion JPEG stream over HTTP, are read as
+    /// their own JPEGs: each frame keeps the one it was decoded from, and
+    /// decodes as FFmpeg decodes it.
+    #[test]
+    #[cfg(feature = "jpeg")]
+    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
+    fn ffmpeg_motion_jpeg_frames_keep_their_jpegs() {
+        let exe = executable().unwrap();
+        let dir = temp_dir("mjpeg");
+        let jpegs: Vec<Vec<u8>> = (0..30).map(|i| moving_jpeg(320, 240, i)).collect();
+        let raw = dir.join("clip.mjpeg");
+        fs::write(&raw, jpegs.concat()).unwrap();
+        let clip = dir.join("clip.mkv");
+        let (made, log) = bounded_output(
+            &exe,
+            &[
+                "-nostdin",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "mjpeg",
+                "-framerate",
+                "30",
+                "-i",
+                raw.to_str().unwrap(),
+                "-c:v",
+                "copy",
+                clip.to_str().unwrap(),
+            ]
+            .map(str::to_owned),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(made, "{log}");
+        let mut camera = open_url(clip.to_str().unwrap(), Duration::from_secs(5)).unwrap();
+        camera.write_memory(32, &0u32.to_le_bytes()).unwrap();
+        camera.start(0).unwrap();
+        for (index, jpeg) in jpegs.iter().enumerate().take(10) {
+            let frame = camera.next_frame(Duration::from_secs(3)).unwrap();
+            assert_eq!(frame.jpeg.as_deref(), Some(&jpeg[..]), "frame {index}");
+            assert_eq!(
+                crate::frame::pixel_format_name(frame.pixel_format),
+                "YCbCr422_8_Planar"
+            );
+        }
+        camera.stop().unwrap();
+        // FFmpeg's own decoding of the same JPEGs, as planes.
+        let decoded = command(&exe)
+            .args(["-v", "error", "-i"])
+            .arg(&clip)
+            .args([
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv422p",
+                "-",
+            ])
+            .output()
+            .unwrap();
+        let mut camera = open_url(clip.to_str().unwrap(), Duration::from_secs(5)).unwrap();
+        camera.start(0).unwrap();
+        let frame = camera.next_frame(Duration::from_secs(3)).unwrap();
+        camera.stop().unwrap();
+        assert_eq!(frame.data.len(), decoded.stdout.len());
+        let worst = frame
+            .data
+            .iter()
+            .zip(&decoded.stdout)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(worst <= 2, "differs from FFmpeg's decoding by {worst}");
+        // A live stream over HTTP, found to be Motion JPEG once opened.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = jpegs.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let served = served.clone();
+                thread::spawn(move || {
+                    let mut request = [0; 4096];
+                    let _ = stream.read(&mut request);
+                    let header = "HTTP/1.0 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n";
+                    if stream.write_all(header.as_bytes()).is_err() {
+                        return;
+                    }
+                    for jpeg in served.iter().cycle() {
+                        let part = format!(
+                            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                            jpeg.len()
+                        );
+                        if stream.write_all(part.as_bytes()).is_err()
+                            || stream.write_all(jpeg).is_err()
+                            || stream.write_all(b"\r\n").is_err()
+                        {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(33));
+                    }
+                });
+            }
+        });
+        let opened = Instant::now();
+        let mut camera = open_url(
+            &format!("http://127.0.0.1:{port}/video"),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        camera.start(0).unwrap();
+        let frame = camera.next_frame(Duration::from_secs(3)).unwrap();
+        println!("HTTP Motion JPEG: first frame after {:?}", opened.elapsed());
+        assert!(
+            jpegs
+                .iter()
+                .any(|jpeg| frame.jpeg.as_deref() == Some(&jpeg[..]))
+        );
+        camera.stop().unwrap();
+        fs::remove_dir_all(dir).unwrap();
     }
     /// A copied recording is the source's own video: its frames decode to
     /// exactly a run of the source's, from a key frame, in each container
@@ -9072,6 +9363,7 @@ esac"#
                     device_ts_ns: None,
                     wall_ms: 0,
                     data: pictures[id as usize % pictures.len()].clone().into(),
+                    jpeg: None,
                 })
                 .unwrap();
             // The recording starts when FFmpeg takes its first frame.
@@ -9159,6 +9451,7 @@ esac"#
                     device_ts_ns: None,
                     wall_ms: 0,
                     data: vec![(id * 8) as u8; width * height * 3].into(),
+                    jpeg: None,
                 })
                 .unwrap();
             thread::sleep(Duration::from_secs_f64(1.0 / 30.0));
@@ -9246,6 +9539,7 @@ esac"#
             device_ts_ns: None,
             wall_ms: 0,
             data: data.into(),
+            jpeg: None,
         };
         forward.push(frame.clone()).unwrap();
         let start = Instant::now();
@@ -9285,6 +9579,7 @@ esac"#
             device_ts_ns: None,
             wall_ms: 0,
             data: vec![0; 64 * 48 * 3].into(),
+            jpeg: None,
         };
         let error = forward.push(frame.clone()).unwrap_err();
         assert!(format!("{error:#}").contains("is unavailable in this FFmpeg build"));
@@ -9322,6 +9617,7 @@ esac"#
             device_ts_ns: None,
             wall_ms: 0,
             data: vec![127; 64 * 48 * 3].into(),
+            jpeg: None,
         };
         forward.push(frame.clone()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
@@ -9380,6 +9676,7 @@ esac"#
                 device_ts_ns: None,
                 wall_ms: id * 33,
                 data,
+                jpeg: None,
             };
             let _ = forward.push(frame);
             thread::sleep(Duration::from_millis(33));
@@ -9581,6 +9878,7 @@ Error opening input files: Input/output error
             hwdec: None,
             software: false,
             known: None,
+            passthrough: cfg!(feature = "jpeg"),
             tap: None,
         }
     }
@@ -9747,12 +10045,14 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
             device_ts_ns: None,
             wall_ms: id,
             data: vec![0; 3].into(),
+            jpeg: None,
         };
         let queue = DecoderQueue {
             state: Mutex::new(Decoded {
                 frames: (1..=3).map(frame).collect(),
                 error: None,
                 needs_rgb: None,
+                needs_decoding: None,
             }),
             changed: Condvar::new(),
             stopped: AtomicBool::new(false),
@@ -10288,6 +10588,92 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
                 "mjpeg"
             ]
         );
+    }
+    /// A stream found to send Motion JPEG is read again as its own JPEGs,
+    /// decoded here, each frame keeping its JPEG; JPEGs that do not decode
+    /// send it back to FFmpeg's decoder. A webcam in its MJPEG mode is read
+    /// that way from the start.
+    #[test]
+    #[cfg(all(unix, feature = "jpeg"))]
+    fn motion_jpeg_sources_are_read_as_their_own_jpegs() {
+        let (width, height) = (16usize, 8usize);
+        let pixels: Vec<u8> = (0..width * height * 3)
+            .map(|i| (i * 3 % 256) as u8)
+            .collect();
+        let jpeg = turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: &pixels[..],
+                width,
+                pitch: width * 3,
+                height,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            90,
+            turbojpeg::Subsamp::Sub2x1,
+        )
+        .unwrap()
+        .to_vec();
+        let script = |name: &str| {
+            Fake::native(
+                name,
+                r#"echo "$*" >> "$dir/argv"
+printf '[info]   Stream #0:0: Video: mjpeg (Baseline), yuvj422p(pc, bt470bg), 16x8, 30 fps\n' >&2
+case "$*" in
+*"-f mjpeg"*) while :; do cat "$dir/frame.jpg"; sleep 0.02; done ;;
+esac
+printf '[info] Output #0, rawvideo, to '"'"'pipe:1'"'"':\n[info]   Stream #0:0: Video: rawvideo, yuvj422p(pc, bt470bg), 16x8\n' >&2
+while :; do head -c 256 /dev/zero; sleep 0.02; done"#,
+            )
+        };
+        let fake = script("mjpeg");
+        fs::write(fake.dir.join("frame.jpg"), &jpeg).unwrap();
+        let mut camera = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(5)).unwrap();
+        camera.start(0).unwrap();
+        for _ in 0..3 {
+            let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
+            assert_eq!(frame.jpeg.as_deref(), Some(&jpeg[..]));
+            assert_eq!(
+                crate::frame::pixel_format_name(frame.pixel_format),
+                "YCbCr422_8_Planar"
+            );
+        }
+        // Decoded by FFmpeg once, to learn what it is, then copied.
+        assert_eq!(fake.launches(&["-f rawvideo"]), 1);
+        assert_eq!(
+            fake.launches(&["-c:v copy -f mjpeg -avioflags direct pipe:1"]),
+            1
+        );
+        drop(camera);
+        drop(fake);
+        // JPEGs that do not decode here are FFmpeg's to decode.
+        let fake = script("mjpeg-broken");
+        let broken = [&[0xFF, 0xD8, 0xFF, 0xDA, 0, 2][..], &[1, 2, 3, 0xFF, 0xD9]].concat();
+        fs::write(fake.dir.join("frame.jpg"), broken).unwrap();
+        let mut camera = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(5)).unwrap();
+        camera.start(0).unwrap();
+        let frame = camera.next_frame(Duration::from_secs(2)).unwrap();
+        assert!(frame.jpeg.is_none());
+        assert_eq!(fake.launches(&["-f rawvideo"]), 2);
+        assert_eq!(fake.launches(&["-f mjpeg"]), 1);
+        drop(camera);
+        // A webcam mode's format is known before it opens.
+        let mode = Mode {
+            width: 640,
+            height: 480,
+            fps: Some((30.0, 30.0)),
+            input_format: Some(0),
+            intervals: None,
+            min_size: None,
+        };
+        let mut webcam = native("v4l2:/dev/video0", vec![mode]);
+        webcam.formats = vec!["mjpeg".into()];
+        webcam.configure(NativeOptions::default()).unwrap();
+        assert_eq!(webcam.launch_output(), Output::Jpeg);
+        webcam.passthrough = false;
+        assert_eq!(webcam.launch_output(), Output::Native);
+        webcam.formats = vec!["yuyv422".into()];
+        webcam.passthrough = true;
+        assert_eq!(webcam.launch_output(), Output::Native);
     }
     #[test]
     #[cfg(unix)]

@@ -1695,6 +1695,7 @@ pub(crate) mod tests {
                 device_ts_ns: Some(self.frames),
                 wall_ms: 0,
                 data: vec![0; 16].into(),
+                jpeg: None,
             })
         }
         fn stop(&mut self) -> Result<()> {
@@ -1931,6 +1932,7 @@ pub(crate) mod tests {
                 device_ts_ns: Some(stamped),
                 wall_ms: 0,
                 data: vec![0; 16].into(),
+                jpeg: None,
             })
         }
         fn stop(&mut self) -> Result<()> {

@@ -27,6 +27,10 @@ pub enum SavedItem {
         origin: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job_id: Option<u64>,
+        /// The file is the JPEG the source sent, not an encoding of the
+        /// frame.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        passthrough: bool,
     },
     Recording {
         started_ms: u64,
@@ -225,6 +229,7 @@ mod tests {
                 format: "png".into(),
                 origin: "schedule".into(),
                 job_id: Some(1),
+                passthrough: false,
             },
         };
         let features = json!({"ExposureTime": 2000.0});

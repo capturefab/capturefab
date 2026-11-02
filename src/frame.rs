@@ -216,6 +216,7 @@ pub fn unpacked(frame: &Frame) -> Result<Cow<'_, Frame>> {
     Ok(Cow::Owned(Frame {
         pixel_format,
         data: data.into(),
+        jpeg: None,
         ..*frame
     }))
 }
@@ -1197,6 +1198,15 @@ pub fn encode_with_meta(
     Ok(encode_parts(frame, format, None, meta)?.to_vec())
 }
 
+/// The JPEG a frame arrived as, when it is whole and of the frame's size,
+/// to be stored as it is.
+fn passthrough(frame: &Frame) -> Option<&[u8]> {
+    frame
+        .jpeg
+        .as_deref()
+        .filter(|jpeg| crate::jpeg::well_formed(jpeg, frame.width, frame.height))
+}
+
 /// Encode a still, writing `meta` (compact provenance JSON) into PNG as an
 /// iTXt chunk named `capturefab` and into JPEG as a COM segment. Raw, PPM and
 /// PGM have no place for it and stay plain. Monochrome PNG of more than 8
@@ -1204,7 +1214,9 @@ pub fn encode_with_meta(
 /// saying how many are significant; other monochrome PNG and PGM are one
 /// 8-bit gray channel; color and Bayer are 8-bit RGB. PNG is compressed
 /// fast: deflate would otherwise take most of a large frame's capture time.
-/// JPEG is at `quality`, or `jpeg::QUALITY`.
+/// JPEG is at `quality`, or `jpeg::QUALITY`; at the default quality, a
+/// frame that arrived as a JPEG is stored as that JPEG (`Encoded::passthrough`),
+/// with the comment, and the standard Huffman tables when it lacks its own.
 ///
 /// Raw, and PGM of 8-bit gray and PPM of RGB8, borrow the frame's bytes,
 /// so nothing is copied before they are written.
@@ -1224,6 +1236,25 @@ pub fn encode_parts<'a>(
     let header = |magic: &str| format!("{magic}\n{} {}\n255\n", frame.width, frame.height);
     match format {
         "raw" => Ok(Encoded::new(Body::Borrowed(&frame.data))),
+        // The JPEG the source sent, as it is, at the source's quality.
+        "jpeg" if let Some(jpeg) = quality.is_none().then(|| passthrough(frame)).flatten() => {
+            let mut insert = match &json {
+                Some(json) => crate::jpeg::com_segment(json.as_bytes())?,
+                None => Vec::new(),
+            };
+            if !crate::jpeg::has_huffman_tables(jpeg) {
+                insert.extend(crate::jpeg::standard_huffman_tables());
+            }
+            let encoded = match insert.is_empty() {
+                true => Encoded::new(Body::Borrowed(jpeg)),
+                false => Encoded::with_insert(
+                    Body::Borrowed(jpeg),
+                    crate::jpeg::com_offset(jpeg)?,
+                    insert,
+                ),
+            };
+            Ok(encoded.passed_through())
+        }
         "jpeg" => {
             let jpeg = crate::jpeg::backend::encode(frame, quality)?;
 
@@ -1389,6 +1420,100 @@ mod tests {
         let wide = serde_json::json!({ "note": "x".repeat(MAX_META) });
         assert!(encode_parts(&frame, "jpeg", None, Some(&wide)).is_err());
     }
+    /// A frame that arrived as a JPEG is stored as that JPEG at the default
+    /// quality, with the comment and, where it has none, the standard
+    /// Huffman tables; any other quality encodes the frame again.
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn source_jpegs_are_stored_as_they_are() {
+        let (width, height) = (32usize, 16usize);
+        let pixels: Vec<u8> = (0..width * height * 3).map(|i| (i % 200) as u8).collect();
+        let jpeg = turbojpeg::compress(
+            turbojpeg::Image {
+                pixels: &pixels[..],
+                width,
+                pitch: width * 3,
+                height,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            85,
+            turbojpeg::Subsamp::Sub2x2,
+        )
+        .unwrap()
+        .to_vec();
+        // Its tables left out, as Motion JPEG from many webcams sends.
+        let mut bare = jpeg[..2].to_vec();
+        let mut at = 2;
+        while jpeg[at + 1] != 0xDA {
+            let length = usize::from(u16::from_be_bytes([jpeg[at + 2], jpeg[at + 3]]));
+            if jpeg[at + 1] != 0xC4 {
+                bare.extend_from_slice(&jpeg[at..at + 2 + length]);
+            }
+            at += 2 + length;
+        }
+        bare.extend_from_slice(&jpeg[at..]);
+        assert!(crate::jpeg::has_huffman_tables(&jpeg) && !crate::jpeg::has_huffman_tables(&bare));
+        let meta = serde_json::json!({"camera": "webcam"});
+        let json = serde_json::to_string(&meta).unwrap();
+        for source in [&jpeg, &bare] {
+            let frame = Frame {
+                width: width as u32,
+                height: height as u32,
+                pixel_format: RGB8,
+                data: turbojpeg::decompress(source, turbojpeg::PixelFormat::RGB)
+                    .unwrap()
+                    .pixels
+                    .into(),
+                jpeg: Some(source.clone().into()),
+                ..Frame::default()
+            };
+            let plain = encode_parts(&frame, "jpeg", None, None).unwrap();
+            assert!(plain.passthrough());
+            let stored = encode_parts(&frame, "jpeg", None, Some(&meta)).unwrap();
+            assert!(stored.passthrough());
+            let mut expected = crate::jpeg::com_segment(json.as_bytes()).unwrap();
+            if source == &bare {
+                expected.extend(crate::jpeg::standard_huffman_tables());
+                assert!(crate::jpeg::has_huffman_tables(&plain.to_vec()));
+            } else {
+                assert_eq!(plain.to_vec(), jpeg);
+                // Nothing of the source is copied.
+                assert_eq!(
+                    plain.parts()[0].as_ptr(),
+                    frame.jpeg.as_ref().unwrap().as_ptr()
+                );
+            }
+            let at = crate::jpeg::com_offset(source).unwrap();
+            assert_eq!(
+                stored.to_vec(),
+                [&source[..at], &expected[..], &source[at..]].concat()
+            );
+            // Decoded alone, it is the image the source's tables made.
+            let decoded = turbojpeg::decompress(&stored.to_vec(), turbojpeg::PixelFormat::RGB);
+            assert_eq!(decoded.unwrap().pixels, frame.data);
+            let again = encode_parts(&frame, "jpeg", Some(75), Some(&meta)).unwrap();
+            assert!(!again.passthrough());
+            assert!(
+                !encode_parts(&frame, "png", None, None)
+                    .unwrap()
+                    .passthrough()
+            );
+        }
+        // A JPEG of another size is not the frame's.
+        let other = Frame {
+            width: 16,
+            height: 16,
+            pixel_format: MONO8,
+            data: vec![0; 256].into(),
+            jpeg: Some(jpeg.into()),
+            ..Frame::default()
+        };
+        assert!(
+            !encode_parts(&other, "jpeg", None, None)
+                .unwrap()
+                .passthrough()
+        );
+    }
     #[test]
     fn coordinate_and_confidence_formats_convert_but_raw_preserves_precision() {
         for format in [0x0110_00b8, 0x0110_00c7] {
@@ -1414,6 +1539,7 @@ mod tests {
             device_ts_ns: None,
             wall_ms: 0,
             data: data.into(),
+            jpeg: None,
         }
     }
     #[test]

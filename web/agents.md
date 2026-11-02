@@ -113,7 +113,9 @@ The `capture` result lists `files` (absolute paths) with `width`, `height`, `pix
 `bit_depth` and the `settings` the frame was taken with. PNG keeps monochrome frames wider than
 8 bits (Mono10 to Mono16, packed or not) as 16-bit gray; color and Bayer frames wider than 8 bits
 become 8-bit PNG or JPEG, and `source_bits` then says how many bits the frame had.
-`-f jpg --quality 85` or a `.jpg` name gives JPEG; `.raw` gives the frame's exact bytes with a
+`-f jpg --quality 85` or a `.jpg` name gives JPEG; from a Motion JPEG webcam, stream or file,
+`-f jpg` without `--quality` stores the JPEG it sent as it was (`"passthrough": true`), with the
+provenance comment and, when it lacks them, the standard Huffman tables. `.raw` gives the frame's exact bytes with a
 `NAME.json` sidecar (`pixel_format`, `pfnc_code`, `width`, `height`, `row_bytes`). Every common
 PFNC pixel format converts; see the
 [pixel format table](guides/camera-compatibility.md#pixel-formats). Webcams, streams and files
