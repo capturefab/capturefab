@@ -464,6 +464,33 @@ pub fn random_hex(count: usize) -> Result<String> {
     Ok(hex(random))
 }
 
+/// `text` as one line a terminal shows as written. A control character
+/// (C0, DEL or C1), such as the escape that starts a sequence to move the
+/// cursor, clear the screen or retitle the window, becomes a space when it
+/// is whitespace and U+FFFD otherwise. For text a camera or the network
+/// supplies: names, serials and string values.
+pub fn printable_line(text: &str) -> std::borrow::Cow<'_, str> {
+    printable(text, |_| false)
+}
+/// `text` as lines a terminal shows as written: [`printable_line`], keeping
+/// line breaks and tabs. For whole results and messages before they print.
+pub fn printable_text(text: &str) -> std::borrow::Cow<'_, str> {
+    printable(text, |c| matches!(c, '\n' | '\t'))
+}
+fn printable(text: &str, keep: impl Fn(char) -> bool) -> std::borrow::Cow<'_, str> {
+    let unsafe_char = |c: char| c.is_control() && !keep(c);
+    if !text.chars().any(unsafe_char) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    text.chars()
+        .map(|c| match c {
+            c if !unsafe_char(c) => c,
+            c if c.is_whitespace() => ' ',
+            _ => char::REPLACEMENT_CHARACTER,
+        })
+        .collect()
+}
+
 /// A byte count for diagnostics, with two decimals in GiB and one below.
 pub fn human_bytes(value: u64) -> String {
     if value >= 1_073_741_824 {
@@ -768,6 +795,24 @@ mod tests {
         let (one, two) = (random_hex(6).unwrap(), random_hex(6).unwrap());
         assert!(one.len() == 12 && one.bytes().all(|b| b.is_ascii_hexdigit()));
         assert_ne!(one, two);
+    }
+    #[test]
+    fn device_text_cannot_steer_the_terminal() {
+        let hostile = "Model\x1b[31mRED\x1b[0m SN\x1b[2Jx \x1b]0;title\x07 \u{9b}2J\x7f";
+        let line = printable_line(hostile);
+        assert!(!line.chars().any(char::is_control), "{line:?}");
+        assert_eq!(
+            line,
+            "Model\u{fffd}[31mRED\u{fffd}[0m SN\u{fffd}[2Jx \u{fffd}]0;title\u{fffd} \u{fffd}2J\u{fffd}"
+        );
+        assert_eq!(printable_line("a\tb\nc\rd"), "a b c d");
+        assert_eq!(printable_text("a\tb\nc\rd\x1b"), "a\tb\nc d\u{fffd}");
+        for clean in ["Pattern camera", "Kamera über Tür · 4K", ""] {
+            assert!(matches!(
+                printable_line(clean),
+                std::borrow::Cow::Borrowed(_)
+            ));
+        }
     }
     #[test]
     fn error_categories_survive_transport() {

@@ -95,6 +95,20 @@ fn camera_id(vendor: u16, product: u16, names: &DeviceNames, location: &str) -> 
         .unwrap_or(location);
     format!("usb:{vendor:04x}:{product:04x}:{unique}")
 }
+/// The names a device's descriptors gave, without the control characters
+/// that could steer the terminal that shows them.
+fn printable_names(names: DeviceNames) -> DeviceNames {
+    let clean = |text: Option<String>| {
+        text.map(|text| crate::types::printable_line(&text).trim().to_owned())
+            .filter(|text| !text.is_empty())
+    };
+    DeviceNames {
+        vendor: clean(names.vendor),
+        model: clean(names.model),
+        serial: clean(names.serial),
+        guid: clean(names.guid),
+    }
+}
 fn camera_info(d: &DeviceInfo) -> CameraInfo {
     let location = format!("{}:{}", d.bus_id(), d.device_address());
     let cached = |text: Option<&str>| text.filter(|text| !text.is_empty()).map(String::from);
@@ -111,6 +125,7 @@ fn camera_info(d: &DeviceInfo) -> CameraInfo {
         names.serial = names.serial.or(read.serial);
         names.guid = read.guid;
     }
+    let names = printable_names(names);
     CameraInfo {
         id: camera_id(d.vendor_id(), d.product_id(), &names, &location),
         transport: Transport::Usb3,
@@ -250,12 +265,9 @@ fn refusal(
 /// string, or without one its USB IDs, which tell cameras apart.
 fn display_name(product: Option<&str>, vendor_id: u16, product_id: u16) -> String {
     product
-        .map(str::trim)
+        .map(|product| crate::types::printable_line(product).trim().to_owned())
         .filter(|product| !product.is_empty())
-        .map_or_else(
-            || format!("{vendor_id:04x}:{product_id:04x}"),
-            str::to_owned,
-        )
+        .unwrap_or_else(|| format!("{vendor_id:04x}:{product_id:04x}"))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1534,6 +1546,10 @@ mod tests {
     fn cameras_without_a_product_string_are_named_by_usb_ids() {
         assert_eq!(display_name(Some(" acA1920 "), 0x2676, 0xba02), "acA1920");
         assert_eq!(display_name(Some(""), 0x2676, 0xba02), "2676:ba02");
+        assert_eq!(
+            display_name(Some("acA\x1b[2J\n"), 0x2676, 0xba02),
+            "acA\u{fffd}[2J"
+        );
         let name = display_name(None, 0x2676, 0xba02);
         let (_, message) = access_error(Stage::Open, nusb::ErrorKind::Busy, &name, None, "linux");
         assert!(
@@ -1572,6 +1588,20 @@ mod tests {
         assert_eq!(id(&names), "usb:2676:ba02:2676005E0A1B");
         names.guid = None;
         assert_eq!(id(&names), "usb:2676:ba02:3:7");
+        // Descriptor strings come from the device: no terminal escapes in
+        // what `list` shows, and nothing but spaces becomes no name at all.
+        let names = printable_names(DeviceNames {
+            vendor: Some("Acme\x1b]0;title\x07".into()),
+            model: Some(" Cam\x1b[31m ".into()),
+            serial: Some("\r\n".into()),
+            guid: None,
+        });
+        assert_eq!(
+            names.vendor.as_deref(),
+            Some("Acme\u{fffd}]0;title\u{fffd}")
+        );
+        assert_eq!(names.model.as_deref(), Some("Cam\u{fffd}[31m"));
+        assert_eq!(names.serial, None);
     }
     #[test]
     fn uvcp_little_endian_wire_packet() {

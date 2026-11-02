@@ -168,12 +168,14 @@ fn status_text(text: &str, age: Duration, progress: bool, cols: u16) -> String {
     fit(&line, cols)
 }
 
-/// `text`, a line without escapes, cut to fit `cols` columns without
-/// wrapping: what is cut ends in `…`.
+/// `text` as one line without escapes, cut to fit `cols` columns without
+/// wrapping: what is cut ends in `…`. Control characters, as in a name a
+/// camera gave, do not reach the terminal.
 pub(crate) fn fit(text: &str, cols: u16) -> String {
+    let text = crate::types::printable_line(text);
     let room = usize::from(cols.max(2)) - 1;
     if text.chars().count() <= room {
-        return text.to_owned();
+        return text.into_owned();
     }
     text.chars()
         .take(room.saturating_sub(1))
@@ -322,6 +324,7 @@ pub(crate) fn pick(
 ) -> io::Result<Option<usize>> {
     writeln!(output, "{} cameras found:", cameras.len())?;
     for (index, camera) in cameras.iter().enumerate() {
+        let camera = crate::types::printable_line(camera);
         writeln!(output, "  {}) {camera}", index + 1)?;
     }
     for _ in 0..3 {
@@ -1002,6 +1005,11 @@ mod tests {
             "3/10 frames"
         );
         assert_eq!(status_text("abcdefghij", second, true, 6), "abcd…");
+        // A camera's name in the line cannot steer the terminal.
+        assert_eq!(
+            status_text("connecting to Cam\x1b[2J\n…", second / 2, false, 80),
+            "connecting to Cam\u{fffd}[2J …"
+        );
         assert_eq!(clock(Duration::from_secs(7)), "0:07");
         assert_eq!(clock(Duration::from_secs(750)), "12:30");
         assert_eq!(clock(Duration::from_secs(3723)), "1:02:03");
@@ -1009,12 +1017,15 @@ mod tests {
 
     #[test]
     fn the_picker_takes_a_number_or_enter() {
-        let cameras = ["gige:a".to_owned(), "u3v:b".to_owned()];
+        let cameras = ["gige:a".to_owned(), "u3v:b  Cam\x1b[2J".to_owned()];
         let mut shown = Vec::new();
         let picked = pick(&cameras, &mut "\n".as_bytes(), &mut shown).unwrap();
         assert_eq!(picked, Some(0));
         let shown = String::from_utf8(shown).unwrap();
-        assert!(shown.contains("  1) gige:a\n  2) u3v:b\n"), "{shown}");
+        assert!(
+            shown.contains("  1) gige:a\n  2) u3v:b  Cam\u{fffd}[2J\n"),
+            "{shown}"
+        );
         let picked = pick(&cameras, &mut "x\n9\n2\n".as_bytes(), &mut Vec::new()).unwrap();
         assert_eq!(picked, Some(1));
         assert_eq!(

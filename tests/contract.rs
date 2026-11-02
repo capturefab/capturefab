@@ -314,8 +314,25 @@ fn reasons_say_what_went_wrong_with_details() {
     );
     assert!(unknown["details"]["candidates"].is_array());
     let file = home.path("missing.mp4");
-    let gone = home.fails(3, &["get", "-c", file.to_str().unwrap(), "Width"]);
-    assert_eq!(gone["code"], "camera_not_found");
+    // A missing file is the same camera that is not there however it is
+    // named: a path, a file: URL or a replay source.
+    let replay = format!("sim:replay:{}", file.display());
+    let url = format!("file:{}", file.display());
+    for camera in [file.to_str().unwrap(), &url, &replay] {
+        let gone = home.fails(3, &["get", "-c", camera, "Width"]);
+        assert_eq!(gone["code"], "camera_not_found", "{camera}: {gone}");
+        assert!(
+            gone["hint"].as_str().unwrap().contains("check the path"),
+            "{camera}: {gone}"
+        );
+        assert_eq!(gone["details"]["candidates"], json!([]), "{camera}");
+    }
+    std::fs::write(home.path("notes.txt"), "not a video").unwrap();
+    let notes = format!("sim:replay:{}", home.path("notes.txt").display());
+    assert_eq!(
+        home.fails(2, &["get", "-c", &notes, "Width"])["code"],
+        "usage"
+    );
     let unsupported = home.fails(5, &["set", "-c", "sim:depth", "exposure=5ms"]);
     assert_eq!(unsupported["code"], "unsupported");
     assert_eq!(
@@ -363,6 +380,23 @@ fn reasons_say_what_went_wrong_with_details() {
     let table = home.run(&["features", "-c", "sim:0", "--all"]).stdout;
     assert!(!table.contains("null"), "{table}");
     assert!(!home.sessions.join("cameras").exists());
+}
+
+#[test]
+fn text_carries_no_control_characters_to_the_terminal() {
+    let home = Home::new("controls");
+    // An error that quotes what it was given, as one can quote what a
+    // camera or the network sent.
+    let run = home.run(&["get", "-c", "sim:0", "Gai\x1b[2Jn"]);
+    assert_eq!(run.code, Some(2), "{}", run.stderr);
+    assert!(run.stderr.contains("Gai\u{fffd}[2Jn"), "{:?}", run.stderr);
+    assert!(!run.stderr.contains('\x1b'), "{:?}", run.stderr);
+    // JSON escapes it instead.
+    let error = home.fails(2, &["get", "-c", "sim:0", "Gai\x1b[2Jn"]);
+    assert!(
+        error["message"].as_str().unwrap().contains("Gai\x1b[2Jn"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1545,13 +1579,18 @@ fn network_is_read_only_unless_asked_to_tune() {
 #[test]
 fn unreachable_cameras_say_what_to_try() {
     let home = Home::new("unreachable");
+    // No GigE Vision camera at an address is a camera that is not there, as
+    // one named by its MAC address is, whether the port is refused or
+    // nothing answers: a longer --timeout would not find it.
     let error = home.fails(3, &["info", "-c", "127.0.0.1"]);
-    assert_eq!(error["code"], "unavailable", "{error}");
+    assert_eq!(error["code"], "camera_not_found", "{error}");
     let message = error["message"].as_str().unwrap();
     assert!(
         message.contains("127.0.0.1") && message.contains("sim:0"),
         "{message}"
     );
+    assert!(error["hint"].as_str().unwrap().contains("sim:0"), "{error}");
+    assert_eq!(error["details"]["candidates"], json!([]), "{error}");
     // ONVIF hosts that do not resolve or refuse are unavailable too.
     for host in ["nonexistent.invalid", "127.0.0.1:1"] {
         let error = home.fails(3, &["onvif", "resolve", host, "--timeout", "2s"]);

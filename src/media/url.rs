@@ -290,10 +290,10 @@ pub fn validate_source(url: &str) -> Result<()> {
         let path = local_file_path(url)?;
         let metadata = fs::metadata(&path).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
-                return Categorized::error(
-                    ErrorKind::CameraNotFound,
-                    format!("media file not found: {}", path.display()),
-                );
+                return crate::camera::missing_path(format!(
+                    "media file not found: {}",
+                    path.display()
+                ));
             }
             anyhow::Error::new(error)
                 .context(format!("cannot inspect media file {}", path.display()))

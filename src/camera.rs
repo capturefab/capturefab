@@ -660,6 +660,16 @@ pub fn needs_no_discovery(selector: &str) -> bool {
     path_like(selector) || malformed_ipv4(selector)
 }
 
+/// A file or folder named as a camera that is not there: `camera_not_found`,
+/// as any camera that is not there, with nothing else to suggest.
+pub(crate) fn missing_path(message: String) -> anyhow::Error {
+    use crate::types::{Categorized, ErrorKind};
+    Categorized::new(ErrorKind::CameraNotFound, message)
+        .hint("check the path; relative paths are from this terminal's folder")
+        .details(serde_json::json!({ "candidates": [] }))
+        .into()
+}
+
 /// A camera as `camera_not_found` and `camera_ambiguous` list it.
 fn candidate(info: &CameraInfo) -> serde_json::Value {
     serde_json::json!({
@@ -710,11 +720,7 @@ fn selector_not_matched(
         );
     }
     if path_like(selector) {
-        return not_found(
-            format!("file not found: {shown}"),
-            &[],
-            "check the path; relative paths are from this terminal's folder",
-        );
+        return missing_path(format!("file not found: {shown}"));
     }
     let mut candidates: Vec<(usize, &CameraInfo)> = known
         .iter()
@@ -1418,7 +1424,7 @@ impl Drop for Camera {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::camera_profile::{CameraCapability, CameraKind, DetectionSource};
+    use crate::camera_profile::{CameraKind, DetectionSource};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -2236,13 +2242,6 @@ pub(crate) mod tests {
             "opening must not poll unrelated exposure registers"
         );
         assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
-        assert!(
-            camera
-                .info
-                .profile
-                .capabilities
-                .contains(&CameraCapability::Exposure)
-        );
         assert!(!camera.features().iter().any(|f| f.name == "DeviceScanType"));
         assert_eq!(camera.info.profile.kind, CameraKind::LineScan);
         assert_eq!(camera.info.profile.source, DetectionSource::DeviceMetadata);
@@ -2284,13 +2283,6 @@ pub(crate) mod tests {
         let info = crate::transport::simulator::info();
         let mut camera = Camera::from_backend(info, Box::new(Fixture(xml))).unwrap();
         assert_eq!(camera.info.profile.kind, CameraKind::AreaScan);
-        assert!(
-            !camera
-                .info
-                .profile
-                .capabilities
-                .contains(&CameraCapability::LineRate)
-        );
         camera.features();
         assert_eq!(camera.info.profile.kind, CameraKind::AreaScan);
     }

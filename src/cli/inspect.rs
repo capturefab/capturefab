@@ -210,8 +210,10 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
         }
         json!({ "cameras": shown })
     };
+    // The picture is drawn with escapes; the text around it is made
+    // printable here, as the output would make all of it.
     let shown = |value: &Value| {
-        let mut shown = text(value);
+        let mut shown = crate::types::printable_text(&text(value)).into_owned();
         if show && let Some(preview) = value["preview"].as_str() {
             shown.push_str(&picture(std::path::Path::new(preview)));
         }
@@ -221,7 +223,7 @@ pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
         Some(cameras) => cameras.iter().map(shown).collect(),
         None => shown(&value),
     };
-    Ok(Report::json(value).text(text))
+    Ok(Report::json(value).drawn(text))
 }
 
 /// The preview at `path` drawn for this terminal, under text of about six

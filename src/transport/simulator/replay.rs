@@ -2,7 +2,7 @@
 //! snapshot of regular files directly inside the selected directory.
 use crate::{
     media::ReplayDecoder,
-    types::{Backend, Frame, RGB8, RegisterIo},
+    types::{Backend, Frame, RGB8, RegisterIo, Usage},
 };
 use anyhow::{Context, Result, bail, ensure};
 use std::{
@@ -82,26 +82,43 @@ fn regular_file(path: &Path) -> Result<()> {
 
 /// List supported direct children, sorted by filename. Subdirectories, symlinks,
 /// and unrelated files are ignored; a symlink selected as the source is rejected.
+/// A source that is not there is `camera_not_found`, as a missing file named
+/// as a camera is; one that cannot be replayed is a usage error.
 pub fn source_files(source: &Path) -> Result<Vec<PathBuf>> {
-    let metadata = fs::symlink_metadata(source)
-        .with_context(|| format!("cannot inspect simulation source {}", source.display()))?;
-    ensure!(
-        !metadata.file_type().is_symlink(),
-        "simulation source must not be a symlink: {}",
-        source.display()
-    );
-    ensure!(
-        metadata.is_file() || metadata.is_dir(),
-        "simulation source must be a regular media file or a directory"
-    );
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return crate::camera::missing_path(format!(
+                "simulation source not found: {}",
+                source.display()
+            ));
+        }
+        anyhow::Error::new(error).context(format!(
+            "cannot inspect simulation source {}",
+            source.display()
+        ))
+    })?;
+    let usage = |message: String| -> anyhow::Error { Usage(message).into() };
+    if metadata.file_type().is_symlink() {
+        return Err(usage(format!(
+            "simulation source must not be a symlink: {}",
+            source.display()
+        )));
+    }
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(usage(format!(
+            "simulation source must be a regular media file or a directory: {}",
+            source.display()
+        )));
+    }
     let source = fs::canonicalize(source)
         .with_context(|| format!("cannot resolve simulation source {}", source.display()))?;
     if metadata.is_file() {
-        ensure!(
-            supported(&source),
-            "unsupported simulation media file {}; use a video or still image, not a playlist",
-            source.display()
-        );
+        if !supported(&source) {
+            return Err(usage(format!(
+                "unsupported simulation media file {}; use a video or still image, not a playlist",
+                source.display()
+            )));
+        }
         return Ok(vec![source]);
     }
     let mut files = Vec::new();
@@ -114,11 +131,12 @@ pub fn source_files(source: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     files.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
-    ensure!(
-        !files.is_empty(),
-        "simulation directory {} contains no supported regular video or still image files at its top level",
-        source.display()
-    );
+    if files.is_empty() {
+        return Err(usage(format!(
+            "simulation directory {} contains no supported regular video or still image files at its top level",
+            source.display()
+        )));
+    }
     Ok(files)
 }
 
@@ -601,18 +619,36 @@ mod tests {
     #[test]
     fn missing_and_empty_sources_have_actionable_errors() {
         let dir = Directory::new();
+        let empty = source_files(&dir.0).unwrap_err();
         assert!(
-            source_files(&dir.0)
-                .unwrap_err()
-                .to_string()
-                .contains("no supported regular")
+            empty.to_string().contains("no supported regular"),
+            "{empty}"
         );
+        assert_eq!(crate::cli::error_code(&empty), ("usage", 2));
+        fs::write(dir.file("notes.txt"), b"fixture").unwrap();
+        let unsupported = source_files(&dir.file("notes.txt")).unwrap_err();
+        assert_eq!(crate::cli::error_code(&unsupported), ("usage", 2));
+        // A replay source that is not there is a camera that is not there,
+        // with the hint a missing file named as a camera has.
+        let missing = source_files(&dir.file("missing.mp4")).unwrap_err();
         assert!(
-            source_files(&dir.file("missing.mp4"))
-                .unwrap_err()
-                .to_string()
-                .contains("cannot inspect simulation source")
+            missing.to_string().contains("simulation source not found"),
+            "{missing}"
         );
+        assert_eq!(crate::cli::error_code(&missing), ("camera_not_found", 3));
+        let classified = crate::types::classify(&missing);
+        assert!(
+            classified
+                .hint
+                .is_some_and(|hint| hint.contains("check the path"))
+        );
+        assert_eq!(
+            classified.details,
+            Some(serde_json::json!({ "candidates": [] }))
+        );
+        let selector = format!("sim:replay:{}", dir.file("missing.mp4").display());
+        let error = crate::camera::validate_selector(&selector).unwrap_err();
+        assert_eq!(crate::cli::error_code(&error), ("camera_not_found", 3));
         assert!(open(&dir.0, 64, 64, f64::NAN, Duration::from_secs(1)).is_err());
     }
 

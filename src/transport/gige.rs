@@ -151,7 +151,7 @@ fn parse_ack(packet: &[u8]) -> Result<Ack<'_>> {
 #[derive(Debug)]
 pub(crate) struct GvcpTimeout {
     pub(crate) command: u16,
-    waited: Duration,
+    pub(crate) waited: Duration,
 }
 impl std::fmt::Display for GvcpTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -191,10 +191,12 @@ pub(crate) fn is_control_rejection(error: &anyhow::Error) -> bool {
     error.downcast_ref::<GvcpStatus>().is_some()
 }
 
+/// A NUL-padded string field a device sent, up to its first NUL. Any host
+/// on the network can answer discovery, so control characters, which could
+/// steer the terminal that shows the name, do not survive.
 fn fixed_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes.split(|b| *b == 0).next().unwrap_or_default())
-        .trim()
-        .to_owned()
+    let text = String::from_utf8_lossy(bytes.split(|b| *b == 0).next().unwrap_or_default());
+    crate::types::printable_line(&text).trim().to_owned()
 }
 fn discovery_info(payload: &[u8], source: Ipv4Addr) -> Result<CameraInfo> {
     ensure!(payload.len() >= 0xf8, "truncated GigE discovery data");
@@ -3163,6 +3165,20 @@ mod tests {
             "software cameras with no MAC must stay distinct"
         );
         assert!(discovery_info(&identity[..240], Ipv4Addr::LOCALHOST).is_err());
+        // Anything on the network can answer discovery: its names cannot
+        // carry terminal escapes to whoever lists cameras.
+        let vendor = b"Vend\x1b]0;PWNED\x07or";
+        let model = b"Model\x1b[31mRED\x1b[0m";
+        let serial = b"SN\x1b[2Jx\r\n";
+        identity[0x48..0x48 + vendor.len()].copy_from_slice(vendor);
+        identity[0x68..0x68 + model.len()].copy_from_slice(model);
+        identity[0xd8..0xd8 + serial.len()].copy_from_slice(serial);
+        let hostile = discovery_info(&identity, Ipv4Addr::new(10, 1, 2, 3)).unwrap();
+        for text in [&hostile.vendor, &hostile.model, &hostile.serial] {
+            assert!(!text.chars().any(char::is_control), "{text:?}");
+        }
+        assert_eq!(hostile.model, "Model\u{fffd}[31mRED\u{fffd}[0m");
+        assert_eq!(hostile.serial, "SN\u{fffd}[2Jx");
         assert!(parse_ack(&[0; 7]).is_err());
         assert!(parse_ack(&[0, 0, 0, 3, 0, 1, 0, 1]).is_err());
     }

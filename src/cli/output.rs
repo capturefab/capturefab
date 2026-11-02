@@ -3,7 +3,7 @@
 //! `{"error":{code,message,hint?,details?}}` otherwise; no null values, and
 //! at most ten distinct warnings. People get text on stdout and errors on
 //! stderr.
-use crate::types::{ErrorKind, classify};
+use crate::types::{ErrorKind, classify, printable_text};
 use serde_json::{Value, json};
 use std::io::{self, Write};
 
@@ -37,13 +37,27 @@ pub fn claim() -> bool {
 pub struct Report {
     pub value: Value,
     pub text: Option<String>,
+    /// The text holds terminal graphics its command drew on purpose, and
+    /// the command made the rest of it printable itself.
+    pub drawn: bool,
 }
 impl Report {
     pub fn json(value: Value) -> Self {
-        Self { value, text: None }
+        Self {
+            value,
+            text: None,
+            drawn: false,
+        }
     }
     pub fn text(mut self, text: impl Into<String>) -> Self {
         self.text = Some(text.into());
+        self
+    }
+    /// Text with terminal graphics in it, which prints as it is: everything
+    /// else in it must already be [`crate::types::printable_text`].
+    pub fn drawn(mut self, text: impl Into<String>) -> Self {
+        self.text = Some(text.into());
+        self.drawn = true;
         self
     }
 }
@@ -70,9 +84,7 @@ impl Output {
         let written = if self.json {
             write_json(&document(report.value))
         } else {
-            let text = report.text.unwrap_or_else(|| {
-                serde_json::to_string_pretty(&report.value).unwrap_or_default() + "\n"
-            });
+            let text = text(report);
             let mut out = io::stdout().lock();
             out.write_all(text.as_bytes()).and_then(|()| out.flush())
         };
@@ -135,6 +147,22 @@ impl Output {
             }
         }
         exit
+    }
+}
+
+/// The text people read for `report`: its own, or its document. Results
+/// show what cameras and the network named, so nothing in it steers the
+/// terminal unless its command drew it there on purpose.
+fn text(report: Report) -> String {
+    let text = report
+        .text
+        .unwrap_or_else(|| serde_json::to_string_pretty(&report.value).unwrap_or_default() + "\n");
+    if report.drawn {
+        return text;
+    }
+    match printable_text(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(printable) => printable,
     }
 }
 
@@ -324,6 +352,23 @@ pub fn clap_error(error: &clap::Error, group: Option<(String, Vec<String>)>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn result_text_cannot_steer_the_terminal() {
+        // A table row with a name a device on the network chose.
+        let row = "gige:00c0df  Model\x1b[31mRED\x1b[0m  SN\x1b[2Jx\t\x1b]0;t\x07\r\n";
+        assert_eq!(
+            text(Report::json(json!({})).text(row)),
+            "gige:00c0df  Model\u{fffd}[31mRED\u{fffd}[0m  SN\u{fffd}[2Jx\t\u{fffd}]0;t\u{fffd} \n"
+        );
+        // Graphics a command drew stay, as JSON escapes everything else.
+        let picture = "Region 640x480\n\x1b_Ga=T;\x1b\\\n";
+        assert_eq!(text(Report::json(json!({})).drawn(picture)), picture);
+        assert_eq!(
+            text(Report::json(json!({"model": "a\x1bb"}))),
+            "{\n  \"model\": \"a\\u001bb\"\n}\n"
+        );
+    }
 
     #[test]
     fn documents_drop_nulls_and_bound_warnings() {

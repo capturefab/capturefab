@@ -581,11 +581,14 @@ fn wait_text(duration: Duration) -> String {
     }
 }
 
-/// A GigE probe of `ip` that went unanswered or was refused, explained and
-/// categorized like the raw error it replaces: no answer is `timeout`
-/// (exit 4), a refused port `unavailable` (exit 3). Other failures, such as
-/// a camera that answered with an error, pass through unchanged. The
-/// protocol detail follows the explanation for whoever debugs it.
+/// A GigE probe of `ip` that went unanswered or was refused, explained.
+/// Either way no GigE Vision camera is there, so it is `camera_not_found`
+/// (exit 3), as a camera named by its MAC address or serial that does not
+/// answer is: which of the two happens depends on whether a router answers
+/// for the address, and waiting longer would not change it. Other
+/// failures, such as a camera that answered with an error, pass through
+/// unchanged. The protocol detail follows the explanation for whoever
+/// debugs it.
 pub(crate) fn explain_probe_failure(
     ip: Ipv4Addr,
     waited: Duration,
@@ -614,13 +617,19 @@ pub(crate) fn explain_probe_failure(
         interfaces_within(Duration::from_millis(500)).unwrap_or_default()
     };
     let message = explain_gige_unreachable(ip, &interfaces, refused, waited);
-    let kind = if refused {
-        ErrorKind::Unavailable
+    let hint = if ip.is_loopback() {
+        "use -c sim:0, or run capturefab list to see cameras".to_owned()
+    } else if refused {
+        format!("try -c onvif://{ip}, or run capturefab list to see cameras")
     } else {
-        ErrorKind::Timeout
+        "run capturefab network to check this computer's adapters, or capturefab list to see cameras"
+            .to_owned()
     };
     let detail = unanswered.unwrap_or_else(|| format!("GVCP: {}", error.root_cause()));
-    Categorized::error(kind, format!("{message} ({detail})"))
+    Categorized::new(ErrorKind::CameraNotFound, format!("{message} ({detail})"))
+        .hint(hint)
+        .details(serde_json::json!({ "candidates": [] }))
+        .into()
 }
 
 fn diagnose(
@@ -1253,14 +1262,54 @@ mod tests {
     }
 
     #[test]
-    fn gige_probe_failures_keep_their_exit_codes() {
+    fn gige_probe_failures_are_cameras_not_found() {
         let wait = Duration::from_secs(2);
         let refused =
             anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
                 .context("receiving GVCP acknowledgement");
         let explained = explain_probe_failure(Ipv4Addr::LOCALHOST, wait, refused);
-        assert_eq!(crate::cli::error_code(&explained), ("unavailable", 3));
+        assert_eq!(crate::cli::error_code(&explained), ("camera_not_found", 3));
         assert!(explained.to_string().contains("sim:0"), "{explained}");
+        // An address nothing answers at is the same: no camera is there, and
+        // waiting longer would not find one.
+        let address = Ipv4Addr::new(192, 0, 2, 77);
+        let unanswered = explain_probe_failure(
+            address,
+            wait,
+            anyhow::Error::new(gige::GvcpTimeout {
+                command: 0x0084,
+                waited: wait,
+            }),
+        );
+        assert_eq!(crate::cli::error_code(&unanswered), ("camera_not_found", 3));
+        let classified = crate::types::classify(&unanswered);
+        assert!(
+            classified
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("capturefab network")),
+            "{:?}",
+            classified.hint
+        );
+        assert_eq!(
+            classified.details,
+            Some(serde_json::json!({ "candidates": [] }))
+        );
+        assert!(
+            unanswered.to_string().contains("0x0084 went unanswered"),
+            "{unanswered}"
+        );
+        let routed = explain_probe_failure(
+            address,
+            wait,
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+        );
+        assert_eq!(crate::cli::error_code(&routed), ("camera_not_found", 3));
+        assert!(
+            crate::types::classify(&routed)
+                .hint
+                .is_some_and(|hint| hint.contains("onvif://192.0.2.77")),
+        );
         let other = explain_probe_failure(
             Ipv4Addr::LOCALHOST,
             wait,

@@ -276,6 +276,7 @@ FFmpeg on its standard input. Results and errors never show credentials. `onvif 
 | `exists` | 1 | Choose a new name, add `{seq}` to `-o`, or pass `--on-exists number`. |
 | `frame_timeout` | 4 | Raise `--timeout`; check `info` for the frame rate, exposure and trigger. |
 | `trigger_timeout` | 4 | Send the trigger, raise `--timeout`, or `set trigger=off`. |
+| `unavailable`, `timeout` | 3, 4 | The camera, stream, session or service did not answer. Follow `error.hint`, check the address and network, then retry once. |
 | `auth_required`, `auth_rejected` | 3 | Save the sign-in with `login add`. |
 | `ffmpeg_missing` | 3 | Run `doctor`; set `CAPTUREFAB_FFMPEG` to an FFmpeg executable. |
 | `permission_denied` | 3 | Follow `error.hint` (on macOS: allow Camera or Local Network for the terminal app). |

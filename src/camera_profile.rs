@@ -34,27 +34,6 @@ impl CameraKind {
             Self::Thermal => "Thermal",
         }
     }
-
-    pub fn summary(self) -> &'static str {
-        match self {
-            Self::Unknown => "Camera type is not reported. Available controls are shown below.",
-            Self::AreaScan => {
-                "Capture complete image frames. Adjust exposure, frame timing and image region."
-            }
-            Self::LineScan => {
-                "Build an image one line at a time. Match line timing and triggers to object motion."
-            }
-            Self::Depth => {
-                "Capture distance data. Select components and configure the measurement range and calibration."
-            }
-            Self::Microscope => {
-                "Inspect small details. Adjust focus, magnification and illumination before capturing."
-            }
-            Self::Thermal => {
-                "Capture thermal measurements. Configure radiometric output and temperature calibration."
-            }
-        }
-    }
 }
 
 impl std::fmt::Display for CameraKind {
@@ -73,46 +52,11 @@ pub enum DetectionSource {
     DeviceMetadata,
 }
 
-impl std::fmt::Display for DetectionSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Unknown => "Not reported",
-            Self::Identity => "Camera identity",
-            Self::Features => "Camera features",
-            Self::DeviceMetadata => "Device metadata",
-        })
-    }
-}
-
-/// An advertised control family, independent of the camera's classification.
-/// Individual FeatureInfo metadata remains authoritative for availability,
-/// write access, choices and limits.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum CameraCapability {
-    Exposure,
-    Gain,
-    Roi,
-    Binning,
-    FrameRate,
-    LineRate,
-    Trigger,
-    Encoder,
-    DepthComponents,
-    DepthRange,
-    SpatialCalibration,
-    Focus,
-    Magnification,
-    Illumination,
-    Temperature,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CameraProfile {
     pub kind: CameraKind,
     pub source: DetectionSource,
     pub evidence: Vec<String>,
-    pub capabilities: Vec<CameraCapability>,
 }
 
 fn normalized(text: &str) -> String {
@@ -145,111 +89,6 @@ fn declared_kind(features: &[FeatureInfo], names: &[&str]) -> Option<(CameraKind
         let kind = metadata_kind(value)?;
         Some((kind, format!("{} = {}", f.name, value)))
     })
-}
-
-fn capability(features: &[FeatureInfo], names: &[&str], prefixes: &[&str]) -> bool {
-    features.iter().any(|feature| {
-        names.contains(&feature.name.as_str())
-            || prefixes
-                .iter()
-                .any(|prefix| feature.name.starts_with(prefix))
-    })
-}
-
-fn capabilities(features: &[FeatureInfo]) -> Vec<CameraCapability> {
-    use CameraCapability::*;
-    // This stable order also makes discovery and snapshots reproducible.
-    [
-        (
-            Exposure,
-            capability(features, &[], &["ExposureTime", "ExposureAuto"]),
-        ),
-        (Gain, capability(features, &[], &["Gain"])),
-        (
-            Roi,
-            capability(features, &["Width", "Height", "OffsetX", "OffsetY"], &[]),
-        ),
-        (
-            Binning,
-            capability(features, &[], &["Binning", "Decimation"]),
-        ),
-        (
-            FrameRate,
-            capability(features, &[], &["AcquisitionFrameRate"]),
-        ),
-        (
-            LineRate,
-            capability(features, &[], &["AcquisitionLineRate", "LineRate"]),
-        ),
-        (Trigger, capability(features, &[], &["Trigger"])),
-        (Encoder, capability(features, &[], &["Encoder"])),
-        (
-            DepthComponents,
-            capability(
-                features,
-                &["ComponentSelector", "ComponentEnable", "Scan3dOutputMode"],
-                &[],
-            ),
-        ),
-        (
-            DepthRange,
-            capability(
-                features,
-                &[
-                    "DepthMin",
-                    "DepthMax",
-                    "DepthRange",
-                    "DepthRangeMin",
-                    "DepthRangeMax",
-                    "Scan3dDistanceMin",
-                    "Scan3dDistanceMax",
-                ],
-                &[],
-            ),
-        ),
-        (
-            SpatialCalibration,
-            capability(
-                features,
-                &["DepthScale", "DepthUnit", "StereoBaseline"],
-                &["Scan3dCoordinate", "Scan3dTransform", "Scan3dAxis"],
-            ),
-        ),
-        (Focus, capability(features, &["LensPosition"], &["Focus"])),
-        (
-            Magnification,
-            capability(
-                features,
-                &["Zoom", "ZoomFactor"],
-                &["Magnification", "Objective"],
-            ),
-        ),
-        (
-            Illumination,
-            capability(
-                features,
-                &[],
-                &["Illumination", "LightSource", "Lighting", "LEDIntensity"],
-            ),
-        ),
-        (
-            Temperature,
-            capability(
-                features,
-                &[
-                    "IRFormat",
-                    "Emissivity",
-                    "ReflectedTemperature",
-                    "AtmosphericTemperature",
-                    "ObjectTemperature",
-                ],
-                &["TemperatureLinear", "TemperatureRange", "Radiometric"],
-            ),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(capability, present)| present.then_some(capability))
-    .collect()
 }
 
 fn specialty_features(features: &[FeatureInfo]) -> Option<(CameraKind, Vec<String>)> {
@@ -356,15 +195,13 @@ fn identity_kind(info: &CameraInfo) -> Option<CameraKind> {
     }
 }
 
-/// Detect from read-only metadata. Type never determines capabilities, and
-/// missing metadata leaves a camera usable with its ordinary feature list.
+/// Detect from read-only metadata. Missing metadata leaves a camera usable
+/// with its ordinary feature list.
 pub fn detect(info: &CameraInfo, features: &[FeatureInfo]) -> CameraProfile {
-    let capabilities = capabilities(features);
     let profile = |kind, source, evidence| CameraProfile {
         kind,
         source,
         evidence,
-        capabilities: capabilities.clone(),
     };
     let declared = declared_kind(features, &["DeviceType", "CameraType", "SensorType"]);
     // Device class is authoritative. Scan geometry is less specific: depth
@@ -410,7 +247,9 @@ pub fn detect(info: &CameraInfo, features: &[FeatureInfo]) -> CameraProfile {
     // scan fallback; Height=1 is never interpreted as a line scan camera.
     if feature(features, "Width").is_some()
         && feature(features, "Height").is_some()
-        && capabilities.contains(&CameraCapability::FrameRate)
+        && features
+            .iter()
+            .any(|f| f.name.starts_with("AcquisitionFrameRate"))
     {
         return profile(
             CameraKind::AreaScan,
@@ -465,7 +304,6 @@ mod tests {
         let p = detect(&camera("Thermal microscope camera"), &features);
         assert_eq!(p.kind, CameraKind::Depth);
         assert_eq!(p.source, DetectionSource::DeviceMetadata);
-        assert!(p.capabilities.contains(&CameraCapability::LineRate));
     }
 
     #[test]
@@ -542,7 +380,6 @@ mod tests {
             let p = detect(&camera("Camera"), &[f("DeviceScanType", json!(geometry))]);
             assert_eq!(p.kind, CameraKind::Depth);
             assert_eq!(p.source, DetectionSource::DeviceMetadata);
-            assert!(p.capabilities.is_empty());
         }
         let p = detect(&camera("Camera"), &[f("PixelFormat", json!("Coord3D_C16"))]);
         assert_eq!(p.kind, CameraKind::Depth);
@@ -594,22 +431,29 @@ mod tests {
             let p = detect(&camera(model), &[]);
             assert_eq!(p.kind, kind, "{model}");
             assert_eq!(p.source, DetectionSource::Identity);
-            assert!(p.capabilities.is_empty());
         }
     }
 
     #[test]
-    fn unknown_metadata_is_safe_and_capabilities_are_independent() {
-        let features = [
+    fn unknown_metadata_is_safe_and_frame_timing_means_area_scan() {
+        let mut features = vec![
             f("DeviceType", json!("Transmitter")),
             f("ExposureTime", json!(1000)),
             f("Width", json!(640)),
+            f("Height", json!(480)),
         ];
         let p = detect(&camera("Generic"), &features);
         assert_eq!(p.kind, CameraKind::Unknown);
-        assert!(p.capabilities.contains(&CameraCapability::Exposure));
-        assert!(p.capabilities.contains(&CameraCapability::Roi));
-        assert!(!p.capabilities.contains(&CameraCapability::DepthRange));
+        assert_eq!(p.source, DetectionSource::Unknown);
+        features.push(f("AcquisitionFrameRateAbs", json!(30)));
+        let p = detect(&camera("Generic"), &features);
+        assert_eq!(p.kind, CameraKind::AreaScan);
+        assert_eq!(p.source, DetectionSource::Features);
+        features.retain(|f| f.name != "Height");
+        assert_eq!(
+            detect(&camera("Generic"), &features).kind,
+            CameraKind::Unknown
+        );
     }
 
     #[test]

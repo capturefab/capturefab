@@ -1365,7 +1365,8 @@ fn media_streams(
         if !names.insert(token.to_string()) {
             continue;
         }
-        let name = child_text(node, "Name").unwrap_or(token).to_string();
+        let name =
+            crate::types::printable_line(child_text(node, "Name").unwrap_or(token)).into_owned();
         // Media1 Profiles/VideoEncoderConfiguration, Media2
         // Profiles/Configurations/VideoEncoder.
         let encoder = child_element(node, "VideoEncoderConfiguration").or_else(|| {
@@ -1373,7 +1374,7 @@ fn media_streams(
         });
         let encoding = encoder
             .and_then(|n| child_text(n, "Encoding"))
-            .map(str::to_string);
+            .map(|text| crate::types::printable_line(text).into_owned());
         let width = encoder
             .and_then(|n| child_text(n, "Width"))
             .and_then(|v| v.parse().ok());
@@ -1729,7 +1730,10 @@ pub fn camera_infos_until(
             .collect(),
     )
 }
-/// A discovered device as `list` shows it.
+/// A discovered device as `list` shows it. Anything on the network can
+/// answer discovery, so nothing it names keeps control characters that
+/// could steer the terminal that shows it: a name, percent-encoded in a
+/// scope, that decodes to one is no name.
 fn camera_info(device: OnvifDevice) -> crate::types::CameraInfo {
     let endpoint = crate::media::redact_url(&device.endpoint);
     let name = device
@@ -1743,7 +1747,7 @@ fn camera_info(device: OnvifDevice) -> crate::types::CameraInfo {
         transport: crate::types::Transport::Media,
         vendor: "ONVIF".into(),
         model: name,
-        serial: device.uuid,
+        serial: crate::types::printable_line(&device.uuid).into_owned(),
         address: Some(endpoint),
         profile: Default::default(),
     }
@@ -1779,6 +1783,26 @@ mod tests {
         let devices = parse_discovery(xml, "192.168.1.3:3702".parse().unwrap()).unwrap();
         assert_eq!(devices[0].uuid, "urn:uuid:test");
         assert_eq!(devices[0].addresses.len(), 2);
+        assert_eq!(camera_info(devices[0].clone()).model, "Camera");
+    }
+    #[test]
+    fn discovered_names_cannot_steer_the_terminal() {
+        // Anything on the network can answer a probe. A scope's name is
+        // percent-encoded, and one that decodes to an escape is no name;
+        // the endpoint's address is XML text, which can hold C1 controls.
+        let xml = probe_match(
+            "tds:Device",
+            "urn:uuid:a\u{9b}2J",
+            "http://192.168.1.3/onvif",
+        )
+        .replace("name/IPC", "name/Door%1B%5B2J");
+        let devices = parse_discovery(&xml, "192.168.1.3:3702".parse().unwrap()).unwrap();
+        let info = camera_info(devices[0].clone());
+        assert_eq!(info.model, "Network camera");
+        assert_eq!(info.serial, "urn:uuid:a\u{fffd}2J");
+        let raw = xml.replace("name/Door%1B%5B2J", "name/Door\u{9b}2J");
+        let devices = parse_discovery(&raw, "192.168.1.3:3702".parse().unwrap()).unwrap();
+        assert_eq!(camera_info(devices[0].clone()).model, "Network camera");
     }
     #[test]
     fn discovery_drops_addresses_no_uri_could_hold() {
@@ -2613,7 +2637,8 @@ mod tests {
                         }
                         "GetProfiles" => {
                             assert!(body.contains("<tr2:GetProfiles><tr2:Type>VideoEncoder</tr2:Type></tr2:GetProfiles>"), "{body}");
-                            MEDIA2_PROFILES.into()
+                            // A profile name can hold controls XML allows.
+                            MEDIA2_PROFILES.replace(">mainStream<", ">main\u{9b}2J\nStream<")
                         }
                         _ => {
                             assert!(body.contains("<tr2:Protocol>RtspUnicast</tr2:Protocol><tr2:ProfileToken>Profile_1</tr2:ProfileToken>"), "{body}");
@@ -2628,7 +2653,7 @@ mod tests {
             server.join().unwrap();
             assert_eq!(streams.len(), 1);
             assert_eq!(streams[0].token, "Profile_1");
-            assert_eq!(streams[0].name, "mainStream");
+            assert_eq!(streams[0].name, "main\u{fffd}2J Stream");
             assert_eq!(streams[0].encoding.as_deref(), Some("H265"));
             assert_eq!(
                 (streams[0].width, streams[0].height),
