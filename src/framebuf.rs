@@ -6,9 +6,9 @@
 //! reference-counted, read-only buffer. Cloning a `Frame` then costs a
 //! reference, so the saver, the inspector and the recording's writer all
 //! read the one buffer the camera filled, and it goes back to the pool from
-//! whichever thread drops it last. Writing to a shared frame goes through
-//! [`FrameBuf::make_mut`], which copies only when the buffer is shared, and
-//! counts that copy.
+//! whichever thread drops it last. Nothing writes to a frozen buffer:
+//! [`FrameBuf::into_pool_vec`] takes it back to write to, copying (and
+//! counting the copy) only when another frame still shares it.
 //!
 //! The pool bounds idle memory, not live frames: it keeps at most
 //! [`MAX_IDLE`] buffers, holding no more than 1/[`IDLE_SHARE`] of the memory
@@ -275,9 +275,8 @@ impl Backing {
 }
 
 impl FrameBuf {
-    /// The buffer to write to: this one when nothing else shares it, else a
-    /// copy from the pool, which is counted. Frames are written only before
-    /// they are frozen; tests change frames they hold to make bad ones.
+    /// `into_pool_vec` in place, for tests that change frames they hold to
+    /// make bad ones.
     #[cfg(test)]
     pub(crate) fn make_mut(&mut self) -> &mut PoolVec {
         if Arc::get_mut(&mut self.0).is_none() {
@@ -288,7 +287,8 @@ impl FrameBuf {
             Backing::Pool(vec) => vec,
         }
     }
-    /// The buffer itself, to write to, by the same rule as `make_mut`.
+    /// The buffer itself, to write to: this one when nothing else shares
+    /// it, else a copy from the pool, which is counted.
     pub(crate) fn into_pool_vec(self) -> PoolVec {
         match Arc::try_unwrap(self.0) {
             Ok(Backing::Pool(vec)) => vec,

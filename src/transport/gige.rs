@@ -2360,7 +2360,10 @@ impl Assembler {
                     // A resent last packet may add or drop padding; the bytes
                     // both copies hold must match. Only empty places are
                     // predicted, so a duplicate never lands.
-                    let kept = &packet.data.bytes()[..range.len()];
+                    let Data::Bytes(bytes, _) = packet.data else {
+                        bail!("GVSP payload landed on a packet already received");
+                    };
+                    let kept = &bytes[..range.len()];
                     let held = (frame.end - offset).min(block_size);
                     let common = held.min(kept.len());
                     let data = frame.data.as_ref().context("GVSP frame buffer missing")?;

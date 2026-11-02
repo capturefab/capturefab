@@ -6386,6 +6386,16 @@ esac"#
             panic!("I420 is luma and chroma");
         };
         assert_eq!((luma.as_ptr(), chroma.len()), (gray.data.as_ptr(), 8));
+        // 8-bit coordinate and confidence planes are their own luma, as a
+        // conversion would make them.
+        for format in [0x0108_00b1, 0x0108_00c6] {
+            let plane = Frame {
+                pixel_format: format,
+                ..gray.clone()
+            };
+            let luma = crate::frame::convert(&plane, |[gray, _, _]| gray).unwrap();
+            assert_eq!(JetsonInput::I420.bytes(&plane).unwrap()[..9], luma[..]);
+        }
         // Other monochrome formats are converted to 8-bit luma.
         let wide = Frame {
             pixel_format: 0x0110_0005,
