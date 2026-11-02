@@ -391,7 +391,7 @@ capturefab -v info -c sim:0</code></pre><button class="copy-button" type="button
           <p>For a bug report, include <code>capturefab --version</code>, the operating system, the camera type, the exact command and its JSON output, and <code>capturefab --json doctor</code>. Remove private addresses and names before you share them.</p>
         </article>
 
-        <article class="doc-section" id="environment" data-doc-section data-doc-title="Environment variables and folders" data-doc-category="Reference" data-doc-tags="environment,variables,CAPTUREFAB_JSON,CAPTUREFAB_CAMERA,CAPTUREFAB_SESSION,CAPTUREFAB_KEEP,CAPTUREFAB_FFMPEG,CAPTUREFAB_SESSION_DIR,CAPTUREFAB_STATE_DIR,CAPTUREFAB_CACHE_DIR,CAPTUREFAB_MIN_FREE,CAPTUREFAB_THREADS,CAPTUREFAB_IMAGES,folders,state,cache,read-only">
+        <article class="doc-section" id="environment" data-doc-section data-doc-title="Environment variables and folders" data-doc-category="Reference" data-doc-tags="environment,variables,CAPTUREFAB_JSON,CAPTUREFAB_CAMERA,CAPTUREFAB_SESSION,CAPTUREFAB_KEEP,CAPTUREFAB_FFMPEG,CAPTUREFAB_SESSION_DIR,CAPTUREFAB_STATE_DIR,CAPTUREFAB_CACHE_DIR,CAPTUREFAB_MIN_FREE,CAPTUREFAB_THREADS,CAPTUREFAB_IMAGES,CAPTUREFAB_GVSP_SCATTER,folders,state,cache,read-only">
           <p class="eyebrow">Reference</p><h2>Environment variables and folders</h2>
           <p class="doc-summary">Variables set defaults for flags and move the folders Capturefab uses.</p>
           <div class="table-scroll"><table><caption>Environment variables</caption><thead><tr><th scope="col">Variable</th><th scope="col">Purpose</th></tr></thead><tbody>
@@ -408,6 +408,7 @@ capturefab -v info -c sim:0</code></pre><button class="copy-button" type="button
             <tr><td><code>CAPTUREFAB_THREADS</code></td><td>At most this many image processing threads</td></tr>
             <tr><td><code>CAPTUREFAB_IMAGES</code></td><td>How <code>watch --show</code> draws frames: <code>kitty</code>, <code>iterm</code>, <code>truecolor</code>, <code>256</code> or <code>none</code></td></tr>
             <tr><td><code>CAPTUREFAB_MAX_CAMERAS</code></td><td>Cameras one session may hold, 1–64 (default 16)</td></tr>
+            <tr><td><code>CAPTUREFAB_GVSP_SCATTER=0</code></td><td>GigE Vision packets are received whole and copied into their frames, rather than received straight into them</td></tr>
           </tbody></table></div>
           <p>Sessions live in the runtime folder (<code>$XDG_RUNTIME_DIR/capturefab</code> on Linux), presets and the sign-in index in the state folder (<code>~/.local/state/capturefab</code> on Linux; the same folder as sessions elsewhere), and the extracted FFmpeg in the cache folder. <code>capturefab --json doctor</code> prints all of them in <code>dirs</code>, and under <code>folders</code> the fallbacks it passed over. Where a default folder cannot be written, as on a read-only root file system, Capturefab falls back to a private folder in a tmpfs and turns off only what needs the missing folder; the <a href="guides/embedded.md">embedded and read-only hosts guide</a> lists each case.</p>
         </article>

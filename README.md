@@ -141,6 +141,7 @@ network paths. More: [CLI workflows](docs/cli-workflows.md),
 | `CAPTUREFAB_THREADS` | at most this many image processing threads |
 | `CAPTUREFAB_IMAGES` | how `--show` draws frames: `kitty`, `iterm`, `truecolor`, `256` or `none` |
 | `CAPTUREFAB_MAX_CAMERAS` | cameras one session may hold, 1–64 (default 16) |
+| `CAPTUREFAB_GVSP_SCATTER=0` | GigE Vision packets are received whole and copied into their frames, rather than received straight into them |
 
 `capturefab --json doctor` prints the folders in use (`dirs`, and under `folders` the fallbacks
 it passed over), including the private folder that holds `inspect` previews. Where a default

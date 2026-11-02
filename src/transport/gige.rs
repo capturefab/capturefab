@@ -3,6 +3,7 @@
 //! Wire constants and layouts follow the GigE Vision bootstrap/GVCP/GVSP
 //! protocols (also documented in Aravis' protocol headers). This implementation
 //! does not link to, embed, or translate Aravis code.
+use crate::copies::Site;
 use crate::framebuf::{PoolVec, pool};
 use crate::types::{
     Backend, CameraInfo, Categorized, Frame, RegisterIo, Transport, TransportStats,
@@ -64,6 +65,14 @@ const TRAVERSAL: Duration = Duration::from_secs(10);
 /// The most packets taken in at once when settings change: a 64 MiB
 /// receive buffer of 1500-byte packets.
 const MAX_TAKEN_IN: usize = 50_000;
+/// `CAPTUREFAB_GVSP_SCATTER=0` receives every GVSP packet whole and copies
+/// its payload into its frame, as before payloads were received in place.
+pub(crate) const SCATTER_ENV: &str = "CAPTUREFAB_GVSP_SCATTER";
+
+/// Whether payload packets are received in place, as the setting says.
+fn scatter(setting: Option<&std::ffi::OsStr>) -> bool {
+    setting.is_none_or(|value| value != "0")
+}
 
 fn be16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
@@ -1096,6 +1105,9 @@ impl Backend for GigE {
                     gvcp,
                     source,
                     buffer,
+                    header: [0; 20],
+                    overflow: vec![0; 64 * 1024],
+                    scatter: scatter(std::env::var_os(SCATTER_ENV).as_deref()),
                     timeout: POLL,
                     next_poll: Instant::now(),
                     next_traversal: Instant::now() + TRAVERSAL,
@@ -1265,12 +1277,10 @@ impl Backend for GigE {
                 stream.socket.set_read_timeout(Some(wait))?;
                 stream.timeout = wait;
             }
-            let received = stream.socket.recv_from(&mut stream.buffer);
+            let received = stream.receive(camera);
             now = Instant::now();
             match received {
-                Ok((length, source)) if source.ip() == camera && source != stream.gvcp => {
-                    crate::copies::record(crate::copies::Site::GvspReceive, length);
-                    let result = stream.assembler.push_at(&stream.buffer[..length], now);
+                Ok(Some(result)) => {
                     stream.flush();
                     match result {
                         Ok(Some(frame)) => return Ok(frame),
@@ -1285,7 +1295,7 @@ impl Backend for GigE {
                         Err(error) => last_error = Some(error.to_string()),
                     }
                 }
-                Ok(_) => {}
+                Ok(None) => {}
                 Err(error)
                     if is_receive_timeout(&error)
                         || matches!(
@@ -1615,7 +1625,13 @@ struct Stream {
     socket: UdpSocket,
     gvcp: SocketAddr,
     source: Option<SocketAddr>,
+    /// Packets received whole: those the assembler cannot place in advance.
     buffer: Vec<u8>,
+    /// A predicted packet's header, and what it holds beyond its slot.
+    header: [u8; 20],
+    overflow: Vec<u8>,
+    /// Payload packets are received straight into their frames.
+    scatter: bool,
     timeout: Duration,
     next_poll: Instant,
     next_traversal: Instant,
@@ -1656,19 +1672,11 @@ impl Stream {
     fn take_in(&mut self, camera: IpAddr) -> u32 {
         if self.socket.set_nonblocking(true).is_ok() {
             for _ in 0..MAX_TAKEN_IN {
-                match self.socket.recv_from(&mut self.buffer) {
-                    Ok((length, source)) if source.ip() == camera && source != self.gvcp => {
-                        crate::copies::record(crate::copies::Site::GvspReceive, length);
-                        // The frame it completes, kept in turn; a packet in
-                        // error leaves its frame incomplete, as it would on
-                        // its way to `next_frame`.
-                        if let Ok(Some(frame)) = self
-                            .assembler
-                            .push_at(&self.buffer[..length], Instant::now())
-                        {
-                            self.assembler.ready.push_front(frame);
-                        }
-                    }
+                match self.receive(camera) {
+                    // The frame it completes, kept in turn; a packet in
+                    // error leaves its frame incomplete, as it would on its
+                    // way to `next_frame`.
+                    Ok(Some(Ok(Some(frame)))) => self.assembler.ready.push_front(frame),
                     Ok(_) => {}
                     Err(_) => break,
                 }
@@ -1677,6 +1685,68 @@ impl Stream {
             self.flush();
         }
         u32::try_from(self.assembler.ready.len() + self.assembler.frames.len()).unwrap_or(u32::MAX)
+    }
+    /// Receive one datagram and take it in when it came from `camera`'s
+    /// stream: straight into its place in a frame when the assembler can
+    /// say which payload packet comes next, else whole into the buffer, to
+    /// be copied from there. None for a datagram from anywhere else.
+    fn receive(&mut self, camera: IpAddr) -> std::io::Result<Option<Result<Option<Frame>>>> {
+        let predicted = self.scatter.then(|| self.assembler.predict()).flatten();
+        let Some(slot) = predicted else {
+            let (length, source) = self.socket.recv_from(&mut self.buffer)?;
+            if source.ip() != camera || source == self.gvcp {
+                return Ok(None);
+            }
+            crate::copies::record(Site::GvspReceive, length);
+            let site = if self.scatter {
+                Site::GvspFallback
+            } else {
+                Site::GvspAssemble
+            };
+            let packet = &self.buffer[..length];
+            return Ok(Some(self.assembler.push_counted(
+                packet,
+                Instant::now(),
+                site,
+            )));
+        };
+        let Stream {
+            socket,
+            header,
+            overflow,
+            assembler,
+            buffer,
+            ..
+        } = self;
+        let place = assembler
+            .slot_mut(&slot)
+            .expect("a predicted slot lies in its frame's buffer");
+        let (received, flags, source) = {
+            let parts = [&mut header[..slot.header], place, &mut overflow[..]];
+            // SAFETY: the socket only writes the bytes it receives into
+            // these buffers, which are initialized already, and never
+            // reads them or writes uninitialized bytes into them.
+            let mut parts = parts.map(|part| unsafe {
+                socket2::MaybeUninitSlice::new(std::slice::from_raw_parts_mut(
+                    part.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                    part.len(),
+                ))
+            });
+            socket2::SockRef::from(&*socket).recv_from_vectored(&mut parts)?
+        };
+        let source = source.as_socket();
+        if source.is_none_or(|source| source.ip() != camera || source == self.gvcp) {
+            // A stray datagram only overwrote a place still empty.
+            return Ok(None);
+        }
+        crate::copies::record(Site::GvspReceive, received);
+        Ok(Some(assembler.landed(
+            &slot,
+            (&header[..], received, flags.is_truncated()),
+            overflow,
+            buffer,
+            Instant::now(),
+        )))
     }
     fn flush(&mut self) {
         for (block, extended, first, last) in self.assembler.requests.drain(..) {
@@ -1782,9 +1852,35 @@ struct GvspPacket<'a> {
     id: u32,
     kind: u8,
     extended: bool,
-    data: &'a [u8],
+    data: Data<'a>,
 }
-fn parse_gvsp(packet: &[u8]) -> Result<GvspPacket<'_>> {
+/// What a packet carries after its header.
+#[derive(Clone, Copy)]
+enum Data<'a> {
+    /// Its bytes, which a payload packet copies into its frame, counted at
+    /// the site.
+    Bytes(&'a [u8], Site),
+    /// A payload of this many bytes, already received in its place in the
+    /// frame's buffer.
+    Landed(usize),
+}
+impl<'a> Data<'a> {
+    fn len(self) -> usize {
+        match self {
+            Data::Bytes(bytes, _) => bytes.len(),
+            Data::Landed(length) => length,
+        }
+    }
+    /// The bytes of a leader or trailer, which never land in a frame.
+    fn bytes(self) -> &'a [u8] {
+        match self {
+            Data::Bytes(bytes, _) => bytes,
+            Data::Landed(_) => &[],
+        }
+    }
+}
+/// The header's size and fields of a GVSP packet, `data` empty.
+fn parse_header(packet: &[u8]) -> Result<(usize, GvspPacket<'static>)> {
     ensure!(packet.len() >= 8, "truncated GVSP header");
     let info = be32(packet, 4);
     let extended = info & 0x8000_0000 != 0;
@@ -1794,14 +1890,36 @@ fn parse_gvsp(packet: &[u8]) -> Result<GvspPacket<'_>> {
     } else {
         (be16(packet, 2) as u64, info & 0x00ff_ffff, 8)
     };
-    Ok(GvspPacket {
+    let packet = GvspPacket {
         status: be16(packet, 0),
         frame,
         id,
         kind: ((info >> 24) & 0x7f) as u8,
         extended,
-        data: &packet[header..],
+        data: Data::Landed(0),
+    };
+    Ok((header, packet))
+}
+/// A GVSP packet whose payload is copied into its frame, counted at `site`.
+fn parse_gvsp(packet: &[u8], site: Site) -> Result<GvspPacket<'_>> {
+    let (header, parsed) = parse_header(packet)?;
+    Ok(GvspPacket {
+        data: Data::Bytes(&packet[header..], site),
+        ..parsed
     })
+}
+/// Where the next packet of the newest frame is expected: the payload
+/// packet after the highest one received, when its place is still empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Slot {
+    block: u64,
+    extended: bool,
+    id: u32,
+    /// The packet header's size.
+    header: usize,
+    /// Its payload's place in the frame's buffer.
+    offset: usize,
+    len: usize,
 }
 
 struct PartialFrame {
@@ -1972,6 +2090,9 @@ struct Assembler {
     budget: Budget,
     blocks: Blocks,
     stats: TransportStats,
+    /// Payload packets, and their bytes, copied into their frames rather
+    /// than received in place.
+    copied: (u64, u64),
 }
 impl Assembler {
     fn new(payload_limit: usize, packet_size: usize, timestamp_frequency: u64) -> Self {
@@ -1997,7 +2118,86 @@ impl Assembler {
             },
             blocks: Blocks::default(),
             stats: TransportStats::default(),
+            copied: (0, 0),
         }
+    }
+    /// Where the next packet is expected to land: the newest frame's
+    /// payload packet after the highest one received, once the frame has
+    /// its buffer, if that packet's place is still empty and inside the
+    /// frame.
+    fn predict(&self) -> Option<Slot> {
+        let frame = self.frames.last()?;
+        frame.data.as_ref()?;
+        let (block_size, max_packets) = self.limits[frame.extended as usize]?;
+        let id = frame.end.div_ceil(block_size) + 1;
+        let offset = (id - 1) * block_size;
+        if id > max_packets
+            || frame.packets.is_some_and(|packets| id > packets)
+            || offset >= self.payload_limit
+            || bit(&frame.received, id as u32)
+        {
+            return None;
+        }
+        Some(Slot {
+            block: frame.block,
+            extended: frame.extended,
+            id: id as u32,
+            header: if frame.extended { 20 } else { 8 },
+            offset,
+            len: block_size.min(self.payload_limit - offset),
+        })
+    }
+    /// The place in the newest frame's buffer `slot` predicts.
+    fn slot_mut(&mut self, slot: &Slot) -> Option<&mut [u8]> {
+        let frame = self
+            .frames
+            .last_mut()
+            .filter(|frame| frame.block == slot.block)?;
+        let data = frame.data.as_mut()?;
+        data.get_mut(slot.offset..slot.offset + slot.len)
+    }
+    /// Take in a datagram of `received` bytes that was received as `slot`
+    /// predicted: its first `slot.header` bytes in `header`, then `slot.len`
+    /// in the slot, the rest in `overflow`. A payload packet of the slot's
+    /// own frame and ID has landed and is only marked; anything else is
+    /// put together in `scratch` and taken in as a whole packet, copied.
+    fn landed(
+        &mut self,
+        slot: &Slot,
+        (header, received, truncated): (&[u8], usize, bool),
+        overflow: &[u8],
+        scratch: &mut Vec<u8>,
+        now: Instant,
+    ) -> Result<Option<Frame>> {
+        let landed = (!truncated && received > slot.header)
+            .then(|| parse_header(&header[..slot.header]).ok())
+            .flatten()
+            .filter(|(size, packet)| {
+                *size == slot.header
+                    && matches!(packet.status, 0 | 0x0100)
+                    && packet.kind == 3
+                    && (packet.frame, packet.extended, packet.id)
+                        == (slot.block, slot.extended, slot.id)
+            });
+        if let Some((_, packet)) = landed {
+            return self.take(
+                GvspPacket {
+                    data: Data::Landed(received - slot.header),
+                    ..packet
+                },
+                now,
+            );
+        }
+        // At most one packet: a resend, a reorder, a leader or a trailer.
+        scratch.clear();
+        scratch.extend_from_slice(&header[..received.min(slot.header)]);
+        let rest = received.saturating_sub(slot.header);
+        let in_slot = rest.min(slot.len);
+        let place = self.slot_mut(slot).context("GVSP frame buffer missing")?;
+        scratch.extend_from_slice(&place[..in_slot]);
+        scratch.extend_from_slice(&overflow[..(rest - in_slot).min(overflow.len())]);
+        crate::copies::record(Site::GvspFallback, scratch.len());
+        self.push_counted(scratch, now, Site::GvspFallback)
     }
     fn incomplete_summary(&self) -> String {
         match self.frames.last() {
@@ -2024,8 +2224,16 @@ impl Assembler {
     fn push(&mut self, packet: &[u8]) -> Result<Option<Frame>> {
         self.push_at(packet, Instant::now())
     }
+    /// Take in a packet received whole, copying its payload into its frame.
+    #[cfg(test)]
     fn push_at(&mut self, packet: &[u8], now: Instant) -> Result<Option<Frame>> {
-        let packet = parse_gvsp(packet)?;
+        self.push_counted(packet, now, Site::GvspAssemble)
+    }
+    fn push_counted(&mut self, packet: &[u8], now: Instant, site: Site) -> Result<Option<Frame>> {
+        let packet = parse_gvsp(packet, site)?;
+        self.take(packet, now)
+    }
+    fn take(&mut self, packet: GvspPacket<'_>, now: Instant) -> Result<Option<Frame>> {
         self.stats.packets_received += 1;
         let block = packet.frame;
         let index = self.frames.iter().rposition(|frame| frame.block == block);
@@ -2074,7 +2282,7 @@ impl Assembler {
         match packet.kind {
             1 => {
                 ensure!(packet.id == 0, "GVSP leader packet ID must be zero");
-                let leader = ImageLeader::parse(packet.data, self.payload_limit)?;
+                let leader = ImageLeader::parse(packet.data.bytes(), self.payload_limit)?;
                 if let Some(previous) = &frame.leader {
                     ensure!(previous == &leader, "conflicting duplicate GVSP leader");
                 } else {
@@ -2104,15 +2312,13 @@ impl Assembler {
                 }
             }
             2 => {
+                let data = packet.data.bytes();
                 ensure!(
-                    packet.id > 1 && packet.data.len() >= 8,
+                    packet.id > 1 && data.len() >= 8,
                     "invalid GVSP image trailer"
                 );
-                ensure!(
-                    be16(packet.data, 2) & !0x4000 == 1,
-                    "GVSP trailer is not an image"
-                );
-                let trailer = (packet.id, be32(packet.data, 4));
+                ensure!(be16(data, 2) & !0x4000 == 1, "GVSP trailer is not an image");
+                let trailer = (packet.id, be32(data, 4));
                 if let Some(previous) = frame.trailer {
                     ensure!(previous == trailer, "conflicting duplicate GVSP trailer");
                 } else {
@@ -2150,10 +2356,11 @@ impl Assembler {
                 // Padding in a last packet may run past the payload size;
                 // only bytes inside it are kept.
                 let range = offset..(offset + length).min(self.payload_limit);
-                let kept = &packet.data[..range.len()];
                 if bit(&frame.received, packet.id) {
                     // A resent last packet may add or drop padding; the bytes
-                    // both copies hold must match.
+                    // both copies hold must match. Only empty places are
+                    // predicted, so a duplicate never lands.
+                    let kept = &packet.data.bytes()[..range.len()];
                     let held = (frame.end - offset).min(block_size);
                     let common = held.min(kept.len());
                     let data = frame.data.as_ref().context("GVSP frame buffer missing")?;
@@ -2175,11 +2382,15 @@ impl Assembler {
                     let data = frame
                         .data
                         .get_or_insert_with(|| pool().take_stale(self.payload_limit));
-                    crate::copies::record(crate::copies::Site::GvspAssemble, kept.len());
-                    data[range].copy_from_slice(kept);
+                    if let Data::Bytes(bytes, site) = packet.data {
+                        crate::copies::record(site, range.len());
+                        self.copied.0 += 1;
+                        self.copied.1 += range.len() as u64;
+                        data[range.clone()].copy_from_slice(&bytes[..range.len()]);
+                    }
                     set_bit(&mut frame.received, packet.id);
                     frame.count += 1;
-                    frame.bytes += kept.len();
+                    frame.bytes += range.len();
                     frame.end = frame.end.max(offset + length);
                     if bit(&frame.requested, packet.id) {
                         self.stats.resend_recovered += 1;
@@ -2751,13 +2962,23 @@ mod tests {
             block: u64,
             extended: bool,
             drops: &[u32],
+            send: impl FnMut(&[u8], SocketAddrV4),
+        ) {
+            self.send_sized(block, extended, (WIDTH, HEIGHT), drops, send);
+        }
+        fn send_sized(
+            &self,
+            block: u64,
+            extended: bool,
+            (width, height): (u32, u32),
+            drops: &[u32],
             mut send: impl FnMut(&[u8], SocketAddrV4),
         ) {
             let (packets, destination) = {
                 let mut camera = self.camera.lock().unwrap();
                 let size = (camera.register(STREAM_PACKET_SIZE) & 0xffff) as usize;
                 let overhead = if extended { 48 } else { 36 };
-                let packets = frame_packets(block, extended, WIDTH, HEIGHT, size - overhead);
+                let packets = frame_packets(block, extended, width, height, size - overhead);
                 camera.frames.insert(block, packets.clone());
                 (packets, camera.destination())
             };
@@ -3263,7 +3484,7 @@ mod tests {
                 .is_err()
         );
         for length in 0..8 {
-            assert!(parse_gvsp(&[0; 8][..length]).is_err());
+            assert!(parse_header(&[0; 8][..length]).is_err());
         }
         let huge = leader(u32::MAX, u32::MAX, RGB8);
         assert!(ImageLeader::parse(&huge, MAX_PAYLOAD).is_err());
@@ -4630,6 +4851,319 @@ mod tests {
                     fake.register(CONTROL_PRIVILEGE)
                 ),
                 (1000, 0)
+            );
+        }
+    }
+
+    /// Every packet of `packets` taken in by `assembler`, as the stream
+    /// takes them: with `scatter`, a packet the assembler predicts is split
+    /// as recvmsg splits it, into the header, its predicted place in the
+    /// frame and the overflow. What each push returned, and the assembler's
+    /// state after it.
+    fn outcomes(assembler: &mut Assembler, packets: &[Vec<u8>], scatter: bool) -> Vec<String> {
+        let start = Instant::now();
+        let (mut scratch, mut overflow) = (Vec::new(), vec![0; 64 * 1024]);
+        let mut seen = Vec::new();
+        for (i, packet) in packets.iter().enumerate() {
+            let now = start + Duration::from_millis(i as u64 * 3);
+            let result = match assembler.predict().filter(|_| scatter) {
+                Some(slot) => {
+                    let mut header = [0xEE; 20];
+                    let head = packet.len().min(slot.header);
+                    header[..head].copy_from_slice(&packet[..head]);
+                    let rest = &packet[head..];
+                    let in_slot = rest.len().min(slot.len);
+                    let place = assembler.slot_mut(&slot).unwrap();
+                    place[..in_slot].copy_from_slice(&rest[..in_slot]);
+                    overflow[..rest.len() - in_slot].copy_from_slice(&rest[in_slot..]);
+                    let received = (&header[..], packet.len(), false);
+                    assembler.landed(&slot, received, &overflow, &mut scratch, now)
+                }
+                None => assembler.push_counted(packet, now, Site::GvspFallback),
+            };
+            let result = result.map(|frame| {
+                frame.map(|f| (f.id, f.width, f.height, f.device_ts_ns, f.data.to_vec()))
+            });
+            if i % 7 == 6 {
+                assembler.poll(now + FRAME_IDLE / 2);
+            }
+            let frames: Vec<_> = (assembler.frames.iter())
+                .map(|f| {
+                    (
+                        f.block,
+                        f.count,
+                        f.bytes,
+                        f.end,
+                        f.packets,
+                        f.received.clone(),
+                    )
+                })
+                .collect();
+            seen.push(format!(
+                "{:?} {:?} {:?} {:?} {frames:?}",
+                result.map_err(|e| format!("{e:#}")),
+                assembler.stats,
+                assembler.requests,
+                assembler.ready.len(),
+            ));
+        }
+        seen
+    }
+
+    /// Generated packet sequences give the same frames, errors, counts and
+    /// state received in place as received whole.
+    #[test]
+    fn packets_received_in_place_assemble_as_packets_received_whole() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut random = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
+        };
+        let mut landed_total = 0;
+        for round in 0..400 {
+            let extended = round % 3 == 0;
+            let (width, height) = ([16, 30, 64, 7][round % 4], [4, 9, 3][round % 3]);
+            let block_size = [16, 33, 64, 100][random(4)];
+            let first = if extended {
+                0xffff_fff0 + random(4) as u64
+            } else {
+                65_530 + random(10) as u64
+            };
+            let mut packets = Vec::new();
+            for frame in 0..3u64 {
+                // Standard block IDs wrap past 65535 to 1.
+                let block = if extended {
+                    first + frame
+                } else {
+                    (first + frame - 1) % 65_535 + 1
+                };
+                let mut frame = frame_packets(block, extended, width, height, block_size);
+                // Row and image padding the camera adds.
+                if round % 5 == 1 {
+                    let image: Vec<u8> = image(width, height)
+                        .chunks(width as usize)
+                        .flat_map(|row| [row, &[0xAB, 0xCD][..]].concat())
+                        .chain([7; 3])
+                        .collect();
+                    let mut lead = leader(width, height, MONO8);
+                    lead[32..34].copy_from_slice(&2u16.to_be_bytes());
+                    lead[34..36].copy_from_slice(&3u16.to_be_bytes());
+                    frame = vec![gvsp(block, 0, 1, extended, &lead)];
+                    for chunk in image.chunks(block_size) {
+                        frame.push(gvsp(block, frame.len() as u32, 3, extended, chunk));
+                    }
+                    frame.push(gvsp(
+                        block,
+                        frame.len() as u32,
+                        2,
+                        extended,
+                        &trailer(height),
+                    ));
+                }
+                for _ in 0..random(4) {
+                    let at = random(frame.len());
+                    match random(8) {
+                        // Reordered.
+                        0 | 1 if at + 1 < frame.len() => frame.swap(at, at + 1),
+                        // A late leader.
+                        2 => {
+                            let leader = frame.remove(0);
+                            frame.insert(at.min(frame.len()), leader);
+                        }
+                        // A duplicate, later.
+                        3 => {
+                            let copy = frame[at].clone();
+                            frame.insert(random(frame.len() + 1), copy);
+                        }
+                        // Lost, or resent much later.
+                        4 => {
+                            let lost = frame.remove(at);
+                            if random(2) == 0 {
+                                frame.push(lost);
+                            }
+                        }
+                        // An error status from the camera.
+                        5 => frame[at][..2].copy_from_slice(&[0x80, 0x01]),
+                        // A resend the camera cannot serve yet.
+                        6 => {
+                            let mut unavailable = frame[at].clone();
+                            unavailable[..2].copy_from_slice(&[0x80, 0x14]);
+                            unavailable.truncate(if extended { 20 } else { 8 });
+                            frame.insert(at, unavailable);
+                        }
+                        // Cut short.
+                        _ => {
+                            let keep = random(frame[at].len());
+                            frame[at].truncate(keep);
+                        }
+                    }
+                }
+                packets.extend(frame);
+            }
+            let payload = (width as usize + 2) * height as usize + 3;
+            let mut whole = Assembler::new(payload + random(3) * block_size, block_size + 36, 0);
+            whole.limits = [Some((block_size, payload.div_ceil(block_size) + 4)); 2];
+            whole.resend = round % 2 == 0;
+            let mut placed = Assembler::new(whole.payload_limit, block_size + 36, 0);
+            placed.limits = whole.limits;
+            placed.resend = whole.resend;
+            assert_eq!(
+                outcomes(&mut placed, &packets, true),
+                outcomes(&mut whole, &packets, false),
+                "round {round}"
+            );
+            landed_total += whole.copied.0 - placed.copied.0;
+        }
+        // Most payload packets landed in place.
+        assert!(landed_total > 2000, "{landed_total}");
+    }
+
+    /// A fake camera on loopback streaming `frames` 1080p Mono8 frames in
+    /// packets of `block` bytes, sent in `order`: what each frame held, and
+    /// the payload packets and bytes copied.
+    fn loopback(frames: u64, order: impl Fn(&mut Vec<Vec<u8>>)) -> (Vec<Vec<u8>>, (u64, u64)) {
+        const BLOCK: usize = 8192;
+        let fake = Fake::new(|camera| {
+            camera.path_mtu = 9000;
+            camera.test_packets = true;
+            camera.registers.insert(GVCP_CAPABILITY, 0x4);
+            camera.resend_status = 0x0100;
+        });
+        let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
+        gige.packet_size = Some(Some(BLOCK as u32 + 36));
+        gige.start(1920 * 1080).unwrap();
+        assert!(gige.stream.as_ref().unwrap().scatter);
+        let mut received = Vec::new();
+        for block in 1..=frames {
+            let mut packets = Vec::new();
+            let mut destination = None;
+            fake.send_sized(block, false, (1920, 1080), &[], |packet, to| {
+                packets.push(packet.to_vec());
+                destination = Some(to);
+            });
+            order(&mut packets);
+            for packet in &packets {
+                fake.stream.send_to(packet, destination.unwrap()).unwrap();
+            }
+            let frame = gige.next_frame(Duration::from_secs(5)).unwrap();
+            assert_eq!(frame.id, block);
+            received.push(frame.data.to_vec());
+        }
+        let copied = gige.stream.as_ref().unwrap().assembler.copied;
+        (received, copied)
+    }
+
+    #[test]
+    fn packets_in_order_land_in_their_frames_without_copies() {
+        let (frames, copied) = loopback(30, |_| {});
+        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+        assert_eq!(copied, (0, 0));
+    }
+
+    #[test]
+    fn reordered_and_resent_packets_are_copied_one_by_one() {
+        // Two payload packets swap places: each arrives where the other was
+        // expected.
+        let (frames, copied) = loopback(3, |packets| packets.swap(5, 6));
+        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+        assert_eq!(copied, (6, 6 * 8192));
+        // A lost packet is asked for again and comes in out of turn; the
+        // packet after it arrived where the lost one was expected.
+        let (frames, copied) = loopback(2, |packets| {
+            packets.remove(40);
+            packets.remove(9);
+        });
+        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+        assert_eq!(copied, (8, 8 * 8192));
+    }
+
+    #[test]
+    fn scatter_receive_can_be_turned_off() {
+        assert!(scatter(None));
+        assert!(scatter(Some(std::ffi::OsStr::new("1"))));
+        assert!(!scatter(Some(std::ffi::OsStr::new("0"))));
+        let fake = Fake::new(|camera| camera.path_mtu = 1500);
+        let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
+        gige.packet_size = Some(Some(1500));
+        gige.start((WIDTH * HEIGHT) as usize).unwrap();
+        gige.stream.as_mut().unwrap().scatter = false;
+        fake.send(1, false, &[]);
+        let frame = gige.next_frame(Duration::from_secs(2)).unwrap();
+        assert_eq!(frame.data.to_vec(), image(WIDTH, HEIGHT));
+        let packets = (WIDTH * HEIGHT) as u64 / (1500 - 36) + 1;
+        assert_eq!(
+            gige.stream.as_ref().unwrap().assembler.copied,
+            (packets, (WIDTH * HEIGHT) as u64)
+        );
+    }
+
+    /// The receiving thread's CPU time.
+    fn thread_cpu() -> Duration {
+        #[cfg(unix)]
+        {
+            let mut time = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime writes the timespec it is given.
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) };
+            Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+        }
+        #[cfg(not(unix))]
+        Duration::ZERO
+    }
+
+    /// Frames per second and receiver CPU time per frame for 4096x3000
+    /// Mono8 over loopback, with payloads received in place and copied.
+    #[test]
+    #[ignore = "a throughput measurement"]
+    fn scatter_receive_throughput() {
+        const BLOCK: usize = 8192;
+        const FRAMES: u64 = 40;
+        for scatter in [true, false] {
+            let fake = Fake::new(|camera| {
+                camera.path_mtu = 9000;
+                camera.test_packets = true;
+            });
+            let mut gige = connect(fake.address, Duration::from_secs(1)).unwrap();
+            gige.packet_size = Some(Some(BLOCK as u32 + 36));
+            gige.start(4096 * 3000).unwrap();
+            gige.stream.as_mut().unwrap().scatter = scatter;
+            let mut packets = Vec::new();
+            let mut destination = None;
+            fake.send_sized(1, false, (4096, 3000), &[], |packet, to| {
+                packets.push(packet.to_vec());
+                destination = Some(to);
+            });
+            let (destination, source) = (destination.unwrap(), fake.stream.try_clone().unwrap());
+            // The sender waits for each frame before the next, so the
+            // socket's buffer never overflows.
+            let (next, wait) = std::sync::mpsc::channel::<u64>();
+            let sender = thread::spawn(move || {
+                while let Ok(block) = wait.recv() {
+                    for packet in &packets {
+                        let mut packet = packet.clone();
+                        packet[2..4].copy_from_slice(&(block as u16).to_be_bytes());
+                        source.send_to(&packet, destination).unwrap();
+                    }
+                }
+            });
+            let (started, cpu) = (Instant::now(), thread_cpu());
+            for block in 1..=FRAMES {
+                next.send(block).unwrap();
+                let frame = gige.next_frame(Duration::from_secs(10)).unwrap();
+                assert_eq!(frame.data.len(), 4096 * 3000);
+            }
+            let (elapsed, cpu) = (started.elapsed(), thread_cpu() - cpu);
+            drop(next);
+            sender.join().unwrap();
+            println!(
+                "scatter {scatter}: {:.1} fps, receiver CPU {:.2} ms per frame, copied {:?}",
+                FRAMES as f64 / elapsed.as_secs_f64(),
+                cpu.as_secs_f64() * 1e3 / FRAMES as f64,
+                gige.stream.as_ref().unwrap().assembler.copied,
             );
         }
     }
