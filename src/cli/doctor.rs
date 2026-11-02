@@ -12,7 +12,11 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ("arch", "string"),
     (
         "features",
-        "{usb,jpeg,keychain,shell} — what this build includes",
+        "{usb,jpeg,videotoolbox,keychain,shell} — what this build includes",
+    ),
+    (
+        "jpeg",
+        "{selected:auto|cpu|videotoolbox,backends:{libjpeg_turbo:{compiled,simd},videotoolbox:{compiled,available,verified?,reason?}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: Apple's JPEG engine encoded a test frame as accurately as libjpeg-turbo",
     ),
     (
         "dirs",

@@ -331,6 +331,9 @@ fn main() {
     let b = Bench {
         filter: args.into_iter().filter(|a| !a.starts_with("--")).collect(),
     };
+    // JPEG rows measure libjpeg-turbo unless they name an engine.
+    // SAFETY: the benchmark is single-threaded here.
+    unsafe { std::env::set_var("CAPTUREFAB_JPEG", "cpu") };
     for (width, height) in [(1920, 1200), (640, 480)] {
         let mut medians = std::collections::HashMap::new();
         for (name, format) in FORMATS {
@@ -454,19 +457,54 @@ fn main() {
     }
     // Converted 12 MP stills, inspections and metering: packed Bayer read in
     // place, unpacked and demosaicked once into what each consumer reads.
-    for (name, format) in [("BayerRG12p", 0x010c_0059), ("BayerRG8", 0x0108_0009)] {
-        let suffix = format!("{name}/4096x3000");
+    for (name, format, width, height) in [
+        ("BayerRG12p", 0x010c_0059, 4096, 3000),
+        ("BayerRG8", 0x0108_0009, 4096, 3000),
+        ("BayerRG8", 0x0108_0009, 1920, 1080),
+        ("YCbCr709_422_8", 0x0210_0041, 1920, 1080),
+        ("RGB8", RGB8, 1920, 1080),
+        ("RGB8", RGB8, 4096, 3000),
+    ] {
+        let suffix = format!("{name}/{width}x{height}");
         if !["encode/jpeg/", "encode/png/", "inspect/", "auto/meter/"]
             .iter()
             .any(|prefix| b.selected(&format!("{prefix}{suffix}")))
         {
             continue;
         }
-        let f = frame(4096, 3000, format);
+        let f = frame(width, height, format);
         #[cfg(feature = "jpeg")]
         b.run(&format!("encode/jpeg/{suffix}"), f.data.len(), || {
             capturefab::testing::frame::encode_parts(&f, "jpeg", None, Some(&meta)).unwrap()
         });
+        #[cfg(feature = "jpeg")]
+        b.run(
+            &format!("encode/jpeg-planes/{suffix}"),
+            f.data.len(),
+            || jpeg::encode_planes(&f, 90).unwrap(),
+        );
+        #[cfg(feature = "jpeg")]
+        b.run(&format!("encode/jpeg-rgb/{suffix}"), f.data.len(), || {
+            jpeg::encode(&f, 90).unwrap()
+        });
+        // Apple's JPEG engine, where this Mac has one.
+        #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+        {
+            // SAFETY: as above.
+            unsafe { std::env::set_var("CAPTUREFAB_JPEG", "videotoolbox") };
+            if capturefab::testing::frame::encode_parts(&f, "jpeg", None, None).is_ok() {
+                b.run(
+                    &format!("encode/jpeg-videotoolbox/{suffix}"),
+                    f.data.len(),
+                    || {
+                        capturefab::testing::frame::encode_parts(&f, "jpeg", None, Some(&meta))
+                            .unwrap()
+                    },
+                );
+            }
+            // SAFETY: as above.
+            unsafe { std::env::set_var("CAPTUREFAB_JPEG", "cpu") };
+        }
         b.run(&format!("encode/png/{suffix}"), f.data.len(), || {
             capturefab::testing::frame::encode_parts(&f, "png", None, Some(&meta)).unwrap()
         });

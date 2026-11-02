@@ -16,6 +16,9 @@ pub enum Body<'a> {
     /// libjpeg-turbo's output, in the buffer it allocated.
     #[cfg(feature = "jpeg")]
     Jpeg(crate::jpeg::Jpeg),
+    /// A JPEG in the sample buffer Apple's JPEG engine wrote it to.
+    #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+    Native(crate::jpeg::videotoolbox::Output),
 }
 
 impl Clone for Body<'_> {
@@ -38,6 +41,8 @@ impl std::ops::Deref for Body<'_> {
             Body::Pooled(bytes) => bytes,
             #[cfg(feature = "jpeg")]
             Body::Jpeg(bytes) => bytes,
+            #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+            Body::Native(bytes) => bytes,
         }
     }
 }

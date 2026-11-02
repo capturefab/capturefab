@@ -8,10 +8,14 @@ license = "MIT"
 repository = "https://github.com/capturefab/capturefab"
 
 [features]
-default = ["usb", "jpeg", "keychain", "shell"]
+default = ["usb", "jpeg", "videotoolbox", "keychain", "shell"]
 usb = ["dep:nusb"]
 # libjpeg-turbo, built from source with its NEON/SSE2/AVX2 SIMD (x86 needs NASM).
 jpeg = ["dep:turbojpeg"]
+# Apple's JPEG engine through VideoToolbox, a system framework, for color
+# stills on macOS (`CAPTUREFAB_JPEG`); a no-op elsewhere. libjpeg-turbo
+# checks its output.
+videotoolbox = ["jpeg"]
 # OS credential store (Keychain / Credential Manager / Secret Service) for
 # saved camera sign-ins.
 keychain = ["dep:keyring"]

@@ -333,9 +333,11 @@ pub fn report(warm_sessions: bool) -> Value {
         "features": {
             "usb": cfg!(feature = "usb"),
             "jpeg": cfg!(feature = "jpeg"),
+            "videotoolbox": cfg!(feature = "videotoolbox"),
             "keychain": cfg!(feature = "keychain"),
             "shell": cfg!(feature = "shell"),
         },
+        "jpeg": crate::jpeg::backend::report(),
         "dirs": {
             "inspect": crate::dirs::scratch().ok().map(|dir| dir.join("inspect")),
             "runtime": runtime,

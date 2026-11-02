@@ -9,6 +9,10 @@ use anyhow::Result;
 #[cfg(not(feature = "jpeg"))]
 use anyhow::bail;
 
+pub(crate) mod backend;
+#[cfg(all(feature = "videotoolbox", target_os = "macos"))]
+pub(crate) mod videotoolbox;
+
 /// Fixed quality and 4:2:0 chroma (gray for monochrome), so the same frame
 /// produces comparable files wherever it is encoded.
 pub const QUALITY: i32 = 90;
@@ -116,6 +120,53 @@ pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     software_quality(&Raster::new(frame)?, quality)
 }
 
+/// A color frame as JFIF Y'CbCr 4:2:0 planes written straight from its rows
+/// into one pooled buffer, compressed without libjpeg-turbo's own color
+/// conversion and downsampling.
+#[cfg(feature = "jpeg")]
+pub fn encode_planes(frame: &Frame, quality: i32) -> Result<Body<'static>> {
+    use crate::frame::{Chroma, FrameRef, Yuv420};
+    crate::frame::validate_source(frame)?;
+    let view = FrameRef::whole(frame);
+    let (width, height) = (view.width, view.height);
+    let (chroma_width, chroma_rows) = (width.div_ceil(2), height.div_ceil(2));
+    let luma_len = width * height;
+    let chroma_len = chroma_width * chroma_rows;
+    let mut planes = crate::framebuf::transforms().take_stale(luma_len + 2 * chroma_len);
+    let (luma, chroma) = planes.split_at_mut(luma_len);
+    let (cb, cr) = chroma.split_at_mut(chroma_len);
+    crate::frame::ycbcr420(
+        view,
+        Yuv420 {
+            luma,
+            luma_stride: width,
+            chroma: Chroma::Planar {
+                cb,
+                cr,
+                stride: chroma_width,
+            },
+        },
+    );
+    crate::copies::record(crate::copies::Site::StillTransform, planes.len());
+    let (luma, chroma) = planes.split_at(luma_len);
+    let (cb, cr) = chroma.split_at(chroma_len);
+    let mut compressor = turbojpeg::Compressor::new()?;
+    compressor.set_quality(quality)?;
+    let jpeg = compressor.compress_yuv_planes_to_owned(&turbojpeg::YuvPlanesImage {
+        y_plane: luma,
+        u_plane: cb,
+        v_plane: cr,
+        width,
+        height,
+        y_stride: width,
+        u_stride: chroma_width,
+        v_stride: chroma_width,
+        subsamp: turbojpeg::Subsamp::Sub2x2,
+    })?;
+    crate::copies::record(crate::copies::Site::JpegEncode, jpeg.len());
+    Ok(Body::Jpeg(Jpeg(jpeg)))
+}
+
 pub fn software(raster: &Raster) -> Result<Body<'static>> {
     software_quality(raster, QUALITY)
 }
@@ -168,8 +219,8 @@ pub fn software_quality(_: &Raster, _: i32) -> Result<Body<'static>> {
     bail!("JPEG is unsupported in this build; rebuild with --features jpeg or capture png")
 }
 
-/// A complete baseline JPEG: SOI, a frame header with the expected size, EOI.
-#[cfg(test)]
+/// A complete baseline JPEG: SOI, a frame header with the expected size,
+/// EOI. A hardware engine's output must be one before it is kept.
 pub fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
     if bytes.len() < 4 || bytes[..2] != [0xFF, 0xD8] || bytes[bytes.len() - 2..] != [0xFF, 0xD9] {
         return false;

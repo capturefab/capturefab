@@ -9,7 +9,11 @@ mod rows;
 mod view;
 pub(crate) use encoded::write_all_vectored;
 pub use encoded::{Body, Encoded};
+#[cfg(all(test, feature = "jpeg"))]
+pub(crate) use rows::tests::noise_frame;
 pub(crate) use rows::{Channels, RowReader};
+#[cfg(feature = "jpeg")]
+pub(crate) use rows::{Chroma, Yuv420, ycbcr420};
 pub use view::FrameRef;
 
 pub fn pixel_format_name(format: u32) -> &'static str {
@@ -1196,8 +1200,8 @@ pub fn encode_parts<'a>(
     match format {
         "raw" => Ok(Encoded::new(Body::Borrowed(&frame.data))),
         "jpeg" => {
-            let quality = quality.map_or(crate::jpeg::QUALITY, i32::from);
-            let jpeg = crate::jpeg::encode(frame, quality)?;
+            let jpeg = crate::jpeg::backend::encode(frame, quality)?;
+
             Ok(match json {
                 Some(json) => {
                     let at = crate::jpeg::com_offset(&jpeg)?;

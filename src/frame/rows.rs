@@ -450,8 +450,172 @@ pub(crate) fn map<P: Send>(
     }
 }
 
+#[cfg(feature = "jpeg")]
+/// Where `ycbcr420` writes JFIF (full-range BT.601) Y'CbCr 4:2:0: a luma
+/// plane and the chroma either as two planes (as libjpeg-turbo reads them)
+/// or interleaved (NV12, as a video encoder's surface holds it), each plane
+/// at its own row stride.
+pub(crate) struct Yuv420<'a> {
+    pub(crate) luma: &'a mut [u8],
+    pub(crate) luma_stride: usize,
+    pub(crate) chroma: Chroma<'a>,
+}
+
+#[cfg(feature = "jpeg")]
+/// A 4:2:0 image's chroma planes.
+pub(crate) enum Chroma<'a> {
+    Planar {
+        cb: &'a mut [u8],
+        cr: &'a mut [u8],
+        stride: usize,
+    },
+    Interleaved {
+        cbcr: &'a mut [u8],
+        stride: usize,
+    },
+}
+
+#[cfg(feature = "jpeg")]
+/// One block of chroma rows of a `Yuv420` image, for one thread.
+enum ChromaRows<'a> {
+    Planar(&'a mut [u8], &'a mut [u8], usize),
+    Interleaved(&'a mut [u8], usize),
+}
+
+#[cfg(feature = "jpeg")]
+/// `view` as JFIF Y'CbCr 4:2:0, written straight into `out` from its RGB
+/// rows two at a time: luma for each pixel and chroma from each 2x2 block's
+/// mean, with the fixed-point coefficients of libjpeg's jccolor.c. An odd
+/// last column or row repeats its own pixels. Large views are split into
+/// blocks of row pairs across cores.
+pub(crate) fn ycbcr420(view: FrameRef<'_>, out: Yuv420<'_>) {
+    let (width, height) = (view.width, view.height);
+    let (chroma_width, chroma_rows) = (width.div_ceil(2), height.div_ceil(2));
+    if width == 0 || height == 0 {
+        return;
+    }
+    let Yuv420 {
+        luma,
+        luma_stride,
+        chroma,
+    } = out;
+    assert!(luma_stride >= width && luma.len() >= (height - 1) * luma_stride + width);
+    let threads = super::worker_threads(view.pixels());
+    let block = chroma_rows.div_ceil(threads).max(1);
+    let run = |first: usize, luma: &mut [u8], mut chroma: ChromaRows<'_>| {
+        let mut reader = RowReader::new(view);
+        let mut rows = [vec![0; 3 * width], vec![0; 3 * width]];
+        let pairs = block.min(chroma_rows - first);
+        for pair in 0..pairs {
+            let y = 2 * (first + pair);
+            let [top, bottom] = &mut rows;
+            reader.read(y, Channels::Rgb, top);
+            let two = y + 1 < height;
+            if two {
+                reader.read(y + 1, Channels::Rgb, bottom);
+            }
+            let bottom = if two { &*bottom } else { &*top };
+            let luma = &mut luma[2 * pair * luma_stride..];
+            write_luma(top, &mut luma[..width]);
+            if two {
+                write_luma(bottom, &mut luma[luma_stride..][..width]);
+            }
+            let blocks = top.chunks(6).zip(bottom.chunks(6));
+            match &mut chroma {
+                ChromaRows::Planar(cb, cr, stride) => {
+                    let (cb, cr) = (&mut cb[pair * *stride..], &mut cr[pair * *stride..]);
+                    for (x, (t, b)) in blocks.enumerate() {
+                        [cb[x], cr[x]] = chroma_of(t, b);
+                    }
+                }
+                ChromaRows::Interleaved(cbcr, stride) => {
+                    let cbcr = &mut cbcr[pair * *stride..][..2 * chroma_width];
+                    for (out, (t, b)) in cbcr.as_chunks_mut::<2>().0.iter_mut().zip(blocks) {
+                        *out = chroma_of(t, b);
+                    }
+                }
+            }
+        }
+    };
+    let luma_block = 2 * block * luma_stride;
+    match chroma {
+        Chroma::Planar { cb, cr, stride } => {
+            assert!(
+                stride >= chroma_width
+                    && cb.len().min(cr.len()) >= (chroma_rows - 1) * stride + chroma_width
+            );
+            let blocks = luma.chunks_mut(luma_block).zip(
+                cb.chunks_mut(block * stride)
+                    .zip(cr.chunks_mut(block * stride)),
+            );
+            std::thread::scope(|scope| {
+                for (i, (luma, (cb, cr))) in blocks.enumerate().take(threads) {
+                    let run = &run;
+                    let rows = ChromaRows::Planar(cb, cr, stride);
+                    if threads == 1 {
+                        run(0, luma, rows);
+                    } else {
+                        scope.spawn(move || run(i * block, luma, rows));
+                    }
+                }
+            });
+        }
+        Chroma::Interleaved { cbcr, stride } => {
+            assert!(
+                stride >= 2 * chroma_width
+                    && cbcr.len() >= (chroma_rows - 1) * stride + 2 * chroma_width
+            );
+            let blocks = luma
+                .chunks_mut(luma_block)
+                .zip(cbcr.chunks_mut(block * stride));
+            std::thread::scope(|scope| {
+                for (i, (luma, cbcr)) in blocks.enumerate().take(threads) {
+                    let run = &run;
+                    let rows = ChromaRows::Interleaved(cbcr, stride);
+                    if threads == 1 {
+                        run(0, luma, rows);
+                    } else {
+                        scope.spawn(move || run(i * block, luma, rows));
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[cfg(feature = "jpeg")]
+/// JFIF luma of each RGB pixel of `rgb`.
+fn write_luma(rgb: &[u8], out: &mut [u8]) {
+    for (y, p) in out.iter_mut().zip(rgb.as_chunks::<3>().0) {
+        let [r, g, b] = p.map(u32::from);
+        *y = ((19_595 * r + 38_470 * g + 7_471 * b + 32_768) >> 16) as u8;
+    }
+}
+
+#[cfg(feature = "jpeg")]
+/// JFIF Cb and Cr of the 2x2 block whose top and bottom halves are `top`
+/// and `bottom` (one or two RGB pixels each), from the block's mean.
+fn chroma_of(top: &[u8], bottom: &[u8]) -> [u8; 2] {
+    // An odd final column repeats its own pixel.
+    let last = top.len() - 3;
+    let (mut r, mut g, mut b) = (0i32, 0i32, 0i32);
+    for p in [&top[..3], &top[last..], &bottom[..3], &bottom[last..]] {
+        (r, g, b) = (
+            r + i32::from(p[0]),
+            g + i32::from(p[1]),
+            b + i32::from(p[2]),
+        );
+    }
+    // Four summed pixels: shift by 18 and round, offset by 128.
+    let scale = |v: i32| ((v + (128 << 18) + (1 << 17)) >> 18).clamp(0, 255) as u8;
+    [
+        scale(-11_059 * r - 21_709 * g + 32_768 * b),
+        scale(32_768 * r - 27_439 * g - 5_329 * b),
+    ]
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::types::Frame;
 
