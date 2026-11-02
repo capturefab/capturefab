@@ -1,0 +1,5 @@
+Capturefab is now a command-line tool for people, scripts and AI agents. The desktop app, browser clients and built-in assistant are gone.
+Install the command with curl -fsSL https://capturefab.com/install.sh | sh on macOS and Linux, or irm https://capturefab.com/install.ps1 | iex in Windows PowerShell.
+To keep using the desktop app, stay on 0.5.0 and skip this update. Its downloads remain at https://capturefab.com/download/v0.5.0/, listed in https://capturefab.com/releases.json.
+With --json every command prints one JSON document and exits with a typed code, and capturefab schema describes every command for agents.
+Cameras stay connected between commands; capture, record, inspect, watch and shell cover stills, video, exposure, focus and scripted runs.

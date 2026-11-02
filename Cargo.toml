@@ -1,6 +1,6 @@
 [package]
 name = "capturefab"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Camera capture command-line tool for people, scripts and AI agents: GigE Vision, USB3 Vision, GenICam, webcams and streams"
