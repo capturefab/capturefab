@@ -249,9 +249,9 @@ fn with_extension(output: &str, format: &str) -> String {
 }
 
 /// The image extension (as written) and the format it names, when the last
-/// component of `output` ends in a literal .png, .jpg, .jpeg, .raw, .pgm or
-/// .ppm. Text after a placeholder's closing brace counts; a placeholder
-/// inside the extension does not.
+/// component of `output` ends in a literal .png, .jpg, .jpeg or .raw. Text
+/// after a placeholder's closing brace counts; a placeholder inside the
+/// extension does not.
 pub fn image_extension(output: &str) -> Option<(&str, &'static str)> {
     let last = output.rsplit(std::path::is_separator).next()?;
     let (_, extension) = last.rsplit_once('.')?;
@@ -262,8 +262,6 @@ pub fn image_extension(output: &str) -> Option<(&str, &'static str)> {
         "png" => "png",
         "jpg" | "jpeg" => "jpeg",
         "raw" => "raw",
-        "pgm" => "pgm",
-        "ppm" => "ppm",
         _ => return None,
     };
     Some((extension, format))
@@ -1434,6 +1432,9 @@ mod tests {
         assert_eq!(image_extension("x-{seq}.png"), Some(("png", "png")));
         assert_eq!(image_extension("x.{date}"), None);
         assert_eq!(image_extension("clip.mp4"), None);
+        // Stills are PNG, JPEG or raw; other image names say nothing.
+        assert_eq!(image_extension("shot.pgm"), None);
+        assert_eq!(image_extension("shot.ppm"), None);
         assert!(format_mismatch("y.jpeg", "jpeg").is_none());
         assert!(format_mismatch("y.jpg", "jpeg").is_none());
         assert_eq!(

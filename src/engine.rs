@@ -2437,8 +2437,8 @@ fn validate_capture(output: &str, count: u32, timeout_ms: u64, format: &str) -> 
     crate::session::validate_frame_wait(timeout_ms)?;
     ensure!((1..=100_000).contains(&count), "count must be 1..100000");
     ensure!(
-        ["png", "jpeg", "raw", "ppm", "pgm"].contains(&format),
-        "format must be png, jpeg, raw, pgm or ppm"
+        ["png", "jpeg", "raw"].contains(&format),
+        "format must be png, jpeg or raw"
     );
     validate_capture_output(output)?;
     Ok(())

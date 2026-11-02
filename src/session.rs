@@ -573,8 +573,8 @@ impl SessionCommand {
                     "fresh frames must be 0..10"
                 );
                 ensure!(
-                    ["png", "jpeg", "raw", "pgm", "ppm"].contains(&format.as_str()),
-                    "format must be png, jpeg, raw, pgm or ppm"
+                    ["png", "jpeg", "raw"].contains(&format.as_str()),
+                    "format must be png, jpeg or raw"
                 );
                 crate::context::validate(context)?;
                 ensure!(
@@ -606,8 +606,8 @@ impl SessionCommand {
                 crate::naming::validate_offset(*utc_offset_s)?;
                 ensure!((1..=100_000).contains(count), "count must be 1..100000");
                 ensure!(
-                    ["png", "jpeg", "raw", "pgm", "ppm"].contains(&format.as_str()),
-                    "format must be png, jpeg, raw, pgm or ppm"
+                    ["png", "jpeg", "raw"].contains(&format.as_str()),
+                    "format must be png, jpeg or raw"
                 );
                 crate::engine::validate_capture_output(output)?;
                 crate::naming::validate_request(output, *count, *on_exists, context)?;
@@ -3128,6 +3128,25 @@ mod tests {
         }
         // `record --for 500ms` must keep working.
         forward(Some(500)).validate().unwrap();
+    }
+    #[test]
+    fn stills_are_png_jpeg_or_raw() {
+        let capture = |format: &str| SessionCommand::Capture {
+            timeout_ms: 1_000,
+            format: format.into(),
+            context: Default::default(),
+            quality: None,
+            fresh: 0,
+            warmup_ms: None,
+            stdout: None,
+        };
+        for format in ["png", "jpeg", "raw"] {
+            capture(format).validate().unwrap();
+        }
+        for format in ["pgm", "ppm"] {
+            let error = capture(format).validate().unwrap_err();
+            assert_eq!(error.to_string(), "format must be png, jpeg or raw");
+        }
     }
     #[test]
     fn worker_lines_are_tagged_with_their_camera_and_redacted() {

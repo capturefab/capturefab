@@ -418,231 +418,377 @@ fn packed_sample(row: &[u8], bit: usize, bits: u32) -> u16 {
     ((value >> (bit & 7)) & ((1 << bits) - 1)) as u16
 }
 
-fn native_rgb(frame: &Frame, layout: Layout, x: usize, y: usize) -> ([u16; 3], u32) {
-    let Layout::Rgb {
-        bits,
-        channels,
-        bgr,
-        planar,
-        packed,
-        aligned,
-    } = layout
-    else {
-        unreachable!()
-    };
-    let (width, height, data) = (frame.width as usize, frame.height as usize, &frame.data);
-    let i = y * width + x;
-    let sample = |channel| {
-        if packed {
-            let row = super::row_bytes(frame.width, frame.pixel_format);
-            let pixel_bits = if aligned {
-                32
-            } else {
-                channels * bits as usize
-            };
-            packed_sample(
-                &data[y * row..(y + 1) * row],
-                x * pixel_bits + channel * bits as usize,
-                bits,
-            )
-        } else {
-            let at = if planar {
-                channel * width * height + i
-            } else {
-                channels * i + channel
-            };
-            if bits == 8 {
-                u16::from(data[at])
-            } else {
-                u16::from_le_bytes([data[2 * at], data[2 * at + 1]])
-            }
-        }
-    };
-    let rgb = [sample(0), sample(1), sample(2)];
-    (if bgr { [rgb[2], rgb[1], rgb[0]] } else { rgb }, bits)
-}
-
 /// Native RGB components and their bit depth, after `validate` succeeds.
 /// Alpha/alignment components are omitted and BGR data is reordered.
 pub(super) fn native_color(frame: &Frame, x: usize, y: usize) -> Option<([u16; 3], u32)> {
-    let (_, layout @ Layout::Rgb { .. }) = layout(frame.pixel_format)? else {
-        return None;
-    };
-    Some(native_rgb(frame, layout, x, y))
+    Decoder::new(frame)?.native_color(x, y)
 }
 
-fn decode(frame: &Frame, layout: Layout, x: usize, y: usize) -> [u8; 3] {
-    let (width, data) = (frame.width as usize, &frame.data);
-    let i = y * width + x;
-    match layout {
-        Layout::Mono { bits } => {
-            let row = super::row_bytes(frame.width, frame.pixel_format);
-            let value = packed_sample(&data[y * row..(y + 1) * row], x * bits as usize, bits);
-            [(u32::from(value) * 255 / ((1 << bits) - 1)) as u8; 3]
+/// A frame of a layout this module knows, looked up once to decode many of
+/// its pixels: a measurement reads hundreds of thousands, and the lookup
+/// costs about as much as decoding one. Pixels are read after `validate`
+/// succeeds.
+#[derive(Clone, Copy)]
+pub(super) struct Decoder<'a> {
+    /// The frame's bytes and size, looked up once: each read through the
+    /// frame's buffer would go through its shared, pooled storage again.
+    data: &'a [u8],
+    width: usize,
+    height: usize,
+    layout: Layout,
+    /// The bytes of a row of a layout of one plane.
+    stride: usize,
+    /// Where a planar layout keeps each pixel's chroma.
+    chroma: ChromaAt,
+}
+
+/// Where the Cb and Cr covering a pixel lie in a planar layout.
+#[derive(Clone, Copy, Default)]
+struct ChromaAt {
+    /// The subsampling as right shifts of x and y: 1 halves, 0 keeps.
+    shift: (u32, u32),
+    /// Chroma samples in a row.
+    columns: usize,
+    /// The first Cb and the first Cr, and the bytes from one to the next.
+    cb: usize,
+    cr: usize,
+    step: usize,
+}
+
+impl ChromaAt {
+    /// Saturating, so that a frame too large to validate makes a decoder
+    /// that `validate` then refuses.
+    fn new(frame: &Frame, sub: (usize, usize), interleaved: Option<bool>) -> Self {
+        debug_assert!(sub.0.is_power_of_two() && sub.1.is_power_of_two());
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        let (columns, rows) = (width.div_ceil(sub.0), height.div_ceil(sub.1));
+        let luma = width.saturating_mul(height);
+        let (cb, cr, step) = match interleaved {
+            None => (luma, luma.saturating_add(columns.saturating_mul(rows)), 1),
+            Some(true) => (luma, luma.saturating_add(1), 2),
+            Some(false) => (luma.saturating_add(1), luma, 2),
+        };
+        Self {
+            shift: (sub.0.trailing_zeros(), sub.1.trailing_zeros()),
+            columns,
+            cb,
+            cr,
+            step,
         }
-        Layout::SignedMono => [data[i] ^ 128; 3],
-        layout @ Layout::Rgb { .. } => {
-            let (rgb, bits) = native_rgb(frame, layout, x, y);
-            rgb.map(|v| (v >> bits.saturating_sub(8)).min(255) as u8)
+    }
+
+    /// The Cb and Cr of pixel (x, y), whose chroma sample covers its block.
+    #[inline(always)]
+    fn at(&self, data: &[u8], x: usize, y: usize) -> (u8, u8) {
+        let i = ((y >> self.shift.1) * self.columns + (x >> self.shift.0)) * self.step;
+        (data[self.cb + i], data[self.cr + i])
+    }
+}
+
+impl<'a> Decoder<'a> {
+    /// None for a format this module does not know.
+    pub(super) fn new(frame: &'a Frame) -> Option<Self> {
+        let (_, layout) = layout(frame.pixel_format)?;
+        let chroma = match layout {
+            Layout::Planes {
+                sub, interleaved, ..
+            } => ChromaAt::new(frame, sub, interleaved),
+            _ => ChromaAt::default(),
+        };
+        Some(Self {
+            data: &frame.data,
+            width: frame.width as usize,
+            height: frame.height as usize,
+            layout,
+            stride: super::row_bytes(frame.width, frame.pixel_format),
+            chroma,
+        })
+    }
+
+    /// Row `y` of a layout of one plane.
+    #[inline(always)]
+    fn row(&self, y: usize) -> &'a [u8] {
+        &self.data[y * self.stride..(y + 1) * self.stride]
+    }
+
+    /// Native RGB components of pixel (x, y) and their bit depth, for an
+    /// RGB layout; None for the others.
+    pub(super) fn native_color(&self, x: usize, y: usize) -> Option<([u16; 3], u32)> {
+        let Layout::Rgb {
+            bits,
+            channels,
+            bgr,
+            planar,
+            packed,
+            aligned,
+        } = self.layout
+        else {
+            return None;
+        };
+        let (width, height, data) = (self.width, self.height, self.data);
+        let i = y * width + x;
+        let sample = |channel| {
+            if packed {
+                let pixel_bits = if aligned {
+                    32
+                } else {
+                    channels * bits as usize
+                };
+                packed_sample(self.row(y), x * pixel_bits + channel * bits as usize, bits)
+            } else {
+                let at = if planar {
+                    channel * width * height + i
+                } else {
+                    channels * i + channel
+                };
+                if bits == 8 {
+                    u16::from(data[at])
+                } else {
+                    u16::from_le_bytes([data[2 * at], data[2 * at + 1]])
+                }
+            }
+        };
+        let rgb = [sample(0), sample(1), sample(2)];
+        Some((if bgr { [rgb[2], rgb[1], rgb[0]] } else { rgb }, bits))
+    }
+
+    /// Pixel (x, y) as 8-bit R'G'B'. Y'CbCr, which decoded video arrives
+    /// in, is read here; other layouts in `other_rgb`, so that this stays
+    /// small enough to inline into a caller's sampling loop.
+    #[inline(always)]
+    pub(super) fn rgb(&self, x: usize, y: usize) -> [u8; 3] {
+        match self.layout {
+            Layout::Yuv { matrix, .. } | Layout::Planes { matrix, .. } => {
+                let [luma, cb, cr] = self.ycbcr(x, y);
+                to_rgb(matrix, luma, cb, cr)
+            }
+            _ => self.other_rgb(x, y),
         }
-        Layout::Rgb565 { bgr } => {
-            let value = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
-            let expand = |v: u16, max: u16| {
-                ((u32::from(v) * 255 + u32::from(max) / 2) / u32::from(max)) as u8
+    }
+
+    /// The brightest of pixel (x, y)'s components as `rgb` gives them,
+    /// without working out the other two of a Y'CbCr layout.
+    #[inline(always)]
+    pub(super) fn brightest(&self, x: usize, y: usize) -> u8 {
+        match self.layout {
+            Layout::Yuv { matrix, .. } | Layout::Planes { matrix, .. } => {
+                let [luma, cb, cr] = self.ycbcr(x, y);
+                brightest(matrix, luma, cb, cr)
+            }
+            _ => {
+                let [r, g, b] = self.other_rgb(x, y);
+                r.max(g).max(b)
+            }
+        }
+    }
+
+    /// `brightest` of each pixel of row `y` from column `x0`, into `out`.
+    pub(super) fn brightest_row(&self, x0: usize, y: usize, out: &mut [u8]) {
+        match self.layout {
+            // A loop for each color space, which none then decides per pixel.
+            Layout::Yuv { matrix, .. } | Layout::Planes { matrix, .. } => match matrix {
+                Matrix::Full => self.ycbcr_peaks(Matrix::Full, x0, y, out),
+                Matrix::Bt601 => self.ycbcr_peaks(Matrix::Bt601, x0, y, out),
+                Matrix::Bt709 => self.ycbcr_peaks(Matrix::Bt709, x0, y, out),
+                Matrix::Full709 => self.ycbcr_peaks(Matrix::Full709, x0, y, out),
+            },
+            _ => {
+                for (x, peak) in (x0..).zip(out) {
+                    *peak = self.brightest(x, y);
+                }
+            }
+        }
+    }
+
+    /// `brightest_row` of a Y'CbCr layout in `matrix`'s color space. The
+    /// pixels a planar layout's chroma sample covers share its chroma terms.
+    #[inline(always)]
+    fn ycbcr_peaks(&self, matrix: Matrix, x0: usize, y: usize, out: &mut [u8]) {
+        let Layout::Planes { .. } = self.layout else {
+            for (x, peak) in (x0..).zip(out) {
+                let [luma, cb, cr] = self.ycbcr(x, y);
+                *peak = brightest(matrix, luma, cb, cr);
+            }
+            return;
+        };
+        let chroma = self.chroma;
+        let luma = &self.data[y * self.width + x0..][..out.len()];
+        let row = (y >> chroma.shift.1) * chroma.columns * chroma.step;
+        let (cb, cr) = (&self.data[chroma.cb + row..], &self.data[chroma.cr + row..]);
+        let (mut held, mut top) = (usize::MAX, 0);
+        for (x, (peak, &luma)) in (x0..).zip(out.iter_mut().zip(luma)) {
+            let at = (x >> chroma.shift.0) * chroma.step;
+            if at != held {
+                (held, top) = (at, top_term(matrix, cb[at], cr[at]));
+            }
+            *peak = component(matrix, luma_term(matrix, luma) + top);
+        }
+    }
+
+    /// `rgb` of the layouts other than Y'CbCr.
+    #[inline(never)]
+    fn other_rgb(&self, x: usize, y: usize) -> [u8; 3] {
+        let data = self.data;
+        let i = y * self.width + x;
+        match self.layout {
+            Layout::Mono { bits } => {
+                let value = packed_sample(self.row(y), x * bits as usize, bits);
+                [(u32::from(value) * 255 / ((1 << bits) - 1)) as u8; 3]
+            }
+            Layout::SignedMono => [data[i] ^ 128; 3],
+            Layout::Rgb { .. } => {
+                let (rgb, bits) = self.native_color(x, y).expect("an RGB layout");
+                rgb.map(|v| (v >> bits.saturating_sub(8)).min(255) as u8)
+            }
+            Layout::Rgb565 { bgr } => {
+                let value = u16::from_le_bytes([data[2 * i], data[2 * i + 1]]);
+                let expand = |v: u16, max: u16| {
+                    ((u32::from(v) * 255 + u32::from(max) / 2) / u32::from(max)) as u8
+                };
+                let rgb = [
+                    expand(value & 31, 31),
+                    expand((value >> 5) & 63, 63),
+                    expand(value >> 11, 31),
+                ];
+                if bgr { [rgb[2], rgb[1], rgb[0]] } else { rgb }
+            }
+            Layout::Yuv { .. } | Layout::Planes { .. } => unreachable!("Y'CbCr is read by `rgb`"),
+        }
+    }
+
+    /// The luma, Cb and Cr of pixel (x, y) of a Y'CbCr layout: planar and
+    /// 4:2:2, what decoded video and webcams send, here; the rest in
+    /// `other_ycbcr`.
+    #[inline(always)]
+    fn ycbcr(&self, x: usize, y: usize) -> [u8; 3] {
+        match self.layout {
+            Layout::Planes { .. } => {
+                let (cb, cr) = self.chroma.at(self.data, x, y);
+                [self.data[y * self.width + x], cb, cr]
+            }
+            Layout::Yuv {
+                group: 2, cb_first, ..
+            } => {
+                let p = &self.row(y)[(x / 2) * 4..];
+                // Match the existing 4:2:2 decoder for a lone last pixel.
+                if cb_first {
+                    [p[1 + 2 * (x & 1)], p[0], p.get(2).copied().unwrap_or(128)]
+                } else {
+                    [p[2 * (x & 1)], p[1], p.get(3).copied().unwrap_or(128)]
+                }
+            }
+            _ => self.other_ycbcr(x, y),
+        }
+    }
+
+    /// `ycbcr` of 4:4:4 and 4:1:1 packed in rows.
+    #[inline(never)]
+    fn other_ycbcr(&self, x: usize, y: usize) -> [u8; 3] {
+        let Layout::Yuv {
+            group, cb_first, ..
+        } = self.layout
+        else {
+            unreachable!("not a Y'CbCr layout")
+        };
+        let row = self.row(y);
+        if group == 1 {
+            let p = &row[3 * x..];
+            return if cb_first {
+                [p[1], p[0], p[2]]
+            } else {
+                [p[0], p[1], p[2]]
             };
-            let rgb = [
-                expand(value & 31, 31),
-                expand((value >> 5) & 63, 63),
-                expand(value >> 11, 31),
-            ];
-            if bgr { [rgb[2], rgb[1], rgb[0]] } else { rgb }
         }
-        Layout::Yuv {
-            matrix,
-            group,
-            cb_first,
-        } => {
-            let row = super::row_bytes(frame.width, frame.pixel_format);
-            let row = &data[y * row..(y + 1) * row];
-            let (luma, cb, cr) = match group {
-                1 => {
-                    let p = &row[3 * x..];
-                    if cb_first {
-                        (p[1], p[0], p[2])
-                    } else {
-                        (p[0], p[1], p[2])
-                    }
-                }
-                2 => {
-                    let p = &row[(x / 2) * 4..];
-                    // Match the existing 4:2:2 decoder for a lone last pixel.
-                    if cb_first {
-                        (p[1 + 2 * (x & 1)], p[0], p.get(2).copied().unwrap_or(128))
-                    } else {
-                        (p[2 * (x & 1)], p[1], p.get(3).copied().unwrap_or(128))
-                    }
-                }
-                _ => {
-                    let p = &row[(x / 4) * 6..];
-                    // Default: Y0 Y1 Cb Y2 Y3 Cr. Explicit: Cb Y0 Y1 Cr Y2 Y3.
-                    let offsets = if cb_first { [1, 2, 4, 5] } else { [0, 1, 3, 4] };
-                    (
-                        p[offsets[x & 3]],
-                        p[if cb_first { 0 } else { 2 }],
-                        p[if cb_first { 3 } else { 5 }],
-                    )
-                }
-            };
-            to_rgb(matrix, luma, cb, cr)
-        }
-        Layout::Planes {
-            matrix,
-            sub,
-            interleaved,
-        } => {
-            let (cb, cr) = chroma_at(frame, sub, interleaved, x, y);
-            to_rgb(matrix, data[i], cb, cr)
-        }
+        let p = &row[(x / 4) * 6..];
+        // Default: Y0 Y1 Cb Y2 Y3 Cr. Explicit: Cb Y0 Y1 Cr Y2 Y3.
+        let offsets = if cb_first { [1, 2, 4, 5] } else { [0, 1, 3, 4] };
+        [
+            p[offsets[x & 3]],
+            p[if cb_first { 0 } else { 2 }],
+            p[if cb_first { 3 } else { 5 }],
+        ]
     }
 }
 
 /// A Y'CbCr sample as R'G'B'.
-fn to_rgb(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> [u8; 3] {
+#[inline(always)]
+pub(super) fn to_rgb(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> [u8; 3] {
+    let (luma, chroma) = terms(matrix, luma, cb, cr);
+    chroma.map(|term| component(matrix, luma + term))
+}
+
+/// The brightest of `to_rgb`'s three components. Each is the same
+/// nondecreasing function of the luma term plus its own chroma term, so the
+/// brightest is the one with the largest chroma term, and only it is
+/// rounded and clamped.
+#[inline(always)]
+pub(super) fn brightest(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> u8 {
+    let (luma, [r, g, b]) = terms(matrix, luma, cb, cr);
+    component(matrix, luma + r.max(g).max(b))
+}
+
+/// A Y'CbCr sample's luma term and the chroma terms of its R', G' and B',
+/// each of which `component` turns, added to the luma term, into one.
+#[inline(always)]
+fn terms(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> (i32, [i32; 3]) {
+    let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
     match matrix {
-        Matrix::Full => super::ycbcr(luma, cb, cr),
-        Matrix::Full709 => {
-            let y = i32::from(luma) << 16;
-            let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
-            // 2(1 - Kr), 2Kb(1 - Kb)/Kg, 2Kr(1 - Kr)/Kg and 2(1 - Kb) for
-            // BT.709's Kr 0.2126 and Kb 0.0722, in 16.16 fixed point.
+        // Whole numbers: each chroma term rounded on its own, as JFIF
+        // decoders compute it.
+        Matrix::Full => (
+            i32::from(luma),
             [
-                y + 103_206 * cr,
-                y - 12_276 * cb - 30_679 * cr,
-                y + 121_609 * cb,
-            ]
-            .map(|v| ((v + 32_768) >> 16).clamp(0, 255) as u8)
-        }
+                (91_881 * cr + 32_768) >> 16,
+                (-22_554 * cb - 46_802 * cr + 32_768) >> 16,
+                (116_130 * cb + 32_768) >> 16,
+            ],
+        ),
+        // 2(1 - Kr), 2Kb(1 - Kb)/Kg, 2Kr(1 - Kr)/Kg and 2(1 - Kb) for
+        // BT.709's Kr 0.2126 and Kb 0.0722, in 16.16 fixed point.
+        Matrix::Full709 => (
+            i32::from(luma) << 16,
+            [103_206 * cr, -12_276 * cb - 30_679 * cr, 121_609 * cb],
+        ),
         Matrix::Bt601 | Matrix::Bt709 => {
-            let y = (i32::from(luma) - 16) * 76_309;
-            let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
             let [r, gu, gv, b] = match matrix {
                 Matrix::Bt601 => [104_597, -25_675, -53_279, 132_201],
                 _ => [117_489, -13_975, -34_925, 138_438],
             };
-            [y + r * cr, y + gu * cb + gv * cr, y + b * cb]
-                .map(|v| ((v + 32_768) >> 16).clamp(0, 255) as u8)
+            (
+                (i32::from(luma) - 16) * 76_309,
+                [r * cr, gu * cb + gv * cr, b * cb],
+            )
         }
     }
 }
 
-/// The Cb and Cr a planar layout keeps for pixel (x, y), whose chroma
-/// sample covers its `sub` block.
-fn chroma_at(
-    frame: &Frame,
-    sub: (usize, usize),
-    interleaved: Option<bool>,
-    x: usize,
-    y: usize,
-) -> (u8, u8) {
-    let (width, height) = (frame.width as usize, frame.height as usize);
-    let (columns, rows) = (width.div_ceil(sub.0), height.div_ceil(sub.1));
-    let (cx, cy) = (x / sub.0, y / sub.1);
-    let chroma = &frame.data[width * height..];
-    match interleaved {
-        None => (
-            chroma[cy * columns + cx],
-            chroma[columns * rows + cy * columns + cx],
-        ),
-        Some(cb_first) => {
-            let pair = &chroma[(cy * columns + cx) * 2..];
-            if cb_first {
-                (pair[0], pair[1])
-            } else {
-                (pair[1], pair[0])
-            }
-        }
-    }
+/// The luma term of `terms` on its own, for a caller that knows `matrix`
+/// (the rest then folds away).
+#[inline(always)]
+fn luma_term(matrix: Matrix, luma: u8) -> i32 {
+    terms(matrix, luma, 128, 128).0
 }
 
-/// Row `y` of a Y'CbCr layout from column `x0`, decoded into `out` as
-/// `pixel_at` decodes each pixel, without looking the layout up for every
-/// one; false for other layouts.
-pub(super) fn decode_row(frame: &Frame, x0: usize, y: usize, out: &mut [[u8; 3]]) -> bool {
-    let Some((_, layout)) = layout(frame.pixel_format) else {
-        return false;
-    };
-    match layout {
-        Layout::Planes {
-            matrix,
-            sub,
-            interleaved,
-        } => {
-            let width = frame.width as usize;
-            let luma = &frame.data[y * width + x0..][..out.len()];
-            for (i, (rgb, &luma)) in out.iter_mut().zip(luma).enumerate() {
-                let (cb, cr) = chroma_at(frame, sub, interleaved, x0 + i, y);
-                *rgb = to_rgb(matrix, luma, cb, cr);
-            }
-            true
-        }
-        Layout::Yuv { .. } => {
-            for (i, rgb) in out.iter_mut().enumerate() {
-                *rgb = decode(frame, layout, x0 + i, y);
-            }
-            true
-        }
-        _ => false,
-    }
+/// The largest chroma term of `terms`, for a caller that knows `matrix`.
+#[inline(always)]
+fn top_term(matrix: Matrix, cb: u8, cr: u8) -> i32 {
+    let (_, [r, g, b]) = terms(matrix, 0, cb, cr);
+    r.max(g).max(b)
 }
 
-/// A directly decoded display pixel, after `validate` succeeds.
-pub(super) fn pixel_at(frame: &Frame, x: usize, y: usize) -> Option<[u8; 3]> {
-    let (_, layout) = layout(frame.pixel_format)?;
-    Some(decode(frame, layout, x, y))
+/// One component from the sum of its luma and chroma terms, rounded from
+/// 16.16 fixed point where `terms` keeps it, and clamped to 8 bits.
+#[inline(always)]
+fn component(matrix: Matrix, sum: i32) -> u8 {
+    match matrix {
+        Matrix::Full => sum,
+        _ => (sum + 32_768) >> 16,
+    }
+    .clamp(0, 255) as u8
 }
 
 pub(super) fn unpacked(frame: &Frame) -> Result<Option<Frame>> {
-    let Some((_, layout)) = layout(frame.pixel_format) else {
+    let Some(decoder) = Decoder::new(frame) else {
         return Ok(None);
     };
     let pixels = super::checked_pixels(frame)?;
@@ -651,7 +797,7 @@ pub(super) fn unpacked(frame: &Frame) -> Result<Option<Frame>> {
     let mut data = Vec::with_capacity(pixels * if mono { 1 } else { 3 });
     for y in 0..frame.height as usize {
         for x in 0..frame.width as usize {
-            let rgb = decode(frame, layout, x, y);
+            let rgb = decoder.rgb(x, y);
             if mono {
                 data.push(rgb[0]);
             } else {
@@ -683,6 +829,32 @@ mod tests {
 
     fn decoded(frame: &Frame) -> Vec<u8> {
         unpacked(frame).unwrap().unwrap().data.to_vec()
+    }
+
+    #[test]
+    fn brightest_is_the_largest_component() {
+        // Every chroma pair, with lumas at and around both ends of both
+        // ranges and a spread between them.
+        let lumas: Vec<u8> = (0..=255)
+            .filter(|v| v % 17 == 0 || [1, 15, 16, 17, 234, 235, 236, 254].contains(v))
+            .collect();
+        for matrix in [Matrix::Full, Matrix::Bt601, Matrix::Bt709, Matrix::Full709] {
+            for cb in 0..=255 {
+                for cr in 0..=255 {
+                    let top = top_term(matrix, cb, cr);
+                    for &luma in &lumas {
+                        let [r, g, b] = to_rgb(matrix, luma, cb, cr);
+                        let expected = r.max(g).max(b);
+                        let shared = component(matrix, luma_term(matrix, luma) + top);
+                        assert_eq!(
+                            [brightest(matrix, luma, cb, cr), shared],
+                            [expected; 2],
+                            "{matrix:?} {luma} {cb} {cr}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -743,7 +915,7 @@ mod tests {
                 .collect();
             let mut source = frame(format, 2, 2, data);
             assert_eq!(decoded(&source), expected, "{}", name(format).unwrap());
-            assert_eq!(pixel_at(&source, 1, 1).unwrap(), [5, 10, 15]);
+            assert_eq!(Decoder::new(&source).unwrap().rgb(1, 1), [5, 10, 15]);
             source.data.make_mut().pop();
             assert!(unpacked(&source).is_err());
         }

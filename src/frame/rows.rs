@@ -4,7 +4,7 @@
 //! mosaic of any depth is demosaicked from a ring of three 8-bit rows, so no
 //! full-size intermediate image is ever built: a consumer gets each row
 //! where it wants it (a preview's accumulator, an encoder's input buffer).
-use super::{FrameRef, Packing, bayer_pattern, is_bayer, packing, pixel_at, row_bytes};
+use super::{FrameRef, Packing, Pixels, bayer_pattern, is_bayer, packing, row_bytes};
 use crate::types::{MONO8, RGB8};
 
 /// What a decoded row holds for each pixel.
@@ -185,20 +185,16 @@ impl<'a> RowReader<'a> {
             }
             Kind::Bayer(pattern, mosaic) => self.demosaic(y, pattern, mosaic, channels, out),
             Kind::Pixels => {
-                let view = self.view;
+                let pixels = Pixels::new(self.view);
                 match channels {
                     Channels::Rgb => {
-                        let out = out.as_chunks_mut::<3>().0;
-                        if super::formats::decode_row(view.frame, x0, view.y0 + y, out) {
-                            return;
-                        }
-                        for (x, rgb) in out.iter_mut().enumerate() {
-                            *rgb = pixel_at(view, x, y);
+                        for (x, rgb) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                            *rgb = pixels.at(x, y);
                         }
                     }
                     Channels::Gray => {
                         for (x, value) in out.iter_mut().enumerate() {
-                            *value = pixel_at(view, x, y)[0];
+                            *value = pixels.at(x, y)[0];
                         }
                     }
                 }
@@ -691,9 +687,10 @@ pub(crate) mod tests {
                         continue;
                     }
                     let mut reader = RowReader::new(view);
+                    let pixels = Pixels::new(view);
                     for y in 0..view.height {
                         let expected: Vec<u8> =
-                            (0..view.width).flat_map(|x| pixel_at(view, x, y)).collect();
+                            (0..view.width).flat_map(|x| pixels.at(x, y)).collect();
                         assert_eq!(
                             reader.row(y, Channels::Rgb),
                             expected,

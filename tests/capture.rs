@@ -242,8 +242,13 @@ fn bursts_time_lapses_and_names_that_never_overwrite() {
     assert!(raw["files"][0].as_str().unwrap().ends_with("frame.raw"));
     let conflict = home.fails(2, &["capture", "-c", "sim:0", "-o", "x.png", "-f", "jpg"]);
     assert_eq!(conflict["code"], "usage");
-    let gif = home.fails(2, &["capture", "-c", "sim:0", "-o", "x.gif"]);
-    assert_eq!(gif["code"], "usage");
+    // Stills are PNG, JPEG or raw: other image names are refused, and
+    // nothing is written.
+    for name in ["x.gif", "x.pgm", "x.ppm"] {
+        let refused = home.fails(2, &["capture", "-c", "sim:0", "-o", name]);
+        assert_eq!(refused["code"], "usage", "{name}");
+        assert!(!home.path(name).exists(), "{name}");
+    }
     // Several frames need several names.
     let one_name = home.fails(2, &["capture", "-c", "sim:0", "-n", "2", "-o", "two.png"]);
     assert!(one_name["message"].as_str().unwrap().contains("{seq}"));

@@ -1,9 +1,9 @@
 //! Encoded stills as the parts they are written in: a body that borrows the
-//! frame where the format stores its bytes as they are (raw, and PGM and PPM
-//! of 8-bit gray and RGB), and at most one insert that goes into it on its
-//! way out (a PNM header, a JPEG's comment segment). Files and pipes take
-//! the parts with vectored writes, so neither the frame nor the encoder's
-//! output is copied to put them together.
+//! frame where the still is bytes the frame already holds (raw, and the
+//! JPEG a source sent), and at most one insert that goes into it on its way
+//! out (a JPEG's comment segment). Files and pipes take the parts with
+//! vectored writes, so neither the frame nor the encoder's output is copied
+//! to put them together.
 use std::io::{IoSlice, Write};
 
 /// The bulk of an encoded image.

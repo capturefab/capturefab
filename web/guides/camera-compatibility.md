@@ -74,8 +74,8 @@ when the shorter payload identifies it unambiguously. If payload padding or chun
 distinction, rows retain the byte-aligned interpretation. Unpacked words are little-endian.
 
 PNG keeps monochrome samples wider than eight bits, packed or not, as 16-bit gray with the samples
-in the top bits and an sBIT chunk naming how many are significant. JPEG, PGM, PPM, color and Bayer
-PNG, and inspection previews are opaque 8-bit images: monochrome samples below eight bits span
+in the top bits and an sBIT chunk naming how many are significant. JPEG, color and Bayer PNG, and
+inspection previews are opaque 8-bit images: monochrome samples below eight bits span
 black to white, and higher-depth samples use their high eight significant bits; a capture result
 reports `bit_depth` and, when the file keeps fewer bits than the frame, `source_bits`. Exposure
 and auto metering use bounded, stratified samples to avoid locking onto one phase of stripes or

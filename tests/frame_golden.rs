@@ -255,8 +255,6 @@ fn frame_case(
             "gray8": gray8,
             "rgba": outcome(frame::rgba(&frame)),
             "raw": outcome(frame::encode(&frame, "raw")),
-            "ppm": outcome(frame::encode(&frame, "ppm")),
-            "pgm": outcome(frame::encode(&frame, "pgm")),
             "png": outcome(frame::encode(&frame, "png")),
             "jpeg": outcome(frame::encode(&frame, "jpeg")),
             "sample_bits": frame::sample_bits(format),

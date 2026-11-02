@@ -81,11 +81,12 @@ pub fn meter(frame: &Frame) -> Option<Meter> {
 /// Bayer samples, wide color components and other layouts are decoded
 /// there, where they lie, without a full-sized temporary image.
 pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
-    use crate::frame::{native_color, native_sample, pixel_at};
+    use crate::frame::{Pixels, native_sample};
     let frame = view.frame;
     crate::frame::validate_source(frame).ok()?;
+    let pixels = Pixels::new(view);
     let packed = crate::frame::packing(frame.pixel_format);
-    let color_bits = native_color(frame, 0, 0).map(|(_, bits)| bits);
+    let color_bits = crate::frame::native_color(frame, 0, 0).map(|(_, bits)| bits);
     let format = packed.map_or(frame.pixel_format, |(format, ..)| format);
     let (w, h) = (view.width, view.height);
     // Other layouts are read as their 8-bit conversion.
@@ -118,13 +119,7 @@ pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
     }
     let scale = ((1u32 << bits) - 1) as f64;
     let (x0, y0) = (view.x0, view.y0);
-    let sample = |x: usize, y: usize| {
-        if decoded {
-            f64::from(pixel_at(view, x, y)[0])
-        } else {
-            f64::from(native_sample(frame, x0 + x, y0 + y))
-        }
-    };
+    let sample = |x: usize, y: usize| f64::from(native_sample(frame, x0 + x, y0 + y));
     let (mut sum, mut count, mut histogram) = (0.0, 0u32, [0u32; 256]);
     for i in crate::frame::sample_indices(gw * gh, 16_384) {
         let (x, y) = (i % gw, i / gw);
@@ -142,16 +137,20 @@ pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
             )
         } else if bytes == 3 {
             let [r, g, b] = if color_bits.is_some() {
-                native_color(frame, x0 + x, y0 + y)?.0.map(f64::from)
+                pixels.native_color(x, y)?.0.map(f64::from)
             } else if decoded {
-                pixel_at(view, x, y).map(f64::from)
+                pixels.at(x, y).map(f64::from)
             } else {
                 let i = 3 * ((y0 + y) * frame.width as usize + x0 + x);
                 [frame.data[i], frame.data[i + 1], frame.data[i + 2]].map(f64::from)
             };
             ((r + 2.0 * g + b) / 4.0, r.max(g).max(b))
         } else {
-            let v = sample(x, y);
+            let v = if decoded {
+                f64::from(pixels.at(x, y)[0])
+            } else {
+                sample(x, y)
+            };
             (v, v)
         };
         sum += (luma / scale).min(1.0);

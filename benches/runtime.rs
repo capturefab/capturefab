@@ -15,7 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const FORMATS: [(&str, u32); 20] = [
+const FORMATS: [(&str, u32); 21] = [
     ("Mono8", MONO8),
     ("RGB8", RGB8),
     ("BGR8", 0x0218_0015),
@@ -36,6 +36,7 @@ const FORMATS: [(&str, u32); 20] = [
     ("RGB16_Planar", 0x0230_0024),
     ("YUV8_UYV", 0x0218_0020),
     ("YCbCr709_422_8", 0x0210_0041),
+    ("yuv420p", 0x820c_0002),
 ];
 
 struct Rng(u64);
@@ -217,6 +218,61 @@ fn frame(width: u32, height: u32, pixel_format: u32) -> Frame {
                 })
                 .collect()
         }
+        // Limited-range BT.601, as FFmpeg decodes most video: 4:2:0 planes
+        // (yuv420p), 4:2:0 with interleaved chroma (NV12), and 4:2:2 as
+        // Cb Y Cr Y (UYVY). Chroma is the mean of the pixels it covers.
+        0x820c_0002 | 0x820c_0011 | 0x0210_0044 => {
+            let ycc = |p: &[u8; 3]| {
+                let [r, g, b] = p.map(f64::from);
+                [
+                    16.0 + 0.25679 * r + 0.50413 * g + 0.09791 * b,
+                    128.0 - 0.14822 * r - 0.29099 * g + 0.43922 * b,
+                    128.0 + 0.43922 * r - 0.36779 * g - 0.07143 * b,
+                ]
+                .map(|v| v.round().clamp(0.0, 255.0) as u8)
+            };
+            let (w, h) = (width as usize, height as usize);
+            let (sx, sy) = if pixel_format == 0x0210_0044 {
+                (2, 1)
+            } else {
+                (2, 2)
+            };
+            let chroma = |c: usize, cx: usize, cy: usize| {
+                let block: Vec<u32> = (cy * sy..(cy * sy + sy).min(h))
+                    .flat_map(|y| (cx * sx..(cx * sx + sx).min(w)).map(move |x| (x, y)))
+                    .map(|(x, y)| u32::from(ycc(&pixels[y * w + x])[c]))
+                    .collect();
+                (block.iter().sum::<u32>() as f64 / block.len() as f64).round() as u8
+            };
+            let (cw, ch) = (w.div_ceil(sx), h.div_ceil(sy));
+            let luma = |x: usize, y: usize| ycc(&pixels[y * w + x])[0];
+            match pixel_format {
+                0x0210_0044 => (0..h)
+                    .flat_map(|y| {
+                        (0..cw).flat_map(move |cx| {
+                            [
+                                chroma(1, cx, y),
+                                luma(2 * cx, y),
+                                chroma(2, cx, y),
+                                luma(2 * cx + 1, y),
+                            ]
+                        })
+                    })
+                    .collect(),
+                _ => {
+                    let mut data: Vec<u8> = pixels.iter().map(|p| ycc(p)[0]).collect();
+                    let blocks = (0..ch).flat_map(|cy| (0..cw).map(move |cx| (cx, cy)));
+                    if pixel_format == 0x820c_0011 {
+                        data.extend(blocks.flat_map(|(x, y)| [chroma(1, x, y), chroma(2, x, y)]));
+                    } else {
+                        for c in [1, 2] {
+                            data.extend(blocks.clone().map(|(x, y)| chroma(c, x, y)));
+                        }
+                    }
+                    data
+                }
+            }
+        }
         0x0108_0009 => (0..height as usize)
             .flat_map(|y| {
                 let pixels = &pixels;
@@ -286,6 +342,10 @@ const PACKED_BASELINES: [(&str, &str); 5] = [
     ("BayerRG14p", "BayerRG12"),
 ];
 const PACKED_LIMIT: f64 = 6.0;
+/// How many times as long as RGB8 measuring Y'CbCr of the same size may
+/// take, when both are benchmarked. With its layout looked up for every
+/// pixel read, decoded video took four to five times as long.
+const YCBCR_MEASURE_LIMIT: f64 = 3.0;
 
 fn png(
     rgb: &[u8],
@@ -418,7 +478,7 @@ fn main() {
     }
     for (name, format) in [("Mono8", MONO8), ("RGB8", RGB8), ("BayerRG8", 0x0108_0009)] {
         let f = frame(1920, 1200, format);
-        for encoding in ["png", "ppm", "raw"] {
+        for encoding in ["png", "raw"] {
             b.run(
                 &format!("encode/{encoding}/{name}/1920x1200"),
                 f.data.len(),
@@ -544,10 +604,45 @@ fn main() {
             || frame::sharpness(&f, region).unwrap(),
         );
     }
+    // What `inspect` measures of a whole frame (exposure, clipping, the
+    // auto meter and focus) in camera layouts and the Y'CbCr that FFmpeg
+    // sources deliver, each read where it lies.
+    for (width, height) in [(640, 480), (1920, 1080)] {
+        let mut rgb8 = None;
+        for (name, format) in [
+            ("Mono8", MONO8),
+            ("RGB8", RGB8),
+            ("yuv420p", 0x820c_0002),
+            ("NV12", 0x820c_0011),
+            ("UYVY", 0x0210_0044),
+        ] {
+            let label = format!("measure/{name}/{width}x{height}");
+            if !b.selected(&label) {
+                continue;
+            }
+            let f = frame(width, height, format);
+            let median = b.run(&label, f.data.len(), || {
+                capturefab::testing::inspect::measure(
+                    &f,
+                    CameraKind::AreaScan,
+                    [0, 0, width, height],
+                )
+            });
+            match (name, median, rgb8) {
+                ("RGB8", _, _) => rgb8 = median,
+                ("Mono8", ..) => {}
+                (_, Some(time), Some(baseline)) => {
+                    let ratio = time / baseline;
+                    assert!(
+                        ratio <= YCBCR_MEASURE_LIMIT,
+                        "{label} takes {ratio:.1} times measure/RGB8/{width}x{height}"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
     let mono = frame(1920, 1200, MONO8);
-    b.run("encode/pgm/Mono8/1920x1200", mono.data.len(), || {
-        frame::encode(&mono, "pgm").unwrap()
-    });
     let bayer = frame(1920, 1200, 0x0108_0009);
     let rgb = frame::rgb(&bayer).unwrap();
     for (label, compression, filter) in [

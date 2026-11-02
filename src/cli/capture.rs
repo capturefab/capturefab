@@ -1374,5 +1374,8 @@ mod tests {
         assert_eq!(format("/a/shot.png", Some(Format::Png)).unwrap(), "png");
         assert!(format("/a/shot.png", Some(Format::Jpg)).is_err());
         assert!(format("/a/shot.gif", None).is_err());
+        // PGM and PPM are not still formats, whatever the name says.
+        assert!(format("/a/shot.pgm", None).is_err());
+        assert!(format("/a/shot.ppm", None).is_err());
     }
 }
