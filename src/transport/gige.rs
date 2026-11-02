@@ -17,6 +17,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod batch;
+
 const GVCP_PORT: u16 = 3956;
 const DISCOVERY: u16 = 0x0002;
 const PACKET_RESEND: u16 = 0x0040;
@@ -1021,7 +1023,7 @@ impl Backend for GigE {
         );
         let socket = UdpSocket::bind((self.host_ip, 0)).context("opening GVSP receive socket")?;
         let receive = socket2::SockRef::from(&socket);
-        request_receive_buffer(payload_size, |size| receive.set_recv_buffer_size(size));
+        request_receive_buffer(payload_size, |size| set_receive_buffer(&socket, size));
         let receive_buffer = receive.recv_buffer_size().ok();
         let port = socket.local_addr()?.port();
         let camera = IpAddr::V4(self.camera_ip);
@@ -1109,6 +1111,8 @@ impl Backend for GigE {
                     overflow: vec![0; 64 * 1024],
                     scratch: Vec::new(),
                     scatter: scatter(std::env::var_os(SCATTER_ENV).as_deref()),
+                    batch: cfg!(target_os = "linux")
+                        .then(|| batch::Batch::new((packet_size as usize).clamp(576, 65_536))),
                     timeout: POLL,
                     next_poll: Instant::now(),
                     next_traversal: Instant::now() + TRAVERSAL,
@@ -1139,7 +1143,7 @@ impl Backend for GigE {
         let socket =
             UdpSocket::bind((self.host_ip, 0)).context("opening GVSP network test socket")?;
         let receive = socket2::SockRef::from(&socket);
-        request_receive_buffer(payload_size, |size| receive.set_recv_buffer_size(size));
+        request_receive_buffer(payload_size, |size| set_receive_buffer(&socket, size));
         let receive_buffer = receive.recv_buffer_size().ok();
         let port = socket.local_addr()?.port();
         let mtu = host_mtu(self.host_ip);
@@ -1364,6 +1368,35 @@ impl Drop for GigE {
     }
 }
 
+/// Ask for a receive buffer of `size` bytes. On Linux, where a plain
+/// request is silently cut to `net.core.rmem_max` (often about 200 KiB,
+/// far less than a frame), a process allowed to (`CAP_NET_ADMIN`) gets the
+/// size it asks for, within a sixteenth of the memory left; one that is
+/// not gets what the limit allows.
+fn set_receive_buffer(socket: &UdpSocket, size: usize) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let most = crate::host::memory_budget().map_or(usize::MAX, |budget| {
+            usize::try_from(budget / 16).unwrap_or(usize::MAX)
+        });
+        let forced = libc::c_int::try_from(size.min(most)).unwrap_or(libc::c_int::MAX);
+        // SAFETY: setsockopt reads the int it is given, for this socket.
+        let set = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUFFORCE,
+                (&forced as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if set == 0 {
+            return Ok(());
+        }
+    }
+    socket2::SockRef::from(socket).set_recv_buffer_size(size)
+}
 fn request_receive_buffer(payload: usize, mut set: impl FnMut(usize) -> std::io::Result<()>) {
     let mut size = payload.saturating_mul(8).clamp(4 << 20, 64 << 20);
     while set(size).is_err() && size > 256 << 10 {
@@ -1636,6 +1669,9 @@ struct Stream {
     scratch: Vec<u8>,
     /// Payload packets are received straight into their frames.
     scatter: bool,
+    /// Several datagrams are received a system call (Linux).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    batch: Option<batch::Batch>,
     timeout: Duration,
     next_poll: Instant,
     next_traversal: Instant,
@@ -1695,6 +1731,10 @@ impl Stream {
     /// say which payload packet comes next, else whole into the buffer, to
     /// be copied from there. None for a datagram from anywhere else.
     fn receive(&mut self, camera: IpAddr) -> std::io::Result<Option<Result<Option<Frame>>>> {
+        #[cfg(target_os = "linux")]
+        if self.batch.is_some() {
+            return self.receive_batch(camera);
+        }
         let predicted = self.scatter.then(|| self.assembler.predict()).flatten();
         let Some(slot) = predicted else {
             let (length, source) = self.socket.recv_from(&mut self.buffer)?;
@@ -1751,6 +1791,38 @@ impl Stream {
             scratch,
             Instant::now(),
         )))
+    }
+    /// `receive`, several datagrams at a time (`batch`).
+    #[cfg(target_os = "linux")]
+    fn receive_batch(&mut self, camera: IpAddr) -> std::io::Result<Option<Result<Option<Frame>>>> {
+        let Stream {
+            socket,
+            gvcp,
+            assembler,
+            batch,
+            scatter,
+            ..
+        } = self;
+        let batch = batch.as_mut().expect("a stream that receives in batches");
+        let slots = if *scatter {
+            assembler.predict_run(batch::BATCH)
+        } else {
+            Vec::new()
+        };
+        let base = match slots.is_empty() {
+            true => std::ptr::null_mut(),
+            false => assembler
+                .newest_buffer()
+                .expect("predicted slots lie in a buffer"),
+        };
+        let count = batch::wanted(*scatter, &slots);
+        let received = batch::receive(socket, batch, (&slots, base, count), (camera, *gvcp))?;
+        let site = if *scatter {
+            Site::GvspFallback
+        } else {
+            Site::GvspAssemble
+        };
+        Ok(batch.take(assembler, (&slots, base), &received, site, Instant::now()))
     }
     fn flush(&mut self) {
         for (block, extended, first, last) in self.assembler.requests.drain(..) {
@@ -2130,25 +2202,53 @@ impl Assembler {
     /// its buffer, if that packet's place is still empty and inside the
     /// frame.
     fn predict(&self) -> Option<Slot> {
-        let frame = self.frames.last()?;
-        frame.data.as_ref()?;
-        let (block_size, max_packets) = self.limits[frame.extended as usize]?;
-        let id = frame.end.div_ceil(block_size) + 1;
-        let offset = (id - 1) * block_size;
-        if id > max_packets
-            || frame.packets.is_some_and(|packets| id > packets)
-            || offset >= self.payload_limit
-            || bit(&frame.received, id as u32)
-        {
-            return None;
-        }
-        Some(Slot {
-            block: frame.block,
-            extended: frame.extended,
-            id: id as u32,
-            header: if frame.extended { 20 } else { 8 },
-            offset,
-            len: block_size.min(self.payload_limit - offset),
+        self.predict_run(1).pop()
+    }
+    /// Where the next `count` packets are expected to land, as `predict`
+    /// says of the first: the newest frame's payload packets that follow,
+    /// up to its end or the first one already received.
+    fn predict_run(&self, count: usize) -> Vec<Slot> {
+        let Some(frame) = self.frames.last().filter(|frame| frame.data.is_some()) else {
+            return Vec::new();
+        };
+        let Some((block_size, max_packets)) = self.limits[frame.extended as usize] else {
+            return Vec::new();
+        };
+        let first = frame.end.div_ceil(block_size) + 1;
+        (first..first + count)
+            .map_while(|id| {
+                let offset = (id - 1) * block_size;
+                let outside = id > max_packets
+                    || frame.packets.is_some_and(|packets| id > packets)
+                    || offset >= self.payload_limit
+                    || bit(&frame.received, id as u32);
+                (!outside).then(|| Slot {
+                    block: frame.block,
+                    extended: frame.extended,
+                    id: id as u32,
+                    header: if frame.extended { 20 } else { 8 },
+                    offset,
+                    len: block_size.min(self.payload_limit - offset),
+                })
+            })
+            .collect()
+    }
+    /// The newest frame's buffer, where a batch's predicted slots lie.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn newest_buffer(&mut self) -> Option<*mut u8> {
+        Some(self.frames.last_mut()?.data.as_mut()?.as_mut_ptr())
+    }
+    /// Whether `slot`'s frame still has the buffer starting at `base` and
+    /// its place is still empty, so a packet that landed there can be taken
+    /// in.
+    fn still_empty(&self, slot: &Slot, base: *const u8) -> bool {
+        self.frames.iter().rev().any(|frame| {
+            frame.block == slot.block
+                && frame
+                    .data
+                    .as_ref()
+                    .is_some_and(|data| std::ptr::eq(data.as_ptr(), base))
+                && !bit(&frame.received, slot.id)
         })
     }
     /// The place in the newest frame's buffer `slot` predicts.
@@ -2159,6 +2259,26 @@ impl Assembler {
             .filter(|frame| frame.block == slot.block)?;
         let data = frame.data.as_mut()?;
         data.get_mut(slot.offset..slot.offset + slot.len)
+    }
+    /// The payload packet a datagram of `received` bytes is, when it landed
+    /// in `slot` as predicted: its header, in `header`, names the slot's
+    /// frame and packet.
+    fn lands(
+        &self,
+        slot: &Slot,
+        (header, received, truncated): (&[u8], usize, bool),
+    ) -> Option<GvspPacket<'static>> {
+        let (size, packet) = (!truncated && received > slot.header)
+            .then(|| parse_header(&header[..slot.header]).ok())
+            .flatten()?;
+        let landed = size == slot.header
+            && matches!(packet.status, 0 | 0x0100)
+            && packet.kind == 3
+            && (packet.frame, packet.extended, packet.id) == (slot.block, slot.extended, slot.id);
+        landed.then(|| GvspPacket {
+            data: Data::Landed(received - slot.header),
+            ..packet
+        })
     }
     /// Take in a datagram of `received` bytes that was received as `slot`
     /// predicted: its first `slot.header` bytes in `header`, then `slot.len`
@@ -2173,24 +2293,8 @@ impl Assembler {
         scratch: &mut Vec<u8>,
         now: Instant,
     ) -> Result<Option<Frame>> {
-        let landed = (!truncated && received > slot.header)
-            .then(|| parse_header(&header[..slot.header]).ok())
-            .flatten()
-            .filter(|(size, packet)| {
-                *size == slot.header
-                    && matches!(packet.status, 0 | 0x0100)
-                    && packet.kind == 3
-                    && (packet.frame, packet.extended, packet.id)
-                        == (slot.block, slot.extended, slot.id)
-            });
-        if let Some((_, packet)) = landed {
-            return self.take(
-                GvspPacket {
-                    data: Data::Landed(received - slot.header),
-                    ..packet
-                },
-                now,
-            );
+        if let Some(packet) = self.lands(slot, (header, received, truncated)) {
+            return self.take(packet, now);
         }
         // At most one packet: a resend, a reorder, a leader or a trailer.
         scratch.clear();
@@ -4195,6 +4299,22 @@ mod tests {
                 .is_some_and(|note| note.contains("less than two"))
         );
     }
+    /// A receive buffer past `net.core.rmem_max` where the process may ask
+    /// for one (root, or CAP_NET_ADMIN), else as large as the limit allows.
+    #[test]
+    fn receive_buffers_are_forced_past_the_limit_where_allowed() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let wanted = 8 << 20;
+        set_receive_buffer(&socket, wanted).unwrap();
+        let got = socket2::SockRef::from(&socket).recv_buffer_size().unwrap();
+        // SAFETY: geteuid only reads this process's effective user.
+        #[cfg(target_os = "linux")]
+        if unsafe { libc::geteuid() } == 0 {
+            // Linux doubles what it is asked for, for its own bookkeeping.
+            assert!(got >= wanted, "{got}");
+        }
+        assert!(got > 0);
+    }
     #[test]
     fn packet_size_ladder_probes_few_sizes() {
         let run = |path: u32, cap, mtu_known| {
@@ -4918,6 +5038,106 @@ mod tests {
         seen
     }
 
+    /// Round `round`'s generated packets, of three frames reordered,
+    /// duplicated, lost, failed and cut short in ways `random` picks, and an
+    /// assembler for them.
+    fn generated(
+        random: &mut impl FnMut(usize) -> usize,
+        round: usize,
+    ) -> (Vec<Vec<u8>>, Assembler) {
+        let extended = round.is_multiple_of(3);
+        let (width, height) = ([16, 30, 64, 7][round % 4], [4, 9, 3][round % 3]);
+        let block_size = [16, 33, 64, 100][random(4)];
+        let first = if extended {
+            0xffff_fff0 + random(4) as u64
+        } else {
+            65_530 + random(10) as u64
+        };
+        let mut packets = Vec::new();
+        for frame in 0..3u64 {
+            // Standard block IDs wrap past 65535 to 1.
+            let block = if extended {
+                first + frame
+            } else {
+                (first + frame - 1) % 65_535 + 1
+            };
+            let mut frame = frame_packets(block, extended, width, height, block_size);
+            // Row and image padding the camera adds.
+            if round % 5 == 1 {
+                let image: Vec<u8> = image(width, height)
+                    .chunks(width as usize)
+                    .flat_map(|row| [row, &[0xAB, 0xCD][..]].concat())
+                    .chain([7; 3])
+                    .collect();
+                let mut lead = leader(width, height, MONO8);
+                lead[32..34].copy_from_slice(&2u16.to_be_bytes());
+                lead[34..36].copy_from_slice(&3u16.to_be_bytes());
+                frame = vec![gvsp(block, 0, 1, extended, &lead)];
+                for chunk in image.chunks(block_size) {
+                    frame.push(gvsp(block, frame.len() as u32, 3, extended, chunk));
+                }
+                frame.push(gvsp(
+                    block,
+                    frame.len() as u32,
+                    2,
+                    extended,
+                    &trailer(height),
+                ));
+            }
+            for _ in 0..random(4) {
+                let at = random(frame.len());
+                match random(8) {
+                    // Reordered.
+                    0 | 1 if at + 1 < frame.len() => frame.swap(at, at + 1),
+                    // A late leader.
+                    2 => {
+                        let leader = frame.remove(0);
+                        frame.insert(at.min(frame.len()), leader);
+                    }
+                    // A duplicate, later.
+                    3 => {
+                        let copy = frame[at].clone();
+                        frame.insert(random(frame.len() + 1), copy);
+                    }
+                    // Lost, or resent much later.
+                    4 => {
+                        let lost = frame.remove(at);
+                        if random(2) == 0 {
+                            frame.push(lost);
+                        }
+                    }
+                    // An error status from the camera.
+                    5 => frame[at][..2].copy_from_slice(&[0x80, 0x01]),
+                    // A resend the camera cannot serve yet.
+                    6 => {
+                        let mut unavailable = frame[at].clone();
+                        unavailable[..2].copy_from_slice(&[0x80, 0x14]);
+                        unavailable.truncate(if extended { 20 } else { 8 });
+                        frame.insert(at, unavailable);
+                    }
+                    // Cut short.
+                    _ => {
+                        let keep = random(frame[at].len());
+                        frame[at].truncate(keep);
+                    }
+                }
+            }
+            packets.extend(frame);
+        }
+        let payload = (width as usize + 2) * height as usize + 3;
+        let mut whole = Assembler::new(payload + random(3) * block_size, block_size + 36, 0);
+        whole.limits = [Some((block_size, payload.div_ceil(block_size) + 4)); 2];
+        whole.resend = round.is_multiple_of(2);
+        (packets, whole)
+    }
+    /// A second assembler set up as `like` is.
+    fn alike(like: &Assembler) -> Assembler {
+        let mut assembler = Assembler::new(like.payload_limit, like.limits[0].unwrap().0 + 36, 0);
+        assembler.limits = like.limits;
+        assembler.resend = like.resend;
+        assembler
+    }
+
     /// Generated packet sequences give the same frames, errors, counts and
     /// state received in place as received whole.
     #[test]
@@ -4931,92 +5151,8 @@ mod tests {
         };
         let mut landed_total = 0;
         for round in 0..400 {
-            let extended = round % 3 == 0;
-            let (width, height) = ([16, 30, 64, 7][round % 4], [4, 9, 3][round % 3]);
-            let block_size = [16, 33, 64, 100][random(4)];
-            let first = if extended {
-                0xffff_fff0 + random(4) as u64
-            } else {
-                65_530 + random(10) as u64
-            };
-            let mut packets = Vec::new();
-            for frame in 0..3u64 {
-                // Standard block IDs wrap past 65535 to 1.
-                let block = if extended {
-                    first + frame
-                } else {
-                    (first + frame - 1) % 65_535 + 1
-                };
-                let mut frame = frame_packets(block, extended, width, height, block_size);
-                // Row and image padding the camera adds.
-                if round % 5 == 1 {
-                    let image: Vec<u8> = image(width, height)
-                        .chunks(width as usize)
-                        .flat_map(|row| [row, &[0xAB, 0xCD][..]].concat())
-                        .chain([7; 3])
-                        .collect();
-                    let mut lead = leader(width, height, MONO8);
-                    lead[32..34].copy_from_slice(&2u16.to_be_bytes());
-                    lead[34..36].copy_from_slice(&3u16.to_be_bytes());
-                    frame = vec![gvsp(block, 0, 1, extended, &lead)];
-                    for chunk in image.chunks(block_size) {
-                        frame.push(gvsp(block, frame.len() as u32, 3, extended, chunk));
-                    }
-                    frame.push(gvsp(
-                        block,
-                        frame.len() as u32,
-                        2,
-                        extended,
-                        &trailer(height),
-                    ));
-                }
-                for _ in 0..random(4) {
-                    let at = random(frame.len());
-                    match random(8) {
-                        // Reordered.
-                        0 | 1 if at + 1 < frame.len() => frame.swap(at, at + 1),
-                        // A late leader.
-                        2 => {
-                            let leader = frame.remove(0);
-                            frame.insert(at.min(frame.len()), leader);
-                        }
-                        // A duplicate, later.
-                        3 => {
-                            let copy = frame[at].clone();
-                            frame.insert(random(frame.len() + 1), copy);
-                        }
-                        // Lost, or resent much later.
-                        4 => {
-                            let lost = frame.remove(at);
-                            if random(2) == 0 {
-                                frame.push(lost);
-                            }
-                        }
-                        // An error status from the camera.
-                        5 => frame[at][..2].copy_from_slice(&[0x80, 0x01]),
-                        // A resend the camera cannot serve yet.
-                        6 => {
-                            let mut unavailable = frame[at].clone();
-                            unavailable[..2].copy_from_slice(&[0x80, 0x14]);
-                            unavailable.truncate(if extended { 20 } else { 8 });
-                            frame.insert(at, unavailable);
-                        }
-                        // Cut short.
-                        _ => {
-                            let keep = random(frame[at].len());
-                            frame[at].truncate(keep);
-                        }
-                    }
-                }
-                packets.extend(frame);
-            }
-            let payload = (width as usize + 2) * height as usize + 3;
-            let mut whole = Assembler::new(payload + random(3) * block_size, block_size + 36, 0);
-            whole.limits = [Some((block_size, payload.div_ceil(block_size) + 4)); 2];
-            whole.resend = round % 2 == 0;
-            let mut placed = Assembler::new(whole.payload_limit, block_size + 36, 0);
-            placed.limits = whole.limits;
-            placed.resend = whole.resend;
+            let (packets, mut whole) = generated(&mut random, round);
+            let mut placed = alike(&whole);
             assert_eq!(
                 outcomes(&mut placed, &packets, true),
                 outcomes(&mut whole, &packets, false),
@@ -5028,10 +5164,133 @@ mod tests {
         assert!(landed_total > 2000, "{landed_total}");
     }
 
+    /// The frames `packets` complete, taken in by `assembler` as batches of
+    /// up to `batch::BATCH` datagrams of sizes `random` picks: each first
+    /// written where the kernel would put it (the predicted ones into their
+    /// header, slot and rest), then all taken in together. Without
+    /// `batches`, one at a time and whole.
+    fn assembled(
+        assembler: &mut Assembler,
+        packets: &[Vec<u8>],
+        mut batches: Option<&mut dyn FnMut(usize) -> usize>,
+    ) -> Vec<(u64, Vec<u8>)> {
+        let now = Instant::now();
+        let mut frames = Vec::new();
+        let mut keep = |result: Result<Option<Frame>>, assembler: &mut Assembler| {
+            for frame in result
+                .ok()
+                .flatten()
+                .into_iter()
+                .chain(assembler.ready.drain(..))
+            {
+                frames.push((frame.id, frame.data.to_vec()));
+            }
+        };
+        let Some(random) = batches.as_mut() else {
+            for packet in packets {
+                let result = assembler.push_counted(packet, now, Site::GvspAssemble);
+                keep(result, assembler);
+            }
+            return frames;
+        };
+        let mut batch = batch::Batch::new(64 * 1024);
+        let mut at = 0;
+        while at < packets.len() {
+            let count = (1 + random(batch::BATCH)).min(packets.len() - at);
+            let slots = assembler.predict_run(count);
+            let base = match slots.is_empty() {
+                true => std::ptr::null_mut(),
+                false => assembler.newest_buffer().unwrap(),
+            };
+            let mut received = Vec::new();
+            for (index, packet) in packets[at..at + count].iter().enumerate() {
+                match slots.get(index) {
+                    Some(slot) => {
+                        let head = packet.len().min(slot.header);
+                        batch.headers[index] = [0xEE; 20];
+                        batch.headers[index][..head].copy_from_slice(&packet[..head]);
+                        let rest = &packet[head..];
+                        let in_slot = rest.len().min(slot.len);
+                        assembler.slot_mut(slot).unwrap()[..in_slot]
+                            .copy_from_slice(&rest[..in_slot]);
+                        batch.rests[index][..rest.len() - in_slot]
+                            .copy_from_slice(&rest[in_slot..]);
+                    }
+                    None => batch.rests[index][..packet.len()].copy_from_slice(packet),
+                }
+                received.push(batch::Received {
+                    len: packet.len(),
+                    truncated: false,
+                    from_camera: true,
+                });
+            }
+            if let Some(result) = batch.take(
+                assembler,
+                (&slots, base),
+                &received,
+                Site::GvspFallback,
+                now,
+            ) {
+                keep(result, assembler);
+            }
+            at += count;
+        }
+        frames
+    }
+
+    /// Generated packet sequences received in batches, each payload packet
+    /// in its predicted place, give the frames they give received whole,
+    /// though one that lands on a later one's place is put in its own.
+    #[test]
+    fn packets_received_in_batches_assemble_as_packets_received_whole() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n.max(1) as u64) as usize
+        };
+        let mut sizes = {
+            let mut seed = 0x9e37_79b9u64;
+            move |n: usize| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed % n.max(1) as u64) as usize
+            }
+        };
+        let (mut landed, mut delivered) = (0, 0);
+        for round in 0..400 {
+            let (packets, mut whole) = generated(&mut random, round);
+            let mut batched = alike(&whole);
+            let frames = assembled(&mut whole, &packets, None);
+            assert_eq!(
+                assembled(&mut batched, &packets, Some(&mut sizes)),
+                frames,
+                "round {round}"
+            );
+            assert_eq!(
+                (batched.stats.incomplete_frames, batched.stats.lost_frames),
+                (whole.stats.incomplete_frames, whole.stats.lost_frames),
+                "round {round}"
+            );
+            landed += whole.copied.0 - batched.copied.0;
+            delivered += frames.len();
+        }
+        // Packets of a frame whose leader came within the batch are whole,
+        // which for these frames of a few packets each is most of them.
+        assert!(landed > 500 && delivered > 300, "{landed} {delivered}");
+    }
+
     /// A fake camera on loopback streaming `frames` 1080p Mono8 frames in
-    /// packets of `block` bytes, sent in `order`: what each frame held, and
-    /// the payload packets and bytes copied.
-    fn loopback(frames: u64, order: impl Fn(&mut Vec<Vec<u8>>)) -> (Vec<Vec<u8>>, (u64, u64)) {
+    /// packets of `block` bytes, sent in `order`, received a datagram at a
+    /// time or, `batched`, several (Linux): what each frame held, and the
+    /// payload packets and bytes copied.
+    fn loopback(
+        frames: u64,
+        batched: bool,
+        order: impl Fn(&mut Vec<Vec<u8>>),
+    ) -> (Vec<Vec<u8>>, (u64, u64)) {
         const BLOCK: usize = 8192;
         let fake = Fake::new(|camera| {
             camera.path_mtu = 9000;
@@ -5043,6 +5302,13 @@ mod tests {
         gige.packet_size = Some(Some(BLOCK as u32 + 36));
         gige.start(1920 * 1080).unwrap();
         assert!(gige.stream.as_ref().unwrap().scatter);
+        assert_eq!(
+            gige.stream.as_ref().unwrap().batch.is_some(),
+            cfg!(target_os = "linux")
+        );
+        if !batched {
+            gige.stream.as_mut().unwrap().batch = None;
+        }
         let mut received = Vec::new();
         for block in 1..=frames {
             let mut packets = Vec::new();
@@ -5075,26 +5341,36 @@ mod tests {
 
     #[test]
     fn packets_in_order_land_in_their_frames_without_copies() {
-        let (frames, copied) = loopback(30, |_| {});
-        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
-        assert_eq!(copied, (0, 0));
+        for batched in [false, true] {
+            let (frames, copied) = loopback(30, batched, |_| {});
+            assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+            assert_eq!(copied, (0, 0), "batched {batched}");
+        }
     }
 
     #[test]
     fn reordered_and_resent_packets_are_copied_one_by_one() {
         // Two payload packets swap places: each arrives where the other was
         // expected.
-        let (frames, copied) = loopback(3, |packets| packets.swap(5, 6));
+        let (frames, copied) = loopback(3, false, |packets| packets.swap(5, 6));
         assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
         assert_eq!(copied, (6, 6 * 8192));
         // A lost packet is asked for again and comes in out of turn; the
         // packet after it arrived where the lost one was expected.
-        let (frames, copied) = loopback(2, |packets| {
+        let lose = |packets: &mut Vec<Vec<u8>>| {
             packets.remove(40);
             packets.remove(9);
-        });
+        };
+        let (frames, copied) = loopback(2, false, lose);
         assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
         assert_eq!(copied, (8, 8 * 8192));
+        // In batches, every packet of the batch after a lost one arrived a
+        // place early and is copied, but no more.
+        let (frames, copied) = loopback(2, true, lose);
+        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+        assert!(copied.0 <= 2 * 2 * batch::BATCH as u64, "{copied:?}");
+        let (frames, _) = loopback(3, true, |packets| packets.swap(5, 6));
+        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
     }
 
     /// A short packet that arrives where a payload packet was expected
@@ -5103,21 +5379,28 @@ mod tests {
     fn frames_after_a_short_mispredicted_packet_arrive() {
         // The last payload packet is lost: the trailer arrives in its place
         // and the resent packet completes the frame.
-        let (frames, copied) = loopback(3, |packets| {
-            let last = packets.len() - 2;
-            packets.remove(last);
-        });
-        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
-        assert_eq!(copied, (0, 0));
+        for batched in [false, true] {
+            let (frames, copied) = loopback(3, batched, |packets| {
+                let last = packets.len() - 2;
+                packets.remove(last);
+            });
+            assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+            assert_eq!(copied, (0, 0), "batched {batched}");
+        }
         // A header-only "packet temporarily unavailable" resend reply where
-        // the packet itself was expected, which arrives next.
-        let (frames, copied) = loopback(3, |packets| {
+        // the packet itself was expected, which arrives next. In batches, the
+        // packets after it in the batch arrived a place late and are copied.
+        let unavailable = |packets: &mut Vec<Vec<u8>>| {
             let mut unavailable = packets[9][..8].to_vec();
             unavailable[..2].copy_from_slice(&0x8014u16.to_be_bytes());
             packets.insert(9, unavailable);
-        });
+        };
+        let (frames, copied) = loopback(3, false, unavailable);
         assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
         assert_eq!(copied, (0, 0));
+        let (frames, copied) = loopback(3, true, unavailable);
+        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+        assert!(copied.0 <= 3 * batch::BATCH as u64, "{copied:?}");
     }
 
     #[test]
@@ -5157,13 +5440,22 @@ mod tests {
     }
 
     /// Frames per second and receiver CPU time per frame for 4096x3000
-    /// Mono8 over loopback, with payloads received in place and copied.
+    /// Mono8 over loopback, with payloads received in place and copied,
+    /// in batches (Linux) and a datagram at a time.
     #[test]
     #[ignore = "a throughput measurement"]
     fn scatter_receive_throughput() {
         const BLOCK: usize = 8192;
         const FRAMES: u64 = 40;
-        for scatter in [true, false] {
+        let batches: &[bool] = if cfg!(target_os = "linux") {
+            &[true, false]
+        } else {
+            &[false]
+        };
+        for (scatter, batched) in [true, false]
+            .into_iter()
+            .flat_map(|scatter| batches.iter().map(move |&batched| (scatter, batched)))
+        {
             let fake = Fake::new(|camera| {
                 camera.path_mtu = 9000;
                 camera.test_packets = true;
@@ -5172,6 +5464,9 @@ mod tests {
             gige.packet_size = Some(Some(BLOCK as u32 + 36));
             gige.start(4096 * 3000).unwrap();
             gige.stream.as_mut().unwrap().scatter = scatter;
+            if !batched {
+                gige.stream.as_mut().unwrap().batch = None;
+            }
             let mut packets = Vec::new();
             let mut destination = None;
             fake.send_sized(1, false, (4096, 3000), &[], |packet, to| {
@@ -5212,7 +5507,7 @@ mod tests {
             sender.join().unwrap();
             assert!(received > 0);
             println!(
-                "scatter {scatter}: {received} of {FRAMES} frames, {:.1} fps, receiver CPU {:.2} ms per frame, copied {:?}",
+                "scatter {scatter}, batches {batched}: {received} of {FRAMES} frames, {:.1} fps, receiver CPU {:.2} ms per frame, copied {:?}",
                 received as f64 / elapsed.as_secs_f64(),
                 cpu.as_secs_f64() * 1e3 / received as f64,
                 gige.stream.as_ref().unwrap().assembler.copied,

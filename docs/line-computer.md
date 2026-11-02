@@ -82,7 +82,9 @@ Where usbcore is built into the kernel, as on Raspberry Pi OS and Jetson Linux, 
 Raspberry Pi OS, the `APPEND` line of `/boot/extlinux/extlinux.conf` on Jetson.
 
 **GigE Vision.** Linux caps every socket's receive buffer at `net.core.rmem_max`, usually
-208 KiB, which loses packets from larger frames. Raise it now and at every boot:
+208 KiB, which loses packets from larger frames. A process allowed to administer the network
+(root, or `CAP_NET_ADMIN`, as a systemd service can grant with `AmbientCapabilities`) gets the
+buffer it asks for regardless; for any other, raise the limit now and at every boot:
 
 ```sh
 sudo sysctl -w net.core.rmem_max=33554432
