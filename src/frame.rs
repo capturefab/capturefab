@@ -203,7 +203,7 @@ pub fn unpacked(frame: &Frame) -> Result<Cow<'_, Frame>> {
 }
 /// One row of packed samples as little-endian 16-bit samples, one per
 /// element of `out`; a short last group is completed with zeros.
-fn unpack_row(row: &[u8], bits: u32, packing: Packing, out: &mut [[u8; 2]]) {
+pub(crate) fn unpack_row(row: &[u8], bits: u32, packing: Packing, out: &mut [[u8; 2]]) {
     fn groups<const BYTES: usize, const SAMPLES: usize>(
         row: &[u8],
         out: &mut [[u8; 2]],

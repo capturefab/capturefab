@@ -16,7 +16,7 @@ use std::{
     cmp::Reverse,
     collections::{HashSet, VecDeque},
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, IoSlice, Read, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -3152,7 +3152,8 @@ pub struct ForwardStats {
     pub recording: Option<crate::engine::saved::RecordedFile>,
 }
 struct WriterState {
-    latest: Option<Vec<u8>>,
+    /// The newest frame, converted only once the writer takes it.
+    latest: Option<Frame>,
     error: Option<String>,
 }
 struct WriterQueue {
@@ -3204,7 +3205,7 @@ impl WriterQueue {
     /// Wait until `slot` and a new frame. With `repeat` the slot alone is
     /// enough, and `Some(None)` asks for the previous frame again. `None`
     /// once the writer stops.
-    fn take(&self, slot: Instant, repeat: bool) -> Option<Option<Vec<u8>>> {
+    fn take(&self, slot: Instant, repeat: bool) -> Option<Option<Frame>> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if !self.running.load(Ordering::Acquire) {
@@ -3849,28 +3850,128 @@ impl JetsonInput {
             Self::Rgba => "rgba",
         }
     }
-    fn bytes(self, frame: &Frame) -> Result<Vec<u8>> {
-        Ok(match self {
+    /// Convert `frame` into `scratch` for `payload`, in one pass: RGBA, or
+    /// gray for a monochrome frame that is not 8-bit gray already.
+    fn prepare(self, frame: &Frame, scratch: &mut Scratch) -> Result<()> {
+        match self {
             Self::Rgba => {
-                let data = crate::frame::rgba(frame)?;
-                crate::copies::record(crate::copies::Site::JetsonInput, data.len());
-                data
+                crate::frame::convert_into(frame, &mut scratch.rgba, |[r, g, b]| [r, g, b, 255])?;
+                crate::copies::record(
+                    crate::copies::Site::JetsonInput,
+                    scratch.rgba.as_flattened().len(),
+                );
             }
             Self::I420 => {
-                let mut data = crate::frame::convert(frame, |[gray, _, _]| gray)?;
-                let site = if frame.pixel_format == crate::types::MONO8 {
-                    crate::copies::Site::Intermediate
-                } else {
-                    crate::copies::Site::JetsonInput
-                };
-                crate::copies::record(site, data.len());
+                if !Self::gray8(frame) {
+                    crate::frame::convert_into(frame, &mut scratch.bytes, |[gray, _, _]| gray)?;
+                    crate::copies::record(crate::copies::Site::JetsonInput, scratch.bytes.len());
+                }
+                // Neutral chroma for both planes, the same for every frame.
                 let chroma =
                     (frame.width as usize).div_ceil(2) * (frame.height as usize).div_ceil(2);
-                data.resize(data.len() + 2 * chroma, 128);
-                data
+                scratch.chroma.resize(2 * chroma, 128);
             }
-        })
+        }
+        Ok(())
     }
+    /// Whether the frame's bytes are the luma plane as they are.
+    fn gray8(frame: &Frame) -> bool {
+        matches!(
+            frame.pixel_format,
+            crate::types::MONO8 | 0x0108_00b1 | 0x0108_00c6
+        )
+    }
+    /// What the encoder reads of a prepared frame: the luma plane, the
+    /// frame's own bytes for 8-bit gray, then the chroma planes.
+    fn payload<'a>(self, frame: &'a Frame, scratch: &'a Scratch) -> Payload<'a> {
+        match self {
+            Self::Rgba => Payload::Slice(scratch.rgba.as_flattened()),
+            Self::I420 => {
+                let pixels = frame.width as usize * frame.height as usize;
+                let luma = if Self::gray8(frame) {
+                    &frame.data[..pixels]
+                } else {
+                    &scratch.bytes[..]
+                };
+                Payload::Parts([luma, &scratch.chroma])
+            }
+        }
+    }
+    /// The bytes the encoder reads for `frame`, as one buffer.
+    #[cfg(test)]
+    fn bytes(self, frame: &Frame) -> Result<Vec<u8>> {
+        let mut scratch = Scratch::default();
+        self.prepare(frame, &mut scratch)?;
+        let payload = self.payload(frame, &scratch);
+        let mut bytes = Vec::with_capacity(payload.len());
+        payload.write_to(&mut bytes)?;
+        Ok(bytes)
+    }
+}
+/// What an encoder's input pipe reads of a frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Payload<'a> {
+    Slice(&'a [u8]),
+    /// Rows of `row` bytes, each followed by `pad`: odd-width 4:2:2, whose
+    /// rows FFmpeg reads as whole pixel pairs.
+    Rows {
+        data: &'a [u8],
+        row: usize,
+        pad: [u8; 2],
+    },
+    /// Parts in order: a Jetson I420 frame's luma and chroma planes.
+    Parts([&'a [u8]; 2]),
+}
+impl Payload<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Payload::Slice(data) => data.len(),
+            Payload::Rows { data, row, pad } => data.len() / row * (row + pad.len()),
+            Payload::Parts(parts) => parts.iter().map(|part| part.len()).sum(),
+        }
+    }
+    /// Write it to `out`, gathering parts and rows into as few writes as
+    /// the pipe takes.
+    fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
+        /// Slices per write, within every platform's IOV_MAX.
+        const BATCH: usize = 1024;
+        match *self {
+            Payload::Slice(data) => out.write_all(data),
+            Payload::Parts(parts) => write_vectored_all(out, &mut parts.map(IoSlice::new)),
+            Payload::Rows { data, row, ref pad } => {
+                let mut slices = Vec::with_capacity(BATCH);
+                for line in data.chunks_exact(row) {
+                    slices.extend([IoSlice::new(line), IoSlice::new(pad)]);
+                    if slices.len() == BATCH {
+                        write_vectored_all(out, &mut slices)?;
+                        slices.clear();
+                    }
+                }
+                write_vectored_all(out, &mut slices)
+            }
+        }
+    }
+}
+/// `write_all` for vectored writes: every byte of `slices`, taking up
+/// where a short write left off.
+fn write_vectored_all(out: &mut impl Write, mut slices: &mut [IoSlice<'_>]) -> std::io::Result<()> {
+    IoSlice::advance_slices(&mut slices, 0);
+    while !slices.is_empty() {
+        match out.write_vectored(slices) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+/// A recording writer's reused buffers for the frames it converts.
+#[derive(Default)]
+struct Scratch {
+    bytes: Vec<u8>,
+    rgba: Vec<[u8; 4]>,
+    chroma: Vec<u8>,
 }
 /// Pixel layout handed to the encoder after FFmpeg's input conversion.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -4229,59 +4330,122 @@ impl RawInput {
             .filter(|&n| n <= MAX_FRAME)
             .context("forwarding frame exceeds size limit")
     }
-    /// The bytes FFmpeg reads for `frame`; the sensor buffer itself unless
-    /// its samples are packed or widened, or its 4:2:2 rows end in half a
-    /// pixel pair.
-    fn bytes(&self, frame: Frame) -> Result<Vec<u8>> {
-        let (width, height) = (frame.width as usize, frame.height as usize);
+    /// Check a frame before it is queued, so a frame that cannot be
+    /// recorded fails its push: its format and size, and that it holds
+    /// every byte its conversion reads.
+    fn check(&self, frame: &Frame) -> Result<()> {
         let length = self.frame_len(frame.width, frame.height)?;
         ensure!(
             frame.pixel_format == self.pixel_format,
             "the camera's pixel format changed; start a new recording to continue"
         );
         let name = crate::frame::pixel_format_name(frame.pixel_format);
-        let mut data = if self.convert {
-            let data = if self.color {
-                crate::frame::rgb(&frame)?
-            } else {
-                crate::frame::gray8(&frame)?.context("monochrome frame has no gray conversion")?
-            };
-            crate::copies::record(crate::copies::Site::FfmpegUnpack, data.len());
-            data
-        } else if self.unpack {
-            let data = crate::frame::unpacked(&frame)?.into_owned().data;
-            crate::copies::record(crate::copies::Site::FfmpegUnpack, data.len());
-            data.into_pool_vec().into_vec()
-        } else {
-            frame.data.into_pool_vec().into_vec()
-        };
-        ensure!(data.len() >= length, "truncated {name} frame");
-        data.truncate(length);
-        if self.widen > 0 {
-            for sample in data.as_chunks_mut::<2>().0 {
-                let value = u16::from_le_bytes(*sample).min(u16::MAX >> self.widen);
-                *sample = (value << self.widen).to_le_bytes();
-            }
+        if self.convert {
+            return crate::frame::validate_source(frame);
         }
-        if self.pairs() && !width.is_multiple_of(2) {
-            // A camera ends each odd-width 4:2:2 row with a lone pixel and its
-            // Cb, but FFmpeg reads rows of whole pairs, 4 * ceil(width / 2)
-            // bytes. Each row gets the missing luma, which lies outside the
-            // image, and a neutral Cr, as `frame::unpacked` decodes that pixel.
-            let row = width * 2;
-            let padded_length = (row + 2)
-                .checked_mul(height)
+        let needed = if self.unpack {
+            crate::frame::row_bytes(frame.width, frame.pixel_format)
+                .checked_mul(frame.height as usize)
+                .context("forwarding frame exceeds size limit")?
+        } else {
+            length
+        };
+        ensure!(frame.data.len() >= needed, "truncated {name} frame");
+        if self.pairs() && !frame.width.is_multiple_of(2) {
+            (frame.width as usize * 2 + 2)
+                .checked_mul(frame.height as usize)
                 .filter(|&n| n <= MAX_FRAME)
                 .context("forwarding frame exceeds size limit")?;
-            crate::copies::record(crate::copies::Site::Intermediate, padded_length);
-            let mut padded = Vec::with_capacity(padded_length);
-            for line in data.chunks_exact(row) {
-                padded.extend_from_slice(line);
-                padded.extend_from_slice(&[128, 128]);
-            }
-            data = padded;
         }
-        Ok(data)
+        Ok(())
+    }
+    /// Whether FFmpeg reads a conversion of the frame rather than its bytes.
+    fn converts(&self) -> bool {
+        self.convert || self.unpack || self.widen > 0
+    }
+    /// Convert a checked `frame` into `scratch` when FFmpeg cannot read its
+    /// bytes: packed samples are unpacked and widened in one pass a row at
+    /// a time, and other layouts converted to gray or RGB.
+    fn prepare(&self, frame: &Frame, scratch: &mut Vec<u8>) -> Result<()> {
+        if !self.converts() {
+            return Ok(());
+        }
+        let length = self.frame_len(frame.width, frame.height)?;
+        if self.convert {
+            *scratch = if self.color {
+                crate::frame::rgb(frame)?
+            } else {
+                crate::frame::gray8(frame)?.context("monochrome frame has no gray conversion")?
+            };
+        } else {
+            scratch.resize(length, 0);
+            let widened = |sample: [u8; 2]| {
+                let value = u16::from_le_bytes(sample).min(u16::MAX >> self.widen);
+                (value << self.widen).to_le_bytes()
+            };
+            match crate::frame::packing(frame.pixel_format).filter(|_| self.unpack) {
+                Some((_, bits, packing)) => {
+                    let row = crate::frame::row_bytes(frame.width, frame.pixel_format);
+                    let rows = frame.data[..row * frame.height as usize].chunks_exact(row);
+                    let out_row = frame.width as usize * 2;
+                    for (line, out) in rows.zip(scratch.chunks_exact_mut(out_row)) {
+                        let samples = out.as_chunks_mut::<2>().0;
+                        crate::frame::unpack_row(line, bits, packing, samples);
+                        if self.widen > 0 {
+                            samples.iter_mut().for_each(|s| *s = widened(*s));
+                        }
+                    }
+                }
+                // Whole 16-bit samples, widened on their way.
+                None => {
+                    let source = frame.data[..length].as_chunks::<2>().0;
+                    for (out, sample) in scratch.as_chunks_mut::<2>().0.iter_mut().zip(source) {
+                        *out = widened(*sample);
+                    }
+                }
+            }
+        }
+        crate::copies::record(crate::copies::Site::FfmpegUnpack, scratch.len());
+        ensure!(
+            scratch.len() == length,
+            "truncated {} frame",
+            crate::frame::pixel_format_name(frame.pixel_format)
+        );
+        Ok(())
+    }
+    /// What FFmpeg reads of a prepared frame: the sensor buffer itself
+    /// unless its samples are packed or widened, a 4:2:2 frame's rows each
+    /// with the half pixel pair FFmpeg's rows end in.
+    fn payload<'a>(&self, frame: &'a Frame, scratch: &'a [u8]) -> Payload<'a> {
+        if self.converts() {
+            return Payload::Slice(scratch);
+        }
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        let length = width * height * self.bytes_per_pixel;
+        if self.pairs() && !width.is_multiple_of(2) {
+            // A camera ends each odd-width 4:2:2 row with a lone pixel and
+            // its Cb, but FFmpeg reads rows of whole pairs, 4 * ceil(width /
+            // 2) bytes. Each row gets the missing luma, which lies outside
+            // the image, and a neutral Cr, as `frame::unpacked` decodes that
+            // pixel.
+            return Payload::Rows {
+                data: &frame.data[..length],
+                row: width * 2,
+                pad: [128, 128],
+            };
+        }
+        Payload::Slice(&frame.data[..length])
+    }
+    /// The bytes FFmpeg reads for `frame`, as one buffer.
+    #[cfg(test)]
+    fn bytes(&self, frame: Frame) -> Result<Vec<u8>> {
+        self.check(&frame)?;
+        let mut scratch = Vec::new();
+        self.prepare(&frame, &mut scratch)?;
+        let payload = self.payload(&frame, &scratch);
+        let mut bytes = Vec::with_capacity(payload.len());
+        payload.write_to(&mut bytes)?;
+        Ok(bytes)
     }
 }
 impl Forwarder {
@@ -4525,21 +4689,37 @@ impl Forwarder {
         let (repeat, through_stalls) = (jetson.is_some() || !local, !local);
         let writer = thread::spawn(move || {
             let mut next = Instant::now();
-            let mut last = None;
+            let mut last: Option<Frame> = None;
+            let mut scratch = Scratch::default();
             loop {
                 let again = repeat && last.is_some() && (through_stalls || !shared.stalled());
                 let Some(fresh) = shared.take(next, again) else {
                     break;
                 };
-                if fresh.is_some() {
-                    last = fresh;
+                if let Some(frame) = fresh {
+                    // A frame that needs converting is converted here, once:
+                    // the frames a newer one replaced in the queue never are,
+                    // and a repeat sends the conversion again.
+                    let prepared = match jetson {
+                        Some(jetson) => jetson.prepare(&frame, &mut scratch),
+                        None => raw.prepare(&frame, &mut scratch.bytes),
+                    };
+                    if let Err(error) = prepared {
+                        shared.fail(format!("{error:#}"));
+                        break;
+                    }
+                    last = Some(frame);
                 }
-                let Some(bytes) = &last else {
+                let Some(frame) = &last else {
                     continue;
                 };
+                let payload = match jetson {
+                    Some(jetson) => jetson.payload(frame, &scratch),
+                    None => raw.payload(frame, &scratch.bytes),
+                };
                 shared.busy.store(true, Ordering::Relaxed);
-                crate::copies::record(crate::copies::Site::PipeWrite, bytes.len());
-                let written = input.write_all(bytes);
+                crate::copies::record(crate::copies::Site::PipeWrite, payload.len());
+                let written = payload.write_to(&mut input);
                 shared.busy.store(false, Ordering::Relaxed);
                 if let Err(e) = written {
                     shared.fail(format!("FFmpeg input failed: {e}"));
@@ -4692,12 +4872,13 @@ impl Forwarder {
             );
         }
         // FFmpeg converts on its own threads with SIMD swscale (or the encoder
-        // hardware), so the sensor buffer itself is queued for the pipe.
-        // Jetson's converter takes RGBA or I420, built here in one pass.
-        let bytes = match process.jetson {
-            Some(input) => input.bytes(&frame)?,
-            None => process.raw.bytes(frame)?,
-        };
+        // hardware), so the camera's buffer itself is queued for the pipe.
+        // What FFmpeg cannot read, and Jetson's RGBA or I420, the writer
+        // builds from it in one pass; only what that reads is checked here.
+        match process.jetson {
+            Some(_) => crate::frame::validate_source(&frame)?,
+            None => process.raw.check(&frame)?,
+        }
         let queue = &process.queue;
         let mut state = queue.state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(error) = &state.error {
@@ -4707,7 +4888,7 @@ impl Forwarder {
             queue.running.load(Ordering::Acquire),
             "FFmpeg forwarding writer stopped"
         );
-        let replaced = state.latest.replace(bytes).is_some();
+        let replaced = state.latest.replace(frame).is_some();
         queue.accepted.fetch_add(1, Ordering::Relaxed);
         let arrived = queue.epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         queue.arrived_ms.store(arrived, Ordering::Relaxed);
@@ -6210,6 +6391,23 @@ esac"#
         assert_eq!((&i420[..9], &i420[9..]), (&gray.data[..], &[128; 8][..]));
         let rgba = JetsonInput::Rgba.bytes(&gray).unwrap();
         assert_eq!(&rgba[..8], [1, 1, 1, 255, 2, 2, 2, 255]);
+        // The luma plane of a Mono8 frame is the frame's own buffer.
+        let mut scratch = Scratch::default();
+        JetsonInput::I420.prepare(&gray, &mut scratch).unwrap();
+        let Payload::Parts([luma, chroma]) = JetsonInput::I420.payload(&gray, &scratch) else {
+            panic!("I420 is luma and chroma");
+        };
+        assert_eq!((luma.as_ptr(), chroma.len()), (gray.data.as_ptr(), 8));
+        // Other monochrome formats are converted to 8-bit luma.
+        let wide = Frame {
+            pixel_format: 0x0110_0005,
+            data: (1..=9u16).flat_map(|v| (v << 4).to_le_bytes()).collect(),
+            ..gray.clone()
+        };
+        assert_eq!(
+            JetsonInput::I420.bytes(&wide).unwrap(),
+            JetsonInput::I420.bytes(&gray).unwrap()
+        );
         assert!(jetson_encoder("nvv4l2h264enc") && !jetson_encoder("h264_nvenc"));
     }
     #[test]
@@ -6355,6 +6553,147 @@ esac"#
             }
         }
     }
+    /// How every frame was turned into the encoder's input before it was
+    /// converted on the writer thread: the reference the payloads match.
+    fn reference_bytes(raw: &RawInput, frame: &Frame) -> Result<Vec<u8>> {
+        let (width, height) = (frame.width as usize, frame.height as usize);
+        let length = raw.frame_len(frame.width, frame.height)?;
+        ensure!(frame.pixel_format == raw.pixel_format, "format changed");
+        let mut data = if raw.convert {
+            if raw.color {
+                crate::frame::rgb(frame)?
+            } else {
+                crate::frame::gray8(frame)?.context("no gray conversion")?
+            }
+        } else if raw.unpack {
+            crate::frame::unpacked(frame)?.data.to_vec()
+        } else {
+            frame.data.to_vec()
+        };
+        ensure!(data.len() >= length, "truncated frame");
+        data.truncate(length);
+        if raw.widen > 0 {
+            for sample in data.as_chunks_mut::<2>().0 {
+                let value = u16::from_le_bytes(*sample).min(u16::MAX >> raw.widen);
+                *sample = (value << raw.widen).to_le_bytes();
+            }
+        }
+        if raw.pairs() && !width.is_multiple_of(2) {
+            let row = width * 2;
+            let mut padded = Vec::with_capacity((row + 2) * height);
+            for line in data.chunks_exact(row) {
+                padded.extend_from_slice(line);
+                padded.extend_from_slice(&[128, 128]);
+            }
+            data = padded;
+        }
+        Ok(data)
+    }
+    #[test]
+    fn payloads_are_written_whole_through_short_writes() {
+        /// A pipe that takes at most 5 bytes per write, gathered or not.
+        struct Short(Vec<u8>, usize);
+        impl Write for Short {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.1 += 1;
+                let n = bytes.len().min(5);
+                self.0.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn write_vectored(&mut self, slices: &[IoSlice<'_>]) -> std::io::Result<usize> {
+                self.1 += 1;
+                let mut room = 5;
+                for slice in slices {
+                    let n = slice.len().min(room);
+                    self.0.extend_from_slice(&slice[..n]);
+                    room -= n;
+                }
+                Ok(5 - room)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let rows: Vec<u8> = (0..2100 * 6).map(|i| i as u8).collect();
+        let parts = [&rows[..7], &[][..]];
+        for payload in [
+            Payload::Slice(&rows[..13]),
+            Payload::Parts(parts),
+            Payload::Parts([&[][..], &rows[..9]]),
+            Payload::Rows {
+                data: &rows,
+                row: 6,
+                pad: [128, 128],
+            },
+        ] {
+            let mut pipe = Short(Vec::new(), 0);
+            payload.write_to(&mut pipe).unwrap();
+            let expected: Vec<u8> = match payload {
+                Payload::Slice(data) => data.to_vec(),
+                Payload::Parts(parts) => parts.concat(),
+                Payload::Rows { data, row, pad } => data
+                    .chunks(row)
+                    .flat_map(|line| [line, &pad[..]].concat())
+                    .collect(),
+            };
+            assert_eq!(
+                (pipe.0.len(), payload.len()),
+                (expected.len(), expected.len())
+            );
+            assert_eq!(pipe.0, expected);
+            // Full writes, but at the end of each batch of rows.
+            assert!(pipe.1 <= expected.len().div_ceil(5) + 5, "{}", pipe.1);
+        }
+    }
+    #[test]
+    fn payloads_match_the_reference_conversion_for_every_format() {
+        let mut formats = Vec::new();
+        for family in [0x0100_0000u32, 0x0200_0000] {
+            for bits in 1..=64u32 {
+                for id in 0..0x200u32 {
+                    let format = family | bits << 16 | id;
+                    if crate::frame::pixel_format_name(format) != "Unknown"
+                        && RawInput::for_format(format).is_ok()
+                    {
+                        formats.push(format);
+                    }
+                }
+            }
+        }
+        assert!(formats.len() > 60, "{}", formats.len());
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut converted = 0;
+        for &format in &formats {
+            let raw = RawInput::for_format(format).unwrap();
+            for (width, height) in [(1, 1), (2, 3), (3, 2), (5, 3), (8, 2), (12, 4)] {
+                let frame = Frame {
+                    width,
+                    height,
+                    pixel_format: format,
+                    data: (0..crate::frame::row_bytes(width, format) * height as usize)
+                        .map(|_| {
+                            seed ^= seed << 13;
+                            seed ^= seed >> 7;
+                            seed ^= seed << 17;
+                            seed as u8
+                        })
+                        .collect(),
+                    ..Frame::default()
+                };
+                let reference = reference_bytes(&raw, &frame);
+                let bytes = raw.bytes(frame.clone());
+                match (&reference, &bytes) {
+                    (Ok(reference), Ok(bytes)) => {
+                        assert_eq!(bytes, reference, "{format:#x} {width}x{height}");
+                        converted += 1;
+                    }
+                    (Err(_), Err(_)) => {}
+                    _ => panic!("{format:#x} {width}x{height}: {reference:?} vs {bytes:?}"),
+                }
+            }
+        }
+        assert!(converted > formats.len() * 3, "{converted}");
+    }
     #[test]
     fn scalar_raw_inputs_preserve_samples_without_expanding_to_rgb() {
         for (format, ffmpeg, bytes_per_pixel) in [
@@ -6378,9 +6717,11 @@ esac"#
                 data: data.into(),
                 ..Frame::default()
             };
-            let bytes = raw.bytes(frame).unwrap();
-            assert_eq!(bytes, expected, "{format:#x}");
-            assert_eq!(bytes.as_ptr(), buffer, "sensor buffer moves without a copy");
+            let Payload::Slice(payload) = raw.payload(&frame, &[]) else {
+                panic!("{format:#x} is one slice");
+            };
+            assert_eq!(payload.as_ptr(), buffer, "the pipe reads the sensor buffer");
+            assert_eq!(raw.bytes(frame).unwrap(), expected, "{format:#x}");
         }
     }
     #[test]
