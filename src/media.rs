@@ -3532,31 +3532,45 @@ fn listed(listing: &str, encoder: &str) -> bool {
         .lines()
         .any(|line| line.split_whitespace().nth(1) == Some(encoder))
 }
-fn probe_key(encoder: &str, input: EncoderInput, width: u32, height: u32) -> String {
+/// A probe's key: the encoder, how its input is converted, the pixel
+/// format the frames reach FFmpeg in (`lavfi` for a generated test frame)
+/// and the size, such as `h264_nvenc yuv bayer_rggb8 1920x1080`.
+fn probe_key(
+    encoder: &str,
+    input: EncoderInput,
+    source: Option<&str>,
+    width: u32,
+    height: u32,
+) -> String {
     let input = match input {
         EncoderInput::Yuv => "yuv",
         EncoderInput::Rgb => "rgb",
     };
-    format!("{encoder} {input} {width}x{height}")
+    let source = source.unwrap_or("lavfi");
+    format!("{encoder} {input} {source} {width}x{height}")
 }
-/// One test frame at the recording's size: hardware encoders have size
-/// limits that a small probe would pass. A probe that timed out counts as a
-/// failure for this choice only.
+/// One test frame at the recording's size, in the pixel format the
+/// recording's frames will reach FFmpeg in when that is known: hardware
+/// encoders have size limits that a small probe would pass, and a format
+/// conversion the encoder's input needs can fail where another does not.
+/// A probe that timed out counts as a failure for this choice only.
 fn encoder_works(
     exe: &Executable,
     encoder: &str,
     input: EncoderInput,
+    source: Option<&RawInput>,
     width: u32,
     height: u32,
 ) -> Result<bool> {
-    let key = probe_key(encoder, input, width, height);
+    let pix_fmt = source.map(|raw| raw.input_pix_fmt(encoder));
+    let key = probe_key(encoder, input, pix_fmt, width, height);
     let works = probed(
         exe,
         |probes| probes.encoders.get(&key).copied(),
         |probes, found| {
             probes.encoders.insert(key.clone(), found);
         },
-        || probe_encoder(exe, encoder, input, width, height),
+        || probe_encoder(exe, encoder, input, source, width, height),
     )?;
     Ok(works.unwrap_or(false))
 }
@@ -3573,19 +3587,26 @@ fn jetson_works(exe: &Executable, encoder: &str) -> Result<bool> {
     Ok(works.unwrap_or(false))
 }
 /// The encoder is in this FFmpeg build, or is a Jetson GStreamer element,
-/// and encodes a test frame of this size.
-fn usable(exe: &Executable, encoder: &str, width: u32, height: u32) -> Result<bool> {
+/// and encodes a test frame of this size, in `source`'s format when it is
+/// known.
+fn usable(
+    exe: &Executable,
+    encoder: &str,
+    width: u32,
+    height: u32,
+    source: Option<&RawInput>,
+) -> Result<bool> {
     if jetson_encoder(encoder) {
         return jetson_works(exe, encoder);
     }
     // One that just failed the small check frame has no device here.
-    let small = probe_key(encoder, EncoderInput::Yuv, PROBE_SIZE.0, PROBE_SIZE.1);
+    let small = probe_key(encoder, EncoderInput::Yuv, None, PROBE_SIZE.0, PROBE_SIZE.1);
     let failed = with_probes(exe, |probes| probes.encoders.get(&small).copied())
         .and_then(Found::current)
         == Some(false);
     Ok(listed(&encoder_listing(exe)?, encoder)
         && !failed
-        && encoder_works(exe, encoder, EncoderInput::Yuv, width, height)?)
+        && encoder_works(exe, encoder, EncoderInput::Yuv, source, width, height)?)
 }
 /// The size probed before a recording's first frame says its real size.
 const PROBE_SIZE: (u32, u32) = (640, 480);
@@ -3643,6 +3664,7 @@ fn select_encoder(
     exe: &Executable,
     config: &ForwardConfig,
     (width, height): (u32, u32),
+    raw: &RawInput,
     skip: &[String],
 ) -> Result<String> {
     let family = codec_family(&config.codec)?;
@@ -3660,7 +3682,8 @@ fn select_encoder(
         return Ok(config.encoder.clone());
     }
     for candidate in encoder_candidates(family) {
-        if !skip.iter().any(|failed| failed == candidate) && usable(exe, candidate, width, height)?
+        if !skip.iter().any(|failed| failed == candidate)
+            && usable(exe, candidate, width, height, Some(raw))?
         {
             return Ok(candidate.into());
         }
@@ -3678,9 +3701,9 @@ pub(crate) fn check_codec(config: &ForwardConfig) -> Result<()> {
     };
     let family = codec_family(&config.codec)?;
     if config.encoder != "auto"
-        || encoder_candidates(family)
-            .iter()
-            .any(|candidate| usable(&exe, candidate, PROBE_SIZE.0, PROBE_SIZE.1).unwrap_or(true))
+        || encoder_candidates(family).iter().any(|candidate| {
+            usable(&exe, candidate, PROBE_SIZE.0, PROBE_SIZE.1, None).unwrap_or(true)
+        })
     {
         return Ok(());
     }
@@ -3697,7 +3720,7 @@ fn unsupported_codec(exe: &Executable, family: &str, size: Option<(u32, u32)>) -
         .filter(|&other| {
             other != family
                 && encoder_candidates(other).iter().any(|candidate| {
-                    usable(exe, candidate, PROBE_SIZE.0, PROBE_SIZE.1).unwrap_or(false)
+                    usable(exe, candidate, PROBE_SIZE.0, PROBE_SIZE.1, None).unwrap_or(false)
                 })
         })
         .collect::<Vec<_>>();
@@ -4033,59 +4056,88 @@ enum EncoderInput {
     Rgb,
 }
 /// NVENC and AMF accept packed RGB and convert it to YUV on the GPU, which
-/// keeps that matrix multiply off the CPU for color sources.
+/// keeps that matrix multiply off the CPU for RGB sources.
 fn hardware_rgb_input(encoder: &str) -> bool {
     encoder.ends_with("_nvenc") || encoder.ends_with("_amf")
 }
-/// Choose the encoder input for a source. RGB input is used only when the
-/// encoder accepts it on this machine, so a driver without it keeps the YUV
-/// path instead of falling back to software encoding.
+/// Choose the encoder input for a source. Only RGB sources go to an encoder
+/// as RGB: a Bayer mosaic or YUV would be converted to RGB on the CPU only
+/// to be converted back on the GPU, where swscale makes their 4:2:0 in one
+/// direct step (and sends a third of the bytes over the bus). RGB input is
+/// used only when the encoder accepts it on this machine, so a driver
+/// without it keeps the YUV path instead of falling back to software
+/// encoding.
 fn encoder_input(
     exe: &Executable,
     encoder: &str,
-    color: bool,
+    raw: &RawInput,
     (width, height): (u32, u32),
 ) -> Result<EncoderInput> {
-    if color
+    if raw.rgb()
         && hardware_rgb_input(encoder)
-        && encoder_works(exe, encoder, EncoderInput::Rgb, width, height)?
+        && encoder_works(exe, encoder, EncoderInput::Rgb, Some(raw), width, height)?
     {
         Ok(EncoderInput::Rgb)
     } else {
         Ok(EncoderInput::Yuv)
     }
 }
+/// Encode one frame with `candidate`: a black frame in `source`'s format,
+/// read as the recording will read its frames, or a generated one.
 fn probe_encoder(
     exe: &Executable,
     candidate: &str,
     input: EncoderInput,
+    source: Option<&RawInput>,
     width: u32,
     height: u32,
 ) -> Result<Option<bool>> {
-    let mut args = [
-        "-nostdin",
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-f",
-        "lavfi",
-        "-i",
-        &format!("color=size={width}x{height}:rate=1"),
-        "-frames:v",
-        "1",
-        "-c:v",
-        candidate,
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<Vec<_>>();
+    let mut args = ["-hide_banner", "-loglevel", "error"]
+        .map(str::to_string)
+        .to_vec();
+    let mut frame = Vec::new();
+    let pix_fmt = match source {
+        Some(raw) => {
+            let pix_fmt = raw.input_pix_fmt(candidate);
+            args.extend(
+                [
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                    pix_fmt,
+                    "-video_size",
+                    &format!("{width}x{height}"),
+                ]
+                .map(str::to_string),
+            );
+            args.extend(raw.color_options().iter().map(|option| option.to_string()));
+            args.extend(["-i".into(), "pipe:0".into()]);
+            // Neutral YUV chroma, so a black frame really is one.
+            frame = vec![if raw.pairs() { 128 } else { 0 }; raw.pipe_len(width, height)?];
+            pix_fmt
+        }
+        None => {
+            args.extend(
+                [
+                    "-nostdin",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &format!("color=size={width}x{height}:rate=1"),
+                ]
+                .map(str::to_string),
+            );
+            "yuv420p"
+        }
+    };
+    args.extend(["-frames:v", "1", "-c:v", candidate].map(str::to_string));
     args.extend(encoder_device_options(candidate));
-    args.extend(encoder_output_options(candidate, input));
+    args.extend(encoder_output_options(candidate, input, pix_fmt));
     args.extend(["-f".into(), "null".into(), "-".into()]);
     // Large sensors take longer to encode even once.
     let pixels = width as u64 * height as u64;
     let timeout = Duration::from_secs(3) + Duration::from_millis(pixels / 10_000);
-    let (works, _, timed_out) = timed_output(exe, &args, &[], timeout)?;
+    let (works, _, timed_out) = timed_output(exe, &args, &frame, timeout)?;
     Ok((!timed_out).then_some(works))
 }
 fn encoder_device_options(encoder: &str) -> Vec<String> {
@@ -4105,45 +4157,55 @@ fn encoder_device_options(encoder: &str) -> Vec<String> {
         Vec::new()
     }
 }
-fn encoder_output_options(encoder: &str, input: EncoderInput) -> Vec<String> {
+/// Output options for `encoder` reading `input` from frames in FFmpeg's
+/// pixel format `source`.
+fn encoder_output_options(encoder: &str, input: EncoderInput, source: &str) -> Vec<String> {
     if encoder == "ffv1" {
         // Every frame intra-coded at the camera's own pixel layout, so the
         // file is lossless frame by frame; no padding or 4:2:0.
         return ["-level", "3", "-g", "1"].map(str::to_owned).to_vec();
     }
+    // A mosaic is demosaicked to RGB24 first: the bundled FFmpeg's swscale
+    // makes 4:2:0 from RGB24 2.6 times faster than its direct Bayer to
+    // yuv420p path (about 21 against 57 ms a 12 MP frame on one Apple core,
+    // the two steps together), and as fast as straight to NV12.
+    let bayer = if source.starts_with("bayer_") && input == EncoderInput::Yuv {
+        "format=rgb24,"
+    } else {
+        ""
+    };
     let mut options = if encoder.ends_with("_vaapi") || encoder.ends_with("_vulkan") {
         // Convert and pad on the CPU, then upload into the device's frames.
         vec![
-            "-vf",
-            "pad=ceil(iw/2)*2:ceil(ih/2)*2,format=nv12,hwupload",
-            "-pix_fmt",
+            "-vf".into(),
+            format!("{bayer}pad=ceil(iw/2)*2:ceil(ih/2)*2,format=nv12,hwupload"),
+            "-pix_fmt".into(),
             if encoder.ends_with("_vaapi") {
                 "vaapi"
             } else {
                 "vulkan"
-            },
+            }
+            .into(),
         ]
     } else {
+        let nv12 = encoder.ends_with("_qsv")
+            || encoder.ends_with("_mf")
+            || encoder.ends_with("_videotoolbox");
         vec![
-            "-vf",
-            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-            "-pix_fmt",
+            "-vf".into(),
+            format!("{bayer}pad=ceil(iw/2)*2:ceil(ih/2)*2"),
+            "-pix_fmt".into(),
             if input == EncoderInput::Rgb {
                 "bgr0"
-            } else if encoder.ends_with("_qsv")
-                || encoder.ends_with("_mf")
-                || encoder.ends_with("_videotoolbox")
-            {
+            } else if nv12 {
                 // The native surface layout of these encoders: no repacking copy.
                 "nv12"
             } else {
                 "yuv420p"
-            },
+            }
+            .into(),
         ]
-    }
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
+    };
     if encoder.ends_with("_videotoolbox") {
         options.extend(["-allow_sw", "0"].map(str::to_owned));
     }
@@ -4348,14 +4410,32 @@ impl RawInput {
             full_range: matches!(ffmpeg, "uyvy422" | "yuyv422"),
         })
     }
-    /// The pixel format `encoder` must store these frames in, when FFmpeg's
-    /// own choice would fail. FFV1 keeps a 16-bit Bayer mosaic only in its
-    /// experimental version 4, so a wide mosaic is stored as 16-bit planar
-    /// RGB, which keeps every widened sample, as FFmpeg itself stores 8-bit
-    /// Bayer as 8-bit RGB.
-    fn output_pix_fmt(&self, encoder: &str) -> Option<&'static str> {
-        (encoder == "ffv1" && self.ffmpeg.starts_with("bayer_") && self.bytes_per_pixel == 2)
-            .then_some("gbrp16le")
+    /// The pixel format FFmpeg reads these frames as for `encoder`: their
+    /// own, except that FFV1 gets a Bayer mosaic as gray, which it stores
+    /// losslessly as it is (players show the mosaic in gray) where it would
+    /// otherwise demosaic 8-bit Bayer into RGB and reject 16-bit Bayer at
+    /// the level it is run at.
+    fn input_pix_fmt(&self, encoder: &str) -> &'static str {
+        match (encoder, self.bytes_per_pixel) {
+            ("ffv1", 1) if self.bayer() => "gray",
+            ("ffv1", _) if self.bayer() => "gray16le",
+            _ => self.ffmpeg,
+        }
+    }
+    fn bayer(&self) -> bool {
+        self.ffmpeg.starts_with("bayer_")
+    }
+    /// Packed RGB, with or without padding, in either component order.
+    fn rgb(&self) -> bool {
+        matches!(self.ffmpeg, "rgb24" | "bgr24" | "rgba" | "bgra")
+    }
+    /// The bytes FFmpeg reads for each frame: odd-width 4:2:2 rows end in
+    /// a whole pixel pair.
+    fn pipe_len(&self, width: u32, height: u32) -> Result<usize> {
+        if self.pairs() && !width.is_multiple_of(2) {
+            return Ok((width as usize + 1) * 2 * height as usize);
+        }
+        self.frame_len(width, height)
     }
     /// YUV 4:2:2, where each two pixels share one Cb and one Cr.
     fn pairs(&self) -> bool {
@@ -4545,7 +4625,7 @@ impl Forwarder {
         let local = recording.is_some();
         let exe = executable()?;
         let skip = self.failed.as_slice();
-        let encoder = select_encoder(&exe, &self.config, (width, height), skip)?;
+        let encoder = select_encoder(&exe, &self.config, (width, height), &raw, skip)?;
         let jetson = jetson_encoder(&encoder).then_some(if raw.color {
             JetsonInput::Rgba
         } else {
@@ -4610,7 +4690,8 @@ impl Forwarder {
                 "copy",
             ]);
         } else {
-            let input = encoder_input(&exe, &encoder, raw.color, (width, height))?;
+            let input = encoder_input(&exe, &encoder, &raw, (width, height))?;
+            let pix_fmt = raw.input_pix_fmt(&encoder);
             cmd.args(encoder_device_options(&encoder));
             // Each frame is stamped when FFmpeg reads it and keeps that time
             // in the output, so the file lasts as long as the recording did
@@ -4625,7 +4706,7 @@ impl Forwarder {
                 "-f",
                 "rawvideo",
                 "-pix_fmt",
-                raw.ffmpeg,
+                pix_fmt,
                 "-video_size",
                 &format!("{width}x{height}"),
                 "-framerate",
@@ -4645,10 +4726,7 @@ impl Forwarder {
                 "-g",
                 &((self.config.fps * 2.0).round().max(1.0) as u32).to_string(),
             ]);
-            cmd.args(encoder_output_options(&encoder, input));
-            if let Some(pix_fmt) = raw.output_pix_fmt(&encoder) {
-                cmd.args(["-pix_fmt", pix_fmt]);
-            }
+            cmd.args(encoder_output_options(&encoder, input, pix_fmt));
             cmd.args(["-fps_mode", "vfr"]);
             if matches!(encoder.as_str(), "libx264" | "libx265") {
                 let cores = cores();
@@ -4812,7 +4890,13 @@ impl Forwarder {
         if let Ok(exe) = executable() {
             remember(&exe, |probes| {
                 probes.encoders.insert(
-                    probe_key(&encoder, EncoderInput::Yuv, width, height),
+                    probe_key(
+                        &encoder,
+                        EncoderInput::Yuv,
+                        Some(raw.input_pix_fmt(&encoder)),
+                        width,
+                        height,
+                    ),
                     Found::now(false),
                 );
             });
@@ -6020,9 +6104,9 @@ esac"#
         // recordings only launch their encoder.
         assert_eq!(fake.launches(&["-encoders"]), 1);
         assert_eq!(fake.launches(&["size=640x480", "-f null"]), 1);
-        assert!(fake.launches(&["size=16x16", "-f null"]) >= 1);
+        assert!(fake.launches(&["-video_size 16x16", "-f null"]) >= 1);
         assert_eq!(fake.launches(&["-f null"]), probes);
-        assert_eq!(fake.launches(&["pipe:0"]), 3);
+        assert_eq!(fake.launches(&["-use_wallclock_as_timestamps"]), 3);
     }
     #[test]
     #[cfg(unix)]
@@ -6067,8 +6151,11 @@ esac"#
             thread::sleep(Duration::from_millis(30));
         }
         let _ = forward.stop();
-        assert_eq!(fake.launches(&["pipe:0"]), 1);
-        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 0);
+        assert_eq!(fake.launches(&["-use_wallclock_as_timestamps"]), 1);
+        assert_eq!(
+            fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
+            0
+        );
     }
     #[test]
     #[cfg(unix)]
@@ -6100,8 +6187,14 @@ esac"#
         // The failed encoder's bytes never reach the new file.
         let written = forward.stats().written as usize;
         assert_eq!(fs::read(&output).unwrap().len(), written * 16 * 16 * 3);
-        assert_eq!(fake.launches(&[&format!("-c:v {first}"), "pipe:0"]), 1);
-        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 1);
+        assert_eq!(
+            fake.launches(&[&format!("-c:v {first}"), "-use_wallclock_as_timestamps"]),
+            1
+        );
+        assert_eq!(
+            fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
+            1
+        );
         // A second early exit is reported instead of trying again.
         fs::write(fake.dir.join("x264-fails"), b"").unwrap();
         config.output = fake.dir.join("again.mkv").to_string_lossy().into();
@@ -6112,8 +6205,14 @@ esac"#
             thread::sleep(Duration::from_millis(30));
         }
         let _ = forward.stop();
-        assert_eq!(fake.launches(&[&format!("-c:v {first}"), "pipe:0"]), 2);
-        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 2);
+        assert_eq!(
+            fake.launches(&[&format!("-c:v {first}"), "-use_wallclock_as_timestamps"]),
+            2
+        );
+        assert_eq!(
+            fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
+            2
+        );
         assert!(!fake.dir.join("again.mkv").exists());
     }
     #[test]
@@ -6144,7 +6243,10 @@ esac"#
         assert!(stats.error.is_some(), "{stats:?}");
         assert_eq!(stats.recording.unwrap().bytes, 10_000);
         assert_eq!(fs::read(&output).unwrap().len(), 10_000);
-        assert_eq!(fake.launches(&["-c:v libx264", "pipe:0"]), 0);
+        assert_eq!(
+            fake.launches(&["-c:v libx264", "-use_wallclock_as_timestamps"]),
+            0
+        );
     }
     #[test]
     fn ppm_preserves_whitespace_pixels_and_multiple_frames() {
@@ -6511,8 +6613,10 @@ esac"#
         let error = RawInput::for_format(0x0110_0099).unwrap_err().to_string();
         assert!(error.contains("0x01100099") && error.contains("--format raw"));
     }
+    /// FFV1 stores a mosaic as gray samples, 16-bit for wider ones; every
+    /// other encoder, and every other format, reads the frames' own format.
     #[test]
-    fn ffv1_stores_wide_bayer_as_sixteen_bit_rgb() {
+    fn ffv1_stores_bayer_mosaics_as_gray() {
         let bayer = (0x0108_0000..=0x0110_0200)
             .filter(|&v| crate::frame::is_bayer(v))
             .filter_map(|v| RawInput::for_format(v).ok())
@@ -6520,18 +6624,133 @@ esac"#
         assert_eq!(bayer.len(), 40);
         for raw in bayer {
             let wide = crate::frame::sample_bits(raw.pixel_format).unwrap() > 8;
-            let expected = wide.then_some("gbrp16le");
+            let expected = if wide { "gray16le" } else { "gray" };
             assert_eq!(
-                raw.output_pix_fmt("ffv1"),
+                raw.input_pix_fmt("ffv1"),
                 expected,
                 "{:x}",
                 raw.pixel_format
             );
-            assert_eq!(raw.output_pix_fmt("libx264"), None);
+            assert_eq!(raw.input_pix_fmt("libx264"), raw.ffmpeg);
+            assert!(!raw.rgb());
         }
-        for format in [crate::types::MONO8, 0x010e_0104, 0x0110_0007, 0x0230_001a] {
+        for (format, ffmpeg) in [
+            (crate::types::MONO8, "gray"),
+            (0x010e_0104, "gray14le"),
+            (0x0110_0007, "gray16le"),
+            (crate::types::RGB8, "rgb24"),
+        ] {
             let raw = RawInput::for_format(format).unwrap();
-            assert_eq!(raw.output_pix_fmt("ffv1"), None, "{format:x}");
+            assert_eq!(raw.input_pix_fmt("ffv1"), ffmpeg, "{format:x}");
+        }
+    }
+    /// Which pixel layout each encoder gets for each kind of source: RGB
+    /// only for RGB sources on encoders that convert it themselves, and a
+    /// mosaic demosaicked to RGB24 before any 4:2:0.
+    #[test]
+    fn encoders_get_the_input_their_source_converts_to_most_directly() {
+        let vf = |options: &[String]| {
+            let at = options.iter().position(|o| o == "-vf").unwrap();
+            let pix = options.iter().position(|o| o == "-pix_fmt").unwrap();
+            (options[at + 1].clone(), options[pix + 1].clone())
+        };
+        let pad = "pad=ceil(iw/2)*2:ceil(ih/2)*2";
+        for (encoder, source, input, filters, pix_fmt) in [
+            (
+                "libx264",
+                "bayer_rggb8",
+                EncoderInput::Yuv,
+                format!("format=rgb24,{pad}"),
+                "yuv420p",
+            ),
+            (
+                "libx264",
+                "rgb24",
+                EncoderInput::Yuv,
+                pad.to_owned(),
+                "yuv420p",
+            ),
+            (
+                "h264_nvenc",
+                "bayer_rggb16le",
+                EncoderInput::Yuv,
+                format!("format=rgb24,{pad}"),
+                "yuv420p",
+            ),
+            (
+                "h264_nvenc",
+                "rgb24",
+                EncoderInput::Rgb,
+                pad.to_owned(),
+                "bgr0",
+            ),
+            (
+                "hevc_amf",
+                "yuyv422",
+                EncoderInput::Yuv,
+                pad.to_owned(),
+                "yuv420p",
+            ),
+            (
+                "h264_videotoolbox",
+                "bayer_rggb8",
+                EncoderInput::Yuv,
+                format!("format=rgb24,{pad}"),
+                "nv12",
+            ),
+            (
+                "h264_videotoolbox",
+                "rgb24",
+                EncoderInput::Yuv,
+                pad.to_owned(),
+                "nv12",
+            ),
+            (
+                "h264_qsv",
+                "bayer_grbg16le",
+                EncoderInput::Yuv,
+                format!("format=rgb24,{pad}"),
+                "nv12",
+            ),
+            (
+                "h264_vaapi",
+                "bayer_rggb8",
+                EncoderInput::Yuv,
+                format!("format=rgb24,{pad},format=nv12,hwupload"),
+                "vaapi",
+            ),
+            (
+                "av1_vulkan",
+                "gray",
+                EncoderInput::Yuv,
+                format!("{pad},format=nv12,hwupload"),
+                "vulkan",
+            ),
+        ] {
+            let options = encoder_output_options(encoder, input, source);
+            assert_eq!(
+                vf(&options),
+                (filters, pix_fmt.to_owned()),
+                "{encoder} {source}"
+            );
+        }
+        assert_eq!(
+            encoder_output_options("ffv1", EncoderInput::Yuv, "gray16le"),
+            ["-level", "3", "-g", "1"]
+        );
+        for (format, rgb) in [
+            (crate::types::RGB8, true),
+            (0x0218_0015, true),
+            (0x0220_0016, true),
+            (0x0108_0009, false),
+            (0x0210_0032, false),
+            (crate::types::MONO8, false),
+        ] {
+            assert_eq!(
+                RawInput::for_format(format).unwrap().rgb(),
+                rgb,
+                "{format:x}"
+            );
         }
     }
     #[test]
@@ -7219,6 +7438,174 @@ esac"#
             let mean = error as f64 / count as f64;
             assert!(mean < 3.0, "{}: mean error {mean:.2}", raw.ffmpeg);
         }
+    }
+    /// A mosaic recorded to a 4:2:0 encoder is demosaicked once, to RGB24,
+    /// and never widened to RGB48 on its way.
+    #[test]
+    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
+    fn ffmpeg_demosaics_a_recorded_mosaic_once() {
+        let exe = executable().unwrap();
+        let (width, height) = (64u32, 48u32);
+        let mut encoders = vec!["libx264"];
+        if cfg!(target_os = "macos") {
+            encoders.push("h264_videotoolbox");
+        }
+        for format in [0x0108_0009, 0x010c_0059] {
+            let raw = RawInput::for_format(format).unwrap();
+            let frame = Frame {
+                width,
+                height,
+                pixel_format: format,
+                data: vec![0x5a; crate::frame::row_bytes(width, format) * height as usize].into(),
+                ..Frame::default()
+            };
+            let bytes = raw.bytes(frame).unwrap();
+            for encoder in &encoders {
+                let pix_fmt = raw.input_pix_fmt(encoder);
+                let mut child = command(&exe)
+                    .args([
+                        "-hide_banner",
+                        "-v",
+                        "verbose",
+                        "-f",
+                        "rawvideo",
+                        "-pix_fmt",
+                    ])
+                    .arg(pix_fmt)
+                    .args(["-video_size", &format!("{width}x{height}"), "-i", "pipe:0"])
+                    .args(["-frames:v", "1", "-c:v", encoder])
+                    .args(encoder_output_options(encoder, EncoderInput::Yuv, pix_fmt))
+                    .args(["-f", "null", "-"])
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+                let mut stdin = child.stdin.take().unwrap();
+                let input = bytes.clone();
+                let feeder = thread::spawn(move || stdin.write_all(&input));
+                let output = child.wait_with_output().unwrap();
+                let _ = feeder.join().unwrap();
+                let log = String::from_utf8_lossy(&output.stderr);
+                if !output.status.success() && log.contains("cannot create compression session") {
+                    eprintln!("{encoder}: no hardware encoder here; skipped");
+                    continue;
+                }
+                assert!(output.status.success(), "{encoder} {pix_fmt}: {log}");
+                // The filter graph's conversions, `fmt:a ... -> ... fmt:b`.
+                let conversions: Vec<(String, String)> = log
+                    .lines()
+                    .filter(|line| line.contains(" -> ") && line.contains("fmt:"))
+                    .map(|line| {
+                        let formats: Vec<String> = line
+                            .split_whitespace()
+                            .filter_map(|word| word.strip_prefix("fmt:"))
+                            .map(str::to_owned)
+                            .collect();
+                        (formats[0].clone(), formats[1].clone())
+                    })
+                    .collect();
+                let from_bayer: Vec<_> = conversions
+                    .iter()
+                    .filter(|(from, _)| from.starts_with("bayer_"))
+                    .collect();
+                assert_eq!(from_bayer.len(), 1, "{encoder} {pix_fmt}: {conversions:?}");
+                assert_eq!(
+                    from_bayer[0].1, "rgb24",
+                    "{encoder} {pix_fmt}: {conversions:?}"
+                );
+                assert!(
+                    !conversions.iter().any(|(_, to)| to.starts_with("rgb48")),
+                    "{encoder} {pix_fmt}: {conversions:?}"
+                );
+            }
+        }
+    }
+    /// FFV1 keeps a recorded mosaic exactly: decoded as gray, every sample
+    /// is the frame's own (widened to 16 bits for a 12-bit mosaic).
+    #[test]
+    #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
+    fn ffv1_recordings_keep_the_mosaic_exactly() {
+        let exe = executable().unwrap();
+        let dir = std::env::temp_dir().join(format!("capturefab-ffv1-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (width, height) = (64u32, 48u32);
+        for format in [0x0108_0009, 0x010c_0059, 0x0110_0011] {
+            let raw = RawInput::for_format(format).unwrap();
+            let mut seed = format;
+            let data: Vec<u8> = (0..crate::frame::row_bytes(width, format) * height as usize)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    seed as u8
+                })
+                .collect();
+            let frame = Frame {
+                width,
+                height,
+                pixel_format: format,
+                data: data.into(),
+                ..Frame::default()
+            };
+            // BayerRG12 keeps only its 12 bits.
+            let frame = if format == 0x0110_0011 {
+                let samples: Vec<u8> = frame
+                    .data
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .flat_map(|s| (u16::from_le_bytes(*s) & 0x0fff).to_le_bytes())
+                    .collect();
+                Frame {
+                    data: samples.into(),
+                    ..frame
+                }
+            } else {
+                frame
+            };
+            let bytes = raw.bytes(frame).unwrap();
+            let pix_fmt = raw.input_pix_fmt("ffv1");
+            let path = dir.join(format!("{format:08x}.mkv"));
+            let mut child = command(&exe)
+                .args([
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-f",
+                    "rawvideo",
+                    "-pix_fmt",
+                ])
+                .arg(pix_fmt)
+                .args(["-video_size", &format!("{width}x{height}"), "-i", "pipe:0"])
+                .args(["-c:v", "ffv1"])
+                .args(encoder_output_options("ffv1", EncoderInput::Yuv, pix_fmt))
+                .arg(&path)
+                .stdin(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = child.stdin.take().unwrap();
+            let input = bytes.clone();
+            let feeder = thread::spawn(move || stdin.write_all(&input));
+            let output = child.wait_with_output().unwrap();
+            feeder.join().unwrap().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let decoded = command(&exe)
+                .args(["-hide_banner", "-loglevel", "error", "-i"])
+                .arg(&path)
+                .args(["-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"])
+                .output()
+                .unwrap();
+            assert!(decoded.status.success());
+            assert!(decoded.stdout == bytes, "{format:08x}: the mosaic changed");
+        }
+        let _ = fs::remove_dir_all(dir);
     }
     #[test]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
