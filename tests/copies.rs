@@ -71,7 +71,7 @@ fn classes(report: &Value) -> Map<String, Value> {
     }
     classes
 }
-fn class(report: &Value, name: &str) -> i64 {
+fn class_bytes(report: &Value, name: &str) -> i64 {
     classes(report)[name].as_i64().unwrap()
 }
 fn site(report: &Value, name: &str) -> i64 {
@@ -187,6 +187,10 @@ fn frame_bytes(format: &str) -> usize {
     }
 }
 
+/// Allocations of a frame's size or more, per frame: buffers come from the
+/// pool, so only the first frames allocate.
+const LARGE_PER_FRAME: f64 = 0.05;
+
 #[test]
 fn raw_captures_copy_nothing_in_user_space() {
     let home = Home::new("copies-raw");
@@ -194,6 +198,10 @@ fn raw_captures_copy_nothing_in_user_space() {
         let (delta, files) = capture_delta(&home, format, &["-f", "raw"], 20);
         show(&format!("capture -f raw {format}"), &delta, 20);
         assert!(delta["frames"].as_i64().unwrap() >= 20, "{delta}");
+        // The file write, from the frame's own buffer, is the only copy.
+        for class in ["avoidable", "necessary", "transform"] {
+            assert_eq!(class_bytes(&delta, class), 0, "{format} {class}: {delta}");
+        }
         assert_eq!(site(&delta, "file_write"), files, "{format}");
         assert_eq!(
             calls(&delta, "file_write"),
@@ -201,11 +209,15 @@ fn raw_captures_copy_nothing_in_user_space() {
             "{format}: a raw file and its sidecar"
         );
         assert!(files > 20 * frame_bytes(format) as i64, "{format}");
+        assert!(
+            large(&delta) as f64 / 20.0 <= LARGE_PER_FRAME,
+            "{format}: {delta}"
+        );
     }
 }
 
 #[test]
-fn still_captures_count_their_copies() {
+fn still_captures_encode_from_the_frame_in_place() {
     let home = Home::new("copies-still");
     for format in ["Mono8", "RGB8"] {
         for (name, extra) in [
@@ -215,7 +227,23 @@ fn still_captures_count_their_copies() {
         ] {
             let (delta, files) = capture_delta(&home, format, extra, 10);
             show(&format!("capture -f {name} {format}"), &delta, 10);
+            assert_eq!(
+                class_bytes(&delta, "avoidable"),
+                0,
+                "{format} {name}: {delta}"
+            );
             assert_eq!(site(&delta, "file_write"), files, "{format} {name}");
+            let per_file = large(&delta) as f64 / 10.0;
+            if name == "png" {
+                // The PNG encoder's own compressed-data buffer grows by
+                // doubling inside the png crate, beside the one output
+                // buffer: one allocation per doubling past 256 KiB.
+                let doublings = (files / 10 / (256 << 10)).max(1).ilog2() + 2;
+                assert!(per_file <= f64::from(doublings) + 1.0, "{format}: {delta}");
+            } else {
+                // libjpeg-turbo writes into its own (C) buffer.
+                assert!(per_file <= LARGE_PER_FRAME, "{format} {name}: {delta}");
+            }
         }
     }
 }
@@ -241,6 +269,7 @@ fn stdout_captures_write_the_frame_once() {
     assert_eq!(run.raw.len(), WIDTH * HEIGHT);
     assert_eq!(site(&report, "stdout_write"), (WIDTH * HEIGHT) as i64);
     assert_eq!(calls(&report, "stdout_write"), 1);
+    assert_eq!(class_bytes(&report, "avoidable"), 0, "{report}");
 }
 
 /// A session whose camera worker counts into `folder`.
@@ -251,33 +280,78 @@ fn counting_session(home: &Home, name: &str, folder: &Path) -> support::cli::Ses
     home.serve_in(&mut command, name, &["sim:0"], &[])
 }
 
-#[test]
-fn inspections_count_their_copies() {
-    let home = Home::new("copies-inspect");
-    for format in ["Mono8", "RGB8"] {
-        let folder = home.root.join(format!("report-{format}"));
-        let name = format!("copies-{format}");
-        let session = counting_session(&home, &name, &folder);
-        let settings = settings(format);
-        let settings: Vec<&str> = settings.iter().map(String::as_str).collect();
-        let values: Vec<&str> = settings.iter().skip(1).step_by(2).copied().collect();
-        home.ok(&[&["--session", &name, "set", "-c", "sim:0"][..], &values].concat());
-        let inspect = || home.ok(&["--session", &name, "inspect", "-c", "sim:0"]);
-        // The first inspection starts the stream; the next ones cost what an
-        // inspection costs.
+/// What `inspections` more inspections of a session camera in `format`
+/// cost, after the first started its stream.
+fn inspect_delta(home: &Home, format: &str, inspections: i64) -> Value {
+    let folder = home.root.join(format!("report-{format}"));
+    let name = format!("copies-{format}");
+    let session = counting_session(home, &name, &folder);
+    let settings = settings(format);
+    let values: Vec<&str> = settings
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .map(String::as_str)
+        .collect();
+    home.ok(&[&["--session", &name, "set", "-c", "sim:0"][..], &values].concat());
+    let inspect = || home.ok(&["--session", &name, "inspect", "-c", "sim:0"]);
+    inspect();
+    let first = counts(&folder);
+    for _ in 0..inspections {
         inspect();
-        let first = counts(&folder);
-        for _ in 0..4 {
-            inspect();
-        }
-        let mut delta = counts(&folder);
-        add(&mut delta, &first, -1);
+    }
+    let mut delta = counts(&folder);
+    add(&mut delta, &first, -1);
+    drop(session);
+    delta
+}
+
+#[test]
+fn inspections_shrink_the_frame_in_place() {
+    let home = Home::new("copies-inspect");
+    for (format, channels) in [("Mono8", 1), ("RGB8", 3)] {
+        let delta = inspect_delta(&home, format, 4);
         show(&format!("inspect {format}"), &delta, 4);
+        assert_eq!(class_bytes(&delta, "avoidable"), 0, "{format}: {delta}");
+        // Nothing as large as the frame: the preview raster, a quarter of
+        // a 1080p frame at most, is the largest allocation.
+        let preview = WIDTH * HEIGHT * channels / 4;
         println!(
             "inspect {format}: largest allocation class {} B",
             largest_class(&delta)
         );
-        drop(session);
+        assert!(
+            largest_class(&delta) <= preview.next_power_of_two() as i64,
+            "{format}: {delta}"
+        );
+    }
+}
+
+/// Formats that are converted for their stills and previews still build
+/// whole-frame intermediates: the numbers the next stage starts from. What
+/// this stage removed stays removed.
+#[test]
+fn converted_formats_copy_only_to_convert() {
+    let home = Home::new("copies-converted");
+    for format in ["BayerRG8", "BayerRG12p", "Mono12p"] {
+        for (name, extra) in [("jpg", &["-f", "jpg"][..]), ("png", &["-f", "png"][..])] {
+            let (delta, _) = capture_delta(&home, format, extra, 5);
+            show(&format!("capture -f {name} {format}"), &delta, 5);
+            for removed in [
+                "frame_clone",
+                "frame_cow",
+                "zero_fill",
+                "still_copy",
+                "output_copy",
+            ] {
+                assert_eq!(site(&delta, removed), 0, "{format} {name} {removed}");
+            }
+        }
+    }
+    let delta = inspect_delta(&home, "BayerRG12p", 2);
+    show("inspect BayerRG12p", &delta, 2);
+    for removed in ["frame_clone", "frame_cow", "zero_fill", "output_copy"] {
+        assert_eq!(site(&delta, removed), 0, "inspect BayerRG12p {removed}");
     }
 }
 
@@ -285,7 +359,7 @@ fn inspections_count_their_copies() {
 /// the frames the recording wrote.
 #[test]
 #[ignore = "needs FFmpeg"]
-fn recordings_count_their_copies() {
+fn recordings_pipe_the_frame_or_unpack_it_once() {
     let home = Home::new("copies-record");
     for format in ["Mono8", "BayerRG8", "BayerRG12p"] {
         let out = format!("{format}.mkv");
@@ -302,10 +376,16 @@ fn recordings_count_their_copies() {
         );
         let written = result["frames"].as_i64().unwrap();
         show(&format!("record {format}"), &report, written.max(1));
-        println!(
-            "record {format}: {written} frames written, ffmpeg_unpack {} calls",
-            calls(&report, "ffmpeg_unpack")
+        assert_eq!(class_bytes(&report, "avoidable"), 0, "{format}: {report}");
+        // Frames are unpacked on the writer thread, once per frame written;
+        // 8-bit frames go to FFmpeg as they are.
+        let unpacked = if format == "BayerRG12p" { written } else { 0 };
+        assert_eq!(
+            calls(&report, "ffmpeg_unpack"),
+            unpacked,
+            "{format}: {report}"
         );
+        assert_eq!(calls(&report, "pipe_write"), written, "{format}: {report}");
     }
 }
 
@@ -317,8 +397,12 @@ fn concurrent_consumers_share_frames() {
     let folder = home.root.join("report");
     let session = counting_session(&home, "copies", &folder);
     let settings = settings("Mono8");
-    let settings: Vec<&str> = settings.iter().map(String::as_str).collect();
-    let values: Vec<&str> = settings.iter().skip(1).step_by(2).copied().collect();
+    let values: Vec<&str> = settings
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .map(String::as_str)
+        .collect();
     home.ok(&[&["--session", "copies", "set", "-c", "sim:0"][..], &values].concat());
     let mut record = home.command();
     record.args([
@@ -355,17 +439,8 @@ fn concurrent_consumers_share_frames() {
     assert!(output.status.success());
     let report = counts(&folder);
     show("record + capture + inspect Mono8", &report, 1);
-    println!(
-        "concurrent: frame_clone {} B in {} calls, frame_cow {} B",
-        site(&report, "frame_clone"),
-        calls(&report, "frame_clone"),
-        site(&report, "frame_cow")
-    );
+    assert_eq!(site(&report, "frame_cow"), 0, "{report}");
+    assert_eq!(site(&report, "frame_clone"), 0, "{report}");
+    assert_eq!(class_bytes(&report, "avoidable"), 0, "{report}");
     drop(session);
-}
-
-/// The classes of a report, so tests can say which may copy.
-#[allow(dead_code)]
-fn avoidable(report: &Value) -> i64 {
-    class(report, "avoidable")
 }

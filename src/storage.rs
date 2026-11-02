@@ -258,16 +258,28 @@ fn direct(dir: &Path, remember: bool) -> bool {
 /// Save encoded bytes as a new file at `path`, never replacing anything
 /// there, with its SHA-256 when `hash`. A failure leaves nothing behind.
 pub fn save(bytes: &[u8], path: &Path, sync: SyncMode, hash: bool) -> Result<Stored> {
-    let dir = folder(path, bytes.len() as u64)?;
+    save_parts(&[bytes], path, sync, hash)
+}
+
+/// `save` for a file made of `parts` in order, written together, without
+/// putting them in one buffer first: an encoded still's header or metadata
+/// and the frame's own bytes.
+pub fn save_parts(parts: &[&[u8]], path: &Path, sync: SyncMode, hash: bool) -> Result<Stored> {
+    let length: usize = parts.iter().map(|part| part.len()).sum();
+    let dir = folder(path, length as u64)?;
     crate::naming::check_free(path)?;
     let stored = Stored {
-        bytes: bytes.len() as u64,
-        sha256: hash.then(|| hex(Sha256::digest(bytes))),
+        bytes: length as u64,
+        sha256: hash.then(|| {
+            let mut digest = Sha256::new();
+            parts.iter().for_each(|part| digest.update(part));
+            hex(digest.finalize())
+        }),
     };
     let taken = |error| failed(path, error);
     if !direct(&dir, false) {
         let partial = partial(path)?;
-        write_new(&partial, bytes, sync).map_err(taken)?;
+        write_new(&partial, parts, sync).map_err(taken)?;
         #[cfg(test)]
         if let Some(race) = tests::RACE.get() {
             race(path);
@@ -281,7 +293,7 @@ pub fn save(bytes: &[u8], path: &Path, sync: SyncMode, hash: bool) -> Result<Sto
             }
         }
     }
-    write_new(path, bytes, sync).map_err(taken)?;
+    write_new(path, parts, sync).map_err(taken)?;
     Ok(stored)
 }
 
@@ -305,12 +317,16 @@ fn failed(path: &Path, error: io::Error) -> anyhow::Error {
     anyhow::Error::from(error).context(format!("cannot write {}", path.display()))
 }
 
-/// Create `path`, which must not exist, holding `bytes`; removed again when
-/// writing them fails.
-fn write_new(path: &Path, bytes: &[u8], sync: SyncMode) -> io::Result<()> {
+/// Create `path`, which must not exist, holding `parts` in order; removed
+/// again when writing them fails.
+fn write_new(path: &Path, parts: &[&[u8]], sync: SyncMode) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    crate::copies::record(crate::copies::Site::FileWrite, bytes.len());
-    let mut written = file.write_all(bytes);
+    let mut slices: Vec<io::IoSlice> = parts.iter().map(|part| io::IoSlice::new(part)).collect();
+    crate::copies::record(
+        crate::copies::Site::FileWrite,
+        parts.iter().map(|part| part.len()).sum(),
+    );
+    let mut written = crate::frame::write_all_vectored(&mut file, &mut slices);
     if sync.is_file() {
         written = written.and_then(|()| file.sync_data());
     }
@@ -721,6 +737,35 @@ mod tests {
         assert_eq!(reason(&error), ErrorKind::Exists);
         assert_eq!(fs::read(temp.path("fixed.png")).unwrap(), b"theirs");
         assert!(temp.partials().is_empty(), "{:?}", temp.partials());
+    }
+
+    #[test]
+    fn parts_are_saved_in_order_with_one_hash_and_never_over_a_file() {
+        let temp = Temp::new("parts");
+        let parts: [&[u8]; 4] = [b"P5\n2 1\n255\n", &[], &[7, 9], b""];
+        let whole = parts.concat();
+        let path = temp.path("shot.pgm");
+        let stored = save_parts(&parts, &path, SyncMode::File, true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), whole);
+        assert_eq!(
+            (stored.bytes, stored.sha256),
+            (whole.len() as u64, Some(hex(Sha256::digest(&whole))))
+        );
+        // The name is taken: nothing is replaced and no partial file stays.
+        let error = save_parts(&[b"other"], &path, SyncMode::File, false).unwrap_err();
+        assert_eq!(reason(&error), ErrorKind::Exists);
+        assert_eq!(fs::read(&path).unwrap(), whole);
+        assert!(temp.partials().is_empty(), "{:?}", temp.partials());
+        // Published through a partial file, as one file is.
+        RACE.set(Some(|path| {
+            assert!(!path.exists(), "published only once written");
+        }));
+        let second = temp.path("second.pgm");
+        save_parts(&parts, &second, SyncMode::Off, false).unwrap();
+        assert_eq!(fs::read(&second).unwrap(), whole);
+        // Nothing to write is an empty file.
+        save_parts(&[], &temp.path("empty"), SyncMode::Off, true).unwrap();
+        assert_eq!(fs::read(temp.path("empty")).unwrap(), b"");
     }
 
     #[test]

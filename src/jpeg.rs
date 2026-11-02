@@ -1,9 +1,14 @@
 //! JPEG stills, encoded in process by libjpeg-turbo's SIMD encoder (`jpeg`
-//! feature).
-use crate::types::{Frame, MONO8};
+//! feature). Frames libjpeg-turbo reads (RGB8, BGR8, Mono8) are encoded in
+//! place, and the JPEG stays in the buffer libjpeg-turbo wrote it to.
+use crate::{
+    frame::Body,
+    types::{Frame, MONO8},
+};
 use anyhow::Result;
 #[cfg(not(feature = "jpeg"))]
 use anyhow::bail;
+use std::borrow::Cow;
 
 /// Fixed quality and 4:2:0 chroma (gray for monochrome), so the same frame
 /// produces comparable files wherever it is encoded.
@@ -16,29 +21,29 @@ pub(crate) fn monochrome(pixel_format: u32) -> bool {
     )
 }
 
-/// 8-bit pixels ready for compression: one gray channel or interleaved RGB.
-pub struct Raster {
+/// 8-bit pixels ready for compression: one gray channel or interleaved RGB,
+/// borrowed where the frame already holds them.
+pub struct Raster<'a> {
     pub width: u32,
     pub height: u32,
     pub channels: usize,
-    pub data: Vec<u8>,
+    pub data: Cow<'a, [u8]>,
 }
 
-impl Raster {
-    pub fn new(frame: &Frame) -> Result<Self> {
-        let (channels, data) = if monochrome(frame.pixel_format) {
+impl<'a> Raster<'a> {
+    pub fn new(frame: &'a Frame) -> Result<Self> {
+        let (channels, data) = if frame.pixel_format == MONO8 {
+            let pixels = crate::frame::checked_pixels(frame)?;
+            anyhow::ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
+            (1, Cow::Borrowed(&frame.data[..pixels]))
+        } else if monochrome(frame.pixel_format) {
             // One pass straight to 8-bit gray; no RGB triplication.
             let gray = crate::frame::convert(frame, |[gray, _, _]| gray)?;
-            let site = if frame.pixel_format == MONO8 {
-                crate::copies::Site::Intermediate
-            } else {
-                crate::copies::Site::StillTransform
-            };
-            crate::copies::record(site, gray.len());
-            (1, gray)
+            crate::copies::record(crate::copies::Site::StillTransform, gray.len());
+            (1, Cow::Owned(gray))
         } else {
-            let rgb = crate::frame::rgb(frame)?;
-            if frame.pixel_format != crate::types::RGB8 {
+            let rgb = crate::frame::rgb_samples(frame)?;
+            if let Cow::Owned(rgb) = &rgb {
                 crate::copies::record(crate::copies::Site::StillTransform, rgb.len());
             }
             (3, rgb)
@@ -52,16 +57,41 @@ impl Raster {
     }
 }
 
-/// libjpeg-turbo reads RGB8, BGR8 and Mono8 frames in place; other formats
-/// are converted into a [`Raster`] first.
+/// A JPEG in the buffer libjpeg-turbo allocated for it.
 #[cfg(feature = "jpeg")]
-pub fn encode(frame: &Frame) -> Result<Vec<u8>> {
+pub struct Jpeg(turbojpeg::OwnedBuf);
+
+// SAFETY: the buffer is plain memory from tj3Alloc, owned by this value
+// alone; tj3Free may release it on any thread.
+#[cfg(feature = "jpeg")]
+unsafe impl Send for Jpeg {}
+// SAFETY: shared references only read the buffer.
+#[cfg(feature = "jpeg")]
+unsafe impl Sync for Jpeg {}
+#[cfg(feature = "jpeg")]
+impl std::ops::Deref for Jpeg {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+#[cfg(feature = "jpeg")]
+impl Clone for Jpeg {
+    fn clone(&self) -> Self {
+        Self(turbojpeg::OwnedBuf::copy_from_slice(self))
+    }
+}
+
+/// `frame` at `quality` (1–100). libjpeg-turbo reads RGB8, BGR8 and Mono8
+/// frames in place; other formats are converted into a [`Raster`] first.
+#[cfg(feature = "jpeg")]
+pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     use turbojpeg::PixelFormat;
     let (format, channels) = match frame.pixel_format {
         crate::types::RGB8 => (PixelFormat::RGB, 3),
         0x0218_0015 => (PixelFormat::BGR, 3),
         MONO8 => (PixelFormat::GRAY, 1),
-        _ => return software(&Raster::new(frame)?),
+        _ => return software_quality(&Raster::new(frame)?, quality),
     };
     let size = crate::frame::checked_pixels(frame)? * channels;
     anyhow::ensure!(
@@ -74,22 +104,22 @@ pub fn encode(frame: &Frame) -> Result<Vec<u8>> {
         frame.width,
         frame.height,
         format,
-        QUALITY,
+        quality,
     )
 }
 #[cfg(not(feature = "jpeg"))]
-pub fn encode(frame: &Frame) -> Result<Vec<u8>> {
-    software(&Raster::new(frame)?)
+pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
+    software_quality(&Raster::new(frame)?, quality)
 }
 
-pub fn software(raster: &Raster) -> Result<Vec<u8>> {
+pub fn software(raster: &Raster) -> Result<Body<'static>> {
     software_quality(raster, QUALITY)
 }
 
 /// libjpeg-turbo at a chosen quality (1–100), for previews that trade
 /// detail for size; stills use `software` and the fixed `QUALITY`.
 #[cfg(feature = "jpeg")]
-pub fn software_quality(raster: &Raster, quality: i32) -> Result<Vec<u8>> {
+pub fn software_quality(raster: &Raster, quality: i32) -> Result<Body<'static>> {
     use turbojpeg::PixelFormat;
     let format = if raster.channels == 1 {
         PixelFormat::GRAY
@@ -106,31 +136,44 @@ fn compress(
     height: u32,
     format: turbojpeg::PixelFormat,
     quality: i32,
-) -> Result<Vec<u8>> {
+) -> Result<Body<'static>> {
+    use std::cell::RefCell;
     use turbojpeg::{Compressor, Image, PixelFormat, Subsamp};
+    // One compressor per thread, set up again for each image.
+    thread_local! {
+        static COMPRESSOR: RefCell<Option<Compressor>> = const { RefCell::new(None) };
+    }
     anyhow::ensure!((1..=100).contains(&quality), "JPEG quality must be 1..100");
-    let mut compressor = Compressor::new()?;
-    compressor.set_quality(quality)?;
-    compressor.set_subsamp(if format == PixelFormat::GRAY {
-        Subsamp::Gray
-    } else {
-        Subsamp::Sub2x2
+    let jpeg = COMPRESSOR.with_borrow_mut(|held| -> Result<_> {
+        let compressor = match held {
+            Some(compressor) => compressor,
+            None => held.insert(Compressor::new()?),
+        };
+        compressor.set_quality(quality)?;
+        compressor.set_subsamp(if format == PixelFormat::GRAY {
+            Subsamp::Gray
+        } else {
+            Subsamp::Sub2x2
+        })?;
+        let compressed = compressor.compress_to_owned(Image {
+            pixels,
+            width: width as usize,
+            pitch: width as usize * format.size(),
+            height: height as usize,
+            format,
+        });
+        if compressed.is_err() {
+            // A compressor that failed starts afresh.
+            *held = None;
+        }
+        Ok(compressed?)
     })?;
-    let jpeg = compressor.compress_to_vec(Image {
-        pixels,
-        width: width as usize,
-        pitch: width as usize * format.size(),
-        height: height as usize,
-        format,
-    })?;
-    // TurboJPEG's own buffer, then copied into the Vec.
     crate::copies::record(crate::copies::Site::JpegEncode, jpeg.len());
-    crate::copies::record(crate::copies::Site::OutputCopy, jpeg.len());
-    Ok(jpeg)
+    Ok(Body::Jpeg(Jpeg(jpeg)))
 }
 
 #[cfg(not(feature = "jpeg"))]
-pub fn software_quality(_: &Raster, _: i32) -> Result<Vec<u8>> {
+pub fn software_quality(_: &Raster, _: i32) -> Result<Body<'static>> {
     bail!("JPEG is unsupported in this build; rebuild with --features jpeg or capture png")
 }
 
@@ -159,15 +202,10 @@ pub fn well_formed(bytes: &[u8], width: u32, height: u32) -> bool {
     false
 }
 
-/// Add a COM (comment) segment holding `payload` to an encoded JPEG, after
-/// SOI and any leading APPn segments so a JFIF or EXIF header stays first.
-/// It works on the finished bytes, so the comment does not depend on which
-/// encoder ran.
-pub fn insert_com(jpeg: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
-    anyhow::ensure!(
-        payload.len() <= usize::from(u16::MAX) - 2,
-        "JPEG comment is too long"
-    );
+/// Where a COM (comment) segment goes in an encoded JPEG: after SOI and any
+/// leading APPn segments, so a JFIF or EXIF header stays first. It works on
+/// the finished bytes, so the comment does not depend on which encoder ran.
+pub fn com_offset(jpeg: &[u8]) -> Result<usize> {
     anyhow::ensure!(
         jpeg.len() >= 4 && jpeg[..2] == [0xFF, 0xD8],
         "not a JPEG image"
@@ -181,14 +219,26 @@ pub fn insert_com(jpeg: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
         );
         at += 2 + length;
     }
-    crate::copies::record(crate::copies::Site::OutputCopy, jpeg.len());
-    let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
-    out.extend_from_slice(&jpeg[..at]);
-    out.extend_from_slice(&[0xFF, 0xFE]);
-    out.extend_from_slice(&(payload.len() as u16 + 2).to_be_bytes());
-    out.extend_from_slice(payload);
-    out.extend_from_slice(&jpeg[at..]);
-    Ok(out)
+    Ok(at)
+}
+/// A COM segment holding `payload`.
+pub fn com_segment(payload: &[u8]) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        payload.len() <= usize::from(u16::MAX) - 2,
+        "JPEG comment is too long"
+    );
+    let mut segment = Vec::with_capacity(payload.len() + 4);
+    segment.extend_from_slice(&[0xFF, 0xFE]);
+    segment.extend_from_slice(&(payload.len() as u16 + 2).to_be_bytes());
+    segment.extend_from_slice(payload);
+    Ok(segment)
+}
+/// The JPEG with a COM segment holding `payload` in its place, in one
+/// buffer; stills write the two as parts instead.
+pub fn insert_com(jpeg: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
+    let segment = com_segment(payload)?;
+    let at = com_offset(jpeg)?;
+    Ok([&jpeg[..at], &segment, &jpeg[at..]].concat())
 }
 
 #[cfg(test)]
@@ -229,7 +279,8 @@ mod tests {
     }
     #[test]
     fn rasters_are_gray_for_mono_and_rgb_otherwise() {
-        let mono = Raster::new(&frame(0x0110_0005, 5, 3, 2)).unwrap();
+        let source = frame(0x0110_0005, 5, 3, 2);
+        let mono = Raster::new(&source).unwrap();
         assert_eq!((mono.channels, mono.data.len()), (1, 15));
         let full = crate::frame::rgb(&frame(0x0110_0005, 5, 3, 2)).unwrap();
         assert!(
@@ -238,8 +289,15 @@ mod tests {
                 .zip(full.chunks(3))
                 .all(|(g, p)| *g == p[0])
         );
-        let bayer = Raster::new(&frame(0x0108_0009, 6, 4, 1)).unwrap();
+        let mosaic = frame(0x0108_0009, 6, 4, 1);
+        let bayer = Raster::new(&mosaic).unwrap();
         assert_eq!((bayer.channels, bayer.data.len()), (3, 72));
+        // 8-bit gray and RGB are the frame's own bytes.
+        for (format, bytes) in [(MONO8, 1), (crate::types::RGB8, 3)] {
+            let source = frame(format, 6, 4, bytes);
+            let raster = Raster::new(&source).unwrap();
+            assert_eq!(raster.data.as_ptr(), source.data.as_ptr(), "{format:x}");
+        }
         // Mono14 and packed Mono12p stay gray; packed BayerRG12p is color.
         for (format, bytes) in [(0x0110_0025, 2.0), (0x010c_0047, 1.5), (0x010c_0059, 1.5)] {
             let size = (6.0 * 4.0 * bytes) as usize;
@@ -263,22 +321,35 @@ mod tests {
     fn borrowed_frames_encode_byte_identical_to_rasters() {
         for (format, bytes) in [(RGB8, 3), (0x0218_0015, 3), (MONO8, 1)] {
             let frame = frame(format, 97, 61, bytes);
-            let borrowed = encode(&frame).unwrap();
-            assert_eq!(
-                borrowed,
-                software(&Raster::new(&frame).unwrap()).unwrap(),
-                "{format:x}"
-            );
+            // Converted to RGB, or copied, as every frame once was.
+            let copied = Raster {
+                width: 97,
+                height: 61,
+                channels: bytes,
+                data: Cow::Owned(if format == MONO8 {
+                    frame.data.to_vec()
+                } else {
+                    crate::frame::rgb(&frame).unwrap()
+                }),
+            };
+            for quality in [QUALITY, 75, 100] {
+                assert_eq!(
+                    encode(&frame, quality).unwrap(),
+                    software_quality(&copied, quality).unwrap(),
+                    "{format:x} at {quality}"
+                );
+            }
             let mut short = frame.clone();
             short.data.make_mut().pop();
-            assert!(encode(&short).is_err(), "{format:x}");
+            assert!(encode(&short, QUALITY).is_err(), "{format:x}");
         }
     }
     #[cfg(feature = "jpeg")]
     #[test]
     fn software_encoding_produces_valid_gray_and_color_jpegs() {
         for (format, bytes, width, height) in [(MONO8, 1, 33, 17), (RGB8, 3, 64, 48)] {
-            let raster = Raster::new(&frame(format, width, height, bytes)).unwrap();
+            let source = frame(format, width, height, bytes);
+            let raster = Raster::new(&source).unwrap();
             let jpeg = software(&raster).unwrap();
             assert!(well_formed(&jpeg, width, height), "{format:x}");
             assert!(!well_formed(&jpeg, width + 1, height));
@@ -290,7 +361,8 @@ mod tests {
     #[cfg(feature = "jpeg")]
     #[test]
     fn lower_quality_makes_smaller_jpegs_and_out_of_range_quality_fails() {
-        let raster = Raster::new(&frame(RGB8, 64, 48, 3)).unwrap();
+        let source = frame(RGB8, 64, 48, 3);
+        let raster = Raster::new(&source).unwrap();
         let fine = software_quality(&raster, 92).unwrap();
         let coarse = software_quality(&raster, 65).unwrap();
         assert!(well_formed(&coarse, 64, 48));

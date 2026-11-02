@@ -8,7 +8,7 @@ use crate::{
     jpeg::Raster,
     types::Frame,
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, ops::RangeInclusive};
 
@@ -426,7 +426,7 @@ pub struct EncodedImage {
     pub mime: &'static str,
     pub width: u32,
     pub height: u32,
-    pub bytes: Vec<u8>,
+    pub bytes: crate::frame::Body<'static>,
 }
 
 /// JSON carries the image as base64 beside its byte count.
@@ -496,14 +496,15 @@ fn render_within(
         return Ok(None);
     }
     let jpeg = jpeg_preview(format, jpeg_available)?;
-    let (channels, pixels) = if frame::monochrome(frame.pixel_format) {
-        (1, frame::convert(frame, |[value, _, _]| value)?)
+    // Mono8 and RGB8 are shrunk from the frame's own bytes.
+    let (channels, pixels) = if frame.pixel_format == crate::types::MONO8 {
+        (1, frame::gray8_samples(frame)?.context("Mono8 is gray")?)
+    } else if frame::monochrome(frame.pixel_format) {
+        (1, Cow::Owned(frame::convert(frame, |[value, _, _]| value)?))
     } else {
-        (3, frame::rgb(frame)?)
+        (3, frame::rgb_samples(frame)?)
     };
-    if frame.pixel_format == crate::types::MONO8 {
-        crate::copies::record(crate::copies::Site::Intermediate, pixels.len());
-    } else if frame.pixel_format != crate::types::RGB8 {
+    if let Cow::Owned(pixels) = &pixels {
         crate::copies::record(crate::copies::Site::PreviewTransform, pixels.len());
     }
     let (width, height) = fit(frame.width, frame.height, max_dimension);
@@ -535,7 +536,7 @@ fn render_within(
             let bytes = if jpeg {
                 crate::jpeg::software_quality(&raster, quality)?
             } else {
-                png(&raster)?
+                png(&raster)?.into()
             };
             if bytes.len() <= limit {
                 return Ok(Some(EncodedImage {
@@ -576,13 +577,12 @@ fn area_average(
     channels: usize,
     out_width: u32,
     out_height: u32,
-) -> Vec<u8> {
+) -> Cow<'_, [u8]> {
     let (w, h) = (width as usize, height as usize);
     let (ow, oh) = (out_width as usize, out_height as usize);
     debug_assert!((1..=w).contains(&ow) && (1..=h).contains(&oh));
     if (ow, oh) == (w, h) {
-        crate::copies::record(crate::copies::Site::Intermediate, w * h * channels);
-        return source[..w * h * channels].to_vec();
+        return Cow::Borrowed(&source[..w * h * channels]);
     }
     let columns: Vec<usize> = (0..w).map(|x| x * ow / w).collect();
     let mut widths = vec![0u64; ow];
@@ -609,7 +609,7 @@ fn area_average(
             rows = 0;
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn png(raster: &Raster) -> Result<Vec<u8>> {
@@ -1131,9 +1131,12 @@ mod tests {
         let ramp: Vec<u8> = (0..10).flat_map(|x| [x * 10, 0, 255]).collect();
         assert_eq!(
             area_average(&ramp, 10, 1, 3, 3, 1),
-            [15, 0, 255, 50, 0, 255, 80, 0, 255]
+            &[15, 0, 255, 50, 0, 255, 80, 0, 255][..]
         );
-        assert_eq!(area_average(&checker, 8, 8, 1, 8, 8), checker);
+        // An image that keeps its size is not copied.
+        let same = area_average(&checker, 8, 8, 1, 8, 8);
+        assert!(matches!(same, Cow::Borrowed(_)));
+        assert_eq!(same, checker);
         assert_eq!(fit(1920, 1080, 1024), (1024, 576));
         assert_eq!(fit(480, 640, 64), (48, 64));
         assert_eq!(fit(100, 50, 1024), (100, 50));
@@ -1151,7 +1154,7 @@ mod tests {
         for (source, channels) in [(&mono, 1), (&color, 3), (&bayer, 3)] {
             let image = render(source, 64, PreviewFormat::Png).unwrap().unwrap();
             assert_eq!((image.width, image.height), (64, 43));
-            let decoder = png::Decoder::new(image.bytes.as_slice());
+            let decoder = png::Decoder::new(&image.bytes[..]);
             let reader = decoder.read_info().unwrap();
             assert_eq!(reader.info().color_type.samples(), channels);
             assert_eq!((reader.info().width, reader.info().height), (64, 43));
@@ -1385,7 +1388,9 @@ mod tests {
                     3,
                     width,
                     height,
-                ),
+                )
+                .into_owned()
+                .into(),
             };
             crate::jpeg::software_quality(&raster, quality).unwrap()
         };

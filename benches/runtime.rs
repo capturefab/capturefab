@@ -432,7 +432,7 @@ fn main() {
         if b.selected(&label) {
             let f = frame(width, height, format);
             b.run(&label, f.data.len(), || {
-                capturefab::testing::engine::encode_still(&f, "raw", None, Some(&meta)).unwrap()
+                capturefab::testing::frame::encode_parts(&f, "raw", None, Some(&meta)).unwrap()
             });
         }
     }
@@ -444,7 +444,7 @@ fn main() {
                 &format!("encode/{label}/Mono8/4096x3000"),
                 f.data.len(),
                 || {
-                    capturefab::testing::engine::encode_still(&f, "jpeg", quality, Some(&meta))
+                    capturefab::testing::frame::encode_parts(&f, "jpeg", quality, Some(&meta))
                         .unwrap()
                 },
             );

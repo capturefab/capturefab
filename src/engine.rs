@@ -487,7 +487,7 @@ impl WorkerHandle {
     /// Write an image captured to stdout: to `file`, which a session client
     /// named, or else to the pipe of the command that started this worker,
     /// which is closed after it.
-    fn write_stdout(&self, file: Option<&str>, image: &[u8]) -> Result<()> {
+    fn write_stdout(&self, file: Option<&str>, image: &crate::frame::Encoded) -> Result<()> {
         use std::io::Write as _;
         crate::copies::record(crate::copies::Site::StdoutWrite, image.len());
         let Some(file) = file else {
@@ -497,7 +497,7 @@ impl WorkerHandle {
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
                 .context("this camera worker has no stdout for an image; save it to a file")?;
-            output.write_all(image)?;
+            image.write_to(&mut output)?;
             return output.flush().map_err(Into::into);
         };
         let path = crate::session::stdout_file(file)?;
@@ -511,7 +511,7 @@ impl WorkerHandle {
         let mut written = options
             .open(&path)
             .with_context(|| format!("create {}", path.display()))?;
-        written.write_all(image)?;
+        image.write_to(&mut written)?;
         Ok(())
     }
 }
@@ -1256,35 +1256,6 @@ fn still_meta(
         meta["context"] = json!(context);
     }
     meta
-}
-
-/// A still as `frame::encode_with_meta` encodes it, but a JPEG at `quality`
-/// when one other than the default is asked for.
-pub fn encode_still(
-    frame: &Frame,
-    format: &str,
-    quality: Option<u8>,
-    meta: Option<&Value>,
-) -> Result<Vec<u8>> {
-    match quality {
-        Some(quality) if format == "jpeg" && i32::from(quality) != crate::jpeg::QUALITY => {
-            let bytes = crate::jpeg::software_quality(
-                &crate::jpeg::Raster::new(frame)?,
-                i32::from(quality),
-            )?;
-            let Some(meta) = meta else {
-                return Ok(bytes);
-            };
-            let json = serde_json::to_string(meta)?;
-            ensure!(
-                json.len() <= crate::frame::MAX_META,
-                "capture metadata exceeds {} bytes",
-                crate::frame::MAX_META
-            );
-            crate::jpeg::insert_com(&bytes, json.as_bytes())
-        }
-        _ => crate::frame::encode_with_meta(frame, format, meta),
-    }
 }
 
 /// Save `NAME.json` beside the raw file `path`: what reading its bytes back
@@ -2189,20 +2160,20 @@ fn process_plain(
                 }
                 let mut files = Vec::new();
                 if output == "-" {
-                    let image = encode_still(&frame, &format, quality, None)?;
+                    let image = crate::frame::encode_parts(&frame, &format, quality, None)?;
                     h.write_stdout(stdout.as_deref(), &image)?;
                     metadata["file_bytes"] = json!(image.len());
                 }
                 if let Some(first) = first {
                     let meta = still_meta(&frame, wall_ms, &settings, &context);
-                    let bytes = encode_still(&frame, &format, quality, Some(&meta))?;
+                    let bytes = crate::frame::encode_parts(&frame, &format, quality, Some(&meta))?;
                     let (path, stored) = crate::naming::save_named(
                         &h.names,
                         &plan,
                         &input,
                         on_exists,
                         first.clone(),
-                        |path| crate::storage::save(&bytes, path, sync, false),
+                        |path| crate::storage::save_parts(&bytes.parts(), path, sync, false),
                     )
                     .with_context(|| format!("save {}", first.display()))?;
                     if format == "raw" {

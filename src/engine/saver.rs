@@ -377,7 +377,7 @@ fn report(
 /// manifest line, for its turn to be reported.
 fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
     let meta = still_meta(&shot.frame, shot.wall_ms, &shot.acquisition, &save.context);
-    let bytes = encode_still(&shot.frame, &save.format, save.quality, Some(&meta))?;
+    let bytes = crate::frame::encode_parts(&shot.frame, &save.format, save.quality, Some(&meta))?;
     let input = crate::naming::NameInput {
         camera: &save.camera,
         now: save.now,
@@ -390,7 +390,7 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
         &input,
         save.on_exists,
         save.path.clone(),
-        |path| crate::storage::save(&bytes, path, save.sync, save.manifest.is_some()),
+        |path| crate::storage::save_parts(&bytes.parts(), path, save.sync, save.manifest.is_some()),
     )
     .with_context(|| format!("save {}", save.path.display()))?;
     if save.format == "raw" {

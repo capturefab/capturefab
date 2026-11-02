@@ -83,14 +83,11 @@ pub mod testing {
     pub mod camera_profile {
         pub use crate::camera_profile::CameraKind;
     }
-    pub mod engine {
-        pub use crate::engine::encode_still;
-    }
     pub mod frame {
         pub use crate::frame::{
-            MAX_META, bit_depth, clipping, convert_into, convertible, encode, encode_with_meta,
-            exposure, gray8, pixel_format_name, rgb, rgba, row_bytes, sample_bits, sharpness,
-            unpacked,
+            Encoded, MAX_META, bit_depth, clipping, convert_into, convertible, encode,
+            encode_parts, encode_with_meta, exposure, gray8, pixel_format_name, rgb, rgba,
+            row_bytes, sample_bits, sharpness, unpacked,
         };
     }
     pub mod inspect {
@@ -103,7 +100,7 @@ pub mod testing {
         pub use crate::session::{SessionCommand, SessionHandle};
     }
     pub mod storage {
-        pub use crate::storage::{SyncMode, save};
+        pub use crate::storage::{SyncMode, save, save_parts};
     }
     pub mod types {
         pub use crate::types::{Frame, MONO8, RGB8};

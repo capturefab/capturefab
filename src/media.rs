@@ -3937,34 +3937,22 @@ impl Payload<'_> {
         const BATCH: usize = 1024;
         match *self {
             Payload::Slice(data) => out.write_all(data),
-            Payload::Parts(parts) => write_vectored_all(out, &mut parts.map(IoSlice::new)),
+            Payload::Parts(parts) => {
+                crate::frame::write_all_vectored(out, &mut parts.map(IoSlice::new))
+            }
             Payload::Rows { data, row, ref pad } => {
                 let mut slices = Vec::with_capacity(BATCH);
                 for line in data.chunks_exact(row) {
                     slices.extend([IoSlice::new(line), IoSlice::new(pad)]);
                     if slices.len() == BATCH {
-                        write_vectored_all(out, &mut slices)?;
+                        crate::frame::write_all_vectored(out, &mut slices)?;
                         slices.clear();
                     }
                 }
-                write_vectored_all(out, &mut slices)
+                crate::frame::write_all_vectored(out, &mut slices)
             }
         }
     }
-}
-/// `write_all` for vectored writes: every byte of `slices`, taking up
-/// where a short write left off.
-fn write_vectored_all(out: &mut impl Write, mut slices: &mut [IoSlice<'_>]) -> std::io::Result<()> {
-    IoSlice::advance_slices(&mut slices, 0);
-    while !slices.is_empty() {
-        match out.write_vectored(slices) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(written) => IoSlice::advance_slices(&mut slices, written),
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
 }
 /// A recording writer's reused buffers for the frames it converts.
 #[derive(Default)]

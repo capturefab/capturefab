@@ -1,9 +1,12 @@
 //! Bounded PFNC image conversion and portable output without image codecs from the OS.
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Context as _, Result, bail, ensure};
-use std::{borrow::Cow, io::Write};
+use std::borrow::Cow;
 
+mod encoded;
 mod formats;
+pub(crate) use encoded::write_all_vectored;
+pub use encoded::{Body, Encoded};
 
 pub fn pixel_format_name(format: u32) -> &'static str {
     match format {
@@ -477,6 +480,27 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
         _ => return Ok(convert(frame, |p| p)?.into_flattened()),
     }
     Ok(out)
+}
+/// The frame's RGB samples, as `rgb` gives them: an RGB8 frame's own bytes,
+/// else a conversion.
+pub(crate) fn rgb_samples(frame: &Frame) -> Result<Cow<'_, [u8]>> {
+    if frame.pixel_format == RGB8 {
+        let length = checked_pixels(frame)? * 3;
+        ensure!(frame.data.len() >= length, "truncated RGB frame");
+        return Ok(Cow::Borrowed(&frame.data[..length]));
+    }
+    rgb(frame).map(Cow::Owned)
+}
+/// The frame's 8-bit gray samples, as `gray8` gives them: the frame's own
+/// bytes for the 8-bit monochrome formats, else a conversion; None for
+/// color formats.
+pub(crate) fn gray8_samples(frame: &Frame) -> Result<Option<Cow<'_, [u8]>>> {
+    if matches!(frame.pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6) {
+        let pixels = checked_pixels(frame)?;
+        ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
+        return Ok(Some(Cow::Borrowed(&frame.data[..pixels])));
+    }
+    Ok(gray8(frame)?.map(Cow::Owned))
 }
 /// How far an unpacked 16-bit monochrome sample shifts right to its top 8
 /// bits: Mono10 keeps bits 9-2, Mono12 bits 11-4, Mono14 bits 13-6, and the
@@ -1231,6 +1255,15 @@ pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
     encode_with_meta(frame, format, None)
 }
 
+/// `encode_parts` at the default quality, in one buffer.
+pub fn encode_with_meta(
+    frame: &Frame,
+    format: &str,
+    meta: Option<&serde_json::Value>,
+) -> Result<Vec<u8>> {
+    Ok(encode_parts(frame, format, None, meta)?.to_vec())
+}
+
 /// Encode a still, writing `meta` (compact provenance JSON) into PNG as an
 /// iTXt chunk named `capturefab` and into JPEG as a COM segment. Raw, PPM and
 /// PGM have no place for it and stay plain. Monochrome PNG of more than 8
@@ -1238,11 +1271,16 @@ pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
 /// saying how many are significant; other monochrome PNG and PGM are one
 /// 8-bit gray channel; color and Bayer are 8-bit RGB. PNG is compressed
 /// fast: deflate would otherwise take most of a large frame's capture time.
-pub fn encode_with_meta(
-    frame: &Frame,
+/// JPEG is at `quality`, or `jpeg::QUALITY`.
+///
+/// Raw, and PGM of 8-bit gray and PPM of RGB8, borrow the frame's bytes,
+/// so nothing is copied before they are written.
+pub fn encode_parts<'a>(
+    frame: &'a Frame,
     format: &str,
+    quality: Option<u8>,
     meta: Option<&serde_json::Value>,
-) -> Result<Vec<u8>> {
+) -> Result<Encoded<'a>> {
     let json = meta.map(serde_json::to_string).transpose()?;
     if let Some(json) = &json {
         ensure!(
@@ -1250,35 +1288,45 @@ pub fn encode_with_meta(
             "capture metadata exceeds {MAX_META} bytes"
         );
     }
-    if format == "raw" {
-        crate::copies::record(crate::copies::Site::StillCopy, frame.data.len());
-        return Ok(frame.data.to_vec());
-    }
-    if format == "jpeg" {
-        let bytes = crate::jpeg::encode(frame)?;
-        return match &json {
-            Some(json) => crate::jpeg::insert_com(&bytes, json.as_bytes()),
-            None => Ok(bytes),
-        };
-    }
-    let mut bytes = Vec::new();
+    let header = |magic: &str| format!("{magic}\n{} {}\n255\n", frame.width, frame.height);
     match format {
+        "raw" => Ok(Encoded::new(Body::Borrowed(&frame.data))),
+        "jpeg" => {
+            let quality = quality.map_or(crate::jpeg::QUALITY, i32::from);
+            let jpeg = crate::jpeg::encode(frame, quality)?;
+            Ok(match json {
+                Some(json) => {
+                    let at = crate::jpeg::com_offset(&jpeg)?;
+                    Encoded::with_insert(jpeg, at, crate::jpeg::com_segment(json.as_bytes())?)
+                }
+                None => Encoded::new(jpeg),
+            })
+        }
         "png" => {
             let (color, depth, samples, significant) = match gray16(frame)? {
                 Some((samples, bits)) => (
                     png::ColorType::Grayscale,
                     png::BitDepth::Sixteen,
-                    samples,
+                    Cow::Owned(samples),
                     Some(bits),
                 ),
-                None => match gray8(frame)? {
+                None => match gray8_samples(frame)? {
                     Some(gray) => (png::ColorType::Grayscale, png::BitDepth::Eight, gray, None),
-                    None => (png::ColorType::Rgb, png::BitDepth::Eight, rgb(frame)?, None),
+                    None => (
+                        png::ColorType::Rgb,
+                        png::BitDepth::Eight,
+                        rgb_samples(frame)?,
+                        None,
+                    ),
                 },
             };
-            if !matches!(frame.pixel_format, MONO8 | RGB8) {
+            if let Cow::Owned(samples) = &samples {
                 crate::copies::record(crate::copies::Site::StillTransform, samples.len());
             }
+            // Room for camera images compressed fast, so the output is
+            // usually allocated once.
+            let room = samples.len() / 2 + json.as_ref().map_or(0, |json| 2 * json.len()) + 4096;
+            let mut bytes = Vec::with_capacity(room);
             let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
             encoder.set_color(color);
             encoder.set_depth(depth);
@@ -1301,28 +1349,35 @@ pub fn encode_with_meta(
             writer.write_image_data(&samples)?;
             drop(writer);
             crate::copies::record(crate::copies::Site::PngEncode, bytes.len());
+            Ok(Encoded::new(Body::Vec(bytes)))
         }
-        "ppm" => {
-            write!(bytes, "P6\n{} {}\n255\n", frame.width, frame.height)?;
-            let rgb = rgb(frame)?;
-            if frame.pixel_format != RGB8 {
-                crate::copies::record(crate::copies::Site::StillTransform, rgb.len());
-            }
-            crate::copies::record(crate::copies::Site::StillCopy, rgb.len());
-            bytes.extend_from_slice(&rgb);
-        }
+        "ppm" => Ok(Encoded::with_insert(
+            body(rgb_samples(frame)?),
+            0,
+            header("P6").into_bytes(),
+        )),
         "pgm" => {
-            let gray = gray8(frame)?.context("PGM requires a monochrome image; use PNG or PPM")?;
-            write!(bytes, "P5\n{} {}\n255\n", frame.width, frame.height)?;
-            if frame.pixel_format != MONO8 {
-                crate::copies::record(crate::copies::Site::StillTransform, gray.len());
-            }
-            crate::copies::record(crate::copies::Site::StillCopy, gray.len());
-            bytes.extend_from_slice(&gray);
+            let gray =
+                gray8_samples(frame)?.context("PGM requires a monochrome image; use PNG or PPM")?;
+            Ok(Encoded::with_insert(
+                body(gray),
+                0,
+                header("P5").into_bytes(),
+            ))
         }
         _ => bail!("unknown image format {format}; use png, jpeg, raw, pgm or ppm"),
     }
-    Ok(bytes)
+}
+
+/// A body of samples: the frame's own, or a conversion, counted.
+fn body(samples: Cow<'_, [u8]>) -> Body<'_> {
+    match samples {
+        Cow::Borrowed(samples) => Body::Borrowed(samples),
+        Cow::Owned(samples) => {
+            crate::copies::record(crate::copies::Site::StillTransform, samples.len());
+            Body::Vec(samples)
+        }
+    }
 }
 
 /// The context tags of provenance JSON as `key=value; ...`, if it has any.
@@ -1338,6 +1393,80 @@ fn description(meta: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stills_borrow_the_frame_where_they_store_its_bytes() {
+        let frame = |pixel_format, bytes: usize| Frame {
+            width: 7,
+            height: 5,
+            pixel_format,
+            data: (0..35 * bytes).map(|i| (i * 13) as u8).collect(),
+            ..Frame::default()
+        };
+        for (format, encoding, header) in [
+            (MONO8, "raw", ""),
+            (0x010c_0047, "raw", ""),
+            (MONO8, "pgm", "P5\n7 5\n255\n"),
+            (0x0108_00b1, "pgm", "P5\n7 5\n255\n"),
+            (0x0108_00c6, "pgm", "P5\n7 5\n255\n"),
+            (RGB8, "ppm", "P6\n7 5\n255\n"),
+        ] {
+            let source = frame(format, if format == RGB8 { 3 } else { 1 });
+            let encoded = encode_parts(&source, encoding, None, None).unwrap();
+            let parts = encoded.parts();
+            let body = parts.iter().rfind(|part| !part.is_empty()).unwrap();
+            assert_eq!(body.as_ptr(), source.data.as_ptr(), "{format:x} {encoding}");
+            assert!(parts.contains(&header.as_bytes()));
+            // The same bytes as a conversion of the samples would give.
+            let samples = if encoding == "ppm" {
+                rgb(&source).unwrap()
+            } else if encoding == "pgm" {
+                gray8(&source).unwrap().unwrap()
+            } else {
+                source.data.to_vec()
+            };
+            assert_eq!(encoded.to_vec(), [header.as_bytes(), &samples].concat());
+            assert_eq!(encoded.len(), header.len() + samples.len());
+        }
+        // Formats that are converted are not borrowed.
+        let mono12 = frame(0x0110_0005, 2);
+        let pgm = encode_parts(&mono12, "pgm", None, None).unwrap();
+        assert!(
+            pgm.parts()
+                .iter()
+                .all(|part| part.as_ptr() != mono12.data.as_ptr())
+        );
+        assert!(encode_parts(&frame(RGB8, 3), "pgm", None, None).is_err());
+        let mut short = frame(RGB8, 3);
+        short.data.make_mut().pop();
+        assert!(encode_parts(&short, "ppm", None, None).is_err());
+    }
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn jpeg_comments_go_in_as_a_part_where_insert_com_puts_them() {
+        let frame = Frame {
+            width: 31,
+            height: 17,
+            pixel_format: MONO8,
+            data: (0..31 * 17).map(|i| (i * 7) as u8).collect(),
+            ..Frame::default()
+        };
+        let meta = serde_json::json!({"camera": "sim:0", "context": {"lot": "7"}});
+        for quality in [None, Some(75)] {
+            let plain = encode_parts(&frame, "jpeg", quality, None).unwrap();
+            assert_eq!(plain.parts()[1], b"");
+            let parts = encode_parts(&frame, "jpeg", quality, Some(&meta)).unwrap();
+            let json = serde_json::to_string(&meta).unwrap();
+            assert_eq!(
+                parts.to_vec(),
+                crate::jpeg::insert_com(&plain.to_vec(), json.as_bytes()).unwrap()
+            );
+            let mut written = Vec::new();
+            parts.write_to(&mut written).unwrap();
+            assert_eq!(written, parts.to_vec());
+        }
+        let wide = serde_json::json!({ "note": "x".repeat(MAX_META) });
+        assert!(encode_parts(&frame, "jpeg", None, Some(&wide)).is_err());
+    }
     #[test]
     fn coordinate_and_confidence_formats_convert_but_raw_preserves_precision() {
         for format in [0x0110_00b8, 0x0110_00c7] {
