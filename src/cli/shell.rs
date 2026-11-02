@@ -328,6 +328,18 @@ impl Shared {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+    /// Wait until no camera is still connecting, or a signal comes.
+    fn wait_connecting(&self) {
+        while !signals::interrupted()
+            && self
+                .known()
+                .cameras
+                .iter()
+                .any(|held| matches!(held.state, Connection::Connecting))
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     /// Connect `selector` in the background, where commands will use it;
     /// a camera already connected or connecting is left alone.
     fn connect(self: &Arc<Self>, selector: String) {
@@ -535,6 +547,13 @@ impl Shell {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
+            }
+            // A line runs once the cameras the shell is connecting are
+            // ready or failed: it would otherwise race their connection for
+            // the same camera, and `cameras` say it was still under way.
+            self.shared.wait_connecting();
+            if signals::interrupted() {
+                return signals::exit_code();
             }
             let step = self.execute(line);
             if signals::interrupted() {
