@@ -5453,14 +5453,41 @@ mod tests {
     #[cfg(unix)]
     impl Fake {
         fn new(name: &str, body: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
             let dir = temp_dir(name);
             let path = dir.join("ffmpeg");
             let script = format!("#!/bin/sh\ndir='{}'\n{body}\n", dir.display());
-            fs::write(&path, script).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(dir.join("script"), script).unwrap();
+            std::os::unix::fs::symlink(Self::launcher(), &path).unwrap();
             FAKE_FFMPEG.set(Some(Arc::new(Executable::external(path))));
             Self { dir }
+        }
+        /// The one executable every stand-in links to: it runs the `script`
+        /// beside the link it was started through. macOS checks a new
+        /// executable the first time it runs, which takes a second or more
+        /// while other tests start theirs, longer than the waits the tests
+        /// allow; this one is checked once, here, before any test waits.
+        fn launcher() -> &'static std::path::Path {
+            static LAUNCHER: OnceLock<PathBuf> = OnceLock::new();
+            extern "C" fn remove() {
+                if let Some(dir) = LAUNCHER.get().and_then(|path| path.parent()) {
+                    let _ = fs::remove_dir_all(dir);
+                }
+            }
+            LAUNCHER.get_or_init(|| {
+                use std::os::unix::fs::PermissionsExt;
+                let path = temp_dir("launcher").join("ffmpeg");
+                fs::write(&path, "#!/bin/sh\nexec /bin/sh \"${0%/*}/script\" \"$@\"\n").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+                // Its first run finds no script beside it and fails at once.
+                let _ = std::process::Command::new(&path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                // SAFETY: `remove` only reads a set OnceLock and removes a
+                // directory, after the tests have finished.
+                unsafe { libc::atexit(remove) };
+                path
+            })
         }
         /// A stand-in that writes raw video as `native` reads it.
         fn native(name: &str, body: &str) -> Self {
