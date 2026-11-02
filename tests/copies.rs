@@ -373,18 +373,21 @@ fn every_format_converts_once_into_its_encoder() {
             ("jpg", &["-f", "jpg"][..]),
             ("png", &["-f", "png"][..]),
         ] {
-            let (delta, files) = capture_delta(&home, format, extra, 5);
+            // Enough frames that one more buffer for a burst that happened
+            // to encode more frames at once stays within the budget.
+            let n = if name == "png" { 5 } else { 20 };
+            let (delta, files) = capture_delta(&home, format, extra, n);
             let label = format!("capture -f {name} {format}");
-            show(&label, &delta, 5);
+            show(&label, &delta, n as i64);
             assert_no_avoidable(&label, &delta);
             assert_eq!(site(&delta, "file_write"), files, "{label}");
-            let per_file = large(&delta) as f64 / 5.0;
+            let per_file = large(&delta) as f64 / n as f64;
             match name {
                 "raw" => assert_eq!(class_bytes(&delta, "transform"), 0, "{label}"),
                 // The png crate's compressed-data buffer grows by doubling
                 // beside the one output buffer (see above).
                 "png" => {
-                    let doublings = (files / 5 / (256 << 10)).max(1).ilog2() + 2;
+                    let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
                     assert!(per_file <= f64::from(doublings) + 1.0, "{label}: {delta}");
                 }
                 _ => assert!(per_file <= LARGE_PER_FRAME, "{label}: {delta}"),

@@ -4,6 +4,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"e4475e7102c15dc7","len":561},
+        "jpeg": {"fnv1a64":"43926406c79b8bf4","len":342},
         "pgm": {"fnv1a64":"1281d364dafc480a","len":574},
         "png": {"fnv1a64":"1b1b279db3b96c04","len":171},
         "png_bit_depth": [8,null],
@@ -35,6 +36,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"f1c90de5c2adcdff","len":561},
+        "jpeg": {"fnv1a64":"9356da3202928ff5","len":498},
         "pgm": {"fnv1a64":"17f4a67af3878162","len":574},
         "png": {"fnv1a64":"8412afd17f388fc5","len":199},
         "png_bit_depth": [8,null],
@@ -66,6 +68,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"1f8f665badd58446","len":561},
+        "jpeg": {"fnv1a64":"c80d5dffcff110e5","len":833},
         "pgm": {"fnv1a64":"dbc42f71d4b222fb","len":574},
         "png": {"fnv1a64":"fe5e2bc7e48438d5","len":646},
         "png_bit_depth": [8,null],
@@ -97,6 +100,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"e4486c1e4ed38b17","len":561},
+        "jpeg": {"fnv1a64":"fb5701ac82e291b9","len":673},
         "pgm": {"fnv1a64":"4174bc2a7f0422ba","len":574},
         "png": {"fnv1a64":"aa45b415f0073681","len":204},
         "png_bit_depth": [8,null],
@@ -128,6 +132,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"008dc026076591b7","len":561},
+        "jpeg": {"fnv1a64":"604fdf18573cea48","len":526},
         "pgm": {"fnv1a64":"c9d9b6202ee7d7da","len":574},
         "png": {"fnv1a64":"1960ba754a979039","len":189},
         "png_bit_depth": [8,null],
@@ -159,6 +164,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"5e8a071367821fc7","len":654},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"73d53ec3e751303d","len":186},
         "png_bit_depth": [8,null],
@@ -190,6 +196,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"802cf87147c495a1","len":889},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"a8dfbd453fb6bf7a","len":275},
         "png_bit_depth": [8,null],
@@ -221,6 +228,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"ff6066a60899cd79","len":1278},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"58722033281fa499","len":1768},
         "png_bit_depth": [8,null],
@@ -252,6 +260,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"92eca147dae8f178","len":1079},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"6cca22861ed33414","len":335},
         "png_bit_depth": [8,null],
@@ -283,6 +292,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"033c97cbf0b9851a","len":875},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"cd790ed53e7c2787","len":247},
         "png_bit_depth": [8,null],
@@ -314,6 +324,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"d53d47887c74419f","len":561},
+        "jpeg": {"fnv1a64":"4eab2a42ae538e49","len":342},
         "pgm": {"fnv1a64":"6d6230f16b7e9442","len":574},
         "png": {"fnv1a64":"49afc71217af9de8","len":193},
         "png_bit_depth": [16,null],
@@ -345,6 +356,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"f1c90de5c2adcdff","len":561},
+        "jpeg": {"fnv1a64":"9356da3202928ff5","len":498},
         "pgm": {"fnv1a64":"17f4a67af3878162","len":574},
         "png": {"fnv1a64":"01b67872db8c6133","len":229},
         "png_bit_depth": [16,null],
@@ -376,6 +388,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"d71c622ef6686801","len":561},
+        "jpeg": {"fnv1a64":"09cd6e038b66f1bf","len":837},
         "pgm": {"fnv1a64":"31c7dc48690131a0","len":574},
         "png": {"fnv1a64":"adce714029360d4e","len":1220},
         "png_bit_depth": [16,null],
@@ -407,6 +420,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"e4486c1e4ed38b17","len":561},
+        "jpeg": {"fnv1a64":"fb5701ac82e291b9","len":673},
         "pgm": {"fnv1a64":"4174bc2a7f0422ba","len":574},
         "png": {"fnv1a64":"13b3507db5faa657","len":300},
         "png_bit_depth": [16,null],
@@ -438,6 +452,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"008dc026076591b7","len":561},
+        "jpeg": {"fnv1a64":"604fdf18573cea48","len":526},
         "pgm": {"fnv1a64":"c9d9b6202ee7d7da","len":574},
         "png": {"fnv1a64":"ec10628db3933b29","len":232},
         "png_bit_depth": [16,null],
@@ -469,6 +484,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"ae4ae96b8b8e109d","len":651},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"dbb5e2d2cb72fe0e","len":189},
         "png_bit_depth": [8,null],
@@ -500,6 +516,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"5680b1cc61426276","len":880},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"6316cf37bfab5a96","len":763},
         "png_bit_depth": [8,null],
@@ -531,6 +548,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"303afdf371a85220","len":1217},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"0d01e7e8abb5c9ca","len":1768},
         "png_bit_depth": [8,null],
@@ -562,6 +580,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"5962bceae9f74e59","len":1152},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"4d324f79b86ba8ae","len":1367},
         "png_bit_depth": [8,null],
@@ -593,6 +612,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"db4e36d84a84de71","len":971},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"b814d407cd066587","len":1075},
         "png_bit_depth": [8,null],
@@ -624,6 +644,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"7f73d84ec244c325","len":2048},
+        "jpeg": {"fnv1a64":"0fa5f70d20b3d889","len":355},
         "pgm": {"fnv1a64":"9cfb9666f6db211d","len":2061},
         "png": {"fnv1a64":"846f94ad7d7e7ea6","len":218},
         "png_bit_depth": [8,null],
@@ -655,6 +676,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"fb597918b32e62e5","len":2048},
+        "jpeg": {"fnv1a64":"fa933b8e594e2394","len":754},
         "pgm": {"fnv1a64":"3f312c8191610edd","len":2061},
         "png": {"fnv1a64":"434abeabf79a3cd9","len":264},
         "png_bit_depth": [8,null],
@@ -686,6 +708,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"182140c8eac0efe6","len":2048},
+        "jpeg": {"fnv1a64":"96d1f3ca2ea2cf46","len":1927},
         "pgm": {"fnv1a64":"96caab0388dffd0e","len":2061},
         "png": {"fnv1a64":"e99283a6123b0aab","len":2148},
         "png_bit_depth": [8,null],
@@ -717,6 +740,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"654164e8fea2a287","len":662},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8b73dace334070e0","len":226},
         "png_bit_depth": [8,null],
@@ -748,6 +772,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"6cb58dfedec92b71","len":1180},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8680ed2702ceebf4","len":378},
         "png_bit_depth": [8,null],
@@ -779,6 +804,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"309ec56cb17feea4","len":2453},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"cb16583d34b251f4","len":6244},
         "png_bit_depth": [8,null],
@@ -810,6 +836,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"3bec19a56e2ec325","len":2048},
+        "jpeg": {"fnv1a64":"d922c4e71fb3791a","len":354},
         "pgm": {"fnv1a64":"9d520c3cbcc9211d","len":2061},
         "png": {"fnv1a64":"5369266497368f3b","len":235},
         "png_bit_depth": [16,null],
@@ -841,6 +868,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"600eddaaf9428625","len":2048},
+        "jpeg": {"fnv1a64":"97b09dddd2d9535f","len":752},
         "pgm": {"fnv1a64":"1c53d387bfa2e41d","len":2061},
         "png": {"fnv1a64":"2f2471399f58e431","len":349},
         "png_bit_depth": [16,null],
@@ -872,6 +900,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"f14bed51f06d11ee","len":2048},
+        "jpeg": {"fnv1a64":"cb61bba59802a0f8","len":1945},
         "pgm": {"fnv1a64":"6bf3b1ca3daa54e6","len":2061},
         "png": {"fnv1a64":"b909faba1c3b5e0d","len":4209},
         "png_bit_depth": [16,null],
@@ -903,6 +932,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"39d6bc293adf47dd","len":659},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"496449de54a70c14","len":229},
         "png_bit_depth": [8,null],
@@ -934,6 +964,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"d949e3bb99b2ee5c","len":1197},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"c5ffce7b3ac113ba","len":2311},
         "png_bit_depth": [8,null],
@@ -965,6 +996,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"505bc6b7553794ed","len":2319},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"11fc88419d531cfc","len":6244},
         "png_bit_depth": [8,null],
@@ -996,6 +1028,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"89a73f16599e0ce5","len":307200},
+        "jpeg": {"fnv1a64":"c7108fca3fd2c3e6","len":61839},
         "pgm": {"fnv1a64":"f2f615b7b972938e","len":307215},
         "png": {"fnv1a64":"88a88909c7ba76fe","len":3231},
         "png_bit_depth": [8,null],
@@ -1023,6 +1056,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"3406e3c89d36cd1d","len":307200},
+        "jpeg": {"fnv1a64":"5ef63fb4d697779f","len":241755},
         "pgm": {"fnv1a64":"a68549ac18e122c6","len":307215},
         "png": {"fnv1a64":"1710edd7c8466169","len":307768},
         "png_bit_depth": [8,null],
@@ -1050,6 +1084,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"3fb67206ad3ffb25","len":307200},
+        "jpeg": {"fnv1a64":"7352de1d47afb582","len":13412},
         "pgm": {"fnv1a64":"acde748637f644ce","len":307215},
         "png": {"fnv1a64":"9583400f72e02913","len":11584},
         "png_bit_depth": [8,null],
@@ -1077,6 +1112,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"81ab43c5de37ca07","len":62004},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"beefd70656b2d262","len":6903},
         "png_bit_depth": [8,null],
@@ -1104,6 +1140,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"13c49aa8385d448f","len":276164},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"de7ba7986a9653c8","len":922218},
         "png_bit_depth": [8,null],
@@ -1131,6 +1168,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"2724aea4be8aa7c6","len":57628},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"37bdc41e5726a3ac","len":25609},
         "png_bit_depth": [8,null],
@@ -1158,6 +1196,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"52e2638764eae4a5","len":307200},
+        "jpeg": {"fnv1a64":"30b821789a38fe52","len":61884},
         "pgm": {"fnv1a64":"e4d2b8e100d3f94e","len":307215},
         "png": {"fnv1a64":"9ed5bab4a5502d6a","len":5437},
         "png_bit_depth": [16,null],
@@ -1185,6 +1224,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"c271ca545c2c2bf2","len":307200},
+        "jpeg": {"fnv1a64":"59d5d83a43e39417","len":241937},
         "pgm": {"fnv1a64":"7e53847c138cff79","len":307215},
         "png": {"fnv1a64":"3c49480d58f86b63","len":615006},
         "png_bit_depth": [16,null],
@@ -1212,6 +1252,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"3fb67206ad3ffb25","len":307200},
+        "jpeg": {"fnv1a64":"7352de1d47afb582","len":13412},
         "pgm": {"fnv1a64":"acde748637f644ce","len":307215},
         "png": {"fnv1a64":"bde731cadb68cd88","len":19591},
         "png_bit_depth": [16,null],
@@ -1239,6 +1280,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"cc6e081f7182a6a3","len":82167},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"4eba711b0cbade08","len":370074},
         "png_bit_depth": [8,null],
@@ -1266,6 +1308,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"7b9e9bc4ffb61132","len":255140},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"a99966f59dc8cad0","len":922218},
         "png_bit_depth": [8,null],
@@ -1293,6 +1336,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"10515eb17236d038","len":191380},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"3921c5f23e8a7c71","len":403863},
         "png_bit_depth": [8,null],
@@ -1320,6 +1364,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"af63b74c8601adad","len":1},
+        "jpeg": {"fnv1a64":"2755930d57357572","len":333},
         "pgm": {"fnv1a64":"0a54eb39cc065832","len":12},
         "png": {"fnv1a64":"5e70743344de020d","len":70},
         "png_bit_depth": [8,null],
@@ -1351,6 +1396,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"3ddb7d37f8a7af15","len":633},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"0f2779410d272e02","len":72},
         "png_bit_depth": [8,null],
@@ -1382,6 +1428,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"af642e4c860277e2","len":1},
+        "jpeg": {"fnv1a64":"1141b2162005b0bf","len":333},
         "pgm": {"fnv1a64":"0a557439cc0740fd","len":12},
         "png": {"fnv1a64":"74c017d45efc0691","len":84},
         "png_bit_depth": [16,null],
@@ -1413,6 +1460,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a207b38da60eb713","len":631},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"84eae7e293d5d7eb","len":72},
         "png_bit_depth": [8,null],
@@ -1444,6 +1492,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"e2644794a4828246","len":6},
+        "jpeg": {"fnv1a64":"47e04f3ec376be4d","len":377},
         "pgm": {"fnv1a64":"19bcd938a1698f4a","len":17},
         "png": {"fnv1a64":"007fc8b85b482a09","len":77},
         "png_bit_depth": [8,null],
@@ -1475,6 +1524,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"c6b5c9f0a429ceb3","len":692},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"f7ba565f67cde278","len":89},
         "png_bit_depth": [8,null],
@@ -1506,6 +1556,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"939a04d8d4b7c1a4","len":6},
+        "jpeg": {"fnv1a64":"54c38319647b7aef","len":358},
         "pgm": {"fnv1a64":"c1fe3b854d03ee80","len":17},
         "png": {"fnv1a64":"6d6f6c6b13b46657","len":96},
         "png_bit_depth": [16,null],
@@ -1537,6 +1588,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"dcbe3bef14816f2d","len":672},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"78dcee2234c2a764","len":89},
         "png_bit_depth": [8,null],
@@ -1568,6 +1620,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"e8251b4a666c2954","len":4},
+        "jpeg": {"fnv1a64":"fea44ed27e04db8c","len":347},
         "pgm": {"fnv1a64":"14eaba1e620d5e5c","len":15},
         "png": {"fnv1a64":"1139682438305917","len":73},
         "png_bit_depth": [8,null],
@@ -1599,6 +1652,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a6dfaf7e0d0b7005","len":659},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"736855cc5827381d","len":81},
         "png_bit_depth": [8,null],
@@ -1630,6 +1684,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"df58352bf213c455","len":4},
+        "jpeg": {"fnv1a64":"65699d39dba6fe9f","len":346},
         "pgm": {"fnv1a64":"7bf72c2acf9c24cd","len":15},
         "png": {"fnv1a64":"029f5d46f7c8ec82","len":90},
         "png_bit_depth": [16,null],
@@ -1661,6 +1716,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"194b7d2c4dea16ae","len":662},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"06288ed93f1203b0","len":81},
         "png_bit_depth": [8,null],
@@ -1692,6 +1748,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"5c04ef24fc924625","len":921600},
+        "jpeg": {"fnv1a64":"f07bb4ab76771790","len":184328},
         "pgm": {"fnv1a64":"dc3a0d17a8bdad0c","len":921616},
         "png": {"fnv1a64":"35cd6938b1ad20e3","len":6837},
         "png_bit_depth": [8,null],
@@ -1719,6 +1776,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"29edee8814439db1","len":921600},
+        "jpeg": {"fnv1a64":"f7a9248479ac3ce9","len":724662},
         "pgm": {"fnv1a64":"5c13bcf1e4305aec","len":921616},
         "png": {"fnv1a64":"964ac26c085a7b73","len":922458},
         "png_bit_depth": [8,null],
@@ -1746,6 +1804,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"1f2a6a1778f3580f","len":180976},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"33fa7ba29a385a4b","len":16882},
         "png_bit_depth": [8,null],
@@ -1773,6 +1832,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"67f5ba6f7673e695","len":826463},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"e2b099be213ae4e8","len":2765798},
         "png_bit_depth": [8,null],
@@ -1800,6 +1860,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"9de3f2a05c8de325","len":921600},
+        "jpeg": {"fnv1a64":"90e2309abc0ea5d4","len":183858},
         "pgm": {"fnv1a64":"2b440eacb35f1e0c","len":921616},
         "png": {"fnv1a64":"a8e3b48deff8d38c","len":13178},
         "png_bit_depth": [16,null],
@@ -1827,6 +1888,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"21e53878ae3fbad1","len":921600},
+        "jpeg": {"fnv1a64":"e647b39d3b19d2f6","len":724509},
         "pgm": {"fnv1a64":"a0a3cbe0db958cd8","len":921616},
         "png": {"fnv1a64":"689819dbee5f7b47","len":1844141},
         "png_bit_depth": [16,null],
@@ -1854,6 +1916,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"fd58f3bb930ab9a7","len":243367},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"1714e4e68541e98d","len":1036910},
         "png_bit_depth": [8,null],
@@ -1881,6 +1944,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"40f5d912c15cbfb8","len":764471},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"46ed7d8512320984","len":2765798},
         "png_bit_depth": [8,null],
@@ -1908,6 +1972,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"6620cac23e54be6b","len":1273},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"c269042eb76617d2","len":1768},
         "png_bit_depth": [8,null],
@@ -1939,6 +2004,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"7d6b5f1d0a1f878d","len":561},
+        "jpeg": {"fnv1a64":"fde56a183bc0f713","len":835},
         "pgm": {"fnv1a64":"7dfbb2b44dcf5be0","len":574},
         "png": {"fnv1a64":"26d2d72d847d2f7b","len":1220},
         "png_bit_depth": [16,null],
@@ -1970,6 +2036,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"29c186ef92a87e6b","len":561},
+        "jpeg": {"fnv1a64":"41752f65c44cab36","len":839},
         "pgm": {"fnv1a64":"5b488321e0f5dd4e","len":574},
         "png": {"fnv1a64":"4a24e95ccd187b06","len":1220},
         "png_bit_depth": [16,null],
@@ -2001,6 +2068,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"1f8f665badd58446","len":561},
+        "jpeg": {"fnv1a64":"f2d6d1947456ecd0","len":1135},
         "pgm": {"fnv1a64":"dbc42f71d4b222fb","len":574},
         "png": {"fnv1a64":"fe5e2bc7e48438d5","len":646},
         "png_bit_depth": [8,null],
@@ -2032,6 +2100,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"29c186ef92a87e6b","len":561},
+        "jpeg": {"fnv1a64":"91329168e0a3c745","len":1137},
         "pgm": {"fnv1a64":"5b488321e0f5dd4e","len":574},
         "png": {"fnv1a64":"4a24e95ccd187b06","len":1220},
         "png_bit_depth": [16,null],
@@ -2063,6 +2132,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"1f8f665badd58446","len":561},
+        "jpeg": {"fnv1a64":"f2d6d1947456ecd0","len":1135},
         "pgm": {"fnv1a64":"dbc42f71d4b222fb","len":574},
         "png": {"fnv1a64":"fe5e2bc7e48438d5","len":646},
         "png_bit_depth": [8,null],
@@ -2094,6 +2164,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"29c186ef92a87e6b","len":561},
+        "jpeg": {"fnv1a64":"91329168e0a3c745","len":1137},
         "pgm": {"fnv1a64":"5b488321e0f5dd4e","len":574},
         "png": {"fnv1a64":"4a24e95ccd187b06","len":1220},
         "png_bit_depth": [16,null],
@@ -2125,6 +2196,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"9c8b203a356159d9","len":1224},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"802829ef9e237006","len":1768},
         "png_bit_depth": [8,null],
@@ -2156,6 +2228,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"d8f41e6e3bd70c44","len":1215},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"48532da0951192d4","len":1768},
         "png_bit_depth": [8,null],
@@ -2187,6 +2260,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"7951c7300d059c3c","len":1211},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"304fdc1e65a8b281","len":1768},
         "png_bit_depth": [8,null],
@@ -2218,6 +2292,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"error":"unsupported PFNC format 0x012000bf; capture with --format raw to preserve bytes"},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"error":"unsupported PFNC format 0x012000bf; capture with --format raw to preserve bytes"},
         "png_bit_depth": [8,32],
@@ -2249,6 +2324,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"error":"unsupported PFNC format 0x01100099; capture with --format raw to preserve bytes"},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"error":"unsupported PFNC format 0x01100099; capture with --format raw to preserve bytes"},
         "png_bit_depth": [8,null],
@@ -2280,6 +2356,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"3fd3972e474020b9","len":663},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"42d10143a8e5f72b","len":81},
         "png_bit_depth": [8,null],
@@ -2311,6 +2388,7 @@
     {
       "conversions": {
         "gray8": {"error":"truncated Mono8 frame"},
+        "jpeg": {"error":"truncated Mono8 frame"},
         "pgm": {"error":"truncated Mono8 frame"},
         "png": {"error":"truncated Mono8 frame"},
         "png_bit_depth": [8,null],
@@ -2342,6 +2420,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"8c84e9e5722de325","len":8192},
+        "jpeg": {"fnv1a64":"d8c4da1d90410434","len":2024},
         "pgm": {"fnv1a64":"cea4f4cd794fea2f","len":8206},
         "png": {"fnv1a64":"abfad8695af548b9","len":411},
         "png_bit_depth": [8,null],
@@ -2374,6 +2453,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"c8b61eeda40e5aa0","len":96},
+        "jpeg": {"fnv1a64":"13b2790e7e518e20","len":447},
         "pgm": {"fnv1a64":"262a27ce2152885c","len":108},
         "png": {"fnv1a64":"4cdf8a01ee4c4b7e","len":150},
         "png_bit_depth": [8,null],
@@ -2405,6 +2485,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"e133cb23abfc33d7","len":96},
+        "jpeg": {"fnv1a64":"1e934e0433e929d9","len":436},
         "pgm": {"fnv1a64":"784f54d0e8ac4b1b","len":108},
         "png": {"fnv1a64":"d10c0c30f01c71d9","len":172},
         "png_bit_depth": [8,null],
@@ -2436,6 +2517,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"4a38cfbf43ee7d1a","len":96},
+        "jpeg": {"fnv1a64":"8ed9237d28b7b7cc","len":435},
         "pgm": {"fnv1a64":"bb443f4760bf8476","len":108},
         "png": {"fnv1a64":"50360148fd9ecfb0","len":172},
         "png_bit_depth": [8,null],
@@ -2470,6 +2552,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"edb370c9a3d8e693","len":96},
+        "jpeg": {"fnv1a64":"facbb0bba71a433d","len":427},
         "pgm": {"fnv1a64":"4936856ad2fdb43f","len":108},
         "png": {"fnv1a64":"9121e407c86c0973","len":172},
         "png_bit_depth": [8,null],
@@ -2504,6 +2587,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"d5ab782a1c3e0bb3","len":96},
+        "jpeg": {"fnv1a64":"fce45239456362ae","len":429},
         "pgm": {"fnv1a64":"e6db2e52e77a0c87","len":108},
         "png": {"fnv1a64":"4768e719d130e5ef","len":172},
         "png_bit_depth": [8,null],
@@ -2538,6 +2622,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"2d970b59fa2790f1","len":752},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8c85675c119b186e","len":364},
         "png_bit_depth": [8,null],
@@ -2572,6 +2657,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"d8268524e6a35b42","len":754},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"324039f492b7af1c","len":364},
         "png_bit_depth": [8,null],
@@ -2606,6 +2692,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"954d5d14b992a134","len":748},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"e5ac6db09cce1c31","len":364},
         "png_bit_depth": [8,null],
@@ -2640,6 +2727,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"4c239030606263d1","len":748},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"5c0b139ff45a513f","len":364},
         "png_bit_depth": [8,null],
@@ -2674,6 +2762,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"d679824caffa3b8e","len":96},
+        "jpeg": {"fnv1a64":"9cffbac484f2e6cb","len":725},
         "pgm": {"fnv1a64":"6d71b5116f30b67a","len":108},
         "png": {"fnv1a64":"7591998846e28d47","len":172},
         "png_bit_depth": [8,null],
@@ -2708,6 +2797,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"24b09526add612b9","len":96},
+        "jpeg": {"fnv1a64":"9fa0c604c1526f05","len":730},
         "pgm": {"fnv1a64":"a639e4359d50aa65","len":108},
         "png": {"fnv1a64":"86ababaa29a1c301","len":172},
         "png_bit_depth": [8,null],
@@ -2742,6 +2832,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"ae77ba0f0cac5596","len":96},
+        "jpeg": {"fnv1a64":"a1a66634a2a2caaa","len":429},
         "pgm": {"fnv1a64":"7f86c8a655c483d2","len":108},
         "png": {"fnv1a64":"3ef7516e6753be7c","len":281},
         "png_bit_depth": [16,null],
@@ -2776,6 +2867,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"dfd42f2e5fdb3aaa","len":753},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"7695526c555f9bac","len":364},
         "png_bit_depth": [8,10],
@@ -2810,6 +2902,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"5741b8d572dc534e","len":752},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8d8a7132c8081dfb","len":364},
         "png_bit_depth": [8,10],
@@ -2844,6 +2937,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"4209ae786e3a3e5e","len":750},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"fb6136ee5d43049f","len":364},
         "png_bit_depth": [8,10],
@@ -2878,6 +2972,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"76f7bc3ae3e94515","len":748},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"50bc58266a583dc7","len":364},
         "png_bit_depth": [8,10],
@@ -2912,6 +3007,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"b790e5001ec727f7","len":96},
+        "jpeg": {"fnv1a64":"1e1bc8c43a4dff80","len":436},
         "pgm": {"fnv1a64":"4fc3b08dc79b3693","len":108},
         "png": {"fnv1a64":"2660a84fd16b5f04","len":281},
         "png_bit_depth": [16,null],
@@ -2946,6 +3042,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"37adbc2d971ff85a","len":96},
+        "jpeg": {"fnv1a64":"0391e41a3f82197e","len":432},
         "pgm": {"fnv1a64":"6ae865fa10ee5f16","len":108},
         "png": {"fnv1a64":"c842b5bfb1451ac1","len":281},
         "png_bit_depth": [16,null],
@@ -2980,6 +3077,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"331290a55ea57a9a","len":752},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"1e62b3ee0532445b","len":364},
         "png_bit_depth": [8,10],
@@ -3014,6 +3112,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"3320a9fe36dce411","len":749},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8981f7eb44223d67","len":364},
         "png_bit_depth": [8,10],
@@ -3048,6 +3147,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a2c9fed7ae282d85","len":750},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"520a48e9006e3207","len":364},
         "png_bit_depth": [8,10],
@@ -3082,6 +3182,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a48085caf42ef416","len":754},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"5b77526b13806e3c","len":364},
         "png_bit_depth": [8,10],
@@ -3116,6 +3217,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"197e7adca284a8ce","len":750},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"7bf38b79e6e04605","len":364},
         "png_bit_depth": [8,12],
@@ -3150,6 +3252,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"b0fadda38e5ed00a","len":750},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"b6d762e3f741b894","len":364},
         "png_bit_depth": [8,12],
@@ -3184,6 +3287,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"4ac4d49aded8ac4f","len":755},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"d139f1a6fd39a03f","len":364},
         "png_bit_depth": [8,12],
@@ -3218,6 +3322,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"447dcab117f5a927","len":752},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"552c77a2c9d853d5","len":364},
         "png_bit_depth": [8,12],
@@ -3252,6 +3357,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"b79168d032a26e49","len":96},
+        "jpeg": {"fnv1a64":"da5730fad0165448","len":430},
         "pgm": {"fnv1a64":"7fb7e8eaceeeec75","len":108},
         "png": {"fnv1a64":"43e88fc5c53f1b13","len":281},
         "png_bit_depth": [16,null],
@@ -3286,6 +3392,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"d8b07175bfdae730","len":760},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"5af3139f1eec1efd","len":364},
         "png_bit_depth": [8,12],
@@ -3320,6 +3427,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"f14dd501d516a821","len":757},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"900d14d64277be52","len":364},
         "png_bit_depth": [8,12],
@@ -3354,6 +3462,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"082abdf0e0dcae1f","len":760},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"991ea883a5ac8971","len":364},
         "png_bit_depth": [8,12],
@@ -3388,6 +3497,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"b02fc599b9dec321","len":747},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"9d9bfe576194307a","len":364},
         "png_bit_depth": [8,12],
@@ -3422,6 +3532,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"4cd05efc45c56d48","len":96},
+        "jpeg": {"fnv1a64":"7f6d7aff696e19d1","len":427},
         "pgm": {"fnv1a64":"d1938b88d83663bc","len":108},
         "png": {"fnv1a64":"6cfa3b0d44aec644","len":281},
         "png_bit_depth": [16,null],
@@ -3456,6 +3567,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"8deeb8f8b36b62a1","len":756},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"55d7b94776f2629c","len":364},
         "png_bit_depth": [8,14],
@@ -3490,6 +3602,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"abd4f68122759069","len":754},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"e91442ab8d95e6ce","len":364},
         "png_bit_depth": [8,14],
@@ -3524,6 +3637,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"883612ee65835600","len":753},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8e564d1d810f7253","len":364},
         "png_bit_depth": [8,14],
@@ -3558,6 +3672,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"536a8fb331e87975","len":753},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"5f050b6dd6657073","len":364},
         "png_bit_depth": [8,14],
@@ -3592,6 +3707,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"7a3309171220ce24","len":96},
+        "jpeg": {"fnv1a64":"f252d1e4d289ad54","len":363},
         "pgm": {"fnv1a64":"78aaf0747d750268","len":108},
         "png": {"fnv1a64":"29cb1991e4febd75","len":281},
         "png_bit_depth": [16,null],
@@ -3626,6 +3742,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"0a2bebf8425250a1","len":96},
+        "jpeg": {"fnv1a64":"de37859c24f1f917","len":354},
         "pgm": {"fnv1a64":"a7340d0d4015715d","len":108},
         "png": {"fnv1a64":"840992b2c825c70b","len":281},
         "png_bit_depth": [16,null],
@@ -3660,6 +3777,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"47c0175ea8ce2b59","len":96},
+        "jpeg": {"fnv1a64":"3e68fc463a798545","len":434},
         "pgm": {"fnv1a64":"24176d81c10447e5","len":108},
         "png": {"fnv1a64":"83130b6deb420bde","len":281},
         "png_bit_depth": [16,null],
@@ -3694,6 +3812,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"b6e65514cf23bbc9","len":665},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"e3d120b4fce187b3","len":188},
         "png_bit_depth": [8,10],
@@ -3728,6 +3847,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"4182862c72867ba2","len":631},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"783d83496f544831","len":149},
         "png_bit_depth": [8,10],
@@ -3762,6 +3882,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"d4fff2863dec94de","len":650},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"90707d19681334b9","len":168},
         "png_bit_depth": [8,10],
@@ -3796,6 +3917,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"18f8b03a34cf606a","len":691},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"04c652432530804f","len":190},
         "png_bit_depth": [8,10],
@@ -3830,6 +3952,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"bfad9f25f916f09a","len":700},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"fc326273503b304d","len":215},
         "png_bit_depth": [8,12],
@@ -3864,6 +3987,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"2504257aeb3f95b3","len":700},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"bdd957de21a4bccd","len":248},
         "png_bit_depth": [8,12],
@@ -3898,6 +4022,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"d072f04cca748d11","len":714},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8dbee1baa27cb0aa","len":277},
         "png_bit_depth": [8,12],
@@ -3932,6 +4057,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"3d03adff3f2a6216","len":682},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"28e1c49a35a1b9ab","len":202},
         "png_bit_depth": [8,12],
@@ -3966,6 +4092,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"4b9656edc28fa2e4","len":96},
+        "jpeg": {"fnv1a64":"810be9affbb94565","len":423},
         "pgm": {"fnv1a64":"4255e5e18c877b38","len":108},
         "png": {"fnv1a64":"526d6b1358054bf4","len":281},
         "png_bit_depth": [16,null],
@@ -4000,6 +4127,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"3ba9ec6cf6553556","len":760},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"52716591ef9f8792","len":364},
         "png_bit_depth": [8,16],
@@ -4034,6 +4162,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"0d0967c55eb077e9","len":753},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"5d7ae3e4c9ce5734","len":364},
         "png_bit_depth": [8,16],
@@ -4068,6 +4197,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"e3c5ad981ce803aa","len":752},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"5a0b2ea76f0b01a0","len":364},
         "png_bit_depth": [8,16],
@@ -4102,6 +4232,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"5d3d854e81efe5bd","len":751},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"18051816bd91f531","len":364},
         "png_bit_depth": [8,16],
@@ -4136,6 +4267,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"26a6b957b5babe3d","len":96},
+        "jpeg": {"fnv1a64":"223abfd8d838098b","len":720},
         "pgm": {"fnv1a64":"23cf9d79509253f9","len":108},
         "png": {"fnv1a64":"664f130e85dfc7aa","len":281},
         "png_bit_depth": [16,null],
@@ -4170,6 +4302,7 @@
     {
       "conversions": {
         "gray8": {"fnv1a64":"f38785e911a586b5","len":96},
+        "jpeg": {"fnv1a64":"7924e56df190c2d6","len":725},
         "pgm": {"fnv1a64":"184781e998dcd8e1","len":108},
         "png": {"fnv1a64":"d8983d4bf83cc2cd","len":281},
         "png_bit_depth": [16,null],
@@ -4204,6 +4337,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"47323c2d95f5a260","len":754},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"2a7f4472c69e85ab","len":342},
         "png_bit_depth": [8,14],
@@ -4238,6 +4372,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"9a902da7d8568160","len":740},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"7c494942050dff21","len":344},
         "png_bit_depth": [8,14],
@@ -4272,6 +4407,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"ada86537082a072b","len":733},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"5e6aced1c4828a87","len":362},
         "png_bit_depth": [8,14],
@@ -4306,6 +4442,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"47dcfa36dd815305","len":739},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"e2ff4d59bd419232","len":342},
         "png_bit_depth": [8,14],
@@ -4340,6 +4477,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"2d83d83d4fcd3e1e","len":774},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"a96ddd9da9bd28a7","len":364},
         "png_bit_depth": [8,null],
@@ -4374,6 +4512,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"aeaa60fa44d75931","len":762},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"fac1b0148514e391","len":364},
         "png_bit_depth": [8,null],
@@ -4408,6 +4547,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"aa63518959b98632","len":766},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"35a27ba1fcd93541","len":364},
         "png_bit_depth": [8,null],
@@ -4442,6 +4582,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"76827d5e08282645","len":777},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"df6442f7c138ee9b","len":364},
         "png_bit_depth": [8,null],
@@ -4476,6 +4617,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"f780162ce83cec0b","len":775},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8a1a8f36c47bc4ff","len":364},
         "png_bit_depth": [8,null],
@@ -4510,6 +4652,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"f2d69d5af60f2955","len":777},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"99ffaaa5c99cf945","len":364},
         "png_bit_depth": [8,null],
@@ -4544,6 +4687,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"9d1d377af042369b","len":781},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"4dd1fdab3d953f61","len":364},
         "png_bit_depth": [8,null],
@@ -4578,6 +4722,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"c61a4dc930f6c54e","len":755},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"aed1215a5e19e689","len":364},
         "png_bit_depth": [8,null],
@@ -4612,6 +4757,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"71bd57c9c8def64f","len":761},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"c4c299b2593ec162","len":364},
         "png_bit_depth": [8,null],
@@ -4646,6 +4792,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a702363a13c15b86","len":779},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"0fd4798da437aff1","len":364},
         "png_bit_depth": [8,null],
@@ -4680,6 +4827,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"b138ed5f6dd9f0b3","len":786},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"4313d6252b941f7a","len":364},
         "png_bit_depth": [8,null],
@@ -4714,6 +4862,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"bfe641e51829c8f5","len":796},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"1bff88587f3a2174","len":364},
         "png_bit_depth": [8,null],
@@ -4748,6 +4897,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"b8a18a3adafd4e2c","len":779},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"989b8976d4150b52","len":364},
         "png_bit_depth": [8,null],
@@ -4782,6 +4932,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"120153865cec0e94","len":783},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"d869d2864cbaf95c","len":364},
         "png_bit_depth": [8,null],
@@ -4816,6 +4967,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a68a99a7d2248134","len":789},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"bfbc6625954ca70f","len":364},
         "png_bit_depth": [8,null],
@@ -4850,6 +5002,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"2b509bfc9121a1d8","len":769},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"d7b458b05b77e235","len":364},
         "png_bit_depth": [8,null],
@@ -4884,6 +5037,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a809786a8c9469d9","len":769},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"9838b049e64738e0","len":364},
         "png_bit_depth": [8,null],
@@ -4918,6 +5072,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"67613d6347a4b8ca","len":775},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"1cca696c2fa137be","len":364},
         "png_bit_depth": [8,null],
@@ -4952,6 +5107,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"5d5573ee3e941041","len":762},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"626374987174ce2b","len":364},
         "png_bit_depth": [8,null],
@@ -4986,6 +5142,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"09e3607de807ee74","len":766},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"9ff756c0d158bbe2","len":364},
         "png_bit_depth": [8,null],
@@ -5020,6 +5177,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"89c2fc70f9aeeb31","len":779},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"a1932fb962f9dc4b","len":364},
         "png_bit_depth": [8,null],
@@ -5054,6 +5212,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"dc819f989ec557a4","len":780},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"884ddbd69702be8f","len":364},
         "png_bit_depth": [8,null],
@@ -5088,6 +5247,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"0bef3fd43cc19309","len":770},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"393f4e1e63484a81","len":364},
         "png_bit_depth": [8,null],
@@ -5122,6 +5282,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"2110566aa08b7bd5","len":770},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"b44059c8c3120e5f","len":364},
         "png_bit_depth": [8,10],
@@ -5156,6 +5317,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"c8714791c553b2e6","len":758},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"a382c0fd096d66ee","len":364},
         "png_bit_depth": [8,10],
@@ -5190,6 +5352,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"23d49dc3c2c236fe","len":758},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"c10a6b70826b5a68","len":364},
         "png_bit_depth": [8,null],
@@ -5224,6 +5387,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"020c2772f767e9e3","len":764},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"24c0b660cf9001dd","len":364},
         "png_bit_depth": [8,null],
@@ -5258,6 +5422,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"8a6637710fd167f1","len":754},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"4e25dbf800bf99ea","len":364},
         "png_bit_depth": [8,10],
@@ -5292,6 +5457,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"7d27afc693db4641","len":759},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"4a7e4e0401d2f7e6","len":364},
         "png_bit_depth": [8,null],
@@ -5326,6 +5492,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"1b586f8aecf608d9","len":764},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"8c640f30b4f1bade","len":364},
         "png_bit_depth": [8,null],
@@ -5360,6 +5527,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"8a31d94a00f2a466","len":753},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"f44ce3da6ff1dc92","len":364},
         "png_bit_depth": [8,12],
@@ -5394,6 +5562,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"91cc3cddae2fba3d","len":768},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"6e0c7ccfb83834fe","len":364},
         "png_bit_depth": [8,12],
@@ -5428,6 +5597,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"45de222441b11ff2","len":759},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"7e429fee5401988e","len":364},
         "png_bit_depth": [8,10],
@@ -5462,6 +5632,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"ee596eb280c371ce","len":767},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"594975d5243618b4","len":364},
         "png_bit_depth": [8,10],
@@ -5496,6 +5667,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"608415ed82968543","len":700},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"7182736e8ebd8d1b","len":174},
         "png_bit_depth": [8,10],
@@ -5530,6 +5702,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"7e2e75a70cba817e","len":644},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"caae9460be5bfea8","len":171},
         "png_bit_depth": [8,10],
@@ -5564,6 +5737,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"60098a054d8d7f47","len":730},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"93754052ea2b4b9e","len":258},
         "png_bit_depth": [8,12],
@@ -5598,6 +5772,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"7a7b91f2179186ea","len":706},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"fb3610ecfa648f89","len":213},
         "png_bit_depth": [8,12],
@@ -5632,6 +5807,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"c368f3c9e7c94882","len":683},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"9adff78705d9adc7","len":178},
         "png_bit_depth": [8,10],
@@ -5666,6 +5842,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"6e2c06e250d2006e","len":729},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"fc19e19a9693e0ce","len":230},
         "png_bit_depth": [8,12],
@@ -5700,6 +5877,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"f85ed5f36d8af964","len":761},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"21e2d760918f03f8","len":364},
         "png_bit_depth": [8,16],
@@ -5734,6 +5912,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"ff23a8f3d96c0f38","len":762},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"1f01156e423e4a4d","len":364},
         "png_bit_depth": [8,16],
@@ -5768,6 +5947,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"822df768537707bf","len":759},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"efe73ec75cae6121","len":364},
         "png_bit_depth": [8,14],
@@ -5802,6 +5982,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"4e2207dd2fcbebd2","len":760},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"a5a7cb7d97c4018f","len":364},
         "png_bit_depth": [8,16],
@@ -5836,6 +6017,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"b033879ecfc5b94c","len":764},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"f8a1d562eefdf3b3","len":364},
         "png_bit_depth": [8,12],
@@ -5870,6 +6052,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a9c8e88e2280014a","len":754},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"d372766841a408b9","len":359},
         "png_bit_depth": [8,14],
@@ -5904,6 +6087,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"516d261c6452416f","len":754},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"2171a4024473adc8","len":364},
         "png_bit_depth": [8,12],
@@ -5938,6 +6122,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"bcf39b9dd12463af","len":645},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"e506c9bf92ab7533","len":161},
         "png_bit_depth": [8,10],
@@ -5972,6 +6157,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"a4f759f96bbb93dc","len":694},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"e47058313910306a","len":206},
         "png_bit_depth": [8,12],
@@ -6006,6 +6192,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"9cbc802e0515d32a","len":748},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"5be8109f34e9006e","len":356},
         "png_bit_depth": [8,14],
@@ -6040,6 +6227,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"2292cb8972427cb7","len":765},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"22e4790c0fa3fb38","len":364},
         "png_bit_depth": [8,16],
@@ -6074,6 +6262,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"c82dd1abbdf9402e","len":662},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"df7fc9709e27044e","len":164},
         "png_bit_depth": [8,10],
@@ -6108,6 +6297,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"08eb3b7f3238649f","len":731},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"c7c6d3496757f636","len":233},
         "png_bit_depth": [8,12],
@@ -6142,6 +6332,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"465940091a9d237c","len":752},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"ef9296b48255b79a","len":364},
         "png_bit_depth": [8,14],
@@ -6176,6 +6367,7 @@
     {
       "conversions": {
         "gray8": null,
+        "jpeg": {"fnv1a64":"7989cb3d406ed084","len":763},
         "pgm": {"error":"PGM requires a monochrome image; use PNG or PPM"},
         "png": {"fnv1a64":"9f5d5420a7584230","len":364},
         "png_bit_depth": [8,16],

@@ -257,6 +257,7 @@ fn frame_case(
             "ppm": outcome(frame::encode(&frame, "ppm")),
             "pgm": outcome(frame::encode(&frame, "pgm")),
             "png": outcome(frame::encode(&frame, "png")),
+            "jpeg": outcome(frame::encode(&frame, "jpeg")),
             "sample_bits": frame::sample_bits(format),
             "png_bit_depth": frame::bit_depth(format, "png"),
         },
@@ -859,6 +860,9 @@ fn same(expected: &Value, actual: &Value, path: &str) -> Result<(), String> {
 
 #[test]
 fn native_frame_outputs_match_the_golden_file() {
+    // libjpeg-turbo, not whichever hardware engine the host has.
+    // SAFETY: this binary's only test, before it starts any thread.
+    unsafe { std::env::set_var("CAPTUREFAB_JPEG", "cpu") };
     let value = golden();
     let mut text = String::new();
     render(&value, 0, &mut text);

@@ -95,8 +95,6 @@ pub mod testing {
     }
     pub mod jpeg {
         pub use crate::jpeg::{Raster, insert_com, software};
-        #[cfg(feature = "jpeg")]
-        pub use crate::jpeg::{encode, encode_planes};
     }
     pub mod session {
         pub use crate::session::{SessionCommand, SessionHandle};

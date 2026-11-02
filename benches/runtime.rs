@@ -478,14 +478,10 @@ fn main() {
             capturefab::testing::frame::encode_parts(&f, "jpeg", None, Some(&meta)).unwrap()
         });
         #[cfg(feature = "jpeg")]
-        b.run(
-            &format!("encode/jpeg-planes/{suffix}"),
-            f.data.len(),
-            || jpeg::encode_planes(&f, 90).unwrap(),
-        );
-        #[cfg(feature = "jpeg")]
+        // Through an RGB image, as converted color stills were compressed
+        // before they went to libjpeg-turbo as Y'CbCr planes.
         b.run(&format!("encode/jpeg-rgb/{suffix}"), f.data.len(), || {
-            jpeg::encode(&f, 90).unwrap()
+            jpeg::software(&jpeg::Raster::new(&f).unwrap()).unwrap()
         });
         // Apple's JPEG engine, where this Mac has one.
         #[cfg(all(feature = "videotoolbox", target_os = "macos"))]
