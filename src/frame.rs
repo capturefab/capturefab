@@ -89,6 +89,13 @@ pub fn pixel_format_name(format: u32) -> &'static str {
 pub fn row_bytes(width: u32, pixel_format: u32) -> usize {
     (u64::from(width) * u64::from((pixel_format >> 16) & 0xff)).div_ceil(8) as usize
 }
+/// Bytes in a `width` × `height` image: `row_bytes` for each row, or the
+/// planes of a planar Y'CbCr layout. None when it overflows.
+pub(crate) fn frame_len(pixel_format: u32, width: u32, height: u32) -> Option<usize> {
+    formats::planes_len(pixel_format, width, height)
+        .or_else(|| row_bytes(width, pixel_format).checked_mul(height as usize))
+}
+pub(crate) use formats::{Matrix, NV12_601, NV12_709, ycbcr_planes};
 /// How a packed format stores its samples.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Packing {
@@ -966,12 +973,15 @@ pub(crate) fn clipping_in(view: FrameRef<'_>) -> Result<Clipping> {
         RGB8 | 0x0218_0015 => (3, 8),
         _ => match wide {
             Some(bits) => (2, bits),
-            // Every other layout as its 8-bit conversion.
+            // Every other layout as its 8-bit conversion, a row at a time.
             None => {
-                let tally = Tally::rows(view, |tally, y| {
-                    for x in 0..width {
-                        let rgb = pixel_at(view, x, y - y0);
-                        tally.add(u32::from(rgb[0].max(rgb[1]).max(rgb[2])), 255);
+                let mut reader = RowReader::new(view);
+                let mut rgb = Vec::new();
+                let tally = Tally::rows(view, move |tally, y| {
+                    rgb.resize(3 * width, 0);
+                    reader.read(y - y0, Channels::Rgb, &mut rgb);
+                    for pixel in rgb.as_chunks::<3>().0 {
+                        tally.add(u32::from(pixel[0].max(pixel[1]).max(pixel[2])), 255);
                     }
                 });
                 return Ok(tally.finish(255, pixels));

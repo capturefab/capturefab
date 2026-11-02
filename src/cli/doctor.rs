@@ -42,6 +42,10 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
         "ffmpeg",
         "{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted",
     ),
+    (
+        "hwdec",
+        "{selected:auto|none|METHOD,methods:{METHOD:{built,works,reason?}}} — hardware decoding CAPTUREFAB_HWDEC selects, and each method of this platform: in this FFmpeg (built) and proved to decode here (works); only with FFmpeg",
+    ),
 ];
 pub const LICENSES_FIELDS: &[(&str, &str)] = &[
     ("capturefab", "string — Capturefab's MIT license"),

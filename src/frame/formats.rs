@@ -2,13 +2,24 @@
 //! EMVA Pixel Format Values (2025-10-07) and PFNC 2.4, sections 3, 6 and 8:
 //! https://www.emva.org/wp-content/uploads/GenICamPixelFormatValues.pdf
 //! https://www.emva.org/wp-content/uploads/GenICam_PFNC_2_4.pdf
+//!
+//! Video decoded by FFmpeg also arrives in planar and semiplanar Y'CbCr
+//! that PFNC has no code for (every planar layout, and limited-range
+//! semiplanar 4:2:0). Those carry Capturefab's own codes, with PFNC's
+//! custom bit (31) set and its color flag and bits per pixel, named in
+//! PFNC's style: `YCbCr` is full-range BT.601 (JFIF), `YCbCr601` and
+//! `YCbCr709` limited-range BT.601 and BT.709.
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Result, ensure};
 
-#[derive(Clone, Copy)]
-enum Matrix {
+/// A Y'CbCr layout's color space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Matrix {
+    /// Full-range BT.601, as JFIF and PFNC's YUV and YCbCr formats.
     Full,
+    /// Limited-range (video) BT.601.
     Bt601,
+    /// Limited-range (video) BT.709.
     Bt709,
 }
 
@@ -36,10 +47,32 @@ enum Layout {
         /// Explicit Cb-first order rather than the PFNC default order.
         cb_first: bool,
     },
+    /// A luma plane, then the chroma subsampled by `sub` (horizontal and
+    /// vertical divisors, 1 or 2): a Cb then a Cr plane, or one plane of
+    /// interleaved pairs (`interleaved`: whether Cb comes first).
+    Planes {
+        matrix: Matrix,
+        sub: (usize, usize),
+        interleaved: Option<bool>,
+    },
 }
 
+/// Capturefab's code for planar Y'CbCr subsampled `sub` in `matrix`'s
+/// color space, PFNC's custom bit set.
+const fn planar(sub: (usize, usize), matrix: Matrix) -> u32 {
+    let bits = match sub {
+        (2, 2) => 12,
+        (2, 1) => 16,
+        _ => 24,
+    };
+    0x8200_0000 | bits << 16 | (1 + matrix as u32)
+}
+/// Limited-range semiplanar 4:2:0 (NV12 order) in BT.601 and BT.709.
+pub(crate) const NV12_601: u32 = 0x820c_0011;
+pub(crate) const NV12_709: u32 = 0x820c_0012;
+
 fn layout(format: u32) -> Option<(&'static str, Layout)> {
-    use Layout::{Mono, Rgb, Rgb565, SignedMono, Yuv};
+    use Layout::{Mono, Planes, Rgb, Rgb565, SignedMono, Yuv};
     use Matrix::{Bt601, Bt709, Full};
     let rgb = |bits, bgr, planar| Rgb {
         bits,
@@ -70,6 +103,25 @@ fn layout(format: u32) -> Option<(&'static str, Layout)> {
         group,
         cb_first,
     };
+    let semi = |matrix, sub, cb_first| Planes {
+        matrix,
+        sub,
+        interleaved: Some(cb_first),
+    };
+    let planes = |matrix, sub| Planes {
+        matrix,
+        sub,
+        interleaved: None,
+    };
+    const P420: u32 = planar((2, 2), Matrix::Full);
+    const P420_601: u32 = planar((2, 2), Matrix::Bt601);
+    const P420_709: u32 = planar((2, 2), Matrix::Bt709);
+    const P422: u32 = planar((2, 1), Matrix::Full);
+    const P422_601: u32 = planar((2, 1), Matrix::Bt601);
+    const P422_709: u32 = planar((2, 1), Matrix::Bt709);
+    const P444: u32 = planar((1, 1), Matrix::Full);
+    const P444_601: u32 = planar((1, 1), Matrix::Bt601);
+    const P444_709: u32 = planar((1, 1), Matrix::Bt709);
     Some(match format {
         0x0108_0002 => ("Mono8s", SignedMono),
         0x0101_0037 => ("Mono1p", Mono { bits: 1 }),
@@ -122,12 +174,33 @@ fn layout(format: u32) -> Option<(&'static str, Layout)> {
         0x0210_0045 => ("YCbCr709_422_8_CbYCrY", yuv(Bt709, 2, true)),
         0x020c_005a => ("YCbCr411_8", yuv(Full, 4, false)),
         0x0218_005b => ("YCbCr8", yuv(Full, 1, false)),
+        0x020c_0112 => ("YCbCr420_8_YY_CbCr_Semiplanar", semi(Full, (2, 2), true)),
+        0x020c_0114 => ("YCbCr420_8_YY_CrCb_Semiplanar", semi(Full, (2, 2), false)),
+        0x0210_0113 => ("YCbCr422_8_YY_CbCr_Semiplanar", semi(Full, (2, 1), true)),
+        0x0210_0115 => ("YCbCr422_8_YY_CrCb_Semiplanar", semi(Full, (2, 1), false)),
+        NV12_601 => (
+            "YCbCr601_420_8_YY_CbCr_Semiplanar",
+            semi(Bt601, (2, 2), true),
+        ),
+        NV12_709 => (
+            "YCbCr709_420_8_YY_CbCr_Semiplanar",
+            semi(Bt709, (2, 2), true),
+        ),
+        P420 => ("YCbCr420_8_Planar", planes(Full, (2, 2))),
+        P420_601 => ("YCbCr601_420_8_Planar", planes(Bt601, (2, 2))),
+        P420_709 => ("YCbCr709_420_8_Planar", planes(Bt709, (2, 2))),
+        P422 => ("YCbCr422_8_Planar", planes(Full, (2, 1))),
+        P422_601 => ("YCbCr601_422_8_Planar", planes(Bt601, (2, 1))),
+        P422_709 => ("YCbCr709_422_8_Planar", planes(Bt709, (2, 1))),
+        P444 => ("YCbCr444_8_Planar", planes(Full, (1, 1))),
+        P444_601 => ("YCbCr601_444_8_Planar", planes(Bt601, (1, 1))),
+        P444_709 => ("YCbCr709_444_8_Planar", planes(Bt709, (1, 1))),
         _ => return None,
     })
 }
 
 /// Every code `layout` knows, for looking a layout up by its name.
-const CODES: [u32; 51] = [
+const CODES: [u32; 66] = [
     0x0108_0002,
     0x0101_0037,
     0x0102_0038,
@@ -179,7 +252,50 @@ const CODES: [u32; 51] = [
     0x0210_0045,
     0x020c_005a,
     0x0218_005b,
+    0x020c_0112,
+    0x020c_0114,
+    0x0210_0113,
+    0x0210_0115,
+    NV12_601,
+    NV12_709,
+    planar((2, 2), Matrix::Full),
+    planar((2, 2), Matrix::Bt601),
+    planar((2, 2), Matrix::Bt709),
+    planar((2, 1), Matrix::Full),
+    planar((2, 1), Matrix::Bt601),
+    planar((2, 1), Matrix::Bt709),
+    planar((1, 1), Matrix::Full),
+    planar((1, 1), Matrix::Bt601),
+    planar((1, 1), Matrix::Bt709),
 ];
+
+/// The code of planar or semiplanar 8-bit Y'CbCr subsampled `sub` in
+/// `matrix`'s color space, chroma interleaved Cb first (NV12) or in planes:
+/// FFmpeg's decoded layouts. None for limited-range 4:2:2 and 4:4:4 semiplanar,
+/// which nothing produces.
+pub(crate) fn ycbcr_planes(sub: (usize, usize), matrix: Matrix, interleaved: bool) -> Option<u32> {
+    Some(match (interleaved, sub, matrix) {
+        (false, _, _) => planar(sub, matrix),
+        (true, (2, 2), Matrix::Full) => 0x020c_0112,
+        (true, (2, 2), Matrix::Bt601) => NV12_601,
+        (true, (2, 2), Matrix::Bt709) => NV12_709,
+        (true, (2, 1), Matrix::Full) => 0x0210_0113,
+        _ => return None,
+    })
+}
+
+/// The bytes of a `width` × `height` image in a planar layout, None for
+/// layouts whose rows are all alike (`row_bytes` times the rows).
+pub(super) fn planes_len(format: u32, width: u32, height: u32) -> Option<usize> {
+    let (_, Layout::Planes { sub, .. }) = layout(format)? else {
+        return None;
+    };
+    let (width, height) = (width as usize, height as usize);
+    let chroma = width.div_ceil(sub.0).checked_mul(height.div_ceil(sub.1))?;
+    width
+        .checked_mul(height)?
+        .checked_add(chroma.checked_mul(2)?)
+}
 
 pub(super) fn name(format: u32) -> Option<&'static str> {
     layout(format).map(|(name, _)| name)
@@ -191,7 +307,7 @@ pub(super) fn name(format: u32) -> Option<&'static str> {
 pub(super) fn sample_bits(format: u32) -> Option<u32> {
     Some(match layout(format)?.1 {
         Layout::Mono { bits } | Layout::Rgb { bits, .. } => bits,
-        Layout::SignedMono | Layout::Yuv { .. } => 8,
+        Layout::SignedMono | Layout::Yuv { .. } | Layout::Planes { .. } => 8,
         Layout::Rgb565 { .. } => 6,
     })
 }
@@ -234,8 +350,10 @@ pub(super) fn validate(frame: &Frame) -> Option<Result<()>> {
                 "{name} requires a width divisible by 4"
             );
         }
-        let length = super::row_bytes(frame.width, frame.pixel_format)
-            .checked_mul(frame.height as usize)
+        let length = planes_len(frame.pixel_format, frame.width, frame.height)
+            .or_else(|| {
+                super::row_bytes(frame.width, frame.pixel_format).checked_mul(frame.height as usize)
+            })
             .ok_or_else(|| anyhow::anyhow!("image size overflow"))?;
         ensure!(frame.data.len() >= length, "truncated {name} frame");
         Ok(())
@@ -368,20 +486,93 @@ fn decode(frame: &Frame, layout: Layout, x: usize, y: usize) -> [u8; 3] {
                     )
                 }
             };
-            match matrix {
-                Matrix::Full => super::ycbcr(luma, cb, cr),
-                Matrix::Bt601 | Matrix::Bt709 => {
-                    let y = (i32::from(luma) - 16) * 76_309;
-                    let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
-                    let [r, gu, gv, b] = match matrix {
-                        Matrix::Bt601 => [104_597, -25_675, -53_279, 132_201],
-                        _ => [117_489, -13_975, -34_925, 138_438],
-                    };
-                    [y + r * cr, y + gu * cb + gv * cr, y + b * cb]
-                        .map(|v| ((v + 32_768) >> 16).clamp(0, 255) as u8)
-                }
+            to_rgb(matrix, luma, cb, cr)
+        }
+        Layout::Planes {
+            matrix,
+            sub,
+            interleaved,
+        } => {
+            let (cb, cr) = chroma_at(frame, sub, interleaved, x, y);
+            to_rgb(matrix, data[i], cb, cr)
+        }
+    }
+}
+
+/// A Y'CbCr sample as R'G'B'.
+fn to_rgb(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> [u8; 3] {
+    match matrix {
+        Matrix::Full => super::ycbcr(luma, cb, cr),
+        Matrix::Bt601 | Matrix::Bt709 => {
+            let y = (i32::from(luma) - 16) * 76_309;
+            let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
+            let [r, gu, gv, b] = match matrix {
+                Matrix::Bt601 => [104_597, -25_675, -53_279, 132_201],
+                _ => [117_489, -13_975, -34_925, 138_438],
+            };
+            [y + r * cr, y + gu * cb + gv * cr, y + b * cb]
+                .map(|v| ((v + 32_768) >> 16).clamp(0, 255) as u8)
+        }
+    }
+}
+
+/// The Cb and Cr a planar layout keeps for pixel (x, y), whose chroma
+/// sample covers its `sub` block.
+fn chroma_at(
+    frame: &Frame,
+    sub: (usize, usize),
+    interleaved: Option<bool>,
+    x: usize,
+    y: usize,
+) -> (u8, u8) {
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let (columns, rows) = (width.div_ceil(sub.0), height.div_ceil(sub.1));
+    let (cx, cy) = (x / sub.0, y / sub.1);
+    let chroma = &frame.data[width * height..];
+    match interleaved {
+        None => (
+            chroma[cy * columns + cx],
+            chroma[columns * rows + cy * columns + cx],
+        ),
+        Some(cb_first) => {
+            let pair = &chroma[(cy * columns + cx) * 2..];
+            if cb_first {
+                (pair[0], pair[1])
+            } else {
+                (pair[1], pair[0])
             }
         }
+    }
+}
+
+/// Row `y` of a Y'CbCr layout from column `x0`, decoded into `out` as
+/// `pixel_at` decodes each pixel, without looking the layout up for every
+/// one; false for other layouts.
+pub(super) fn decode_row(frame: &Frame, x0: usize, y: usize, out: &mut [[u8; 3]]) -> bool {
+    let Some((_, layout)) = layout(frame.pixel_format) else {
+        return false;
+    };
+    match layout {
+        Layout::Planes {
+            matrix,
+            sub,
+            interleaved,
+        } => {
+            let width = frame.width as usize;
+            let luma = &frame.data[y * width + x0..][..out.len()];
+            for (i, (rgb, &luma)) in out.iter_mut().zip(luma).enumerate() {
+                let (cb, cr) = chroma_at(frame, sub, interleaved, x0 + i, y);
+                *rgb = to_rgb(matrix, luma, cb, cr);
+            }
+            true
+        }
+        Layout::Yuv { .. } => {
+            for (i, rgb) in out.iter_mut().enumerate() {
+                *rgb = decode(frame, layout, x0 + i, y);
+            }
+            true
+        }
+        _ => false,
     }
 }
 
@@ -739,17 +930,19 @@ mod tests {
         use crate::{camera_profile::CameraKind, inspect::PreviewFormat};
         let mut exercised = 0;
         // Cover every identifier in each byte-size family declared above,
-        // including the newer alignment codes beyond the first 256 IDs.
+        // including the newer alignment codes beyond the first 256 IDs, and
+        // Capturefab's own planar codes.
         for format in [
             0x0101, 0x0102, 0x0104, 0x0108, 0x020c, 0x0210, 0x0218, 0x021e, 0x0220, 0x0224, 0x0228,
             0x0230, 0x0240,
         ]
         .into_iter()
         .flat_map(|size| (0..=0x12e).map(move |id| size << 16 | id))
+        .chain(CODES.into_iter().filter(|code| code >> 31 == 1))
         .filter(|&format| name(format).is_some())
         {
             exercised += 1;
-            let length = conversion::row_bytes(12, format) * 8;
+            let length = conversion::frame_len(format, 12, 8).unwrap();
             let data = (0..length + 3)
                 .map(|i| (i as u8).wrapping_mul(71).wrapping_add(29))
                 .collect();
@@ -833,7 +1026,8 @@ mod tests {
             );
         }
         assert_eq!(
-            exercised, 51,
+            exercised,
+            CODES.len(),
             "all declared additional layouts are exercised"
         );
     }

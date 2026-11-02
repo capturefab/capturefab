@@ -81,6 +81,7 @@ fn kind(pixel_format: u32) -> Kind {
 /// Reads a view's rows in order (any order works; in order is cheapest)
 /// with one row of scratch, plus three 8-bit rows for a wide or packed
 /// Bayer mosaic. The frame must have passed `validate_source`.
+#[derive(Clone)]
 pub(crate) struct RowReader<'a> {
     view: FrameRef<'a>,
     kind: Kind,
@@ -187,7 +188,11 @@ impl<'a> RowReader<'a> {
                 let view = self.view;
                 match channels {
                     Channels::Rgb => {
-                        for (x, rgb) in out.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                        let out = out.as_chunks_mut::<3>().0;
+                        if super::formats::decode_row(view.frame, x0, view.y0 + y, out) {
+                            return;
+                        }
+                        for (x, rgb) in out.iter_mut().enumerate() {
                             *rgb = pixel_at(view, x, y);
                         }
                     }
@@ -627,13 +632,20 @@ pub(crate) mod tests {
         ]
         .into_iter()
         .flat_map(|prefix| (0..=0x12e).map(move |id| prefix << 16 | id))
+        // Capturefab's own planar and semiplanar Y'CbCr codes.
+        .chain(
+            [0x820c, 0x8210, 0x8218]
+                .into_iter()
+                .flat_map(|prefix| [1, 2, 3, 0x11, 0x12].map(move |id| prefix << 16 | id)),
+        )
         .filter(|&format| crate::frame::convertible(format))
         .collect()
     }
 
     pub(crate) fn noise_frame(format: u32, width: u32, height: u32) -> Frame {
         let mut seed = format ^ 0x2545_f491 ^ width;
-        let data: Vec<u8> = (0..row_bytes(width, format) * height as usize)
+        let len = crate::frame::frame_len(format, width, height).unwrap();
+        let data: Vec<u8> = (0..len)
             .map(|_| {
                 seed ^= seed << 13;
                 seed ^= seed >> 17;

@@ -360,6 +360,7 @@ pub fn report(warm_sessions: bool) -> Value {
             }
             Err(error) => json!({ "error": error }),
         };
+        report["hwdec"] = crate::media::hwdec::report();
     }
     report
 }

@@ -6180,9 +6180,14 @@ mod tests {
             crate::dirs::ensure_private_dir(&session).unwrap();
             // Two launches that end after half a second, then a steady one.
             let ffmpeg = dir.join("ffmpeg");
+            // Raw video as FFmpeg describes it, else PPM.
             let script = r#"case "$*" in *rtsp*) ;; *) exit 0 ;; esac
 n=$(($(cat "$dir/launches" 2>/dev/null || echo 0) + 1)); echo $n > "$dir/launches"
-frame() { printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; }
+case "$*" in
+*rawvideo*) printf "[info] Output #0, rawvideo, to 'pipe:1':\n[info]   Stream #0:0: Video: rawvideo, rgb24, 2x2\n" >&2
+    frame() { head -c 12 /dev/zero; } ;;
+*) frame() { printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; } ;;
+esac
 case $n in
 1|2) for i in 1 2 3 4 5 6 7 8 9 10; do frame; sleep 0.05; done ;;
 *) while frame; do sleep 0.05; done ;;

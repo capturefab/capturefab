@@ -102,6 +102,7 @@ pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
         0x0218_0015 => (PixelFormat::BGR, 3),
         MONO8 => (PixelFormat::GRAY, 1),
         other if monochrome(other) => return software_quality(&Raster::new(frame)?, quality),
+        JFIF_420 => return compress_jfif(frame, quality),
         _ => return encode_planes(frame, quality),
     };
     let size = crate::frame::checked_pixels(frame)? * channels;
@@ -121,6 +122,62 @@ pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
 #[cfg(not(feature = "jpeg"))]
 pub fn encode(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     software_quality(&Raster::new(frame)?, quality)
+}
+
+/// Planar full-range BT.601 Y'CbCr 4:2:0, as MJPEG and full-range video
+/// decode to: the very planes a JPEG stores.
+#[cfg(feature = "jpeg")]
+const JFIF_420: u32 = 0x820c_0001;
+
+/// A frame of JFIF Y'CbCr 4:2:0 planes compressed from its own buffer; one
+/// of odd size goes through `encode_planes`, which pads its luma.
+#[cfg(feature = "jpeg")]
+fn compress_jfif(frame: &Frame, quality: i32) -> Result<Body<'static>> {
+    crate::frame::validate_source(frame)?;
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
+        return encode_planes(frame, quality);
+    }
+    let (luma, chroma) = frame.data.split_at(width * height);
+    let (cb, cr) = chroma.split_at(width * height / 4);
+    compress_yuv(
+        luma,
+        cb,
+        &cr[..width * height / 4],
+        width,
+        height,
+        width,
+        quality,
+    )
+}
+
+/// libjpeg-turbo compressing Y'CbCr 4:2:0 planes, luma `luma_stride` wide.
+#[cfg(feature = "jpeg")]
+fn compress_yuv(
+    luma: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    luma_stride: usize,
+    quality: i32,
+) -> Result<Body<'static>> {
+    anyhow::ensure!((1..=100).contains(&quality), "JPEG quality must be 1..100");
+    let mut compressor = turbojpeg::Compressor::new()?;
+    compressor.set_quality(quality)?;
+    let jpeg = compressor.compress_yuv_planes_to_owned(&turbojpeg::YuvPlanesImage {
+        y_plane: luma,
+        u_plane: cb,
+        v_plane: cr,
+        width,
+        height,
+        y_stride: luma_stride,
+        u_stride: luma_stride / 2,
+        v_stride: luma_stride / 2,
+        subsamp: turbojpeg::Subsamp::Sub2x2,
+    })?;
+    crate::copies::record(crate::copies::Site::JpegEncode, jpeg.len());
+    Ok(Body::Jpeg(Jpeg(jpeg)))
 }
 
 /// A color frame as JFIF Y'CbCr 4:2:0 planes written straight from its rows
@@ -169,21 +226,7 @@ fn encode_planes(frame: &Frame, quality: i32) -> Result<Body<'static>> {
     crate::copies::record(crate::copies::Site::StillTransform, planes.len());
     let (luma, chroma) = planes.split_at(luma_len);
     let (cb, cr) = chroma.split_at(chroma_len);
-    let mut compressor = turbojpeg::Compressor::new()?;
-    compressor.set_quality(quality)?;
-    let jpeg = compressor.compress_yuv_planes_to_owned(&turbojpeg::YuvPlanesImage {
-        y_plane: luma,
-        u_plane: cb,
-        v_plane: cr,
-        width,
-        height,
-        y_stride: luma_width,
-        u_stride: chroma_width,
-        v_stride: chroma_width,
-        subsamp: turbojpeg::Subsamp::Sub2x2,
-    })?;
-    crate::copies::record(crate::copies::Site::JpegEncode, jpeg.len());
-    Ok(Body::Jpeg(Jpeg(jpeg)))
+    compress_yuv(luma, cb, cr, width, height, luma_width, quality)
 }
 
 pub fn software(raster: &Raster) -> Result<Body<'static>> {
@@ -486,6 +529,39 @@ mod tests {
                 "{format:08x} {width}x{height}: {ours:.2} dB against {theirs:.2} dB"
             );
             assert_eq!(encode(&frame, QUALITY).unwrap(), planes, "{format:08x}");
+        }
+    }
+
+    /// Full-range planar 4:2:0, as MJPEG decodes, is compressed from the
+    /// frame's own planes; odd sizes go through padded planes.
+    #[cfg(feature = "jpeg")]
+    #[test]
+    fn jfif_planes_compress_as_they_are() {
+        for (width, height) in [(64u32, 48u32), (63, 47)] {
+            let (w, h) = (width as usize, height as usize);
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let mut data: Vec<u8> = (0..w * h).map(|i| (i % w * 255 / w) as u8).collect();
+            data.extend((0..cw * ch).map(|i| (100 + i % cw) as u8));
+            data.extend((0..cw * ch).map(|i| (150 - i / cw) as u8));
+            let frame = Frame {
+                width,
+                height,
+                pixel_format: JFIF_420,
+                data: data.into(),
+                ..Frame::default()
+            };
+            let jpeg = encode(&frame, QUALITY).unwrap();
+            assert!(well_formed(&jpeg, width, height), "{width}x{height}");
+            let decoded = turbojpeg::decompress(&jpeg, turbojpeg::PixelFormat::RGB).unwrap();
+            let source = crate::frame::rgb(&frame).unwrap();
+            let mean = decoded
+                .pixels
+                .iter()
+                .zip(&source)
+                .map(|(&a, &b)| f64::from(a.abs_diff(b)))
+                .sum::<f64>()
+                / source.len() as f64;
+            assert!(mean < 1.5, "{width}x{height}: mean difference {mean:.2}");
         }
     }
 }
