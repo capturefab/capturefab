@@ -123,8 +123,6 @@ pub enum SessionCommand {
         strict: bool,
     },
     Auto {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        balance: Option<f64>,
         /// Keep adjusting as a job of the session, until stopped.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         continuous: bool,
@@ -138,34 +136,19 @@ pub enum SessionCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         job: Option<u64>,
     },
-    Manual {
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        revert: bool,
-    },
+    /// Leave Capturefab's auto mode, the camera keeping the values it set.
+    Manual,
+    /// One frame, encoded to the client's stdout: by a worker of the
+    /// client's own to its stdout, else through the private `stdout` file.
+    /// Files are saved by `schedule`, one frame or more.
     Capture {
-        output: String,
-        count: u32,
         timeout_ms: u64,
         format: String,
-        /// What to do when an output name without {seq} exists; fail by default.
-        #[serde(default, skip_serializing_if = "crate::naming::OnExists::is_fail")]
-        on_exists: crate::naming::OnExists,
-        /// Whether each file reaches the disk before it is reported.
-        #[serde(default, skip_serializing_if = "crate::storage::SyncMode::is_file")]
-        sync: crate::storage::SyncMode,
-        /// The client's own `CAPTUREFAB_MIN_FREE`, in bytes, when it set
-        /// one: the files leave that much free on their disk as well as the
-        /// worker's own floor.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        min_free: Option<u64>,
         /// Tags such as line, station, part, lot and note.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         context: crate::context::Context,
-        /// The caller's UTC offset in seconds, for {date} and {time}.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        utc_offset_s: Option<i32>,
         /// JPEG quality 1..100. Unset, a Motion JPEG source's own JPEG is
-        /// stored as it is, and other frames are encoded at 90.
+        /// sent as it is, and other frames are encoded at 90.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quality: Option<u8>,
         /// Frames to let pass after the first frame exposed after the
@@ -177,9 +160,9 @@ pub enum SessionCommand {
         /// come, unset waits up to 2 s.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         warmup_ms: Option<u64>,
-        /// With output `-` through a session: the private file, in the
-        /// runtime folder's `out`, the image goes to for the client to
-        /// stream to its stdout and delete.
+        /// Through a session: the private file, in the runtime folder's
+        /// `out`, the image goes to for the client to stream to its stdout
+        /// and delete.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stdout: Option<String>,
     },
@@ -357,7 +340,15 @@ pub fn deserialize_command<'de, D: serde::Deserializer<'de>>(
         && fields.get("op").and_then(Value::as_str).is_some_and(|op| {
             matches!(
                 op,
-                "disconnect" | "start" | "stop" | "jobs" | "status" | "xml" | "read_setup" | "info"
+                "disconnect"
+                    | "start"
+                    | "stop"
+                    | "jobs"
+                    | "status"
+                    | "xml"
+                    | "read_setup"
+                    | "info"
+                    | "manual"
             )
         })
         && let Some(field) = fields.keys().find(|key| key.as_str() != "op")
@@ -556,15 +547,10 @@ impl SessionCommand {
                 }
             }
             Self::Auto {
-                balance,
                 region,
                 max_exposure_us,
                 ..
             } => {
-                ensure!(
-                    balance.is_none_or(|balance| balance.is_finite() && (0.0..=1.0).contains(&balance)),
-                    "auto balance must be a finite number from 0 (quality) to 1 (frame rate)"
-                );
                 ensure!(
                     max_exposure_us.is_none_or(|us| us.is_finite() && us > 0.0),
                     "the longest exposure must be a positive time"
@@ -572,18 +558,34 @@ impl SessionCommand {
                 crate::inspect::validate(0, 1, 0, *region)?;
             }
             Self::Capture {
-                output,
-                count,
                 timeout_ms,
                 format,
-                on_exists,
                 context,
-                utc_offset_s,
+                quality,
                 fresh,
                 warmup_ms,
-                ..
+                stdout,
+            } => {
+                validate_frame_wait(*timeout_ms)?;
+                validate_warmup(*warmup_ms)?;
+                ensure!(
+                    *fresh <= crate::inspect::MAX_FRESH,
+                    "fresh frames must be 0..10"
+                );
+                ensure!(
+                    ["png", "jpeg", "raw", "pgm", "ppm"].contains(&format.as_str()),
+                    "format must be png, jpeg, raw, pgm or ppm"
+                );
+                crate::context::validate(context)?;
+                ensure!(
+                    quality.is_none_or(|quality| (1..=100).contains(&quality)),
+                    "JPEG quality must be 1..100"
+                );
+                if let Some(file) = stdout {
+                    stdout_file(file)?;
+                }
             }
-            | Self::Schedule {
+            Self::Schedule {
                 output,
                 count,
                 timeout_ms,
@@ -609,30 +611,10 @@ impl SessionCommand {
                 );
                 crate::engine::validate_capture_output(output)?;
                 crate::naming::validate_request(output, *count, *on_exists, context)?;
-                if matches!(self, Self::Schedule { .. }) {
-                    ensure!(
-                        output != "-",
-                        "scheduled capture requires a file or directory"
-                    );
-                } else {
-                    ensure!(*count == 1, "{}", crate::engine::ONE_FRAME);
-                }
-                if let Self::Capture {
-                    quality, stdout, ..
-                } = self
-                {
-                    ensure!(
-                        quality.is_none_or(|quality| (1..=100).contains(&quality)),
-                        "JPEG quality must be 1..100"
-                    );
-                    ensure!(
-                        stdout.is_none() || output == "-",
-                        "a stdout file is for output -"
-                    );
-                    if let Some(file) = stdout {
-                        stdout_file(file)?;
-                    }
-                }
+                ensure!(
+                    output != "-",
+                    "scheduled capture requires a file or directory"
+                );
                 if let Self::Schedule {
                     first_at_ms,
                     interval_ms,
@@ -725,13 +707,12 @@ impl SessionCommand {
 pub fn default_request_timeout(command: &SessionCommand) -> Duration {
     Duration::from_millis(match command {
         SessionCommand::Capture {
-            count,
             timeout_ms,
             warmup_ms,
             fresh,
             ..
         } => frame_wait_ms(*timeout_ms)
-            .saturating_mul(u64::from(*count + *fresh))
+            .saturating_mul(u64::from(1 + *fresh))
             .saturating_add(warmup_ms.unwrap_or(DEFAULT_WARMUP_MS))
             .saturating_add(60_000),
         // Waiting for the camera's turn, or starting a stopped camera and
@@ -2119,6 +2100,11 @@ impl SessionHandle {
                 );
                 let worker = self.worker_of(&held)?;
                 let result = match cancel {
+                    // The client left while the request waited for the
+                    // camera's turn: it is not started.
+                    Some(cancel) if cancel.cancelled.load(Ordering::Acquire) => Err(
+                        Categorized::error(ErrorKind::Interrupted, "cancelled before it started"),
+                    ),
                     Some(cancel) => {
                         let (id, reply) = worker.submit(command.into())?;
                         cancel.running(&worker, id);
@@ -3018,16 +3004,14 @@ mod tests {
             default_request_timeout(&SessionCommand::from_json_slice(json.as_bytes()).unwrap())
         };
         // Every frame may wait its full timeout, after a warm-up of 2 s,
-        // plus a minute to save.
+        // plus a minute to send.
         assert_eq!(
-            timeout(
-                r#"{"op":"capture","output":"a.png","count":5,"timeout_ms":10000,"format":"png"}"#
-            ),
-            Duration::from_secs(112)
+            timeout(r#"{"op":"capture","timeout_ms":10000,"format":"png"}"#),
+            Duration::from_secs(72)
         );
         assert_eq!(
             timeout(
-                r#"{"op":"capture","output":"a.png","count":1,"timeout_ms":60000,"format":"png","warmup_ms":0,"fresh":2}"#
+                r#"{"op":"capture","timeout_ms":60000,"format":"png","warmup_ms":0,"fresh":2}"#
             ),
             Duration::from_secs(240)
         );
@@ -3057,8 +3041,7 @@ mod tests {
     }
     #[test]
     fn plant_floor_command_defaults_and_unit_ops_are_strict() {
-        let capture =
-            r#"{"op":"capture","output":"a.png","count":1,"timeout_ms":100,"format":"png"}"#;
+        let capture = r#"{"op":"schedule","output":"a.png","count":1,"timeout_ms":100,"format":"png","first_at_ms":0,"interval_ms":0}"#;
         let command = SessionCommand::from_json_slice(capture.as_bytes()).unwrap();
         assert_eq!(
             serde_json::to_value(&command).unwrap()["on_exists"],
@@ -3070,7 +3053,7 @@ mod tests {
                 .find("context")
                 .is_none()
         );
-        for op in ["jobs", "read_setup"] {
+        for op in ["jobs", "read_setup", "manual"] {
             let extra = format!(r#"{{"op":"{op}","x":1}}"#);
             assert!(
                 SessionCommand::from_json_slice(extra.as_bytes()).is_err(),
@@ -3218,7 +3201,7 @@ mod tests {
         for (command, field) in [
             (r#"{"op":"status","op":"start"}"#, "op"),
             (
-                r#"{"op":"capture","output":"frame.png","count":1,"timeout_ms":1000,"format":"png","context":{"line":"1","line":"2"}}"#,
+                r#"{"op":"capture","timeout_ms":1000,"format":"png","context":{"line":"1","line":"2"}}"#,
                 "line",
             ),
         ] {
@@ -3276,9 +3259,8 @@ mod tests {
                 .validate()
         };
         let capture = |fresh: u32| {
-            let json = format!(
-                r#"{{"op":"capture","output":"a.png","count":1,"timeout_ms":0,"format":"png","fresh":{fresh}}}"#
-            );
+            let json =
+                format!(r#"{{"op":"capture","timeout_ms":0,"format":"png","fresh":{fresh}}}"#);
             SessionCommand::from_json_slice(json.as_bytes())
                 .unwrap()
                 .validate()
@@ -3326,17 +3308,15 @@ mod tests {
             },
             SessionCommand::connect("sim:0".into(), 0),
             SessionCommand::Auto {
-                balance: Some(f64::NAN),
                 continuous: false,
                 job: None,
-                max_exposure_us: None,
+                max_exposure_us: Some(f64::NAN),
                 region: None,
             },
             SessionCommand::Auto {
-                balance: Some(1.01),
                 continuous: false,
                 job: None,
-                max_exposure_us: None,
+                max_exposure_us: Some(0.0),
                 region: None,
             },
             SessionCommand::ReadMemory {

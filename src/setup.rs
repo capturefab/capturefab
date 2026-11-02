@@ -211,10 +211,13 @@ pub struct SetupValue {
 }
 
 /// Capturefab's software auto exposure, which a restore turns on.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SavedAuto {
-    pub balance: f64,
+    /// What presets saved before the balance was fixed carry: read and
+    /// ignored.
+    #[serde(default, rename = "balance", skip_serializing)]
+    _balance: Option<serde::de::IgnoredAny>,
 }
 
 /// A value the setup left out, and why.
@@ -610,12 +613,6 @@ pub fn validate(setup: &Setup) -> Result<()> {
     }
     if let Some(serial) = &setup.camera.serial {
         validate_text("camera identity", serial)?;
-    }
-    if let Some(auto) = &setup.auto {
-        ensure!(
-            auto.balance.is_finite() && (0.0..=1.0).contains(&auto.balance),
-            "auto balance must be a finite number from 0 to 1"
-        );
     }
     let mut seen = BTreeSet::new();
     for value in &setup.values {
@@ -1408,6 +1405,21 @@ mod tests {
             json["values"][0]["value"] = bad;
             assert!(parse(&serde_json::to_vec(&json).unwrap()).is_err());
         }
+        // Auto mode, saved on: a preset saved with a balance still reads,
+        // and is written without it.
+        for saved in [serde_json::json!({}), serde_json::json!({"balance": 0.25})] {
+            let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            json["auto"] = saved;
+            let read = parse(&serde_json::to_vec(&json).unwrap()).unwrap();
+            assert!(read.auto.is_some());
+            assert_eq!(
+                serde_json::to_value(&read).unwrap()["auto"],
+                serde_json::json!({})
+            );
+        }
+        let mut json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        json["auto"] = serde_json::json!({"mode": 1});
+        assert!(parse(&serde_json::to_vec(&json).unwrap()).is_err());
     }
 
     #[test]

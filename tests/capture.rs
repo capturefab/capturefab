@@ -23,6 +23,56 @@ fn without_timing(mut value: Value) -> Value {
     value
 }
 
+/// {date} and {time} are when each frame was taken, not when it was asked
+/// for: a triggered camera's frame comes a trigger interval later.
+#[cfg(unix)]
+#[test]
+fn time_names_are_the_frames_time() {
+    let home = Home::new("frame-time-names");
+    let run = home.run_env(
+        &[("TZ", "UTC")],
+        &[
+            "--json",
+            "capture",
+            "-c",
+            "sim:4?line0=every:700ms",
+            "--set",
+            "TriggerMode=On",
+            "--set",
+            "TriggerSource=Line0",
+            "--timeout",
+            "10s",
+            "-n",
+            "2",
+            "-o",
+            "t/{date}/{time}.png",
+            "--manifest",
+            "m.jsonl",
+        ],
+    );
+    assert_eq!(run.success()["count"], 2);
+    let manifest = std::fs::read_to_string(home.path("m.jsonl")).unwrap();
+    assert_eq!(manifest.lines().count(), 2, "{manifest}");
+    for line in manifest.lines() {
+        let line: Value = serde_json::from_str(line).unwrap();
+        // 2026-11-02T06:05:30.867Z: the frame's time.
+        let time = line["time"].as_str().unwrap();
+        let stamp = format!(
+            "{}-{}",
+            time[..10].replace('-', ""),
+            time[11..23].replace(':', "")
+        );
+        let file = Path::new(line["file"].as_str().unwrap());
+        assert_eq!(
+            file.file_name().unwrap().to_str().unwrap(),
+            format!("{stamp}.png"),
+            "{line}"
+        );
+        let folder = file.parent().unwrap().file_name().unwrap();
+        assert_eq!(folder.to_str().unwrap(), &time[..10], "{line}");
+    }
+}
+
 #[test]
 fn direct_and_session_results_are_the_same_apart_from_timing() {
     let home = Home::new("same-results");
@@ -762,6 +812,32 @@ fn a_manifest_lists_each_saved_file_with_its_hash() {
     assert_eq!(folder["code"], "usage");
     let stdout = home.run(&["capture", "-c", "sim:0", "-o", "-", "--manifest", "x.jsonl"]);
     assert_eq!(stdout.code, Some(2), "{}", stdout.stderr);
+    // A manifest is never an image: not one saved before, and not the one
+    // this capture saves, which stays free.
+    home.ok(&["capture", "-c", "sim:0", "-o", "a.png"]);
+    let image = std::fs::read(home.path("a.png")).unwrap();
+    for (output, manifest) in [
+        ("b.png", "a.png"),
+        ("c.png", "c.png"),
+        ("d.raw", "d.raw.json"),
+    ] {
+        let refused = home.fails(
+            2,
+            &[
+                "capture",
+                "-c",
+                "sim:0",
+                "-o",
+                output,
+                "--manifest",
+                manifest,
+            ],
+        );
+        assert_eq!(refused["code"], "usage", "{refused}");
+        assert!(!home.path(output).exists(), "{output}");
+    }
+    assert_eq!(std::fs::read(home.path("a.png")).unwrap(), image);
+    assert!(!home.path("c.png").exists() && !home.path("d.raw.json").exists());
 }
 
 /// A capture that would leave less than the free-space floor is refused,
@@ -1258,6 +1334,49 @@ fn several_background_jobs_are_listed_and_waited_for_together() {
     }
     // One ID keeps its own shape.
     assert_eq!(home.ok(&["jobs", "wait", ids[0]])["job"]["id"], ids[0]);
+}
+
+/// A raw still of decoded video says where each plane starts and how its
+/// rows are laid out: a 4:2:0 frame's chroma rows are half its luma rows.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn raw_stills_of_planar_video_describe_each_plane() {
+    let home = Home::new("capture-planar-raw");
+    let made = std::process::Command::new(support::cli::ffmpeg())
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=64x48:rate=10",
+        ])
+        .args(["-t", "1", "-c:v", "ffv1", "-pix_fmt", "yuv420p"])
+        .arg(home.path("clip.mkv"))
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    home.ok(&["capture", "-c", "clip.mkv", "-o", "still.raw"]);
+    let sidecar: Value =
+        serde_json::from_slice(&std::fs::read(home.path("still.raw.json")).unwrap()).unwrap();
+    let format = sidecar["pixel_format"].as_str().unwrap();
+    assert!(format.ends_with("_420_8_Planar"), "{sidecar}");
+    assert!(sidecar.get("row_bytes").is_none(), "{sidecar}");
+    assert_eq!(
+        sidecar["planes"],
+        json!([
+            {"offset": 0, "row_bytes": 64, "rows": 48},
+            {"offset": 3072, "row_bytes": 32, "rows": 24},
+            {"offset": 3840, "row_bytes": 32, "rows": 24},
+        ]),
+        "{sidecar}"
+    );
+    assert_eq!(sidecar["bytes"], 4608);
+    assert_eq!(std::fs::read(home.path("still.raw")).unwrap().len(), 4608);
 }
 
 /// A JPEG still of a Motion JPEG source is the JPEG it sent, as it was,

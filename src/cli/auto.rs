@@ -138,7 +138,6 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
     }
     let streaming = client.status()?["streaming"] == true;
     client.call(SessionCommand::Auto {
-        balance: None,
         continuous: false,
         region: limits.region,
         max_exposure_us: limits.max_exposure_us,
@@ -166,7 +165,7 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
         }
     })();
     // Hold what auto mode reached, also when it was cut short.
-    let held = client.call(SessionCommand::Manual { revert: false });
+    let held = client.call(SessionCommand::Manual);
     if started {
         let camera = client.status()?;
         let busy = camera["forwarding"].is_string()
@@ -188,7 +187,7 @@ pub(super) fn settle(client: &Client, timeout: Duration, limits: &Limits) -> Res
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|change| !matches!(change["feature"].as_str(), Some("auto" | "balance")))
+            .filter(|change| change["feature"] != "auto")
             .count(),
         "mean": auto["brightness"].as_f64().map(|mean| (mean * 10_000.0).round() / 10_000.0),
     });
@@ -371,7 +370,7 @@ fn settle_once(
 
 /// Turn auto exposure, gain and white balance off, keeping their values.
 fn off(client: &Client) -> Result<Value> {
-    client.call(SessionCommand::Manual { revert: false })?;
+    client.call(SessionCommand::Manual)?;
     let info = client.call(SessionCommand::Info)?;
     Ok(crate::types::without_nulls(json!({
         "camera": info["camera"],
@@ -412,7 +411,6 @@ fn continuous(client: &Client) -> Result<Value> {
     } else if client.session().is_some() {
         // A job of the session, which streams the camera until stopped.
         let reply = client.call(SessionCommand::Auto {
-            balance: None,
             continuous: true,
             region: None,
             max_exposure_us: None,

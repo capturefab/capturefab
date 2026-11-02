@@ -121,7 +121,7 @@ become 8-bit PNG or JPEG, and `source_bits` then says how many bits the frame ha
 `-f jpg` without `--quality` stores the JPEG it sent as it was (`"passthrough": true`), with the
 provenance comment and, when it lacks them, the standard Huffman tables. `.raw` gives the frame's
 exact bytes with a `NAME.json` sidecar (`pixel_format`, `pfnc_code`, `width`, `height`,
-`row_bytes`). Every common PFNC pixel format converts; see the
+`row_bytes`, or for a planar layout `planes`, each with its `offset`, `row_bytes` and `rows`). Every common PFNC pixel format converts; see the
 [pixel format table](guides/camera-compatibility.md#pixel-formats). Webcams, streams and files
 arrive as FFmpeg decodes them (gray, YUV such as `YCbCr709_420_8_Planar`, or RGB8 for RGB
 sources), so their `.raw` bytes are in that format. JPEGs may come from Apple's JPEG engine on
@@ -225,7 +225,8 @@ capturefab record --json -c sim:0 -o rtsp://localhost:8554/cam --background
 ```
 
 The result has `output`, `bytes`, `frames`, `dropped`, `fps_actual`, `codec`, `encoder`, `ended`
-(`duration`, `signal`, `max_size` or `stopped`) and `finalized`. `--max-size 2G` ends the file
+(`duration`, `signal`, `max_size`, `stopped`, or `source_ended` when a video file being recorded
+came to its end) and `finalized`. `--max-size 2G` ends the file
 successfully before that size, leaving FFmpeg room to finish it; a limit too small for that cuts the
 file at the size, with `finalized: false`, no `frames` and a warning. `hevc` and `av1` need a
 hardware encoder unless the source is copied, and fail with exit 5 before recording otherwise;

@@ -321,6 +321,8 @@ enum Ended {
     Stopped,
     /// It failed, after recording what its error's details show.
     Failed,
+    /// Its source, a video file, came to its end.
+    Source,
 }
 impl Ended {
     fn name(self) -> &'static str {
@@ -330,6 +332,7 @@ impl Ended {
             Self::MaxSize => "max_size",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
+            Self::Source => "source_ended",
         }
     }
 }
@@ -448,6 +451,7 @@ impl Recording<'_> {
                     _ if job["state"] == "failed" => return Err(self.failure(&job, &detail)),
                     Some("duration") => Ended::Duration,
                     Some("max_size") => Ended::MaxSize,
+                    Some("source_ended") => Ended::Source,
                     _ if signal => Ended::Signal,
                     _ => Ended::Stopped,
                 };
@@ -650,7 +654,7 @@ pub const FIELDS: &[(&str, &str)] = &[
     ),
     (
         "ended",
-        "duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it",
+        "duration|signal|max_size|stopped|source_ended — signal is a normal end without --for; stopped: jobs stop or session stop ended it; source_ended: the video file being recorded came to its end",
     ),
     (
         "finalized",

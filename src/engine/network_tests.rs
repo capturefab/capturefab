@@ -308,7 +308,7 @@ fn idle_camera_is_tuned_without_starting_acquisition() {
 
 #[test]
 fn pending_and_running_capture_jobs_prevent_network_writes() {
-    for status in ["pending", "running"] {
+    for status in [CaptureStatus::Pending, CaptureStatus::Running] {
         let mut harness = Harness::new(Transport::GigE, true);
         let output = "network-scan-protected.png";
         harness.jobs.push(Scheduled {
@@ -329,7 +329,7 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
             baseline: None,
             info: crate::scheduling::CaptureJob {
                 id: 1,
-                status: status.into(),
+                status,
                 output: output.into(),
                 count: 1,
                 captured: 0,
@@ -359,7 +359,10 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
         });
         let error = harness.optimize().unwrap_err();
         assert!(error.to_string().contains("scheduled captures"));
-        assert!(harness.backend.lock().unwrap().calls.is_empty(), "{status}");
+        assert!(
+            harness.backend.lock().unwrap().calls.is_empty(),
+            "{status:?}"
+        );
         assert!(harness.camera.as_ref().unwrap().is_streaming());
         assert_eq!(harness.jobs[0].info.status, status);
     }

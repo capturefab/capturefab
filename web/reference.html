@@ -322,7 +322,7 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <tr><td><code>dropped</code></td><td>int — frames the encoder could not take, and frames the transport lost</td></tr>
 <tr><td><code>duration_s</code></td><td>float</td></tr>
 <tr><td><code>encoder</code></td><td>string — the FFmpeg encoder used; copy: an H.264 or HEVC source recorded as it arrived, without re-encoding</td></tr>
-<tr><td><code>ended</code></td><td>duration|signal|max_size|stopped — signal is a normal end without --for; stopped: jobs stop or session stop ended it</td></tr>
+<tr><td><code>ended</code></td><td>duration|signal|max_size|stopped|source_ended — signal is a normal end without --for; stopped: jobs stop or session stop ended it; source_ended: the video file being recorded came to its end</td></tr>
 <tr><td><code>finalized</code></td><td>bool — the file was closed and is complete; false when it was cut at --max-size before FFmpeg could finish it (with a warning), or its worker died</td></tr>
 <tr><td><code>fps</code></td><td>float — the frame rate written: --fps, or the camera&#x27;s</td></tr>
 <tr><td><code>fps_actual</code></td><td>float — frames per second, as frames counts them</td></tr>
@@ -467,7 +467,7 @@ capturefab preset apply --file bench.json -c sim:0 --strict
 capturefab preset apply bench -c gige:00c0df123456 --persist UserSet1</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab preset apply examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab preset apply JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
 <tr><td><code>applied</code></td><td>int — values written</td></tr>
-<tr><td><code>auto_change</code></td><td>{current,saved,action,risk} — Capturefab auto mode</td></tr>
+<tr><td><code>auto_change</code></td><td>{current:bool,saved:bool,action:enter|release|none,risk} — Capturefab auto mode now and in the preset</td></tr>
 <tr><td><code>auto_changed</code></td><td>bool</td></tr>
 <tr><td><code>camera</code></td><td>{id,vendor,model,serial} — the camera compared</td></tr>
 <tr><td><code>changes</code></td><td>[{feature,at?,saved,current,risk:reversible|disruptive,stream_locked,warning?}] — disruptive changes may change triggering, I/O lines or acquisition rate</td></tr>
@@ -494,7 +494,7 @@ capturefab preset apply bench -c gige:00c0df123456 --persist UserSet1</code></pr
 <div class="code-wrap"><pre><code>capturefab preset export bench -o bench.json
 capturefab preset export bench &gt; bench.json</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab preset export examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab preset export JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>auto</code></td><td>{balance} — without -o</td></tr>
+<tr><td><code>auto</code></td><td>{} — without -o: Capturefab auto mode, when saved on</td></tr>
 <tr><td><code>camera</code></td><td>{transport,vendor,model,serial?,kind} — without -o</td></tr>
 <tr><td><code>name</code></td><td>string — without -o</td></tr>
 <tr><td><code>note</code></td><td>string — without -o</td></tr>
@@ -564,7 +564,7 @@ capturefab preset save line1 -c gige:00c0df123456 --note &#x27;ring light 60%&#x
 <div class="code-wrap"><pre><code>capturefab preset show bench
 capturefab --json preset show bench</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab preset show examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab preset show JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>auto</code></td><td>{balance} — Capturefab auto mode, when saved on</td></tr>
+<tr><td><code>auto</code></td><td>{} — Capturefab auto mode, when saved on</td></tr>
 <tr><td><code>camera</code></td><td>{transport,vendor,model,serial?,kind}</td></tr>
 <tr><td><code>name</code></td><td>string</td></tr>
 <tr><td><code>note</code></td><td>string</td></tr>

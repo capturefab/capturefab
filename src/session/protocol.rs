@@ -69,7 +69,7 @@ impl WorkerCommand {
                     | SessionCommand::Exec { .. }
                     | SessionCommand::WriteMemory { .. }
                     | SessionCommand::Auto { .. }
-                    | SessionCommand::Manual { .. }
+                    | SessionCommand::Manual
             ),
             _ => false,
         }

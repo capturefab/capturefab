@@ -452,8 +452,8 @@ fn show_text(value: &Value) -> String {
     if let Some(note) = value["note"].as_str() {
         out.push_str(&format!("Note: {note}\n"));
     }
-    if let Some(balance) = value["auto"]["balance"].as_f64() {
-        out.push_str(&format!("Auto exposure on, balance {balance}\n"));
+    if value["auto"].is_object() {
+        out.push_str("Auto exposure on\n");
     }
     for row in value["values"].as_array().into_iter().flatten() {
         out.push_str(&format!(
@@ -528,7 +528,7 @@ pub const APPLY_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "auto_change",
-        "{current,saved,action,risk} — Capturefab auto mode",
+        "{current:bool,saved:bool,action:enter|release|none,risk} — Capturefab auto mode now and in the preset",
     ),
     ("warnings", "[string]"),
     ("dry_run", "true — with --dry-run: nothing was written"),
@@ -633,17 +633,8 @@ fn strict_refusal(diff: &Value) -> Option<anyhow::Error> {
 
 /// Software auto exposure's change in a diff, as people read it.
 fn auto_row(auto: &Value) -> Option<String> {
-    let balance = |value: &Value| value.as_f64().map_or("?".into(), |b| format!("{b:.2}"));
     match auto["action"].as_str()? {
-        "enter" => Some(format!(
-            "Auto exposure: off → on (balance {})",
-            balance(&auto["saved"])
-        )),
-        "balance" => Some(format!(
-            "Auto exposure balance: {} → {}",
-            balance(&auto["current"]),
-            balance(&auto["saved"])
-        )),
+        "enter" => Some("Auto exposure: off → on".into()),
         "release" => Some("Auto exposure: on → off (manual)".into()),
         _ => None,
     }
@@ -886,7 +877,7 @@ mod tests {
         );
         let diff = json!({
             "setup":"bench","camera":{"id":"sim:0"},"changes":[],"unchanged":3,
-            "auto_change":{"current":null,"saved":0.25,"action":"enter","risk":"reversible"},
+            "auto_change":{"current":false,"saved":true,"action":"enter","risk":"reversible"},
         });
         let mut out = Vec::new();
         write_diff(&mut out, &diff, "Would change").unwrap();
@@ -896,8 +887,8 @@ mod tests {
             "{text}"
         );
         assert_eq!(
-            auto_row(&json!({"action":"balance","current":0.5,"saved":0.75})).as_deref(),
-            Some("Auto exposure balance: 0.50 → 0.75")
+            auto_row(&json!({"action":"release","current":true,"saved":false})).as_deref(),
+            Some("Auto exposure: on → off (manual)")
         );
         assert_eq!(
             renamed(json!({"setup":"x","a":1})),

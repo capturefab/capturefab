@@ -26,10 +26,6 @@ fn text(value: &Value) -> String {
     }
 }
 
-fn auto_policy(auto: &Option<AutoController>) -> Option<f64> {
-    auto.as_ref().map(|controller| controller.status().balance)
-}
-
 fn evolving(auto: &Option<AutoController>, feature: &str) -> bool {
     auto.as_ref()
         .is_some_and(|controller| controller.manages(feature))
@@ -388,7 +384,7 @@ pub(super) fn process(
         command.session(),
         Some(
             SessionCommand::Auto { .. }
-                | SessionCommand::Manual { .. }
+                | SessionCommand::Manual
                 | SessionCommand::ApplySetup { .. }
         )
     );
@@ -528,7 +524,7 @@ pub(super) fn process(
             }
         }
     }
-    let switch_auto = auto_policy(&before.auto) != auto_policy(auto);
+    let switch_auto = before.auto.is_some() != auto.is_some();
     let rollback = restore(camera_mut(camera)?, auto, &before, &fields, switch_auto);
     let restarted = restart.then(|| camera_mut(camera).and_then(Camera::start));
     publish(h, camera, auto);
@@ -590,7 +586,6 @@ mod tests {
     fn failed_managed_write_does_not_leave_auto_disabled() {
         let h = connected();
         h.request(SessionCommand::Auto {
-            balance: Some(0.3),
             continuous: false,
             job: None,
             max_exposure_us: None,
@@ -599,7 +594,7 @@ mod tests {
         .unwrap();
         let exposure = get(&h, "ExposureTime");
         assert!(h.set_value("ExposureTime", "0").is_err());
-        assert_eq!(h.snapshot().auto.unwrap().balance, 0.3);
+        assert!(h.snapshot().auto.is_some());
         assert_eq!(get(&h, "ExposureTime"), exposure);
         h.shutdown();
     }

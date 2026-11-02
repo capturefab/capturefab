@@ -127,8 +127,8 @@ not), Bayer at 8 to 16 bits with its packed variants, RGB/BGR at 8 to 16 bits (i
 planar, packed, 565 and alpha-padded) and YUV/YCbCr 4:4:4, 4:2:2 and 4:1:1. PNG keeps monochrome
 samples wider than 8 bits as 16-bit gray; color and Bayer PNG and JPEG are 8-bit, and the result
 says so (`bit_depth`, `source_bits`). `-f raw` saves the frame's exact bytes with a `NAME.json`
-sidecar naming the pixel format, its PFNC code and the row size. Clipping counts and auto
-exposure metering use the frame's own bit depth.
+sidecar naming the pixel format, its PFNC code and the row size (each plane's for planar
+layouts). Clipping counts and auto exposure metering use the frame's own bit depth.
 
 Webcams, streams and files arrive in the format FFmpeg decodes them to: gray, YUV 4:2:0, 4:2:2
 or 4:4:4 (planar, NV12 or YUYV/UYVY) with its color range and matrix, or RGB for RGB sources, so

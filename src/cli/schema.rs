@@ -84,7 +84,7 @@ const PRESET_DOCUMENT: &[(&str, &str)] = &[
     ("saved_at", "string — RFC 3339"),
     ("note", "string"),
     ("camera", "{transport,vendor,model,serial?,kind}"),
-    ("auto", "{balance} — Capturefab auto mode, when saved on"),
+    ("auto", "{} — Capturefab auto mode, when saved on"),
     ("values", "[{feature,value,at?:[{selector,value}]}]"),
     ("skipped", "[{feature,at?,reason}]"),
 ];
@@ -157,7 +157,10 @@ fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
                 "camera",
                 "{transport,vendor,model,serial?,kind} — without -o",
             ),
-            ("auto", "{balance} — without -o"),
+            (
+                "auto",
+                "{} — without -o: Capturefab auto mode, when saved on",
+            ),
             (
                 "values",
                 "[{feature,value,at?:[{selector,value}]}] — without -o",

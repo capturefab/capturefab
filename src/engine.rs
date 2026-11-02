@@ -6,6 +6,7 @@ use crate::{
     auto::AutoController,
     camera::Camera,
     media::{ForwardConfig, Forwarder, StreamEnd},
+    scheduling::CaptureStatus,
     session::protocol::{JobStatus, Output, WorkerCommand},
     types::Frame,
 };
@@ -78,8 +79,9 @@ impl Queue {
         Ok(())
     }
     /// The next request, waiting up to `wait` for one; None when the wait
-    /// ended or the camera thread was woken.
-    fn take(&self, wait: Duration) -> Option<Envelope> {
+    /// ended or the camera thread was woken. `taken` sees it before the
+    /// queue lets go of it.
+    fn take(&self, wait: Duration, taken: impl FnOnce(&Envelope)) -> Option<Envelope> {
         let mut waiting = self.lock();
         if waiting.requests.is_empty() && !waiting.woken && !wait.is_zero() {
             waiting = self
@@ -89,7 +91,9 @@ impl Queue {
                 .0;
         }
         waiting.woken = false;
-        waiting.requests.pop_front()
+        let envelope = waiting.requests.pop_front()?;
+        taken(&envelope);
+        Some(envelope)
     }
     /// Take request `id` back while it still waits.
     fn remove(&self, id: u64) -> Option<Envelope> {
@@ -387,6 +391,17 @@ impl WorkerHandle {
                 )
             })
     }
+    /// The camera thread's next request, waiting up to `wait` for one. It
+    /// is published as running before the queue lets go of it, so a cancel
+    /// finds it queued or running, never between the two.
+    fn next_request(&self, wait: Duration) -> Option<Envelope> {
+        self.queue.take(wait, |envelope| {
+            *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running {
+                id: envelope.id,
+                cancel: Arc::default(),
+            });
+        })
+    }
     /// Cancel request `id`: a queued one is answered `interrupted` at once,
     /// a running one stops at its next frame wait. Others are ignored.
     pub(crate) fn cancel(&self, id: u64) {
@@ -596,9 +611,6 @@ fn forget_lost(h: &WorkerHandle) {
         s.last_error = None;
     }
 }
-/// Why a capture command takes one frame.
-pub(crate) const ONE_FRAME: &str =
-    "capture takes one frame; schedule takes more, saved by the encoders as they come";
 /// How often a frame of a software trigger is asked for again when the
 /// transport lost it or no frame came, before the wait for it fails.
 const TRIGGER_RETRIES: u32 = 5;
@@ -853,6 +865,8 @@ enum Ended {
     Failed,
     /// The worker shut down.
     Interrupted,
+    /// Its source, a video file, came to its end.
+    Source,
 }
 impl Ended {
     fn name(self) -> &'static str {
@@ -862,13 +876,14 @@ impl Ended {
             Self::Stopped => "stopped",
             Self::Failed => "failed",
             Self::Interrupted => "interrupted",
+            Self::Source => "source_ended",
         }
     }
     fn status(self) -> JobStatus {
         match self {
             Self::Failed => JobStatus::Failed,
             Self::Interrupted => JobStatus::Interrupted,
-            Self::Duration | Self::MaxSize | Self::Stopped => JobStatus::Done,
+            Self::Duration | Self::MaxSize | Self::Stopped | Self::Source => JobStatus::Done,
         }
     }
 }
@@ -1262,12 +1277,17 @@ fn save_sidecar(
     min_free: Option<u64>,
 ) -> Result<()> {
     let sidecar = crate::naming::sidecar(path);
+    // A planar layout's rows are its planes', which say where each starts.
+    let planes = crate::frame::planes(frame.pixel_format, frame.width, frame.height);
     let document = crate::types::without_nulls(json!({
         "pixel_format": crate::inspect::pixel_format_label(frame.pixel_format),
         "pfnc_code": frame.pixel_format,
         "width": frame.width,
         "height": frame.height,
-        "row_bytes": crate::frame::row_bytes(frame.width, frame.pixel_format),
+        "row_bytes": planes
+            .is_none()
+            .then(|| crate::frame::row_bytes(frame.width, frame.pixel_format)),
+        "planes": planes,
         "bytes": frame.data.len(),
         "frame_id": (frame.id > 0).then_some(frame.id),
         "device_ts_ns": frame.device_ts_ns,
@@ -1309,42 +1329,32 @@ fn image_file(
     }
 }
 
-/// Enter auto mode, or change its balance: the `auto` command, which a
-/// restored setup with an auto policy also runs.
+/// Enter auto mode, unless it runs: the `auto` command, which a restored
+/// setup with auto mode also runs.
 fn enter_auto(
     h: &WorkerHandle,
     camera: &mut Option<Camera>,
     auto: &mut Option<AutoController>,
     forwarder: &Option<(Forwarder, f64)>,
     jobs: &[Scheduled],
-    balance: Option<f64>,
     job: Option<u64>,
 ) -> Result<Value> {
     let c = camera_mut(camera)?;
-    let explicit = match auto.as_mut() {
-        Some(controller) => {
-            if let Some(balance) = balance {
-                controller.set_balance(c, balance)?;
-            }
-            balance.is_some()
-        }
-        None => {
-            let balance = balance.unwrap_or(crate::auto::DEFAULT_BALANCE);
-            let mut controller = AutoController::enter(c, balance)?;
-            controller.set_forward_fps(forwarder.as_ref().map(|(_, fps)| *fps))?;
-            *auto = Some(controller);
-            true
-        }
-    };
+    let entered = auto.is_none();
+    if entered {
+        let mut controller = AutoController::enter(c)?;
+        controller.set_forward_fps(forwarder.as_ref().map(|(_, fps)| *fps))?;
+        *auto = Some(controller);
+    }
     let controller = auto.as_mut().context("auto controller")?;
-    if explicit && forwarder.is_none() && !jobs.iter().any(|j| j.info.active()) {
+    if entered && forwarder.is_none() && !jobs.iter().any(|j| j.info.active()) {
         controller.choose_video_mode(c);
     }
     controller.tick(c, Instant::now());
     let status = controller.status().clone();
     refresh(h, camera);
     publish_auto(h, controller);
-    h.log("info", format!("Auto mode, balance {:.2}", status.balance));
+    h.log("info", "Auto mode".into());
     if let Some(job) = job {
         // A new continuous run replaces the one before.
         end_auto_job(h, JobStatus::Done);
@@ -1733,7 +1743,7 @@ fn process_plain(
             Ok(json!({"connected":h.snapshot().connected}))
         }
         SessionCommand::Disconnect => {
-            cancel_jobs(jobs, "cancelled");
+            cancel_jobs(jobs, CaptureStatus::Cancelled);
             sync_jobs(h, jobs);
             *scheduled_stream = JobStream::default();
             let auto_result = release_auto(h, auto, camera, true);
@@ -1897,6 +1907,9 @@ fn process_plain(
                 "capture schedule queue is full (32 active jobs)"
             );
             crate::scheduling::validate_schedule(first_at_ms, interval_ms, count)?;
+            if let Some(manifest) = &manifest {
+                check_manifest(&output, count, &format, Path::new(manifest))?;
+            }
             let manifest = manifest
                 .map(|path| crate::engine::saved::Manifest::open(Path::new(&path)).map(Arc::new))
                 .transpose()?;
@@ -1925,7 +1938,7 @@ fn process_plain(
             };
             let info = crate::scheduling::CaptureJob {
                 id,
-                status: "pending".into(),
+                status: CaptureStatus::Pending,
                 output: output.clone(),
                 count,
                 captured: 0,
@@ -1985,23 +1998,21 @@ fn process_plain(
             Ok(json!({"job":info}))
         }
         SessionCommand::Auto {
-            balance,
             job,
             region,
             max_exposure_us,
             ..
         } => {
-            let entered = enter_auto(h, camera, auto, forwarder, jobs, balance, job)?;
+            let entered = enter_auto(h, camera, auto, forwarder, jobs, job)?;
             if let (Some(controller), Some(c)) = (auto.as_mut(), camera.as_mut()) {
                 controller.set_limits(c, region, max_exposure_us)?;
             }
             Ok(entered)
         }
-        SessionCommand::Manual { revert } => {
+        SessionCommand::Manual => {
             let c = camera_mut(camera)?;
             let released = match auto.take() {
-                Some(controller) => controller.release(c, revert),
-                None if revert => Ok(()),
+                Some(controller) => controller.release(c, false),
                 None => crate::auto::hold(c),
             };
             h.state.write().unwrap_or_else(|e| e.into_inner()).auto = None;
@@ -2056,7 +2067,7 @@ fn process_plain(
             Ok(value)
         }
         SessionCommand::Stop => {
-            cancel_jobs(jobs, "cancelled");
+            cancel_jobs(jobs, CaptureStatus::Cancelled);
             sync_jobs(h, jobs);
             *scheduled_stream = JobStream::default();
             let forward_result = stop_forward(h, forwarder, auto, Ended::Stopped);
@@ -2068,28 +2079,17 @@ fn process_plain(
             Ok(json!({"streaming":false}))
         }
         SessionCommand::Capture {
-            output,
-            count,
             timeout_ms,
             format,
-            on_exists,
-            sync,
-            min_free,
             context,
-            utc_offset_s,
             quality,
             fresh,
             warmup_ms,
             stdout,
         } => {
-            // One frame, encoded here: a burst is a job of the acquisition
-            // loop, whose encoders never hold up the camera.
-            validate_capture(&output, count, timeout_ms, &format)?;
-            ensure!(count == 1, "{ONE_FRAME}");
-            if output != "-" {
-                preflight_capture_output(&output, 1, &format, on_exists)?;
-            }
-            ensure!(!output.is_empty(), "provide an output path");
+            // One frame to stdout, encoded here; files are saved by jobs of
+            // the acquisition loop, whose encoders never hold up the camera.
+            validate_capture("-", 1, timeout_ms, &format)?;
             let c = camera_mut(camera)?;
             let duration = frame_wait(c, timeout_ms);
             let was_streaming = c.is_streaming();
@@ -2097,9 +2097,8 @@ fn process_plain(
             // publishes.
             let baseline = Baseline::with(h, c.stats());
             c.start()?;
-            let mut folders = crate::storage::Folders::default();
             let mut unanswered = 0;
-            let mut result = (|| -> Result<Value> {
+            let result = (|| -> Result<Value> {
                 let mut after_change = false;
                 let warmup = if was_streaming {
                     None
@@ -2115,27 +2114,6 @@ fn process_plain(
                         "Auto exposure had not settled; capturing anyway".into(),
                     );
                 }
-                let label = crate::naming::camera_name(&c.info);
-                let plan = crate::naming::Plan::new(&output, 1, &format);
-                // Pick the name before requesting the frame: a feeder
-                // consumes paper irreversibly, so a taken name in fail mode
-                // is refused first.
-                let input = crate::naming::NameInput {
-                    camera: &label,
-                    now: crate::naming::clock(utc_offset_s),
-                    index: 0,
-                    context: &context,
-                };
-                let first = if output == "-" {
-                    None
-                } else {
-                    let path = h
-                        .names
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .candidate(&plan, &input, on_exists)?;
-                    Some(path)
-                };
                 // Frames exposed before the last settings change, and the
                 // first `fresh` after it, are let pass.
                 let mut skip = fresh;
@@ -2154,7 +2132,6 @@ fn process_plain(
                     }
                 };
                 let status = auto.as_ref().map(|a| a.status().clone());
-                let wall_ms = frame.wall_ms;
                 let settings = acquisition(c);
                 let mut metadata = serde_json::to_value(&frame)?;
                 metadata["pixel_format_name"] =
@@ -2163,51 +2140,13 @@ fn process_plain(
                 if !settings.settings.is_empty() {
                     metadata["settings"] = Value::Object(settings.settings.clone());
                 }
-                let mut files = Vec::new();
-                if output == "-" {
-                    let image = crate::frame::encode_parts(&frame, &format, quality, None)?;
-                    h.write_stdout(stdout.as_deref(), &image)?;
-                    metadata["file_bytes"] = json!(image.len());
-                    if image.passthrough() {
-                        metadata["passthrough"] = json!(true);
-                    }
+                let image = crate::frame::encode_parts(&frame, &format, quality, None)?;
+                h.write_stdout(stdout.as_deref(), &image)?;
+                metadata["file_bytes"] = json!(image.len());
+                if image.passthrough() {
+                    metadata["passthrough"] = json!(true);
                 }
-                if let Some(first) = first {
-                    let meta = still_meta(&frame, wall_ms, &settings, &context);
-                    let bytes = crate::frame::encode_parts(&frame, &format, quality, Some(&meta))?;
-                    let (path, stored) = crate::naming::save_named(
-                        &h.names,
-                        &plan,
-                        &input,
-                        on_exists,
-                        first.clone(),
-                        |path| {
-                            crate::storage::save_parts(&bytes.parts(), path, sync, min_free, false)
-                        },
-                    )
-                    .with_context(|| format!("save {}", first.display()))?;
-                    if format == "raw" {
-                        save_sidecar(&path, &frame, wall_ms, &settings, sync, min_free)?;
-                    }
-                    folders.add(&path);
-                    let file = path.to_string_lossy().into_owned();
-                    let saved = image_file(
-                        &path,
-                        &stored,
-                        &frame,
-                        bytes.passthrough(),
-                        wall_ms,
-                        &context,
-                    );
-                    h.push_saved(None, saved);
-                    metadata["file"] = json!(file);
-                    metadata["file_bytes"] = json!(bytes.len());
-                    if bytes.passthrough() {
-                        metadata["passthrough"] = json!(true);
-                    }
-                    files.push(file);
-                }
-                let mut value = json!({"files":files,"frame":metadata,"count":1});
+                let mut value = json!({"frame":metadata,"count":1});
                 if !context.is_empty() {
                     value["context"] = json!(context);
                 }
@@ -2241,13 +2180,6 @@ fn process_plain(
                 Ok(())
             };
             refresh(h, camera);
-            // The file's name reaches the disk before the reply.
-            if sync.is_file()
-                && let Err(error) = folders.sync()
-                && result.is_ok()
-            {
-                result = Err(error);
-            }
             let mut value =
                 result.map_err(|error| crate::types::with_details(error, counted.clone()))?;
             if let (Some(value), Value::Object(counted)) = (value.as_object_mut(), counted) {
@@ -2423,9 +2355,17 @@ impl Scheduled {
         info.incomplete = incomplete;
         info.resent = resent;
     }
-    /// Pick the next frame's name, a free one, with the frame's number.
-    fn allocate(&self, names: &Mutex<crate::naming::Namer>) -> Result<Picked> {
-        let now = crate::naming::clock(self.utc_offset_s);
+    /// Pick the next frame's name, a free one, with the frame's number:
+    /// its {date} and {time} those of the frame taken at `wall_ms`, or now.
+    fn allocate(
+        &self,
+        names: &Mutex<crate::naming::Namer>,
+        wall_ms: Option<u64>,
+    ) -> Result<Picked> {
+        let now = match wall_ms {
+            Some(wall_ms) => crate::naming::frame_time(wall_ms, self.utc_offset_s),
+            None => crate::naming::clock(self.utc_offset_s),
+        };
         let index = self.index();
         let path = names.lock().unwrap_or_else(|e| e.into_inner()).candidate(
             &self.plan,
@@ -2699,7 +2639,7 @@ fn validate_schedule_outputs(
 }
 /// End every active job as `status`: cancelled by a command, interrupted
 /// by shutdown.
-fn cancel_jobs(jobs: &mut [Scheduled], status: &str) {
+fn cancel_jobs(jobs: &mut [Scheduled], status: CaptureStatus) {
     for j in jobs.iter_mut().filter(|j| j.info.active()) {
         j.info.end(status, None);
         j.deadline = None;
@@ -2755,12 +2695,7 @@ fn sync_jobs(h: &WorkerHandle, jobs: &mut [Scheduled]) {
                 h.log("warn", format!("Capture job {}: {error:#}", job.info.id));
             }
         }
-        let status = match job.info.status.as_str() {
-            "complete" => JobStatus::Done,
-            "cancelled" => JobStatus::Cancelled,
-            "interrupted" => JobStatus::Interrupted,
-            _ => JobStatus::Failed,
-        };
+        let status = job.info.status.ended().unwrap_or(JobStatus::Failed);
         let error = job.info.error.as_ref().map(|message| {
             let mut error = json!({ "message": message });
             if let (Some(error), Some(Ok(Value::Object(tag)))) = (
@@ -2841,7 +2776,16 @@ fn tick_jobs(
                 if stopped || job.wait.is_zero() {
                     job.wait = frame_wait(c, job.timeout_ms);
                 }
-                job.next = Some(job.allocate(&h.names)?);
+                // A name that may be refused is refused before a frame is
+                // asked for. One that says when the frame was taken is
+                // picked when it comes; numbered, it is never refused.
+                job.next = if job.plan.names_time()
+                    && crate::naming::renumbers(&job.plan, job.on_exists)
+                {
+                    None
+                } else {
+                    Some(job.allocate(&h.names, None)?)
+                };
                 c.request_frame()?;
                 job.trigger = c.software_triggered().then(|| TriggerWait {
                     lost: losses(c),
@@ -2855,7 +2799,7 @@ fn tick_jobs(
             let warm_up = match result {
                 Ok(warm_up) => warm_up,
                 Err(e) => {
-                    job.info.end("failed", Some(&e));
+                    job.info.end(CaptureStatus::Failed, Some(&e));
                     h.log(
                         "error",
                         format!("Capture job {} failed: {e:#}", job.info.id),
@@ -2863,7 +2807,7 @@ fn tick_jobs(
                     continue;
                 }
             };
-            job.info.status = "running".into();
+            job.info.status = CaptureStatus::Running;
             let timeout = job.wait;
             job.deadline = Some(deadline_after(timeout));
             job.warm = (auto && warm_up)
@@ -2903,7 +2847,7 @@ fn tick_jobs(
                 None => crate::types::frame_timeout("frame timeout"),
             };
             job.deadline = None;
-            job.info.end("failed", Some(&error));
+            job.info.end(CaptureStatus::Failed, Some(&error));
             h.log("error", format!("Capture job {}: {error:#}", job.info.id));
         }
     }
@@ -3009,6 +2953,7 @@ fn shoot(
     jobs: &mut [Scheduled],
     settled: bool,
     room: bool,
+    wall_ms: u64,
 ) -> Vec<saver::Save> {
     let now = crate::scheduling::now_ms();
     let mut saves = Vec::new();
@@ -3039,7 +2984,7 @@ fn shoot(
         let picked = job.next.take();
         if !room {
             job.info.skipped += 1;
-            job.info.status = "pending".into();
+            job.info.status = CaptureStatus::Pending;
             job.advance();
             if job.info.skipped == 1 {
                 h.log(
@@ -3052,9 +2997,10 @@ fn shoot(
             }
             continue;
         }
+        // {date} and {time} are the frame's.
         let named = match picked {
-            Some(picked) => Ok(picked),
-            None => job.allocate(&h.names),
+            Some(picked) if !job.plan.names_time() => Ok(picked),
+            _ => job.allocate(&h.names, Some(wall_ms)),
         };
         match named {
             Ok((path, at, index)) => {
@@ -3062,10 +3008,14 @@ fn shoot(
                 job.take(index);
                 job.saving += 1;
                 job.advance();
-                job.info.status = if job.wants() { "pending" } else { "running" }.into();
+                job.info.status = if job.wants() {
+                    CaptureStatus::Pending
+                } else {
+                    CaptureStatus::Running
+                };
             }
             Err(e) => {
-                job.info.end("failed", Some(&e));
+                job.info.end(CaptureStatus::Failed, Some(&e));
                 h.log(
                     "error",
                     format!("Capture job {} stopped: {e:#}", job.info.id),
@@ -3151,7 +3101,7 @@ fn finish(h: &WorkerHandle, job: &mut Scheduled, index: u32, result: Result<save
                 info.error = None;
                 info.error_tag = None;
                 if info.captured >= info.count {
-                    info.status = "complete".into();
+                    info.status = CaptureStatus::Done;
                     info.ended_ms = Some(crate::scheduling::now_ms());
                     h.log(
                         "info",
@@ -3170,7 +3120,7 @@ fn finish(h: &WorkerHandle, job: &mut Scheduled, index: u32, result: Result<save
             // Taken again under its own number, not one still being saved.
             job.free.insert(index);
             job.info.retries += 1;
-            job.info.status = "pending".into();
+            job.info.status = CaptureStatus::Pending;
             job.info.error = Some(format!("{e:#}"));
             h.log(
                 "warn",
@@ -3178,7 +3128,7 @@ fn finish(h: &WorkerHandle, job: &mut Scheduled, index: u32, result: Result<save
             );
         }
         Err(e) => {
-            job.info.end("failed", Some(&e));
+            job.info.end(CaptureStatus::Failed, Some(&e));
             h.log("error", format!("Capture job {id} stopped: {e:#}"));
         }
     }
@@ -3224,9 +3174,16 @@ pub(crate) fn frame_wait_error(c: &mut Camera, waited: Duration) -> anyhow::Erro
             .details(json!({"trigger": trigger}))
             .into()
         }
-        _ => crate::types::frame_timeout(format!("no frame within {wait}")),
+        _ => crate::types::Categorized::new(
+            crate::types::ErrorKind::FrameTimeout,
+            format!("no frame within {wait}"),
+        )
+        .hint(NO_FRAME_HINT)
+        .into(),
     }
 }
+/// What to do when no frame came in time.
+const NO_FRAME_HINT: &str = "raise --timeout; check info for the frame rate, exposure and trigger";
 /// Whether `trigger` waits for a hardware line, not software or a clock.
 fn hardware(trigger: &crate::controls::Trigger) -> bool {
     trigger.mode == "On"
@@ -3390,6 +3347,27 @@ pub(crate) fn unsettled_warning(warmup_ms: u64) -> String {
 /// Frame `index`'s name under an output whose names are known in advance.
 /// A folder's names depend on the camera and the time, so they never are:
 /// its frames are in the folder.
+/// Refuse a manifest that is one of the capture's own files, or a raw
+/// file's sidecar: opened first, it would take that name.
+fn check_manifest(output: &str, count: u32, format: &str, manifest: &Path) -> Result<()> {
+    if !crate::naming::Plan::new(output, count, format).is_static() {
+        return Ok(());
+    }
+    for index in 0..count {
+        let path = output_path(output, count, index, format);
+        if manifest == path || (format == "raw" && manifest == crate::naming::sidecar(&path)) {
+            return Err(crate::types::Categorized::new(
+                crate::types::ErrorKind::Usage,
+                format!(
+                    "--manifest {} is a file this capture saves; name another, such as captures.jsonl",
+                    manifest.display()
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
 fn output_path(output: &str, count: u32, index: u32, format: &str) -> PathBuf {
     match crate::naming::Plan::new(output, count, format) {
         crate::naming::Plan::Template(template) => {
@@ -3478,7 +3456,7 @@ fn apply_stops(
     for job in stops {
         if let Some(scheduled) = jobs.iter_mut().find(|j| j.info.id == job) {
             if scheduled.info.active() {
-                scheduled.info.end("cancelled", None);
+                scheduled.info.end(CaptureStatus::Cancelled, None);
                 scheduled.deadline = None;
                 // It takes no more frames; those it took are saved, unless
                 // the encoders cannot finish them in time.
@@ -3580,7 +3558,7 @@ fn worker(h: WorkerHandle) {
         } else {
             idle_wait(&h, &jobs)
         };
-        if let Some(e) = h.queue.take(wait) {
+        if let Some(e) = h.next_request(wait) {
             h.beat();
             if let Some(id) = e.id {
                 h.events.emit(Output::Started {
@@ -3588,10 +3566,6 @@ fn worker(h: WorkerHandle) {
                     budget_ms: e.command.budget_ms(),
                 });
             }
-            *h.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(Running {
-                id: e.id,
-                cancel: Arc::default(),
-            });
             if let Some(request) = inspector::Request::of(&e.command) {
                 inspector::begin(
                     &h,
@@ -3713,7 +3687,7 @@ fn worker(h: WorkerHandle) {
                         settings.invalidate();
                     }
                     auto_moving |= !settled;
-                    let saves = shoot(&h, c, &mut jobs, settled, room);
+                    let saves = shoot(&h, c, &mut jobs, settled, room, frame.wall_ms);
                     // The jobs armed together took their first frame: from
                     // now on the camera streams only while one needs it.
                     if !saves.is_empty() {
@@ -3766,13 +3740,28 @@ fn worker(h: WorkerHandle) {
                     }
                     Some(end) => {
                         // The file ended, or its server refused every
-                        // reconnect: stop instead of counting errors.
+                        // reconnect: stop instead of counting errors. A
+                        // recording ends with its source, its file
+                        // finished rather than held open in the encoder.
                         let _ = c.stop();
                         reconnecting = false;
                         if end == StreamEnd::Finished {
                             h.log("info", "Video file finished".into());
+                            if forwarder.is_some() {
+                                let _ = end_forward(
+                                    &h,
+                                    &mut forwarder,
+                                    &mut auto,
+                                    Ended::Source,
+                                    None,
+                                    |_| None,
+                                );
+                            }
                         } else {
                             h.log("error", format!("Acquisition stopped: {e:#}"));
+                            if forwarder.is_some() {
+                                forward_failed(&h, &mut forwarder, &mut auto, e);
+                            }
                         }
                         refresh(&h, &camera);
                     }
@@ -3795,6 +3784,16 @@ fn worker(h: WorkerHandle) {
                                 "error",
                                 "Acquisition stopped after repeated transport errors".into(),
                             );
+                            if forwarder.is_some() {
+                                forward_failed(
+                                    &h,
+                                    &mut forwarder,
+                                    &mut auto,
+                                    e.context(
+                                        "acquisition stopped after repeated transport errors",
+                                    ),
+                                );
+                            }
                             refresh(&h, &camera);
                         }
                     }
@@ -3822,7 +3821,7 @@ fn worker(h: WorkerHandle) {
     );
     settle_saves(&h, &mut saver, &mut jobs);
     drop(saver);
-    cancel_jobs(&mut jobs, "interrupted");
+    cancel_jobs(&mut jobs, CaptureStatus::Interrupted);
     sync_jobs(&h, &mut jobs);
     let _ = stop_forward(&h, &mut forwarder, &mut auto, Ended::Interrupted);
     end_auto_job(&h, JobStatus::Interrupted);
@@ -4472,9 +4471,7 @@ mod tests {
         assert_eq!(h.value("Width"), 128);
         assert!(h.set_value("Width", "1").is_err());
         let dir = temp_dir("simulator-acquisition");
-        let v = h
-            .request(capture_to(&dir.join("one.raw"), 1, Default::default()))
-            .unwrap();
+        let v = saved_by(&h, capture_to(&dir.join("one.raw"), 1, Default::default())).unwrap();
         assert_eq!(v["frame"]["width"], 128);
         assert!(!h.snapshot().streaming);
         assert_eq!(h.snapshot().frames, 1);
@@ -4483,61 +4480,54 @@ mod tests {
         assert!(h.snapshot().connected.is_none());
         h.shutdown();
     }
-    #[test]
-    fn saved_captures_are_reported_with_context() {
-        let h = WorkerHandle::new();
-        connect(&h, "1000");
-        let root = std::env::temp_dir().join(format!(
-            "capturefab-saved-{}-{}",
+    /// A private file for an image captured to stdout, as a session's
+    /// client names it.
+    fn stdout_file() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let dir = crate::dirs::temp().unwrap();
+        dir.join(format!(
+            "{}-{:x}{:x}",
             std::process::id(),
-            crate::scheduling::now_ms()
-        ));
-        let context = crate::context::Context::from([("line".into(), "L1".into())]);
-        let v = h
-            .request(SessionCommand::Capture {
-                min_free: None,
-                output: root.join("shot.raw").to_string_lossy().into_owned(),
-                count: 1,
-                timeout_ms: 1000,
-                format: "raw".into(),
-                on_exists: Default::default(),
-                sync: Default::default(),
-                context: context.clone(),
-                utc_offset_s: None,
-                quality: None,
-                stdout: None,
-                fresh: 0,
-                warmup_ms: None,
-            })
+            crate::scheduling::now_ms(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+    /// One raw frame to `file`, as `capture -o -` through a session asks.
+    fn to_stdout(file: &Path) -> SessionCommand {
+        SessionCommand::Capture {
+            timeout_ms: 6000,
+            format: "raw".into(),
+            context: Default::default(),
+            quality: None,
+            fresh: 0,
+            warmup_ms: None,
+            stdout: Some(file.to_string_lossy().into_owned()),
+        }
+    }
+    #[test]
+    fn a_capture_to_stdout_sends_one_image_and_counts_what_was_lost() {
+        let h = WorkerHandle::new();
+        h.request(SessionCommand::connect("sim:0?drop=0.3".into(), 100))
             .unwrap();
-        assert_eq!(v["context"]["line"], "L1");
-        assert_eq!(v["frame"]["file"], v["files"][0]);
+        let file = stdout_file();
+        let mut command = to_stdout(&file);
+        let context = crate::context::Context::from([("line".into(), "L1".into())]);
+        if let SessionCommand::Capture { context: tags, .. } = &mut command {
+            *tags = context.clone();
+        }
+        let v = h.request(command).unwrap();
+        assert_eq!(v["context"], json!(context));
         assert_eq!(v["frame"]["pixel_format_name"], "Mono8");
-        assert_eq!(
-            v["frame"]["file_bytes"].as_u64().unwrap(),
-            std::fs::metadata(v["files"][0].as_str().unwrap())
-                .unwrap()
-                .len()
-        );
-        let wall_ms = v["frame"]["wall_ms"].as_u64().unwrap();
-        let batch = h.take_saved();
-        assert_eq!(batch.len(), 1);
-        // A capture command's file is no job's.
-        let (job, saved) = &batch[0];
-        assert_eq!(*job, None);
-        assert_eq!(saved.wall_ms, wall_ms);
-        assert_eq!(saved.context, context);
-        assert_eq!(saved.bytes, 128 * 128);
-        // Files are hashed only for a manifest, which a capture command has not.
-        assert_eq!(saved.sha256, None);
-        assert!(std::path::Path::new(&saved.path).is_absolute());
-        assert!(matches!(
-            saved.item,
-            crate::engine::saved::SavedItem::Capture { .. }
-        ));
+        let bytes = std::fs::read(&file).unwrap();
+        assert_eq!(bytes.len(), 640 * 480);
+        assert_eq!(v["frame"]["file_bytes"], bytes.len());
+        // What the transport lost before the frame is counted.
+        let lost = v["dropped"].as_u64().unwrap() + v["incomplete"].as_u64().unwrap();
+        assert_eq!(lost, v["frame"]["id"].as_u64().unwrap() - 1, "{v}");
+        // An image to stdout is no saved file.
         assert!(h.take_saved().is_empty());
+        let _ = std::fs::remove_file(file);
         h.shutdown();
-        let _ = std::fs::remove_dir_all(root);
     }
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -4551,21 +4541,44 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
+    /// `count` raw frames saved to `output`, as `capture -o` asks.
     fn capture_to(output: &Path, count: u32, on_exists: crate::naming::OnExists) -> SessionCommand {
-        SessionCommand::Capture {
+        SessionCommand::Schedule {
             min_free: None,
             output: output.to_string_lossy().into_owned(),
             count,
             timeout_ms: 1000,
             format: "raw".into(),
+            first_at_ms: 0,
+            interval_ms: 0,
             on_exists,
+            manifest: None,
             sync: Default::default(),
             context: Default::default(),
             utc_offset_s: None,
             quality: None,
-            stdout: None,
+            job: None,
+            lease: false,
             fresh: 0,
             warmup_ms: None,
+            inspect: false,
+        }
+    }
+    /// Run capture job `command` to its end: the files it saved and its
+    /// frame's shape, or why it was refused or failed.
+    fn saved_by(h: &WorkerHandle, command: SessionCommand) -> Result<Value> {
+        let id = h.request(command)?["job"]["id"].as_u64().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let job = h.snapshot().jobs.into_iter().find(|j| j.id == id).unwrap();
+            if !job.active() {
+                return match job.status {
+                    CaptureStatus::Done => Ok(json!({"files": job.files, "frame": job.frame})),
+                    _ => Err(anyhow::anyhow!(job.error.unwrap_or_default())),
+                };
+            }
+            assert!(Instant::now() < deadline, "job {id} did not end");
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
     #[test]
@@ -4584,16 +4597,11 @@ mod tests {
                 && name.starts_with(&format!("{label}-"))
                 && name.ends_with(&format!("-{seq:04}.raw"))
         };
-        // One frame: a sequence is a schedule.
-        let error = h
-            .request(capture_to(&dir.join("shot.raw"), 3, OnExists::Fail))
-            .unwrap_err();
-        assert!(error.to_string().contains("schedule"), "{error:#}");
         let mut mismatched = capture_to(&dir.join("y.jpg"), 1, OnExists::Fail);
-        if let SessionCommand::Capture { format, .. } = &mut mismatched {
+        if let SessionCommand::Schedule { format, .. } = &mut mismatched {
             *format = "png".into();
         }
-        let v = h.request(mismatched).unwrap();
+        let v = saved_by(&h, mismatched).unwrap();
         assert_eq!(
             v["files"][0].as_str().unwrap(),
             dir.join("y.jpg").to_str().unwrap()
@@ -4605,13 +4613,9 @@ mod tests {
             dir.join("newdir").display(),
             std::path::MAIN_SEPARATOR
         );
-        let v = h
-            .request(capture_to(Path::new(&folder), 1, OnExists::Fail))
-            .unwrap();
+        let v = saved_by(&h, capture_to(Path::new(&folder), 1, OnExists::Fail)).unwrap();
         assert!(in_folder(&v["files"][0], &dir.join("newdir"), 1), "{v}");
-        let v = h
-            .request(capture_to(&dir.join("noext"), 1, OnExists::Fail))
-            .unwrap();
+        let v = saved_by(&h, capture_to(&dir.join("noext"), 1, OnExists::Fail)).unwrap();
         assert_eq!(
             v["files"][0].as_str().unwrap(),
             dir.join("noext.raw").to_str().unwrap()
@@ -4678,24 +4682,24 @@ mod tests {
         };
         let seq = dir.join("{camera}-{seq}.raw");
         for n in 1..=2 {
-            let v = h.request(capture_to(&seq, 1, OnExists::Fail)).unwrap();
+            let v = saved_by(&h, capture_to(&seq, 1, OnExists::Fail)).unwrap();
             assert_eq!(files(v), [format!("{label}-{n:04}.raw")]);
         }
         let file = dir.join("shot.raw");
-        h.request(capture_to(&file, 1, OnExists::Fail)).unwrap();
-        let error = h.request(capture_to(&file, 1, OnExists::Fail)).unwrap_err();
+        saved_by(&h, capture_to(&file, 1, OnExists::Fail)).unwrap();
+        let error = saved_by(&h, capture_to(&file, 1, OnExists::Fail)).unwrap_err();
         assert!(
             error.to_string().contains("output already exists"),
             "{error:#}"
         );
-        let v = h.request(capture_to(&file, 1, OnExists::Number)).unwrap();
+        let v = saved_by(&h, capture_to(&file, 1, OnExists::Number)).unwrap();
         assert_eq!(files(v), ["shot-0001.raw"]);
         // A directory names frames by camera and time, and continues its
         // numbering on every run.
         let frames = dir.join("frames");
         std::fs::create_dir(&frames).unwrap();
         for run in 0..3 {
-            let v = h.request(capture_to(&frames, 1, OnExists::Fail)).unwrap();
+            let v = saved_by(&h, capture_to(&frames, 1, OnExists::Fail)).unwrap();
             let name = &files(v)[0];
             let name = name
                 .strip_prefix(&format!("frames{}{label}-", std::path::MAIN_SEPARATOR))
@@ -4743,7 +4747,7 @@ mod tests {
         while h.snapshot().jobs.iter().any(|j| j.active()) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert_eq!(h.snapshot().jobs[0].status, "complete");
+        assert_eq!(h.snapshot().jobs[0].status, CaptureStatus::Done);
         let mut names = std::fs::read_dir(&dir)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -4763,8 +4767,12 @@ mod tests {
         );
         let batch = h.take_saved();
         assert_eq!(batch.len(), 3);
+        // Files are hashed only for a manifest, which this job has not.
         assert!(batch.iter().all(|(job, f)| *job == Some(1)
             && f.context["lot"] == "7"
+            && f.bytes == 128 * 128
+            && f.sha256.is_none()
+            && Path::new(&f.path).is_absolute()
             && matches!(f.item, crate::engine::saved::SavedItem::Capture { .. })));
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
@@ -4779,7 +4787,7 @@ mod tests {
             min_free: None,
             info: crate::scheduling::CaptureJob {
                 id,
-                status: "running".into(),
+                status: CaptureStatus::Running,
                 output: output.clone(),
                 count: 2,
                 captured: 0,
@@ -4889,7 +4897,14 @@ mod tests {
         frame: Frame,
     ) -> bool {
         let room = saver.has_room(frame.data.len());
-        let saves = shoot(h, &mut sim_camera(), jobs, true, room);
+        let saves = shoot(
+            h,
+            &mut sim_camera(),
+            jobs,
+            true,
+            room,
+            crate::scheduling::now_ms(),
+        );
         if saves.is_empty() {
             return false;
         }
@@ -4942,14 +4957,14 @@ mod tests {
         // takes another at its next interval.
         assert_eq!((jobs[0].saving, jobs[1].saving, jobs[2].saving), (1, 1, 0));
         assert_eq!(jobs[2].info.skipped, 1);
-        assert_eq!(jobs[2].info.status, "pending");
+        assert_eq!(jobs[2].info.status, CaptureStatus::Pending);
         assert_eq!(jobs[2].info.next_at_ms, 60_000);
         assert!(jobs[2].deadline.is_none());
         drain(&h, &saver, &mut jobs);
         for job in &jobs[..2] {
             assert_eq!(
-                (job.info.captured, job.info.status.as_str()),
-                (1, "pending")
+                (job.info.captured, job.info.status),
+                (1, CaptureStatus::Pending)
             );
             assert!(
                 job.info
@@ -4992,7 +5007,7 @@ mod tests {
         assert_eq!(jobs[0].saving, 6);
         drain(&h, &saver, &mut jobs);
         let info = &jobs[0].info;
-        assert_eq!(info.status, "complete");
+        assert_eq!(info.status, CaptureStatus::Done);
         assert_eq!(
             info.files
                 .iter()
@@ -5039,7 +5054,7 @@ mod tests {
             h.stops.lock().unwrap().insert(1);
             let stopped = Instant::now();
             apply_stops(&h, &mut None, &mut None, &mut None, &mut jobs);
-            assert_eq!(jobs[0].info.status, "cancelled");
+            assert_eq!(jobs[0].info.status, CaptureStatus::Cancelled);
             while jobs[0].saving > 0 && stopped.elapsed() < Duration::from_secs(10) {
                 saved(&h, &mut jobs, &saver);
                 give_up_saving(&mut jobs, &mut saver);
@@ -5161,7 +5176,17 @@ mod tests {
             .unwrap()
             .next_frame(Duration::from_secs(1))
             .unwrap();
-        assert!(!shoot(&h, camera.as_mut().unwrap(), &mut jobs, true, true).is_empty());
+        assert!(
+            !shoot(
+                &h,
+                camera.as_mut().unwrap(),
+                &mut jobs,
+                true,
+                true,
+                crate::scheduling::now_ms()
+            )
+            .is_empty()
+        );
         assert!(jobs[0].saving == 1 && jobs[0].info.next_at_ms <= crate::scheduling::now_ms());
         // Due again while its shot is saved: the stream keeps running.
         tick_jobs(&h, &mut camera, &mut jobs, &mut started, false, true);
@@ -5215,7 +5240,17 @@ mod tests {
             .unwrap()
             .next_frame(Duration::from_secs(1))
             .unwrap();
-        assert!(!shoot(&h, camera.as_mut().unwrap(), &mut jobs, true, true).is_empty());
+        assert!(
+            !shoot(
+                &h,
+                camera.as_mut().unwrap(),
+                &mut jobs,
+                true,
+                true,
+                crate::scheduling::now_ms()
+            )
+            .is_empty()
+        );
         assert_eq!(jobs[0].saving, 1);
         // Its one frame is being saved: nothing needs the camera, which
         // stops now rather than at the next frame, and does not linger.
@@ -5257,14 +5292,11 @@ mod tests {
         assert_eq!(frame.width, 4);
         assert_eq!(triggers(), 1);
         let dir = temp_dir("software-trigger");
-        let captured = run_command(
-            &h,
-            &mut camera,
-            capture_to(&dir.join("shot.raw"), 1, crate::naming::OnExists::Fail),
-        )
-        .unwrap();
-        assert_eq!(captured["files"].as_array().unwrap().len(), 1);
+        let file = stdout_file();
+        let captured = run_command(&h, &mut camera, to_stdout(&file)).unwrap();
+        assert_eq!(captured["frame"]["width"], 4);
         assert_eq!(triggers(), 1);
+        let _ = std::fs::remove_file(file);
         // A shot fires its trigger when due; auto exposure has no frames to
         // warm up on, so the triggered frame is taken.
         let mut job = armed(1, &dir);
@@ -5279,7 +5311,17 @@ mod tests {
             .unwrap()
             .next_frame(Duration::from_secs(1))
             .unwrap();
-        assert!(!shoot(&h, camera.as_mut().unwrap(), &mut jobs, false, true).is_empty());
+        assert!(
+            !shoot(
+                &h,
+                camera.as_mut().unwrap(),
+                &mut jobs,
+                false,
+                true,
+                crate::scheduling::now_ms()
+            )
+            .is_empty()
+        );
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -5315,7 +5357,7 @@ mod tests {
         shoot_once(&mut job, slow_disk());
         assert!(job.info.active() && job.saving == 0);
         assert_eq!((job.info.retries, job.info.captured), (1, 0));
-        assert_eq!(job.info.status, "pending");
+        assert_eq!(job.info.status, CaptureStatus::Pending);
         assert!(job.info.error.as_deref().unwrap().contains("timed out"));
         // The same frame number, one interval later.
         assert_eq!(job.info.next_at_ms, 60_000);
@@ -5329,7 +5371,7 @@ mod tests {
         // A path that mentions timeouts does not make a refusal transient.
         let refused = anyhow::anyhow!("Permission denied").context("save /data/timeouts/a.raw");
         shoot_once(&mut job, Err(refused));
-        assert_eq!(job.info.status, "failed");
+        assert_eq!(job.info.status, CaptureStatus::Failed);
         // A disk below its floor ends the job with its reason.
         let mut full = armed(2, &dir);
         let floor = crate::types::Categorized::error(
@@ -5337,7 +5379,7 @@ mod tests {
             "100 MiB free on the disk of /data/a.raw",
         );
         shoot_once(&mut full, Err(floor));
-        assert_eq!(full.info.status, "failed");
+        assert_eq!(full.info.status, CaptureStatus::Failed);
         assert_eq!(full.info.error_tag.as_ref().unwrap().code, "storage_full");
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
@@ -5365,7 +5407,7 @@ mod tests {
         // Frame 0 is shot again, never a number still being saved.
         assert!(job.wants());
         assert_eq!(job.index(), 0);
-        let (path, _, index) = job.allocate(&h.names).unwrap();
+        let (path, _, index) = job.allocate(&h.names, None).unwrap();
         assert_eq!(index, 0);
         assert_eq!(path, dir.join("job1-000001.raw"));
         job.take(index);
@@ -5455,9 +5497,8 @@ mod tests {
             h.set_value(feature, value).unwrap();
         }
     }
-    fn auto(h: &WorkerHandle, balance: Option<f64>) -> Result<Value> {
+    fn auto(h: &WorkerHandle) -> Result<Value> {
         h.request(SessionCommand::Auto {
-            balance,
             continuous: false,
             job: None,
             max_exposure_us: None,
@@ -5511,7 +5552,7 @@ mod tests {
     fn an_inspection_settles_auto_exposure_on_a_stopped_camera_first() {
         let h = WorkerHandle::new();
         connect(&h, "1000");
-        auto(&h, None).unwrap();
+        auto(&h).unwrap();
         let inspected = inspect(&h, 1).unwrap();
         // Frames metered while settling are counted too.
         assert!(h.snapshot().frames >= 1);
@@ -5565,11 +5606,37 @@ mod tests {
         h.shutdown();
     }
     #[test]
+    fn a_cancel_just_after_the_camera_thread_takes_a_request_is_kept() {
+        // No camera thread: this one takes the request as it would.
+        let h = WorkerHandle::idle();
+        let (reply, answer) = mpsc::channel();
+        h.queue_request(
+            Some(9),
+            SessionCommand::Status.into(),
+            Box::new(move |result| {
+                let _ = reply.send(result);
+            }),
+        )
+        .map_err(|(error, _)| error)
+        .unwrap();
+        let taken = h.next_request(Duration::ZERO).unwrap();
+        assert_eq!(taken.id, Some(9));
+        // The cancel comes before the request starts running: it is
+        // neither queued nor forgotten, so its frame wait ends at once.
+        assert!(!h.cancelled());
+        h.cancel(9);
+        assert!(h.cancelled());
+        assert!(answer.try_recv().is_err());
+        // Another request's cancel is not this one's.
+        *h.running.lock().unwrap() = None;
+        h.cancel(9);
+        assert!(!h.cancelled());
+    }
+    #[test]
     fn manual_mode_ends_continuous_auto_exposure() {
         let h = WorkerHandle::new();
         connect(&h, "1000");
         h.request(SessionCommand::Auto {
-            balance: None,
             continuous: true,
             job: Some(7),
             max_exposure_us: None,
@@ -5586,7 +5653,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert!(ended(&h).is_empty());
-        h.request(SessionCommand::Manual { revert: false }).unwrap();
+        h.request(SessionCommand::Manual).unwrap();
         assert_eq!(ended(&h), [(7, JobStatus::Done)]);
         // Nothing is left to end at shutdown.
         h.shutdown();
@@ -5742,15 +5809,14 @@ mod tests {
     }
 
     #[test]
-    fn software_auto_exposure_converges_inside_the_balance_caps() {
-        for (balance, exposure, fps) in [(1.0, "2500", 120.0f64), (0.0, "40000", 30.0)] {
+    fn software_auto_exposure_converges_inside_its_caps() {
+        // Half way between the simulator's 30 and 120 fps, by ratio.
+        let fps = 60.0f64;
+        for exposure in ["2500", "40000"] {
             let h = WorkerHandle::new();
             connect(&h, exposure);
             h.request(SessionCommand::Start).unwrap();
-            assert_eq!(
-                auto(&h, Some(balance)).unwrap()["auto"]["strategy"],
-                "software"
-            );
+            assert_eq!(auto(&h).unwrap()["auto"]["strategy"], "software");
             let deadline = Instant::now() + Duration::from_secs(20);
             let status = loop {
                 let status = h.snapshot().auto.unwrap();
@@ -5764,7 +5830,6 @@ mod tests {
             assert!((status.exposure_limits_us.unwrap()[1] - cap).abs() < 1e-6);
             assert!(status.exposure_us.unwrap() <= cap + 1e-6);
             assert!((status.brightness.unwrap() / 0.45).log2().abs() < 0.2);
-            assert_eq!(status.gain_db.unwrap() > 0.5, balance == 1.0);
             h.shutdown();
         }
     }
@@ -5772,21 +5837,22 @@ mod tests {
     #[test]
     fn auto_mode_commands_follow_the_contract() {
         let h = WorkerHandle::new();
-        assert!(auto(&h, None).is_err());
+        assert!(auto(&h).is_err());
         connect(&h, "10000");
-        assert!(auto(&h, Some(2.0)).is_err());
         assert!(h.snapshot().auto.is_none());
-        let entered = auto(&h, Some(0.25)).unwrap();
-        assert_eq!(entered["auto"]["balance"], 0.25);
+        let entered = auto(&h).unwrap();
         assert!(
             entered["auto"]["managed"]
                 .as_array()
                 .unwrap()
                 .contains(&json!("ExposureTime"))
         );
-        assert_eq!(auto(&h, None).unwrap()["auto"]["balance"], 0.25);
-        assert!(auto(&h, Some(f64::NAN)).is_err());
-        assert_eq!(h.snapshot().auto.unwrap().balance, 0.25);
+        // Asked again, it goes on as it was.
+        assert_eq!(
+            auto(&h).unwrap()["auto"]["strategy"],
+            entered["auto"]["strategy"]
+        );
+        assert!(h.snapshot().auto.is_some());
         let set = |feature: &str, value: &str| h.set_value(feature, value).unwrap();
         set("Width", "128");
         assert!(h.snapshot().auto.is_some());
@@ -5794,14 +5860,14 @@ mod tests {
         assert_eq!(manual["changed"][0]["to"], 5000.0, "{manual}");
         assert!(h.snapshot().auto.is_none());
         assert_eq!(
-            h.request(SessionCommand::Manual { revert: false }).unwrap(),
+            h.request(SessionCommand::Manual).unwrap(),
             json!({"auto": null})
         );
         // Turning on the camera's own auto, by control or by feature, ends
         // auto mode too.
         for value in ["auto_exposure=once", "ExposureAuto=Once"] {
             set("ExposureAuto", "Off");
-            auto(&h, Some(0.5)).unwrap();
+            auto(&h).unwrap();
             let values = vec![crate::controls::Assignment::parse(value).unwrap()];
             h.request(SessionCommand::SetValues {
                 values,
@@ -5817,31 +5883,15 @@ mod tests {
     fn capture_warms_up_auto_exposure_and_reports_auto_status() {
         let h = WorkerHandle::new();
         connect(&h, "2500");
-        auto(&h, Some(0.5)).unwrap();
-        let dir = temp_dir("auto-capture");
-        let v = h
-            .request(SessionCommand::Capture {
-                min_free: None,
-                output: dir.join("warm.raw").to_string_lossy().into_owned(),
-                count: 1,
-                timeout_ms: 6000,
-                format: "raw".into(),
-                on_exists: Default::default(),
-                sync: Default::default(),
-                context: Default::default(),
-                utc_offset_s: None,
-                quality: None,
-                stdout: None,
-                fresh: 0,
-                warmup_ms: None,
-            })
-            .unwrap();
+        auto(&h).unwrap();
+        let file = stdout_file();
+        let v = h.request(to_stdout(&file)).unwrap();
         assert_eq!(v["frame"]["width"], 128);
         assert_eq!(v["auto"]["strategy"], "software");
         assert!(v["auto"]["brightness"].as_f64().unwrap() > 0.2);
         assert!(!h.snapshot().streaming);
         h.shutdown();
-        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(file);
     }
 
     struct Shared(Arc<Mutex<crate::transport::simulator::Simulator>>);
@@ -6132,7 +6182,6 @@ mod tests {
         run(
             &mut camera,
             SessionCommand::Auto {
-                balance: Some(1.0),
                 continuous: false,
                 job: None,
                 max_exposure_us: None,
@@ -6141,8 +6190,9 @@ mod tests {
             .into(),
         )
         .unwrap();
-        assert!((read(0x110) - (1e6 / 120.0 - 1e6 / 120.0 * 0.02)).abs() < 1e-6);
-        assert!(read(0x118) > 7.0);
+        // Exposure within a 60 fps frame, and gain for the rest.
+        assert!((read(0x110) - (1e6 / 60.0 - 1e6 / 60.0 * 0.02)).abs() < 1e-6);
+        assert!(read(0x118) > 1.0);
         assert_eq!(read(0x120), 120.0);
         run(&mut camera, SessionCommand::Disconnect.into()).unwrap();
         assert!(camera.is_none());

@@ -317,6 +317,33 @@ pub(super) fn planes_len(format: u32, width: u32, height: u32) -> Option<usize> 
         .checked_add(chroma.checked_mul(2)?)
 }
 
+/// The row bytes and rows of each plane of a planar or semiplanar layout,
+/// in the order they follow each other; None for one plane of rows.
+pub(super) fn planes(format: u32, width: u32, height: u32) -> Option<Vec<(usize, usize)>> {
+    let (width, height) = (width as usize, height as usize);
+    match layout(format)?.1 {
+        Layout::Planes {
+            sub, interleaved, ..
+        } => {
+            let (row, rows) = (width.div_ceil(sub.0), height.div_ceil(sub.1));
+            Some(match interleaved {
+                Some(_) => vec![(width, height), (row.checked_mul(2)?, rows)],
+                None => vec![(width, height), (row, rows), (row, rows)],
+            })
+        }
+        Layout::Rgb {
+            planar: true,
+            bits,
+            channels,
+            ..
+        } => {
+            let row = width.checked_mul(if bits == 8 { 1 } else { 2 })?;
+            Some(vec![(row, height); channels])
+        }
+        _ => None,
+    }
+}
+
 pub(super) fn name(format: u32) -> Option<&'static str> {
     layout(format).map(|(name, _)| name)
 }
@@ -995,6 +1022,48 @@ mod tests {
         assert_eq!(ycbcr_planes((2, 1), Matrix::Full709, true), None);
     }
 
+    #[test]
+    fn planar_layouts_name_each_planes_rows() {
+        let rows = |format, width, height| {
+            crate::frame::planes(format, width, height)
+                .unwrap()
+                .iter()
+                .map(|p| (p.offset, p.row_bytes, p.rows))
+                .collect::<Vec<_>>()
+        };
+        // Decoded 4:2:0 video: a 320-byte luma row, then 160-byte chroma
+        // rows, never the 480-byte average PFNC's bits per pixel gives.
+        assert_eq!(
+            rows(planar((2, 2), Matrix::Bt709), 320, 240),
+            [(0, 320, 240), (76_800, 160, 120), (96_000, 160, 120)]
+        );
+        assert_eq!(
+            rows(planar((2, 1), Matrix::Full), 321, 3),
+            [(0, 321, 3), (963, 161, 3), (1446, 161, 3)]
+        );
+        assert_eq!(
+            rows(NV12_709, 320, 240),
+            [(0, 320, 240), (76_800, 320, 120)]
+        );
+        assert_eq!(
+            rows(0x0230_0022, 4, 2),
+            [(0, 8, 2), (16, 8, 2), (32, 8, 2)],
+            "RGB10_Planar"
+        );
+        assert!(crate::frame::planes(MONO8, 320, 240).is_none());
+        assert!(crate::frame::planes(RGB8, 320, 240).is_none());
+        // The planes make up the whole frame.
+        for format in CODES.into_iter().filter(|&format| name(format).is_some()) {
+            if let Some(planes) = crate::frame::planes(format, 13, 7) {
+                let last = planes.last().unwrap();
+                assert_eq!(
+                    Some(last.offset + last.row_bytes * last.rows),
+                    crate::frame::frame_len(format, 13, 7),
+                    "{format:#x}"
+                );
+            }
+        }
+    }
     #[test]
     fn every_additional_layout_flows_through_image_consumers() {
         use crate::frame as conversion;

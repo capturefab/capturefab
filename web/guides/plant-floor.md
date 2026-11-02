@@ -34,9 +34,9 @@ bit as 16-bit gray, while color and Bayer frames become 8-bit RGB; `jpg` is smal
 90 by default) and 8-bit. The result's `bit_depth` says what the files keep, and `source_bits`
 how many bits the frames had when the files keep fewer. `raw` writes the frame's bytes exactly as
 the camera sent them, at their full bit depth, with a `NAME.json` sidecar naming the pixel format,
-its PFNC code and the row length: use it for Bayer data and for depth or thermal samples, and
-record the camera's calibration features alongside (`capturefab get -c CAM PixelFormat Width
-Height …`). The JSON result of every capture lists the files with their size, pixel format and
+its PFNC code and the row length (each plane's for planar video): use it for Bayer data and for
+depth or thermal samples, and record the camera's calibration features alongside (`capturefab get
+-c CAM PixelFormat Width Height …`). The JSON result of every capture lists the files with their size, pixel format and
 the camera settings the frame was taken with, which a script can append to its own log:
 
 ```sh

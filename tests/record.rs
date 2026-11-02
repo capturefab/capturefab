@@ -766,12 +766,16 @@ fn a_second_signal_ends_at_once_with_a_document() {
 /// An H.264 file `name` in the test's home, 10 s at 30 fps with a key frame
 /// each second and no B-frames, as a camera sends.
 fn h264_clip(home: &Home, name: &str) {
+    h264_clip_of(home, name, 10);
+}
+/// `h264_clip`, `seconds` long.
+fn h264_clip_of(home: &Home, name: &str, seconds: u32) {
     let made = std::process::Command::new(support::cli::ffmpeg())
         .args(["-v", "error", "-f", "lavfi", "-i"])
         .args([
             "testsrc2=size=320x240:rate=30",
             "-t",
-            "10",
+            &seconds.to_string(),
             "-c:v",
             "libx264",
         ])
@@ -784,6 +788,47 @@ fn h264_clip(home: &Home, name: &str) {
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
+}
+
+/// A recording of a video file ends with the file, finished, rather than
+/// holding its frames in the encoder until a signal; so does one asked to
+/// run longer than the file.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_recording_ends_when_its_video_file_does() {
+    let home = Home::new("record-source-end");
+    h264_clip_of(&home, "short.mp4", 2);
+    for (output, extra) in [
+        ("copy.mp4", &[][..]),
+        (
+            "encoded.mp4",
+            &["--codec", "h264", "--bitrate", "1M", "--for", "1m"][..],
+        ),
+    ] {
+        let mut child = home
+            .command()
+            .args(["--json", "record", "-c", "short.mp4", "-o", output])
+            .args(extra)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("recording {output} went on after its source ended");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let output_of = child.wait_with_output().unwrap();
+        assert_eq!(output_of.status.code(), Some(0), "{output}");
+        let result: Value = serde_json::from_slice(&output_of.stdout).unwrap();
+        assert_eq!(result["ended"], "source_ended", "{result}");
+        assert_eq!(result["finalized"], true, "{result}");
+        assert!(result["frames"].as_u64().unwrap() >= 30, "{result}");
+        assert!(decodes(&home.path(output)), "{output}");
+    }
 }
 
 /// An H.264 source is recorded as it arrives, in its own codec and with no

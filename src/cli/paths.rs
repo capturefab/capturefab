@@ -58,9 +58,7 @@ fn resolve_source(path: &mut String, base: &Path) -> Result<()> {
 /// are untouched.
 pub(crate) fn resolve_outputs(command: &mut SessionCommand, base: &Path) -> Result<()> {
     match command {
-        SessionCommand::Capture { output, .. } | SessionCommand::Schedule { output, .. } => {
-            resolve_path(output, base)
-        }
+        SessionCommand::Schedule { output, .. } => resolve_path(output, base),
         SessionCommand::Forward { output, .. } if crate::media::is_recording(output) => {
             // `file:relative.mkv` is a local path, while `file:///...` and
             // `file://localhost/...` are already absolute file URLs.
@@ -215,11 +213,11 @@ mod tests {
     fn relative_outputs_resolve_against_the_caller_and_urls_do_not() {
         let base = std::env::temp_dir().join("capturefab-path-output-tests");
         let mut capture = SessionCommand::from_json_slice(
-            br#"{"op":"capture","output":"frames/shot.png","count":1,"timeout_ms":2000,"format":"png"}"#,
+            br#"{"op":"schedule","output":"frames/shot.png","count":1,"timeout_ms":2000,"format":"png","first_at_ms":0,"interval_ms":0}"#,
         )
         .unwrap();
         resolve_outputs(&mut capture, &base).unwrap();
-        let SessionCommand::Capture { output, .. } = &capture else {
+        let SessionCommand::Schedule { output, .. } = &capture else {
             unreachable!()
         };
         assert_eq!(output, &base.join("frames/shot.png").display().to_string());

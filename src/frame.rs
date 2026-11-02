@@ -91,6 +91,32 @@ pub fn pixel_format_name(format: u32) -> &'static str {
 pub fn row_bytes(width: u32, pixel_format: u32) -> usize {
     (u64::from(width) * u64::from((pixel_format >> 16) & 0xff)).div_ceil(8) as usize
 }
+/// The planes of a planar or semiplanar layout, such as decoded video's
+/// `YCbCr709_420_8_Planar` or `RGB8_Planar`: each one's offset, row bytes
+/// and rows. None for a layout of one plane, whose rows are `row_bytes`.
+pub fn planes(pixel_format: u32, width: u32, height: u32) -> Option<Vec<Plane>> {
+    let mut offset = 0usize;
+    formats::planes(pixel_format, width, height)?
+        .into_iter()
+        .map(|(row_bytes, rows)| {
+            let plane = Plane {
+                offset,
+                row_bytes,
+                rows,
+            };
+            offset = offset.checked_add(row_bytes.checked_mul(rows)?)?;
+            Some(plane)
+        })
+        .collect()
+}
+/// One plane of a planar layout, as a raw capture's sidecar describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Plane {
+    /// Where it starts, in bytes from the frame's first.
+    pub offset: usize,
+    pub row_bytes: usize,
+    pub rows: usize,
+}
 /// Bytes in a `width` × `height` image: `row_bytes` for each row, or the
 /// planes of a planar Y'CbCr layout. None when it overflows.
 pub(crate) fn frame_len(pixel_format: u32, width: u32, height: u32) -> Option<usize> {

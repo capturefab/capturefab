@@ -166,8 +166,11 @@ pub fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
             command
                 .validate()
                 .map_err(|error| Usage(format!("{error:#}")))?;
-            if matches!(&command, SessionCommand::Capture { output, .. } if output == "-") {
-                return Err(Usage("debug rpc captures need an output file".into()).into());
+            if matches!(&command, SessionCommand::Capture { .. }) {
+                return Err(Usage(
+                    "debug rpc cannot send an image to stdout; save one with schedule".into(),
+                )
+                .into());
             }
             if let SessionCommand::Connect { camera, .. } = &mut command {
                 *camera = super::caller_selector(camera)?;

@@ -23,7 +23,6 @@ pub struct AutoChange {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct AutoStatus {
-    pub balance: f64,
     pub strategy: String,
     pub state: String,
     pub target_fps: Option<f64>,
@@ -40,20 +39,14 @@ pub struct AutoStatus {
     pub changes: Vec<AutoChange>,
 }
 
-pub const DEFAULT_BALANCE: f64 = 0.5;
+/// How the controller weighs image quality (0: long exposures, low gain,
+/// large video modes) against frame rate (1).
+const BALANCE: f64 = 0.5;
 const TARGET: f64 = 0.45;
 const AUTOS: [&str; 3] = ["ExposureAuto", "GainAuto", "BalanceWhiteAuto"];
 const SECOND: Duration = Duration::from_secs(1);
-const DARK: &str = "too dark for this balance: slide toward Quality or add light";
+const DARK: &str = "too dark at the longest exposure and highest gain allowed: add light, or raise --max-exposure if one was set";
 const BRIGHT: &str = "too bright at minimum exposure";
-
-pub fn validate_balance(balance: f64) -> Result<f64> {
-    ensure!(
-        balance.is_finite() && (0.0..=1.0).contains(&balance),
-        "balance must be a finite number between 0 (quality) and 1 (frame rate)"
-    );
-    Ok(balance)
-}
 
 pub(crate) fn clock() -> String {
     let s = SystemTime::now()
@@ -404,6 +397,8 @@ struct WhiteBalance {
 #[derive(Clone, Default)]
 pub struct AutoController {
     status: AutoStatus,
+    /// Image quality (0) against frame rate (1): `BALANCE`.
+    balance: f64,
     published: AutoStatus,
     published_at: Option<Instant>,
     caps: Caps,
@@ -447,8 +442,12 @@ pub struct AutoController {
 }
 
 impl AutoController {
-    pub fn enter(camera: &mut Camera, balance: f64) -> Result<Self> {
-        let balance = validate_balance(balance)?;
+    pub fn enter(camera: &mut Camera) -> Result<Self> {
+        Self::enter_with(camera, BALANCE)
+    }
+    /// `enter`, weighing image quality (0) against frame rate (1) as
+    /// `balance` says.
+    fn enter_with(camera: &mut Camera, balance: f64) -> Result<Self> {
         if !camera.info.profile.kind.supports_auto() {
             return Err(crate::types::Categorized::error(
                 crate::types::ErrorKind::Unsupported,
@@ -465,10 +464,10 @@ impl AutoController {
             .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b.into()));
         let mut controller = Self {
             status: AutoStatus {
-                balance,
                 state: "waiting".into(),
                 ..Default::default()
             },
+            balance,
             jitter: (hash % 1000) as f64 / 4000.0,
             ..Default::default()
         };
@@ -477,27 +476,16 @@ impl AutoController {
             .context("auto mode capability probe")?;
         controller.plan(camera);
         let strategy = json!(controller.status.strategy);
-        controller.change(
-            "auto",
-            None,
-            strategy,
-            &format!("auto mode entered with balance {balance:.2}"),
-        );
+        controller.change("auto", None, strategy, "auto mode entered");
         Ok(controller)
     }
-    pub fn set_balance(&mut self, camera: &mut Camera, balance: f64) -> Result<()> {
-        let balance = validate_balance(balance)?;
-        if balance != self.status.balance {
-            self.change(
-                "balance",
-                Some(json!(self.status.balance)),
-                json!(balance),
-                "balance changed",
-            );
-            self.status.balance = balance;
+    /// Weigh image quality against frame rate as `balance` says from now.
+    #[cfg(test)]
+    fn set_balance(&mut self, camera: &mut Camera, balance: f64) {
+        if balance != self.balance {
+            self.balance = balance;
             self.plan(camera);
         }
-        Ok(())
     }
     /// Meter only `region` of the frame, and keep exposure at most
     /// `max_exposure` microseconds, raising gain instead, as against motion
@@ -647,7 +635,7 @@ impl AutoController {
         if !self.caps.video_mode {
             return;
         }
-        let balance = self.status.balance;
+        let balance = self.balance;
         let result = camera.choices("VideoMode").and_then(|choices| {
             let modes: Vec<_> = choices
                 .iter()
@@ -672,7 +660,11 @@ impl AutoController {
                         .then(a.1.total_cmp(&b.1))
                 })
                 .context("camera lists no video modes")?;
-            self.set_mode(camera, json!(best.0), Some("video mode for the balance"))
+            self.set_mode(
+                camera,
+                json!(best.0),
+                Some("video mode for image quality and frame rate"),
+            )
         });
         match result {
             Ok(_) => self.clear_note("video-mode"),
@@ -1043,7 +1035,7 @@ impl AutoController {
             self.caps.trigger_period = self.period.map(|p| p * 1e6);
         }
         let c = self.caps.clone();
-        let mut p = policy(&c, self.status.balance);
+        let mut p = policy(&c, self.balance);
         if let Some(fps) = self.link_fps {
             let free = 1e6 / fps - margin(1e6 / fps);
             p.exposure_cap = p
@@ -1100,7 +1092,7 @@ impl AutoController {
                 pair,
                 p.exposure_lower,
                 high,
-                "exposure range for the balance",
+                "exposure range for the frame rate",
             );
         }
         if let (Some(pair), Some(_)) = (c.gain_limits, c.gain) {
@@ -1109,7 +1101,7 @@ impl AutoController {
                 pair,
                 c.gain_raw(p.gain_min),
                 c.gain_raw(p.gain_cap),
-                "gain range for the balance",
+                "gain range allowed",
             );
         }
         if let Some([f, v]) = c.profile {
@@ -1146,7 +1138,7 @@ impl AutoController {
                         camera,
                         g,
                         json!(c.gain_raw(start)),
-                        "gain within the range for the balance",
+                        "gain within the range allowed",
                     );
                 }
             }
@@ -1243,7 +1235,7 @@ impl AutoController {
     fn limiter_off(&mut self, camera: &mut Camera, c: &Caps) {
         if camera.network_budget_bytes_per_second().is_some() && !c.triggered {
             if let Some(f) = c.frame_rate {
-                let cap = policy(c, self.status.balance).fps_max;
+                let cap = policy(c, self.balance).fps_max;
                 self.rate_on(camera, c, "scanned network budget active");
                 self.apply(
                     camera,
@@ -2154,19 +2146,9 @@ mod tests {
     fn invalid_auto_inputs_do_not_change_controller_or_camera_state() {
         let fake = Fake::new(true);
         let mut camera = fake.camera();
-        for balance in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.1] {
-            assert!(AutoController::enter(&mut camera, balance).is_err());
-            assert!(fake.writes.lock().unwrap().is_empty());
-        }
-        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         auto.set_forward_fps(Some(20.0)).unwrap();
         let status = auto.status().clone();
-        let writes = fake.writes.lock().unwrap().clone();
-        for balance in [f64::NAN, f64::INFINITY, -0.1, 1.1] {
-            assert!(auto.set_balance(&mut camera, balance).is_err());
-            assert_eq!(auto.status(), &status);
-            assert_eq!(*fake.writes.lock().unwrap(), writes);
-        }
         for fps in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -1.0] {
             assert!(auto.set_forward_fps(Some(fps)).is_err());
             assert_eq!(auto.caps.forward_fps, Some(20.0));
@@ -2649,7 +2631,7 @@ mod tests {
         let fake = Fake::new(true);
         fake.set_lost(0);
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!(
             *fake.writes.lock().unwrap(),
             [
@@ -2705,7 +2687,7 @@ mod tests {
     fn limit_pairs_are_written_in_an_order_that_stays_valid() {
         let fake = Fake::new(true);
         let mut camera = fake.camera();
-        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         let pair = ["AutoExposureTimeLowerLimit", "AutoExposureTimeUpperLimit"];
         for (low, high) in [(50_000.0, 60_000.0), (100.0, 200.0)] {
             fake.writes.lock().unwrap().clear();
@@ -2721,7 +2703,7 @@ mod tests {
     fn supervisor_reports_pinned_exposure_and_recovers() {
         let fake = Fake::new(true);
         let mut camera = fake.camera();
-        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         camera.start().unwrap();
         let mut now = Instant::now();
         fake.set_f64(EXPOSURE, auto.policy.exposure_cap);
@@ -2747,7 +2729,7 @@ mod tests {
         fake.set_lost(0);
         fake.set_u32(CURRENT, 20_000_000);
         let mut camera = fake.camera();
-        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         camera.start().unwrap();
         let mut now = Instant::now();
         let fitted = |auto: &AutoController| {
@@ -2772,7 +2754,7 @@ mod tests {
     fn supervisor_steps_gain_without_a_profile_and_falls_back_when_stalled() {
         let fake = Fake::new(false);
         let mut camera = fake.camera();
-        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!((fake.u32(GAIN_AUTO), fake.f64(GAIN)), (0, 0.0));
         camera.start().unwrap();
         let mut now = Instant::now();
@@ -2793,7 +2775,7 @@ mod tests {
         let fake = Fake::new(true);
         fake.set_lost(0);
         let mut camera = fake.camera();
-        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         camera.start().unwrap();
         let mut now = Instant::now();
         drive(&mut auto, &mut camera, &mut now, 3.0, 120);
@@ -2820,7 +2802,7 @@ mod tests {
         let fake = Fake::new(true);
         let mut camera = fake.camera();
         let before = fake.memory.lock().unwrap().clone();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         fake.set_f64(EXPOSURE, 20_000.0);
         fake.set_f64(GAIN, 6.0);
         auto.release(&mut camera, true).unwrap();
@@ -2831,7 +2813,7 @@ mod tests {
 
         let fake = Fake::new(true);
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         auto.release(&mut camera, false).unwrap();
         assert_eq!(
             [EXPOSURE_AUTO, GAIN_AUTO, WHITE_AUTO].map(|a| fake.u32(a)),
@@ -2859,7 +2841,7 @@ mod tests {
             "<Enumeration Name='TriggerMode'><EnumEntry Name='Off'><Value>0</Value></EnumEntry><EnumEntry Name='On'><Value>1</Value></EnumEntry><pValue>TriggerReg</pValue></Enumeration><IntReg Name='TriggerReg'><Address>176</Address><Length>4</Length><AccessMode>RW</AccessMode></IntReg></RegisterDescription>",
         );
         let mut camera = fake.camera();
-        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         let fps = auto.status().target_fps.unwrap();
         fake.set_u32(PAYLOAD, 4_608_000);
         fake.set_u32(PIXEL, MONO8);
@@ -2949,7 +2931,7 @@ mod tests {
         let mut camera = fake.camera();
         assert!(camera.is_locked("ExposureTime") && camera.is_locked("AcquisitionFrameRate"));
         camera.set_network_budget_bytes_per_second(40_000_000);
-        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         assert_eq!(auto.status().strategy, "firmware");
         assert_eq!(
             (auto.caps.exposure, auto.caps.gain, auto.caps.frame_rate),
@@ -2979,7 +2961,7 @@ mod tests {
             .replace("AutoExposureTimeLowerLimit", "UnusedLowerLimit")
             .replace("AutoExposureTimeUpperLimit", "UnusedUpperLimit");
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!(auto.status().strategy, "software");
         assert_eq!(auto.caps.exposure, Some("ExposureTime"));
         assert_eq!((fake.u32(EXPOSURE_AUTO), fake.u32(GAIN_AUTO)), (0, 0));
@@ -3000,7 +2982,7 @@ mod tests {
         fake.set_u32(208, 2);
         let mut camera = fake.camera();
         camera.set_network_budget_bytes_per_second(40_000_000);
-        let auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         assert_eq!(
             auto.caps.frame_rate_enable,
             Some("AcquisitionFrameRateEnabled")
@@ -3030,7 +3012,7 @@ mod tests {
             );
         fake.set_u32(MODE, 1);
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         assert_eq!(auto.caps.throughput, Some("StreamBytesPerSecond"));
         assert_eq!(fake.u32(MODE), 0);
         auto.release(&mut camera, true).unwrap();
@@ -3051,7 +3033,7 @@ mod tests {
             .replace("AutoExposureTimeUpperLimit", "UnusedUpperLimit");
         fake.set_f64(GAIN, 2.0);
         let mut camera = fake.camera();
-        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert!(auto.caps.gain_linear);
         assert_eq!(auto.status().gain_limits_db, Some([0.0, 15.0]));
         fake.set_f64(EXPOSURE, auto.policy.exposure_cap);
@@ -3074,7 +3056,7 @@ mod tests {
             "<Float Name='Gain'><Unit>DN</Unit><pValue>GainReg</pValue>",
         );
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!(auto.caps.gain, None);
     }
 
@@ -3092,7 +3074,7 @@ mod tests {
             &selector("<EnumEntry Name='DigitalAll'><Value>0</Value></EnumEntry><EnumEntry Name='SensorAll'><Value>1</Value></EnumEntry>"),
         );
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!(auto.caps.gain_selector, Some("SensorAll"));
         assert_eq!(fake.u32(176), 1);
 
@@ -3102,7 +3084,7 @@ mod tests {
         );
         fake.set_u32(176, 0);
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!(auto.caps.gain, None);
         assert!(auto.status().notes.iter().any(|n| n.contains("DigitalAll")));
     }
@@ -3115,7 +3097,7 @@ mod tests {
             "<Float Name='GainRaw'><pValue>GainReg</pValue>",
         );
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!(
             (auto.status().strategy.as_str(), auto.caps.gain),
             ("firmware", None)
@@ -3153,7 +3135,7 @@ mod tests {
             .replace("AutoExposureTimeUpperLimit", "UnusedUpperLimit");
         fake.set_u32(EXPOSURE_AUTO, 2);
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!(auto.status().strategy, "software");
         assert_eq!(fake.u32(EXPOSURE_AUTO), 0);
         assert!(auto.manages("ExposureAuto"));
@@ -3173,7 +3155,7 @@ mod tests {
         fake.set_u32(EXPOSURE_AUTO, 2);
         fake.set_u32(WHITE_AUTO, 2);
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert!(auto.manages("BalanceRatioSelector"));
         fake.set_f64(EXPOSURE, 3983.0);
         fake.set_f64(152, 1.6);
@@ -3191,7 +3173,7 @@ mod tests {
         fake.set_lost(0);
         fake.set_u32(THROUGHPUT, 125_000_000);
         let mut camera = fake.camera();
-        let auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         assert_eq!(fake.u32(THROUGHPUT), 115_000_000);
         assert_eq!(auto.bandwidth.as_ref().unwrap().aimd.limit, 115e6);
         auto.release(&mut camera, true).unwrap();
@@ -3205,7 +3187,7 @@ mod tests {
         fake.set_u32(THROUGHPUT, 125_000_000);
         let mut camera = fake.camera();
         camera.set_network_budget_bytes_per_second(40_000_000);
-        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         assert!(fake.u32(THROUGHPUT) <= 40_000_000);
         assert!(auto.bandwidth.as_ref().unwrap().aimd.cap <= 40_000_000.0);
         camera.set_network_budget_bytes_per_second(20_000_000);
@@ -3220,7 +3202,7 @@ mod tests {
         let fake = Fake::new(true);
         let mut camera = fake.camera();
         camera.set_network_budget_bytes_per_second(400_000_000);
-        let auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         assert!((auto.caps.link.unwrap() * 0.92 - 400_000_000.0).abs() < 1.0);
     }
 
@@ -3233,7 +3215,7 @@ mod tests {
             .replace("DeviceLinkThroughputLimit", "UnusedThroughputLimit");
         let mut camera = fake.camera();
         camera.set_network_budget_bytes_per_second(40_000_000);
-        let mut auto = AutoController::enter(&mut camera, 1.0).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 1.0).unwrap();
         assert_eq!(fake.u32(ENABLE), 1);
         let cap = 40_000_000.0 / (1.05 * 2_304_000.0);
         assert!(fake.f64(RATE) <= cap + 1e-6);
@@ -3260,14 +3242,14 @@ mod tests {
             );
         let mut camera = fake.camera();
         camera.info.transport = Transport::Media;
-        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         assert_eq!(auto.status().strategy, "video-mode");
         assert_eq!(auto.status().target_fps, Some(30.0));
         camera.start().unwrap();
         let mut now = Instant::now();
         drive(&mut auto, &mut camera, &mut now, 1.0, 120);
         assert_eq!(auto.status().state, "stable");
-        auto.set_balance(&mut camera, 1.0).unwrap();
+        auto.set_balance(&mut camera, 1.0);
         auto.choose_video_mode(&mut camera);
         assert_eq!(camera.get("VideoMode").unwrap(), "640x480@120");
         assert_eq!(auto.status().target_fps, Some(120.0));
@@ -3289,7 +3271,7 @@ mod tests {
     fn revert_orders_limits_after_a_later_plan_raises_the_lower_bound() {
         let fake = Fake::new(true);
         let mut camera = fake.camera();
-        let mut auto = AutoController::enter(&mut camera, 0.5).unwrap();
+        let mut auto = AutoController::enter_with(&mut camera, 0.5).unwrap();
         auto.write_pair(
             &mut camera,
             ["AutoExposureTimeLowerLimit", "AutoExposureTimeUpperLimit"],

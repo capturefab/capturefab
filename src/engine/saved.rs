@@ -145,6 +145,9 @@ pub struct Manifest {
 }
 impl Manifest {
     /// Open `path` for appending, creating it and its folder when missing.
+    /// An existing file must be empty or JSON Lines, such as an earlier
+    /// manifest: lines are never appended to an image or another file named
+    /// by mistake.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path
             .parent()
@@ -154,16 +157,24 @@ impl Manifest {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("cannot create the folder of {}", path.display()))?;
         }
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
+            .read(true)
             .append(true)
             .create(true)
             .open(path)
             .with_context(|| format!("cannot open manifest {}", path.display()))?;
-        anyhow::ensure!(
-            file.metadata()?.is_file(),
-            "manifest {} is not a file",
-            path.display()
-        );
+        let meta = file.metadata()?;
+        anyhow::ensure!(meta.is_file(), "manifest {} is not a file", path.display());
+        if meta.len() > 0 && !json_lines(&mut file)? {
+            return Err(crate::types::Categorized::new(
+                crate::types::ErrorKind::Usage,
+                format!(
+                    "manifest {} is not a JSON Lines file; name a new file or an earlier manifest",
+                    path.display()
+                ),
+            )
+            .into());
+        }
         Ok(Self {
             file,
             path: path.to_path_buf(),
@@ -181,6 +192,19 @@ impl Manifest {
             .sync_data()
             .with_context(|| format!("cannot sync manifest {}", self.path.display()))
     }
+}
+
+/// Whether a file's first line starts as a JSON object and its last
+/// ends: what this or an earlier manifest leaves.
+fn json_lines(file: &mut File) -> Result<bool> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut first = [0u8; 1];
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut first)?;
+    file.seek(SeekFrom::End(-1))?;
+    file.read_exact(&mut last)?;
+    Ok(first == *b"{" && last == *b"\n")
 }
 
 #[cfg(test)]
@@ -262,6 +286,15 @@ mod tests {
                 .all(|row| serde_json::from_str::<Value>(row).unwrap() == line)
         );
         assert!(Manifest::open(&dir).is_err(), "a folder is no manifest");
+        // Lines go to an empty file or a manifest, never another file.
+        let image = dir.join("shot.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\n...IEND").unwrap();
+        let refused = Manifest::open(&image).unwrap_err();
+        assert_eq!(crate::cli::error_code(&refused).0, "usage", "{refused:#}");
+        assert_eq!(std::fs::read(&image).unwrap(), b"\x89PNG\r\n\x1a\n...IEND");
+        let empty = dir.join("empty.jsonl");
+        std::fs::write(&empty, b"").unwrap();
+        Manifest::open(&empty).unwrap().append(&line).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

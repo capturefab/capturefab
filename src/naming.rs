@@ -507,6 +507,19 @@ impl Plan {
             Plan::Stdout | Plan::Directory { .. } => false,
         }
     }
+    /// Whether a frame's name says when it was taken: a folder's names, or
+    /// a template with {date}, {time} or {datetime}.
+    pub fn names_time(&self) -> bool {
+        match self {
+            Plan::Directory { .. } => true,
+            Plan::Template(t) => tokens(t).is_ok_and(|tokens| {
+                tokens
+                    .iter()
+                    .any(|t| matches!(t, Token::Date | Token::Time | Token::DateTime))
+            }),
+            Plan::Stdout | Plan::File(_) => false,
+        }
+    }
     /// Whether each camera's frames get names of their own: a folder's
     /// names, or a template with {camera} or {serial}.
     pub fn names_camera(&self) -> bool {
@@ -545,11 +558,21 @@ pub fn renumbers(plan: &Plan, on_exists: OnExists) -> bool {
 /// seconds, or this computer's when none was sent. A session started in
 /// another time zone then names files as the person who asked would.
 pub fn clock(utc_offset_s: Option<i32>) -> DateTime<FixedOffset> {
-    let now = chrono::Utc::now();
+    in_zone(chrono::Utc::now(), utc_offset_s)
+}
+/// A frame's time, `wall_ms` UTC Unix milliseconds, as `clock` reads now.
+pub fn frame_time(wall_ms: u64, utc_offset_s: Option<i32>) -> DateTime<FixedOffset> {
+    let time = i64::try_from(wall_ms)
+        .ok()
+        .and_then(DateTime::from_timestamp_millis)
+        .unwrap_or_else(chrono::Utc::now);
+    in_zone(time, utc_offset_s)
+}
+fn in_zone(time: DateTime<chrono::Utc>, utc_offset_s: Option<i32>) -> DateTime<FixedOffset> {
     let offset = utc_offset_s
         .and_then(FixedOffset::east_opt)
-        .unwrap_or_else(|| *now.with_timezone(&chrono::Local).offset());
-    now.with_timezone(&offset)
+        .unwrap_or_else(|| *time.with_timezone(&chrono::Local).offset());
+    time.with_timezone(&offset)
 }
 /// This computer's UTC offset in seconds now, which requests carry.
 pub fn local_offset() -> i32 {
@@ -1009,6 +1032,28 @@ mod tests {
         assert_eq!(here.offset().local_minus_utc(), local_offset());
         assert!(validate_offset(Some(86_400)).is_err());
         assert!(validate_offset(Some(-3600)).is_ok());
+        // A frame's time, read the same way.
+        let taken = frame_time(1_700_000_000_123, Some(3600));
+        assert_eq!(taken.format(TIME_FORMAT).to_string(), "20231114-231320.123");
+    }
+
+    #[test]
+    fn names_say_whether_they_carry_the_time() {
+        for (output, count, timed) in [
+            ("shots/", 1, true),
+            ("a/{date}/b.png", 1, true),
+            ("{time}.png", 1, true),
+            ("{datetime}-{seq}.png", 2, true),
+            ("{camera}-{seq}.png", 2, false),
+            ("shot.png", 1, false),
+            ("-", 1, false),
+        ] {
+            assert_eq!(
+                Plan::new(output, count, "png").names_time(),
+                timed,
+                "{output}"
+            );
+        }
     }
 
     #[test]

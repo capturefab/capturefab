@@ -32,6 +32,41 @@ fn inspect_waits_for_a_trigger_without_limit() {
     }
 }
 
+/// A free-running camera with no frame in time: what to do, and what it
+/// sent meanwhile, without advice about triggers it does not use.
+#[test]
+fn a_missed_frame_says_what_to_do_and_what_came() {
+    let home = Home::new("inspect-timeout");
+    // A one-second exposure: the frame after the first comes long after
+    // the wait.
+    let error = home.fails(
+        4,
+        &[
+            "inspect",
+            "-c",
+            "sim:0",
+            "--set",
+            "ExposureTime=1000000",
+            "--fresh",
+            "1",
+            "--timeout",
+            "300ms",
+            "--preview",
+            "none",
+        ],
+    );
+    assert_eq!(error["code"], "frame_timeout", "{error}");
+    let message = error["message"].as_str().unwrap();
+    assert!(!message.to_lowercase().contains("trigger"), "{message}");
+    assert!(
+        error["hint"].as_str().unwrap().contains("--timeout"),
+        "{error}"
+    );
+    // The frame let pass came; the next did not.
+    assert_eq!(error["details"]["frames"], 1, "{error}");
+    assert!(error["details"]["dropped"].is_u64(), "{error}");
+}
+
 #[test]
 fn inspect_measures_a_fresh_frame_and_leaves_a_private_preview() {
     let home = Home::new("inspect");

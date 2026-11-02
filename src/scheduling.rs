@@ -5,10 +5,42 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_DURATION_MS: u64 = 315_576_000_000;
 
+/// Where a capture job is: waiting for its next shot, taking one, or how
+/// it ended.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureStatus {
+    /// Waiting until its next shot is due.
+    #[default]
+    Pending,
+    /// Waiting for a shot's frame, or for its last shots to be saved.
+    Running,
+    /// Every frame asked for was saved.
+    Done,
+    Failed,
+    /// Stopped by a command.
+    Cancelled,
+    /// Ended by the worker shutting down.
+    Interrupted,
+}
+impl CaptureStatus {
+    /// How the job ended, as the protocol reports it; None while it runs.
+    pub(crate) fn ended(self) -> Option<crate::session::protocol::JobStatus> {
+        use crate::session::protocol::JobStatus;
+        Some(match self {
+            Self::Pending | Self::Running => return None,
+            Self::Done => JobStatus::Done,
+            Self::Failed => JobStatus::Failed,
+            Self::Cancelled => JobStatus::Cancelled,
+            Self::Interrupted => JobStatus::Interrupted,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CaptureJob {
     pub id: u64,
-    pub status: String,
+    pub status: CaptureStatus,
     pub output: String,
     pub count: u32,
     pub captured: u32,
@@ -101,11 +133,12 @@ pub struct JobFrame {
 }
 impl CaptureJob {
     pub fn active(&self) -> bool {
-        matches!(self.status.as_str(), "pending" | "running")
+        self.status.ended().is_none()
     }
-    /// Stop the job as `status` (failed or cancelled), with the failure.
-    pub fn end(&mut self, status: &str, error: Option<&anyhow::Error>) {
-        self.status = status.into();
+    /// Stop the job as `status` (failed, cancelled or interrupted), with
+    /// the failure.
+    pub fn end(&mut self, status: CaptureStatus, error: Option<&anyhow::Error>) {
+        self.status = status;
         self.ended_ms = Some(now_ms());
         if let Some(error) = error {
             self.error = Some(format!("{error:#}"));

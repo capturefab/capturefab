@@ -267,8 +267,19 @@ pub(super) fn begin(
             request,
             reply: envelope.reply,
         }),
+        Err(error) if no_frame_in_time(&error) => {
+            (envelope.reply)(Err(counted(h, error, &baseline)))
+        }
         Err(error) => (envelope.reply)(Err(error)),
     }
+}
+
+/// Whether `error` says no frame or trigger came in time.
+fn no_frame_in_time(error: &anyhow::Error) -> bool {
+    matches!(
+        crate::types::classify(error).kind,
+        crate::types::ErrorKind::FrameTimeout | crate::types::ErrorKind::TriggerTimeout
+    )
 }
 
 /// Acquire `count` frames from a stopped camera, warming up one that sets
@@ -420,7 +431,7 @@ pub(super) fn expire(
             interrupted("inspection cancelled")
         } else if now >= item.deadline {
             match camera.as_mut() {
-                Some(c) => missing_frame(c, item.request.timeout),
+                Some(c) => counted(h, missing_frame(c, item.request.timeout), &item.baseline),
                 None => no_camera(),
             }
         } else if !streaming {
@@ -482,15 +493,26 @@ fn missing_frame(c: &mut Camera, wait: Duration) -> anyhow::Error {
     }
 }
 
+/// `error` with the frames delivered, dropped and incomplete since
+/// `baseline`, which also say why a frame never came.
+fn counted(h: &WorkerHandle, error: anyhow::Error, baseline: &Baseline) -> anyhow::Error {
+    crate::types::with_details(error, baseline.counts(&Baseline::now(h), 0))
+}
+
 /// An inspection without a frame; "timed out" makes the CLI exit 4.
 pub(super) fn no_new_frame(camera: &str, wait: Duration) -> anyhow::Error {
     // Rounded up, so a deadline set for 3s just before reads "3s".
     let ms = u64::try_from(wait.as_micros().div_ceil(1000)).unwrap_or(u64::MAX);
-    crate::types::frame_timeout(format!(
-        "no new frame from {} within {} (timed out); a triggered camera needs TriggerSoftware",
-        crate::media::redact_url(camera),
-        crate::types::duration_text(Duration::from_millis(ms))
-    ))
+    crate::types::Categorized::new(
+        crate::types::ErrorKind::FrameTimeout,
+        format!(
+            "no new frame from {} within {} (timed out)",
+            crate::media::redact_url(camera),
+            crate::types::duration_text(Duration::from_millis(ms))
+        ),
+    )
+    .hint(NO_FRAME_HINT)
+    .into()
 }
 
 /// Measure a job's frame and write its preview: the reply.
@@ -767,8 +789,14 @@ mod tests {
         let error = no_new_frame("rtsp://user:secret@cam/live", Duration::from_millis(3000));
         assert_eq!(
             error.to_string(),
-            "no new frame from rtsp://<redacted>@cam/live within 3s (timed out); a triggered camera needs TriggerSoftware"
+            "no new frame from rtsp://<redacted>@cam/live within 3s (timed out)"
         );
         assert_eq!(crate::cli::error_code(&error), ("frame_timeout", 4));
+        // What to do, and nothing about triggers for a camera without one.
+        let hint = crate::types::classify(&error).hint.unwrap();
+        assert!(
+            hint.contains("--timeout") && hint.contains("info"),
+            "{hint}"
+        );
     }
 }

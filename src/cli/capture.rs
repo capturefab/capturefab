@@ -1061,15 +1061,9 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
     }
     prepare(&client, args, plan)?;
     let request = |stdout: Option<String>| SessionCommand::Capture {
-        output: "-".into(),
-        count: 1,
         timeout_ms: plan.timeout_ms,
         format: plan.format.into(),
-        on_exists: Default::default(),
-        sync: args.sync,
-        min_free: plan.min_free,
         context: plan.context.clone(),
-        utc_offset_s: Some(crate::naming::local_offset()),
         quality: args.quality,
         fresh: args.fresh,
         warmup_ms: Some(plan.warmup_ms),

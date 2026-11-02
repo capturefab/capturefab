@@ -757,25 +757,12 @@ fn debug_rpc_takes_public_commands_only() {
         &["--json", "debug", "rpc", "-c", "sim:0"],
     );
     assert_eq!(run.success()["values"]["TriggerMode[FrameStart]"], "Off");
-    // A capture takes one frame and counts what the transport lost before
-    // it; more frames are a schedule's.
-    let capture = |count: u32| {
-        let output = home.path("rpc.png");
-        format!(
-            r#"{{"op":"capture","output":{},"count":{count},"timeout_ms":2000,"format":"png"}}"#,
-            json!(output.to_str().unwrap())
-        )
-    };
+    // A capture sends its image to stdout, which the results own here;
+    // files are a schedule's.
     let run = home.run_stdin(
-        &capture(1),
-        &["--json", "debug", "rpc", "-c", "sim:0?drop=0.3"],
+        r#"{"op":"capture","timeout_ms":2000,"format":"png"}"#,
+        &["--json", "debug", "rpc", "-c", "sim:0"],
     );
-    let shot = run.success();
-    assert_eq!(shot["files"].as_array().unwrap().len(), 1, "{shot}");
-    let first = shot["frame"]["id"].as_u64().unwrap();
-    let lost = shot["dropped"].as_u64().unwrap() + shot["incomplete"].as_u64().unwrap();
-    assert_eq!(lost, first - 1, "{shot}");
-    let run = home.run_stdin(&capture(3), &["--json", "debug", "rpc", "-c", "sim:0"]);
     assert!(
         run.failure(2)["message"]
             .as_str()

@@ -840,7 +840,7 @@ fn answer(
     };
     command.validate()?;
     ensure!(
-        !matches!(&command, SessionCommand::Capture { output, stdout: None, .. } if output == "-"),
+        !matches!(&command, SessionCommand::Capture { stdout: None, .. }),
         "a capture to stdout through a session needs a stdout file"
     );
     // Looking at a session, or waiting for its jobs, is not using it.
@@ -1181,7 +1181,7 @@ pub fn call_keeping(
 ) -> Result<Value> {
     command.validate()?;
     ensure!(
-        !matches!(&command, SessionCommand::Capture { output, stdout: None, .. } if output == "-"),
+        !matches!(&command, SessionCommand::Capture { stdout: None, .. }),
         "a capture to stdout through a session needs a stdout file"
     );
     if let Some(camera) = camera {

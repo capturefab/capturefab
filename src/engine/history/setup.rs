@@ -272,9 +272,7 @@ pub(super) fn read(
     }
     let reading = Reading {
         camera: SavedCamera::from_info(&camera.info),
-        auto: auto.as_ref().map(|controller| SavedAuto {
-            balance: controller.status().balance,
-        }),
+        auto: auto.as_ref().map(|_| SavedAuto::default()),
         values,
         skipped,
     };
@@ -329,41 +327,32 @@ pub(super) struct Row {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) enum AutoChange {
     None,
-    /// Auto starts with this balance.
-    Enter(f64),
-    /// Auto keeps running with another balance.
-    Balance {
-        from: f64,
-        to: f64,
-    },
+    /// Auto starts.
+    Enter,
     /// Auto stops; the camera keeps its values (manual mode).
     Release,
 }
 impl AutoChange {
-    fn of(current: Option<f64>, saved: Option<f64>) -> Self {
+    fn of(current: bool, saved: bool) -> Self {
         match (current, saved) {
-            (None, None) => Self::None,
-            (None, Some(balance)) => Self::Enter(balance),
-            (Some(_), None) => Self::Release,
-            (Some(from), Some(to)) if (from - to).abs() <= 1e-6 => Self::None,
-            (Some(from), Some(to)) => Self::Balance { from, to },
+            (false, true) => Self::Enter,
+            (true, false) => Self::Release,
+            _ => Self::None,
         }
     }
     fn action(self) -> &'static str {
         match self {
             Self::None => "none",
-            Self::Enter(_) => "enter",
-            Self::Balance { .. } => "balance",
+            Self::Enter => "enter",
             Self::Release => "release",
         }
     }
     /// The words a log line or result uses, if anything changes.
-    fn words(self) -> Option<String> {
+    fn words(self) -> Option<&'static str> {
         match self {
             Self::None => None,
-            Self::Enter(balance) => Some(format!("auto exposure on (balance {balance:.2})")),
-            Self::Balance { from, to } => Some(format!("auto balance {from:.2} → {to:.2}")),
-            Self::Release => Some("auto exposure off (manual)".into()),
+            Self::Enter => Some("auto exposure on"),
+            Self::Release => Some("auto exposure off (manual)"),
         }
     }
 }
@@ -376,8 +365,8 @@ pub(super) struct Plan {
     warnings: Vec<String>,
     pub(super) restarts_stream: bool,
     blocked: Option<String>,
-    /// Software auto exposure's balance now and in the setup.
-    auto: (Option<f64>, Option<f64>),
+    /// Whether software auto exposure runs now, and runs in the setup.
+    auto: (bool, bool),
 }
 impl Plan {
     pub(super) fn changes(&self) -> impl Iterator<Item = &Row> {
@@ -763,10 +752,7 @@ pub(super) fn plan(
                 locked.join(", ")
             )
         }),
-        auto: (
-            auto.as_ref().map(|controller| controller.status().balance),
-            setup.auto.as_ref().map(|saved| saved.balance),
-        ),
+        auto: (auto.is_some(), setup.auto.is_some()),
     })
 }
 
@@ -1145,8 +1131,8 @@ pub(super) fn apply(
     }
     let mut result = outcome(plan, &c.info, &restored.unavailable);
     match &setup.auto {
-        Some(saved) => {
-            let entered = enter_auto(h, camera, auto, forwarder, jobs, Some(saved.balance), None)?;
+        Some(_) => {
+            let entered = enter_auto(h, camera, auto, forwarder, jobs, None)?;
             result["auto"] = entered["auto"].clone();
         }
         None => {
@@ -1490,7 +1476,6 @@ mod tests {
         let h = connected("sim:0");
         let manual = saved(&h, "manual");
         h.request(SessionCommand::Auto {
-            balance: Some(0.25),
             continuous: false,
             job: None,
             max_exposure_us: None,
@@ -1498,7 +1483,7 @@ mod tests {
         })
         .unwrap();
         let automatic = saved(&h, "auto");
-        assert_eq!(automatic.auto.as_ref().unwrap().balance, 0.25);
+        assert!(automatic.auto.is_some());
         assert!(
             automatic.skipped.iter().any(|s| s.feature == "ExposureTime"
                 && s.reason == "managed by Capturefab auto exposure"),
@@ -1510,7 +1495,7 @@ mod tests {
         let release = diff(&h, &manual).unwrap();
         assert_eq!(
             release["auto_change"],
-            json!({"current":0.25,"saved":null,"action":"release","risk":"reversible"})
+            json!({"current":true,"saved":false,"action":"release","risk":"reversible"})
         );
         let released = apply(&h, &manual).unwrap();
         assert_eq!(released["auto_changed"], true, "{released}");
@@ -1518,7 +1503,7 @@ mod tests {
         let enter = diff(&h, &automatic).unwrap();
         assert_eq!(enter["changes"], json!([]), "{enter}");
         assert_eq!(enter["auto_change"]["action"], "enter");
-        assert_eq!(enter["auto_change"]["saved"], 0.25);
+        assert_eq!(enter["auto_change"]["saved"], true);
         let restored = apply(&h, &automatic).unwrap();
         assert_eq!(restored["auto_changed"], true);
         assert_eq!(restored["applied"], 0);
@@ -1526,8 +1511,7 @@ mod tests {
             h.snapshot()
                 .logs
                 .iter()
-                .any(|l| l.message
-                    == "Restored preset auto: 0 changed; auto exposure on (balance 0.25)"),
+                .any(|l| l.message == "Restored preset auto: 0 changed; auto exposure on"),
             "{:?}",
             h.snapshot().logs
         );
@@ -1535,8 +1519,8 @@ mod tests {
             diff(&h, &automatic).unwrap()["auto_change"]["action"],
             "none"
         );
-        assert_eq!(restored["auto"]["balance"], 0.25, "{restored}");
-        assert_eq!(h.snapshot().auto.unwrap().balance, 0.25);
+        assert!(restored["auto"]["managed"].is_array(), "{restored}");
+        assert!(h.snapshot().auto.is_some());
         h.shutdown();
     }
 
