@@ -340,6 +340,7 @@ pub struct Measurements {
 /// Measure the `px` region of `frame` (see `crop_rect`) from a camera of
 /// `kind`. Depth, thermal and line-scan images and undecodable formats have
 /// no exposure or focus; a note says why.
+#[cfg(any(test, feature = "testing"))]
 pub fn measure(frame: &Frame, kind: CameraKind, region_px: [u32; 4]) -> Measurements {
     let rect = crop_rect(frame, region_px);
     match view(frame, rect) {

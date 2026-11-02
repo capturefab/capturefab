@@ -275,6 +275,7 @@ impl Planes {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
 pub fn software(raster: &Raster) -> Result<Body<'static>> {
     software_quality(raster, QUALITY)
 }
@@ -469,6 +470,7 @@ pub fn com_segment(payload: &[u8]) -> Result<Vec<u8>> {
 }
 /// The JPEG with a COM segment holding `payload` in its place, in one
 /// buffer; stills write the two as parts instead.
+#[cfg(any(test, feature = "testing"))]
 pub fn insert_com(jpeg: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
     let segment = com_segment(payload)?;
     let at = com_offset(jpeg)?;

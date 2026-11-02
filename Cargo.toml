@@ -33,6 +33,11 @@ shell = ["dep:rustyline"]
 # write each camera worker's and GPU JPEG helper's counts to
 # $CAPTUREFAB_COPY_REPORT (tests/copies.rs). Off in every release build.
 copy-audit = []
+# `capturefab::testing`: the library's internals that the integration tests
+# and benchmarks reach, and the reference conversions and one-call wrappers
+# only they and the unit tests call. The dev-dependency below turns it on
+# for tests and benchmarks, so no other build compiles them.
+testing = []
 
 [dependencies]
 anyhow = "1"
@@ -83,6 +88,9 @@ libc = "0.2"
 # SHA-NI at runtime without this; the asm crate does not assemble under MSVC.
 [target.'cfg(all(target_arch = "aarch64", not(target_env = "msvc")))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
+
+[dev-dependencies]
+capturefab = { path = ".", default-features = false, features = ["testing"] }
 
 [build-dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

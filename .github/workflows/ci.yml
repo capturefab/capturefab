@@ -37,6 +37,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      # Without the tests the library has no `testing` feature, so code only
+      # they call shows as dead.
+      - run: cargo clippy --locked -- -D warnings
 
   test:
     name: Test on ${{ matrix.os }}

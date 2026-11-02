@@ -119,9 +119,6 @@ impl<'a> Encoded<'a> {
     pub fn len(&self) -> usize {
         self.body.len() + self.insert.as_ref().map_or(0, |(_, bytes)| bytes.len())
     }
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
     /// The image's bytes in order, in up to three parts.
     pub fn parts(&self) -> [&[u8]; 3] {
         match &self.insert {
@@ -130,6 +127,7 @@ impl<'a> Encoded<'a> {
         }
     }
     /// The image in one buffer, for callers that need it whole.
+    #[cfg(any(test, feature = "testing"))]
     pub fn to_vec(&self) -> Vec<u8> {
         self.parts().concat()
     }
@@ -179,7 +177,7 @@ mod tests {
         assert_eq!(out, [1, 2, 9, 3, 4]);
         let end = Encoded::with_insert(Body::Vec(frame.to_vec()), 4, vec![9]);
         assert_eq!(end.to_vec(), [1, 2, 3, 4, 9]);
-        assert!(Encoded::new(Body::Vec(Vec::new())).is_empty());
+        assert_eq!(Encoded::new(Body::Vec(Vec::new())).len(), 0);
     }
     #[test]
     #[should_panic(expected = "insert past the end")]

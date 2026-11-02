@@ -27,13 +27,12 @@
 #[cfg(jpeg_helper)]
 pub(crate) mod shared;
 
+#[cfg(jpeg_helper)]
+use std::sync::atomic::Ordering;
 use std::{
     fmt,
     ops::{Deref, DerefMut},
-    sync::{
-        Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex, OnceLock},
 };
 
 /// The most buffers the pool keeps idle: enough for a camera's next frame
@@ -74,9 +73,9 @@ struct Shared {
     max_idle: usize,
     /// The memory the process may still use, when known.
     budget: Box<dyn Fn() -> Option<u64> + Send + Sync>,
-    allocations: AtomicU64,
-    reuses: AtomicU64,
-    freed: AtomicU64,
+    allocations: Counter,
+    reuses: Counter,
+    freed: Counter,
     /// How many helpers read this pool's buffers: while any do, new
     /// buffers are shared memory.
     #[cfg(jpeg_helper)]
@@ -138,7 +137,27 @@ enum Want {
     Segment,
 }
 
+/// A count of what a pool has done, kept only where something reads it:
+/// the unit tests and the copy audit (`FramePool::stats`). Elsewhere it
+/// counts nothing.
+#[derive(Default)]
+struct Counter(#[cfg(any(test, feature = "copy-audit"))] std::sync::atomic::AtomicU64);
+
+impl Counter {
+    fn add(&self, n: u64) {
+        #[cfg(any(test, feature = "copy-audit"))]
+        self.0.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(not(any(test, feature = "copy-audit")))]
+        let _ = n;
+    }
+    #[cfg(any(test, feature = "copy-audit"))]
+    fn get(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// What a pool has done.
+#[cfg(any(test, feature = "copy-audit"))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PoolStats {
     /// Buffers allocated because none idle would do.
@@ -163,9 +182,9 @@ impl FramePool {
                 idle: Mutex::new(Vec::new()),
                 max_idle: max_idle.max(1),
                 budget: Box::new(budget),
-                allocations: AtomicU64::new(0),
-                reuses: AtomicU64::new(0),
-                freed: AtomicU64::new(0),
+                allocations: Counter::default(),
+                reuses: Counter::default(),
+                freed: Counter::default(),
                 #[cfg(jpeg_helper)]
                 sharers: std::sync::atomic::AtomicUsize::new(0),
             }),
@@ -177,7 +196,7 @@ impl FramePool {
     pub fn take_stale(&self, len: usize) -> PoolVec {
         let store = self.shared_store(len).unwrap_or_else(|| {
             self.reuse(len, Want::Any).unwrap_or_else(|| {
-                self.shared.allocations.fetch_add(1, Ordering::Relaxed);
+                self.shared.allocations.add(1);
                 Store::Heap(vec![0; len])
             })
         });
@@ -196,7 +215,7 @@ impl FramePool {
     pub(crate) fn take_empty(&self, capacity: usize) -> PoolVec {
         let store = self.shared_store(capacity).unwrap_or_else(|| {
             self.reuse(capacity, Want::Any).unwrap_or_else(|| {
-                self.shared.allocations.fetch_add(1, Ordering::Relaxed);
+                self.shared.allocations.add(1);
                 Store::Heap(Vec::with_capacity(capacity))
             })
         });
@@ -210,7 +229,7 @@ impl FramePool {
         let mut vec = match self.reuse(len, Want::Heap) {
             Some(Store::Heap(vec)) => vec,
             _ => {
-                self.shared.allocations.fetch_add(1, Ordering::Relaxed);
+                self.shared.allocations.add(1);
                 vec![0; len]
             }
         };
@@ -233,7 +252,7 @@ impl FramePool {
             Some(store) => store,
             None => {
                 let segment = shared::Segment::create(len).ok()?;
-                self.shared.allocations.fetch_add(1, Ordering::Relaxed);
+                self.shared.allocations.add(1);
                 Store::Segment(Arc::new(segment))
             }
         };
@@ -258,11 +277,12 @@ impl FramePool {
         self.shared.sharers.fetch_add(1, Ordering::AcqRel);
         Sharing(self.shared.clone())
     }
+    #[cfg(any(test, feature = "copy-audit"))]
     pub fn stats(&self) -> PoolStats {
         PoolStats {
-            allocations: self.shared.allocations.load(Ordering::Relaxed),
-            reuses: self.shared.reuses.load(Ordering::Relaxed),
-            freed: self.shared.freed.load(Ordering::Relaxed),
+            allocations: self.shared.allocations.get(),
+            reuses: self.shared.reuses.get(),
+            freed: self.shared.freed.get(),
         }
     }
     fn holding(&self, store: Store) -> PoolVec {
@@ -280,7 +300,7 @@ impl FramePool {
         if self.shared.sharers.load(Ordering::Acquire) > 0 {
             return self.reuse(len, Want::Segment).or_else(|| {
                 let segment = shared::Segment::create(len).ok()?;
-                self.shared.allocations.fetch_add(1, Ordering::Relaxed);
+                self.shared.allocations.add(1);
                 Some(Store::Segment(Arc::new(segment)))
             });
         }
@@ -301,7 +321,7 @@ impl FramePool {
             })
             .min_by_key(|(_, store)| store.capacity())
             .map(|(index, _)| index)?;
-        self.shared.reuses.fetch_add(1, Ordering::Relaxed);
+        self.shared.reuses.add(1);
         Some(idle.swap_remove(best))
     }
 }
@@ -332,7 +352,7 @@ impl Shared {
             usize::try_from(budget / IDLE_SHARE).unwrap_or(usize::MAX)
         });
         if store.capacity() > limit {
-            self.freed.fetch_add(1, Ordering::Relaxed);
+            self.freed.add(1);
             return;
         }
         let mut freed = Vec::new();
@@ -346,7 +366,7 @@ impl Shared {
                 freed.push(oldest);
             }
         }
-        self.freed.fetch_add(freed.len() as u64, Ordering::Relaxed);
+        self.freed.add(freed.len() as u64);
         // Freed outside the lock: unmapping a large buffer takes a while.
         drop(freed);
     }

@@ -93,7 +93,10 @@ pub fn run() {
 }
 
 /// What the integration tests and benchmarks use, at the same paths as in
-/// the crate. Not a public API.
+/// the crate. Not a public API: only the `testing` feature, which tests and
+/// benchmarks turn on, builds it, with the reference conversions and
+/// one-call wrappers that nothing else calls.
+#[cfg(feature = "testing")]
 #[doc(hidden)]
 pub mod testing {
     pub mod auto {
@@ -107,9 +110,9 @@ pub mod testing {
     }
     pub mod frame {
         pub use crate::frame::{
-            Encoded, MAX_META, bit_depth, clipping, convert_into, convertible, encode,
-            encode_parts, encode_with_meta, exposure, gray8, pixel_format_name, rgb, rgba,
-            row_bytes, sample_bits, sharpness, unpacked,
+            MAX_META, bit_depth, clipping, convert_into, convertible, encode, encode_parts,
+            encode_with_meta, exposure, gray8, pixel_format_name, rgb, rgba, row_bytes,
+            sample_bits, sharpness, unpacked,
         };
     }
     pub mod inspect {
@@ -122,12 +125,12 @@ pub mod testing {
         pub use crate::session::{SessionCommand, SessionHandle};
     }
     pub mod storage {
-        pub use crate::storage::{SyncMode, save, save_parts};
+        pub use crate::storage::{SyncMode, save};
     }
     pub mod types {
         pub use crate::types::{Frame, MONO8, RGB8};
     }
     pub mod framebuf {
-        pub use crate::framebuf::{FrameBuf, FramePool, PoolStats, PoolVec, pool};
+        pub use crate::framebuf::pool;
     }
 }

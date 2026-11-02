@@ -787,6 +787,7 @@ fn component(matrix: Matrix, sum: i32) -> u8 {
     .clamp(0, 255) as u8
 }
 
+#[cfg(any(test, feature = "testing"))]
 pub(super) fn unpacked(frame: &Frame) -> Result<Option<Frame>> {
     let Some(decoder) = Decoder::new(frame) else {
         return Ok(None);

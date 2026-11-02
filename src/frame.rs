@@ -1,7 +1,6 @@
 //! Bounded PFNC image conversion and portable output without image codecs from the OS.
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Context as _, Result, bail, ensure};
-use std::borrow::Cow;
 
 mod encoded;
 mod formats;
@@ -194,7 +193,9 @@ pub fn unpacked_format(pixel_format: u32) -> u32 {
 /// `frame` in a whole-sample layout: packed 10-, 12- and 14-bit mono/Bayer
 /// samples retain native precision in 16-bit words. Other transformed color
 /// layouts become RGB8; low-bit and signed monochrome become Mono8.
-pub fn unpacked(frame: &Frame) -> Result<Cow<'_, Frame>> {
+#[cfg(any(test, feature = "testing"))]
+pub fn unpacked(frame: &Frame) -> Result<std::borrow::Cow<'_, Frame>> {
+    use std::borrow::Cow;
     let pixel_format = unpacked_format(frame.pixel_format);
     if pixel_format == frame.pixel_format {
         return Ok(Cow::Borrowed(frame));
@@ -465,6 +466,7 @@ pub(crate) fn monochrome(pixel_format: u32) -> bool {
         || unpacked_shift(pixel_format).is_some()
 }
 /// The frame as 8-bit RGB, three bytes a pixel.
+#[cfg(any(test, feature = "testing"))]
 pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
     validate_source(frame)?;
     let view = FrameRef::whole(frame);
@@ -549,6 +551,7 @@ fn unpacked_shift(format: u32) -> Option<u32> {
 /// One 8-bit sample per pixel for the monochrome family, packed formats
 /// unpacked first, with the same bit choice as [`rgb`]; None for color,
 /// Bayer, YUV and RGBa formats, which stay RGB.
+#[cfg(any(test, feature = "testing"))]
 pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
     checked_pixels(frame)?;
     if !monochrome(frame.pixel_format) {
@@ -643,6 +646,7 @@ fn gray16(frame: &Frame) -> Result<Option<(crate::framebuf::PoolVec, u32)>> {
     Ok(Some((out, bits)))
 }
 /// Opaque RGBA bytes, converted in one pass without an intermediate RGB image.
+#[cfg(any(test, feature = "testing"))]
 pub fn rgba(frame: &Frame) -> Result<Vec<u8>> {
     Ok(convert(frame, |[r, g, b]| [r, g, b, 255])?.into_flattened())
 }
@@ -658,6 +662,7 @@ pub(crate) fn checked_pixels(frame: &Frame) -> Result<usize> {
 }
 /// Convert a PFNC frame into any pixel representation (RGB, RGBA, gray) with
 /// a single allocation; `pixel` maps each interpolated RGB triple.
+#[cfg(any(test, feature = "testing"))]
 pub fn convert<P: Copy + Default + Send>(
     frame: &Frame,
     pixel: impl Fn([u8; 3]) -> P + Sync,
@@ -1108,6 +1113,7 @@ pub struct Clipping {
 /// clip at 1023, a Mono8 or RGB8 one at 255, an RGB12 one at 4095 in any
 /// component, each Bayer sample on its own. Packed samples and wide color
 /// components are read where they lie, without unpacking the frame.
+#[cfg(any(test, feature = "testing"))]
 pub fn clipping(frame: &Frame) -> Result<Clipping> {
     clipping_in(FrameRef::whole(frame))
 }
@@ -1369,11 +1375,13 @@ fn sharpness_over(
 /// well under this.
 pub const MAX_META: usize = 16 * 1024;
 
+#[cfg(any(test, feature = "testing"))]
 pub fn encode(frame: &Frame, format: &str) -> Result<Vec<u8>> {
     encode_with_meta(frame, format, None)
 }
 
 /// `encode_parts` at the default quality, in one buffer.
+#[cfg(any(test, feature = "testing"))]
 pub fn encode_with_meta(
     frame: &Frame,
     format: &str,

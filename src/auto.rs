@@ -73,6 +73,7 @@ pub struct Meter {
     pub p99: f64,
 }
 
+#[cfg(any(test, feature = "testing"))]
 pub fn meter(frame: &Frame) -> Option<Meter> {
     meter_in(crate::frame::FrameRef::whole(frame))
 }

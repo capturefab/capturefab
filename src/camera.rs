@@ -779,6 +779,7 @@ pub fn validate_selector(selector: &str) -> Result<()> {
     Ok(())
 }
 impl Camera {
+    #[cfg(any(test, feature = "testing"))]
     pub fn open(selector: &str, known: &[CameraInfo], timeout: Duration) -> Result<Self> {
         Self::open_with_login(selector, known, timeout, None)
     }
