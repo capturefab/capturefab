@@ -1460,36 +1460,41 @@ fn rollback(
             Err(error) => failed.push(json!({"name": name, "error": format!("{error:#}")})),
         }
     }
-    // One geometry value can bound another (an offset the width), so
-    // values that do not take in one order are written again in later
-    // passes, until all hold or a pass changes nothing.
-    let differs = |camera: &mut Camera, (feature, value): &(String, Value)| {
-        camera.get(feature).ok().as_ref() != Some(value)
+    // One geometry value can bound or rescale another (an offset the
+    // width, a binning the size), so the whole checkpoint is read again
+    // after each pass of writes, and what differs is written again, for
+    // as many passes as the group has values.
+    let differing = |camera: &mut Camera| {
+        geometry
+            .iter()
+            .filter(|(feature, value)| camera.get(feature).ok().as_ref() != Some(value))
+            .collect::<Vec<_>>()
     };
-    let mut left = geometry
-        .iter()
-        .filter(|entry| differs(camera, entry))
-        .collect::<Vec<_>>();
+    let mut left = differing(camera);
+    let mut rewritten: Vec<&String> = Vec::new();
     let mut errors = std::collections::BTreeMap::new();
-    while !left.is_empty() {
+    for _ in 0..geometry.len() {
+        if left.is_empty() {
+            break;
+        }
         for (feature, value) in &left {
             match camera.set(feature, &text(value)) {
                 Ok(()) => errors.remove(feature),
                 Err(error) => errors.insert(feature.clone(), format!("{error:#}")),
             };
-        }
-        let before = left.len();
-        let (still, done): (Vec<_>, Vec<_>) =
-            left.into_iter().partition(|entry| differs(camera, entry));
-        for (feature, _) in done {
-            failed.retain(|failure| failure["name"] != feature.as_str());
-            if !restored.contains(feature) {
-                restored.push(feature.clone());
+            if !rewritten.contains(&feature) {
+                rewritten.push(feature);
             }
         }
-        left = still;
-        if left.len() == before {
-            break;
+        left = differing(camera);
+    }
+    for feature in rewritten {
+        if left.iter().any(|(other, _)| other == feature) {
+            continue;
+        }
+        failed.retain(|failure| failure["name"] != feature.as_str());
+        if !restored.contains(feature) {
+            restored.push(feature.clone());
         }
     }
     for (feature, value) in left {
