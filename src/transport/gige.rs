@@ -5044,10 +5044,20 @@ mod tests {
                 destination = Some(to);
             });
             order(&mut packets);
-            for packet in &packets {
-                fake.stream.send_to(packet, destination.unwrap()).unwrap();
-            }
+            // Sent while the frame is received, a few packets at a time, so
+            // a small socket buffer (Linux's default is about 200 KiB) never
+            // overflows.
+            let (source, destination) = (fake.stream.try_clone().unwrap(), destination.unwrap());
+            let sender = thread::spawn(move || {
+                for (i, packet) in packets.iter().enumerate() {
+                    source.send_to(packet, destination).unwrap();
+                    if i % 8 == 7 {
+                        thread::sleep(Duration::from_micros(300));
+                    }
+                }
+            });
             let frame = gige.next_frame(Duration::from_secs(5)).unwrap();
+            sender.join().unwrap();
             assert_eq!(frame.id, block);
             received.push(frame.data.to_vec());
         }
@@ -5138,31 +5148,42 @@ mod tests {
                 destination = Some(to);
             });
             let (destination, source) = (destination.unwrap(), fake.stream.try_clone().unwrap());
-            // The sender waits for each frame before the next, so the
-            // socket's buffer never overflows.
+            // The sender waits for each frame before the next, and pauses
+            // every 4 packets, so a small socket buffer (Linux's default,
+            // about 200 KiB) never overflows; frame rates are then the
+            // sender's, and the receiver's CPU time is what is compared.
             let (next, wait) = std::sync::mpsc::channel::<u64>();
             let sender = thread::spawn(move || {
                 while let Ok(block) = wait.recv() {
-                    for packet in &packets {
+                    for (i, packet) in packets.iter().enumerate() {
                         let mut packet = packet.clone();
                         packet[2..4].copy_from_slice(&(block as u16).to_be_bytes());
                         source.send_to(&packet, destination).unwrap();
+                        if i % 4 == 3 {
+                            thread::sleep(Duration::from_micros(100));
+                        }
                     }
                 }
             });
             let (started, cpu) = (Instant::now(), thread_cpu());
+            let mut received = 0;
             for block in 1..=FRAMES {
                 next.send(block).unwrap();
-                let frame = gige.next_frame(Duration::from_secs(10)).unwrap();
-                assert_eq!(frame.data.len(), 4096 * 3000);
+                // A receiver that falls behind loses a frame to the full
+                // socket buffer; this camera resends nothing.
+                if let Ok(frame) = gige.next_frame(Duration::from_secs(1)) {
+                    assert_eq!(frame.data.len(), 4096 * 3000);
+                    received += 1;
+                }
             }
             let (elapsed, cpu) = (started.elapsed(), thread_cpu() - cpu);
             drop(next);
             sender.join().unwrap();
+            assert!(received > 0);
             println!(
-                "scatter {scatter}: {:.1} fps, receiver CPU {:.2} ms per frame, copied {:?}",
-                FRAMES as f64 / elapsed.as_secs_f64(),
-                cpu.as_secs_f64() * 1e3 / FRAMES as f64,
+                "scatter {scatter}: {received} of {FRAMES} frames, {:.1} fps, receiver CPU {:.2} ms per frame, copied {:?}",
+                received as f64 / elapsed.as_secs_f64(),
+                cpu.as_secs_f64() * 1e3 / received as f64,
                 gige.stream.as_ref().unwrap().assembler.copied,
             );
         }

@@ -70,7 +70,7 @@ A shell or script that uses such a service's sessions sets the same `CAPTUREFAB_
 
 ## Memory and CPUs
 
-Capturefab sizes its work from what the host and its cgroups leave it: `doctor` shows the CPUs (the affinity mask and cgroup CPU quota) and the memory available under cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`. Encoders and FFmpeg use one thread per available CPU, up to eight; `CAPTUREFAB_THREADS` caps them. A burst holds at most a quarter of the memory left, up to 1 GiB, and counts any frame it could not hold as dropped instead of exhausting memory. A camera's worker gives each frame's memory back to the system once the frame is freed, so a warm camera does not keep a burst's peak for the commands after it.
+Capturefab sizes its work from what the host and its cgroups leave it: `doctor` shows the CPUs (the affinity mask and cgroup CPU quota) and the memory available under cgroup v2 `memory.max` or v1 `memory.limit_in_bytes`. Encoders and FFmpeg use one thread per available CPU, up to eight; `CAPTUREFAB_THREADS` caps them. A burst holds at most a quarter of the memory left, up to 1 GiB, and counts any frame it could not hold as dropped instead of exhausting memory. A camera's worker keeps at most two frames' buffers for the frames to come, holding no more than a twentieth of the memory left, and gives the rest back to the system once they are freed, so a warm camera does not keep a burst's peak for the commands after it.
 
 ## Check the image
 

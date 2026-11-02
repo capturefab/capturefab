@@ -137,36 +137,23 @@ fn compress(
     format: turbojpeg::PixelFormat,
     quality: i32,
 ) -> Result<Body<'static>> {
-    use std::cell::RefCell;
     use turbojpeg::{Compressor, Image, PixelFormat, Subsamp};
-    // One compressor per thread, set up again for each image.
-    thread_local! {
-        static COMPRESSOR: RefCell<Option<Compressor>> = const { RefCell::new(None) };
-    }
     anyhow::ensure!((1..=100).contains(&quality), "JPEG quality must be 1..100");
-    let jpeg = COMPRESSOR.with_borrow_mut(|held| -> Result<_> {
-        let compressor = match held {
-            Some(compressor) => compressor,
-            None => held.insert(Compressor::new()?),
-        };
-        compressor.set_quality(quality)?;
-        compressor.set_subsamp(if format == PixelFormat::GRAY {
-            Subsamp::Gray
-        } else {
-            Subsamp::Sub2x2
-        })?;
-        let compressed = compressor.compress_to_owned(Image {
-            pixels,
-            width: width as usize,
-            pitch: width as usize * format.size(),
-            height: height as usize,
-            format,
-        });
-        if compressed.is_err() {
-            // A compressor that failed starts afresh.
-            *held = None;
-        }
-        Ok(compressed?)
+    // A compressor per image: a reused one encodes large images about a
+    // tenth slower.
+    let mut compressor = Compressor::new()?;
+    compressor.set_quality(quality)?;
+    compressor.set_subsamp(if format == PixelFormat::GRAY {
+        Subsamp::Gray
+    } else {
+        Subsamp::Sub2x2
+    })?;
+    let jpeg = compressor.compress_to_owned(Image {
+        pixels,
+        width: width as usize,
+        pitch: width as usize * format.size(),
+        height: height as usize,
+        format,
     })?;
     crate::copies::record(crate::copies::Site::JpegEncode, jpeg.len());
     Ok(Body::Jpeg(Jpeg(jpeg)))
