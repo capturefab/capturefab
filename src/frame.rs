@@ -194,6 +194,7 @@ pub fn unpacked(frame: &Frame) -> Result<Cow<'_, Frame>> {
         let source = frame.data[..pixels * 4].as_chunks::<4>().0;
         source.iter().flat_map(|p| order.map(|c| p[c])).collect()
     };
+    crate::copies::record(crate::copies::Site::Intermediate, data.len());
     Ok(Cow::Owned(Frame {
         pixel_format,
         data,
@@ -403,6 +404,7 @@ fn eight_bit(frame: &Frame) -> Result<Cow<'_, Frame>> {
             *value = (u16::from_le_bytes(*sample) >> shift).min(255) as u8;
         }
     }
+    crate::copies::record(crate::copies::Site::Intermediate, data.len());
     Ok(Cow::Owned(Frame {
         pixel_format,
         data,
@@ -451,6 +453,7 @@ pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
         }
         RGB8 => {
             ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
+            crate::copies::record(crate::copies::Site::Intermediate, pixels * 3);
             out.copy_from_slice(&frame.data[..pixels * 3]);
         }
         0x0218_0015 => {
@@ -512,7 +515,10 @@ pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
                 data.truncate(pixels);
                 data
             }
-            Cow::Borrowed(frame) => frame.data[..pixels].to_vec(),
+            Cow::Borrowed(frame) => {
+                crate::copies::record(crate::copies::Site::Intermediate, pixels);
+                frame.data[..pixels].to_vec()
+            }
         }));
     }
     let Some(shift) = unpacked_shift(frame.pixel_format) else {
@@ -1244,6 +1250,7 @@ pub fn encode_with_meta(
         );
     }
     if format == "raw" {
+        crate::copies::record(crate::copies::Site::StillCopy, frame.data.len());
         return Ok(frame.data.clone());
     }
     if format == "jpeg" {
@@ -1268,6 +1275,9 @@ pub fn encode_with_meta(
                     None => (png::ColorType::Rgb, png::BitDepth::Eight, rgb(frame)?, None),
                 },
             };
+            if !matches!(frame.pixel_format, MONO8 | RGB8) {
+                crate::copies::record(crate::copies::Site::StillTransform, samples.len());
+            }
             let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
             encoder.set_color(color);
             encoder.set_depth(depth);
@@ -1288,14 +1298,25 @@ pub fn encode_with_meta(
                 writer.write_chunk(png::chunk::sBIT, &[bits as u8])?;
             }
             writer.write_image_data(&samples)?;
+            drop(writer);
+            crate::copies::record(crate::copies::Site::PngEncode, bytes.len());
         }
         "ppm" => {
             write!(bytes, "P6\n{} {}\n255\n", frame.width, frame.height)?;
-            bytes.extend_from_slice(&rgb(frame)?);
+            let rgb = rgb(frame)?;
+            if frame.pixel_format != RGB8 {
+                crate::copies::record(crate::copies::Site::StillTransform, rgb.len());
+            }
+            crate::copies::record(crate::copies::Site::StillCopy, rgb.len());
+            bytes.extend_from_slice(&rgb);
         }
         "pgm" => {
             let gray = gray8(frame)?.context("PGM requires a monochrome image; use PNG or PPM")?;
             write!(bytes, "P5\n{} {}\n255\n", frame.width, frame.height)?;
+            if frame.pixel_format != MONO8 {
+                crate::copies::record(crate::copies::Site::StillTransform, gray.len());
+            }
+            crate::copies::record(crate::copies::Site::StillCopy, gray.len());
             bytes.extend_from_slice(&gray);
         }
         _ => bail!("unknown image format {format}; use png, jpeg, raw, pgm or ppm"),

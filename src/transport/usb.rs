@@ -681,6 +681,7 @@ impl Stream {
             bytes
         } else {
             let image = (self.expected - frame.data.len()).min(bytes.len());
+            crate::copies::record(crate::copies::Site::UsbAssemble, image);
             frame.data.extend_from_slice(&bytes[..image]);
             if image == bytes.len() {
                 if full || frame.data.len() == self.expected {

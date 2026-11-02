@@ -91,6 +91,8 @@ jobs:
           cache-on-failure: true
       # Every test binary runs, so one failure does not hide the rest.
       - run: cargo test --locked --no-fail-fast
+      # Where frames are copied: the budgets of the zero-copy frame path.
+      - run: cargo test --locked --features copy-audit --test copies
       # The command reference is generated from this binary's schema; the
       # committed snapshot must match it.
       - name: Command reference matches the CLI

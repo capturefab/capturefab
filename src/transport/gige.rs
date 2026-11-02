@@ -1268,6 +1268,7 @@ impl Backend for GigE {
             now = Instant::now();
             match received {
                 Ok((length, source)) if source.ip() == camera && source != stream.gvcp => {
+                    crate::copies::record(crate::copies::Site::GvspReceive, length);
                     let result = stream.assembler.push_at(&stream.buffer[..length], now);
                     stream.flush();
                     match result {
@@ -1656,6 +1657,7 @@ impl Stream {
             for _ in 0..MAX_TAKEN_IN {
                 match self.socket.recv_from(&mut self.buffer) {
                     Ok((length, source)) if source.ip() == camera && source != self.gvcp => {
+                        crate::copies::record(crate::copies::Site::GvspReceive, length);
                         // The frame it completes, kept in turn; a packet in
                         // error leaves its frame incomplete, as it would on
                         // its way to `next_frame`.
@@ -2164,7 +2166,9 @@ impl Assembler {
                     }
                     if frame.data.is_empty() {
                         frame.data = vec![0; self.payload_limit];
+                        crate::copies::record(crate::copies::Site::ZeroFill, self.payload_limit);
                     }
+                    crate::copies::record(crate::copies::Site::GvspAssemble, kept.len());
                     frame.data[range].copy_from_slice(kept);
                     set_bit(&mut frame.received, packet.id);
                     frame.count += 1;
@@ -2334,6 +2338,10 @@ impl Assembler {
         let mut data = frame.data;
         let stride = leader.row_bytes + leader.x_padding;
         if leader.x_padding > 0 {
+            crate::copies::record(
+                crate::copies::Site::GigeRowCompact,
+                leader.row_bytes * (height as usize).saturating_sub(1),
+            );
             for row in 1..height as usize {
                 data.copy_within(
                     row * stride..row * stride + leader.row_bytes,

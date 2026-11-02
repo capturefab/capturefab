@@ -420,6 +420,38 @@ fn main() {
             );
         }
     }
+    // Stills as captures encode them, with their provenance metadata: raw
+    // and JPEG from the frame in place where the encoder can read it.
+    let meta = serde_json::json!({"camera": "sim:0", "time": "2026-11-01T00:00:00Z"});
+    for (name, format, width, height) in [
+        ("Mono8", MONO8, 4096, 3000),
+        ("BayerRG12p", 0x010c_0059, 4096, 3000),
+        ("RGB8", RGB8, 1920, 1080),
+    ] {
+        let label = format!("encode/raw/{name}/{width}x{height}");
+        if b.selected(&label) {
+            let f = frame(width, height, format);
+            b.run(&label, f.data.len(), || {
+                capturefab::testing::engine::encode_still(&f, "raw", None, Some(&meta)).unwrap()
+            });
+        }
+    }
+    #[cfg(feature = "jpeg")]
+    if b.selected("encode/jpeg") {
+        let f = frame(4096, 3000, MONO8);
+        for (label, quality) in [("jpeg", None), ("jpeg-q75", Some(75))] {
+            b.run(
+                &format!("encode/{label}/Mono8/4096x3000"),
+                f.data.len(),
+                || {
+                    capturefab::testing::engine::encode_still(&f, "jpeg", quality, Some(&meta))
+                        .unwrap()
+                },
+            );
+        }
+    }
+    // A frame-sized buffer, as a camera's receive loop takes one per frame.
+    b.run("pool/vec-zeroed/12MB", 12 << 20, || vec![0u8; 12 << 20]);
     // The stage's scopes on a common 5 MP industrial sensor: the histogram,
     // and focus in the default quarter region and over the whole frame.
     let f = frame(2448, 2048, 0x0108_0009);

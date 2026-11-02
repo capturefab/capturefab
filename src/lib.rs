@@ -18,6 +18,7 @@ pub(crate) mod camera_profile;
 pub(crate) mod cli;
 pub(crate) mod context;
 pub(crate) mod controls;
+pub(crate) mod copies;
 pub(crate) mod dirs;
 pub(crate) mod discovery;
 pub(crate) mod doctor;
@@ -49,6 +50,12 @@ pub(crate) mod types;
 pub(crate) mod volumes;
 pub(crate) mod xml_cache;
 
+/// Every frame-sized allocation is counted in the executable, the tests
+/// and the benchmarks of a `copy-audit` build.
+#[cfg(feature = "copy-audit")]
+#[global_allocator]
+static ALLOCATOR: copies::Counting = copies::Counting;
+
 /// The `capturefab` executable: the hidden camera worker mode, or the CLI.
 pub fn run() {
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__worker")) {
@@ -74,6 +81,9 @@ pub mod testing {
     }
     pub mod camera_profile {
         pub use crate::camera_profile::CameraKind;
+    }
+    pub mod engine {
+        pub use crate::engine::encode_still;
     }
     pub mod frame {
         pub use crate::frame::{

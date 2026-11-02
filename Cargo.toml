@@ -18,6 +18,10 @@ keychain = ["dep:keyring"]
 # Line editing, history and tab completion in `capturefab shell`; without it
 # the shell reads plain lines.
 shell = ["dep:rustyline"]
+# Count where camera frames are copied and the large allocations made, and
+# write each camera worker's counts to $CAPTUREFAB_COPY_REPORT
+# (tests/copies.rs). Off in every release build.
+copy-audit = []
 
 [dependencies]
 anyhow = "1"

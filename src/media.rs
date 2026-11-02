@@ -1003,9 +1003,11 @@ fn read_ppm(reader: &mut impl BufRead, id: u64) -> Result<Frame> {
         "media frame exceeds 256 MiB limit"
     );
     let mut data = vec![0; size];
+    crate::copies::record(crate::copies::Site::ZeroFill, size);
     reader
         .read_exact(&mut data)
         .context("truncated FFmpeg RGB frame")?;
+    crate::copies::record(crate::copies::Site::PipeRead, size);
     Ok(Frame {
         id,
         width,
@@ -3841,9 +3843,19 @@ impl JetsonInput {
     }
     fn bytes(self, frame: &Frame) -> Result<Vec<u8>> {
         Ok(match self {
-            Self::Rgba => crate::frame::rgba(frame)?,
+            Self::Rgba => {
+                let data = crate::frame::rgba(frame)?;
+                crate::copies::record(crate::copies::Site::JetsonInput, data.len());
+                data
+            }
             Self::I420 => {
                 let mut data = crate::frame::convert(frame, |[gray, _, _]| gray)?;
+                let site = if frame.pixel_format == crate::types::MONO8 {
+                    crate::copies::Site::Intermediate
+                } else {
+                    crate::copies::Site::JetsonInput
+                };
+                crate::copies::record(site, data.len());
                 let chroma =
                     (frame.width as usize).div_ceil(2) * (frame.height as usize).div_ceil(2);
                 data.resize(data.len() + 2 * chroma, 128);
@@ -4221,13 +4233,17 @@ impl RawInput {
         );
         let name = crate::frame::pixel_format_name(frame.pixel_format);
         let mut data = if self.convert {
-            if self.color {
+            let data = if self.color {
                 crate::frame::rgb(&frame)?
             } else {
                 crate::frame::gray8(&frame)?.context("monochrome frame has no gray conversion")?
-            }
+            };
+            crate::copies::record(crate::copies::Site::FfmpegUnpack, data.len());
+            data
         } else if self.unpack {
-            crate::frame::unpacked(&frame)?.into_owned().data
+            let data = crate::frame::unpacked(&frame)?.into_owned().data;
+            crate::copies::record(crate::copies::Site::FfmpegUnpack, data.len());
+            data
         } else {
             frame.data
         };
@@ -4249,6 +4265,7 @@ impl RawInput {
                 .checked_mul(height)
                 .filter(|&n| n <= MAX_FRAME)
                 .context("forwarding frame exceeds size limit")?;
+            crate::copies::record(crate::copies::Site::Intermediate, padded_length);
             let mut padded = Vec::with_capacity(padded_length);
             for line in data.chunks_exact(row) {
                 padded.extend_from_slice(line);
@@ -4513,6 +4530,7 @@ impl Forwarder {
                     continue;
                 };
                 shared.busy.store(true, Ordering::Relaxed);
+                crate::copies::record(crate::copies::Site::PipeWrite, bytes.len());
                 let written = input.write_all(bytes);
                 shared.busy.store(false, Ordering::Relaxed);
                 if let Err(e) = written {

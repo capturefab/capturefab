@@ -393,7 +393,12 @@ pub(super) fn serve(
             reply: item.reply,
         });
     }
-    keep.then(|| Arc::try_unwrap(shared).unwrap_or_else(|shared| (*shared).clone()))
+    keep.then(|| {
+        Arc::try_unwrap(shared).unwrap_or_else(|shared| {
+            crate::copies::record(crate::copies::Site::FrameClone, shared.data.len());
+            (*shared).clone()
+        })
+    })
 }
 
 /// End the waiting requests that were cancelled, whose deadline passed, or

@@ -402,6 +402,7 @@ impl Backend for Replay {
                 break first;
             }
             if let Some(still) = &self.still {
+                crate::copies::record(crate::copies::Site::FrameClone, still.data.len());
                 break still.clone();
             }
             let remaining = deadline.saturating_duration_since(Instant::now());

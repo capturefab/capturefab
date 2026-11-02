@@ -156,6 +156,10 @@ pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
             _ => bail!("unsupported RGB component depth {bits}"),
         };
         let bytes = if bits == 8 { 3 } else { 6 };
+        crate::copies::record(
+            crate::copies::Site::Crop,
+            width as usize * height as usize * bytes,
+        );
         let mut data = Vec::with_capacity(width as usize * height as usize * bytes);
         for yy in y..y + height {
             for xx in x..x + width {
@@ -183,6 +187,7 @@ pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
     let [x, y, width, height] = crop_rect(frame, px);
     let stride = frame.width as usize * bytes;
     let row = width as usize * bytes;
+    crate::copies::record(crate::copies::Site::Crop, row * height as usize);
     let mut data = Vec::with_capacity(row * height as usize);
     for line in frame.data[..stride * frame.height as usize]
         .chunks_exact(stride)
@@ -496,6 +501,11 @@ fn render_within(
     } else {
         (3, frame::rgb(frame)?)
     };
+    if frame.pixel_format == crate::types::MONO8 {
+        crate::copies::record(crate::copies::Site::Intermediate, pixels.len());
+    } else if frame.pixel_format != crate::types::RGB8 {
+        crate::copies::record(crate::copies::Site::PreviewTransform, pixels.len());
+    }
     let (width, height) = fit(frame.width, frame.height, max_dimension);
     let first = first_quality(cropped, frame.width, frame.height);
     let lowest = QUALITIES[QUALITIES.len() - 1];
@@ -571,6 +581,7 @@ fn area_average(
     let (ow, oh) = (out_width as usize, out_height as usize);
     debug_assert!((1..=w).contains(&ow) && (1..=h).contains(&oh));
     if (ow, oh) == (w, h) {
+        crate::copies::record(crate::copies::Site::Intermediate, w * h * channels);
         return source[..w * h * channels].to_vec();
     }
     let columns: Vec<usize> = (0..w).map(|x| x * ow / w).collect();

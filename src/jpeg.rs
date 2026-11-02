@@ -28,9 +28,20 @@ impl Raster {
     pub fn new(frame: &Frame) -> Result<Self> {
         let (channels, data) = if monochrome(frame.pixel_format) {
             // One pass straight to 8-bit gray; no RGB triplication.
-            (1, crate::frame::convert(frame, |[gray, _, _]| gray)?)
+            let gray = crate::frame::convert(frame, |[gray, _, _]| gray)?;
+            let site = if frame.pixel_format == MONO8 {
+                crate::copies::Site::Intermediate
+            } else {
+                crate::copies::Site::StillTransform
+            };
+            crate::copies::record(site, gray.len());
+            (1, gray)
         } else {
-            (3, crate::frame::rgb(frame)?)
+            let rgb = crate::frame::rgb(frame)?;
+            if frame.pixel_format != crate::types::RGB8 {
+                crate::copies::record(crate::copies::Site::StillTransform, rgb.len());
+            }
+            (3, rgb)
         };
         Ok(Self {
             width: frame.width,
@@ -105,13 +116,17 @@ fn compress(
     } else {
         Subsamp::Sub2x2
     })?;
-    Ok(compressor.compress_to_vec(Image {
+    let jpeg = compressor.compress_to_vec(Image {
         pixels,
         width: width as usize,
         pitch: width as usize * format.size(),
         height: height as usize,
         format,
-    })?)
+    })?;
+    // TurboJPEG's own buffer, then copied into the Vec.
+    crate::copies::record(crate::copies::Site::JpegEncode, jpeg.len());
+    crate::copies::record(crate::copies::Site::OutputCopy, jpeg.len());
+    Ok(jpeg)
 }
 
 #[cfg(not(feature = "jpeg"))]
@@ -166,6 +181,7 @@ pub fn insert_com(jpeg: &[u8], payload: &[u8]) -> Result<Vec<u8>> {
         );
         at += 2 + length;
     }
+    crate::copies::record(crate::copies::Site::OutputCopy, jpeg.len());
     let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
     out.extend_from_slice(&jpeg[..at]);
     out.extend_from_slice(&[0xFF, 0xFE]);

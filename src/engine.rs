@@ -478,6 +478,7 @@ impl WorkerHandle {
     }
     /// Count a frame the camera delivered.
     fn count_frame(&self, frame: &Frame) {
+        crate::copies::frame();
         self.counters.frames.fetch_add(1, Ordering::Relaxed);
         self.counters
             .received_bytes
@@ -488,6 +489,7 @@ impl WorkerHandle {
     /// which is closed after it.
     fn write_stdout(&self, file: Option<&str>, image: &[u8]) -> Result<()> {
         use std::io::Write as _;
+        crate::copies::record(crate::copies::Site::StdoutWrite, image.len());
         let Some(file) = file else {
             let mut output = self
                 .output
@@ -1258,7 +1260,7 @@ fn still_meta(
 
 /// A still as `frame::encode_with_meta` encodes it, but a JPEG at `quality`
 /// when one other than the default is asked for.
-pub(crate) fn encode_still(
+pub fn encode_still(
     frame: &Frame,
     format: &str,
     quality: Option<u8>,
@@ -3730,6 +3732,7 @@ fn worker(h: WorkerHandle) {
                     let (shot, frame) = if saves.is_empty() {
                         (None, Some(frame))
                     } else if forward || !waiting.is_empty() {
+                        crate::copies::record(crate::copies::Site::FrameClone, frame.data.len());
                         (Some(frame.clone()), Some(frame))
                     } else {
                         (Some(frame), None)

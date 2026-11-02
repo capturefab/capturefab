@@ -55,6 +55,11 @@ impl Events {
         self.0.outbox.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub(crate) fn emit(&self, output: Output) {
+        // What was counted is on disk before the client hears that its
+        // request or job ended, in case it ends this process then.
+        if matches!(output, Output::Reply { .. } | Output::JobEnd { .. }) {
+            crate::copies::report();
+        }
         let mut outbox = self.outbox();
         if outbox.closed {
             return;

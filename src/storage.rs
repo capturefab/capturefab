@@ -309,6 +309,7 @@ fn failed(path: &Path, error: io::Error) -> anyhow::Error {
 /// writing them fails.
 fn write_new(path: &Path, bytes: &[u8], sync: SyncMode) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    crate::copies::record(crate::copies::Site::FileWrite, bytes.len());
     let mut written = file.write_all(bytes);
     if sync.is_file() {
         written = written.and_then(|()| file.sync_data());

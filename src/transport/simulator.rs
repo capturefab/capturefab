@@ -1036,6 +1036,7 @@ impl Simulator {
         };
         let mut sum = 0u64;
         let mut data = vec![0; self.u32(PAYLOAD) as usize];
+        crate::copies::record(crate::copies::Site::ZeroFill, data.len());
         let row_bytes = crate::frame::row_bytes(width, pixel_format);
         for (i, (base, ring)) in self.scene.2.iter().enumerate() {
             let (x, y) = (i as u32 % width, i as u32 / width);

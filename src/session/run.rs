@@ -139,6 +139,7 @@ pub fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> 
             std::process::exit(1);
         });
     handle.shutdown();
+    crate::copies::report();
     events.close();
     let _ = writer.join();
     read
