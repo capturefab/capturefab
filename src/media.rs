@@ -527,10 +527,6 @@ pub(crate) fn ffmpeg_hint() -> String {
 }
 /// A private file that did not exist before. It is not synced: a copy cut
 /// short by a crash fails validation and is written again.
-fn write_new(path: &std::path::Path, bytes: &[u8], executable: bool) -> Result<()> {
-    new_private_file(path, executable)?.write_all(bytes)?;
-    Ok(())
-}
 fn new_private_file(path: &std::path::Path, executable: bool) -> Result<fs::File> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -544,10 +540,7 @@ fn new_private_file(path: &std::path::Path, executable: bool) -> Result<fs::File
     Ok(options.open(path)?)
 }
 fn nonce() -> Result<String> {
-    let mut nonce = [0u8; 16];
-    getrandom::fill(&mut nonce)
-        .map_err(|e| anyhow!("cannot generate FFmpeg extraction nonce: {e}"))?;
-    Ok(nonce.iter().map(|b| format!("{b:02x}")).collect())
+    crate::types::random_hex(16).context("cannot name the extracted FFmpeg")
 }
 fn cores() -> usize {
     crate::host::threads(crate::host::cpus())
@@ -3682,6 +3675,10 @@ pub struct ForwardConfig {
     /// default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_file_bytes: Option<u64>,
+    /// The client's own free-space floor, which a local recording leaves
+    /// as well as the worker's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_free: Option<u64>,
 }
 impl ForwardConfig {
     /// Validate forwarding settings before starting a process, changing camera
@@ -3726,7 +3723,7 @@ impl ForwardConfig {
     /// The new file of a local recording at `path`, bounded by
     /// `max_file_bytes` when it has one.
     pub fn writer(&self, path: &std::path::Path) -> Result<crate::storage::Recording> {
-        crate::storage::Recording::create(path, self.max_file_bytes, false)
+        crate::storage::Recording::create(path, self.max_file_bytes, self.min_free)
     }
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -4222,13 +4219,7 @@ fn save_probes(exe: &Executable, probes: &mut Probes) {
     let Ok(bytes) = serde_json::to_vec(probes) else {
         return;
     };
-    let Ok(nonce) = nonce() else {
-        return;
-    };
-    let temporary = path.with_extension(format!("{nonce}.tmp"));
-    if write_new(&temporary, &bytes, false).is_err() || fs::rename(&temporary, path).is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
+    let _ = crate::dirs::write_private(path, &bytes, false);
 }
 /// Identifies this boot, so remembered probes do not outlive a driver or
 /// hardware change. Without one, probes are remembered by the process only.
@@ -6076,11 +6067,10 @@ impl Forwarder {
                     && output.storage.bytes_written() > 0;
             let path = output.storage.path().to_path_buf();
             let result = if valid {
-                output.storage.finish().map(|stored| {
+                output.storage.finish().map(|bytes| {
                     let recorded = crate::engine::saved::RecordedFile {
                         path: path.display().to_string(),
-                        bytes: stored.bytes,
-                        sha256: stored.sha256,
+                        bytes,
                         // A copy's video starts with its first frame.
                         started_ms: match process.queue.first_copied_ms.load(Ordering::Relaxed) {
                             0 => process.started_ms,
@@ -6089,7 +6079,6 @@ impl Forwarder {
                         ended_ms: crate::scheduling::now_ms(),
                         codec: self.config.codec.clone(),
                         encoder: process.encoder.clone(),
-                        fps: self.config.fps,
                     };
                     self.final_stats.recording = Some(recorded);
                 })
@@ -7195,6 +7184,7 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
             fps,
             bitrate: "1M".into(),
             max_file_bytes: None,
+            min_free: None,
         }
     }
     #[cfg(unix)]
@@ -9472,6 +9462,7 @@ esac"#
                         fps: 30.0,
                         bitrate: "8M".into(),
                         max_file_bytes: None,
+                        min_free: None,
                     },
                     None,
                     tap,
@@ -9731,6 +9722,7 @@ esac"#
             fps: 10.0,
             bitrate: "1M".into(),
             max_file_bytes: None,
+            min_free: None,
         })
         .unwrap();
         for frame in frames {
@@ -9772,6 +9764,7 @@ esac"#
             fps: 30.0,
             bitrate: "8M".into(),
             max_file_bytes: None,
+            min_free: None,
         })
         .unwrap();
         let (width, height) = (1920usize, 1080usize);
@@ -9871,6 +9864,7 @@ esac"#
             fps: 30.0,
             bitrate: "4M".into(),
             max_file_bytes: None,
+            min_free: None,
         })
         .unwrap();
         let (width, height) = (1280usize, 720usize);
@@ -9953,6 +9947,7 @@ esac"#
             fps: 60.0,
             bitrate: "32M".into(),
             max_file_bytes: None,
+            min_free: None,
         })
         .unwrap();
         let mut noise = 123u32;
@@ -10002,6 +9997,7 @@ esac"#
             fps: 30.0,
             bitrate: "1M".into(),
             max_file_bytes: None,
+            min_free: None,
         })
         .unwrap();
         let frame = Frame {
@@ -10040,6 +10036,7 @@ esac"#
             fps: 30.0,
             bitrate: "1M".into(),
             max_file_bytes: Some(512),
+            min_free: None,
         })
         .unwrap();
         let frame = Frame {
@@ -10086,6 +10083,7 @@ esac"#
             fps: 30.0,
             bitrate: "8M".into(),
             max_file_bytes: Some(limit),
+            min_free: None,
         })
         .unwrap();
         // Noise compresses poorly, so the limit comes within seconds.
@@ -10152,6 +10150,7 @@ esac"#
             fps: 30.0,
             bitrate: "4M".into(),
             max_file_bytes: None,
+            min_free: None,
         };
         assert!(Forwarder::new(config.clone()).is_ok());
         let mut serialized = serde_json::to_value(&config).unwrap();
@@ -10424,6 +10423,7 @@ while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
                 fps: 30.0,
                 bitrate: "8M".into(),
                 max_file_bytes: None,
+                min_free: None,
             },
             None,
             tap.clone(),

@@ -128,8 +128,10 @@ macOS, or nvJPEG or VA-API on Linux, each checked against libjpeg-turbo first
 Compressed streams and webcams other than Motion JPEG, which libjpeg-turbo decodes, are decoded
 in hardware where it works in a session, and files and `--no-session` commands in software
 (`CAPTUREFAB_HWDEC=auto|none|METHOD`; `doctor --json` reports the methods under `hwdec`). A
-session's cameras keep the `CAPTUREFAB_JPEG`, `CAPTUREFAB_HWDEC`, `CAPTUREFAB_FFMPEG` and
-`CAPTUREFAB_MIN_FREE` the session started with: stop it, or use `--no-session`, to change them.
+session's cameras keep the `CAPTUREFAB_JPEG`, `CAPTUREFAB_HWDEC` and `CAPTUREFAB_FFMPEG` the
+session started with: stop it, or use `--no-session`, to change them. A command's own
+`CAPTUREFAB_MIN_FREE` raises the free-space floor for the files a session writes for it, but does
+not lower the floor the session started with.
 
 The result also says which frame it saved: `time` (RFC 3339) and `device_ts_ns` (the camera's
 own clock, never a date), with `frames` the camera delivered while it ran, `dropped` frames lost

@@ -3615,7 +3615,7 @@ mod tests {
     }
     #[test]
     fn packet_resend_commands_match_aravis_captures() {
-        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        use crate::types::hex;
         let standard = resend_packet(0xff15, 0xfffd, false, 3, 4);
         assert_eq!(hex(&standard[..8]), "42000040000cff15");
         assert_eq!(hex(&standard[8..]), "0000fffd0000000300000004");

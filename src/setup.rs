@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
     fs,
-    io::{Read, Write},
+    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -1141,41 +1141,12 @@ impl Store {
         Ok(path)
     }
     fn write(&self, path: &Path, setup: &Setup) -> Result<()> {
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("preset file name")?;
-        let temp = self
-            .dir
-            .join(format!(".{file_name}.{}.tmp", std::process::id()));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let result = (|| -> Result<()> {
-            let bytes = stored_bytes(setup)?;
-            ensure!(
-                bytes.len() <= MAX_SETUP_BYTES,
-                "a preset is at most 256 KiB"
-            );
-            let _ = fs::remove_file(&temp);
-            let mut output = options.open(&temp)?;
-            output.write_all(&bytes)?;
-            output.sync_all()?;
-            fs::rename(&temp, path)?;
-            #[cfg(unix)]
-            if let Ok(dir) = fs::File::open(&self.dir) {
-                let _ = dir.sync_all();
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        let bytes = stored_bytes(setup)?;
+        ensure!(
+            bytes.len() <= MAX_SETUP_BYTES,
+            "a preset is at most 256 KiB"
+        );
+        crate::dirs::write_private(path, &bytes, true)
     }
     /// Delete a saved setup's file without parsing it, so a damaged or
     /// newer file can be removed too. A file name with capital letters,

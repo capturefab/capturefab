@@ -1,5 +1,6 @@
 //! Versioned newline-delimited JSON over loopback, with a private per-session bearer token.
 use crate::session::{SessionCommand, SessionHandle};
+use crate::types::hex;
 use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -649,14 +650,9 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
         .finalize()
         .into()
 }
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
 /// 32 random bytes in hex: a token or a challenge.
 fn random_hex() -> Result<String> {
-    let mut random = [0u8; 32];
-    getrandom::fill(&mut random).map_err(|e| anyhow::anyhow!("random bytes: {e}"))?;
-    Ok(hex(&random))
+    crate::types::random_hex(32)
 }
 /// Whether `text` is 64 hex digits, as tokens and challenges are.
 fn is_secret_shaped(text: &str) -> bool {
@@ -667,7 +663,7 @@ fn is_secret_shaped(text: &str) -> bool {
 fn proof(token: &str, challenge: &str) -> String {
     let mut message = b"capturefab session proof\n".to_vec();
     message.extend_from_slice(challenge.as_bytes());
-    hex(&hmac_sha256(token.as_bytes(), &message))
+    hex(hmac_sha256(token.as_bytes(), &message))
 }
 /// Write `value` as one line within `deadline`.
 fn write_line(stream: &mut TcpStream, value: &impl Serialize, deadline: Instant) -> Result<()> {
@@ -943,38 +939,15 @@ fn busy(message: String) -> anyhow::Error {
 /// while its session runs, which no power loss outlives.
 fn write_descriptor(dir: &Path, descriptor: &Descriptor) -> Result<()> {
     let path = descriptor_path_in(dir, &descriptor.name)?;
-    let mut suffix = [0u8; 8];
-    getrandom::fill(&mut suffix).map_err(|e| anyhow::anyhow!("random file name: {e}"))?;
-    let suffix = suffix
-        .iter()
-        .map(|v| format!("{v:02x}"))
-        .collect::<String>();
-    let temp_path = dir.join(format!(".{}.{suffix}.tmp", descriptor.name));
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let publish = (|| -> Result<()> {
-        let mut file = options.open(&temp_path).with_context(|| {
-            format!(
-                "cannot create session '{}' in {}",
-                descriptor.name,
-                dir.display()
-            )
-        })?;
-        serde_json::to_writer(&mut file, descriptor)?;
-        file.write_all(b"\n")?;
-        drop(file);
-        fs::rename(&temp_path, &path)?;
-        Ok(())
-    })();
-    if publish.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    publish
+    let mut bytes = serde_json::to_vec(descriptor)?;
+    bytes.push(b'\n');
+    crate::dirs::write_private(&path, &bytes, false).with_context(|| {
+        format!(
+            "cannot create session '{}' in {}",
+            descriptor.name,
+            dir.display()
+        )
+    })
 }
 impl Server {
     /// Serve `h` as session `name`, which exits after `idle` without use
@@ -1906,12 +1879,12 @@ mod tests {
     #[test]
     fn hmac_matches_the_rfc_4231_vectors() {
         assert_eq!(
-            hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            hex(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
         // A key longer than the block is hashed first.
         assert_eq!(
-            hex(&hmac_sha256(
+            hex(hmac_sha256(
                 &[0xaa; 131],
                 b"Test Using Larger Than Block-Size Key - Hash Key First"
             )),

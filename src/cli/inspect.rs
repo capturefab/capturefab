@@ -279,6 +279,11 @@ fn inspect(
         crate::inspect::CLIP_WARN
     });
     let camera = crate::media::redact_url(info["camera"].as_str().unwrap_or("the camera"));
+    // The camera's worker writes a preview file with this command's floor.
+    let min_free = match preview {
+        Preview::File(_) => crate::storage::min_free()?,
+        _ => None,
+    };
     let frame = |fresh: u32, preview: Option<String>, max_dimension: u32| {
         let _waiting = term::activity(format!("waiting for a frame from {camera}…"));
         client
@@ -289,6 +294,7 @@ fn inspect(
                 max_dimension,
                 format,
                 region: args.region,
+                min_free: preview.as_ref().and(min_free),
                 preview,
                 warmup_ms: Some(millis(args.warmup)),
             })
@@ -335,7 +341,7 @@ fn inspect(
             // The best frame's preview goes where it was asked to.
             Preview::File(file) => {
                 let bytes = std::fs::read(path)?;
-                crate::storage::save_one(&bytes, file)?;
+                crate::storage::save_one(&bytes, file, None)?;
                 value["preview"] = json!(file);
             }
             _ => value["preview"] = json!(path),

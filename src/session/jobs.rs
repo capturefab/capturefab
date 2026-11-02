@@ -661,17 +661,7 @@ impl Book {
         let write = || -> anyhow::Result<()> {
             let dir = file.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?;
             crate::dirs::ensure_private_dir(dir)?;
-            let temp = dir.join(format!(".{}.tmp", std::process::id()));
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            std::io::Write::write_all(&mut options.open(&temp)?, &data)?;
-            std::fs::rename(&temp, file)?;
-            Ok(())
+            crate::dirs::write_private(file, &data, false)
         };
         if let Err(error) = write() {
             crate::eprintln!(
@@ -696,13 +686,7 @@ mod tests {
                 bytes: 10,
                 sha256: None,
                 context: Default::default(),
-                item: SavedItem::Recording {
-                    started_ms: 0,
-                    ended_ms: 1,
-                    codec: "h264".into(),
-                    encoder: "libx264".into(),
-                    fps: 30.0,
-                },
+                item: SavedItem::Recording,
             },
         }
     }

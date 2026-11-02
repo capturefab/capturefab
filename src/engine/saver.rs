@@ -47,6 +47,8 @@ pub(super) struct Save {
     /// JPEG quality, when not the default.
     pub(super) quality: Option<u8>,
     pub(super) sync: crate::storage::SyncMode,
+    /// The client's own free-space floor.
+    pub(super) min_free: Option<u64>,
     /// The job's manifest, which gets a line once the file is published.
     pub(super) manifest: Option<Arc<super::saved::Manifest>>,
     pub(super) source: Source,
@@ -391,7 +393,10 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
         &input,
         save.on_exists,
         save.path.clone(),
-        |path| crate::storage::save_parts(&bytes.parts(), path, save.sync, save.manifest.is_some()),
+        |path| {
+            let hash = save.manifest.is_some();
+            crate::storage::save_parts(&bytes.parts(), path, save.sync, save.min_free, hash)
+        },
     )
     .with_context(|| format!("save {}", save.path.display()))?;
     if save.format == "raw" {
@@ -401,16 +406,15 @@ fn write(h: &WorkerHandle, shot: &Shot, save: &Save) -> Result<Written> {
             shot.wall_ms,
             &shot.acquisition,
             save.sync,
+            save.min_free,
         )?;
     }
     let file = image_file(
         &path,
         &stored,
         &shot.frame,
-        &save.format,
         bytes.passthrough(),
         shot.wall_ms,
-        Some(save.job),
         &save.context,
     );
     // Measured here, from the frame in memory, beside the file.

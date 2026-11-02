@@ -130,13 +130,8 @@ impl Drop for Manifest {
 }
 impl Manifest {
     fn images(files: &[PathBuf], fps: f64) -> Result<Self> {
-        let mut random = [0u8; 16];
-        getrandom::fill(&mut random)
-            .map_err(|e| anyhow::anyhow!("cannot generate simulation manifest name: {e}"))?;
-        let nonce = random
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+        let nonce = crate::types::random_hex(16)
+            .map_err(|e| anyhow::anyhow!("cannot name the simulation manifest: {e}"))?;
         let manifest =
             Self(std::env::temp_dir().join(format!("capturefab-replay-{nonce}.ffconcat")));
         let mut options = OpenOptions::new();
@@ -459,9 +454,7 @@ mod tests {
     struct Directory(PathBuf);
     impl Directory {
         fn new() -> Self {
-            let mut nonce = [0u8; 16];
-            getrandom::fill(&mut nonce).unwrap();
-            let suffix = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            let suffix = crate::types::random_hex(16).unwrap();
             let path = std::env::temp_dir().join(format!("capturefab-replay-test-{suffix}"));
             fs::create_dir(&path).unwrap();
             Self(fs::canonicalize(path).unwrap())

@@ -1,5 +1,5 @@
 use crate::types::{
-    Backend, CameraInfo, Frame, MONO8, RGB8, RegisterIo, Transport, TransportStats,
+    Backend, CameraInfo, Frame, MONO8, RGB8, RegisterIo, Transport, TransportStats, hex,
 };
 use anyhow::{Context as _, Result, bail, ensure};
 use std::{
@@ -822,9 +822,6 @@ fn copy_settings(from: &[u8], to: &mut [u8]) {
             to[i] = *byte;
         }
     }
-}
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 fn unhex(text: &str) -> Result<Vec<u8>> {
     ensure!(text.len().is_multiple_of(2), "odd hex length");

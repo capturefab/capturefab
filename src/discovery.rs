@@ -118,29 +118,7 @@ fn write(cache: &Cache) -> anyhow::Result<()> {
     let path = path().ok_or_else(|| anyhow::anyhow!("no runtime folder"))?;
     let dir = path.parent().ok_or_else(|| anyhow::anyhow!("no folder"))?;
     crate::dirs::ensure_private_dir(dir)?;
-    let mut suffix = [0u8; 6];
-    getrandom::fill(&mut suffix).map_err(|e| anyhow::anyhow!("random file name: {e}"))?;
-    let suffix = suffix
-        .iter()
-        .map(|v| format!("{v:02x}"))
-        .collect::<String>();
-    let temp = dir.join(format!(".discovery.{suffix}.tmp"));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let written = options
-        .open(&temp)
-        .map_err(anyhow::Error::from)
-        .and_then(|file| Ok(serde_json::to_writer(file, cache)?))
-        .and_then(|()| Ok(std::fs::rename(&temp, &path)?));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    written
+    crate::dirs::write_private(&path, &serde_json::to_vec(cache)?, false)
 }
 
 #[cfg(test)]

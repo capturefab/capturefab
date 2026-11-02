@@ -440,6 +440,25 @@ pub fn parse_bytes(value: &str) -> anyhow::Result<u64> {
     Ok(bytes)
 }
 
+/// `bytes` in lowercase hex.
+pub fn hex(bytes: impl AsRef<[u8]>) -> String {
+    use std::fmt::Write as _;
+    let bytes = bytes.as_ref();
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+/// `count` random bytes in lowercase hex: a name no other file has, a
+/// nonce or a secret.
+pub fn random_hex(count: usize) -> Result<String> {
+    let mut random = vec![0u8; count];
+    getrandom::fill(&mut random).map_err(|error| anyhow::anyhow!("random bytes: {error}"))?;
+    Ok(hex(random))
+}
+
 /// A byte count for diagnostics, with two decimals in GiB and one below.
 pub fn human_bytes(value: u64) -> String {
     if value >= 1_073_741_824 {
@@ -694,6 +713,14 @@ pub fn frame_timeout(message: impl Into<String>) -> anyhow::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn bytes_are_lowercase_hex_and_random_names_differ() {
+        assert_eq!(hex([0x00, 0x0f, 0xa5, 0xff]), "000fa5ff");
+        assert_eq!(hex([]), "");
+        let (one, two) = (random_hex(6).unwrap(), random_hex(6).unwrap());
+        assert!(one.len() == 12 && one.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(one, two);
+    }
     #[test]
     fn error_categories_survive_transport() {
         let usage: anyhow::Error = Usage("bad option".into()).into();

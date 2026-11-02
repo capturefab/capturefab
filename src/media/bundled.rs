@@ -51,10 +51,7 @@ impl<'a> Payload<'a> {
         let length =
             usize::try_from(length).context("bundled FFmpeg is too large for this host")?;
         ensure!(length > 0, "bundled FFmpeg is empty");
-        let digest = bytes[PAYLOAD_MAGIC.len() + 8..header]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
+        let digest = crate::types::hex(&bytes[PAYLOAD_MAGIC.len() + 8..header]);
         Ok(Self {
             bytes: &bytes[header..],
             length,
@@ -376,13 +373,7 @@ fn marked(dir: &Path, marker: &str, path: &Path, digest: &str) -> bool {
 /// `digest`.
 fn mark(dir: &Path, marker: &str, path: &Path, digest: &str) -> Result<()> {
     let line = marker_line(path, digest).context("the copy is gone")?;
-    let temporary = dir.join(format!("{marker}.{}.tmp", nonce()?));
-    let written = super::write_new(&temporary, line.as_bytes(), false)
-        .and_then(|()| Ok(fs::rename(&temporary, dir.join(marker))?));
-    if written.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    written
+    crate::dirs::write_private(&dir.join(marker), line.as_bytes(), false)
 }
 
 /// Lock the copy in `dir` shared. Another build's cleanup may move the

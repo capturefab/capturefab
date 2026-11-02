@@ -621,6 +621,7 @@ fn main() {
                     &capturefab::testing::frame::encode(&f, encoding).unwrap(),
                     &output.join(format!("{index}.{encoding}")),
                     SyncMode::File,
+                    None,
                     false,
                 )
                 .unwrap();
@@ -631,7 +632,7 @@ fn main() {
     b.run("storage/save/5MB", five.len(), || {
         index += 1;
         let path = output.join(format!("{index}.raw"));
-        storage::save(&five, &path, SyncMode::File, false).unwrap();
+        storage::save(&five, &path, SyncMode::File, None, false).unwrap();
     });
     // Session snapshots, as status takes them, with eight idle simulated
     // cameras on real workers and a full session log.

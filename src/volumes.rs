@@ -125,8 +125,11 @@ fn root_in(path: &Path, declared: &[PathBuf]) -> Option<PathBuf> {
     let depth = match parts.first().map(String::as_str) {
         Some("Volumes") if cfg!(target_os = "macos") => 2,
         // usbmount and hand-written fstab entries mount drives at
-        // /media/NAME; desktops use /media/USER/NAME.
+        // /media/NAME; desktops use /media/USER/NAME. A /media that is a
+        // volume of its own, as a container's or one fstab mounts there,
+        // holds plain folders, under the mount point it is.
         Some("media") if cfg!(target_os = "linux") => match parts.get(1) {
+            _ if own_mount(Path::new("/media"), declared) => return None,
             Some(name) if own_mount(&Path::new("/media").join(name), declared) => 2,
             _ => 3,
         },
@@ -152,6 +155,26 @@ fn own_mount(path: &Path, declared: &[PathBuf]) -> bool {
     mounted || declared.iter().any(|point| point == path)
 }
 
+/// `path` with its nearest existing folder replaced by its real path, so a
+/// symlink where a volume would be mounted, such as macOS's
+/// /Volumes/Macintosh HD to /, is judged by the folder it leads to.
+#[cfg(unix)]
+fn real(path: &Path) -> PathBuf {
+    for existing in path.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(existing) {
+            return match path.strip_prefix(existing) {
+                Ok(rest) if !rest.as_os_str().is_empty() => real.join(rest),
+                _ => real,
+            };
+        }
+    }
+    path.to_path_buf()
+}
+#[cfg(not(unix))]
+fn real(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 /// Refuse a path on an external volume, or under a mount point fstab
 /// declares, that is not mounted, instead of silently creating its
 /// directories on the system disk.
@@ -160,15 +183,16 @@ pub fn ensure_present(path: &Path) -> Result<()> {
 }
 
 fn present_in(path: &Path, declared: &[PathBuf]) -> Result<()> {
+    let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    let real = real(&path);
     let under = || {
-        let path = std::path::absolute(path).ok()?;
         declared
             .iter()
-            .filter(|point| path.starts_with(point))
+            .filter(|point| path.starts_with(point) || real.starts_with(point))
             .max_by_key(|point| point.components().count())
             .cloned()
     };
-    let Some(root) = root_in(path, declared).or_else(under) else {
+    let Some(root) = root_in(&real, declared).or_else(under) else {
         return Ok(());
     };
     #[cfg(unix)]
@@ -211,6 +235,12 @@ mod tests {
                 root_in(Path::new("/run/media/ana/SD/a.png"), &[]),
                 Some(PathBuf::from("/run/media/ana/SD"))
             );
+        }
+        // Where /media is a folder of the system disk, as on desktops.
+        #[cfg(target_os = "linux")]
+        if !mounted(Path::new("/media"))
+            && !declared().iter().any(|point| point == Path::new("/media"))
+        {
             assert_eq!(
                 root_in(Path::new("/media/ana/USB/x/y.png"), &[]),
                 Some(PathBuf::from("/media/ana/USB"))
@@ -258,7 +288,8 @@ mod tests {
         assert_eq!(crate::cli::output::error_code(&error), ("unavailable", 3));
         present_in(Path::new("/tmp/capturefab/a.png"), &declared).unwrap();
         std::fs::remove_dir_all(&point).unwrap();
-        if cfg!(target_os = "linux") {
+        #[cfg(target_os = "linux")]
+        if !mounted(Path::new("/media")) {
             let usb = [PathBuf::from("/media/usb0")];
             assert_eq!(
                 root_in(Path::new("/media/usb0/2026/a.png"), &usb),
@@ -268,6 +299,58 @@ mod tests {
                 root_in(Path::new("/media/ana/USB/a.png"), &usb),
                 Some(PathBuf::from("/media/ana/USB"))
             );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinks_where_volumes_mount_are_judged_by_where_they_lead() {
+        let root = std::env::temp_dir().join(format!("capturefab-volume-{}", std::process::id()));
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let real_target = std::fs::canonicalize(&target).unwrap();
+        assert_eq!(real(&link.join("new/a.png")), real_target.join("new/a.png"));
+        assert_eq!(real(&link), real_target);
+        // A link to a folder that is gone leads nowhere: it stays a name.
+        std::os::unix::fs::symlink(root.join("gone"), root.join("dangling")).unwrap();
+        let real_root = std::fs::canonicalize(&root).unwrap();
+        assert_eq!(real(&root.join("dangling/a")), real_root.join("dangling/a"));
+        std::fs::remove_dir_all(&root).unwrap();
+        // The boot volume's own entry, a link to /, is the system disk.
+        if cfg!(target_os = "macos")
+            && let Some(boot) = std::fs::read_dir("/Volumes")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.path())
+                .find(|entry| std::fs::read_link(entry).is_ok_and(|to| to == Path::new("/")))
+        {
+            let folder = std::env::temp_dir();
+            let through = boot.join(folder.strip_prefix("/").unwrap()).join("a.png");
+            present_in(&through, &[]).unwrap();
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_media_volume_of_its_own_holds_plain_folders() {
+        let media = [PathBuf::from("/media")];
+        assert_eq!(
+            root_in(Path::new("/media/line1/2026-11-02/a.png"), &media),
+            None
+        );
+        assert_eq!(root_in(Path::new("/media/ana/USB/a.png"), &media), None);
+        // The mount point fstab declares is checked instead.
+        match present_in(Path::new("/media/line1/2026-11-02/a.png"), &media) {
+            Ok(()) => assert!(mounted(Path::new("/media"))),
+            Err(error) => assert!(
+                error
+                    .to_string()
+                    .contains("external volume /media is not mounted"),
+                "{error}"
+            ),
         }
     }
 

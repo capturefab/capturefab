@@ -312,6 +312,7 @@ fn pending_and_running_capture_jobs_prevent_network_writes() {
         let mut harness = Harness::new(Transport::GigE, true);
         let output = "network-scan-protected.png";
         harness.jobs.push(Scheduled {
+            min_free: None,
             plan: crate::naming::Plan::File(output.into()),
             camera: crate::naming::CameraName {
                 label: "camera".into(),

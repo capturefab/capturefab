@@ -319,6 +319,7 @@ fn settle_once(
                 format: Default::default(),
                 region: None,
                 preview: None,
+                min_free: None,
                 warmup_ms: Some(0),
             })
             .ok(),

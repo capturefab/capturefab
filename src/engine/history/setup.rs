@@ -1277,6 +1277,7 @@ mod tests {
         // A scheduled capture keeps the stream: no restart, and nothing
         // changes.
         h.request(SessionCommand::Schedule {
+            min_free: None,
             output: "setup-never-written.png".into(),
             count: 1,
             timeout_ms: 100,

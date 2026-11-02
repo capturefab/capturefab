@@ -7,16 +7,13 @@
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{io::Write as _, path::PathBuf};
+use std::path::PathBuf;
 
 /// The file of `camera`'s settings, named by a hash: a camera's ID may be a
 /// URL with a password, which must not reach a file name.
 fn path(camera: &str) -> Result<PathBuf> {
     let digest = Sha256::digest(key(camera).as_bytes());
-    let name = digest[..16]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let name = crate::types::hex(&digest[..16]);
     Ok(crate::dirs::runtime()?
         .join("settings")
         .join(format!("{name}.json")))
@@ -43,31 +40,8 @@ pub(super) fn save(camera: &str, settings: &Value) -> Result<()> {
     let path = path(camera)?;
     let dir = path.parent().context("settings folder")?;
     crate::dirs::ensure_private_dir(dir)?;
-    let temp = dir.join(format!(
-        ".{}.{}.tmp",
-        path.file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("camera"),
-        std::process::id()
-    ));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let written = (|| -> Result<()> {
-        let mut file = options.open(&temp)?;
-        file.write_all(&serde_json::to_vec(settings)?)?;
-        drop(file);
-        std::fs::rename(&temp, &path)?;
-        Ok(())
-    })();
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    written.with_context(|| format!("save camera settings in {}", dir.display()))
+    crate::dirs::write_private(&path, &serde_json::to_vec(settings)?, false)
+        .with_context(|| format!("save camera settings in {}", dir.display()))
 }
 
 #[cfg(test)]

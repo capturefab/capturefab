@@ -232,6 +232,7 @@ impl Watch<'_> {
             format: PreviewFormat::Png,
             region: self.args.region,
             preview: None,
+            min_free: None,
             warmup_ms: Some(0),
         };
         let spawned = std::thread::Builder::new()

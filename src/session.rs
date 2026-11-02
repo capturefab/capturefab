@@ -153,6 +153,11 @@ pub enum SessionCommand {
         /// Whether each file reaches the disk before it is reported.
         #[serde(default, skip_serializing_if = "crate::storage::SyncMode::is_file")]
         sync: crate::storage::SyncMode,
+        /// The client's own `CAPTUREFAB_MIN_FREE`, in bytes, when it set
+        /// one: the files leave that much free on their disk as well as the
+        /// worker's own floor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_free: Option<u64>,
         /// Tags such as line, station, part, lot and note.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         context: crate::context::Context,
@@ -194,6 +199,11 @@ pub enum SessionCommand {
         /// Whether each file reaches the disk before it is reported.
         #[serde(default, skip_serializing_if = "crate::storage::SyncMode::is_file")]
         sync: crate::storage::SyncMode,
+        /// The client's own `CAPTUREFAB_MIN_FREE`, in bytes, when it set
+        /// one: the files leave that much free on their disk as well as the
+        /// worker's own floor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_free: Option<u64>,
         /// Tags such as line, station, part, lot and note.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         context: crate::context::Context,
@@ -264,6 +274,11 @@ pub enum SessionCommand {
         /// exist; the private inspect folder when unset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         preview: Option<String>,
+        /// The client's own `CAPTUREFAB_MIN_FREE`, in bytes, when it set
+        /// one: the files leave that much free on their disk as well as the
+        /// worker's own floor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_free: Option<u64>,
         /// How long a camera that sets its own exposure may take to settle
         /// after it starts, in milliseconds; 0 takes its frames as they
         /// come, unset waits up to 2 s.
@@ -289,6 +304,11 @@ pub enum SessionCommand {
         /// default, when the free-space floor alone ends it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         max_file_bytes: Option<u64>,
+        /// The client's own `CAPTUREFAB_MIN_FREE`, in bytes, when it set
+        /// one: the files leave that much free on their disk as well as the
+        /// worker's own floor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min_free: Option<u64>,
         /// What to do when an output name without {seq} exists; fail by default.
         #[serde(default, skip_serializing_if = "crate::naming::OnExists::is_fail")]
         on_exists: crate::naming::OnExists,
@@ -682,6 +702,7 @@ impl SessionCommand {
                     fps: *fps,
                     bitrate: bitrate.clone(),
                     max_file_bytes: *max_file_bytes,
+                    min_free: None,
                 }
                 .validate()?;
             }
@@ -3064,6 +3085,7 @@ mod tests {
             SessionCommand::Forward {
                 duration_ms: None,
                 max_file_bytes: None,
+                min_free: None,
                 ..
             }
         ));
@@ -3094,6 +3116,7 @@ mod tests {
             fps: 30.0,
             bitrate: "4M".into(),
             max_file_bytes: None,
+            min_free: None,
             on_exists: Default::default(),
             context: Default::default(),
             duration_ms,
@@ -3205,6 +3228,7 @@ mod tests {
     #[test]
     fn frame_and_set_values_have_strict_shapes_and_documented_defaults() {
         let SessionCommand::Frame {
+            min_free: None,
             fresh,
             timeout_ms,
             max_dimension,
@@ -3297,6 +3321,7 @@ mod tests {
                 data: vec![],
             },
             SessionCommand::Frame {
+                min_free: None,
                 fresh: 11,
                 timeout_ms: 3000,
                 max_dimension: 1024,
@@ -3306,6 +3331,7 @@ mod tests {
                 warmup_ms: None,
             },
             SessionCommand::Frame {
+                min_free: None,
                 fresh: 1,
                 timeout_ms: 3000,
                 max_dimension: 1024,
@@ -3472,6 +3498,7 @@ mod tests {
     fn frame_inspections_wait_their_turn_outside_the_action_queue() {
         let handle = SessionHandle::new();
         let frame = || SessionCommand::Frame {
+            min_free: None,
             fresh: 1,
             timeout_ms: 50,
             max_dimension: 0,
@@ -3674,6 +3701,7 @@ mod tests {
         let (id, reply) = worker
             .submit(
                 SessionCommand::Frame {
+                    min_free: None,
                     fresh: 1,
                     timeout_ms: 10_000,
                     max_dimension: 0,

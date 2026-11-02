@@ -22,23 +22,13 @@ pub enum SavedItem {
         width: u32,
         height: u32,
         pixel_format: u32,
-        format: String,
-        /// capture or schedule.
-        origin: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        job_id: Option<u64>,
         /// The file is the JPEG the source sent, not an encoding of the
         /// frame.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         passthrough: bool,
     },
-    Recording {
-        started_ms: u64,
-        ended_ms: u64,
-        codec: String,
-        encoder: String,
-        fps: f64,
-    },
+    /// A finished recording, which started at the file's `wall_ms`.
+    Recording,
 }
 
 /// One finished file, reported by a camera worker to the coordinator.
@@ -56,18 +46,16 @@ pub struct SavedFile {
     pub item: SavedItem,
 }
 
-/// A finished local recording, reported by the forwarder when it stops.
+/// A finished local recording, reported by the forwarder when it stops,
+/// as its job's summary shows it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RecordedFile {
     pub path: String,
     pub bytes: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
     pub started_ms: u64,
     pub ended_ms: u64,
     pub codec: String,
     pub encoder: String,
-    pub fps: f64,
 }
 
 impl SavedFile {
@@ -226,9 +214,6 @@ mod tests {
                 width: 64,
                 height: 48,
                 pixel_format: crate::types::MONO8,
-                format: "png".into(),
-                origin: "schedule".into(),
-                job_id: Some(1),
                 passthrough: false,
             },
         };

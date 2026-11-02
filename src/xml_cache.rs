@@ -24,11 +24,7 @@ pub(crate) fn key(parts: &[&[u8]]) -> String {
         digest.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
         digest.update(part);
     }
-    digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    crate::types::hex(digest.finalize())
 }
 
 fn dir() -> Option<PathBuf> {
@@ -61,13 +57,9 @@ pub(crate) fn store(key: &str, xml: &str) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let temp = dir.join(format!(".{key}.{}.tmp", std::process::id()));
-    let written = std::fs::write(&temp, xml).and_then(|()| std::fs::rename(&temp, &path));
-    if written.is_err() {
-        let _ = std::fs::remove_file(&temp);
-        return;
+    if crate::dirs::write_private(&path, xml.as_bytes(), false).is_ok() {
+        prune(&dir);
     }
-    prune(&dir);
 }
 
 /// Forget the XML kept under `key`, which turned out wrong.

@@ -101,7 +101,7 @@ pub fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
                     } else {
                         std::env::current_dir()?.join(path)
                     };
-                    crate::storage::save_one(xml.as_bytes(), &path)?;
+                    crate::storage::save_one(xml.as_bytes(), &path, None)?;
                     let text = format!("Wrote {}\n", path.display());
                     Report::json(json!({"path": path, "bytes": xml.len()})).text(text)
                 }
@@ -124,13 +124,14 @@ pub fn run(global: &Global, command: DebugCommand) -> Result<Option<Report>> {
             command.validate().map_err(super::input)?;
             let client = Client::open(global, camera.camera.as_deref())?;
             let value = client.call(command)?;
-            let bytes = value["data"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|b| b.as_u64())
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
+            let bytes = crate::types::hex(
+                value["data"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|b| b.as_u64().and_then(|b| u8::try_from(b).ok()))
+                    .collect::<Vec<u8>>(),
+            );
             Report::json(json!({"address": address, "hex": bytes}))
                 .text(format!("0x{address:x}: {bytes}\n"))
         }

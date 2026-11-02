@@ -31,10 +31,7 @@ fn lockable(info: &CameraInfo) -> bool {
 /// The camera's lock file, in the runtime folder when there is one.
 fn path(info: &CameraInfo) -> Option<PathBuf> {
     let digest = Sha256::digest(info.id.as_bytes());
-    let name = digest[..8]
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let name = crate::types::hex(&digest[..8]);
     let runtime = crate::dirs::runtime().ok()?;
     Some(runtime.join("cameras").join(format!("{name}.lock")))
 }

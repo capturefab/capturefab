@@ -50,6 +50,8 @@ pub(super) struct Request {
     region: Option<[f64; 4]>,
     /// The file the preview goes to; the private folder when unset.
     preview: Option<PathBuf>,
+    /// The client's own free-space floor for that file.
+    min_free: Option<u64>,
 }
 impl Request {
     pub(super) fn of(command: &WorkerCommand) -> Option<Self> {
@@ -60,6 +62,7 @@ impl Request {
             format,
             region,
             preview,
+            min_free,
             warmup_ms,
         }) = command.session()
         else {
@@ -74,6 +77,7 @@ impl Request {
             format: *format,
             region: *region,
             preview: preview.as_ref().map(PathBuf::from),
+            min_free: *min_free,
         })
     }
 }
@@ -499,7 +503,10 @@ fn measure(job: &Job) -> Result<Value> {
         request.region,
         request.max_dimension,
         request.format,
-        request.preview.as_deref(),
+        request
+            .preview
+            .as_deref()
+            .map(|path| (path, request.min_free)),
     )?;
     if !job.notes.is_empty() {
         reply["settled"] = json!(false);
@@ -539,8 +546,9 @@ fn measure(job: &Job) -> Result<Value> {
     Ok(reply)
 }
 
-/// Measure `frame`'s `region` and write its preview, to `preview` or the
-/// private folder: the reply's measurements and `image`.
+/// Measure `frame`'s `region` and write its preview, to `preview`'s file
+/// with the client's own free-space floor, or the private folder: the
+/// reply's measurements and `image`.
 pub(super) fn measurements(
     frame: &Frame,
     kind: crate::camera_profile::CameraKind,
@@ -548,7 +556,7 @@ pub(super) fn measurements(
     region: Option<[f64; 4]>,
     max_dimension: u32,
     format: PreviewFormat,
-    preview: Option<&Path>,
+    preview: Option<(&Path, Option<u64>)>,
 ) -> Result<Value> {
     let mut inspection = crate::inspect::inspect(frame, kind, region, max_dimension, format)?;
     let image = inspection.image.take();
@@ -563,8 +571,8 @@ pub(super) fn measurements(
             "png"
         };
         let path = match preview {
-            Some(path) => {
-                crate::storage::save_one(&image.bytes, path)?;
+            Some((path, min_free)) => {
+                crate::storage::save_one(&image.bytes, path, min_free)?;
                 path.to_path_buf()
             }
             None => private_image(

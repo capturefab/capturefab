@@ -301,14 +301,15 @@ impl WorkerHandle {
     pub(crate) fn push_saved(&self, job: Option<u64>, file: crate::engine::saved::SavedFile) {
         self.events.emit(Output::Saved { job, file });
     }
-    /// The saved-file lines waiting in a detached outbox, for tests.
+    /// The saved-file lines waiting in a detached outbox, for tests, with
+    /// the job each is for.
     #[cfg(test)]
-    pub(crate) fn take_saved(&self) -> Vec<crate::engine::saved::SavedFile> {
+    pub(crate) fn take_saved(&self) -> Vec<(Option<u64>, crate::engine::saved::SavedFile)> {
         self.events
             .drain()
             .into_iter()
             .filter_map(|line| match line {
-                Output::Saved { file, .. } => Some(file),
+                Output::Saved { job, file } => Some((job, file)),
                 _ => None,
             })
             .collect()
@@ -957,32 +958,19 @@ fn end_forward(
             summary["encoder"] = json!(stats.encoder);
             summary["codec"] = json!(stats.codec);
             // A finished file is reported even when stopping reported an error.
-            if let Some(file) = stats.recording.clone() {
-                let path = absolute_path(std::path::Path::new(&file.path));
-                summary["recording"] = json!({
-                    "path": path,
-                    "bytes": file.bytes,
-                    "started_ms": file.started_ms,
-                    "ended_ms": file.ended_ms,
-                    "codec": file.codec,
-                    "encoder": file.encoder,
-                });
+            if let Some(mut file) = stats.recording.clone() {
+                file.path = absolute_path(std::path::Path::new(&file.path));
+                summary["recording"] = json!(file);
                 let context = meta.map(|m| m.context).unwrap_or_default();
                 h.push_saved(
                     job,
                     crate::engine::saved::SavedFile {
                         wall_ms: file.started_ms,
-                        path,
+                        path: file.path,
                         bytes: file.bytes,
-                        sha256: file.sha256,
+                        sha256: None,
                         context,
-                        item: crate::engine::saved::SavedItem::Recording {
-                            started_ms: file.started_ms,
-                            ended_ms: file.ended_ms,
-                            codec: file.codec,
-                            encoder: file.encoder,
-                            fps: file.fps,
-                        },
+                        item: crate::engine::saved::SavedItem::Recording,
                     },
                 );
             }
@@ -1269,6 +1257,7 @@ fn save_sidecar(
     wall_ms: u64,
     acquisition: &Acquisition,
     sync: crate::storage::SyncMode,
+    min_free: Option<u64>,
 ) -> Result<()> {
     let sidecar = crate::naming::sidecar(path);
     let document = crate::types::without_nulls(json!({
@@ -1285,7 +1274,7 @@ fn save_sidecar(
     }));
     let saved = serde_json::to_vec(&document)
         .map_err(anyhow::Error::from)
-        .and_then(|bytes| crate::storage::save(&bytes, &sidecar, sync, false));
+        .and_then(|bytes| crate::storage::save(&bytes, &sidecar, sync, min_free, false));
     if let Err(error) = saved {
         let _ = std::fs::remove_file(path);
         return Err(error).with_context(|| format!("save {}", sidecar.display()));
@@ -1293,15 +1282,12 @@ fn save_sidecar(
     Ok(())
 }
 /// A published image, as its `saved` line reports it.
-#[allow(clippy::too_many_arguments)]
 fn image_file(
     path: &std::path::Path,
     stored: &crate::storage::Stored,
     frame: &Frame,
-    format: &str,
     passthrough: bool,
     wall_ms: u64,
-    job_id: Option<u64>,
     context: &crate::context::Context,
 ) -> crate::engine::saved::SavedFile {
     crate::engine::saved::SavedFile {
@@ -1316,14 +1302,6 @@ fn image_file(
             width: frame.width,
             height: frame.height,
             pixel_format: frame.pixel_format,
-            format: format.into(),
-            origin: if job_id.is_some() {
-                "schedule"
-            } else {
-                "capture"
-            }
-            .into(),
-            job_id,
             passthrough,
         },
     }
@@ -1469,6 +1447,7 @@ fn process_plain(
             fps,
             bitrate,
             max_file_bytes,
+            min_free,
             on_exists,
             context,
             duration_ms,
@@ -1482,19 +1461,8 @@ fn process_plain(
                 forwarder.is_none(),
                 "the camera is already recording; capturefab jobs stop ends that recording"
             );
-            let mut identity = [0u8; 16];
-            getrandom::fill(&mut identity)
+            let forwarding_id = crate::types::random_hex(16)
                 .map_err(|_| anyhow::anyhow!("could not allocate a recording identity"))?;
-            const HEX: &[u8; 16] = b"0123456789abcdef";
-            let forwarding_id: String = identity
-                .iter()
-                .flat_map(|byte| {
-                    [
-                        char::from(HEX[usize::from(byte >> 4)]),
-                        char::from(HEX[usize::from(byte & 15)]),
-                    ]
-                })
-                .collect();
             let mut config = ForwardConfig {
                 output: output.clone(),
                 codec,
@@ -1502,6 +1470,7 @@ fn process_plain(
                 fps,
                 bitrate,
                 max_file_bytes,
+                min_free,
             };
             config.validate()?;
             let named = crate::media::is_recording(&output)
@@ -1900,6 +1869,7 @@ fn process_plain(
             on_exists,
             manifest,
             sync,
+            min_free,
             context,
             utc_offset_s,
             quality,
@@ -1983,6 +1953,7 @@ fn process_plain(
                 inspect,
                 format,
                 sync,
+                min_free,
                 manifest,
                 source,
                 folders: Default::default(),
@@ -2097,6 +2068,7 @@ fn process_plain(
             format,
             on_exists,
             sync,
+            min_free,
             context,
             utc_offset_s,
             quality,
@@ -2203,11 +2175,13 @@ fn process_plain(
                         &input,
                         on_exists,
                         first.clone(),
-                        |path| crate::storage::save_parts(&bytes.parts(), path, sync, false),
+                        |path| {
+                            crate::storage::save_parts(&bytes.parts(), path, sync, min_free, false)
+                        },
                     )
                     .with_context(|| format!("save {}", first.display()))?;
                     if format == "raw" {
-                        save_sidecar(&path, &frame, wall_ms, &settings, sync)?;
+                        save_sidecar(&path, &frame, wall_ms, &settings, sync, min_free)?;
                     }
                     folders.add(&path);
                     let file = path.to_string_lossy().into_owned();
@@ -2215,10 +2189,8 @@ fn process_plain(
                         &path,
                         &stored,
                         &frame,
-                        &format,
                         bytes.passthrough(),
                         wall_ms,
-                        None,
                         &context,
                     );
                     h.push_saved(None, saved);
@@ -2305,6 +2277,8 @@ struct Scheduled {
     inspect: bool,
     format: String,
     sync: crate::storage::SyncMode,
+    /// The client's own free-space floor.
+    min_free: Option<u64>,
     /// Where a line for each saved file goes.
     manifest: Option<Arc<crate::engine::saved::Manifest>>,
     source: Source,
@@ -2488,6 +2462,7 @@ impl Scheduled {
             format: self.format.clone(),
             quality: self.quality,
             sync: self.sync,
+            min_free: self.min_free,
             manifest: self.manifest.clone(),
             source: self.source.clone(),
             context: self.info.context.clone(),
@@ -3987,6 +3962,7 @@ mod tests {
             crate::scheduling::now_ms()
         ));
         let schedule = |output: String, count: u32, format: &str| SessionCommand::Schedule {
+            min_free: None,
             output,
             count,
             timeout_ms: 100,
@@ -4047,6 +4023,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let output = root.join("rec-{seq}.mkv").to_string_lossy().into_owned();
         let forward = || SessionCommand::Forward {
+            min_free: None,
             output: output.clone(),
             codec: "h264".into(),
             encoder: "auto".into(),
@@ -4081,6 +4058,7 @@ mod tests {
     }
     fn timed_forward(output: &Path, duration_ms: Option<u64>) -> SessionCommand {
         SessionCommand::Forward {
+            min_free: None,
             output: output.to_string_lossy().into_owned(),
             codec: "h264".into(),
             encoder: "libx264".into(),
@@ -4452,11 +4430,12 @@ mod tests {
         // Once the forward is gone, its file is finished and reported.
         let saved = h.take_saved();
         assert_eq!(saved.len(), 1);
+        let (_, recorded) = &saved[0];
         assert!(matches!(
-            saved[0].item,
-            crate::engine::saved::SavedItem::Recording { .. }
+            recorded.item,
+            crate::engine::saved::SavedItem::Recording
         ));
-        assert_eq!(std::fs::metadata(&output).unwrap().len(), saved[0].bytes);
+        assert_eq!(std::fs::metadata(&output).unwrap().len(), recorded.bytes);
         // The first status that shows it gone already says how it ended.
         assert_eq!(
             (ended.forwarding_since_ms, ended.forwarding_until_ms),
@@ -4509,6 +4488,7 @@ mod tests {
         let context = crate::context::Context::from([("line".into(), "L1".into())]);
         let v = h
             .request(SessionCommand::Capture {
+                min_free: None,
                 output: root.join("shot.raw").to_string_lossy().into_owned(),
                 count: 1,
                 timeout_ms: 1000,
@@ -4535,7 +4515,9 @@ mod tests {
         let wall_ms = v["frame"]["wall_ms"].as_u64().unwrap();
         let batch = h.take_saved();
         assert_eq!(batch.len(), 1);
-        let saved = &batch[0];
+        // A capture command's file is no job's.
+        let (job, saved) = &batch[0];
+        assert_eq!(*job, None);
         assert_eq!(saved.wall_ms, wall_ms);
         assert_eq!(saved.context, context);
         assert_eq!(saved.bytes, 128 * 128);
@@ -4544,7 +4526,7 @@ mod tests {
         assert!(std::path::Path::new(&saved.path).is_absolute());
         assert!(matches!(
             saved.item,
-            crate::engine::saved::SavedItem::Capture { ref origin, job_id: None, .. } if origin == "capture"
+            crate::engine::saved::SavedItem::Capture { .. }
         ));
         assert!(h.take_saved().is_empty());
         h.shutdown();
@@ -4564,6 +4546,7 @@ mod tests {
     }
     fn capture_to(output: &Path, count: u32, on_exists: crate::naming::OnExists) -> SessionCommand {
         SessionCommand::Capture {
+            min_free: None,
             output: output.to_string_lossy().into_owned(),
             count,
             timeout_ms: 1000,
@@ -4638,6 +4621,7 @@ mod tests {
         std::fs::write(&path, b"keep").unwrap();
         let error = h
             .request(SessionCommand::Forward {
+                min_free: None,
                 output: path.to_string_lossy().into_owned(),
                 codec: "h264".into(),
                 encoder: "auto".into(),
@@ -4727,6 +4711,7 @@ mod tests {
         let dir = temp_dir("scheduled-seq");
         let job = h
             .request(SessionCommand::Schedule {
+                min_free: None,
                 output: dir.join("s-{seq}.raw").to_string_lossy().into_owned(),
                 count: 3,
                 timeout_ms: 1000,
@@ -4771,14 +4756,9 @@ mod tests {
         );
         let batch = h.take_saved();
         assert_eq!(batch.len(), 3);
-        assert!(batch.iter().all(|f| f.context["lot"] == "7"
-            && matches!(
-                f.item,
-                crate::engine::saved::SavedItem::Capture {
-                    job_id: Some(1),
-                    ..
-                }
-            )));
+        assert!(batch.iter().all(|(job, f)| *job == Some(1)
+            && f.context["lot"] == "7"
+            && matches!(f.item, crate::engine::saved::SavedItem::Capture { .. })));
         h.shutdown();
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -4789,6 +4769,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         Scheduled {
+            min_free: None,
             info: crate::scheduling::CaptureJob {
                 id,
                 status: "running".into(),
@@ -4850,9 +4831,6 @@ mod tests {
                     width: 8,
                     height: 8,
                     pixel_format: crate::types::MONO8,
-                    format: "raw".into(),
-                    origin: "schedule".into(),
-                    job_id: Some(save.job),
                     passthrough: false,
                 },
             },
@@ -5020,7 +4998,7 @@ mod tests {
         let saved = h
             .take_saved()
             .into_iter()
-            .map(|file| file.path)
+            .map(|(_, file)| file.path)
             .collect::<Vec<_>>();
         assert_eq!(saved, info.files);
         drop(saver);
@@ -5485,6 +5463,7 @@ mod tests {
     /// Inspect the camera's next frame, measurements only.
     fn inspect(h: &WorkerHandle, fresh: u32) -> Result<Value> {
         h.request(SessionCommand::Frame {
+            min_free: None,
             fresh,
             timeout_ms: 2000,
             max_dimension: 0,
@@ -5551,6 +5530,7 @@ mod tests {
         h.queue_request(
             Some(7),
             SessionCommand::Frame {
+                min_free: None,
                 fresh: 1,
                 timeout_ms: 10_000,
                 max_dimension: 0,
@@ -5614,6 +5594,7 @@ mod tests {
         set(&h, "TriggerSource", "Line0");
         let reply = h
             .submit(SessionCommand::Frame {
+                min_free: None,
                 fresh: 1,
                 timeout_ms: 10_000,
                 max_dimension: 0,
@@ -5833,6 +5814,7 @@ mod tests {
         let dir = temp_dir("auto-capture");
         let v = h
             .request(SessionCommand::Capture {
+                min_free: None,
                 output: dir.join("warm.raw").to_string_lossy().into_owned(),
                 count: 1,
                 timeout_ms: 6000,
@@ -6089,6 +6071,7 @@ mod tests {
         let h = WorkerHandle::new();
         let mut camera = Some(Camera::open("sim:0", &[], Duration::from_secs(1)).unwrap());
         let frame = SessionCommand::Frame {
+            min_free: None,
             fresh: 1,
             timeout_ms: 1000,
             max_dimension: 0,

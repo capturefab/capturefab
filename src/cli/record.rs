@@ -183,6 +183,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         return Err(Usage("--fps must be 0.1..240".into()).into());
     }
     let max_file_bytes = args.max_size;
+    let min_free = crate::storage::min_free()?;
     let request = |fps: f64| SessionCommand::Forward {
         output: output.clone(),
         codec: args.codec().name().into(),
@@ -190,6 +191,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
         fps,
         bitrate: args.bitrate(),
         max_file_bytes,
+        min_free,
         on_exists: Default::default(),
         context: Default::default(),
         duration_ms: args.duration.map(millis),
@@ -228,6 +230,7 @@ pub fn run(global: &Global, args: RecordArgs) -> Result<Report> {
             fps: args.fps.unwrap_or(30.0),
             bitrate: args.bitrate(),
             max_file_bytes,
+            min_free,
         })?;
     }
     signals::take_over();

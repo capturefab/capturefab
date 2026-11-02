@@ -14,12 +14,7 @@
 use crate::types::{Categorized, ErrorKind};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
-use std::{
-    fs,
-    io::{Read, Write},
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{fs, io::Read, path::PathBuf, sync::Arc};
 use zeroize::Zeroizing;
 
 #[cfg(all(feature = "keychain", not(test)))]
@@ -569,30 +564,12 @@ impl Logins {
     fn write(&self, file: &File) -> Result<()> {
         let dir = self.dir()?;
         crate::dirs::ensure_private_dir(&dir)?;
-        let temp = dir.join(format!("{INDEX}.{}.tmp", std::process::id()));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let result = (|| -> Result<()> {
-            let mut output = options.open(&temp)?;
-            let bytes = serde_json::to_vec_pretty(file)?;
-            ensure!(
-                bytes.len() <= MAX_FILE,
-                "the saved camera sign-in list is too large"
-            );
-            output.write_all(&bytes)?;
-            output.sync_all()?;
-            fs::rename(&temp, dir.join(INDEX))?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp);
-        }
-        result
+        let bytes = serde_json::to_vec_pretty(file)?;
+        ensure!(
+            bytes.len() <= MAX_FILE,
+            "the saved camera sign-in list is too large"
+        );
+        crate::dirs::write_private(&dir.join(INDEX), &bytes, true)
     }
     fn open_lock(&self) -> Result<fs::File> {
         let dir = self.dir()?;

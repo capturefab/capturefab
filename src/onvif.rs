@@ -50,9 +50,7 @@ pub struct OnvifStream {
     pub uri: String,
 }
 fn random_hex() -> Result<String> {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow!("cannot generate ONVIF nonce: {e}"))?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+    crate::types::random_hex(16).context("cannot generate ONVIF nonce")
 }
 fn uuid() -> Result<String> {
     let h = random_hex()?;

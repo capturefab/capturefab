@@ -187,9 +187,11 @@ network paths. More: [CLI workflows](docs/cli-workflows.md),
 | `CAPTUREFAB_VAAPI_DEVICE` | the DRM render node VA-API JPEG encoding uses, instead of the first `/dev/dri/renderD*` that encodes JPEG |
 | `CAPTUREFAB_HWDEC` | hardware decoding of H.264, HEVC and other compressed video: `auto` (default: streams and webcams, in a session), `none`, or a method such as `videotoolbox`, `cuda`, `vulkan` or `d3d11va`, used for files and `--no-session` too; one this FFmpeg lacks or that fails its probe is exit 3 `unavailable`. Motion JPEG is decoded with libjpeg-turbo whatever it says |
 
-A session's cameras keep the `CAPTUREFAB_JPEG`, `CAPTUREFAB_HWDEC`, `CAPTUREFAB_FFMPEG` and
-`CAPTUREFAB_MIN_FREE` the session started with, the warm `auto` session included: stop it
-(`capturefab session stop auto`) or use `--no-session` for a command to use other values.
+A session's cameras keep the `CAPTUREFAB_JPEG`, `CAPTUREFAB_HWDEC` and `CAPTUREFAB_FFMPEG` the
+session started with, the warm `auto` session included: stop it (`capturefab session stop auto`)
+or use `--no-session` for a command to use other values. A command's own `CAPTUREFAB_MIN_FREE`
+raises the free-space floor for the files a session writes for it, but does not lower the floor
+the session started with.
 
 `capturefab --json doctor` prints the folders in use (`dirs`, and under `folders` the fallbacks
 it passed over), including the private folder that holds `inspect` previews, the JPEG encoders

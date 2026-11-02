@@ -427,6 +427,30 @@ fn a_recording_without_room_fails_as_storage_full() {
     assert!(!home.path("big.mkv").exists());
 }
 
+/// A recording a session makes leaves the floor its command set, as the
+/// session's own environment has none.
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_session_recording_leaves_its_commands_free_space_floor() {
+    let home = Home::new("record-full-session");
+    let record = |floor: Option<&str>, name: &str| {
+        let args = ["--json", "record", "-c", "sim:0", "-o", name, "--for", "1s"];
+        let mut command = home.warm_command();
+        match floor {
+            Some(floor) => command.env("CAPTUREFAB_MIN_FREE", floor),
+            None => command.env_remove("CAPTUREFAB_MIN_FREE"),
+        };
+        support::cli::Run::of_output(command.args(args).output().unwrap(), &args)
+    };
+    home.warm(&["--json", "get", "-c", "sim:0", "Width"])
+        .success();
+    let full = record(Some("1000T"), "big.mkv").failure(6);
+    assert_eq!(full["code"], "storage_full", "{full}");
+    assert!(!home.path("big.mkv").exists());
+    record(None, "fits.mkv").success();
+    assert!(home.path("fits.mkv").exists());
+}
+
 /// --max-size ends a recording successfully, at exactly that size, with
 /// the video before it playable; without it nothing caps a recording.
 #[test]

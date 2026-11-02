@@ -10,9 +10,15 @@
 //! (exFAT, some network shares) get the still created under its name
 //! instead. A recording streams from FFmpeg into a new file under its name,
 //! up to its size limit. The folders a job or command published in are
-//! synced once when it ends ([`Folders`]), so the names survive a power cut
-//! too.
-use crate::types::{Categorized, ErrorKind, Usage, human_bytes};
+//! synced once when it ends ([`Folders`]), and a folder a write creates is
+//! synced into its parent as it is created, so the names survive a power
+//! cut too.
+//!
+//! Writes leave a free-space floor on their disk: the camera worker's own
+//! (`CAPTUREFAB_MIN_FREE` where it runs, else 1% of the disk), or the
+//! higher one the command that asked for the file set, which a session's
+//! worker, running with the session's environment, gets with the request.
+use crate::types::{Categorized, ErrorKind, Usage, hex, human_bytes};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -89,10 +95,6 @@ pub struct Stored {
     pub sha256: Option<String>,
 }
 
-fn hex(bytes: impl AsRef<[u8]>) -> String {
-    bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Free and total bytes for unprivileged writes on one disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Space {
@@ -121,6 +123,27 @@ pub fn space(path: &Path) -> Option<Space> {
 pub fn floor(total: u64) -> Result<u64> {
     floor_with(std::env::var_os(MIN_FREE_ENV).as_deref(), total)
 }
+/// The `CAPTUREFAB_MIN_FREE` this process was given, in bytes, when it
+/// was: what a command sends with the writes it asks a camera worker for.
+pub fn min_free() -> Result<Option<u64>> {
+    min_free_with(std::env::var_os(MIN_FREE_ENV).as_deref())
+}
+fn min_free_with(setting: Option<&std::ffi::OsStr>) -> Result<Option<u64>> {
+    let setting = setting.filter(|value| !value.is_empty());
+    setting
+        .map(|setting| floor_with(Some(setting), 0))
+        .transpose()
+}
+/// The floor a write leaves on a disk of `total` bytes: this process's, or
+/// `min_free`, the command's own, when that is higher. True when it is this
+/// process's.
+fn floor_for(total: u64, min_free: Option<u64>) -> Result<(u64, bool)> {
+    let own = floor(total)?;
+    Ok(match min_free {
+        Some(asked) if asked > own => (asked, false),
+        _ => (own, true),
+    })
+}
 fn floor_with(setting: Option<&std::ffi::OsStr>, total: u64) -> Result<u64> {
     let Some(setting) = setting.filter(|value| !value.is_empty()) else {
         return Ok((total / 100).clamp(FLOOR_MIN, FLOOR_MAX));
@@ -139,16 +162,17 @@ fn floor_with(setting: Option<&std::ffi::OsStr>, total: u64) -> Result<u64> {
 }
 
 /// Refuse to add `adding` bytes at `path` when that would leave less than
-/// the floor free on its disk: `storage_full`, with `{path, free_bytes}`.
-/// A disk that does not report its space is not refused.
-pub fn ensure_room(path: &Path, adding: u64) -> Result<()> {
+/// the floor free on its disk ([`floor_for`] with `min_free`):
+/// `storage_full`, with `{path, free_bytes}`. A disk that does not report
+/// its space is not refused.
+fn ensure_room(path: &Path, adding: u64, min_free: Option<u64>) -> Result<()> {
     let Some(space) = space(path) else {
         return Ok(());
     };
-    let floor = floor(space.total)?;
+    let (floor, own) = floor_for(space.total, min_free)?;
     if floor > 0 && space.free.saturating_sub(adding) < floor {
         let free = space.free;
-        return Err(full(path, NoRoom::Floor { free, floor }));
+        return Err(full(path, NoRoom::Floor { free, floor, own }));
     }
     Ok(())
 }
@@ -156,8 +180,9 @@ pub fn ensure_room(path: &Path, adding: u64) -> Result<()> {
 /// Why a disk has no room for more of a file.
 #[derive(Clone, Debug)]
 enum NoRoom {
-    /// `free` bytes are left, below the `floor` Capturefab keeps.
-    Floor { free: u64, floor: u64 },
+    /// `free` bytes are left, below the `floor` Capturefab keeps: this
+    /// process's own when `own`, else the one the command set.
+    Floor { free: u64, floor: u64, own: bool },
     /// A write was refused: the disk, or the user's quota on it, is full.
     Refused(String),
 }
@@ -165,21 +190,26 @@ enum NoRoom {
 /// `storage_full` for `path`, with `{path, free_bytes}` either way.
 fn full(path: &Path, no_room: NoRoom) -> anyhow::Error {
     let (message, free, hint) = match no_room {
-        NoRoom::Floor { free, floor } => (
-            format!(
-                "{} free on the disk of {}, and Capturefab leaves {} free",
-                human_bytes(free),
-                path.display(),
-                human_bytes(floor)
-            ),
-            Some(free),
-            crate::session::with_environment_hint(
+        NoRoom::Floor { free, floor, own } => {
+            let hint = format!(
+                "free some space, write to another disk, or lower {MIN_FREE_ENV} (0 turns the floor off)"
+            );
+            (
                 format!(
-                    "free some space, write to another disk, or lower {MIN_FREE_ENV} (0 turns the floor off)"
+                    "{} free on the disk of {}, and Capturefab leaves {} free",
+                    human_bytes(free),
+                    path.display(),
+                    human_bytes(floor)
                 ),
-                MIN_FREE_ENV,
-            ),
-        ),
+                Some(free),
+                // A session's own floor is the one it started with.
+                if own {
+                    crate::session::with_environment_hint(hint, MIN_FREE_ENV)
+                } else {
+                    hint
+                },
+            )
+        }
         NoRoom::Refused(error) => (
             format!("cannot write {}: {error}", path.display()),
             space(path).map(|space| space.free),
@@ -203,7 +233,8 @@ fn no_room(error: &io::Error) -> bool {
 /// The folder `path` goes in, created when missing, unless the path has
 /// control characters, it is under the mount point of a drive that is not
 /// there, or `adding` bytes there would leave less than the floor free.
-fn folder(path: &Path, adding: u64) -> Result<PathBuf> {
+/// With `sync`, each folder it creates is synced into its parent.
+fn folder(path: &Path, adding: u64, sync: SyncMode, min_free: Option<u64>) -> Result<PathBuf> {
     let bytes = path.as_os_str().as_encoded_bytes();
     if bytes.iter().any(u8::is_ascii_control) {
         return Err(Usage("an output path must not contain control characters".into()).into());
@@ -216,9 +247,25 @@ fn folder(path: &Path, adding: u64) -> Result<PathBuf> {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     crate::volumes::ensure_present(parent)?;
-    ensure_room(path, adding)?;
+    ensure_room(path, adding, min_free)?;
+    // The folders it lacks, deepest first: a new folder's name is in its
+    // parent, which syncing the folder itself does not make durable.
+    let missing: Vec<&Path> = parent
+        .ancestors()
+        .take_while(|dir| {
+            !dir.as_os_str().is_empty()
+                && matches!(fs::symlink_metadata(dir), Err(error) if error.kind() == io::ErrorKind::NotFound)
+        })
+        .collect();
     let cannot = || format!("cannot create folder {}", parent.display());
     fs::create_dir_all(parent).with_context(cannot)?;
+    if sync.is_file() {
+        for dir in missing.iter().rev() {
+            let up = dir.parent().filter(|up| !up.as_os_str().is_empty());
+            let up = up.unwrap_or_else(|| Path::new("."));
+            sync_dir(up).with_context(|| format!("cannot sync {}", up.display()))?;
+        }
+    }
     Ok(parent.to_path_buf())
 }
 
@@ -231,10 +278,8 @@ fn partial(path: &Path) -> Result<PathBuf> {
     while !name.is_char_boundary(end) {
         end -= 1;
     }
-    let mut random = [0u8; 6];
-    getrandom::fill(&mut random).map_err(|error| anyhow!("random file name: {error}"))?;
-    let pid = std::process::id();
-    let partial = format!(".{}.{pid}-{}.partial", &name[..end], hex(random));
+    let (pid, random) = (std::process::id(), crate::types::random_hex(6)?);
+    let partial = format!(".{}.{pid}-{random}.partial", &name[..end]);
     Ok(path.with_file_name(partial))
 }
 
@@ -259,17 +304,31 @@ fn direct(dir: &Path, remember: bool) -> bool {
 }
 
 /// Save encoded bytes as a new file at `path`, never replacing anything
-/// there, with its SHA-256 when `hash`. A failure leaves nothing behind.
-pub fn save(bytes: &[u8], path: &Path, sync: SyncMode, hash: bool) -> Result<Stored> {
-    save_parts(&[bytes], path, sync, hash)
+/// there, leaving the floor free with the command's own `min_free` (see
+/// [`floor_for`]), with its SHA-256 when `hash`. A failure leaves nothing
+/// behind.
+pub fn save(
+    bytes: &[u8],
+    path: &Path,
+    sync: SyncMode,
+    min_free: Option<u64>,
+    hash: bool,
+) -> Result<Stored> {
+    save_parts(&[bytes], path, sync, min_free, hash)
 }
 
 /// `save` for a file made of `parts` in order, written together, without
 /// putting them in one buffer first: an encoded still's header or metadata
 /// and the frame's own bytes.
-pub fn save_parts(parts: &[&[u8]], path: &Path, sync: SyncMode, hash: bool) -> Result<Stored> {
+pub fn save_parts(
+    parts: &[&[u8]],
+    path: &Path,
+    sync: SyncMode,
+    min_free: Option<u64>,
+    hash: bool,
+) -> Result<Stored> {
     let length: usize = parts.iter().map(|part| part.len()).sum();
-    let dir = folder(path, length as u64)?;
+    let dir = folder(path, length as u64, sync, min_free)?;
     crate::naming::check_free(path)?;
     let stored = Stored {
         bytes: length as u64,
@@ -302,8 +361,8 @@ pub fn save_parts(parts: &[&[u8]], path: &Path, sync: SyncMode, hash: bool) -> R
 
 /// Save one file a command writes on its own, such as a preview or an
 /// exported preset, as [`save`] does, with its folder synced too.
-pub fn save_one(bytes: &[u8], path: &Path) -> Result<Stored> {
-    let stored = save(bytes, path, SyncMode::File, false)?;
+pub fn save_one(bytes: &[u8], path: &Path, min_free: Option<u64>) -> Result<Stored> {
+    let stored = save(bytes, path, SyncMode::File, min_free, false)?;
     Folders::of(path).sync()?;
     Ok(stored)
 }
@@ -407,19 +466,50 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     zero(unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) })
 }
 
+/// `path` as the NUL-terminated wide string a Windows call takes. From
+/// 248 units with its NUL, where std stops passing paths as they are (some
+/// calls take less than MAX_PATH), it is made absolute and normal and
+/// given its `\\?\` form, which has no such limit, as std does: a still
+/// whose partial file std wrote beside a long name is published under it.
+#[cfg(windows)]
+fn wide(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    let plain: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let wide = if plain.len() + 1 < 248 {
+        plain
+    } else {
+        let full = std::path::absolute(path)?;
+        verbatim(&full.as_os_str().encode_wide().collect::<Vec<u16>>())
+    };
+    Ok(wide.into_iter().chain([0]).collect())
+}
+/// The `\\?\` form of an absolute, normal Windows path: `C:\x` is
+/// `\\?\C:\x`, `\\server\share` is `\\?\UNC\server\share` and
+/// `\\.\` becomes `\\?\`; one in that form already, or any other,
+/// stays as it is.
+#[cfg(any(windows, test))]
+fn verbatim(full: &[u16]) -> Vec<u16> {
+    const SEP: u16 = b'\\' as u16;
+    const COLON: u16 = b':' as u16;
+    const QUERY: u16 = b'?' as u16;
+    const DOT: u16 = b'.' as u16;
+    let prefix = |text: &str| text.encode_utf16().collect::<Vec<u16>>();
+    let (head, rest) = match full {
+        [_, COLON, SEP, ..] => (prefix(r"\\?\"), full),
+        [SEP, SEP, QUERY, SEP, ..] | [SEP, QUERY, QUERY, SEP, ..] => (Vec::new(), full),
+        [SEP, SEP, DOT, SEP, rest @ ..] => (prefix(r"\\?\"), rest),
+        [SEP, SEP, rest @ ..] => (prefix(r"\\?\UNC\"), rest),
+        _ => (Vec::new(), full),
+    };
+    [head.as_slice(), rest].concat()
+}
+
 #[cfg(windows)]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::{
         Foundation::ERROR_SHARING_VIOLATION, Storage::FileSystem::MoveFileExW,
     };
-    let wide = |path: &Path| {
-        path.as_os_str()
-            .encode_wide()
-            .chain([0])
-            .collect::<Vec<u16>>()
-    };
-    let (from, to) = (wide(from), wide(to));
+    let (from, to) = (wide(from)?, wide(to)?);
     // Antivirus and search indexers hold a new file open for a moment.
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {
@@ -451,6 +541,8 @@ fn rename_noreplace(_: &Path, _: &Path) -> io::Result<()> {
 /// Make the names published in `dir` durable. Folders that cannot be
 /// synced, as on some network shares, are skipped.
 pub fn sync_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    tests::SYNCED.with_borrow_mut(|synced| synced.push(dir.to_path_buf()));
     // NTFS journals its folders, and std cannot open one as a file.
     #[cfg(unix)]
     match File::open(dir).and_then(|dir| dir.sync_all()) {
@@ -527,21 +619,22 @@ pub struct Recording {
     path: PathBuf,
     limit: Option<u64>,
     written: u64,
-    hash: Option<Sha256>,
+    /// The command's own floor, as [`save`] takes it.
+    min_free: Option<u64>,
     /// Bytes written, and when, at the last look at free space.
     looked: (u64, Instant),
     alarm: Arc<Alarm>,
     cut: Option<Cut>,
 }
 impl Recording {
-    /// Create `path`, which must not exist, for at most `limit` bytes, with
-    /// a streamed SHA-256 when `hash`.
-    pub fn create(path: &Path, limit: Option<u64>, hash: bool) -> Result<Self> {
+    /// Create `path`, which must not exist, for at most `limit` bytes,
+    /// leaving the floor free with the command's own `min_free`.
+    pub fn create(path: &Path, limit: Option<u64>, min_free: Option<u64>) -> Result<Self> {
         ensure!(
             limit != Some(0),
             "a recording's maximum size must be positive"
         );
-        folder(path, 0)?;
+        folder(path, 0, SyncMode::File, min_free)?;
         let file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -552,7 +645,7 @@ impl Recording {
             path: path.to_path_buf(),
             limit,
             written: 0,
-            hash: hash.then(Sha256::new),
+            min_free,
             looked: (0, Instant::now()),
             alarm: Arc::new(Alarm {
                 path: path.to_path_buf(),
@@ -583,25 +676,22 @@ impl Recording {
         self.looked = (self.written, Instant::now());
         // The setting was checked when the file was created.
         if let Some(space) = space(&self.path)
-            && let Ok(floor) = floor(space.total)
+            && let Ok((floor, own)) = floor_for(space.total, self.min_free)
             && space.free < floor
         {
             let free = space.free;
-            self.alarm.raise(NoRoom::Floor { free, floor });
+            self.alarm.raise(NoRoom::Floor { free, floor, own });
         }
     }
-    /// Close the file with its bytes on disk, and its folder: its size and
-    /// hash. A file cut short keeps the bytes before the cut, as every
-    /// recording container plays up to its last complete part.
-    pub fn finish(mut self) -> Result<Stored> {
+    /// Close the file with its bytes on disk, and its folder: its size. A
+    /// file cut short keeps the bytes before the cut, as every recording
+    /// container plays up to its last complete part.
+    pub fn finish(mut self) -> Result<u64> {
         let file = self.file.take().context("recording already finished")?;
         let cannot = || format!("cannot flush recording {}", self.path.display());
         file.sync_all().with_context(cannot)?;
         Folders::of(&self.path).sync()?;
-        Ok(Stored {
-            bytes: self.written,
-            sha256: self.hash.take().map(|hash| hex(hash.finalize())),
-        })
+        Ok(self.written)
     }
     /// Remove a recording that holds no video.
     pub fn abort(mut self) -> Result<()> {
@@ -644,9 +734,6 @@ impl Write for Recording {
             io::Error::new(error.kind(), message)
         })?;
         self.written += count as u64;
-        if let Some(hash) = &mut self.hash {
-            hash.update(&bytes[..count]);
-        }
         self.look();
         Ok(count)
     }
@@ -658,7 +745,7 @@ impl Write for Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
 
     type Measure = fn(&Path) -> Option<Space>;
     thread_local! {
@@ -666,14 +753,15 @@ mod tests {
         pub(super) static SPACE: Cell<Option<Measure>> = const { Cell::new(None) };
         /// What a test does between a still's write and its publish.
         pub(super) static RACE: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+        /// The folders synced so far.
+        pub(super) static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
     }
 
     struct Temp(PathBuf);
     impl Temp {
         fn new(name: &str) -> Self {
-            let mut random = [0u8; 8];
-            getrandom::fill(&mut random).unwrap();
-            let dir = std::env::temp_dir().join(format!("capturefab-{name}-{}", hex(random)));
+            let random = crate::types::random_hex(8).unwrap();
+            let dir = std::env::temp_dir().join(format!("capturefab-{name}-{random}"));
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
         }
@@ -728,7 +816,7 @@ mod tests {
         assert_eq!(first, temp.path("shot-0001.png"));
         let (path, stored) =
             crate::naming::save_named(&namer, &plan, &input, OnExists::Fail, first, |path| {
-                save(b"ours", path, SyncMode::File, true)
+                save(b"ours", path, SyncMode::File, None, true)
             })
             .unwrap();
         assert_eq!(path, temp.path("shot-0002.png"));
@@ -736,7 +824,14 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"ours");
         assert_eq!(stored.sha256, Some(hex(Sha256::digest(b"ours"))));
         // A fixed name fails as taken, and its partial file is gone.
-        let error = save(b"ours", &temp.path("fixed.png"), SyncMode::File, false).unwrap_err();
+        let error = save(
+            b"ours",
+            &temp.path("fixed.png"),
+            SyncMode::File,
+            None,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(reason(&error), ErrorKind::Exists);
         assert_eq!(fs::read(temp.path("fixed.png")).unwrap(), b"theirs");
         assert!(temp.partials().is_empty(), "{:?}", temp.partials());
@@ -748,14 +843,14 @@ mod tests {
         let parts: [&[u8]; 4] = [b"P5\n2 1\n255\n", &[], &[7, 9], b""];
         let whole = parts.concat();
         let path = temp.path("shot.pgm");
-        let stored = save_parts(&parts, &path, SyncMode::File, true).unwrap();
+        let stored = save_parts(&parts, &path, SyncMode::File, None, true).unwrap();
         assert_eq!(fs::read(&path).unwrap(), whole);
         assert_eq!(
             (stored.bytes, stored.sha256),
             (whole.len() as u64, Some(hex(Sha256::digest(&whole))))
         );
         // The name is taken: nothing is replaced and no partial file stays.
-        let error = save_parts(&[b"other"], &path, SyncMode::File, false).unwrap_err();
+        let error = save_parts(&[b"other"], &path, SyncMode::File, None, false).unwrap_err();
         assert_eq!(reason(&error), ErrorKind::Exists);
         assert_eq!(fs::read(&path).unwrap(), whole);
         assert!(temp.partials().is_empty(), "{:?}", temp.partials());
@@ -764,10 +859,10 @@ mod tests {
             assert!(!path.exists(), "published only once written");
         }));
         let second = temp.path("second.pgm");
-        save_parts(&parts, &second, SyncMode::Off, false).unwrap();
+        save_parts(&parts, &second, SyncMode::Off, None, false).unwrap();
         assert_eq!(fs::read(&second).unwrap(), whole);
         // Nothing to write is an empty file.
-        save_parts(&[], &temp.path("empty"), SyncMode::Off, true).unwrap();
+        save_parts(&[], &temp.path("empty"), SyncMode::Off, None, true).unwrap();
         assert_eq!(fs::read(temp.path("empty")).unwrap(), b"");
     }
 
@@ -778,8 +873,8 @@ mod tests {
         // A partial file would be seen here.
         RACE.set(Some(|_| panic!("no partial file on such a file system")));
         let path = temp.path("shot.raw");
-        save(b"one", &path, SyncMode::Off, false).unwrap();
-        let error = save(b"two", &path, SyncMode::File, false).unwrap_err();
+        save(b"one", &path, SyncMode::Off, None, false).unwrap();
+        let error = save(b"two", &path, SyncMode::File, None, false).unwrap_err();
         assert_eq!(reason(&error), ErrorKind::Exists);
         assert_eq!(fs::read(&path).unwrap(), b"one");
     }
@@ -790,9 +885,9 @@ mod tests {
         for name in ["a\nb.png", "a\0b.png"] {
             let path = temp.path("new").join(name);
             let errors = [
-                save(b"x", &path, SyncMode::File, false).unwrap_err(),
-                save_one(b"x", &path).unwrap_err(),
-                Recording::create(&path, None, false).err().unwrap(),
+                save(b"x", &path, SyncMode::File, None, false).unwrap_err(),
+                save_one(b"x", &path, None).unwrap_err(),
+                Recording::create(&path, None, None).err().unwrap(),
             ];
             for error in errors {
                 assert_eq!(reason(&error), ErrorKind::Usage, "{error:#}");
@@ -804,7 +899,7 @@ mod tests {
     #[test]
     fn a_disk_with_no_room_is_storage_full_with_its_free_space() {
         let temp = Temp::new("no-room");
-        let mut recording = Recording::create(&temp.path("clip.mkv"), None, false).unwrap();
+        let mut recording = Recording::create(&temp.path("clip.mkv"), None, None).unwrap();
         SPACE.set(Some(|_| {
             Some(Space {
                 free: 4096,
@@ -845,6 +940,24 @@ mod tests {
     }
 
     #[test]
+    fn long_windows_paths_take_their_verbatim_form() {
+        let form = |path: &str| {
+            String::from_utf16(&verbatim(&path.encode_utf16().collect::<Vec<_>>())).unwrap()
+        };
+        assert_eq!(form(r"C:\Users\ana\shot.png"), r"\\?\C:\Users\ana\shot.png");
+        assert_eq!(form(r"\\nas\share\shot.png"), r"\\?\UNC\nas\share\shot.png");
+        assert_eq!(form(r"\\.\C:\shot.png"), r"\\?\C:\shot.png");
+        for kept in [
+            r"\\?\C:\shot.png",
+            r"\\?\UNC\nas\s\a",
+            r"\??\C:\a",
+            "shot.png",
+        ] {
+            assert_eq!(form(kept), kept);
+        }
+    }
+
+    #[test]
     fn the_floor_is_one_percent_within_bounds_or_the_setting() {
         let os = |text: &str| Some(std::ffi::OsString::from(text));
         for (setting, total, floor) in [
@@ -860,6 +973,17 @@ mod tests {
         }
         let error = floor_with(os("lots").as_deref(), 0).unwrap_err();
         assert_eq!(reason(&error), ErrorKind::Usage);
+        // What a command sends a session's worker: bytes, when it set one.
+        for (setting, sent) in [
+            (None, None),
+            (os(""), None),
+            (os("0"), Some(0)),
+            (os("2G"), Some(2 << 30)),
+        ] {
+            assert_eq!(min_free_with(setting.as_deref()).unwrap(), sent);
+        }
+        let error = min_free_with(os("lots").as_deref()).unwrap_err();
+        assert_eq!(reason(&error), ErrorKind::Usage);
     }
 
     #[test]
@@ -872,33 +996,89 @@ mod tests {
                 total: 10 << 30,
             })
         }));
-        save(&[1; 100], &temp.path("fits.raw"), SyncMode::File, false).unwrap();
+        save(
+            &[1; 100],
+            &temp.path("fits.raw"),
+            SyncMode::File,
+            None,
+            false,
+        )
+        .unwrap();
         let path = temp.path("big.raw");
-        let error = save(&[1; 101], &path, SyncMode::File, false).unwrap_err();
+        let error = save(&[1; 101], &path, SyncMode::File, None, false).unwrap_err();
         assert_eq!(reason(&error), ErrorKind::StorageFull);
         let details = crate::types::classify(&error).details.unwrap();
         assert_eq!(details["path"], path.to_str().unwrap());
         assert_eq!(details["free_bytes"], (512 << 20) + 100);
         assert!(!path.exists() && temp.partials().is_empty());
+        // A command's own floor, as a session's worker gets it, holds when
+        // it is higher, and a lower one leaves the worker's in place.
+        let error = save(&[1; 1], &path, SyncMode::File, Some(1 << 30), false).unwrap_err();
+        assert_eq!(reason(&error), ErrorKind::StorageFull);
+        assert!(
+            format!("{error}").contains("leaves 1.00 GiB free"),
+            "{error}"
+        );
+        let hint = crate::types::classify(&error).hint.unwrap();
+        assert!(hint.contains("lower CAPTUREFAB_MIN_FREE"), "{hint}");
+        let error = save(&[1; 101], &path, SyncMode::File, Some(0), false).unwrap_err();
+        assert_eq!(reason(&error), ErrorKind::StorageFull);
+        save(&[1; 50], &path, SyncMode::File, Some(1000), false).unwrap();
         // A recording starts only above the floor too.
+        let clip = temp.path("clip.mkv");
+        let error = Recording::create(&clip, None, Some(1 << 30)).err().unwrap();
+        assert_eq!(reason(&error), ErrorKind::StorageFull);
+        assert!(!clip.exists());
         SPACE.set(Some(|_| {
             Some(Space {
                 free: 1 << 20,
                 total: 10 << 30,
             })
         }));
-        let error = Recording::create(&temp.path("clip.mkv"), None, false)
-            .err()
-            .unwrap();
+        let error = Recording::create(&clip, None, None).err().unwrap();
         assert_eq!(reason(&error), ErrorKind::StorageFull);
-        assert!(!temp.path("clip.mkv").exists());
+        assert!(!clip.exists());
+    }
+
+    #[test]
+    fn new_folders_are_synced_into_their_parents() {
+        let temp = Temp::new("new-folders");
+        SYNCED.take();
+        save(
+            b"x",
+            &temp.path("a/b/c/one.png"),
+            SyncMode::File,
+            None,
+            false,
+        )
+        .unwrap();
+        let parents = [temp.0.clone(), temp.path("a"), temp.path("a/b")];
+        assert_eq!(SYNCED.take(), parents);
+        // Folders that exist, or files not synced at all, sync none here.
+        save(
+            b"x",
+            &temp.path("a/b/c/two.png"),
+            SyncMode::File,
+            None,
+            false,
+        )
+        .unwrap();
+        save(b"x", &temp.path("d/e/one.png"), SyncMode::Off, None, false).unwrap();
+        assert_eq!(SYNCED.take(), Vec::<PathBuf>::new());
+        // A recording's new folder too, and its own once it is finished.
+        let clip = temp.path("f/g/clip.mkv");
+        let mut recording = Recording::create(&clip, None, None).unwrap();
+        assert_eq!(SYNCED.take(), [temp.0.clone(), temp.path("f")]);
+        recording.write_all(b"video").unwrap();
+        assert_eq!(recording.finish().unwrap(), 5);
+        assert_eq!(SYNCED.take(), [temp.path("f/g")]);
     }
 
     #[test]
     fn a_recording_below_the_floor_raises_its_alarm_and_keeps_its_bytes() {
         let temp = Temp::new("recording-alarm");
         let path = temp.path("clip.mkv");
-        let mut recording = Recording::create(&path, None, false).unwrap();
+        let mut recording = Recording::create(&path, None, None).unwrap();
         let alarm = recording.alarm();
         recording.write_all(b"header").unwrap();
         assert!(alarm.error().is_none());
@@ -918,29 +1098,53 @@ mod tests {
             1 << 20
         );
         assert_eq!(recording.cut(), None);
-        assert_eq!(recording.finish().unwrap().bytes, 11);
+        assert_eq!(recording.finish().unwrap(), 11);
         assert_eq!(fs::read(&path).unwrap(), b"headervideo");
+        // Above the worker's 512 MiB floor, a command's own higher one
+        // sets it off.
+        SPACE.set(Some(|_| {
+            Some(Space {
+                free: 2 << 30,
+                total: 10 << 30,
+            })
+        }));
+        let mut recording = Recording::create(&temp.path("own.mkv"), None, Some(1 << 30)).unwrap();
+        recording.write_all(b"header").unwrap();
+        SPACE.set(Some(|_| {
+            Some(Space {
+                free: 768 << 20,
+                total: 10 << 30,
+            })
+        }));
+        recording.looked.1 -= LOOK_EVERY;
+        recording.write_all(b"video").unwrap();
+        let error = recording
+            .alarm()
+            .error()
+            .expect("below the command's floor");
+        assert!(
+            format!("{error}").contains("leaves 1.00 GiB free"),
+            "{error}"
+        );
     }
 
     #[test]
     fn a_recording_ends_exactly_at_its_maximum_size() {
         let temp = Temp::new("recording-max-size");
         let path = temp.path("clip.mkv");
-        let mut recording = Recording::create(&path, Some(10), true).unwrap();
+        let mut recording = Recording::create(&path, Some(10), None).unwrap();
         let error = io::copy(&mut &b"0123456789abcdef"[..], &mut recording).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::FileTooLarge);
         assert_eq!(recording.cut(), Some(Cut::MaxSize));
-        let stored = recording.finish().unwrap();
-        assert_eq!(stored.bytes, 10);
-        assert_eq!(stored.sha256, Some(hex(Sha256::digest(b"0123456789"))));
+        assert_eq!(recording.finish().unwrap(), 10);
         assert_eq!(fs::read(&path).unwrap(), b"0123456789");
         // Without one, a recording past the old 512 MiB default goes on.
-        let mut open = Recording::create(&temp.path("long.mkv"), None, false).unwrap();
+        let mut open = Recording::create(&temp.path("long.mkv"), None, None).unwrap();
         open.written = 600 << 20;
         open.write_all(b"more").unwrap();
         assert_eq!((open.cut(), open.bytes_written()), (None, (600 << 20) + 4));
         // Its name is its own: a second recording cannot take it.
-        let taken = Recording::create(&path, None, false).err().unwrap();
+        let taken = Recording::create(&path, None, None).err().unwrap();
         assert_eq!(reason(&taken), ErrorKind::Exists);
     }
 
@@ -948,7 +1152,7 @@ mod tests {
     fn an_aborted_recording_is_removed_and_folders_sync_once() {
         let temp = Temp::new("recording-abort");
         let path = temp.path("empty.mkv");
-        Recording::create(&path, None, false)
+        Recording::create(&path, None, None)
             .unwrap()
             .abort()
             .unwrap();

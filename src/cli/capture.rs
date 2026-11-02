@@ -128,6 +128,9 @@ struct Plan {
     context: crate::context::Context,
     /// Absolute, as the caller meant it.
     manifest: Option<String>,
+    /// This command's own `CAPTUREFAB_MIN_FREE`, which a session's worker
+    /// does not have.
+    min_free: Option<u64>,
 }
 
 impl Plan {
@@ -241,6 +244,7 @@ impl Plan {
             settings,
             context,
             manifest,
+            min_free: crate::storage::min_free()?,
         };
         if plan.output != "-" {
             crate::engine::check_capture_name(&plan.output, count, format)?;
@@ -272,6 +276,7 @@ impl Plan {
             on_exists: args.on_exists,
             manifest: self.manifest.clone(),
             sync: args.sync,
+            min_free: self.min_free,
             context: self.context.clone(),
             utc_offset_s: Some(crate::naming::local_offset()),
             quality,
@@ -1062,6 +1067,7 @@ fn to_stdout(global: &Global, args: &CaptureArgs, plan: &Plan) -> Result<()> {
         format: plan.format.into(),
         on_exists: Default::default(),
         sync: args.sync,
+        min_free: plan.min_free,
         context: plan.context.clone(),
         utc_offset_s: Some(crate::naming::local_offset()),
         quality: args.quality,
@@ -1186,12 +1192,7 @@ fn stdout_file() -> Result<std::path::PathBuf> {
             .hint("capture to a file with -o, or run with --no-session")
         })?,
     };
-    let mut random = [0u8; 8];
-    getrandom::fill(&mut random).map_err(|error| anyhow::anyhow!("random file name: {error}"))?;
-    let suffix = random
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let suffix = crate::types::random_hex(8)?;
     Ok(dir.join(format!("{}-{suffix}", std::process::id())))
 }
 

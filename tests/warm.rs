@@ -247,6 +247,48 @@ fn a_session_says_it_keeps_the_free_space_floor_it_started_with() {
 }
 
 #[test]
+fn a_command_brings_its_own_free_space_floor_to_a_session() {
+    let home = Home::new("warm-min-free-raised");
+    let run = |floor: Option<&str>, args: &[&str]| {
+        let mut command = home.warm_command();
+        match floor {
+            Some(floor) => command.env("CAPTUREFAB_MIN_FREE", floor),
+            None => command.env_remove("CAPTUREFAB_MIN_FREE"),
+        };
+        support::cli::Run::of_output(command.args(args).output().unwrap(), args)
+    };
+    // The session starts with the default floor.
+    run(
+        None,
+        &["--json", "capture", "-c", "sim:0", "-o", "first.png"],
+    )
+    .success();
+    let started = sessions(&home);
+    // A command's own higher floor holds for the files the session writes
+    // for it, a still's and a preview's, and is its own to lower.
+    for args in [
+        &["--json", "capture", "-c", "sim:0", "-o", "big.png"][..],
+        &["--json", "inspect", "-c", "sim:0", "--preview", "big.jpg"],
+    ] {
+        let error = run(Some("100T"), args).failure(6);
+        assert_eq!(error["code"], "storage_full", "{error}");
+        let hint = error["hint"].as_str().unwrap();
+        assert!(
+            hint.contains("lower CAPTUREFAB_MIN_FREE") && !hint.contains("session auto"),
+            "{error}"
+        );
+    }
+    assert!(!home.path("big.png").exists() && !home.path("big.jpg").exists());
+    run(
+        Some("0"),
+        &["--json", "capture", "-c", "sim:0", "-o", "small.png"],
+    )
+    .success();
+    // The session wrote them all.
+    assert_eq!(sessions(&home), started);
+}
+
+#[test]
 fn a_change_after_a_capture_finds_a_lingering_camera_stopped() {
     let home = Home::new("warm-linger-set");
     let hooks = [("CAPTUREFAB_TEST_HOOKS", "1")];

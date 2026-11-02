@@ -198,7 +198,7 @@ pub fn run(global: &Global, command: PresetCommand) -> Result<Report> {
             let path = absolute(&output)?;
             let mut bytes = serde_json::to_vec_pretty(&document)?;
             bytes.push(b'\n');
-            crate::storage::save_one(&bytes, &path)?;
+            crate::storage::save_one(&bytes, &path, None)?;
             let text = format!("Wrote preset {name} to {}.\n", path.display());
             Ok(Report::json(json!({"preset": name, "path": path})).text(text))
         }

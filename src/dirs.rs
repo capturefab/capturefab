@@ -415,6 +415,43 @@ pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     writable(path).map_err(|error| unwritable(path, &error))
 }
 
+/// Replace `path` with a private file (0600) holding `bytes`, written
+/// beside it under a name of its own first, so a reader never sees half of
+/// it and two writers never share one. With `durable`, the file is synced
+/// and then, as far as it can be, its folder, so it survives a power cut.
+/// A failure leaves what was there and no other file.
+pub(crate) fn write_private(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
+    use anyhow::Context as _;
+    use std::io::Write as _;
+    let name = path.file_name().context("no file name")?.to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", crate::types::random_hex(6)?));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = (|| {
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        if durable {
+            file.sync_all()?;
+        }
+        drop(file);
+        fs::rename(&temp, path)
+    })();
+    if written.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    written.with_context(|| format!("cannot write {}", path.display()))?;
+    if durable {
+        let dir = path.parent().filter(|dir| !dir.as_os_str().is_empty());
+        let _ = crate::storage::sync_dir(dir.unwrap_or_else(|| Path::new(".")));
+    }
+    Ok(())
+}
+
 /// `permission_denied` for writing in `path`, whose cause is `error`. The
 /// hint names the variable of the folder `path` is in, among those this
 /// process looked for: wording a hint never makes another folder.
@@ -911,6 +948,30 @@ mod tests {
             ensure_private_dir(&path).unwrap();
             Self(path)
         }
+    }
+    #[test]
+    fn private_files_replace_what_was_there_whole() {
+        let dir = TestDir::new("write-private");
+        let path = dir.0.join("state.json");
+        for (bytes, durable) in [(&b"first"[..], false), (b"second", true)] {
+            write_private(&path, bytes, durable).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // A file that cannot replace a folder leaves no other file.
+        fs::create_dir(dir.0.join("taken")).unwrap();
+        fs::write(dir.0.join("taken/keep"), b"x").unwrap();
+        assert!(write_private(&dir.0.join("taken"), b"x", false).is_err());
+        let names = fs::read_dir(&dir.0)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names, ["state.json", "taken"].map(String::from).into());
     }
     impl Drop for TestDir {
         fn drop(&mut self) {
