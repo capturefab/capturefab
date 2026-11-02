@@ -1,7 +1,8 @@
 //! `capturefab jobs`: the captures, recordings and continuous auto exposure
-//! running in sessions, as each session's job book has them, and how to stop
-//! or wait for one. A job's ID is `<session>-<n>`; n counts a session's
-//! jobs. The jobs of a session that died are read from what it saved.
+//! sessions run, as each session's job book has them, and how to stop or
+//! wait for one. A job's ID is `<session>-<n>`; n counts a session's jobs,
+//! across its runs. The jobs of a session that ended are read from what it
+//! saved.
 use super::{Global, output::Report, term};
 use crate::{
     ipc,
@@ -24,7 +25,7 @@ pub struct JobsArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum JobsAction {
-    /// Every running session's jobs, finished ones included; or the jobs named, as they are now
+    /// Every session's jobs, finished ones and those of ended sessions included; or the jobs named, as they are now
     #[command(
         after_help = "Examples:\n  capturefab jobs list\n  capturefab jobs list --running\n  capturefab --json jobs list auto-1 auto-2\n  capturefab --json jobs"
     )]
@@ -221,7 +222,7 @@ fn saved_job(session: &str, id: &str) -> Result<Value> {
                 ErrorKind::SessionNotFound,
                 format!("session {session} is not running"),
             )
-            .hint("capturefab jobs lists the jobs of every running session")
+            .hint("capturefab jobs lists every session's jobs")
             .into()
         })
 }
@@ -235,7 +236,7 @@ fn named_job(id: &str) -> Result<Value> {
             ErrorKind::Usage,
             format!("session {session} has no job {id}"),
         )
-        .hint("capturefab jobs lists the jobs of every running session")
+        .hint("capturefab jobs lists every session's jobs")
         .into());
     }
     saved_job(&session, id)
@@ -622,7 +623,7 @@ pub const LIST_FIELDS: &[(&str, &str)] = &[(
     concat!(
         "[",
         job_row!(),
-        "] — every running session's, and those of a session that died, as lost; with IDs, those jobs in that order; with --running, only those that have not ended"
+        "] — every session's, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended"
     ),
 )];
 pub const STOP_FIELDS: &[(&str, &str)] = &[(

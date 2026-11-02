@@ -109,7 +109,8 @@ commands, so repeated calls skip connecting and starting the stream:
   [line computer guide](docs/line-computer.md)). Commands use a session that holds their camera
   on their own; `--session NAME` picks one and `--no-session` never uses one. A session holds
   the cameras it was started with as long as it runs, and a camera a command added with `--keep`
-  until that camera has been unused that long.
+  until that camera has been unused that long. `session stop` ends a session at once: its running
+  jobs end as `interrupted`, keeping the files saved so far.
 
 ## Cameras and sources
 

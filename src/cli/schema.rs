@@ -773,6 +773,30 @@ mod tests {
     }
 
     #[test]
+    fn results_describe_left_out_keys_as_absent_never_null() {
+        // Output drops null values (`output::document`), so a key a result
+        // leaves out is absent, and the schema must not promise a null.
+        for (name, _) in commands() {
+            let documented = super::command(&name).unwrap();
+            for (field, meaning) in documented["result"].as_object().into_iter().flatten() {
+                let meaning = meaning.as_str().unwrap();
+                assert!(
+                    !meaning
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .any(|word| word == "null"),
+                    "{name} {field}: {meaning}"
+                );
+            }
+        }
+        assert!(
+            super::command("doctor").unwrap()["result"]["read_only_root"]
+                .as_str()
+                .unwrap()
+                .contains("absent")
+        );
+    }
+
+    #[test]
     fn the_overview_stays_small_and_lists_every_reason() {
         let overview = overview();
         let text = overview.to_string();

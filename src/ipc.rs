@@ -139,7 +139,8 @@ struct Request {
     /// the request says a command is about to use that camera.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keep_ms: Option<u64>,
-    /// Shut the session down once its recordings are finished.
+    /// Shut the session down now: running jobs end as interrupted, and
+    /// recordings are finalized before the process exits.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     stop: bool,
 }

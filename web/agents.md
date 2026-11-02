@@ -181,34 +181,38 @@ capturefab capture --json -c sim:0 -n 20 -o frames/
 
 ```sh
 capturefab capture --json -c sim:0 --every 10s --for 1h -o 'lapse/{seq:5}.jpg' --background
-capturefab jobs wait --json auto-1 --timeout 10m
+capturefab jobs wait --json ID --timeout 10m     # ID: the job.id the line above returned
 ```
 
 `--background` returns `{"job":{"id","state","saved","planned","next_at",…}}` once the job is
 armed or has saved its first frame, and a session (started on demand) keeps running it; on a
-triggered camera that first frame waits for a trigger, up to `--timeout`. `jobs wait ID...`
-exits 0 when the jobs are done (`job`, or `jobs` for several IDs, as a capture of several cameras
-returns), with a failed job's own error code, and 4 if one is still running when `--timeout`
-ends; call it again to keep waiting. `jobs list ID...` shows jobs as they are now without
-waiting, and `--running` only those that have not ended; `jobs --json` lists every job, finished
-ones included. `jobs stop ID` ends one and keeps the files saved so far. A job's `state` is
+triggered camera that first frame waits for a trigger, up to `--timeout`. Pass that `job.id` to
+`jobs wait`, `jobs list` and `jobs stop`: IDs count on across a session's jobs and its runs
+(`auto-1`, `auto-2`, …), so an ID you did not get back may name an earlier, finished job.
+`jobs wait ID...` exits 0 when the jobs are done (`job`, or `jobs` for several IDs, as a capture
+of several cameras returns), with a failed job's own error code, and 4 if one is still running
+when `--timeout` ends; call it again to keep waiting. `jobs list ID...` shows jobs as they are
+now without waiting, and `--running` only those that have not ended; `jobs --json` lists every
+job, finished ones included. `jobs stop ID` ends one and keeps the files saved so far, and
+`session stop` ends its session's running jobs at once, as `interrupted`. A job's `state` is
 `armed`, `running` or `stopping`, then `done`, `failed`, `cancelled`, `interrupted`, or `lost`
 when its session died. `--at 14:30` or `--in 5m` delays the start.
 
 ### Triggered capture
 
 ```sh
-capturefab capture --json -c sim:0 --set trigger=software -o part.png
-capturefab set --json -c sim:0 trigger=line0:rising --keep 5m
-capturefab capture --json -c sim:0 -o 'part-{seq}.png' --timeout 30s
+capturefab capture --json -c 'sim:0?line0=every:500ms' --set trigger=software -o part.png
+capturefab set --json -c 'sim:0?line0=every:500ms' trigger=line0:rising --keep 5m
+capturefab capture --json -c 'sim:0?line0=every:500ms' -o 'part-{seq}.png' --timeout 30s
 ```
 
-With a software trigger, `capture` fires `TriggerSoftware` itself. For a hardware trigger
-(`trigger=line0:rising`), `capture` waits for the line: `--timeout 30s` bounds the wait, and
-expiry is exit 4 `trigger_timeout` with the trigger configuration in `details.trigger`. The
-trigger setting stays for the captures that follow: the camera stays open in a session between
-commands, and a simulator or webcam keeps the settings Capturefab emulates for it until its
-runtime folder is cleared, as a real camera keeps its own until it powers off.
+`sim:0?line0=every:500ms` is a simulator whose Line0 input fires every 500 ms; on plain `sim:0`
+the line never fires. With a software trigger, `capture` fires `TriggerSoftware` itself. For a
+hardware trigger (`trigger=line0:rising`), `capture` waits for the line: `--timeout 30s` bounds
+the wait, and expiry is exit 4 `trigger_timeout` with the trigger configuration in
+`details.trigger`. The trigger setting stays for the captures that follow: the camera stays open
+in a session between commands, and a simulator or webcam keeps the settings Capturefab emulates
+for it until its runtime folder is cleared, as a real camera keeps its own until it powers off.
 To capture every trigger for a while, combine `--timeout none -n 100 --background`, then
 `jobs wait` or `jobs stop`. `set -c CAM trigger=off` returns to free running.
 

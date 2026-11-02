@@ -40,27 +40,34 @@ SHA-256, settings and tags) for whatever reads the files later.
 ## A time lapse that outlives the terminal
 
 ```sh
-capturefab capture -c sim:0 --every 30s --for 8h -o 'lapse/{seq:5}.jpg' --background
+job=$(capturefab capture --json -c sim:0 --every 30s --for 8h -o 'lapse/{seq:5}.jpg' --background |
+  python3 -c 'import json,sys; print(json.load(sys.stdin)["job"]["id"])')
 capturefab jobs                         # progress: saved, planned, next_at
-capturefab jobs wait auto-1 --timeout 1m
-capturefab jobs stop auto-1             # end early; files saved so far stay
+capturefab jobs wait "$job" --timeout 1m
+capturefab jobs stop "$job"             # end early; files saved so far stay
 ```
 
-`--background` starts a session if none holds the camera, submits the job and returns its ID.
-A session started this way ends once it has had no jobs and no requests for a minute. `--at 06:00` or `--in 10m`
-delays the first frame; `-n 100 --every 2s` bounds the series by count instead of time.
+`--background` starts a session if none holds the camera, submits the job and returns its ID
+(`job.id`, such as `auto-3`). Use the ID it returns: IDs count on across a session's jobs and
+its runs, so another ID may name an earlier, finished job. A session started this way ends once
+it has had no jobs and no requests for a minute. `--at 06:00` or `--in 10m` delays the first
+frame; `-n 100 --every 2s` bounds the series by count instead of time.
 
 ## A triggered inspection station
 
 ```sh
-capturefab session start --name station -c sim:0 --live --idle 8h
-capturefab set -c sim:0 trigger=line0:rising exposure=2ms
-capturefab capture -c sim:0 -n 1000 -o 'station/{time}.png' --timeout none --background
+capturefab session start --name station -c 'sim:0?line0=every:500ms' --live --idle 8h
+capturefab set -c 'sim:0?line0=every:500ms' trigger=line0:rising exposure=2ms
+capturefab capture -c 'sim:0?line0=every:500ms' -n 1000 -o 'station/{time}.png' --timeout none --background
 capturefab session status station
 capturefab jobs stop all                # at the end of the shift; files saved so far stay
 capturefab session stop station
-capturefab set -c sim:0 trigger=off     # back to free running
+capturefab set -c 'sim:0?line0=every:500ms' trigger=off     # back to free running
 ```
+
+`sim:0?line0=every:500ms` is a simulator whose Line0 input fires every 500 ms, standing in for a
+camera wired to a sensor; on plain `sim:0` the line never fires
+([simulated cameras](simulation.md#frame-loss-and-hardware-triggers)).
 
 With a hardware trigger, `capture` saves one frame per trigger and waits for the next;
 `--timeout none` waits without limit, and a bounded `--timeout` ends with exit 4

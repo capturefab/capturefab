@@ -23,8 +23,10 @@ pub enum SessionAction {
         after_help = "Examples:\n  capturefab session start -c sim:0\n  capturefab session start --name line1 -c gige:00c0df123456 --live --idle 8h"
     )]
     Start(StartArgs),
-    /// Stop a session once its recordings and captures are finished
-    #[command(after_help = "Examples:\n  capturefab session stop\n  capturefab session stop line1")]
+    /// Stop a session now: its running jobs end as interrupted, keeping the files saved so far
+    #[command(
+        after_help = "Recordings are finalized. To let jobs finish first, wait for them: capturefab jobs wait ID.\n\nExamples:\n  capturefab session stop\n  capturefab session stop line1"
+    )]
     Stop {
         /// The session (default: the only one running)
         #[arg(value_name = "NAME")]

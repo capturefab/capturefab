@@ -45,7 +45,7 @@ Capturefab keeps three kinds of files, each in the first folder of its list that
 Folders are looked for only by the commands that need them, so a read-only system costs nothing to commands that never write. Without a folder:
 
 - no runtime folder: no session starts, so each camera command opens its camera alone (no warm cameras, about as fast as `--keep 0`), camera locks are skipped and previews go to `$TMPDIR/capturefab-<uid>/inspect`, or need `--preview FILE` or `--preview none`;
-- no state folder, or a read-only one: saving presets and sign-ins fails with `permission_denied` and a hint naming `CAPTUREFAB_STATE_DIR`; a read-only one baked into the image can still be read. A session keeps its jobs in memory while it runs; once it ends they are gone, and `jobs show` gives `session_not_found` with the same hint;
+- no state folder, or a read-only one: saving presets and sign-ins fails with `permission_denied` and a hint naming `CAPTUREFAB_STATE_DIR`; a read-only one baked into the image can still be read. A session keeps its jobs in memory while it runs; once it ends they are gone, and `jobs wait ID` or `jobs list ID` for one of them gives `session_not_found` with the same hint;
 - no cache: GenICam XML is read from each camera every time.
 
 A systemd service on such an image gives each a folder of its own, kept by systemd with the right owner and mode:

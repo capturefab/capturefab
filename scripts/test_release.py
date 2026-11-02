@@ -674,6 +674,18 @@ class SiteTests(unittest.TestCase):
         self.assertIn('Smoke-tested on its own platform · Unsigned', page)
         self.assertIn('/ latest', page)
 
+    def test_source_build_says_where_ffmpeg_comes_from(self):
+        def page(version):
+            release = published(version)
+            release['source'] = dict(name=f'capturefab-{version}-source.tar.gz', url=f'https://example.invalid/v{version}/source.tar.gz', size=1048576, sha256='b' * 64)
+            return site.downloads(dict(schema_version=1, latest=version, releases=[release]), SITE)
+        # Cargo has not built FFmpeg since the desktop releases.
+        current = page('0.6.0')
+        self.assertIn('Cargo does not build FFmpeg', current)
+        self.assertIn('CAPTUREFAB_FFMPEG_BINARY', current)
+        self.assertNotIn('pinned upstream archives', current)
+        self.assertIn('builds FFmpeg from pinned upstream archives', page('0.5.0'))
+
     def test_unsafe_manifest_links_are_rejected(self):
         manifest = dict(schema_version=1, latest='1.2.3', releases=[published('1.2.3', url='javascript:alert(1)')])
         with self.assertRaises(ValueError):

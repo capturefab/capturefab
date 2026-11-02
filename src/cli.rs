@@ -190,7 +190,7 @@ pub enum Command {
         after_help = "A preset lives on this computer and can be applied to any camera of the model; a user set (exec 'UserSetSave[UserSet1]', or preset apply --persist) lives in the camera.\n\nExamples:\n  capturefab preset save bench -c sim:0\n  capturefab preset apply bench -c sim:0 --dry-run\n  capturefab preset list"
     )]
     Preset(preset::PresetCommand),
-    /// Captures and recordings running in sessions: list, stop, wait
+    /// Captures, recordings and auto exposure run in sessions, ended ones included: list, stop, wait
     #[command(
         subcommand_required = false,
         args_conflicts_with_subcommands = true,

@@ -73,10 +73,11 @@ pub fn base(selector: &str) -> &str {
     selector.split_once('?').map_or(selector, |(base, _)| base)
 }
 
-/// What a selector's `?options` ask of the simulated camera: frames lost
-/// on the way or arriving incomplete (`drop=0.02`, a share of frames for
-/// each), and a hardware line that fires on a schedule (`line0=every:500ms`;
-/// without it Line0 never fires, and Line1 never does).
+/// What a selector's `?options` ask of the simulated camera: a share of
+/// frames that go bad (`drop=0.02`, up to 0.5), half of them lost on the way
+/// and half arriving incomplete, and a hardware line that fires on a
+/// schedule (`line0=every:500ms`; without it Line0 never fires, and Line1
+/// never does).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Options {
     drop: f64,
@@ -709,7 +710,8 @@ impl Simulator {
     }
     /// Lose this frame on the way, as `drop` asks: true when it was lost
     /// whole, false when it arrived incomplete; either way it is counted
-    /// and its block ID skipped.
+    /// and its block ID skipped. `drop` is the share of frames that go bad,
+    /// split evenly between the two, so even 0.5 delivers half the frames.
     fn lose(&mut self) -> Option<bool> {
         if self.options.drop <= 0.0 {
             return None;
@@ -720,10 +722,10 @@ impl Simulator {
         self.random ^= self.random >> 27;
         let unit =
             (self.random.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 11) as f64 / (1u64 << 53) as f64;
-        if unit < self.options.drop {
+        if unit < self.options.drop / 2.0 {
             self.stats.lost_frames += 1;
             Some(true)
-        } else if unit < 2.0 * self.options.drop {
+        } else if unit < self.options.drop {
             self.stats.incomplete_frames += 1;
             Some(false)
         } else {
@@ -1509,6 +1511,33 @@ mod tests {
             stats.lost_frames + stats.incomplete_frames - (ids[0] - 1)
         );
         assert!(camera("sim:0").stats().is_none());
+    }
+
+    #[test]
+    fn drop_is_the_share_of_frames_that_go_bad() {
+        // The most loss the option allows still delivers about half the
+        // frames, the rest split between lost and incomplete.
+        let mut c = camera("sim:0?drop=0.5");
+        c.set("Width", "64").unwrap();
+        c.set("Height", "64").unwrap();
+        c.set("AcquisitionFrameRate", "120").unwrap();
+        c.set("ExposureTime", "100").unwrap();
+        c.start().unwrap();
+        let last = (0..100)
+            .map(|_| c.next_frame(Duration::from_secs(1)).unwrap().id)
+            .last()
+            .unwrap();
+        let stats = c.stats().unwrap();
+        let bad = stats.lost_frames + stats.incomplete_frames;
+        assert_eq!(bad + 100, last, "{stats:?}");
+        assert!(
+            (0.4..0.6).contains(&(bad as f64 / last as f64)),
+            "{stats:?}"
+        );
+        assert!(
+            (0.3..0.7).contains(&(stats.lost_frames as f64 / bad as f64)),
+            "{stats:?}"
+        );
     }
 
     #[test]

@@ -35,6 +35,31 @@ that folder is cleared (for example by a reboot). Commands also keep the camera 
 seconds between them (the `auto` session), and `capture --set exposure=5ms` changes settings and
 captures in one call.
 
+## Frame loss and hardware triggers
+
+Options after a `?` make an area-scan simulator lose frames, as a busy network does, or fire its
+trigger input, as a sensor wired to a real camera does:
+
+```sh
+capturefab capture -c 'sim:0?drop=0.1' -n 20 -o lossy/        # dropped, incomplete, gaps
+capturefab set -c 'sim:0?line0=every:500ms' trigger=line0:rising
+capturefab capture -c 'sim:0?line0=every:500ms' -n 5 -o 'part-{seq}.png'
+capturefab set -c 'sim:0?line0=every:500ms' trigger=off
+```
+
+- `drop=D`, from 0 to 0.5: that share of frames goes bad, half lost on the way and half arriving
+  incomplete and discarded. A capture still saves the frames it asked for; its result counts the
+  bad ones (`dropped`, `incomplete`) and, for a burst, the block IDs missing between its first and
+  last frame (`gaps`), and `session status` counts them too (`lost`, `incomplete`). `drop=0.5`
+  delivers about half the frames.
+- `line0=every:DUR`: the Line0 input fires every DUR, so with `trigger=line0:rising` each capture
+  takes the next frame it starts. Without this option Line0 never fires, and Line1 never does: a
+  capture waiting for either ends at `--timeout` with exit 4 `trigger_timeout`.
+
+Join them with `&`, as in `'sim:0?drop=0.02&line0=every:500ms'`, and quote the selector in the
+shell. A selector with options is a camera of its own that starts from the settings its base
+(`sim:0`) saved, so use the same selector for every command of a sequence.
+
 ## Replay test data
 
 `sim:replay:PATH` turns recorded data into a camera:

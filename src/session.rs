@@ -2554,7 +2554,7 @@ impl SessionHandle {
                 ErrorKind::Usage,
                 format!("{job} is not a job of session {}", self.inner.name),
             )
-            .hint("capturefab jobs lists the jobs of every running session")
+            .hint("capturefab jobs lists every session's jobs")
             .into());
         }
         Ok(number)
@@ -2564,7 +2564,7 @@ impl SessionHandle {
             ErrorKind::Usage,
             format!("session {} has no job {job}", self.inner.name),
         )
-        .hint("capturefab jobs lists the jobs of every running session")
+        .hint("capturefab jobs lists every session's jobs")
         .into()
     }
     /// Wait for `job` to change after `after_seq`, or end: `{seq, job,

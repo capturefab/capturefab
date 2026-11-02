@@ -60,14 +60,17 @@ capturefab capture --json -c sim:0 -o 'shots/{seq}.png'</code></pre><button clas
         <div class="code-wrap"><pre><code># capturefab inspect --json -c sim:0 \
 #   --set exposure=1ms --preview none
 {"camera":"sim:0",
- "exposure":{"clipped_high":0.0,"clipped_low":0.0043,
-   "mean":0.0446,"p1":0.004,"p50":0.046,"p99":0.0893},
+ "exposure":{"clipped_high":0.0,"clipped_high_px":0,
+   "clipped_low":0.0,"clipped_low_px":0,"max":0.0902,
+   "mean":0.0446,"p1":0.0039,"p50":0.0461,"p99":0.0892},
  "focus":{"sharpness":4.3685},
- "frame":{"age_ms":13,"bits":8,"height":480,
-   "pixel_format":"Mono8","width":640},
+ "frame":{"age_ms":23,"bits":8,"device_ts_ns":4710250,
+   "height":480,"id":1,"pixel_format":"Mono8",
+   "time":"2026-11-02T14:00:28.395Z","width":640},
+ "frames":1,
  "settings":{"exposure_us":1000.0,"fps":30.0,
    "gain_db":0.0,"pixel_format":"Mono8"},
- "suggest":{"ev":3.32,"exposure_us":10000.0},
+ "suggest":{"ev":3.34,"exposure_us":10112.0},
  "verdict":["dark"]}
 
 # capturefab set --json -c sim:0 ExposureTime=1h

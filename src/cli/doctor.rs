@@ -20,11 +20,11 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "folders",
-        "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path null when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
+        "{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path absent when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over",
     ),
     (
         "inspect_dir",
-        "string or null — the private folder inspect writes previews to without --preview PATH",
+        "string, absent when there is none — the private folder inspect writes previews to without --preview PATH",
     ),
     (
         "warm_sessions",
@@ -32,7 +32,7 @@ pub const DOCTOR_FIELDS: &[(&str, &str)] = &[
     ),
     (
         "read_only_root",
-        "bool or null — the root file system is mounted read-only (Linux)",
+        "bool, absent off Linux or when it cannot tell — the root file system is mounted read-only",
     ),
     (
         "host",

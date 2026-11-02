@@ -623,7 +623,8 @@ capturefab --json session status line1</code></pre><button class="copy-button" t
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-session-stop"><code>capturefab session stop</code></h3>
-<p>Stop a session once its recordings and captures are finished. Effect: <code>disruptive</code>.</p>
+<p>Stop a session now: its running jobs end as interrupted, keeping the files saved so far. Effect: <code>disruptive</code>.</p>
+<p>Recordings are finalized. To let jobs finish first, wait for them: capturefab jobs wait ID.</p>
 <div class="table-scroll"><table><caption>capturefab session stop arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Values</th></tr></thead><tbody>
 <tr><td><code>[NAME]</code></td><td>The session (default: the only one running)</td><td>—</td></tr>
 </tbody></table></div>
@@ -652,16 +653,16 @@ capturefab serve -c gige:00c0df123456 --live</code></pre><button class="copy-but
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-auth_required"><code>auth_required</code></a>, <a href="#error-auth_rejected"><code>auth_rejected</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-invalid_duration"><code>invalid_duration</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs"><code>capturefab jobs</code></h3>
-<p>Captures and recordings running in sessions: list, stop, wait. Effect: <code>read</code>.</p>
+<p>Captures, recordings and auto exposure run in sessions, ended ones included: list, stop, wait. Effect: <code>read</code>.</p>
 <div class="code-wrap"><pre><code>capturefab jobs
 capturefab jobs wait auto-1 --timeout 10m
 capturefab jobs stop all</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session&#x27;s, and those of a session that died, as lost; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session&#x27;s, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs-list"><code>capturefab jobs list</code></h3>
-<p>Every running session&#x27;s jobs, finished ones included; or the jobs named, as they are now. Effect: <code>read</code>.</p>
+<p>Every session&#x27;s jobs, finished ones and those of ended sessions included; or the jobs named, as they are now. Effect: <code>read</code>.</p>
 <div class="table-scroll"><table><caption>capturefab jobs list arguments</caption><thead><tr><th scope="col">Argument or option</th><th scope="col">Meaning</th><th scope="col">Values</th></tr></thead><tbody>
 <tr><td><code>[ID...]</code></td><td>Job IDs such as auto-1: only these, in this order; without waiting, unlike jobs wait</td><td>—</td></tr>
 <tr><td><code>--running</code></td><td>Only jobs that have not ended: armed, running or stopping</td><td>—</td></tr>
@@ -671,7 +672,7 @@ capturefab jobs list --running
 capturefab --json jobs list auto-1 auto-2
 capturefab --json jobs</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab jobs list examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab jobs list JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every running session&#x27;s, and those of a session that died, as lost; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
+<tr><td><code>jobs</code></td><td>[{id,camera,kind:capture|record|auto,state:armed|running|stopping|done|failed|cancelled|interrupted|lost,saved,planned?,bytes?,last_file?,next_at?,ends_at?,started,ended?,error?:{code,message}}] — every session&#x27;s, a session that ended included, as it saved them (those that had not ended as lost); finished ones for an hour after they end; with IDs, those jobs in that order; with --running, only those that have not ended</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>
 <h3 id="command-jobs-stop"><code>capturefab jobs stop</code></h3>
@@ -788,13 +789,13 @@ capturefab --json doctor</code></pre><button class="copy-button" type="button" a
 <tr><td><code>checks</code></td><td>[{name,status:ok|warn|fail,message,fix?}] — fix is a command or step that resolves a warning</td></tr>
 <tr><td><code>features</code></td><td>{usb,jpeg,videotoolbox,nvjpeg,vaapi,keychain,shell} — what this build includes</td></tr>
 <tr><td><code>ffmpeg</code></td><td>{source:CAPTUREFAB_FFMPEG|bundled|next_to_executable|path,path,version,bundled_error?} or {error} — FFmpeg is looked for in that order; bundled_error says why a bundled copy could not be extracted</td></tr>
-<tr><td><code>folders</code></td><td>{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path null when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over</td></tr>
+<tr><td><code>folders</code></td><td>{runtime,state,cache: {path,from,writable,fs_type,passed:[{path,from,why}],error}} — the folders in use (runtime: sessions; state: presets, sign-ins; cache: FFmpeg), path absent when there is none; which candidate each uses (from: a variable, XDG_*, login, home, run, temp, runtime) and the fallbacks passed over</td></tr>
 <tr><td><code>host</code></td><td>{cpus,threads,cpu_quota,memory:{total_bytes,available_bytes,cgroup_limit_bytes,cgroup_used_bytes,budget_bytes}} — what cgroups leave this process</td></tr>
 <tr><td><code>hwdec</code></td><td>{selected:auto|none|METHOD,methods:{METHOD:{built,works,reason?}}} — hardware decoding CAPTUREFAB_HWDEC selects, and each method of this platform: in this FFmpeg (built) and proved to decode here (works); only with FFmpeg</td></tr>
-<tr><td><code>inspect_dir</code></td><td>string or null — the private folder inspect writes previews to without --preview PATH</td></tr>
+<tr><td><code>inspect_dir</code></td><td>string, absent when there is none — the private folder inspect writes previews to without --preview PATH</td></tr>
 <tr><td><code>jpeg</code></td><td>{selected:auto|cpu|videotoolbox|nvjpeg|vaapi,backends:{libjpeg_turbo:{compiled,simd},videotoolbox|nvjpeg|vaapi:{compiled,available,verified?,reason?,version?,driver?,device?,integrated?,upload?:in-place|dma|copy}}} — the JPEG encoder CAPTUREFAB_JPEG selects; verified: the engine encoded a test frame as accurately as libjpeg-turbo, checked once a boot (a failure again after five minutes) and kept in the cache; nvjpeg and vaapi (Linux) run in a helper process; upload: how frames reach the GPU (read where the camera wrote them, one DMA, or written into its memory)</td></tr>
 <tr><td><code>os</code></td><td>string</td></tr>
-<tr><td><code>read_only_root</code></td><td>bool or null — the root file system is mounted read-only (Linux)</td></tr>
+<tr><td><code>read_only_root</code></td><td>bool, absent off Linux or when it cannot tell — the root file system is mounted read-only</td></tr>
 <tr><td><code>version</code></td><td>string — Capturefab version</td></tr>
 <tr><td><code>warm_sessions</code></td><td>bool — camera commands can keep their camera open in the auto session</td></tr>
 </tbody></table></div>

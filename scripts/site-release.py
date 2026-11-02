@@ -163,10 +163,13 @@ def source_section(release):
         <details class="all-builds"><summary>Media sources for each download</summary><p>Each download includes FFmpeg, which uses GPLv3. Its media sources archive holds the exact FFmpeg, x264, SRT, OpenSSL and zlib source archives, the enabled header archives and their build recipe.</p><div class="table-scroll"><table class="release-assets"><caption>capturefab {version} media sources</caption><thead><tr><th scope="col">System</th><th scope="col">Processor</th><th scope="col">File</th><th scope="col">SHA-256</th></tr></thead><tbody>
 {rows}
         </tbody></table></div></details>''' if media else ''
+    # Up to the desktop releases, build.rs built FFmpeg itself; later ones only embed one.
+    ffmpeg = ('A release build also builds FFmpeg from pinned upstream archives when it has no copy.' if is_desktop_release(release) else
+              'Cargo does not build FFmpeg: build it with <code>scripts/build-ffmpeg.sh</code> and set <code>CAPTUREFAB_FFMPEG_BINARY</code> to embed it, or Capturefab uses <code>CAPTUREFAB_FFMPEG</code>, or an <code>ffmpeg</code> beside it or on <code>PATH</code>, when it runs.')
     return f'''      <section class="section" id="source" aria-labelledby="source-title">
         <div class="section-heading"><h2 id="source-title">Source code</h2><p>Capturefab uses the MIT license. Each release publishes its source as a download: the exact Capturefab files and every Rust dependency, ready for an offline build.</p></div>
         <div class="source-build">
-          <div><h3>capturefab {version} source</h3><p><a class="button" href="{href(source['url'])}">Download {html.escape(name)} <span aria-hidden="true">↓</span></a></p><p><small>{facts}</small></p><p>Use a stable Rust toolchain, a C compiler and CMake. For x86 builds, NASM is necessary for libjpeg-turbo. A release build also builds FFmpeg from pinned upstream archives when it has no copy. Read the <a href="guides/ffmpeg-build.md">FFmpeg build guide</a> for that step. On macOS, use <code>shasum -a 256 -c</code> in place of <code>sha256sum -c</code>.</p></div>
+          <div><h3>capturefab {version} source</h3><p><a class="button" href="{href(source['url'])}">Download {html.escape(name)} <span aria-hidden="true">↓</span></a></p><p><small>{facts}</small></p><p>Use a stable Rust toolchain, a C compiler and CMake. For x86 builds, NASM is necessary for libjpeg-turbo. {ffmpeg} Read the <a href="guides/ffmpeg-build.md">FFmpeg build guide</a> for that step. On macOS, use <code>shasum -a 256 -c</code> in place of <code>sha256sum -c</code>.</p></div>
           <div class="code-wrap"><pre><code>{check}tar -xzf {html.escape(name)}
 cd {folder}
 cargo --config .cargo/vendor-config.toml build --release --offline --locked
