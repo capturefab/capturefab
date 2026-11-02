@@ -115,9 +115,9 @@ The `capture` result lists `files` (absolute paths) with `width`, `height`, `pix
 become 8-bit PNG or JPEG, and `source_bits` then says how many bits the frame had.
 `-f jpg --quality 85` or a `.jpg` name gives JPEG; from a Motion JPEG webcam, stream or file,
 `-f jpg` without `--quality` stores the JPEG it sent as it was (`"passthrough": true`), with the
-provenance comment and, when it lacks them, the standard Huffman tables. `.raw` gives the frame's exact bytes with a
-`NAME.json` sidecar (`pixel_format`, `pfnc_code`, `width`, `height`, `row_bytes`). Every common
-PFNC pixel format converts; see the
+provenance comment and, when it lacks them, the standard Huffman tables. `.raw` gives the frame's
+exact bytes with a `NAME.json` sidecar (`pixel_format`, `pfnc_code`, `width`, `height`,
+`row_bytes`). Every common PFNC pixel format converts; see the
 [pixel format table](guides/camera-compatibility.md#pixel-formats). Webcams, streams and files
 arrive as FFmpeg decodes them (gray, YUV such as `YCbCr709_420_8_Planar`, or RGB8 for RGB
 sources), so their `.raw` bytes are in that format. Color JPEGs may come from Apple's JPEG engine
