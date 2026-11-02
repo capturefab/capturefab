@@ -10373,7 +10373,7 @@ esac
 printf '[info]   Stream #0:0: Video: h264 (High), yuv420p, 4x2, 30 fps\n[info] Output #0, rawvideo, to '"'"'pipe:1'"'"':\n[info]   Stream #0:0: Video: rawvideo, yuv420p(tv, bt709), 4x2\n' >&2
 fd=$(echo "$*" | sed -n 's/.*-f mpegts pipe:\([0-9]*\).*/\1/p')
 if [ -n "$fd" ]; then
-    eval "{ cat \"\$dir/ts1\"; sleep 0.5; cat \"\$dir/ts2\"; } >&$fd &"
+    { cat "$dir/ts1"; sleep 0.5; cat "$dir/ts2"; } > "/dev/fd/$fd" &
 fi
 while :; do head -c 12 /dev/zero; sleep 0.02; done"#,
         );
