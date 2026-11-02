@@ -105,6 +105,9 @@ pub fn run_worker(args: impl Iterator<Item = std::ffi::OsString>) -> Result<()> 
         build: env!("CARGO_PKG_VERSION").into(),
     });
     let output = args.output.map(platform::inherited).transpose()?;
+    if args.session != super::DIRECT {
+        let _ = super::SERVED.set(args.session.clone());
+    }
     let handle = WorkerHandle::serving(events.clone(), args.session, output);
     let stopping = Arc::new(AtomicBool::new(false));
     {

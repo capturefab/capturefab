@@ -474,10 +474,12 @@ pub(crate) enum Chroma<'a> {
         cr: &'a mut [u8],
         stride: usize,
     },
-    Interleaved {
-        cbcr: &'a mut [u8],
-        stride: usize,
-    },
+    // Only the VideoToolbox engine writes NV12 surfaces.
+    #[cfg_attr(
+        not(all(feature = "videotoolbox", target_os = "macos")),
+        allow(dead_code)
+    )]
+    Interleaved { cbcr: &'a mut [u8], stride: usize },
 }
 
 #[cfg(feature = "jpeg")]
@@ -636,7 +638,7 @@ pub(crate) mod tests {
         .chain(
             [0x820c, 0x8210, 0x8218]
                 .into_iter()
-                .flat_map(|prefix| [1, 2, 3, 0x11, 0x12].map(move |id| prefix << 16 | id)),
+                .flat_map(|prefix| [1, 2, 3, 4, 0x11, 0x12, 0x13].map(move |id| prefix << 16 | id)),
         )
         .filter(|&format| crate::frame::convertible(format))
         .collect()
@@ -759,6 +761,120 @@ pub(crate) mod tests {
             let row = reader.row(1, channels).as_ptr();
             let inside = frame.data.as_ptr_range().contains(&row);
             assert_eq!(inside, borrowed, "{format:08x}");
+        }
+    }
+
+    /// JFIF 4:2:0 from RGB rows, as libjpeg-turbo's planes and as an NV12
+    /// surface, at odd sizes and with rows wider than the image.
+    #[test]
+    #[cfg(feature = "jpeg")]
+    fn ycbcr420_matches_jfif_at_any_size_and_stride() {
+        let jfif = |[r, g, b]: [f64; 3]| {
+            [
+                0.299 * r + 0.587 * g + 0.114 * b,
+                128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b,
+                128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b,
+            ]
+        };
+        // Odd sizes repeat their edges; 1031x517 is split across threads.
+        for (width, height) in [(1, 1), (2, 2), (3, 1), (5, 7), (33, 17), (1031, 517)] {
+            let rgb: Vec<[u8; 3]> = (0..width * height)
+                .map(|i| {
+                    [
+                        (i * 7) as u8,
+                        (i * 13 + i / width) as u8,
+                        (255 - i % 256) as u8,
+                    ]
+                })
+                .collect();
+            let frame = Frame {
+                width: width as u32,
+                height: height as u32,
+                pixel_format: RGB8,
+                data: rgb.as_flattened().to_vec().into(),
+                ..Frame::default()
+            };
+            let at = |x: usize, y: usize| {
+                rgb[y.min(height - 1) * width + x.min(width - 1)].map(f64::from)
+            };
+            let (chroma_width, chroma_rows) = (width.div_ceil(2), height.div_ceil(2));
+            let luma_stride = width + 3;
+            for interleaved in [false, true] {
+                // Each row ends in padding the writer must leave alone.
+                let mut luma = vec![7; luma_stride * height];
+                let (used, chroma_stride) = if interleaved {
+                    (2 * chroma_width, 2 * chroma_width + 6)
+                } else {
+                    (chroma_width, chroma_width + 3)
+                };
+                let mut planes = [
+                    vec![7; chroma_stride * chroma_rows],
+                    vec![
+                        7;
+                        if interleaved {
+                            0
+                        } else {
+                            chroma_stride * chroma_rows
+                        }
+                    ],
+                ];
+                let [first, second] = &mut planes;
+                let chroma = if interleaved {
+                    Chroma::Interleaved {
+                        cbcr: first,
+                        stride: chroma_stride,
+                    }
+                } else {
+                    Chroma::Planar {
+                        cb: first,
+                        cr: second,
+                        stride: chroma_stride,
+                    }
+                };
+                ycbcr420(
+                    FrameRef::whole(&frame),
+                    Yuv420 {
+                        luma: &mut luma,
+                        luma_stride,
+                        chroma,
+                    },
+                );
+                let case = format!("{width}x{height} interleaved {interleaved}");
+                for (y, row) in luma.chunks(luma_stride).enumerate() {
+                    for (x, &value) in row[..width].iter().enumerate() {
+                        let expected = jfif(at(x, y))[0];
+                        assert!(
+                            (f64::from(value) - expected).abs() <= 0.51,
+                            "{case}: Y {x},{y}"
+                        );
+                    }
+                    assert!(row[width..].iter().all(|&v| v == 7), "{case}: row {y}");
+                }
+                for y in 0..chroma_rows {
+                    let row = y * chroma_stride;
+                    for x in 0..chroma_width {
+                        let mean = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                            .map(|(dx, dy)| jfif(at(2 * x + dx, 2 * y + dy)))
+                            .iter()
+                            .fold([0.0; 2], |s, p| [s[0] + p[1] / 4.0, s[1] + p[2] / 4.0]);
+                        let (cb, cr) = if interleaved {
+                            (planes[0][row + 2 * x], planes[0][row + 2 * x + 1])
+                        } else {
+                            (planes[0][row + x], planes[1][row + x])
+                        };
+                        for (component, got) in [cb, cr].into_iter().enumerate() {
+                            assert!(
+                                (f64::from(got) - mean[component].clamp(0.0, 255.0)).abs() <= 0.51,
+                                "{case}: C{component} {x},{y}"
+                            );
+                        }
+                    }
+                    for plane in planes.iter().filter(|plane| !plane.is_empty()) {
+                        let padding = &plane[row + used..row + chroma_stride];
+                        assert!(padding.iter().all(|&v| v == 7), "{case}: chroma row {y}");
+                    }
+                }
+            }
         }
     }
 }

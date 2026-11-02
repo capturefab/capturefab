@@ -119,15 +119,18 @@ exposure metering use the frame's own bit depth.
 Webcams, streams and files arrive in the format FFmpeg decodes them to: gray, YUV 4:2:0, 4:2:2
 or 4:4:4 (planar, NV12 or YUYV/UYVY) with its color range and matrix, or RGB for RGB sources, so
 `-f raw` saves those bytes. Where PFNC has no code for a layout (planar Y'CbCr, limited-range
-NV12) the pixel format is one of Capturefab's own, named in PFNC's style: `YCbCr601_420_8_Planar`
-is limited-range BT.601 4:2:0 in three planes, `YCbCr709_…` limited-range BT.709 and plain
-`YCbCr…` full-range BT.601. Other color spaces are read as RGB. Compressed network streams and
-webcams in a compressed mode are decoded in hardware where it works (`CAPTUREFAB_HWDEC`); files
-are decoded in software, which delivers their first frame sooner.
+NV12, full-range BT.709) the pixel format is one of Capturefab's own, named in PFNC's style:
+`YCbCr601_420_8_Planar` is limited-range BT.601 4:2:0 in three planes, `YCbCr709_…` limited-range
+BT.709, `YCbCr709Full_…` full-range BT.709 and plain `YCbCr…` full-range BT.601. Other color
+spaces are read as RGB. In a session, the warm one included, compressed network streams and
+webcams in a compressed mode are decoded in hardware where it works (`CAPTUREFAB_HWDEC`), as
+the decoder runs on between commands; files, and commands with `--no-session`, decode in software,
+which delivers one frame sooner.
 
 JPEG stills of color frames go to Apple's JPEG engine on macOS where it is faster and as accurate
-as libjpeg-turbo (checked on the first frame of each size and format; frames under 512K pixels,
-monochrome frames and `--quality` other than 90 stay on libjpeg-turbo); `CAPTUREFAB_JPEG` chooses.
+as libjpeg-turbo (checked beside the first frame of each size and format, which libjpeg-turbo
+writes; frames under 512K pixels, monochrome frames and `--quality` other than 90 stay on
+libjpeg-turbo); `CAPTUREFAB_JPEG` chooses.
 `record --codec ffv1` of a Bayer camera stores the mosaic itself, losslessly, as 8- or 16-bit
 gray, which players show in gray.
 
@@ -158,7 +161,11 @@ network paths. More: [CLI workflows](docs/cli-workflows.md),
 | `CAPTUREFAB_MAX_CAMERAS` | cameras one session may hold, 1–64 (default 16) |
 | `CAPTUREFAB_GVSP_SCATTER=0` | GigE Vision packets are received whole and copied into their frames, rather than received straight into them |
 | `CAPTUREFAB_JPEG` | the JPEG encoder: `auto` (default), `cpu` (libjpeg-turbo) or `videotoolbox`; a named engine that is missing or fails its accuracy check is exit 3 `unavailable` |
-| `CAPTUREFAB_HWDEC` | hardware decoding: `auto` (default: streams and webcams), `none`, or a method such as `videotoolbox`, `cuda`, `vulkan` or `d3d11va`, used for files too; one this FFmpeg lacks or that fails its probe is exit 3 `unavailable` |
+| `CAPTUREFAB_HWDEC` | hardware decoding: `auto` (default: streams and webcams, in a session), `none`, or a method such as `videotoolbox`, `cuda`, `vulkan` or `d3d11va`, used for files and `--no-session` too; one this FFmpeg lacks or that fails its probe is exit 3 `unavailable` |
+
+A session's cameras keep the `CAPTUREFAB_JPEG` and `CAPTUREFAB_HWDEC` the session started with,
+the warm `auto` session included: stop it (`capturefab session stop auto`) or use `--no-session`
+for a command to use other values.
 
 `capturefab --json doctor` prints the folders in use (`dirs`, and under `folders` the fallbacks
 it passed over), including the private folder that holds `inspect` previews, the JPEG encoders

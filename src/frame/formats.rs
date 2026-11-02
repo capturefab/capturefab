@@ -4,11 +4,12 @@
 //! https://www.emva.org/wp-content/uploads/GenICam_PFNC_2_4.pdf
 //!
 //! Video decoded by FFmpeg also arrives in planar and semiplanar Y'CbCr
-//! that PFNC has no code for (every planar layout, and limited-range
-//! semiplanar 4:2:0). Those carry Capturefab's own codes, with PFNC's
-//! custom bit (31) set and its color flag and bits per pixel, named in
-//! PFNC's style: `YCbCr` is full-range BT.601 (JFIF), `YCbCr601` and
-//! `YCbCr709` limited-range BT.601 and BT.709.
+//! that PFNC has no code for (every planar layout, limited-range
+//! semiplanar 4:2:0, and full-range BT.709). Those carry Capturefab's own
+//! codes, with PFNC's custom bit (31) set and its color flag and bits per
+//! pixel, named in PFNC's style: `YCbCr` is full-range BT.601 (JFIF),
+//! `YCbCr601` and `YCbCr709` limited-range BT.601 and BT.709, and
+//! `YCbCr709Full` full-range BT.709.
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Result, ensure};
 
@@ -21,6 +22,8 @@ pub(crate) enum Matrix {
     Bt601,
     /// Limited-range (video) BT.709.
     Bt709,
+    /// Full-range BT.709, as many network cameras tag their video.
+    Full709,
 }
 
 #[derive(Clone, Copy)]
@@ -67,13 +70,15 @@ const fn planar(sub: (usize, usize), matrix: Matrix) -> u32 {
     };
     0x8200_0000 | bits << 16 | (1 + matrix as u32)
 }
-/// Limited-range semiplanar 4:2:0 (NV12 order) in BT.601 and BT.709.
+/// Semiplanar 4:2:0 (NV12 order) in limited-range BT.601 and BT.709 and
+/// full-range BT.709: `0x820c_0010` plus `planar`'s matrix number.
 pub(crate) const NV12_601: u32 = 0x820c_0011;
 pub(crate) const NV12_709: u32 = 0x820c_0012;
+const NV12_709_FULL: u32 = 0x820c_0013;
 
 fn layout(format: u32) -> Option<(&'static str, Layout)> {
     use Layout::{Mono, Planes, Rgb, Rgb565, SignedMono, Yuv};
-    use Matrix::{Bt601, Bt709, Full};
+    use Matrix::{Bt601, Bt709, Full, Full709};
     let rgb = |bits, bgr, planar| Rgb {
         bits,
         channels: 3,
@@ -122,6 +127,9 @@ fn layout(format: u32) -> Option<(&'static str, Layout)> {
     const P444: u32 = planar((1, 1), Matrix::Full);
     const P444_601: u32 = planar((1, 1), Matrix::Bt601);
     const P444_709: u32 = planar((1, 1), Matrix::Bt709);
+    const P420_709_FULL: u32 = planar((2, 2), Matrix::Full709);
+    const P422_709_FULL: u32 = planar((2, 1), Matrix::Full709);
+    const P444_709_FULL: u32 = planar((1, 1), Matrix::Full709);
     Some(match format {
         0x0108_0002 => ("Mono8s", SignedMono),
         0x0101_0037 => ("Mono1p", Mono { bits: 1 }),
@@ -186,6 +194,10 @@ fn layout(format: u32) -> Option<(&'static str, Layout)> {
             "YCbCr709_420_8_YY_CbCr_Semiplanar",
             semi(Bt709, (2, 2), true),
         ),
+        NV12_709_FULL => (
+            "YCbCr709Full_420_8_YY_CbCr_Semiplanar",
+            semi(Full709, (2, 2), true),
+        ),
         P420 => ("YCbCr420_8_Planar", planes(Full, (2, 2))),
         P420_601 => ("YCbCr601_420_8_Planar", planes(Bt601, (2, 2))),
         P420_709 => ("YCbCr709_420_8_Planar", planes(Bt709, (2, 2))),
@@ -195,12 +207,15 @@ fn layout(format: u32) -> Option<(&'static str, Layout)> {
         P444 => ("YCbCr444_8_Planar", planes(Full, (1, 1))),
         P444_601 => ("YCbCr601_444_8_Planar", planes(Bt601, (1, 1))),
         P444_709 => ("YCbCr709_444_8_Planar", planes(Bt709, (1, 1))),
+        P420_709_FULL => ("YCbCr709Full_420_8_Planar", planes(Full709, (2, 2))),
+        P422_709_FULL => ("YCbCr709Full_422_8_Planar", planes(Full709, (2, 1))),
+        P444_709_FULL => ("YCbCr709Full_444_8_Planar", planes(Full709, (1, 1))),
         _ => return None,
     })
 }
 
 /// Every code `layout` knows, for looking a layout up by its name.
-const CODES: [u32; 66] = [
+const CODES: [u32; 70] = [
     0x0108_0002,
     0x0101_0037,
     0x0102_0038,
@@ -258,6 +273,7 @@ const CODES: [u32; 66] = [
     0x0210_0115,
     NV12_601,
     NV12_709,
+    NV12_709_FULL,
     planar((2, 2), Matrix::Full),
     planar((2, 2), Matrix::Bt601),
     planar((2, 2), Matrix::Bt709),
@@ -267,18 +283,22 @@ const CODES: [u32; 66] = [
     planar((1, 1), Matrix::Full),
     planar((1, 1), Matrix::Bt601),
     planar((1, 1), Matrix::Bt709),
+    planar((2, 2), Matrix::Full709),
+    planar((2, 1), Matrix::Full709),
+    planar((1, 1), Matrix::Full709),
 ];
 
 /// The code of planar or semiplanar 8-bit Y'CbCr subsampled `sub` in
 /// `matrix`'s color space, chroma interleaved Cb first (NV12) or in planes:
-/// FFmpeg's decoded layouts. None for limited-range 4:2:2 and 4:4:4 semiplanar,
-/// which nothing produces.
+/// FFmpeg's decoded layouts. None for the other semiplanar 4:2:2 and 4:4:4
+/// layouts, which nothing produces.
 pub(crate) fn ycbcr_planes(sub: (usize, usize), matrix: Matrix, interleaved: bool) -> Option<u32> {
     Some(match (interleaved, sub, matrix) {
         (false, _, _) => planar(sub, matrix),
         (true, (2, 2), Matrix::Full) => 0x020c_0112,
         (true, (2, 2), Matrix::Bt601) => NV12_601,
         (true, (2, 2), Matrix::Bt709) => NV12_709,
+        (true, (2, 2), Matrix::Full709) => NV12_709_FULL,
         (true, (2, 1), Matrix::Full) => 0x0210_0113,
         _ => return None,
     })
@@ -503,6 +523,18 @@ fn decode(frame: &Frame, layout: Layout, x: usize, y: usize) -> [u8; 3] {
 fn to_rgb(matrix: Matrix, luma: u8, cb: u8, cr: u8) -> [u8; 3] {
     match matrix {
         Matrix::Full => super::ycbcr(luma, cb, cr),
+        Matrix::Full709 => {
+            let y = i32::from(luma) << 16;
+            let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
+            // 2(1 - Kr), 2Kb(1 - Kb)/Kg, 2Kr(1 - Kr)/Kg and 2(1 - Kb) for
+            // BT.709's Kr 0.2126 and Kb 0.0722, in 16.16 fixed point.
+            [
+                y + 103_206 * cr,
+                y - 12_276 * cb - 30_679 * cr,
+                y + 121_609 * cb,
+            ]
+            .map(|v| ((v + 32_768) >> 16).clamp(0, 255) as u8)
+        }
         Matrix::Bt601 | Matrix::Bt709 => {
             let y = (i32::from(luma) - 16) * 76_309;
             let (cb, cr) = (i32::from(cb) - 128, i32::from(cr) - 128);
@@ -922,6 +954,44 @@ mod tests {
                 [0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255]
             );
         }
+    }
+
+    /// Planar and semiplanar Y'CbCr expand their range and use their
+    /// matrix: black, white and red in each color space.
+    #[test]
+    fn decoded_video_planes_use_their_range_and_matrix() {
+        // Y, Cb, Cr of pure red.
+        for (matrix, black, white, red) in [
+            (Matrix::Full, 0, 255, [76, 85, 255]),
+            (Matrix::Bt601, 16, 235, [81, 90, 240]),
+            (Matrix::Bt709, 16, 235, [63, 102, 240]),
+            (Matrix::Full709, 0, 255, [54, 99, 255]),
+        ] {
+            for interleaved in [false, true] {
+                let format = ycbcr_planes((2, 2), matrix, interleaved).unwrap();
+                let label = name(format).unwrap();
+                // A 2x2 image's luma, then its one Cb and Cr: as two planes
+                // or one pair, the same bytes.
+                for ([y, cb, cr], expected) in [
+                    ([black, 128, 128], [0, 0, 0]),
+                    ([white, 128, 128], [255, 255, 255]),
+                    (red, [255, 0, 0]),
+                ] {
+                    let rgb = decoded(&frame(format, 2, 2, vec![y, y, y, y, cb, cr]));
+                    for pixel in rgb.chunks(3) {
+                        assert!(
+                            pixel.iter().zip(expected).all(|(&a, b)| a.abs_diff(b) <= 1),
+                            "{label}: {pixel:?} for {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            name(ycbcr_planes((2, 1), Matrix::Full709, false).unwrap()),
+            Some("YCbCr709Full_422_8_Planar")
+        );
+        assert_eq!(ycbcr_planes((2, 1), Matrix::Full709, true), None);
     }
 
     #[test]

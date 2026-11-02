@@ -57,14 +57,18 @@ Captures, inspections and recordings convert these PFNC layouts:
 | Interleaved color | RGB/BGR at 8/10/12/14/16 bits, RGB/BGR10p/12p, RGB10p32, RGB/BGR565p |
 | Planar color | RGB8/10/12/16_Planar |
 | Alpha/alignment color | RGBa/BGRa at 8/10/12/14/16 bits, RGBa/BGRa10p/12p, RGB8a32/BGR8a32; alpha/alignment is omitted from opaque images |
-| YUV/YCbCr | Generic 8-bit 4:4:4, 4:2:2 and 4:1:1; YCbCr601/709 at those subsamplings, in the PFNC default and explicit Cb-first orders |
+| YUV/YCbCr | Generic 8-bit 4:4:4, 4:2:2 and 4:1:1; YCbCr601/709 at those subsamplings, in the PFNC default and explicit Cb-first orders; semiplanar YCbCr420/422 `_YY_CbCr` and `_YY_CrCb` |
+| Decoded video | Capturefab's own codes for what PFNC has none for: planar 4:2:0, 4:2:2 and 4:4:4 (`YCbCr420_8_Planar` and so on), and semiplanar 4:2:0 (NV12) in limited-range BT.601/709 and full-range BT.709 |
 | Scalar measurements | Coord3D_C8/C16, Confidence8/16 as grayscale; floating-point depth (Coord3D_C32f) as raw only |
 
 Names and component orders follow the
 [EMVA pixel format values](https://www.emva.org/wp-content/uploads/GenICamPixelFormatValues.pdf)
 and [PFNC 2.4](https://www.emva.org/wp-content/uploads/GenICam_PFNC_2_4.pdf). Generic YUV/YCbCr
 uses full-range BT.601; explicitly named YCbCr601/709 uses video-range luma/chroma and its named
-matrix. 4:1:1 requires widths divisible by four. A lone last 4:2:2 pixel uses neutral Cr. Packed
+matrix, and Capturefab's `YCbCr709Full` full-range BT.709. Capturefab's own codes set PFNC's
+custom bit (31) and follow its naming, for example `YCbCr601_420_8_Planar` (limited-range BT.601
+4:2:0 in three planes) and `YCbCr709_420_8_YY_CbCr_Semiplanar` (limited-range BT.709 NV12); webcams,
+streams and files arrive in them as FFmpeg decodes them. 4:1:1 requires widths divisible by four. A lone last 4:2:2 pixel uses neutral Cr. Packed
 rows start on byte boundaries in the acquired frame; GigE also normalizes continuous LSB packing
 when the shorter payload identifies it unambiguously. If payload padding or chunks hide that
 distinction, rows retain the byte-aligned interpretation. Unpacked words are little-endian.
@@ -81,8 +85,8 @@ its native component precision, and its sidecar names the PFNC format and code. 
 layouts fail explicitly and can still be saved as raw.
 
 Recording passes the sensor layouts FFmpeg accepts and converts the remaining supported formats to
-gray/RGB24. `--codec ffv1` stores Bayer frames as RGB, 16 bits per channel for 10- to 16-bit
-mosaics; `capture --format raw` keeps the mosaic itself. These checks establish conversion
+gray/RGB24. `--codec ffv1` stores a Bayer mosaic itself as 8- or 16-bit gray (10- to 16-bit
+mosaics as 16-bit), which decodes back to the exact mosaic; players show it in gray. These checks establish conversion
 behavior with synthetic payloads; they do not establish compatibility with a physical camera
 model.
 

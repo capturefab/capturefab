@@ -9,8 +9,8 @@
 //! stays the same for the life of the process (FFmpeg scales a source that
 //! changes size mid-stream to the size it started with), so every frame is
 //! one fixed number of bytes. A format Capturefab cannot carry as decoded
-//! (another matrix, full-range BT.709, limited-range gray), or an output
-//! FFmpeg did not describe, makes the decoder ask for RGB24 instead.
+//! (another matrix, limited-range gray, packed 4:2:2 of odd width), or an
+//! output FFmpeg did not describe, makes the decoder ask for RGB24 instead.
 use crate::frame::{Matrix, ycbcr_planes};
 use crate::types::{Frame, MONO8, RGB8};
 use anyhow::{Context, Result, ensure};
@@ -113,9 +113,10 @@ const MATRICES: [&str; 17] = [
 
 /// The frame format of described raw video: its PFNC (or Capturefab) code
 /// and the bytes of each frame. None for a format, range or matrix
-/// Capturefab does not carry as decoded. An unspecified matrix is BT.601
-/// and an unspecified range video levels (full for `yuvj` and gray), as
-/// FFmpeg's own conversions take them.
+/// Capturefab does not carry as decoded, and for packed 4:2:2 of odd width,
+/// whose rows FFmpeg pads to whole pixel pairs where PFNC's end on the last
+/// pixel. An unspecified matrix is BT.601 and an unspecified range video
+/// levels (full for `yuvj` and gray), as FFmpeg's own conversions take them.
 pub(super) fn frame_format(described: &Described) -> Option<(u32, usize)> {
     let full = match described.range {
         Some(range) => range == Range::Full,
@@ -137,6 +138,7 @@ pub(super) fn frame_format(described: &Described) -> Option<(u32, usize)> {
         (None | Some("bt470bg" | "smpte170m"), true) => Matrix::Full,
         (None | Some("bt470bg" | "smpte170m"), false) => Matrix::Bt601,
         (Some("bt709"), false) => Matrix::Bt709,
+        (Some("bt709"), true) => Matrix::Full709,
         _ => return None,
     };
     let yuv = |sub, interleaved| ycbcr_planes(sub, matrix, interleaved);
@@ -145,15 +147,18 @@ pub(super) fn frame_format(described: &Described) -> Option<(u32, usize)> {
         "yuv420p" | "yuvj420p" => yuv((2, 2), false)?,
         "yuv422p" | "yuvj422p" => yuv((2, 1), false)?,
         "yuv444p" | "yuvj444p" => yuv((1, 1), false)?,
+        "yuyv422" | "uyvy422" if !width.is_multiple_of(2) => return None,
         "yuyv422" => match matrix {
             Matrix::Full => 0x0210_0032,
             Matrix::Bt601 => 0x0210_003e,
             Matrix::Bt709 => 0x0210_0041,
+            Matrix::Full709 => return None,
         },
         "uyvy422" => match matrix {
             Matrix::Full => 0x0210_001f,
             Matrix::Bt601 => 0x0210_0044,
             Matrix::Bt709 => 0x0210_0045,
+            Matrix::Full709 => return None,
         },
         _ => return None,
     };
@@ -193,12 +198,14 @@ pub(super) fn read_frame(
     })
 }
 
-/// The video stream FFmpeg reads: its codec and size.
+/// The video stream FFmpeg reads: its codec, size and whether its samples
+/// are wider than 8 bits.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Input {
     pub codec: String,
     pub width: u32,
     pub height: u32,
+    pub deep: bool,
 }
 
 /// What a line of FFmpeg's log says.
@@ -219,10 +226,16 @@ fn input(line: &str) -> Option<Input> {
         word.split_once('x')
             .filter(|(w, h)| is_number(w) && is_number(h))
     })?;
+    // The pixel format follows the codec's part, whose parentheses hold
+    // no commas. FFmpeg's names of formats wider than 8 bits end in their
+    // byte order, such as `yuv420p10le`.
+    let pix_fmt = rest.split(", ").nth(1).unwrap_or_default();
+    let pix_fmt = pix_fmt.split(['(', ' ']).next().unwrap_or_default();
     Some(Input {
         codec,
         width: width.parse().ok()?,
         height: height.parse().ok()?,
+        deep: pix_fmt.ends_with("le") || pix_fmt.ends_with("be"),
     })
 }
 
@@ -374,17 +387,38 @@ mod tests {
             Some((0x8210_0002, 15 + 18))
         );
         assert_eq!(format("yuv444p", Some(Full), None), Some((0x8218_0001, 45)));
-        assert_eq!(format("yuyv422", None, None), Some((0x0210_003e, 30)));
-        assert_eq!(format("uyvy422", Some(Full), None), Some((0x0210_001f, 30)));
+        let even = |pix_fmt: &str, range, colorspace: Option<&str>| {
+            frame_format(&Described {
+                pix_fmt: pix_fmt.into(),
+                width: 6,
+                height: 3,
+                range,
+                colorspace: colorspace.map(Into::into),
+            })
+        };
+        assert_eq!(even("yuyv422", None, None), Some((0x0210_003e, 36)));
+        assert_eq!(even("uyvy422", Some(Full), None), Some((0x0210_001f, 36)));
         assert_eq!(
-            format("uyvy422", None, Some("bt709")),
-            Some((0x0210_0045, 30))
+            even("uyvy422", None, Some("bt709")),
+            Some((0x0210_0045, 36))
+        );
+        // Full-range BT.709, as network cameras often tag their video.
+        assert_eq!(
+            format("yuvj420p", Some(Full), Some("bt709")),
+            Some((0x820c_0004, 27))
+        );
+        assert_eq!(
+            format("nv12", Some(Full), Some("bt709")),
+            Some((0x820c_0013, 27))
         );
         assert_eq!(format("gray", None, None), Some((MONO8, 15)));
         assert_eq!(format("rgb24", None, None), Some((RGB8, 45)));
         // What Capturefab asks for as RGB instead.
         assert_eq!(format("gray", Some(Limited), None), None);
-        assert_eq!(format("yuv420p", Some(Full), Some("bt709")), None);
+        assert_eq!(even("yuyv422", Some(Full), Some("bt709")), None);
+        // FFmpeg pads an odd row to a whole pixel pair; PFNC does not.
+        assert_eq!(format("yuyv422", None, None), None);
+        assert_eq!(format("uyvy422", Some(Full), None), None);
         assert_eq!(format("yuv420p", None, Some("bt2020nc")), None);
         assert_eq!(format("p010le", None, None), None);
     }
@@ -420,9 +454,20 @@ mod tests {
             Said::Input(Input {
                 codec: "h264".into(),
                 width: 1920,
-                height: 1080
+                height: 1080,
+                deep: false,
             })
         );
+        let deep = input(
+            "[info]   Stream #0:0[0x1](und): Video: hevc (Main 10) (hvc1 / 0x31637668), yuv420p10le(tv, bt709, progressive), 3840x2160, 30 fps",
+        )
+        .unwrap();
+        assert_eq!(
+            (deep.codec.as_str(), deep.width, deep.deep),
+            ("hevc", 3840, true)
+        );
+        let plain = input("Stream #0:0: Video: mjpeg (Baseline), yuvj422p(pc, bt470bg/unknown/unknown), 1280x720, 30 fps").unwrap();
+        assert!(!plain.deep);
         let outputs: Vec<_> = said
             .iter()
             .filter_map(|said| match said {

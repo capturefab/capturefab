@@ -898,6 +898,22 @@ fn maximum_cameras() -> Result<usize> {
 const LOG_LINES: usize = 200;
 /// The job IDs of a command's own worker, outside any session.
 pub(crate) const DIRECT: &str = "direct";
+/// The session whose camera this process serves, set once as a camera
+/// worker of a session starts; None in every other process, including the
+/// workers of one command.
+static SERVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+pub(crate) fn served_session() -> Option<&'static str> {
+    SERVED.get().map(String::as_str)
+}
+/// What an error about the camera worker's `variable` adds in a session:
+/// its workers have the environment the session started with, so the value
+/// a later command sets does not reach them.
+pub(crate) fn environment_hint(variable: &str) -> Option<String> {
+    let name = served_session()?;
+    Some(format!(
+        "session {name} keeps the {variable} it started with: stop it with capturefab session stop {name} and run the command again, or run it with --no-session"
+    ))
+}
 /// One line of a camera worker's or the session's log.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogEntry {

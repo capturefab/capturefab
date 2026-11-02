@@ -6,9 +6,7 @@
 //! reference-counted, read-only buffer. Cloning a `Frame` then costs a
 //! reference, so the saver, the inspector and the recording's writer all
 //! read the one buffer the camera filled, and it goes back to the pool from
-//! whichever thread drops it last. Nothing writes to a frozen buffer:
-//! [`FrameBuf::into_pool_vec`] takes it back to write to, copying (and
-//! counting the copy) only when another frame still shares it.
+//! whichever thread drops it last. Nothing writes to a frozen buffer.
 //!
 //! The pool bounds idle memory, not live frames: it keeps at most
 //! [`MAX_IDLE`] buffers, holding no more than 1/[`IDLE_SHARE`] of the memory

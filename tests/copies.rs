@@ -111,12 +111,20 @@ fn settings(format: &str) -> Vec<String> {
 /// `--json ARGS` with its workers counting into a fresh folder: their
 /// counts, the result, and the bytes of the files written under `out`.
 fn counted(home: &Home, out: &str, args: &[&str]) -> (Value, Value, i64) {
+    counted_env(home, &[], out, args)
+}
+/// `counted` with more variables set.
+fn counted_env(home: &Home, env: &[(&str, &str)], out: &str, args: &[&str]) -> (Value, Value, i64) {
     let folder = home
         .root
         .join(format!("report-{}", out.replace(['/', '.'], "-")));
     std::fs::create_dir_all(&folder).unwrap();
     let run = home.run_env(
-        &[("CAPTUREFAB_COPY_REPORT", folder.to_str().unwrap())],
+        &[
+            &[("CAPTUREFAB_COPY_REPORT", folder.to_str().unwrap())][..],
+            env,
+        ]
+        .concat(),
         &[&["--json"][..], args].concat(),
     );
     let result = run.success();
@@ -134,6 +142,16 @@ fn counted(home: &Home, out: &str, args: &[&str]) -> (Value, Value, i64) {
 /// What one more frame of `capture -n N` costs, from N and 2N frames, and
 /// the bytes of the files that frame added.
 fn capture_delta(home: &Home, format: &str, extra: &[&str], n: usize) -> (Value, i64) {
+    capture_delta_env(home, &[], format, extra, n)
+}
+/// `capture_delta` with more variables set.
+fn capture_delta_env(
+    home: &Home,
+    env: &[(&str, &str)],
+    format: &str,
+    extra: &[&str],
+    n: usize,
+) -> (Value, i64) {
     let mut runs = Vec::new();
     for count in [n, 2 * n] {
         let out = format!("{format}-{}-{count}/", extra.join(""));
@@ -146,7 +164,7 @@ fn capture_delta(home: &Home, format: &str, extra: &[&str], n: usize) -> (Value,
             &settings,
         ]
         .concat();
-        runs.push(counted(home, &out, &args));
+        runs.push(counted_env(home, env, &out, &args));
     }
     let mut delta = runs[1].0.clone();
     add(&mut delta, &runs[0].0, -1);
@@ -396,6 +414,47 @@ fn every_format_converts_once_into_its_encoder() {
                 _ => assert!(per_file <= LARGE_PER_FRAME, "{label}: {delta}"),
             }
         }
+    }
+}
+
+/// Apple's JPEG engine, named: color stills are written from the frame's
+/// rows straight into the engine's surface (`still_transform`) and kept in
+/// its own buffer, so a frame copies nothing it need not and allocates
+/// nothing large. Skipped where the engine is missing or fails its check.
+#[test]
+#[cfg(target_os = "macos")]
+fn the_jpeg_engine_encodes_from_the_frame() {
+    let home = Home::new("copies-videotoolbox");
+    let engine = [("CAPTUREFAB_JPEG", "videotoolbox")];
+    let settings = settings("RGB8");
+    let settings: Vec<&str> = settings.iter().map(String::as_str).collect();
+    let probe = home.run_env(
+        &engine,
+        &[
+            &["--json", "capture", "-c", "sim:0", "-o", "probe.jpg"][..],
+            &settings,
+        ]
+        .concat(),
+    );
+    if probe.code != Some(0) {
+        eprintln!(
+            "no VideoToolbox JPEG engine here; skipped: {}",
+            probe.stdout
+        );
+        return;
+    }
+    for format in ["RGB8", "BayerRG8"] {
+        let n = 20;
+        let (delta, files) = capture_delta_env(&home, &engine, format, &["-f", "jpg"], n);
+        let label = format!("capture -f jpg {format} (VideoToolbox)");
+        show(&label, &delta, n as i64);
+        assert_no_avoidable(&label, &delta);
+        assert_eq!(calls(&delta, "output_copy"), 0, "{label}: {delta}");
+        assert_eq!(site(&delta, "file_write"), files, "{label}");
+        assert!(
+            large(&delta) as f64 / n as f64 <= LARGE_PER_FRAME,
+            "{label}: {delta}"
+        );
     }
 }
 

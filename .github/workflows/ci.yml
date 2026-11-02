@@ -133,6 +133,7 @@ jobs:
       - run: cargo check --locked --no-default-features
       - run: cargo check --locked --no-default-features --features usb
       - run: cargo check --locked --no-default-features --features jpeg
+      - run: cargo check --locked --no-default-features --features videotoolbox
       - run: cargo check --locked --no-default-features --features keychain
       - run: cargo check --locked --no-default-features --features shell
 

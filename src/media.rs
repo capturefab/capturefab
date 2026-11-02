@@ -604,41 +604,52 @@ fn timed_output(
         .stderr(Stdio::piped())
         .spawn()
         .context("cannot launch FFmpeg")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(input);
-    }
+    let deadline = Instant::now() + timeout;
+    let stdin = child.stdin.take();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let reader = |mut input: Box<dyn Read + Send>| {
-        thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = input.by_ref().take(1024 * 1024).read_to_end(&mut bytes);
-            bytes
-        })
-    };
-    let out = reader(Box::new(stdout));
-    let err = reader(Box::new(stderr));
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let success = loop {
-        if let Some(status) = child.try_wait()? {
-            break status.success();
+    thread::scope(|scope| {
+        // The input is written from a thread of its own: an FFmpeg that
+        // stalls before it reads it, such as on a hung device, would block
+        // the write. Once FFmpeg is killed the write fails.
+        if let Some(mut stdin) = stdin {
+            scope.spawn(move || {
+                let _ = stdin.write_all(input);
+            });
         }
-        if Instant::now() >= deadline {
-            timed_out = true;
-            let _ = child.kill();
-            let _ = child.wait();
-            break false;
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
-    let mut bytes = out.join().unwrap_or_default();
-    bytes.extend(err.join().unwrap_or_default());
-    Ok((
-        success,
-        String::from_utf8_lossy(&bytes).to_string(),
-        timed_out,
-    ))
+        let reader = |mut input: Box<dyn Read + Send>| {
+            scope.spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = input.by_ref().take(1024 * 1024).read_to_end(&mut bytes);
+                bytes
+            })
+        };
+        let out = reader(Box::new(stdout));
+        let err = reader(Box::new(stderr));
+        let mut timed_out = false;
+        let success = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if Instant::now() < deadline => {}
+                // The threads end once FFmpeg does.
+                waited => {
+                    timed_out = waited.is_ok();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    waited?;
+                    break false;
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let mut bytes = out.join().unwrap_or_default();
+        bytes.extend(err.join().unwrap_or_default());
+        Ok((
+            success,
+            String::from_utf8_lossy(&bytes).to_string(),
+            timed_out,
+        ))
+    })
 }
 /// The bundled FFmpeg's license notice, with the license texts it is
 /// distributed under.
@@ -2435,8 +2446,8 @@ struct MediaBackend {
     /// A launch with hardware decoding failed: this source decodes in
     /// software from now on.
     software: bool,
-    /// The codec and size class FFmpeg last said the source has.
-    known: Option<(String, &'static str)>,
+    /// The video FFmpeg last said the source has.
+    known: Option<native::Input>,
 }
 /// How a media source's stream ended, for callers that act on the end rather
 /// than on the wording of its error.
@@ -2768,12 +2779,21 @@ impl MediaBackend {
         self.hwdec = None;
         if let Some(source) = self.hwdec_source() {
             let exe = executable().context(FfmpegUnavailable)?;
-            let known = self
-                .known
+            let known = self.known.as_ref().map(|input| {
+                let class = hwdec::size_class(input.width, input.height);
+                (hwdec::codec_key(input), class)
+            });
+            let known = known
                 .as_ref()
                 .map(|(codec, class)| (codec.as_str(), *class));
             if let Some(method) = hwdec::choose(&exe, source, known)?
-                && let Some(extra) = hwdec::options(method, self.codec())
+                && let Some(extra) = hwdec::options(
+                    method,
+                    self.codec(),
+                    known.is_some_and(|(codec, class)| {
+                        hwdec::remembered(&exe, method, codec, class) == Some(true)
+                    }),
+                )
             {
                 options.extend(extra);
                 self.hwdec = Some(method);
@@ -2808,7 +2828,7 @@ impl MediaBackend {
                 .and_then(|index| self.formats.get(index))?;
             return matches!(format.as_str(), "mjpeg" | "h264" | "hevc").then_some(format);
         }
-        self.known.as_ref().map(|(codec, _)| codec.as_str())
+        self.known.as_ref().map(|input| input.codec.as_str())
     }
     /// What a decoder's first frame says about the source: its codec and
     /// size, and whether the hardware decoded it, which is kept for the
@@ -2817,12 +2837,14 @@ impl MediaBackend {
         let (Some(input), Some(pix_fmt)) = facts else {
             return;
         };
-        let class = hwdec::size_class(input.width, input.height);
-        if let (Some(method), Ok(exe)) = (self.hwdec, executable()) {
+        if let (Some(method), Ok(exe)) = (self.hwdec, executable())
+            && !input.deep
+        {
+            let class = hwdec::size_class(input.width, input.height);
             let hardware = hwdec::decoded_in_hardware(&pix_fmt);
-            hwdec::learned(&exe, method, &input.codec, class, hardware);
+            hwdec::learned(&exe, method, &hwdec::codec_key(&input), class, hardware);
         }
-        self.known = Some((input.codec, class));
+        self.known = Some(input);
     }
     /// The source would decode to frames carried only as RGB: ask for RGB
     /// from now on.
@@ -2849,11 +2871,13 @@ impl MediaBackend {
             decoder = self.spawn()?;
             first = decoder.next(timeout);
         }
-        // A source the hardware could not decode is decoded in software,
-        // and if that works the method is not used for it again. One that
-        // failed before FFmpeg found its video (refused, not found, a bad
-        // sign-in) is not opened again for nothing.
-        if first.is_err()
+        // A source whose FFmpeg exited with the hardware is decoded in
+        // software, and if that works the method is not used for it again.
+        // One that failed before FFmpeg found its video (refused, not found,
+        // a bad sign-in), or that sent no frame in time, which software
+        // would not change, is not opened again for nothing.
+        if let Err(error) = &first
+            && error.chain().any(|cause| cause.is::<StreamEnded>())
             && let Some(method) = self.hwdec
             && let input @ Some(_) = decoder.facts().0
         {
@@ -2865,7 +2889,7 @@ impl MediaBackend {
                 && let (Some(input), Ok(exe)) = (input, executable())
             {
                 let class = hwdec::size_class(input.width, input.height);
-                hwdec::learned(&exe, method, &input.codec, class, false);
+                hwdec::learned(&exe, method, &hwdec::codec_key(&input), class, false);
             }
         }
         if first.is_ok() {
@@ -3710,6 +3734,9 @@ struct Probes {
     /// `ffmpeg -hwaccels` output.
     #[serde(default)]
     hwaccels: Option<String>,
+    /// `ffmpeg -decoders` output, asked for only where a method needs it.
+    #[serde(default)]
+    decoder_listing: Option<String>,
     /// Hardware decoding by method, codec and size class, such as
     /// `videotoolbox hevc uhd`, and each method's probe (`hwdec`).
     #[serde(default)]
@@ -3799,6 +3826,7 @@ fn save_probes(exe: &Executable, probes: &mut Probes) {
     probes.boot = boot.to_owned();
     probes.listing = probes.listing.take().or(stored.listing);
     probes.hwaccels = probes.hwaccels.take().or(stored.hwaccels);
+    probes.decoder_listing = probes.decoder_listing.take().or(stored.decoder_listing);
     for (key, found) in stored.encoders {
         let mine = probes.encoders.entry(key).or_insert(found);
         *mine = mine.newer(Some(found));
@@ -4389,10 +4417,10 @@ fn hardware_rgb_input(encoder: &str) -> bool {
     encoder.ends_with("_nvenc") || encoder.ends_with("_amf")
 }
 /// Choose the encoder input for a source. Only RGB sources go to an encoder
-/// as RGB: a Bayer mosaic or YUV would be converted to RGB on the CPU only
-/// to be converted back on the GPU, where swscale makes their 4:2:0 in one
-/// direct step (and sends a third of the bytes over the bus). RGB input is
-/// used only when the encoder accepts it on this machine, so a driver
+/// as RGB: a Bayer mosaic or YUV would be converted on the CPU either way
+/// (a mosaic demosaicked to RGB24 first, see `encoder_output_options`), and
+/// as 4:2:0 it sends under half the bytes of `bgr0` over the bus. RGB input
+/// is used only when the encoder accepts it on this machine, so a driver
 /// without it keeps the YUV path instead of falling back to software
 /// encoding.
 fn encoder_input(
@@ -5727,9 +5755,29 @@ esac"#,
         );
         // The probe, the launch that failed, and one in software.
         assert_eq!(fake.launches(&["hwdownload"]), 1);
-        assert_eq!(fake.launches(&["-hwaccel cuda -threads 1", "-i rtsp"]), 1);
+        assert_eq!(fake.launches(&["-hwaccel cuda", "-i rtsp"]), 1);
         assert_eq!(fake.launches(&["-f rawvideo"]), 2);
         drop(camera);
+        drop(fake);
+        // A stream that sends no frame in time would send none in software
+        // either: it is not opened again.
+        let fake = Fake::native(
+            "hwdec-stall",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-hwaccels*) printf 'Hardware acceleration methods:\ncuda\n' ;;
+*hwdownload*) cat > /dev/null ;;
+*) printf "{}" >&2; exec sleep 10 ;;
+esac"#,
+                describe("nv12")
+            ),
+        );
+        let Err(error) = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(1)) else {
+            panic!("a stream that sent nothing opened");
+        };
+        assert!(format!("{error:#}").contains("within 1 s"), "{error:#}");
+        assert_eq!(fake.launches(&["-i rtsp"]), 1);
         drop(fake);
         // The hardware opens the stream but FFmpeg decodes it in software.
         let fake = Fake::native(
@@ -5761,9 +5809,102 @@ for i in 1 2 3; do head -c 12 /dev/zero; sleep 0.05; done"#,
             .filter(|line| line.contains("-i rtsp"))
             .map(str::to_owned)
             .collect();
+        // Not yet proven, the first launch keeps FFmpeg's decoder threads,
+        // which the software decoding FFmpeg fell back to then has.
         assert!(launches[0].contains("-hwaccel cuda"), "{launches:?}");
+        assert!(!launches[0].contains("-threads 1 "), "{launches:?}");
         assert!(!launches[1].contains("-hwaccel"), "{launches:?}");
+        drop(camera);
+        drop(fake);
+        // Once the hardware has decoded the stream (NV12 frames), it does
+        // so on one decoder thread.
+        let fake = Fake::native(
+            "hwdec-proven",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+n=$(($(cat "$dir/launches" 2>/dev/null || echo 0) + 1))
+case "$*" in
+*-hwaccels*) printf 'Hardware acceleration methods:\ncuda\n' ; exit 0 ;;
+*hwdownload*) cat > /dev/null ; exit 0 ;;
+esac
+echo $n > "$dir/launches"
+printf "{}" >&2
+for i in 1 2 3; do head -c 12 /dev/zero; sleep 0.05; done"#,
+                describe("nv12")
+            ),
+        );
+        let mut camera = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(5)).unwrap();
+        camera.start(12).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fake.read("launches").trim() != "2" {
+            assert!(Instant::now() < deadline, "the stream did not come back");
+            let _ = camera.next_frame(Duration::from_millis(200));
+        }
+        let launches: Vec<String> = fake
+            .read("argv")
+            .lines()
+            .filter(|line| line.contains("-i rtsp"))
+            .map(str::to_owned)
+            .collect();
+        assert!(!launches[0].contains("-threads 1 "), "{launches:?}");
+        assert!(
+            launches[1].contains("-hwaccel cuda -threads 1"),
+            "{launches:?}"
+        );
         hwdec::SETTING.set(None);
+    }
+
+    /// Under `auto` a stream is decoded in hardware only by a session's
+    /// camera worker, whose decoder runs on between commands; a command's
+    /// own worker decodes its one frame sooner in software.
+    #[test]
+    #[cfg(unix)]
+    fn auto_decodes_streams_in_hardware_only_in_sessions() {
+        let Some(&method) = hwdec::candidates().first() else {
+            return;
+        };
+        hwdec::SETTING.set(Some(hwdec::Setting::Auto));
+        let fake = Fake::native(
+            "hwdec-auto",
+            &format!(
+                r#"echo "$*" >> "$dir/argv"
+case "$*" in
+*-hwaccels*) printf 'Hardware acceleration methods:\n{method}\n' ; exit 0 ;;
+*hwdownload*) cat > /dev/null ; exit 0 ;;
+esac
+printf "[info] Output #0, rawvideo, to 'pipe:1':\n[info]   Stream #0:0: Video: rawvideo, nv12(tv, bt709), 4x2\n" >&2
+while :; do head -c 12 /dev/zero; sleep 0.05; done"#
+            ),
+        );
+        let hardware = format!("-hwaccel {method}");
+        for (lasting, launches) in [(false, 0), (true, 1)] {
+            hwdec::LASTING.set(Some(lasting));
+            let mut camera = open_url("rtsp://127.0.0.1:9/live", Duration::from_secs(5)).unwrap();
+            camera.start(12).unwrap();
+            camera.next_frame(Duration::from_secs(2)).unwrap();
+            assert_eq!(
+                fake.launches(&[&hardware, "-i rtsp"]),
+                launches,
+                "{lasting}"
+            );
+        }
+        hwdec::LASTING.set(None);
+        hwdec::SETTING.set(None);
+    }
+
+    /// A probe whose FFmpeg never reads its input still ends at its
+    /// deadline: the input is written beside the wait, not before it.
+    #[test]
+    #[cfg(unix)]
+    fn probes_end_at_their_deadline_when_ffmpeg_reads_nothing() {
+        let fake = Fake::new("stalled", "exec sleep 30");
+        let exe = FAKE_FFMPEG.with_borrow(Clone::clone).unwrap();
+        let started = Instant::now();
+        let (success, _, timed_out) =
+            timed_output(&exe, &[], &vec![0; 8 << 20], Duration::from_millis(300)).unwrap();
+        assert!(!success && timed_out);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(fake);
     }
     /// Raw video is read at the size and format FFmpeg's log describes,
     /// one fixed number of bytes a frame.
@@ -7980,7 +8121,21 @@ esac"#
         let exe = executable().unwrap();
         let dir = std::env::temp_dir().join(format!("capturefab-native-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let cases: [(&str, &[&str], &str); 9] = [
+        let cases: [(&str, &[&str], &str); 10] = [
+            (
+                "709full.mp4",
+                &[
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-colorspace",
+                    "bt709",
+                    "-color_range",
+                    "pc",
+                ],
+                "YCbCr709Full_420_8_Planar",
+            ),
             (
                 "709.mp4",
                 &[
@@ -8092,16 +8247,33 @@ esac"#
                 );
             }
         }
-        // Matrices and ranges Capturefab does not carry as decoded are read
-        // as RGB, the source opened again for it.
-        for (name, encode) in [
+        // Matrices and ranges Capturefab does not carry as decoded, and
+        // packed 4:2:2 of odd width, whose rows FFmpeg pads, are read as
+        // RGB, the source opened again for it.
+        for (name, (width, height), encode) in [
             (
                 "2020.mp4",
-                ["-colorspace", "bt2020nc", "-color_range", "tv"],
+                (64, 48),
+                &[
+                    "-c:v",
+                    "libx264",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-colorspace",
+                    "bt2020nc",
+                    "-color_range",
+                    "tv",
+                ][..],
             ),
             (
-                "709full.mp4",
-                ["-colorspace", "bt709", "-color_range", "pc"],
+                "yuyv-odd.nut",
+                (321, 241),
+                &["-vf", "format=yuyv422", "-c:v", "rawvideo"],
+            ),
+            (
+                "uyvy-odd.nut",
+                (321, 241),
+                &["-vf", "format=uyvy422", "-c:v", "rawvideo"],
             ),
         ] {
             let path = dir.join(name);
@@ -8114,25 +8286,22 @@ esac"#
                 "-f",
                 "lavfi",
                 "-i",
-                "testsrc2=size=64x48:rate=10",
+                // testsrc2 would round an odd size to an even one.
+                &format!("testsrc=size={width}x{height}:rate=10"),
                 "-frames:v",
                 "3",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
             ]
             .map(str::to_string)
             .to_vec();
-            args.extend(encode.map(str::to_string));
+            args.extend(encode.iter().map(|arg| arg.to_string()));
             args.push(path.to_string_lossy().into());
             let (success, log) = bounded_output(&exe, &args, Duration::from_secs(20)).unwrap();
             assert!(success, "{name}: {log}");
             let mut camera = open_url(path.to_str().unwrap(), Duration::from_secs(10)).unwrap();
-            camera.start(64 * 48 * 3).unwrap();
+            camera.start(0).unwrap();
             let frame = camera.next_frame(Duration::from_secs(10)).unwrap();
             assert_eq!(frame.pixel_format, RGB8, "{name}");
-            assert_eq!(frame.data.len(), 64 * 48 * 3, "{name}");
+            assert_eq!(frame.data.len(), (width * height * 3) as usize, "{name}");
         }
         let _ = fs::remove_dir_all(dir);
     }
@@ -8150,10 +8319,13 @@ esac"#
         }
         let dir = std::env::temp_dir().join(format!("capturefab-hwdec-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
+        // Whether the frames show the hardware decoded them: a 10-bit
+        // source's are 8-bit whichever did, so nothing is learned from it.
         for (name, codec, pix_fmt, hardware) in [
-            ("h264.mp4", "libx264", "yuv420p", true),
-            ("hevc.mp4", "hevc_videotoolbox", "nv12", true),
-            ("h264-444.mp4", "libx264", "yuv444p", false),
+            ("h264.mp4", "libx264", "yuv420p", Some(true)),
+            ("hevc.mp4", "hevc_videotoolbox", "nv12", Some(true)),
+            ("hevc10.mp4", "hevc_videotoolbox", "p010le", None),
+            ("h264-444.mp4", "libx264", "yuv444p", Some(false)),
         ] {
             let path = dir.join(name);
             let args = [
@@ -8188,7 +8360,9 @@ esac"#
             let software = frame(hwdec::Setting::None);
             let decoded = frame(hwdec::Setting::Named("videotoolbox"));
             let format = crate::frame::pixel_format_name(decoded.pixel_format);
-            assert_eq!(format.ends_with("Semiplanar"), hardware, "{name}: {format}");
+            if let Some(hardware) = hardware {
+                assert_eq!(format.ends_with("Semiplanar"), hardware, "{name}: {format}");
+            }
             let (a, b) = (
                 crate::frame::rgb(&software).unwrap(),
                 crate::frame::rgb(&decoded).unwrap(),
@@ -8201,14 +8375,14 @@ esac"#
                 / a.len() as f64;
             assert!(mean < 2.0, "{name}: mean difference {mean:.2}");
             let class = hwdec::size_class(1280, 720);
-            let codec = if name.starts_with("hevc") {
-                "hevc"
-            } else {
-                "h264"
+            let codec = match name {
+                "hevc10.mp4" => "hevc-deep",
+                name if name.starts_with("hevc") => "hevc",
+                _ => "h264",
             };
             assert_eq!(
                 hwdec::remembered(&exe, "videotoolbox", codec, class),
-                Some(hardware),
+                hardware,
                 "{name}"
             );
         }

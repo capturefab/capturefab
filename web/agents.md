@@ -120,6 +120,10 @@ PFNC pixel format converts; see the
 arrive as FFmpeg decodes them (gray, YUV such as `YCbCr709_420_8_Planar`, or RGB8 for RGB
 sources), so their `.raw` bytes are in that format. Color JPEGs may come from Apple's JPEG engine
 on macOS (`CAPTUREFAB_JPEG=cpu` keeps libjpeg-turbo; `doctor` reports both under `jpeg`).
+Compressed streams and webcams are decoded in hardware where it works in a session, and files
+and `--no-session` commands in software (`CAPTUREFAB_HWDEC=auto|none|METHOD`; `doctor --json`
+reports the methods under `hwdec`). A session's cameras keep the `CAPTUREFAB_JPEG` and
+`CAPTUREFAB_HWDEC` the session started with: stop it, or use `--no-session`, to change them.
 
 ### Set and verify in one call
 
