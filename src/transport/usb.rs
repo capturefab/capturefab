@@ -448,8 +448,9 @@ fn usbfs_window() -> usize {
 /// The longest transfer that may receive a whole image. nusb turns on
 /// WinUSB's RAW_IO, under which a transfer must fit the pipe's
 /// MAXIMUM_TRANSFER_SIZE, which nusb does not report, so Windows keeps to
-/// the length every other transfer uses. macOS and Linux take a transfer
-/// of any length, Linux within its usbfs window.
+/// the length every other transfer uses: only images up to 1 MiB arrive
+/// whole there. macOS and Linux take a transfer of any length, Linux
+/// within its usbfs window.
 #[cfg(windows)]
 const WHOLE_TRANSFER: usize = MAX_TRANSFER;
 #[cfg(not(windows))]
@@ -2082,46 +2083,39 @@ mod tests {
             assert_eq!((many.block, submitted(&many)), (MIB / 4, MIB));
         }
         // Frames of which four fit the window, and the memory, arrive whole
-        // where the platform takes transfers that long: VGA everywhere but
-        // Windows, which keeps to 1 MiB transfers.
-        let whole = !cfg!(windows);
+        // where the platform takes transfers that long: up to 1 MiB, the
+        // length every other transfer requests, everywhere.
         let vga = at(640 * 480, window(Some(16), 1), Some(1 << 30));
-        assert_eq!(vga.whole, whole);
-        if whole {
-            assert_eq!(
-                (vga.block, vga.count, vga.tail, vga.request, vga.transfers),
-                (307_200, 1, 0, 307_200, MIN_TRANSFERS)
-            );
-        } else {
-            assert_eq!((vga.block, vga.count, vga.transfers), (307_200, 1, 6));
-        }
+        assert_eq!(
+            (vga.block, vga.count, vga.tail, vga.request, vga.transfers),
+            (307_200, 1, 0, 307_200, MIN_TRANSFERS)
+        );
+        assert!(vga.whole);
         // An image that is no whole number of packets: one final transfer.
         let odd = at(1000 * MPS + 100, usize::MAX, None);
-        if whole {
-            assert_eq!(
-                (odd.count, odd.tail, odd.request),
-                (0, 1001 * MPS, 1001 * MPS)
-            );
-        }
+        assert_eq!(
+            (odd.count, odd.tail, odd.request, odd.whole),
+            (0, 1001 * MPS, 1001 * MPS, true)
+        );
         // Not where four would leave too little memory.
         assert!(!at(640 * 480, window(Some(16), 1), Some(8 * 307_200)).whole);
         let tail = at(2_304_000, window(Some(16), 1), None);
         assert_eq!((tail.count, tail.tail, tail.whole), (2, 206_848, false));
-        // Without a usbfs limit, or with a raised one, large frames arrive
-        // whole too, four transfers at a time; Windows keeps two frames of
-        // 1 MiB transfers submitted.
+        // Without a usbfs limit, or with a raised one, larger frames arrive
+        // whole too, four transfers at a time; Windows, which keeps to 1 MiB
+        // transfers, keeps two frames of them submitted.
         for limit in [None, Some(0), Some(256)] {
             let unlimited = at(12_000_000, window(limit, 1), Some(4 << 30));
-            if whole {
-                assert_eq!(
-                    (unlimited.block, unlimited.count, unlimited.transfers),
-                    (12_000_256, 0, MIN_TRANSFERS)
-                );
+            let layout = (
+                unlimited.block,
+                unlimited.count,
+                unlimited.transfers,
+                unlimited.whole,
+            );
+            if cfg!(windows) {
+                assert_eq!(layout, (MIB, 11, 28, false));
             } else {
-                assert_eq!(
-                    (unlimited.block, unlimited.count, unlimited.transfers),
-                    (MIB, 11, 28)
-                );
+                assert_eq!(layout, (12_000_256, 0, MIN_TRANSFERS, true));
             }
         }
     }

@@ -2977,7 +2977,8 @@ fn jobs_changed(h: &WorkerHandle, camera: &mut Option<Camera>, jobs: &mut Vec<Sc
     refresh(h, camera);
 }
 /// The files to save of the frame that came, for every job due now; the
-/// saver encodes and writes them from its own copy. Without `room` the
+/// saver encodes and writes them from the frame, sharing its buffer with the
+/// camera's other consumers. Without `room` the
 /// encoders' queue is full: the frame is dropped, and due jobs take a later
 /// one instead of holding up acquisition.
 fn shoot(

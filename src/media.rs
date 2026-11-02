@@ -3232,6 +3232,69 @@ impl WriterQueue {
             .get_or_insert(error);
     }
 }
+/// The writer thread's loop, until the queue stops or a frame cannot be
+/// converted or written: on each slot of `interval`, the newest frame the
+/// queue holds goes to `input`, converted first where the encoder cannot
+/// read it. With `repeat` a slot without a new frame sends the last one
+/// again, while the camera streams or, with `through_stalls`, throughout.
+/// How many frames it took from the queue, each converted at most once.
+fn write_frames(
+    shared: &WriterQueue,
+    input: &mut impl Write,
+    (raw, jetson): (RawInput, Option<JetsonInput>),
+    interval: Duration,
+    (repeat, through_stalls): (bool, bool),
+) -> u64 {
+    let mut next = Instant::now();
+    let mut last: Option<Frame> = None;
+    let mut scratch = Scratch::default();
+    let mut taken = 0;
+    loop {
+        let again = repeat && last.is_some() && (through_stalls || !shared.stalled());
+        let Some(fresh) = shared.take(next, again) else {
+            break;
+        };
+        if let Some(frame) = fresh {
+            taken += 1;
+            // A frame that needs converting is converted here, once: the
+            // frames a newer one replaced in the queue never are, and a
+            // repeat sends the conversion again.
+            let prepared = match jetson {
+                Some(jetson) => jetson.prepare(&frame, &mut scratch),
+                None => raw.prepare(&frame, &mut scratch.bytes),
+            };
+            if let Err(error) = prepared {
+                shared.fail(format!("{error:#}"));
+                break;
+            }
+            last = Some(frame);
+        }
+        let Some(frame) = &last else {
+            continue;
+        };
+        let payload = match jetson {
+            Some(jetson) => jetson.payload(frame, &scratch),
+            None => raw.payload(frame, &scratch.bytes),
+        };
+        shared.busy.store(true, Ordering::Relaxed);
+        crate::copies::record(crate::copies::Site::PipeWrite, payload.len());
+        let written = payload.write_to(input);
+        shared.busy.store(false, Ordering::Relaxed);
+        if let Err(e) = written {
+            shared.fail(format!("FFmpeg input failed: {e}"));
+            break;
+        }
+        shared.written.fetch_add(1, Ordering::Relaxed);
+        if !repeat {
+            last = None;
+        }
+        // Slots stay on a fixed grid; a writer that fell behind skips the
+        // slots it missed instead of catching up in a burst.
+        let now = Instant::now();
+        next = (next + interval).max(now.checked_sub(interval).unwrap_or(now));
+    }
+    taken
+}
 struct EncoderProcess {
     child: Child,
     writer: Option<JoinHandle<()>>,
@@ -4676,52 +4739,13 @@ impl Forwarder {
         // on every slot throughout.
         let (repeat, through_stalls) = (jetson.is_some() || !local, !local);
         let writer = thread::spawn(move || {
-            let mut next = Instant::now();
-            let mut last: Option<Frame> = None;
-            let mut scratch = Scratch::default();
-            loop {
-                let again = repeat && last.is_some() && (through_stalls || !shared.stalled());
-                let Some(fresh) = shared.take(next, again) else {
-                    break;
-                };
-                if let Some(frame) = fresh {
-                    // A frame that needs converting is converted here, once:
-                    // the frames a newer one replaced in the queue never are,
-                    // and a repeat sends the conversion again.
-                    let prepared = match jetson {
-                        Some(jetson) => jetson.prepare(&frame, &mut scratch),
-                        None => raw.prepare(&frame, &mut scratch.bytes),
-                    };
-                    if let Err(error) = prepared {
-                        shared.fail(format!("{error:#}"));
-                        break;
-                    }
-                    last = Some(frame);
-                }
-                let Some(frame) = &last else {
-                    continue;
-                };
-                let payload = match jetson {
-                    Some(jetson) => jetson.payload(frame, &scratch),
-                    None => raw.payload(frame, &scratch.bytes),
-                };
-                shared.busy.store(true, Ordering::Relaxed);
-                crate::copies::record(crate::copies::Site::PipeWrite, payload.len());
-                let written = payload.write_to(&mut input);
-                shared.busy.store(false, Ordering::Relaxed);
-                if let Err(e) = written {
-                    shared.fail(format!("FFmpeg input failed: {e}"));
-                    break;
-                }
-                shared.written.fetch_add(1, Ordering::Relaxed);
-                if !repeat {
-                    last = None;
-                }
-                // Slots stay on a fixed grid; a writer that fell behind skips
-                // the slots it missed instead of catching up in a burst.
-                let now = Instant::now();
-                next = (next + interval).max(now.checked_sub(interval).unwrap_or(now));
-            }
+            write_frames(
+                &shared,
+                &mut input,
+                (raw, jetson),
+                interval,
+                (repeat, through_stalls),
+            );
             // Closing stdin lets FFmpeg flush its muxer and finalize files.
             drop(input);
             shared.running.store(false, Ordering::Release);
@@ -6586,6 +6610,95 @@ esac"#
             data = padded;
         }
         Ok(data)
+    }
+    /// The writer converts a frame when it takes it from the queue, once:
+    /// frames a newer one replaced while FFmpeg was busy are never
+    /// converted, and a repeat writes the same conversion again.
+    #[test]
+    fn the_writer_converts_only_the_frames_it_writes() {
+        /// A pipe that holds its first write until the test lets it go.
+        struct Held {
+            bytes: Vec<u8>,
+            gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+        }
+        impl Write for Held {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if let Some((writing, go)) = self.gate.take() {
+                    writing.send(()).unwrap();
+                    go.recv().unwrap();
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        const MONO12P: u32 = 0x010c_0047;
+        let raw = RawInput::for_format(MONO12P).unwrap();
+        assert!(raw.unpack);
+        let frames: Vec<Frame> = (1..=4u8)
+            .map(|n| Frame {
+                id: n.into(),
+                width: 8,
+                height: 4,
+                pixel_format: MONO12P,
+                data: (0..48u8).map(|i| i.wrapping_mul(37) ^ n).collect(),
+                ..Frame::default()
+            })
+            .collect();
+        for repeat in [false, true] {
+            let queue = Arc::new(WriterQueue::new());
+            let offer = |frame: &Frame| {
+                let mut state = queue.state.lock().unwrap();
+                state.latest = Some(frame.clone());
+                drop(state);
+                queue.changed.notify_one();
+            };
+            let (writing, held) = std::sync::mpsc::channel();
+            let (go, gate) = std::sync::mpsc::channel();
+            let writer = thread::spawn({
+                let queue = queue.clone();
+                move || {
+                    let mut pipe = Held {
+                        bytes: Vec::new(),
+                        gate: Some((writing, gate)),
+                    };
+                    let interval = Duration::from_millis(1);
+                    let taken =
+                        write_frames(&queue, &mut pipe, (raw, None), interval, (repeat, true));
+                    (pipe.bytes, taken)
+                }
+            });
+            // The second and third frames are replaced by the fourth while
+            // the first is still being written.
+            offer(&frames[0]);
+            held.recv().unwrap();
+            for frame in &frames[1..] {
+                offer(frame);
+            }
+            go.send(()).unwrap();
+            let writes = if repeat { 5 } else { 2 };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while queue.written.load(Ordering::Relaxed) < writes {
+                assert!(Instant::now() < deadline, "repeat {repeat}");
+                thread::sleep(Duration::from_millis(1));
+            }
+            queue.running.store(false, Ordering::Release);
+            queue.changed.notify_all();
+            let (bytes, taken) = writer.join().unwrap();
+            let written = queue.written.load(Ordering::Relaxed) as usize;
+            assert_eq!(taken, 2, "repeat {repeat}");
+            assert!(written == 2 || repeat && written >= 5, "{written}");
+            let first = reference_bytes(&raw, &frames[0]).unwrap();
+            let last = reference_bytes(&raw, &frames[3]).unwrap();
+            assert_ne!(first, last);
+            let expected: Vec<u8> = std::iter::once(first)
+                .chain(std::iter::repeat_n(last, written - 1))
+                .flatten()
+                .collect();
+            assert_eq!(bytes, expected, "repeat {repeat}");
+        }
     }
     #[test]
     fn payloads_are_written_whole_through_short_writes() {

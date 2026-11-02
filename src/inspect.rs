@@ -475,6 +475,27 @@ fn jpeg_preview(format: PreviewFormat, jpeg_available: bool) -> Result<bool> {
     })
 }
 
+/// The channels and samples a preview of `frame` is shrunk from: the
+/// frame's own bytes for the 8-bit monochrome formats and RGB8, else a
+/// conversion.
+fn preview_samples(frame: &Frame) -> Result<(usize, Cow<'_, [u8]>)> {
+    let (channels, pixels) = if matches!(
+        frame.pixel_format,
+        crate::types::MONO8 | 0x0108_00b1 | 0x0108_00c6
+    ) {
+        let gray = frame::gray8_samples(frame)?;
+        (1, gray.context("8-bit monochrome is gray")?)
+    } else if frame::monochrome(frame.pixel_format) {
+        (1, Cow::Owned(frame::convert(frame, |[value, _, _]| value)?))
+    } else {
+        (3, frame::rgb_samples(frame)?)
+    };
+    if let Cow::Owned(pixels) = &pixels {
+        crate::copies::record(crate::copies::Site::PreviewTransform, pixels.len());
+    }
+    Ok((channels, pixels))
+}
+
 /// A preview of `frame` whose longest edge is at most `max_dimension`, or
 /// None for 0 and for formats that cannot be decoded. Pixels are averaged
 /// over each output pixel's area, so detail blends instead of aliasing.
@@ -496,17 +517,7 @@ fn render_within(
         return Ok(None);
     }
     let jpeg = jpeg_preview(format, jpeg_available)?;
-    // Mono8 and RGB8 are shrunk from the frame's own bytes.
-    let (channels, pixels) = if frame.pixel_format == crate::types::MONO8 {
-        (1, frame::gray8_samples(frame)?.context("Mono8 is gray")?)
-    } else if frame::monochrome(frame.pixel_format) {
-        (1, Cow::Owned(frame::convert(frame, |[value, _, _]| value)?))
-    } else {
-        (3, frame::rgb_samples(frame)?)
-    };
-    if let Cow::Owned(pixels) = &pixels {
-        crate::copies::record(crate::copies::Site::PreviewTransform, pixels.len());
-    }
+    let (channels, pixels) = preview_samples(frame)?;
     let (width, height) = fit(frame.width, frame.height, max_dimension);
     let first = first_quality(cropped, frame.width, frame.height);
     let lowest = QUALITIES[QUALITIES.len() - 1];
@@ -1173,6 +1184,33 @@ mod tests {
                 .unwrap(),
             image.bytes
         );
+    }
+
+    #[test]
+    fn eight_bit_gray_and_rgb8_previews_read_the_frame_in_place() {
+        let gray = ramp(64, 48);
+        let mono = render(&frame(MONO8, 64, 48, gray.clone()), 32, PreviewFormat::Png)
+            .unwrap()
+            .unwrap();
+        // Coord3D_C8 and Confidence8 are their own gray samples, as Mono8 is.
+        for format in [MONO8, 0x0108_00b1, 0x0108_00c6] {
+            let source = frame(format, 64, 48, gray.clone());
+            let (channels, pixels) = preview_samples(&source).unwrap();
+            assert_eq!(channels, 1, "{format:x}");
+            assert!(matches!(pixels, Cow::Borrowed(_)), "{format:x}");
+            let image = render(&source, 32, PreviewFormat::Png).unwrap().unwrap();
+            assert_eq!(image.bytes, mono.bytes, "{format:x}");
+        }
+        let rgb = frame(RGB8, 4, 3, (0..36).collect());
+        assert!(matches!(
+            preview_samples(&rgb).unwrap(),
+            (3, Cow::Borrowed(_))
+        ));
+        let wide = frame(MONO12, 4, 3, vec![0; 24]);
+        assert!(matches!(
+            preview_samples(&wide).unwrap(),
+            (1, Cow::Owned(_))
+        ));
     }
 
     #[test]

@@ -23,7 +23,8 @@ fn queue_bytes() -> usize {
     })
 }
 
-/// A copy of one frame for every job that was due when it arrived.
+/// One frame, shared with its other consumers, for every job that was due
+/// when it arrived.
 pub(super) struct Shot {
     pub(super) frame: Frame,
     /// When the frame arrived, UTC Unix milliseconds.

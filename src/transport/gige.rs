@@ -1107,6 +1107,7 @@ impl Backend for GigE {
                     buffer,
                     header: [0; 20],
                     overflow: vec![0; 64 * 1024],
+                    scratch: Vec::new(),
                     scatter: scatter(std::env::var_os(SCATTER_ENV).as_deref()),
                     timeout: POLL,
                     next_poll: Instant::now(),
@@ -1630,6 +1631,9 @@ struct Stream {
     /// A predicted packet's header, and what it holds beyond its slot.
     header: [u8; 20],
     overflow: Vec<u8>,
+    /// A packet that did not land as predicted, put back together. Never
+    /// `buffer`, which must keep its length to receive a whole datagram.
+    scratch: Vec<u8>,
     /// Payload packets are received straight into their frames.
     scatter: bool,
     timeout: Duration,
@@ -1715,7 +1719,7 @@ impl Stream {
             header,
             overflow,
             assembler,
-            buffer,
+            scratch,
             ..
         } = self;
         let place = assembler
@@ -1744,7 +1748,7 @@ impl Stream {
             &slot,
             (&header[..], received, flags.is_truncated()),
             overflow,
-            buffer,
+            scratch,
             Instant::now(),
         )))
     }
@@ -5090,6 +5094,29 @@ mod tests {
         });
         assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
         assert_eq!(copied, (8, 8 * 8192));
+    }
+
+    /// A short packet that arrives where a payload packet was expected
+    /// leaves the next frames' leaders and trailers whole.
+    #[test]
+    fn frames_after_a_short_mispredicted_packet_arrive() {
+        // The last payload packet is lost: the trailer arrives in its place
+        // and the resent packet completes the frame.
+        let (frames, copied) = loopback(3, |packets| {
+            let last = packets.len() - 2;
+            packets.remove(last);
+        });
+        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+        assert_eq!(copied, (0, 0));
+        // A header-only "packet temporarily unavailable" resend reply where
+        // the packet itself was expected, which arrives next.
+        let (frames, copied) = loopback(3, |packets| {
+            let mut unavailable = packets[9][..8].to_vec();
+            unavailable[..2].copy_from_slice(&0x8014u16.to_be_bytes());
+            packets.insert(9, unavailable);
+        });
+        assert!(frames.iter().all(|frame| *frame == image(1920, 1080)));
+        assert_eq!(copied, (0, 0));
     }
 
     #[test]

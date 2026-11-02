@@ -116,8 +116,8 @@ pub fn software(raster: &Raster) -> Result<Body<'static>> {
     software_quality(raster, QUALITY)
 }
 
-/// libjpeg-turbo at a chosen quality (1–100), for previews that trade
-/// detail for size; stills use `software` and the fixed `QUALITY`.
+/// libjpeg-turbo at a chosen quality (1–100), from a converted raster: for
+/// previews, and for stills of formats `encode` cannot read in place.
 #[cfg(feature = "jpeg")]
 pub fn software_quality(raster: &Raster, quality: i32) -> Result<Body<'static>> {
     use turbojpeg::PixelFormat;
