@@ -452,7 +452,8 @@ fn a_recording_ends_as_asked_at_its_maximum_size() {
     assert_eq!(open["ended"], "duration", "{open}");
 }
 
-/// A second signal ends the command at once, still with one document.
+/// A second signal ends the command at once, still with one document,
+/// and ends the camera worker's process group with it.
 #[cfg(unix)]
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
@@ -469,18 +470,47 @@ fn a_second_signal_ends_at_once_with_a_document() {
         assert!(Instant::now() < deadline, "the recording did not start");
         std::thread::sleep(Duration::from_millis(50));
     }
-    // SAFETY: kill only sends signals to the child this test spawned.
+    // The command's own worker (it keeps no session) leads a process
+    // group with its FFmpeg. Stopped, it cannot finish the recording the
+    // first signal asks it to, however fast it would: only the second
+    // signal can end the command.
+    let children = std::process::Command::new("pgrep")
+        .args(["-P", &child.id().to_string()])
+        .output()
+        .unwrap();
+    let worker = String::from_utf8_lossy(&children.stdout)
+        .lines()
+        .next()
+        .expect("the command's camera worker")
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    // SAFETY: kill only sends signals to processes this test started:
+    // the command, and the group its worker leads.
     unsafe {
+        assert_eq!(libc::kill(-worker, libc::SIGSTOP), 0);
         assert_eq!(libc::kill(child.id() as i32, libc::SIGINT), 0);
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(200));
         assert_eq!(libc::kill(child.id() as i32, libc::SIGINT), 0);
     }
     let output = child.wait_with_output().unwrap();
+    // SAFETY: as above; signal 0 only asks whether the group has members.
+    let lives = || unsafe { libc::kill(-worker, 0) } == 0;
+    let ended = Instant::now();
+    while lives() && ended.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let left = lives();
+    if left {
+        // SAFETY: as above.
+        unsafe { libc::kill(-worker, libc::SIGKILL) };
+    }
     assert_eq!(output.status.code(), Some(130));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
     let document: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(document["error"]["code"], "interrupted", "{document}");
+    assert!(!left, "the worker's group outlived the command");
 }
 
 /// An H.264 file `name` in the test's home, 10 s at 30 fps with a key frame
