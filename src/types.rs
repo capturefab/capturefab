@@ -512,15 +512,27 @@ pub fn classify(error: &anyhow::Error) -> Classified {
         if cause.is::<crate::transport::gige::GvcpTimeout>() {
             return plain(ErrorKind::Timeout);
         }
+        // A session that went away mid-request is unavailable, as one that
+        // cannot be reached is.
+        if cause.is::<crate::ipc::Closed>() {
+            return Classified {
+                kind: ErrorKind::Unavailable,
+                hint: Some(crate::ipc::CLOSED_HINT.into()),
+                details: None,
+            };
+        }
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
             use std::io::ErrorKind as Io;
             match io.kind() {
                 Io::StorageFull | Io::QuotaExceeded => {
                     return Classified {
                         kind: ErrorKind::StorageFull,
-                        hint: Some(format!(
-                            "free some space or write to another folder; {} sets how much Capturefab leaves free",
-                            crate::storage::MIN_FREE_ENV
+                        hint: Some(crate::session::with_environment_hint(
+                            format!(
+                                "free some space or write to another folder; {} sets how much Capturefab leaves free",
+                                crate::storage::MIN_FREE_ENV
+                            ),
+                            crate::storage::MIN_FREE_ENV,
                         )),
                         details: None,
                     };

@@ -27,6 +27,9 @@ pub struct ServeArgs {
     /// Write one JSON line to this inherited descriptor once ready or failed (session start)
     #[arg(long, value_name = "FD", hide = true)]
     pub ready_fd: Option<u64>,
+    /// Let the cameras go after this long unused, as the command that started it for them asked (--keep, --background)
+    #[arg(long, value_name = "DUR", hide = true, value_parser = super::args::duration)]
+    pub camera_keep: Option<Duration>,
 }
 
 /// Where `session start` waits to hear whether the session came up.
@@ -36,21 +39,30 @@ impl Ready {
         let Some(fd) = fd else {
             return Ok(Self(None));
         };
+        // It is kept from the camera workers this process starts, and their
+        // FFmpeg: `session start` would otherwise not see the pipe end while
+        // they run, should this process die before it says anything.
         #[cfg(unix)]
         let file = {
             use std::os::fd::FromRawFd;
             let fd = i32::try_from(fd).context("--ready-fd is not a descriptor")?;
             // SAFETY: `session start` passed this descriptor for this
             // process alone to write once and close.
-            unsafe { std::fs::File::from_raw_fd(fd) }
+            unsafe {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                std::fs::File::from_raw_fd(fd)
+            }
         };
         #[cfg(windows)]
         let file = {
             use std::os::windows::io::FromRawHandle;
+            use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+            let handle = fd as usize as std::os::windows::io::RawHandle;
             // SAFETY: `session start` made this pipe handle inheritable for
             // this process alone to write once and close.
             unsafe {
-                std::fs::File::from_raw_handle(fd as usize as std::os::windows::io::RawHandle)
+                SetHandleInformation(handle as _, HANDLE_FLAG_INHERIT, 0);
+                std::fs::File::from_raw_handle(handle)
             }
         };
         Ok(Self(Some(file)))
@@ -95,10 +107,14 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
             let selector = super::caller_selector(selector)?;
             let connected =
                 handle.request(SessionCommand::connect(selector, millis(CONNECT_TIMEOUT)))?;
+            let id = connected["connected"]["id"]
+                .as_str()
+                .context("camera connected without an ID")?;
+            // A session holds the cameras it was started with as long as it
+            // runs, unless a command started it for its camera, which then
+            // goes as that command asked.
+            handle.keep_camera(id, args.camera_keep);
             if args.live {
-                let id = connected["connected"]["id"]
-                    .as_str()
-                    .context("camera connected without an ID")?;
                 handle.request_to(id, SessionCommand::Start)?;
             }
         }
@@ -173,4 +189,28 @@ pub fn run(global: &Global, args: ServeArgs) -> Result<Option<Report>> {
         );
     }
     Ok(None)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_ready_pipe_is_not_inherited_by_the_processes_serve_starts() {
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let (reader, writer) = std::io::pipe().unwrap();
+        let fd = writer.into_raw_fd();
+        // As `session start` passes it: inheritable across the exec.
+        // SAFETY: fcntl on a descriptor this test owns.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+        let mut ready = Ready::open(Some(fd as u64)).unwrap();
+        let file = ready.0.as_ref().unwrap();
+        // SAFETY: as above.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        ready.say(&json!({"ready": true}));
+        let mut line = String::new();
+        std::io::Read::read_to_string(&mut &reader, &mut line).unwrap();
+        assert_eq!(line, "{\"ready\":true}\n");
+    }
 }

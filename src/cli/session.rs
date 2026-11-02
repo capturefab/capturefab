@@ -103,7 +103,7 @@ fn start(global: &Global, args: StartArgs) -> Result<Report> {
     // for and stays at least the idle time asked for.
     let (mut value, started) = match ipc::running_session(&args.name) {
         Some(descriptor) => {
-            ipc::keep(&args.name, args.idle)?;
+            ipc::keep(&args.name, None, args.idle)?;
             for selector in &cameras {
                 ipc::call(
                     &args.name,
@@ -142,7 +142,13 @@ fn start(global: &Global, args: StartArgs) -> Result<Report> {
             )
         }
         None => (
-            detach(&args.name, &cameras, args.live, args.idle, &mut warnings)?,
+            detach(
+                &args.name,
+                &cameras,
+                args.live,
+                (args.idle, None),
+                &mut warnings,
+            )?,
             true,
         ),
     };
@@ -177,7 +183,7 @@ pub(super) fn ensure(
     // or several agents' calls) take turns: one starts it, the rest use it.
     let _turn = ipc::start_turn(name)?;
     if ipc::running_session(name).is_some() {
-        match ipc::keep(name, idle) {
+        match ipc::keep(name, None, idle) {
             Ok(()) => return Ok(false),
             // It ended unused just now: start another once it is gone.
             Err(error) if super::session_gone(&error) => {
@@ -197,7 +203,8 @@ pub(super) fn ensure(
     }
     let cameras = selector.map(str::to_owned).into_iter().collect::<Vec<_>>();
     let mut warnings = Vec::new();
-    match detach(name, &cameras, false, idle, &mut warnings) {
+    // The camera goes as this command asked, not with the session.
+    match detach(name, &cameras, false, (idle, Some(idle)), &mut warnings) {
         Ok(_) => {
             for warning in warnings {
                 global.output().note(format_args!("capturefab: {warning}"));
@@ -205,7 +212,9 @@ pub(super) fn ensure(
             Ok(true)
         }
         // A session started another way, such as serve, took the name.
-        Err(_) if ipc::running_session(name).is_some() => ipc::keep(name, idle).map(|()| false),
+        Err(_) if ipc::running_session(name).is_some() => {
+            ipc::keep(name, None, idle).map(|()| false)
+        }
         Err(error) => Err(error),
     }
 }
@@ -228,22 +237,6 @@ pub(super) fn can_start() -> bool {
     };
     crate::dirs::runtime().is_ok()
         && log_path(super::AUTO_SESSION).is_ok_and(|log| log.parent().is_some_and(usable))
-}
-
-/// Session `name`'s descriptor when it runs, or `session_not_found`; what a
-/// session that was killed left under that name is removed.
-fn running(name: &str) -> Result<ipc::Descriptor> {
-    let descriptor = ipc::read_descriptor(name)?;
-    if ipc::running_session(name).is_some() {
-        return Ok(descriptor);
-    }
-    let _ = ipc::remove_stale(name);
-    Err(Categorized::new(
-        ErrorKind::SessionNotFound,
-        format!("session {name} is not running; it ended without cleaning up, and what it left is removed"),
-    )
-    .hint(format!("start it again with capturefab session start --name {name}"))
-    .into())
 }
 
 /// Where a detached session's output goes: `sessions/NAME.log` in the
@@ -308,13 +301,15 @@ fn rotate(path: &std::path::Path, most: u64) {
     }
 }
 
-/// Start `serve` as a session of its own, detached from this terminal, and
-/// wait for it to say it is ready: its ready document, or its failure.
+/// Start `serve` as session `name` of its own, detached from this
+/// terminal, holding `cameras` (only as long as `camera_keep` unused, when
+/// given) and ending after `idle` unused, and wait for it to say it is
+/// ready: its ready document, or its failure.
 fn detach(
     name: &str,
     cameras: &[String],
     live: bool,
-    idle: Duration,
+    (idle, camera_keep): (Duration, Option<Duration>),
     warnings: &mut Vec<String>,
 ) -> Result<Value> {
     let executable = std::env::var_os("CAPTUREFAB_EXECUTABLE")
@@ -331,6 +326,11 @@ fn detach(
     }
     if live {
         command.arg("--live");
+    }
+    if let Some(keep) = camera_keep {
+        command
+            .arg("--camera-keep")
+            .arg(super::args::duration_text(keep));
     }
     for variable in [
         "CAPTUREFAB_SESSION",
@@ -527,7 +527,7 @@ fn named(global: &Global, name: Option<String>) -> Result<String> {
 
 fn stop(global: &Global, name: Option<String>) -> Result<Report> {
     let name = named(global, name)?;
-    let descriptor = running(&name)?;
+    let descriptor = ipc::read_descriptor(&name)?;
     let pid = descriptor.pid;
     let asked = ipc::stop(&descriptor);
     if let Err(error) = &asked {
@@ -617,7 +617,7 @@ fn uptime(descriptor: &ipc::Descriptor) -> u64 {
 
 fn status(global: &Global, name: Option<String>) -> Result<Report> {
     let name = named(global, name)?;
-    let descriptor = running(&name)?;
+    let descriptor = ipc::read_descriptor(&name)?;
     let state = ipc::call(&name, Request::Status, Duration::from_secs(10))?;
     let cameras = state["cameras"]
         .as_array()

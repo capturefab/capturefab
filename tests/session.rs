@@ -456,6 +456,89 @@ fn a_killed_sessions_descriptor_does_not_hold_its_name() {
     home.ok(&["session", "stop", "stale"]);
 }
 
+/// A session holds the cameras it was started with as long as it runs; a
+/// camera a command connected with `--keep` goes once that keep runs out
+/// unused, while the session goes on.
+#[test]
+fn a_session_keeps_its_own_cameras_and_lets_kept_ones_go() {
+    let home = Home::new("keep-camera");
+    home.ok(&["session", "start", "--name", "lab", "-c", "sim:0"]);
+    let held = || {
+        home.ok(&["session", "status", "lab"])["cameras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|camera| camera["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    // A command's keep does not shorten what the session was started with.
+    home.ok(&["get", "-c", "sim:0", "--keep", "1s", "Width"]);
+    home.ok(&[
+        "--session",
+        "lab",
+        "get",
+        "-c",
+        "sim:1",
+        "--keep",
+        "1s",
+        "Width",
+    ]);
+    assert_eq!(held(), ["sim:0", "sim:1"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while held() != ["sim:0"] {
+        assert!(Instant::now() < deadline, "{:?}", held());
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(held(), ["sim:0"]);
+    home.ok(&["session", "stop", "lab"]);
+}
+
+/// A program that takes the port of a session that was killed learns
+/// nothing from a command that names the session: no token, no camera
+/// address with its sign-in, and no answer of its is taken for the
+/// session's.
+#[cfg(unix)]
+#[test]
+fn a_program_on_a_killed_sessions_port_is_sent_nothing() {
+    use std::io::Read;
+    let home = Home::new("squat");
+    let started = home.ok(&["session", "start", "--name", "lab", "-c", "sim:0"]);
+    let pid = started["pid"].as_i64().unwrap() as i32;
+    let descriptor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(home.sessions.join("lab.json")).unwrap()).unwrap();
+    // SAFETY: kill only sends a signal to the session this test started.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while support::cli::process_lives(pid) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let listener = std::net::TcpListener::bind(descriptor["address"].as_str().unwrap()).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let error = home.fails(
+        3,
+        &[
+            "--session",
+            "lab",
+            "info",
+            "-c",
+            "rtsp://admin:Sup3rSecret@10.1.2.3/live",
+        ],
+    );
+    assert_eq!(error["code"], "session_not_found", "{error}");
+    let mut sent = Vec::new();
+    if let Ok((mut stream, _)) = listener.accept() {
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let _ = stream.read_to_end(&mut sent);
+    }
+    assert!(sent.is_empty(), "{}", String::from_utf8_lossy(&sent));
+    assert!(!home.sessions.join("lab.json").exists());
+}
+
 /// Commands that start the same session at once share it: the cameras of
 /// one capture, or several agents' calls.
 #[test]

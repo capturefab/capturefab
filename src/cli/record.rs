@@ -389,10 +389,11 @@ impl Recording<'_> {
         ))
     }
     /// The recording's error, as its job ended with it, with its reason,
-    /// and what it recorded before, as a disk below its floor leaves.
+    /// and what it recorded before, as a disk below its floor leaves, or a
+    /// worker that died leaves unfinished.
     fn failure(&self, job: &Value, detail: &Value) -> anyhow::Error {
         let mut details = json!({ "job": job });
-        if detail["recording"].is_object()
+        if (detail["recording"].is_object() || job["last_file"].is_string())
             && let (Some(details), Value::Object(result)) = (
                 details.as_object_mut(),
                 self.result(job, detail, Ended::Failed),
@@ -501,7 +502,10 @@ impl Recording<'_> {
             .unwrap_or_default();
         let mut value = json!({
             "camera": self.info["camera"],
-            "output": file["path"].as_str().map_or_else(|| self.output.clone(), str::to_owned),
+            "output": file["path"]
+                .as_str()
+                .or(job["last_file"].as_str())
+                .map_or_else(|| self.output.clone(), str::to_owned),
             "bytes": file["bytes"].as_u64().or(job["bytes"].as_u64()),
             "duration_s": (duration_s * 1000.0).round() / 1000.0,
             "frames": frames,

@@ -480,9 +480,9 @@ impl Shared {
     }
 }
 
-/// Keep the sessions the shell's cameras are in from ending while it runs:
-/// each is used again well before its keep runs out. Once the shell exits
-/// they end as after any command.
+/// Keep the shell's cameras, and the sessions they are in, from being let
+/// go while it runs: each is used again well before its keep runs out.
+/// Once the shell exits they go as after any command.
 fn keep_sessions(shared: &Arc<Shared>) {
     if shared.route.keep.is_none() {
         return;
@@ -495,17 +495,22 @@ fn keep_sessions(shared: &Arc<Shared>) {
                 let Some(alive) = shared.upgrade() else {
                     return;
                 };
-                let sessions = alive
+                let cameras = alive
                     .known()
                     .cameras
                     .iter()
                     .filter(|held| matches!(held.state, Connection::Ready))
-                    .filter_map(|held| Some((held.session.clone()?, held.keep?)))
+                    .filter_map(|held| {
+                        // Named as commands name it to the session.
+                        let camera = super::caller_selector(&held.selector)
+                            .unwrap_or_else(|_| held.selector.clone());
+                        Some((held.session.clone()?, camera, held.keep?))
+                    })
                     .collect::<BTreeSet<_>>();
                 drop(alive);
                 let mut next = Duration::from_secs(20);
-                for (session, keep) in sessions {
-                    let _ = crate::ipc::keep(&session, keep);
+                for (session, camera, keep) in cameras {
+                    let _ = crate::ipc::keep(&session, Some(&camera), keep);
                     next = next.min(keep / 3);
                 }
                 std::thread::sleep(next.max(Duration::from_secs(1)));

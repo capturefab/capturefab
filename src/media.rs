@@ -472,7 +472,10 @@ fn ffmpeg_missing() -> anyhow::Error {
         ErrorKind::FfmpegMissing,
         "this build has no FFmpeg built in, and none is next to capturefab or on PATH",
     )
-    .hint(ffmpeg_hint())
+    .hint(crate::session::with_environment_hint(
+        ffmpeg_hint(),
+        "CAPTUREFAB_FFMPEG",
+    ))
     .into()
 }
 /// An FFmpeg installed beside the executable, in `beside`, or else in a

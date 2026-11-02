@@ -705,9 +705,9 @@ fn check_version(version: u64) -> Result<()> {
     Ok(())
 }
 
-/// Parse a setup document strictly and validate it. The `--json` envelope
-/// `setup show NAME --json` prints, `{"version":1,"ok":true,"result":DOCUMENT}`,
-/// is accepted too, so its output can be imported or applied as is.
+/// Parse a preset document strictly and validate it. Only the document
+/// itself: the `--json` output of `preset show`, which wraps it in a
+/// result, is refused.
 pub fn parse(bytes: &[u8]) -> Result<Setup> {
     ensure!(
         bytes.len() <= MAX_SETUP_BYTES,
@@ -717,9 +717,8 @@ pub fn parse(bytes: &[u8]) -> Result<Setup> {
     from_value(value)
 }
 
-/// A setup document, or the `setup show NAME --json` envelope around one,
-/// checked strictly and validated. A newer version is reported as such
-/// before any field it may have added.
+/// A preset document, checked strictly and validated. A newer version is
+/// reported as such before any field it may have added.
 pub fn from_value(value: serde_json::Value) -> Result<Setup> {
     let setup = document(value)?;
     validate(&setup)?;
@@ -754,21 +753,9 @@ pub fn read_file(path: &Path) -> Result<Setup> {
     parse(&read_bytes(path)?).with_context(|| format!("read preset {}", path.display()))
 }
 
-/// Read a file in the store. A note with control characters, which older
-/// versions stored, is put on one line instead of making the setup
-/// unreadable; new notes are refused by `validate_note`.
+/// Read a file in the store, as `parse` reads a document.
 fn read_stored(path: &Path) -> Result<Setup> {
-    let bytes = read_bytes(path)?;
-    let mut setup =
-        document(serde_json::from_slice(&bytes).context("not a valid preset document")?)?;
-    if let Some(note) = &mut setup.note {
-        *note = note
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-    }
-    validate(&setup)?;
-    Ok(setup)
+    parse(&read_bytes(path)?)
 }
 
 /// A file's bytes, refusing one larger than any setup.
@@ -954,7 +941,7 @@ fn stem(path: &Path) -> Option<&str> {
     validate_name(name).is_ok().then_some(name)
 }
 
-/// The setups directory: one `<lowercase name>.json` per setup.
+/// The presets folder: one `<lowercase name>.json` per preset.
 pub struct Store {
     dir: PathBuf,
 }
@@ -963,7 +950,7 @@ impl Store {
     /// Without a state folder there are no presets: a typed error names
     /// the variable that gives them one.
     pub fn session() -> Result<Self> {
-        Ok(Self::at(crate::dirs::state()?.join("setups")))
+        Ok(Self::at(crate::dirs::state()?.join("presets")))
     }
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
@@ -981,7 +968,7 @@ impl Store {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(self.dir.join("setups.lock"))?;
+            .open(self.dir.join("presets.lock"))?;
         lock.lock_exclusive()?;
         Ok(lock)
     }
@@ -1744,7 +1731,7 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(names, ["setups.lock"]);
+        assert_eq!(names, ["presets.lock"]);
         let _ = fs::remove_dir_all(store.dir());
     }
 
@@ -1793,7 +1780,7 @@ mod tests {
     #[test]
     fn imports_rename() {
         let dir = temp("import");
-        let store = Store::at(dir.join("setups"));
+        let store = Store::at(dir.join("presets"));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("bench.json");
         let original = setup("bench");
@@ -1980,7 +1967,7 @@ mod tests {
     #[test]
     fn reasons_name_files_not_long_paths() {
         let deep = temp("long").join("a".repeat(120)).join("b".repeat(120));
-        let store = Store::at(deep.join("setups"));
+        let store = Store::at(deep.join("presets"));
         let bench = store.save(&setup("bench"), false).unwrap();
         fs::copy(&bench, store.dir().join("other.json")).unwrap();
         let mut shelf = setup("shelf");
@@ -2025,8 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_note_with_a_tab_still_reads() {
-        // Older versions stored such notes; they stay usable.
+    fn a_stored_note_with_control_characters_is_refused_as_any_file_is() {
         let store = Store::at(temp("tabbed"));
         let path = store.save(&setup("tabbed"), false).unwrap();
         let mut json: serde_json::Value =
@@ -2034,10 +2020,10 @@ mod tests {
         json["note"] = serde_json::json!("a\tb\nc");
         fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
         let list = store.list().unwrap();
-        assert!(list[0].status.is_none(), "{list:?}");
-        assert_eq!(list[0].note.as_deref(), Some("a b c"));
-        assert_eq!(store.get("tabbed").unwrap().note.as_deref(), Some("a b c"));
-        // A new file with one is still refused.
+        assert_eq!(list[0].status, Some(FileStatus::Unreadable), "{list:?}");
+        let reason = list[0].reason.as_deref().unwrap_or_default();
+        assert!(reason.contains("control characters"), "{list:?}");
+        assert!(store.get("tabbed").is_err());
         assert!(read_file(&path).is_err());
         let _ = fs::remove_dir_all(store.dir());
     }
@@ -2107,7 +2093,7 @@ mod tests {
         );
         // It saves and imports back as written.
         let dir = temp("size");
-        let store = Store::at(dir.join("setups"));
+        let store = Store::at(dir.join("presets"));
         let path = store.save(&big, false).unwrap();
         assert_eq!(
             import(&store, &path, "again", false).unwrap().values,

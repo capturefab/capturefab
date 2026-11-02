@@ -209,6 +209,21 @@ fn a_background_recording_is_a_job_until_stopped() {
     assert_eq!(job["state"], "running");
     let id = job["id"].as_str().unwrap().to_owned();
     std::thread::sleep(Duration::from_secs(1));
+    // While it runs, its job names the file it writes, and its size so far.
+    let listed = home.ok(&["jobs"]);
+    let running = listed["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|job| job["id"] == id.as_str())
+        .unwrap_or_else(|| panic!("{listed}"));
+    assert_eq!(running["state"], "running", "{running}");
+    assert_eq!(
+        running["last_file"],
+        serde_json::json!(home.real("bg.mkv")),
+        "{running}"
+    );
+    assert!(running["bytes"].as_u64().unwrap() > 0, "{running}");
     let stopped = home.ok(&["jobs", "stop", &id]);
     assert_eq!(stopped["stopped"][0]["state"], "done", "{stopped}");
     assert!(stopped["stopped"][0]["bytes"].as_u64().unwrap() > 0);

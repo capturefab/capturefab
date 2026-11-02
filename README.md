@@ -105,7 +105,9 @@ commands, so repeated calls skip connecting and starting the stream:
 - `capturefab session start -c CAM --live` starts a named session in the background, and
   `capturefab serve` runs one in the foreground, for example under systemd (see the
   [line computer guide](docs/line-computer.md)). Commands use a session that holds their camera
-  on their own; `--session NAME` picks one and `--no-session` never uses one.
+  on their own; `--session NAME` picks one and `--no-session` never uses one. A session holds
+  the cameras it was started with as long as it runs, and a camera a command added with `--keep`
+  until that camera has been unused that long.
 
 ## Cameras and sources
 
@@ -185,9 +187,9 @@ network paths. More: [CLI workflows](docs/cli-workflows.md),
 | `CAPTUREFAB_VAAPI_DEVICE` | the DRM render node VA-API JPEG encoding uses, instead of the first `/dev/dri/renderD*` that encodes JPEG |
 | `CAPTUREFAB_HWDEC` | hardware decoding of H.264, HEVC and other compressed video: `auto` (default: streams and webcams, in a session), `none`, or a method such as `videotoolbox`, `cuda`, `vulkan` or `d3d11va`, used for files and `--no-session` too; one this FFmpeg lacks or that fails its probe is exit 3 `unavailable`. Motion JPEG is decoded with libjpeg-turbo whatever it says |
 
-A session's cameras keep the `CAPTUREFAB_JPEG` and `CAPTUREFAB_HWDEC` the session started with,
-the warm `auto` session included: stop it (`capturefab session stop auto`) or use `--no-session`
-for a command to use other values.
+A session's cameras keep the `CAPTUREFAB_JPEG`, `CAPTUREFAB_HWDEC`, `CAPTUREFAB_FFMPEG` and
+`CAPTUREFAB_MIN_FREE` the session started with, the warm `auto` session included: stop it
+(`capturefab session stop auto`) or use `--no-session` for a command to use other values.
 
 `capturefab --json doctor` prints the folders in use (`dirs`, and under `folders` the fallbacks
 it passed over), including the private folder that holds `inspect` previews, the JPEG encoders

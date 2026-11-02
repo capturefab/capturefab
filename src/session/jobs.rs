@@ -135,10 +135,11 @@ impl Job {
         if let Some(planned) = self.planned {
             value["planned"] = json!(planned);
         }
-        if let Some(bytes) = self.bytes {
+        let (bytes, file) = self.writing();
+        if let Some(bytes) = bytes {
             value["bytes"] = json!(bytes);
         }
-        if let Some(file) = &self.last_file {
+        if let Some(file) = file {
             value["last_file"] = json!(file);
         }
         if !self.state.ended() {
@@ -169,6 +170,18 @@ impl Job {
             });
         }
         value
+    }
+    /// Its size and file: those saved, or while a recording runs the file
+    /// it writes and how large that is so far.
+    fn writing(&self) -> (Option<u64>, Option<&str>) {
+        if self.last_file.is_some() || self.kind != JobKind::Record || self.state.ended() {
+            return (self.bytes, self.last_file.as_deref());
+        }
+        let Some(path) = self.detail["path"].as_str() else {
+            return (self.bytes, None);
+        };
+        let bytes = std::fs::metadata(path).ok().map(|meta| meta.len());
+        (bytes.or(self.bytes), Some(path))
     }
     /// What a command that waited for this job builds its result from: the
     /// worker's account of it, with its files.
@@ -487,6 +500,17 @@ impl JobBook {
             .iter_mut()
             .filter(|job| job.key == key && !job.state.ended())
         {
+            // A recording its worker never finished is on disk, and plays
+            // up to its last complete part: it is the job's file.
+            if let (JobKind::Record, None, Some(path)) =
+                (job.kind, &job.last_file, job.detail["path"].as_str())
+                && let Ok(meta) = std::fs::metadata(path)
+            {
+                job.saved += 1;
+                job.bytes = Some(meta.len());
+                job.files.push(path.to_owned());
+                job.last_file = Some(path.to_owned());
+            }
             job.state = state;
             job.error = (state == JobState::Failed).then(|| wire.clone());
             job.ended_ms = Some(now);
@@ -798,6 +822,62 @@ mod tests {
         let lease = book.find(number).unwrap().lease.clone().unwrap();
         assert_eq!(lease.waiters, 0);
         assert!(lease.until > Instant::now() + LEASE - Duration::from_secs(1));
+    }
+
+    /// A recording's file of `bytes` bytes in a folder of its own.
+    fn recording(name: &str, bytes: usize) -> (PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "capturefab-jobs-{name}-{}-{}",
+            std::process::id(),
+            crate::scheduling::now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("o-0001.mkv");
+        std::fs::write(&path, vec![0u8; bytes]).unwrap();
+        let shown = path.to_str().unwrap().to_owned();
+        (dir, shown)
+    }
+
+    #[test]
+    fn a_running_recording_shows_its_file_and_size() {
+        let (dir, path) = recording("running", 1234);
+        let book = JobBook::new("bench");
+        let number = book.start(JobKind::Record, "sim:1", None, false);
+        book.accepted(number, json!({"path": path, "since_ms": 1}));
+        book.event(&Output::Progress {
+            job: number,
+            progress: json!({"written": 3, "path": path}),
+        });
+        let doc = book.get(number).unwrap().doc("bench");
+        assert_eq!(doc["state"], "running");
+        assert_eq!(doc["last_file"], path.as_str(), "{doc}");
+        assert_eq!(doc["bytes"], 1234, "{doc}");
+        assert_eq!(doc["saved"], 0, "{doc}");
+        // Once saved, what the worker said of it.
+        book.event(&saved(number, &path));
+        assert_eq!(book.get(number).unwrap().doc("bench")["bytes"], 10);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_recording_whose_worker_died_names_the_file_it_left() {
+        let (dir, path) = recording("crashed", 4321);
+        let book = JobBook::new("bench");
+        let number = book.start(JobKind::Record, "sim:2", None, false);
+        book.accepted(number, json!({"path": path, "since_ms": 1}));
+        let error = crate::types::Categorized::error(
+            crate::types::ErrorKind::WorkerCrashed,
+            "camera worker exited",
+        );
+        book.fail_camera("sim:2", &error);
+        let job = book.get(number).unwrap();
+        assert_eq!(job.state, JobState::Failed);
+        let doc = job.doc("bench");
+        assert_eq!(doc["saved"], 1, "{doc}");
+        assert_eq!(doc["last_file"], path.as_str(), "{doc}");
+        assert_eq!(doc["bytes"], 4321, "{doc}");
+        assert_eq!(job.detail()["files"], json!([path]));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -1172,7 +1172,7 @@ mod tests {
         assert_eq!(chosen.path, state);
         assert!(!chosen.writable);
         // Writing there says which variable moves it.
-        let error = ensure_private_dir(&state.join("setups")).unwrap_err();
+        let error = ensure_private_dir(&state.join("presets")).unwrap_err();
         let classified = crate::types::classify(&error);
         assert_eq!(classified.kind.code(), ("permission_denied", 3));
         assert!(classified.hint.is_some());

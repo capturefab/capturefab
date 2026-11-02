@@ -321,7 +321,7 @@ fn a_preset_applies_through_a_session_that_keeps_state_elsewhere() {
     ]);
     assert!(
         home.sessions
-            .join("setups")
+            .join("presets")
             .read_dir()
             .unwrap()
             .next()

@@ -270,7 +270,7 @@ impl Facts {
             .iter()
             .filter(|_| state.place.is_some())
             .map(|name| state_dir.join(name))
-            .filter(|path| path.symlink_metadata().is_ok())
+            .filter(|path| path.symlink_metadata().is_ok() && !crate::ipc::is_descriptor(path))
             .chain(leases)
             .collect();
         leftovers.sort();
@@ -674,9 +674,11 @@ fn session_check(state: &Folder) -> Check {
 }
 
 /// What version 0.5 kept in the state directory for the desktop app,
-/// hubs, destinations, the assistant, resource limits, update checks and
-/// the storage ledger, beside the ledger's `storage-*.lease` files.
-const LEFTOVERS: [&str; 17] = [
+/// hubs, destinations, the assistant, resource limits, update checks,
+/// setups and the storage ledger, beside the ledger's `storage-*.lease`
+/// files. A session named like one of them publishes its descriptor under
+/// that name where state and sessions share a folder; that is no leftover.
+const LEFTOVERS: [&str; 18] = [
     "gui.prefs.json",
     "hubs.json",
     "hubs.lock",
@@ -694,6 +696,7 @@ const LEFTOVERS: [&str; 17] = [
     "storage.lock",
     "storage-policy.json",
     "storage-summary.json",
+    "setups",
 ];
 
 /// Leftovers of version 0.5, with the command that removes them.
@@ -713,7 +716,7 @@ fn leftovers_check(leftovers: &[PathBuf]) -> Option<Check> {
     Some(Check::warn(
         "leftover_state",
         format!(
-            "{} file{} from Capturefab 0.5 that nothing reads any more (desktop, hubs, destinations, assistant, update settings or the storage ledger, whose budget and retention are gone).",
+            "{} file{} from Capturefab 0.5 that nothing reads any more (desktop, hubs, destinations, assistant, update settings, setups, which capturefab preset import takes one file at a time, or the storage ledger, whose budget and retention are gone).",
             leftovers.len(),
             if leftovers.len() == 1 { "" } else { "s" }
         ),
@@ -1239,6 +1242,24 @@ mod tests {
             check.message
         );
         assert!(check.fix.unwrap().contains("storage.journal"));
+    }
+
+    #[test]
+    fn a_session_named_like_old_state_is_no_leftover() {
+        let state = crate::dirs::state().unwrap();
+        crate::dirs::ensure_private_dir(&state).unwrap();
+        let (session, old) = (state.join("resources.json"), state.join("updates.json"));
+        std::fs::write(
+            &session,
+            br#"{"version":3,"name":"resources","pid":1,"address":"127.0.0.1:1","token":"t"}"#,
+        )
+        .unwrap();
+        std::fs::write(&old, br#"{"checked_ms":1}"#).unwrap();
+        let leftovers = Facts::gather(false, None).leftovers;
+        let _ = std::fs::remove_file(&session);
+        let _ = std::fs::remove_file(&old);
+        assert!(!leftovers.contains(&session), "{leftovers:?}");
+        assert!(leftovers.contains(&old), "{leftovers:?}");
     }
 
     #[test]

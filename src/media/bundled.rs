@@ -133,10 +133,14 @@ pub(super) fn refused() -> Option<String> {
 
 /// `ffmpeg_missing` for a copy that could not be extracted, for `why`.
 fn nowhere(why: String) -> anyhow::Error {
+    let hint = format!(
+        "set {} to a writable folder that allows running programs, or CAPTUREFAB_FFMPEG to an FFmpeg executable",
+        crate::dirs::CACHE_DIR_ENV
+    );
     Categorized::new(ErrorKind::FfmpegMissing, why)
-        .hint(format!(
-            "set {} to a writable folder that allows running programs, or CAPTUREFAB_FFMPEG to an FFmpeg executable",
-            crate::dirs::CACHE_DIR_ENV
+        .hint(crate::session::with_environment_hint(
+            hint,
+            "CAPTUREFAB_FFMPEG",
         ))
         .into()
 }

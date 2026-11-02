@@ -173,8 +173,11 @@ fn full(path: &Path, no_room: NoRoom) -> anyhow::Error {
                 human_bytes(floor)
             ),
             Some(free),
-            format!(
-                "free some space, write to another disk, or lower {MIN_FREE_ENV} (0 turns the floor off)"
+            crate::session::with_environment_hint(
+                format!(
+                    "free some space, write to another disk, or lower {MIN_FREE_ENV} (0 turns the floor off)"
+                ),
+                MIN_FREE_ENV,
             ),
         ),
         NoRoom::Refused(error) => (

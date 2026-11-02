@@ -88,19 +88,17 @@ pub fn row(info: &CameraInfo) -> Row {
 /// unused; the sessions' descriptors list what they hold.
 fn held(rows: &mut [Row]) {
     let sessions = crate::ipc::sessions();
-    let mut left = std::collections::BTreeMap::new();
     for row in rows.iter_mut() {
-        let Some(session) = sessions.iter().find(|session| {
-            session
+        let Some((session, camera)) = sessions.iter().find_map(|session| {
+            let camera = session
                 .cameras
                 .iter()
-                .any(|camera| camera.named_by(&row.id).is_some())
+                .find(|camera| camera.named_by(&row.id).is_some())?;
+            Some((session, camera))
         }) else {
             continue;
         };
-        let idle = *left
-            .entry(session.name.clone())
-            .or_insert_with(|| crate::ipc::idle_left(&session.name));
+        let idle = crate::ipc::idle_left(&session.name, &camera.id);
         let mut held_by = json!({"session": session.name});
         if let Some(idle) = idle {
             held_by["idle_releases_in_s"] = json!(idle.as_millis().div_ceil(1000));

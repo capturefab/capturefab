@@ -666,3 +666,41 @@ fn a_dead_sessions_jobs_read_as_lost() {
     assert_ne!(next["job"]["id"], id.as_str());
     home.ok(&["session", "stop", "doomed"]);
 }
+
+/// A recording whose worker dies is left on disk, playable up to its last
+/// complete part: the error names it, and its size.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
+fn a_recording_whose_worker_dies_names_the_file_it_left() {
+    let home = Home::new("fault-record-panic");
+    let run = home.run_env(
+        &[("CAPTUREFAB_TEST_HOOKS", "1")],
+        &[
+            "--json",
+            "record",
+            "-c",
+            "sim:2?panic=after:100",
+            "-o",
+            "rec-{seq}.mkv",
+            "--codec",
+            "ffv1",
+            "--for",
+            "10s",
+        ],
+    );
+    let error = run.failure(3);
+    assert_eq!(error["code"], "worker_crashed", "{error}");
+    let details = &error["details"];
+    let file = home.real("rec-0001.mkv");
+    assert_eq!(details["output"], serde_json::json!(file), "{error}");
+    assert_eq!(details["finalized"], false, "{error}");
+    let job = &details["job"];
+    assert_eq!(job["last_file"], serde_json::json!(file), "{error}");
+    // Its size as the worker died; the FFmpeg it left may have written a
+    // last part as it was ended.
+    let on_disk = std::fs::metadata(&file).unwrap().len();
+    let bytes = job["bytes"].as_u64().unwrap();
+    assert!(bytes > 0 && bytes <= on_disk, "{error}");
+    assert_eq!(details["bytes"], bytes, "{error}");
+}

@@ -923,6 +923,14 @@ pub(crate) fn environment_hint(variable: &str) -> Option<String> {
         "session {name} keeps the {variable} it started with: stop it with capturefab session stop {name} and run the command again, or run it with --no-session"
     ))
 }
+/// `hint`, followed in a session's camera worker by [`environment_hint`]
+/// for `variable`, which the hint may tell a person to change.
+pub(crate) fn with_environment_hint(hint: String, variable: &str) -> String {
+    match environment_hint(variable) {
+        Some(session) => format!("{hint}; {session}"),
+        None => hint,
+    }
+}
 /// One line of a camera worker's or the session's log.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct LogEntry {
@@ -1116,8 +1124,114 @@ struct Held {
     crashes: Mutex<VecDeque<Instant>>,
     /// One reconnect at a time.
     reconnecting: Mutex<()>,
+    /// How long it stays unused, and its use.
+    keep: Mutex<Keep>,
+}
+/// How long a held camera stays connected unused, and its use by a
+/// session's clients.
+struct Keep {
+    /// The longest a client's command asked to keep it after its last use
+    /// (`--keep`, or the warm default); none holds it as long as the
+    /// session.
+    keep: Option<Duration>,
+    /// The session was started with it, which holds it as long as the
+    /// session whatever a command asks.
+    pinned: bool,
+    /// When a client last used it.
+    used: Instant,
+    /// Client requests using it now.
+    busy: usize,
+    /// Its keep ran out unused: it is let go once its turn comes, unless
+    /// a request uses it first.
+    releasing: bool,
+    /// It is being let go: requests find it gone.
+    released: bool,
+}
+impl Default for Keep {
+    fn default() -> Self {
+        Self {
+            keep: None,
+            pinned: false,
+            used: Instant::now(),
+            busy: 0,
+            releasing: false,
+            released: false,
+        }
+    }
+}
+/// How long until a held camera is let go unused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unused {
+    /// A request or a job uses it now.
+    InUse,
+    /// Its own keep runs out after this.
+    After(Duration),
+    /// It stays as long as the session.
+    WithSession,
+}
+/// A client's request using a held camera: it stays connected while the
+/// request runs, and its keep counts from the request's end.
+pub struct CameraUse(Arc<Held>);
+impl Drop for CameraUse {
+    fn drop(&mut self) {
+        let mut keep = locked(&self.0.keep);
+        keep.busy = keep.busy.saturating_sub(1);
+        keep.used = Instant::now();
+    }
 }
 impl Held {
+    /// A request uses it, which wants it kept at least `keep` after; false
+    /// once it is being let go.
+    fn enter(&self, keep: Option<Duration>) -> bool {
+        let mut state = locked(&self.keep);
+        if state.released {
+            return false;
+        }
+        state.busy += 1;
+        state.used = Instant::now();
+        state.keep = state.keep.max(keep);
+        true
+    }
+    /// Whether its keep ran out unused, with no request and no job (`jobs`)
+    /// using it: it is to be let go. A job counts as use.
+    fn expired(&self, jobs: bool) -> bool {
+        let mut state = locked(&self.keep);
+        let Some(keep) = state.keep.filter(|_| !state.pinned) else {
+            return false;
+        };
+        if state.releasing || state.released {
+            return false;
+        }
+        if state.busy > 0 || jobs {
+            state.used = Instant::now();
+            return false;
+        }
+        state.releasing = state.used.elapsed() >= keep;
+        state.releasing
+    }
+    /// Whether to let it go now, its turn come: it is still unused, and
+    /// from now on requests find it gone.
+    fn let_go(&self, jobs: bool) -> bool {
+        let mut state = locked(&self.keep);
+        state.releasing = false;
+        let unused = state
+            .keep
+            .filter(|_| !state.pinned)
+            .is_some_and(|keep| state.used.elapsed() >= keep && state.busy == 0 && !jobs);
+        state.released = unused;
+        unused
+    }
+    /// How long until it is let go unused, with `jobs` using it or not.
+    fn unused_left(&self, jobs: bool) -> Unused {
+        let state = locked(&self.keep);
+        if state.busy > 0 || jobs {
+            return Unused::InUse;
+        }
+        match state.keep.filter(|_| !state.pinned) {
+            Some(keep) => Unused::After(keep.saturating_sub(state.used.elapsed())),
+            None => Unused::WithSession,
+        }
+    }
     fn worker(&self) -> Option<Arc<Worker>> {
         self.worker
             .read()
@@ -1728,6 +1842,88 @@ impl SessionHandle {
     pub fn has_jobs(&self) -> bool {
         self.inner.jobs.active(None)
     }
+    /// A client's request uses the held camera `camera` names, or the only
+    /// one, and wants it kept at least `keep` after it ends: it stays while
+    /// the request runs. None when no such camera is held, or it is being
+    /// let go.
+    pub fn hold_camera(&self, camera: Option<&str>, keep: Option<Duration>) -> Option<CameraUse> {
+        let (_, held) = self.target(camera).ok()?;
+        held.enter(keep).then(|| CameraUse(held))
+    }
+    /// Keep the held camera `camera` names at least `keep` after its last
+    /// use, or with none as long as the session: what a session started
+    /// with a camera does with it.
+    pub fn keep_camera(&self, camera: &str, keep: Option<Duration>) {
+        if let Ok((_, held)) = self.target(Some(camera)) {
+            let mut state = locked(&held.keep);
+            match keep {
+                Some(keep) => state.keep = state.keep.max(Some(keep)),
+                None => state.pinned = true,
+            }
+        }
+    }
+    /// How long until the held camera `camera` names is let go unused;
+    /// None when no such camera is held.
+    pub fn unused_left(&self, camera: &str) -> Option<Unused> {
+        let (key, held) = self.target(Some(camera)).ok()?;
+        Some(held.unused_left(self.inner.jobs.active(Some(&key))))
+    }
+    /// Let go of the cameras whose keep ran out unused, each in its turn
+    /// after the commands before.
+    fn release_unused(&self) {
+        for (key, held) in self.cameras() {
+            if !held.expired(self.inner.jobs.active(Some(&key))) {
+                continue;
+            }
+            let h = self.clone();
+            let releasing = held.clone();
+            let spawned = std::thread::Builder::new()
+                .name("capturefab-release".into())
+                .spawn(move || h.release(&key, &releasing));
+            if spawned.is_err() {
+                locked(&held.keep).releasing = false;
+            }
+        }
+    }
+    /// Let go of camera `key`, as `held`, once the commands before have run,
+    /// unless one used it meanwhile.
+    fn release(&self, key: &str, held: &Arc<Held>) {
+        let turn = self.command_turn(Some(key), &SessionCommand::Disconnect);
+        if let Some(turn) = &turn {
+            turn.wait();
+        }
+        let current = self
+            .inner
+            .cameras
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(key)
+            .is_some_and(|camera| Arc::ptr_eq(camera, held));
+        if !current || self.inner.quitting.load(Ordering::Acquire) {
+            locked(&held.keep).releasing = false;
+            return;
+        }
+        if !held.let_go(self.inner.jobs.active(Some(key))) {
+            return;
+        }
+        let keep = locked(&held.keep).keep.unwrap_or_default();
+        let camera = crate::media::redact_url(key);
+        match self.disconnect(Some(key)) {
+            Ok(_) => self.note(
+                "info",
+                format!(
+                    "Closed {camera}: unused for {}",
+                    crate::scheduling::format_duration(
+                        u64::try_from(keep.as_millis()).unwrap_or(u64::MAX)
+                    )
+                ),
+            ),
+            Err(error) => self.note(
+                "warn",
+                crate::scrub::redact_urls(&format!("Closing {camera}, unused: {error:#}")),
+            ),
+        }
+    }
     fn command_turn(&self, target: Option<&str>, command: &SessionCommand) -> Option<CommandTurn> {
         if inline(command) {
             return None;
@@ -2218,6 +2414,7 @@ impl SessionHandle {
                 config_unknown: AtomicBool::new(false),
                 crashes: Mutex::default(),
                 reconnecting: Mutex::default(),
+                keep: Mutex::default(),
             }),
         );
         slot.keep();
@@ -2730,6 +2927,7 @@ fn watch(coordinator: Weak<Coordinator>, stop: &(Mutex<bool>, Condvar)) {
                 worker.watch(handle.inner.jobs.active(Some(&key)));
             }
         }
+        handle.release_unused();
         for (key, number) in handle.inner.jobs.abandoned() {
             handle.note(
                 "warn",

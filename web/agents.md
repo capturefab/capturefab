@@ -128,8 +128,8 @@ macOS, or nvJPEG or VA-API on Linux, each checked against libjpeg-turbo first
 Compressed streams and webcams other than Motion JPEG, which libjpeg-turbo decodes, are decoded
 in hardware where it works in a session, and files and `--no-session` commands in software
 (`CAPTUREFAB_HWDEC=auto|none|METHOD`; `doctor --json` reports the methods under `hwdec`). A
-session's cameras keep the `CAPTUREFAB_JPEG` and `CAPTUREFAB_HWDEC` the session started with:
-stop it, or use `--no-session`, to change them.
+session's cameras keep the `CAPTUREFAB_JPEG`, `CAPTUREFAB_HWDEC`, `CAPTUREFAB_FFMPEG` and
+`CAPTUREFAB_MIN_FREE` the session started with: stop it, or use `--no-session`, to change them.
 
 The result also says which frame it saved: `time` (RFC 3339) and `device_ts_ns` (the camera's
 own clock, never a date), with `frames` the camera delivered while it ran, `dropped` frames lost
@@ -220,7 +220,10 @@ fail with exit 5 before recording otherwise; `ffv1` is lossless, and stores a Ba
 as gray samples. An H.264 or HEVC stream, file or webcam mode is copied as it arrives, without
 re-encoding (`"encoder":"copy"`, `codec` the source's), from its last key frame, unless `--codec`
 names another codec or `--fps` or `--bitrate` is given (Linux and macOS; Windows encodes). Without
-`--for`, a recording started with `--background` runs until `jobs stop ID`.
+`--for`, a recording started with `--background` runs until `jobs stop ID`; while it runs, its job
+shows the file it writes as `last_file` and its size so far as `bytes`. When the camera's worker
+dies, the error's `details.job` and `output` name the file it left, which plays up to its last
+complete part (`finalized: false`).
 
 ### Keep settings for later
 

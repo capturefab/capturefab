@@ -166,6 +166,87 @@ fn a_camera_the_session_holds_names_it_to_another_command() {
 }
 
 #[test]
+fn a_camera_goes_once_its_own_keep_runs_out_while_others_are_used() {
+    let home = Home::new("warm-per-camera");
+    let hooks = [("CAPTUREFAB_TEST_HOOKS", "1")];
+    // A simulator that, like a GigE camera, one process at a time owns.
+    let camera = "sim:20?exclusive=1";
+    let run = |args: &[&str]| {
+        support::cli::Run::of_output(
+            home.warm_command().envs(hooks).args(args).output().unwrap(),
+            args,
+        )
+    };
+    let held = || {
+        home.ok(&["session", "status", "auto"])["cameras"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|camera| camera["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    run(&["--json", "get", "--keep", "2s", "-c", camera, "Width"]).success();
+    // Another process is told when the session lets go of it: within its
+    // own keep, not the session's.
+    let error = run(&["--json", "--no-session", "get", "-c", camera, "Width"]).failure(3);
+    assert_eq!(error["code"], "camera_busy", "{error}");
+    let left = error["details"]["held_by"]["idle_releases_in_s"]
+        .as_u64()
+        .unwrap();
+    assert!(left <= 2, "{error}");
+    // Commands keep using another camera, which keeps the session for a
+    // minute after each; the first camera goes once its keep runs out.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        run(&["--json", "get", "-c", "sim:21", "Width"]).success();
+        if !held().iter().any(|id| id == camera) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{:?}", held());
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert_eq!(held(), ["sim:21"]);
+    // It is free for another process, and the session connects it again
+    // for the next command that asks.
+    run(&["--json", "--no-session", "get", "-c", camera, "Width"]).success();
+    run(&["--json", "get", "-c", camera, "Width"]).success();
+    assert_eq!(held().len(), 2);
+}
+
+#[test]
+fn a_session_says_it_keeps_the_free_space_floor_it_started_with() {
+    let home = Home::new("warm-min-free");
+    let capture = |floor: &str, args: &[&str]| {
+        let args = [
+            &["--json"][..],
+            args,
+            &["capture", "-c", "sim:0", "-o", "{seq}.png"],
+        ]
+        .concat();
+        support::cli::Run::of_output(
+            home.warm_command()
+                .env("CAPTUREFAB_MIN_FREE", floor)
+                .args(&args)
+                .output()
+                .unwrap(),
+            &args,
+        )
+    };
+    let error = capture("100T", &[]).failure(6);
+    assert_eq!(error["code"], "storage_full", "{error}");
+    // Lowered for the next command, the floor the session started with
+    // still holds, and the hint says why.
+    let error = capture("0", &[]).failure(6);
+    let hint = error["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("session auto keeps the CAPTUREFAB_MIN_FREE")
+            && hint.contains("--no-session"),
+        "{error}"
+    );
+    capture("0", &["--no-session"]).success();
+}
+
+#[test]
 fn a_change_after_a_capture_finds_a_lingering_camera_stopped() {
     let home = Home::new("warm-linger-set");
     let hooks = [("CAPTUREFAB_TEST_HOOKS", "1")];

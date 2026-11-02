@@ -561,6 +561,21 @@ static HELD: std::sync::OnceLock<SessionHandle> = std::sync::OnceLock::new();
 fn hold(handle: SessionHandle) {
     let _ = HELD.set(handle);
 }
+/// How a command came to use a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Found {
+    /// The command named it, or needs one for `--keep` or `--background`.
+    Named,
+    /// The command started it just now for its camera.
+    Started,
+    /// Its descriptor lists the command's camera.
+    Routed,
+}
+impl Found {
+    fn of(started: bool) -> Self {
+        if started { Self::Started } else { Self::Named }
+    }
+}
 /// Why a session could not take a command: it is stopping or gone, which
 /// lets automatic routing use a worker of this command, or it failed.
 enum Unusable {
@@ -612,13 +627,13 @@ impl Client {
             }
             let started = route.needs_session()
                 && session::ensure(name, selector.as_deref(), route.idle(), global)?;
-            return Self::in_session(out, name, selector, route, since_ms, started)
+            return Self::in_session(out, name, selector, route, since_ms, Found::of(started))
                 .map_err(Unusable::error);
         }
         if !global.no_session
             && let Some(name) = route_to(&ipc::sessions(), selector.as_deref())
         {
-            match Self::in_session(out, &name, selector.clone(), route, since_ms, false) {
+            match Self::in_session(out, &name, selector.clone(), route, since_ms, Found::Routed) {
                 Ok(client) => return Ok(client),
                 // A session that is stopping, or gone, leaves the camera to
                 // this command; one that holds it and failed says why.
@@ -648,7 +663,8 @@ impl Client {
                 None => default_camera(out)?,
             };
             let started = session::ensure(AUTO_SESSION, Some(&selector), route.idle(), global)?;
-            return Self::in_session(out, AUTO_SESSION, Some(selector), route, since_ms, started)
+            let found = Found::of(started);
+            return Self::in_session(out, AUTO_SESSION, Some(selector), route, since_ms, found)
                 .map_err(Unusable::error);
         }
         let selector = match selector {
@@ -710,17 +726,17 @@ impl Client {
             since_ms,
         })
     }
-    /// Use session `name` for `selector`, connecting the camera there when
-    /// it does not hold it yet; otherwise a short request checks that the
-    /// session still runs and holds it, unless this command just `started`
-    /// it for the camera.
+    /// Use session `name`, `found` as it was, for `selector`, connecting the
+    /// camera there when it does not hold it yet; otherwise a short request
+    /// checks that the session still runs and holds it, unless this command
+    /// just started it for the camera.
     fn in_session(
         out: Output,
         name: &str,
         selector: Option<String>,
         route: Route,
         since_ms: u64,
-        started: bool,
+        found: Found,
     ) -> std::result::Result<Self, Unusable> {
         let keep = route.keep_for(name);
         let unusable = |error: anyhow::Error| {
@@ -747,17 +763,31 @@ impl Client {
             stdout: None,
             since_ms,
         };
+        let connect = |selector: &str| {
+            let connect = SessionCommand::connect(selector.to_owned(), route.connect());
+            ipc::call_keeping(name, None, connect.clone(), default_timeout(&connect), keep)
+                .map(drop)
+                .map_err(unusable)
+        };
         match (&selector, held) {
-            (Some(selector), false) => {
-                let connect = SessionCommand::connect(selector.clone(), route.connect());
-                ipc::call_keeping(name, None, connect.clone(), default_timeout(&connect), keep)
-                    .map_err(unusable)?;
-            }
-            // Started for it just now, with this command's keep.
-            (Some(_), true) if started => {}
+            (Some(selector), false) => connect(selector)?,
+            // Started for it just now, as this command asked.
+            (Some(_), true) if found == Found::Started => {}
             // The session runs and holds it: one short request says it still
-            // answers, and keeps it.
-            (Some(_), true) => ipc::touch(&descriptor, keep).map_err(unusable)?,
+            // answers, and keeps it, unless its keep ran out just now and it
+            // let go of the camera. A command that found the session by the
+            // camera alone then goes on as if it had not; one that asked for
+            // the session, or to keep the camera, connects it there again.
+            (Some(selector), true) => match ipc::touch(&descriptor, selector, keep) {
+                Ok(()) => {}
+                Err(error) if crate::types::classify(&error).kind == ErrorKind::CameraNotFound => {
+                    if found == Found::Routed && keep.is_none() {
+                        return Err(Unusable::Gone(error));
+                    }
+                    connect(selector)?;
+                }
+                Err(error) => return Err(unusable(error)),
+            },
             // Without -c, the session's only camera, named from now on so a
             // camera connected later does not change what this command uses.
             (None, _) => {
@@ -1234,7 +1264,6 @@ mod tests {
         let session = |name: &str, cameras: Vec<ipc::HeldCamera>| ipc::Descriptor {
             version: ipc::VERSION,
             name: name.into(),
-            kind: ipc::SessionKind::Serve,
             pid: 1,
             address: "127.0.0.1:1".parse().unwrap(),
             token: String::new(),

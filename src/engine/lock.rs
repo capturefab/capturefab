@@ -79,7 +79,7 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
 }
 
 /// `camera_busy` for the camera `info` names, which the worker `owner`
-/// names holds: a session, with how long until it lets the camera go
+/// names holds: a session, with how long until it lets that camera go
 /// unused, or a command of its own.
 fn busy(info: &CameraInfo, mut owner: Value) -> anyhow::Error {
     let camera = crate::media::redact_url(&info.id);
@@ -87,7 +87,9 @@ fn busy(info: &CameraInfo, mut owner: Value) -> anyhow::Error {
         .as_str()
         .filter(|session| *session != crate::session::DIRECT)
         .map(str::to_owned);
-    let left = session.as_deref().and_then(crate::ipc::idle_left);
+    let left = session
+        .as_deref()
+        .and_then(|session| crate::ipc::idle_left(session, &info.id));
     if let (Some(left), Some(owner)) = (left, owner.as_object_mut()) {
         owner.insert(
             "idle_releases_in_s".into(),
