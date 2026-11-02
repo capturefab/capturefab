@@ -192,11 +192,18 @@ fn fields(command: &str) -> Option<&'static [(&'static str, &'static str)]> {
         ],
         "schema" => &[
             ("contract_version", "int"),
-            ("commands", "[{name,summary,effect,effect_with?}]"),
+            (
+                "commands",
+                "{name: [effect, summary]} — effect: read|file_write|camera_write|disruptive",
+            ),
+            (
+                "effect_with",
+                "{name: {flag: effect}} — flags that widen a command's effect",
+            ),
             ("conventions", "{...}"),
             ("grammars", "{selector,name,duration,template}"),
-            ("exit_codes", "{code: meaning}"),
-            ("errors", "[{code,exit,meaning}]"),
+            ("exit_codes", "{exit: meaning}"),
+            ("errors", "{code: [exit, meaning]} — every error.code"),
         ],
         _ => return None,
     })
@@ -521,18 +528,18 @@ pub(crate) fn arguments(command: &clap::Command) -> Vec<Value> {
         .collect()
 }
 
+/// The whole contract in brief: maps keyed by command and by error code,
+/// with positional values, which keeps it small enough to read once.
 fn overview() -> Value {
-    let commands = commands()
+    let found = commands();
+    let commands = found
         .iter()
-        .map(|(name, command)| {
-            let mut entry =
-                json!({"name": name, "summary": summary(command), "effect": effect(name)});
-            if let Some(with) = effect_with(name) {
-                entry["effect_with"] = with;
-            }
-            entry
-        })
-        .collect::<Vec<_>>();
+        .map(|(name, command)| (name.clone(), json!([effect(name), summary(command)])))
+        .collect::<Map<_, _>>();
+    let widened = found
+        .iter()
+        .filter_map(|(name, _)| Some((name.clone(), effect_with(name)?)))
+        .collect::<Map<_, _>>();
     let exit_codes = json!({
         "0": "ok", "1": "failed", "2": "usage or input", "3": "unavailable",
         "4": "timeout", "5": "unsupported", "6": "storage full",
@@ -542,12 +549,13 @@ fn overview() -> Value {
         .iter()
         .map(|kind| {
             let (code, exit) = kind.code();
-            json!({"code": code, "exit": exit, "meaning": kind.meaning()})
+            (code.to_owned(), json!([exit, kind.meaning()]))
         })
-        .collect::<Vec<_>>();
+        .collect::<Map<_, _>>();
     json!({
         "contract_version": CONTRACT_VERSION,
         "commands": commands,
+        "effect_with": widened,
         "conventions": {
             "json": "--json (or CAPTUREFAB_JSON=1): one line on stdout, the result on exit 0, else {\"error\":{code,message,hint?,details?}}: code is the reason (see errors), the exit code its category. No nulls; warnings ≤10",
             "globals": "--json, -q/--quiet, -v/--verbose, --session NAME (CAPTUREFAB_SESSION), --no-session (overrides it); before or after the command",
@@ -619,17 +627,41 @@ fn command(name: &str) -> Result<Value> {
 }
 
 pub fn run(_global: &Global, words: &[String]) -> Result<Report> {
-    let value = if words.is_empty() {
-        overview()
-    } else {
-        let name = words.join(" ");
-        if name.trim().is_empty() {
-            return Err(Usage("name a command, such as schema set".into()).into());
-        }
-        command(&name)?
-    };
+    if words.is_empty() {
+        let value = overview();
+        let text = brief(&value, 0) + "\n";
+        return Ok(Report::json(value).text(text));
+    }
+    let name = words.join(" ");
+    if name.trim().is_empty() {
+        return Err(Usage("name a command, such as schema set".into()).into());
+    }
+    let value = command(&name)?;
     let text = serde_json::to_string_pretty(&value)? + "\n";
     Ok(Report::json(value).text(text))
+}
+
+/// JSON with each entry of the outer two maps on a line of its own: the
+/// overview as people read it, little larger than the line `--json` prints.
+fn brief(value: &Value, depth: usize) -> String {
+    let Value::Object(map) = value else {
+        return value.to_string();
+    };
+    if depth == 2 || map.is_empty() {
+        return value.to_string();
+    }
+    let pad = "  ".repeat(depth + 1);
+    let entries = map
+        .iter()
+        .map(|(key, value)| {
+            format!(
+                "{pad}{}: {}",
+                Value::from(key.as_str()),
+                brief(value, depth + 1)
+            )
+        })
+        .collect::<Vec<_>>();
+    format!("{{\n{}\n{}}}", entries.join(",\n"), "  ".repeat(depth))
 }
 
 #[cfg(test)]
@@ -714,12 +746,23 @@ mod tests {
     fn the_overview_stays_small_and_lists_every_reason() {
         let overview = overview();
         let text = overview.to_string();
-        // Under 9.5 KB, some 2.4k tokens at four characters a token.
-        assert!(text.len() < 9500, "{} bytes", text.len());
+        // Under 8 KB, some 2k tokens at four characters a token.
+        assert!(text.len() < 8000, "{} bytes", text.len());
         assert_eq!(
-            overview["errors"].as_array().unwrap().len(),
+            overview["errors"].as_object().unwrap().len(),
             ErrorKind::ALL.len()
         );
+        assert_eq!(overview["errors"]["camera_not_found"][0], 3);
+        assert_eq!(overview["commands"]["set"][0], "camera_write");
+        assert_eq!(overview["effect_with"]["capture"]["--set"], "camera_write");
+        assert_eq!(
+            overview["commands"].as_object().unwrap().len(),
+            commands().len()
+        );
         assert!(super::command("no such").is_err());
+        // What people read is the same JSON, an entry a line.
+        let shown = brief(&overview, 0);
+        assert_eq!(serde_json::from_str::<Value>(&shown).unwrap(), overview);
+        assert!(shown.len() < text.len() * 11 / 10, "{} bytes", shown.len());
     }
 }

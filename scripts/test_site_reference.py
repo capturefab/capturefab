@@ -48,10 +48,10 @@ Examples:
 
 
 def snapshot():
-    schema = dict(contract_version=1, commands=[dict(name='capture', summary='Save frames', effect='file_write'), dict(name='frobnicate', summary='Something new', effect='read')],
+    schema = dict(contract_version=1, commands=dict(capture=['file_write', 'Save frames'], frobnicate=['read', 'Something new']), effect_with={},
                   conventions=dict(json='--json: one document', results='snake_case keys', credentials='never printed', describe='capturefab schema COMMAND',
                                    globals='--json, -q', camera='-c/--camera CAM', routing='--session NAME', jobs='--background prints a job'),
-                  errors=[dict(code='usage', exit=2, meaning='fix the command'), dict(code='exists', exit=1, meaning='never overwritten <ever>')],
+                  errors=dict(usage=[2, 'fix the command'], exists=[1, 'never overwritten <ever>']),
                   exit_codes={'0': 'ok', '130': 'interrupted', '2': 'usage'},
                   grammars=dict(duration='250ms, 2s', template='{seq} {time}'))
     capture = dict(command='capture', summary='Save frames', effect='file_write', contract_version=1, errors=['usage', 'exists'],
@@ -149,7 +149,7 @@ class CommandLineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             temp = Path(temp)
             bare = snapshot()['schema']
-            bare['commands'] = [dict(name='list', summary='List cameras', effect='read')]
+            bare['commands'] = dict(list=['read', 'List cameras'])
             detail = dict(command='list', summary='List cameras', effect='read', contract_version=1, errors=[], args=[])
             fake = temp / 'capturefab'
             fake.write_text('#!/bin/sh\n'

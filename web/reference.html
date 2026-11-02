@@ -50,32 +50,32 @@
 <tr><td><code>130</code></td><td>interrupted (143 SIGTERM, 129 SIGHUP)</td></tr>
 </tbody></table></div>
 <div class="table-scroll"><table><caption>Error codes in <code>error.code</code></caption><thead><tr><th scope="col">Code</th><th scope="col">Exit</th><th scope="col">Meaning</th></tr></thead><tbody>
-<tr><td><code id="error-failed">failed</code></td><td><code>1</code></td><td>the operation failed</td></tr>
-<tr><td><code id="error-usage">usage</code></td><td><code>2</code></td><td>invalid arguments or input</td></tr>
-<tr><td><code id="error-invalid_duration">invalid_duration</code></td><td><code>2</code></td><td>not a valid duration (see grammars.duration)</td></tr>
-<tr><td><code id="error-feature_not_found">feature_not_found</code></td><td><code>2</code></td><td>no such feature or control; see details.did_you_mean</td></tr>
-<tr><td><code id="error-out_of_range">out_of_range</code></td><td><code>2</code></td><td>outside the feature&#x27;s range; details {feature,value,min,max,inc,nearest,unit}</td></tr>
-<tr><td><code id="error-invalid_choice">invalid_choice</code></td><td><code>2</code></td><td>not one of details.choices</td></tr>
-<tr><td><code id="error-not_writable">not_writable</code></td><td><code>2</code></td><td>the feature is read-only</td></tr>
-<tr><td><code id="error-feature_locked">feature_locked</code></td><td><code>1</code></td><td>another setting locks the feature now; see details.locked_by</td></tr>
-<tr><td><code id="error-camera_ambiguous">camera_ambiguous</code></td><td><code>2</code></td><td>several cameras match; pick one of details.candidates with -c</td></tr>
-<tr><td><code id="error-camera_not_found">camera_not_found</code></td><td><code>3</code></td><td>no camera matches; details.candidates lists what answered</td></tr>
-<tr><td><code id="error-camera_busy">camera_busy</code></td><td><code>3</code></td><td>another process or job holds the camera; details.held_by when known</td></tr>
-<tr><td><code id="error-permission_denied">permission_denied</code></td><td><code>3</code></td><td>the OS refused access; see hint</td></tr>
-<tr><td><code id="error-disconnected">disconnected</code></td><td><code>3</code></td><td>the camera went away</td></tr>
-<tr><td><code id="error-worker_crashed">worker_crashed</code></td><td><code>3</code></td><td>the camera worker process died</td></tr>
-<tr><td><code id="error-session_not_found">session_not_found</code></td><td><code>3</code></td><td>no running session has that name</td></tr>
-<tr><td><code id="error-ffmpeg_missing">ffmpeg_missing</code></td><td><code>3</code></td><td>FFmpeg could not be found or started</td></tr>
-<tr><td><code id="error-unavailable">unavailable</code></td><td><code>3</code></td><td>the camera, stream or service cannot be reached</td></tr>
-<tr><td><code id="error-auth_required">auth_required</code></td><td><code>3</code></td><td>the camera needs a sign-in; run login add</td></tr>
-<tr><td><code id="error-auth_rejected">auth_rejected</code></td><td><code>3</code></td><td>the camera refused the sign-in</td></tr>
-<tr><td><code id="error-frame_timeout">frame_timeout</code></td><td><code>4</code></td><td>no frame arrived in time</td></tr>
-<tr><td><code id="error-trigger_timeout">trigger_timeout</code></td><td><code>4</code></td><td>a triggered camera got no trigger in time; details.trigger</td></tr>
-<tr><td><code id="error-timeout">timeout</code></td><td><code>4</code></td><td>the operation did not finish in time</td></tr>
-<tr><td><code id="error-unsupported">unsupported</code></td><td><code>5</code></td><td>the camera or this build cannot do that</td></tr>
 <tr><td><code id="error-exists">exists</code></td><td><code>1</code></td><td>the output exists (never overwritten); details.path</td></tr>
-<tr><td><code id="error-storage_full">storage_full</code></td><td><code>6</code></td><td>disk full or below CAPTUREFAB_MIN_FREE; details {path,free_bytes?}</td></tr>
+<tr><td><code id="error-failed">failed</code></td><td><code>1</code></td><td>the operation failed</td></tr>
+<tr><td><code id="error-feature_locked">feature_locked</code></td><td><code>1</code></td><td>another setting locks the feature now; see details.locked_by</td></tr>
 <tr><td><code id="error-incomplete">incomplete</code></td><td><code>1</code></td><td>fewer results than requested; see details</td></tr>
+<tr><td><code id="error-camera_ambiguous">camera_ambiguous</code></td><td><code>2</code></td><td>several cameras match; pick one of details.candidates with -c</td></tr>
+<tr><td><code id="error-feature_not_found">feature_not_found</code></td><td><code>2</code></td><td>no such feature or control; see details.did_you_mean</td></tr>
+<tr><td><code id="error-invalid_choice">invalid_choice</code></td><td><code>2</code></td><td>not one of details.choices</td></tr>
+<tr><td><code id="error-invalid_duration">invalid_duration</code></td><td><code>2</code></td><td>not a valid duration (see grammars.duration)</td></tr>
+<tr><td><code id="error-not_writable">not_writable</code></td><td><code>2</code></td><td>the feature is read-only</td></tr>
+<tr><td><code id="error-out_of_range">out_of_range</code></td><td><code>2</code></td><td>outside the feature&#x27;s range; details {feature,value,min,max,inc,nearest,unit}</td></tr>
+<tr><td><code id="error-usage">usage</code></td><td><code>2</code></td><td>invalid arguments or input</td></tr>
+<tr><td><code id="error-auth_rejected">auth_rejected</code></td><td><code>3</code></td><td>the camera refused the sign-in</td></tr>
+<tr><td><code id="error-auth_required">auth_required</code></td><td><code>3</code></td><td>the camera needs a sign-in; run login add</td></tr>
+<tr><td><code id="error-camera_busy">camera_busy</code></td><td><code>3</code></td><td>another process or job holds the camera; details.held_by when known</td></tr>
+<tr><td><code id="error-camera_not_found">camera_not_found</code></td><td><code>3</code></td><td>no camera matches; details.candidates lists what answered</td></tr>
+<tr><td><code id="error-disconnected">disconnected</code></td><td><code>3</code></td><td>the camera went away</td></tr>
+<tr><td><code id="error-ffmpeg_missing">ffmpeg_missing</code></td><td><code>3</code></td><td>FFmpeg could not be found or started</td></tr>
+<tr><td><code id="error-permission_denied">permission_denied</code></td><td><code>3</code></td><td>the OS refused access; see hint</td></tr>
+<tr><td><code id="error-session_not_found">session_not_found</code></td><td><code>3</code></td><td>no running session has that name</td></tr>
+<tr><td><code id="error-unavailable">unavailable</code></td><td><code>3</code></td><td>the camera, stream or service cannot be reached</td></tr>
+<tr><td><code id="error-worker_crashed">worker_crashed</code></td><td><code>3</code></td><td>the camera worker process died</td></tr>
+<tr><td><code id="error-frame_timeout">frame_timeout</code></td><td><code>4</code></td><td>no frame arrived in time</td></tr>
+<tr><td><code id="error-timeout">timeout</code></td><td><code>4</code></td><td>the operation did not finish in time</td></tr>
+<tr><td><code id="error-trigger_timeout">trigger_timeout</code></td><td><code>4</code></td><td>a triggered camera got no trigger in time; details.trigger</td></tr>
+<tr><td><code id="error-unsupported">unsupported</code></td><td><code>5</code></td><td>the camera or this build cannot do that</td></tr>
+<tr><td><code id="error-storage_full">storage_full</code></td><td><code>6</code></td><td>disk full or below CAPTUREFAB_MIN_FREE; details {path,free_bytes?}</td></tr>
 <tr><td><code id="error-interrupted">interrupted</code></td><td><code>130</code></td><td>stopped by a signal; details hold partial results</td></tr>
 </tbody></table></div></article>
 <article class="doc-section" id="cli-global-options" data-doc-section data-doc-title="Global options, cameras and sessions" data-doc-category="Command reference" data-doc-tags="global options,environment,session,camera,--keep,--background"><h2>Global options, cameras and sessions</h2><p class="doc-summary">Options every command takes, how a camera is chosen and when a session is used.</p>
@@ -346,7 +346,7 @@ capturefab record -c sim:0 -o rtsp://localhost:8554/cam --background</code></pre
 <tr><td><code>--preview</code> PATH</td><td>Where to write the preview (it must not exist), or none (default: a private folder doctor shows)</td><td>—</td></tr>
 <tr><td><code>--size</code> PX</td><td>The preview&#x27;s longest edge in pixels, 64..2048</td><td>default <code>768</code></td></tr>
 <tr><td><code>--fresh</code> N</td><td>Frames to let pass after the first one exposed after the last settings change, 0..9</td><td>default <code>0</code></td></tr>
-<tr><td><code>--timeout</code> DUR</td><td>How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer)</td><td>—</td></tr>
+<tr><td><code>--timeout</code> DUR</td><td>How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped</td><td>—</td></tr>
 <tr><td><code>--warmup</code> DUR</td><td>How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 measures at once</td><td>default <code>2s</code></td></tr>
 <tr><td><code>--set</code> NAME=VALUE</td><td>Change settings first, as one atomic change (as set does), then measure; repeatable</td><td>repeatable</td></tr>
 <tr><td><code>--for</code> DUR</td><td>Measure a frame every --every for this long (at most 50 samples), as for focusing: the series, and the sharpest frame&#x27;s measurements and preview</td><td>—</td></tr>
@@ -800,11 +800,12 @@ capturefab --json doctor</code></pre><button class="copy-button" type="button" a
 capturefab schema set
 capturefab schema preset apply</code></pre><button class="copy-button" type="button" aria-label="Copy the capturefab schema examples">Copy</button></div>
 <div class="table-scroll"><table><caption>capturefab schema JSON result</caption><thead><tr><th scope="col">Field</th><th scope="col">Type and meaning</th></tr></thead><tbody>
-<tr><td><code>commands</code></td><td>[{name,summary,effect,effect_with?}]</td></tr>
+<tr><td><code>commands</code></td><td>{name: [effect, summary]} — effect: read|file_write|camera_write|disruptive</td></tr>
 <tr><td><code>contract_version</code></td><td>int</td></tr>
 <tr><td><code>conventions</code></td><td>{...}</td></tr>
-<tr><td><code>errors</code></td><td>[{code,exit,meaning}]</td></tr>
-<tr><td><code>exit_codes</code></td><td>{code: meaning}</td></tr>
+<tr><td><code>effect_with</code></td><td>{name: {flag: effect}} — flags that widen a command&#x27;s effect</td></tr>
+<tr><td><code>errors</code></td><td>{code: [exit, meaning]} — every error.code</td></tr>
+<tr><td><code>exit_codes</code></td><td>{exit: meaning}</td></tr>
 <tr><td><code>grammars</code></td><td>{selector,name,duration,template}</td></tr>
 </tbody></table></div>
 <p>Errors: <a href="#error-usage"><code>usage</code></a>, <a href="#error-failed"><code>failed</code></a>, <a href="#error-camera_not_found"><code>camera_not_found</code></a>, <a href="#error-camera_ambiguous"><code>camera_ambiguous</code></a>, <a href="#error-camera_busy"><code>camera_busy</code></a>, <a href="#error-permission_denied"><code>permission_denied</code></a>, <a href="#error-disconnected"><code>disconnected</code></a>, <a href="#error-auth_required"><code>auth_required</code></a>, <a href="#error-auth_rejected"><code>auth_rejected</code></a>, <a href="#error-session_not_found"><code>session_not_found</code></a>, <a href="#error-ffmpeg_missing"><code>ffmpeg_missing</code></a>, <a href="#error-unavailable"><code>unavailable</code></a>, <a href="#error-timeout"><code>timeout</code></a>.</p>

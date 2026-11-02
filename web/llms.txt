@@ -8,7 +8,7 @@ Capturefab is one `capturefab` executable for macOS, Windows and Linux. GigE Vis
 
 - [Agent instructions](agents.md): rules, permissions, call patterns for common tasks and error recovery by `error.code`.
 - [Command reference](reference.html): every command, option, JSON result field, exit code and error code, generated from `capturefab schema`.
-- `capturefab schema` prints the same contract as JSON (about 9 KB, roughly 3,000 tokens); `capturefab schema COMMAND` describes one command.
+- `capturefab schema` prints the same contract as JSON (about 8 KB, roughly 2,500 tokens); `capturefab schema COMMAND` describes one command.
 
 ## Contract in brief
 

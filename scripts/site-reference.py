@@ -105,16 +105,16 @@ def collect(binary):
         bare = json.loads(run(binary, 'schema', env=env))
         top = parse_help(run(binary, '-h', env=env))
         commands = {}
-        for entry in bare['commands']:
-            words = entry['name'].split()
+        for name in bare['commands']:
+            words = name.split()
             detail = json.loads(run(binary, 'schema', *words, env=env))
             help_ = parse_help(run(binary, *words, '-h', env=env))
             detail.update(examples=help_['examples'], notes=help_['notes'])
-            if top['aliases'].get(entry['name']):
-                detail['aliases'] = top['aliases'][entry['name']]
-            commands[entry['name']] = detail
+            if top['aliases'].get(name):
+                detail['aliases'] = top['aliases'][name]
+            commands[name] = detail
         groups = {}
-        for name in sorted({entry['name'].split()[0] for entry in bare['commands'] if ' ' in entry['name']} - set(commands)):
+        for name in sorted({name.split()[0] for name in bare['commands'] if ' ' in name} - set(commands)):
             help_ = parse_help(run(binary, name, '-h', env=env))
             groups[name] = dict(summary=help_['about'], notes=help_['notes'], examples=help_['examples'])
     return dict(generated_by='scripts/site-reference.py --binary target/debug/capturefab', about=top['about'],
@@ -238,7 +238,8 @@ def render(snapshot):
     sections = []
 
     exit_rows = [(code(key), esc(value)) for key, value in sorted(schema['exit_codes'].items(), key=lambda item: int(item[0]))]
-    error_rows = [(f'<code id="error-{esc(e["code"])}">{esc(e["code"])}</code>', code(e['exit']), prose(e['meaning'])) for e in schema['errors']]
+    errors = sorted(schema['errors'].items(), key=lambda item: (item[1][0], item[0]))
+    error_rows = [(f'<code id="error-{esc(name)}">{esc(name)}</code>', code(exit_), prose(meaning)) for name, (exit_, meaning) in errors]
     basics = [f'<p>{prose(conventions["json"])}.</p>', f'<p>{prose(conventions["results"])}. Credentials: {prose(conventions["credentials"])}.</p>',
               f'<p>{prose(conventions["describe"])}. This page is generated from that output (contract version {code(schema["contract_version"])}), so it lists exactly what the CLI accepts.</p>',
               table('Exit codes', ['Exit code', 'Category'], exit_rows),

@@ -24,7 +24,7 @@ app, whose commands and JSON differ, so update a `capturefab` that reports one o
    `1` failed, `2` usage or input (fix the command), `3` unavailable (camera, session or
    FFmpeg), `4` timeout, `5` unsupported, `6` storage full, `130` interrupted. `error.code` is
    the specific reason, and `error.hint` says what to do next.
-3. **Do not guess flags.** Read `capturefab schema` once (about 9 KB, roughly 3,000 tokens), then
+3. **Do not guess flags.** Read `capturefab schema` once (about 8 KB, roughly 2,500 tokens), then
    `capturefab schema COMMAND` for the commands you use. Unknown flags are exit 2 `usage`.
 4. **Durations need a unit**: `250ms`, `2s`, `1.5s`, `5m`, `1h30m`. `--timeout none` waits
    without limit. A bare `5000` is exit 2 `invalid_duration`.
@@ -41,7 +41,8 @@ app, whose commands and JSON differ, so update a `capturefab` that reports one o
 
 Put the command first and flags after it, so a harness can allow commands by prefix:
 `capturefab capture --json -c sim:0 -o shot.png`. `capturefab schema` gives each command's
-`effect` when it runs without the flags below:
+`effect` when it runs without the flags below (`commands` maps a name to `[effect, summary]`,
+`effect_with` the widening flags, and `errors` each `error.code` to `[exit, meaning]`):
 
 | Effect | Commands | Suggested policy |
 | --- | --- | --- |
@@ -139,7 +140,8 @@ capturefab inspect --json -c sim:0 --set exposure=2788us --preview none
 alone is for changes you do not need to measure: `capturefab set --json -c sim:0 exposure=5ms gain=3`
 returns `changed: [{name, from, to}]` with the values read back. `--dry-run` checks every value
 and shows the writes in order without changing anything. A failed `set` restores every value it
-wrote.
+wrote, and the rest of the image geometry a write moved (binning rescales size and offsets);
+`error.details.rollback` lists `restored` and `failed`.
 
 ### Focus or aim loop
 

@@ -1046,7 +1046,7 @@
      "value_name": "N"
     },
     {
-     "help": "How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer)",
+     "help": "How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped",
      "long": "--timeout",
      "name": "timeout",
      "repeatable": false,
@@ -2290,11 +2290,12 @@
    ],
    "notes": [],
    "result": {
-    "commands": "[{name,summary,effect,effect_with?}]",
+    "commands": "{name: [effect, summary]} — effect: read|file_write|camera_write|disruptive",
     "contract_version": "int",
     "conventions": "{...}",
-    "errors": "[{code,exit,meaning}]",
-    "exit_codes": "{code: meaning}",
+    "effect_with": "{name: {flag: effect}} — flags that widen a command's effect",
+    "errors": "{code: [exit, meaning]} — every error.code",
+    "exit_codes": "{exit: meaning}",
     "grammars": "{selector,name,duration,template}"
    },
    "summary": "Describe commands, arguments, results and error codes as JSON"
@@ -2909,227 +2910,172 @@
   }
  },
  "schema": {
-  "commands": [
-   {
-    "effect": "read",
-    "name": "list",
-    "summary": "List cameras: GigE Vision, USB3 Vision, webcams, ONVIF"
-   },
-   {
-    "effect": "read",
-    "name": "info",
-    "summary": "What a camera is and what it can do: size, format, exposure, gain, trigger, controls"
-   },
-   {
-    "effect": "read",
-    "name": "features",
-    "summary": "List a camera's features with values, ranges, choices and locks"
-   },
-   {
-    "effect": "read",
-    "name": "get",
-    "summary": "Read features or controls in one call"
-   },
-   {
-    "effect": "camera_write",
-    "name": "set",
-    "summary": "Change features or controls as one atomic change; a failure restores every value"
-   },
-   {
-    "effect": "disruptive",
-    "name": "exec",
-    "summary": "Run a command feature, such as UserSetSave[UserSet1]"
-   },
-   {
-    "effect": "file_write",
-    "effect_with": {
-     "--auto": "camera_write",
-     "--set": "camera_write"
-    },
-    "name": "capture",
-    "summary": "Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites"
-   },
-   {
-    "effect": "file_write",
-    "effect_with": {
-     "--auto": "camera_write",
-     "--set": "camera_write"
-    },
-    "name": "record",
-    "summary": "Record video to a file or stream it to rtsp://, srt://, rtmp:// or udp://"
-   },
-   {
-    "effect": "read",
-    "effect_with": {
-     "--set": "camera_write"
-    },
-    "name": "inspect",
-    "summary": "Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview"
-   },
-   {
-    "effect": "read",
-    "name": "watch",
-    "summary": "Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise"
-   },
-   {
-    "effect": "camera_write",
-    "name": "auto",
-    "summary": "Settle exposure and gain, then hold them; or turn auto exposure off or on"
-   },
-   {
-    "effect": "file_write",
-    "name": "preset save",
-    "summary": "Save the camera's current settings as a named preset"
-   },
-   {
-    "effect": "read",
-    "name": "preset list",
-    "summary": "List saved presets and the folder that holds them"
-   },
-   {
-    "effect": "read",
-    "name": "preset show",
-    "summary": "Show a saved preset's values"
-   },
-   {
-    "effect": "camera_write",
-    "name": "preset apply",
-    "summary": "Restore a preset as one camera change; a failure puts every value back"
-   },
-   {
-    "effect": "file_write",
-    "name": "preset rm",
-    "summary": "Delete a saved preset; no camera changes"
-   },
-   {
-    "effect": "file_write",
-    "name": "preset import",
-    "summary": "Save a preset document from a file, such as one preset export wrote"
-   },
-   {
-    "effect": "file_write",
-    "name": "preset export",
-    "summary": "Write a preset's document to a file, or to stdout"
-   },
-   {
-    "effect": "read",
-    "name": "jobs",
-    "summary": "Captures and recordings running in sessions: list, stop, wait"
-   },
-   {
-    "effect": "read",
-    "name": "jobs list",
-    "summary": "Every running session's jobs, finished ones included"
-   },
-   {
-    "effect": "camera_write",
-    "name": "jobs stop",
-    "summary": "Stop a job, or all of them; files saved so far stay"
-   },
-   {
-    "effect": "read",
-    "name": "jobs wait",
-    "summary": "Wait for a job: exit 0 when done, its own code if it failed, 4 if still running"
-   },
-   {
-    "effect": "disruptive",
-    "name": "session start",
-    "summary": "Start a session in the background; it ends after --idle unused"
-   },
-   {
-    "effect": "disruptive",
-    "name": "session stop",
-    "summary": "Stop a session once its recordings and captures are finished"
-   },
-   {
-    "effect": "read",
-    "name": "session status",
-    "summary": "A session's cameras, their state and jobs"
-   },
-   {
-    "effect": "read",
-    "name": "session list",
-    "summary": "The running sessions"
-   },
-   {
-    "effect": "disruptive",
-    "name": "serve",
-    "summary": "Run a session in the foreground (systemd, a terminal); Ctrl-C stops it"
-   },
-   {
-    "effect": "file_write",
-    "name": "login add",
-    "summary": "Check a camera sign-in, then save it in the OS credential store"
-   },
-   {
-    "effect": "read",
-    "name": "login list",
-    "summary": "List saved camera sign-ins (never their passwords)"
-   },
-   {
-    "effect": "file_write",
-    "name": "login rm",
-    "summary": "Forget a saved camera sign-in and delete its password"
-   },
-   {
-    "effect": "read",
-    "name": "onvif resolve",
-    "summary": "List an ONVIF camera's profiles and their RTSP stream URIs"
-   },
-   {
-    "effect": "read",
-    "effect_with": {
-     "--tune": "camera_write"
-    },
-    "name": "network",
-    "summary": "Check GigE network paths; --tune applies bandwidth sharing to cameras"
-   },
-   {
-    "effect": "read",
-    "name": "doctor",
-    "summary": "Check this computer: FFmpeg, folders, USB and GigE limits, with a fix for each warning"
-   },
-   {
-    "effect": "read",
-    "name": "schema",
-    "summary": "Describe commands, arguments, results and error codes as JSON"
-   },
-   {
-    "effect": "disruptive",
-    "name": "shell",
-    "summary": "Run commands one after another with the cameras kept connected: a prompt in a terminal, one command a line otherwise"
-   },
-   {
-    "effect": "read",
-    "name": "completions",
-    "summary": "Print shell completions: bash, zsh, fish, powershell, elvish"
-   },
-   {
-    "effect": "read",
-    "name": "debug xml",
-    "summary": "Print a camera's GenICam XML, or write it to a file"
-   },
-   {
-    "effect": "read",
-    "name": "debug read",
-    "summary": "Read raw camera memory"
-   },
-   {
-    "effect": "disruptive",
-    "name": "debug write",
-    "summary": "Write raw camera memory"
-   },
-   {
-    "effect": "disruptive",
-    "name": "debug rpc",
-    "summary": "Send one session command, a JSON object on stdin, and print its reply"
-   },
-   {
-    "effect": "read",
-    "name": "licenses",
-    "summary": "Print Capturefab's license and the bundled FFmpeg's license notice"
-   }
-  ],
+  "commands": {
+   "auto": [
+    "camera_write",
+    "Settle exposure and gain, then hold them; or turn auto exposure off or on"
+   ],
+   "capture": [
+    "file_write",
+    "Save frames: one shot, a burst, a time lapse or a delayed capture; never overwrites"
+   ],
+   "completions": [
+    "read",
+    "Print shell completions: bash, zsh, fish, powershell, elvish"
+   ],
+   "debug read": [
+    "read",
+    "Read raw camera memory"
+   ],
+   "debug rpc": [
+    "disruptive",
+    "Send one session command, a JSON object on stdin, and print its reply"
+   ],
+   "debug write": [
+    "disruptive",
+    "Write raw camera memory"
+   ],
+   "debug xml": [
+    "read",
+    "Print a camera's GenICam XML, or write it to a file"
+   ],
+   "doctor": [
+    "read",
+    "Check this computer: FFmpeg, folders, USB and GigE limits, with a fix for each warning"
+   ],
+   "exec": [
+    "disruptive",
+    "Run a command feature, such as UserSetSave[UserSet1]"
+   ],
+   "features": [
+    "read",
+    "List a camera's features with values, ranges, choices and locks"
+   ],
+   "get": [
+    "read",
+    "Read features or controls in one call"
+   ],
+   "info": [
+    "read",
+    "What a camera is and what it can do: size, format, exposure, gain, trigger, controls"
+   ],
+   "inspect": [
+    "read",
+    "Measure a fresh frame: exposure, clipping, focus, suggested exposure, a preview"
+   ],
+   "jobs": [
+    "read",
+    "Captures and recordings running in sessions: list, stop, wait"
+   ],
+   "jobs list": [
+    "read",
+    "Every running session's jobs, finished ones included"
+   ],
+   "jobs stop": [
+    "camera_write",
+    "Stop a job, or all of them; files saved so far stay"
+   ],
+   "jobs wait": [
+    "read",
+    "Wait for a job: exit 0 when done, its own code if it failed, 4 if still running"
+   ],
+   "licenses": [
+    "read",
+    "Print Capturefab's license and the bundled FFmpeg's license notice"
+   ],
+   "list": [
+    "read",
+    "List cameras: GigE Vision, USB3 Vision, webcams, ONVIF"
+   ],
+   "login add": [
+    "file_write",
+    "Check a camera sign-in, then save it in the OS credential store"
+   ],
+   "login list": [
+    "read",
+    "List saved camera sign-ins (never their passwords)"
+   ],
+   "login rm": [
+    "file_write",
+    "Forget a saved camera sign-in and delete its password"
+   ],
+   "network": [
+    "read",
+    "Check GigE network paths; --tune applies bandwidth sharing to cameras"
+   ],
+   "onvif resolve": [
+    "read",
+    "List an ONVIF camera's profiles and their RTSP stream URIs"
+   ],
+   "preset apply": [
+    "camera_write",
+    "Restore a preset as one camera change; a failure puts every value back"
+   ],
+   "preset export": [
+    "file_write",
+    "Write a preset's document to a file, or to stdout"
+   ],
+   "preset import": [
+    "file_write",
+    "Save a preset document from a file, such as one preset export wrote"
+   ],
+   "preset list": [
+    "read",
+    "List saved presets and the folder that holds them"
+   ],
+   "preset rm": [
+    "file_write",
+    "Delete a saved preset; no camera changes"
+   ],
+   "preset save": [
+    "file_write",
+    "Save the camera's current settings as a named preset"
+   ],
+   "preset show": [
+    "read",
+    "Show a saved preset's values"
+   ],
+   "record": [
+    "file_write",
+    "Record video to a file or stream it to rtsp://, srt://, rtmp:// or udp://"
+   ],
+   "schema": [
+    "read",
+    "Describe commands, arguments, results and error codes as JSON"
+   ],
+   "serve": [
+    "disruptive",
+    "Run a session in the foreground (systemd, a terminal); Ctrl-C stops it"
+   ],
+   "session list": [
+    "read",
+    "The running sessions"
+   ],
+   "session start": [
+    "disruptive",
+    "Start a session in the background; it ends after --idle unused"
+   ],
+   "session status": [
+    "read",
+    "A session's cameras, their state and jobs"
+   ],
+   "session stop": [
+    "disruptive",
+    "Stop a session once its recordings and captures are finished"
+   ],
+   "set": [
+    "camera_write",
+    "Change features or controls as one atomic change; a failure restores every value"
+   ],
+   "shell": [
+    "disruptive",
+    "Run commands one after another with the cameras kept connected: a prompt in a terminal, one command a line otherwise"
+   ],
+   "watch": [
+    "read",
+    "Live measurements while aiming, focusing or setting exposure: redrawn in a terminal, one JSON line each otherwise"
+   ]
+  },
   "contract_version": 1,
   "conventions": {
    "camera": "-c/--camera CAM (CAPTUREFAB_CAMERA). Without it: the session's only camera, else the only camera list finds (not sim: or screens)",
@@ -3142,143 +3088,132 @@
    "routing": "--session NAME, else a session holding the camera, else the auto session, open 60s after last use (--keep DUR); --keep 0 or --no-session: a worker of the command",
    "streams": "NDJSON: watch a line per measurement, shell per command; capture, record, jobs wait --progress: stderr lines {progress:{job,state,saved,planned?,elapsed_s,left_s?,…}}"
   },
-  "errors": [
-   {
-    "code": "failed",
-    "exit": 1,
-    "meaning": "the operation failed"
+  "effect_with": {
+   "capture": {
+    "--auto": "camera_write",
+    "--set": "camera_write"
    },
-   {
-    "code": "usage",
-    "exit": 2,
-    "meaning": "invalid arguments or input"
+   "inspect": {
+    "--set": "camera_write"
    },
-   {
-    "code": "invalid_duration",
-    "exit": 2,
-    "meaning": "not a valid duration (see grammars.duration)"
+   "network": {
+    "--tune": "camera_write"
    },
-   {
-    "code": "feature_not_found",
-    "exit": 2,
-    "meaning": "no such feature or control; see details.did_you_mean"
-   },
-   {
-    "code": "out_of_range",
-    "exit": 2,
-    "meaning": "outside the feature's range; details {feature,value,min,max,inc,nearest,unit}"
-   },
-   {
-    "code": "invalid_choice",
-    "exit": 2,
-    "meaning": "not one of details.choices"
-   },
-   {
-    "code": "not_writable",
-    "exit": 2,
-    "meaning": "the feature is read-only"
-   },
-   {
-    "code": "feature_locked",
-    "exit": 1,
-    "meaning": "another setting locks the feature now; see details.locked_by"
-   },
-   {
-    "code": "camera_ambiguous",
-    "exit": 2,
-    "meaning": "several cameras match; pick one of details.candidates with -c"
-   },
-   {
-    "code": "camera_not_found",
-    "exit": 3,
-    "meaning": "no camera matches; details.candidates lists what answered"
-   },
-   {
-    "code": "camera_busy",
-    "exit": 3,
-    "meaning": "another process or job holds the camera; details.held_by when known"
-   },
-   {
-    "code": "permission_denied",
-    "exit": 3,
-    "meaning": "the OS refused access; see hint"
-   },
-   {
-    "code": "disconnected",
-    "exit": 3,
-    "meaning": "the camera went away"
-   },
-   {
-    "code": "worker_crashed",
-    "exit": 3,
-    "meaning": "the camera worker process died"
-   },
-   {
-    "code": "session_not_found",
-    "exit": 3,
-    "meaning": "no running session has that name"
-   },
-   {
-    "code": "ffmpeg_missing",
-    "exit": 3,
-    "meaning": "FFmpeg could not be found or started"
-   },
-   {
-    "code": "unavailable",
-    "exit": 3,
-    "meaning": "the camera, stream or service cannot be reached"
-   },
-   {
-    "code": "auth_required",
-    "exit": 3,
-    "meaning": "the camera needs a sign-in; run login add"
-   },
-   {
-    "code": "auth_rejected",
-    "exit": 3,
-    "meaning": "the camera refused the sign-in"
-   },
-   {
-    "code": "frame_timeout",
-    "exit": 4,
-    "meaning": "no frame arrived in time"
-   },
-   {
-    "code": "trigger_timeout",
-    "exit": 4,
-    "meaning": "a triggered camera got no trigger in time; details.trigger"
-   },
-   {
-    "code": "timeout",
-    "exit": 4,
-    "meaning": "the operation did not finish in time"
-   },
-   {
-    "code": "unsupported",
-    "exit": 5,
-    "meaning": "the camera or this build cannot do that"
-   },
-   {
-    "code": "exists",
-    "exit": 1,
-    "meaning": "the output exists (never overwritten); details.path"
-   },
-   {
-    "code": "storage_full",
-    "exit": 6,
-    "meaning": "disk full or below CAPTUREFAB_MIN_FREE; details {path,free_bytes?}"
-   },
-   {
-    "code": "incomplete",
-    "exit": 1,
-    "meaning": "fewer results than requested; see details"
-   },
-   {
-    "code": "interrupted",
-    "exit": 130,
-    "meaning": "stopped by a signal; details hold partial results"
+   "record": {
+    "--auto": "camera_write",
+    "--set": "camera_write"
    }
-  ],
+  },
+  "errors": {
+   "auth_rejected": [
+    3,
+    "the camera refused the sign-in"
+   ],
+   "auth_required": [
+    3,
+    "the camera needs a sign-in; run login add"
+   ],
+   "camera_ambiguous": [
+    2,
+    "several cameras match; pick one of details.candidates with -c"
+   ],
+   "camera_busy": [
+    3,
+    "another process or job holds the camera; details.held_by when known"
+   ],
+   "camera_not_found": [
+    3,
+    "no camera matches; details.candidates lists what answered"
+   ],
+   "disconnected": [
+    3,
+    "the camera went away"
+   ],
+   "exists": [
+    1,
+    "the output exists (never overwritten); details.path"
+   ],
+   "failed": [
+    1,
+    "the operation failed"
+   ],
+   "feature_locked": [
+    1,
+    "another setting locks the feature now; see details.locked_by"
+   ],
+   "feature_not_found": [
+    2,
+    "no such feature or control; see details.did_you_mean"
+   ],
+   "ffmpeg_missing": [
+    3,
+    "FFmpeg could not be found or started"
+   ],
+   "frame_timeout": [
+    4,
+    "no frame arrived in time"
+   ],
+   "incomplete": [
+    1,
+    "fewer results than requested; see details"
+   ],
+   "interrupted": [
+    130,
+    "stopped by a signal; details hold partial results"
+   ],
+   "invalid_choice": [
+    2,
+    "not one of details.choices"
+   ],
+   "invalid_duration": [
+    2,
+    "not a valid duration (see grammars.duration)"
+   ],
+   "not_writable": [
+    2,
+    "the feature is read-only"
+   ],
+   "out_of_range": [
+    2,
+    "outside the feature's range; details {feature,value,min,max,inc,nearest,unit}"
+   ],
+   "permission_denied": [
+    3,
+    "the OS refused access; see hint"
+   ],
+   "session_not_found": [
+    3,
+    "no running session has that name"
+   ],
+   "storage_full": [
+    6,
+    "disk full or below CAPTUREFAB_MIN_FREE; details {path,free_bytes?}"
+   ],
+   "timeout": [
+    4,
+    "the operation did not finish in time"
+   ],
+   "trigger_timeout": [
+    4,
+    "a triggered camera got no trigger in time; details.trigger"
+   ],
+   "unavailable": [
+    3,
+    "the camera, stream or service cannot be reached"
+   ],
+   "unsupported": [
+    5,
+    "the camera or this build cannot do that"
+   ],
+   "usage": [
+    2,
+    "invalid arguments or input"
+   ],
+   "worker_crashed": [
+    3,
+    "the camera worker process died"
+   ]
+  },
   "exit_codes": {
    "0": "ok",
    "1": "failed",
