@@ -6,6 +6,32 @@ use serde_json::json;
 use std::path::Path;
 use support::cli::Home;
 
+/// `--timeout none` waits for a triggered frame for as long as it takes;
+/// a wait of 0 or past 10 minutes is a usage error.
+#[test]
+fn inspect_waits_for_a_trigger_without_limit() {
+    let home = Home::new("inspect-forever");
+    let camera = "sim:0?line0=every:700ms";
+    home.ok(&["set", "-c", camera, "TriggerMode=On", "TriggerSource=Line0"]);
+    let measured = home.ok(&[
+        "inspect",
+        "-c",
+        camera,
+        "--timeout",
+        "none",
+        "--preview",
+        "none",
+    ]);
+    assert_eq!(measured["frame"]["width"], 640, "{measured}");
+    for wait in ["0", "11m"] {
+        let refused = home.fails(2, &["inspect", "-c", camera, "--timeout", wait]);
+        assert!(
+            refused["message"].as_str().unwrap().contains("none"),
+            "{refused}"
+        );
+    }
+}
+
 #[test]
 fn inspect_measures_a_fresh_frame_and_leaves_a_private_preview() {
     let home = Home::new("inspect");

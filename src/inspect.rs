@@ -30,6 +30,9 @@ pub const MAX_FRESH: u32 = 10;
 /// The longest an inspection may wait for its frame: ten minutes, for a
 /// part on a conveyor that triggers the camera.
 pub const MAX_WAIT_MS: u64 = 600_000;
+/// The wait `--timeout none` asks for: for a trigger until stopped, as a
+/// capture's.
+pub const WAIT_FOREVER_MS: u64 = crate::scheduling::MAX_DURATION_MS;
 /// Preview edges a request may ask for; 0 asks for measurements only.
 pub const EDGES: RangeInclusive<u32> = 64..=2048;
 /// The largest encoded preview. About 2 MiB as base64, well inside the
@@ -73,8 +76,8 @@ pub fn validate(
 ) -> Result<()> {
     ensure!(fresh <= MAX_FRESH, "fresh frames must be 0..10");
     ensure!(
-        timeout_ms <= MAX_WAIT_MS,
-        "inspection wait must be at most 600000 milliseconds (0: the camera's default)"
+        timeout_ms <= MAX_WAIT_MS || timeout_ms == WAIT_FOREVER_MS,
+        "inspection wait must be at most 600000 milliseconds (0: the camera's default), or {WAIT_FOREVER_MS} for none"
     );
     ensure!(
         max_dimension == 0 || EDGES.contains(&max_dimension),

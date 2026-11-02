@@ -3,7 +3,9 @@
 //! and writes the preview, by default to a private folder; this turns the
 //! measurements into a short document with a verdict and a suggested
 //! exposure.
-use super::{Client, Global, args::CamerasArg, args::KeepArg, millis, output::Report, term};
+use super::{
+    Client, Global, args::CamerasArg, args::KeepArg, args::Wait, millis, output::Report, term,
+};
 use crate::{
     controls::Assignment,
     inspect::PreviewFormat,
@@ -31,9 +33,9 @@ pub struct InspectArgs {
     /// Frames to let pass after the first one exposed after the last settings change, 0..9
     #[arg(long, default_value_t = 0, value_name = "N", value_parser = clap::value_parser!(u32).range(0..=9))]
     pub fresh: u32,
-    /// How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer)
-    #[arg(long, value_name = "DUR", value_parser = super::args::duration)]
-    pub timeout: Option<Duration>,
+    /// How long to wait for the frame, up to 10m (default: 5s, or 3 exposures and frame periods when longer); none waits for a trigger until stopped
+    #[arg(long, value_name = "DUR", value_parser = super::args::wait)]
+    pub timeout: Option<Wait>,
     /// How long a camera that sets its own exposure (webcam, stream, ExposureAuto=Continuous) may take to settle after it starts; 0 measures at once
     #[arg(long, default_value = "2s", value_name = "DUR", value_parser = super::args::duration)]
     pub warmup: Duration,
@@ -54,6 +56,17 @@ pub struct InspectArgs {
     pub show: bool,
     #[command(flatten)]
     pub keep: KeepArg,
+}
+
+impl InspectArgs {
+    /// The frame wait to ask the worker for: 0 for the camera's default.
+    fn timeout_ms(&self) -> u64 {
+        match self.timeout {
+            Some(Wait::For(wait)) => millis(wait),
+            Some(Wait::Forever) => crate::inspect::WAIT_FOREVER_MS,
+            None => 0,
+        }
+    }
 }
 
 fn parse_share(text: &str) -> std::result::Result<f64, String> {
@@ -84,11 +97,13 @@ const TARGET: f64 = 0.45;
 const SATURATED: f64 = 0.25;
 
 pub fn run(global: &Global, args: InspectArgs) -> Result<Report> {
-    if args
-        .timeout
-        .is_some_and(|wait| wait.is_zero() || millis(wait) > crate::inspect::MAX_WAIT_MS)
+    if let Some(Wait::For(wait)) = args.timeout
+        && (wait.is_zero() || millis(wait) > crate::inspect::MAX_WAIT_MS)
     {
-        return Err(Usage("--timeout must be longer than 0 and at most 10m".into()).into());
+        return Err(Usage(
+            "--timeout must be longer than 0 and at most 10m; none waits for ever".into(),
+        )
+        .into());
     }
     if millis(args.warmup) > crate::session::MAX_WARMUP_MS {
         return Err(Usage("--warmup is at most 60s".into()).into());
@@ -270,7 +285,7 @@ fn inspect(
             .call(SessionCommand::Frame {
                 // The worker counts the frame measured too.
                 fresh: fresh + 1,
-                timeout_ms: args.timeout.map_or(0, millis),
+                timeout_ms: args.timeout_ms(),
                 max_dimension,
                 format,
                 region: args.region,
