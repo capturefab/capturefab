@@ -580,13 +580,21 @@ fn read_rpc_line(stream: TcpStream, limit: usize, deadline: Instant) -> Result<V
         reader
             .get_ref()
             .set_read_timeout(Some(remaining(deadline)?))?;
-        let buffer = reader.fill_buf().map_err(|error| match error.kind() {
-            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                deadline_exceeded("RPC deadline exceeded".into())
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            // Linux interrupts a read with a timeout for a signal's
+            // handler, SA_RESTART or not; the deadline still holds.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(match error.kind() {
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                        deadline_exceeded("RPC deadline exceeded".into())
+                    }
+                    _ if closed(&error) => closed_early(Some(error)),
+                    _ => error.into(),
+                });
             }
-            _ if closed(&error) => closed_early(Some(error)),
-            _ => error.into(),
-        })?;
+        };
         if buffer.is_empty() {
             return Err(closed_early(None));
         }
@@ -678,15 +686,20 @@ fn write_line(stream: &mut TcpStream, value: &impl Serialize, deadline: Instant)
     let mut offset = 0;
     while offset < line.len() {
         stream.set_write_timeout(Some(remaining(deadline)?))?;
-        let count = stream
-            .write(&line[offset..])
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
-                    deadline_exceeded("RPC deadline exceeded".into())
-                }
-                _ if closed(&error) => closed_early(Some(error)),
-                _ => error.into(),
-            })?;
+        let count = match stream.write(&line[offset..]) {
+            Ok(count) => count,
+            // As a read is, by a signal's handler.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(match error.kind() {
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                        deadline_exceeded("RPC deadline exceeded".into())
+                    }
+                    _ if closed(&error) => closed_early(Some(error)),
+                    _ => error.into(),
+                });
+            }
+        };
         if count == 0 {
             return Err(closed_early(None));
         }
@@ -1392,13 +1405,16 @@ fn send(descriptor: &Descriptor, request: Request, timeout: Duration) -> Result<
     let mut offset = 0;
     while offset < message.len() {
         stream.set_write_timeout(Some(remaining(deadline)?))?;
-        let count = stream.write(&message[offset..]).map_err(|error| {
-            if closed(&error) {
-                closed_early(Some(error)).context(format!("sending a request to session '{name}'"))
-            } else {
-                rpc_network_error(name, "sending a request", error)
+        let count = match stream.write(&message[offset..]) {
+            Ok(count) => count,
+            // As a read is, by a signal's handler.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) if closed(&error) => {
+                return Err(closed_early(Some(error))
+                    .context(format!("sending a request to session '{name}'")));
             }
-        })?;
+            Err(error) => return Err(rpc_network_error(name, "sending a request", error)),
+        };
         if count == 0 {
             return Err(
                 closed_early(None).context(format!("sending a request to session '{name}'"))
@@ -1991,6 +2007,44 @@ mod tests {
         drop(claims);
         assert!(!descriptor_path_in(&dir.0, "stale").unwrap().exists());
         handle.shutdown();
+    }
+    /// A signal's handler interrupts a read with a timeout (on Linux even
+    /// under SA_RESTART, which this handler does not ask for); the read
+    /// goes on within its deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_does_not_cut_an_rpc_read_short() {
+        extern "C" fn nothing(_: libc::c_int) {}
+        /// The reading thread, for pthread_kill.
+        struct Reader(libc::pthread_t);
+        // SAFETY: only an ID, signalled while its thread runs.
+        unsafe impl Send for Reader {}
+        // SAFETY: a handler that does nothing, for a signal nothing else
+        // in these tests sends.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = nothing as *const () as usize;
+            assert_eq!(
+                libc::sigaction(libc::SIGURG, &action, std::ptr::null_mut()),
+                0
+            );
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let (said, told) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            // SAFETY: pthread_self only names this thread.
+            said.send(Reader(unsafe { libc::pthread_self() })).unwrap();
+            read_rpc_line(stream, MAX_HELLO, Instant::now() + Duration::from_secs(30))
+        });
+        let thread = told.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        // SAFETY: the thread runs until the line below arrives.
+        assert_eq!(unsafe { libc::pthread_kill(thread.0, libc::SIGURG) }, 0);
+        std::thread::sleep(Duration::from_millis(100));
+        client.write_all(b"{}\n").unwrap();
+        assert_eq!(reader.join().unwrap().unwrap(), b"{}\n");
     }
     #[test]
     fn a_process_lives_until_it_exits() {
