@@ -530,6 +530,31 @@ fn set_is_one_atomic_change() {
         on(&["get", "Width", "OffsetX"])["values"],
         json!({"Width": 640, "OffsetX": 100})
     );
+    // The geometry is checkpointed as a group: a binning rescales Width and
+    // OffsetX (whose maximum is WidthMax - Width), and restoring it alone
+    // would leave them rounded (636 and 1280).
+    on(&["set", "Width=639", "OffsetX=1281"]);
+    let failed = home.fails(
+        2,
+        &[
+            "--session",
+            "atomic",
+            "set",
+            "BinningHorizontal=4",
+            "Width=1000",
+        ],
+    );
+    assert_eq!(failed["code"], "out_of_range", "{failed}");
+    assert_eq!(
+        failed["details"]["rollback"],
+        json!({"restored": ["BinningHorizontal", "Width", "OffsetX"], "failed": []}),
+        "{failed}"
+    );
+    assert_eq!(
+        on(&["get", "BinningHorizontal", "Width", "OffsetX", "WidthMax"])["values"],
+        json!({"BinningHorizontal": 1, "Width": 639, "OffsetX": 1281, "WidthMax": 1920})
+    );
+    on(&["set", "roi=100,0,640,480"]);
     // Geometry cannot change while the camera streams.
     let _live = home.serve_with("live", &["sim:live"], &["--live"]);
     let busy = home.fails(3, &["set", "-c", "sim:live", "Width=320"]);
@@ -722,10 +747,10 @@ fn schema_describes_every_command_and_its_results() {
         "{selector}"
     );
     let commands = schema["commands"]
-        .as_array()
+        .as_object()
         .unwrap()
-        .iter()
-        .map(|command| command["name"].as_str().unwrap().to_owned())
+        .keys()
+        .cloned()
         .collect::<Vec<_>>();
     for name in [
         "list",
@@ -755,19 +780,22 @@ fn schema_describes_every_command_and_its_results() {
             "{removed}"
         );
     }
-    for command in &schema["commands"].as_array().unwrap()[..] {
+    for (name, entry) in schema["commands"].as_object().unwrap() {
+        let effect = entry[0].as_str().unwrap();
         assert!(
-            ["read", "camera_write", "file_write", "disruptive"]
-                .contains(&command["effect"].as_str().unwrap()),
-            "{command}"
+            ["read", "camera_write", "file_write", "disruptive"].contains(&effect),
+            "{name}: {entry}"
         );
-        let words = command["name"]
-            .as_str()
-            .unwrap()
-            .split(' ')
-            .collect::<Vec<_>>();
+        let words = name.split(' ').collect::<Vec<_>>();
         let described = home.ok(&[&["schema"][..], &words].concat());
-        assert_eq!(described["command"], command["name"]);
+        assert_eq!(described["command"], name.as_str());
+        assert_eq!(described["effect"], effect);
+        assert_eq!(described["summary"], entry[1]);
+        assert_eq!(
+            described.get("effect_with"),
+            schema["effect_with"].get(name),
+            "{name}"
+        );
         // Every argument schema names is one --help shows.
         let help = home.run(&[&words[..], &["--help"]].concat()).stdout;
         for arg in described["args"].as_array().unwrap() {
@@ -783,10 +811,10 @@ fn schema_describes_every_command_and_its_results() {
         }
     }
     let codes = schema["errors"]
-        .as_array()
+        .as_object()
         .unwrap()
-        .iter()
-        .map(|error| error["code"].as_str().unwrap())
+        .keys()
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
     for code in [
         "usage",
@@ -799,7 +827,8 @@ fn schema_describes_every_command_and_its_results() {
     ] {
         assert!(codes.contains(code), "{code}");
     }
-    assert!(schema.to_string().len() < 9500, "the overview stays small");
+    assert_eq!(schema["errors"]["storage_full"][0], 6);
+    assert!(schema.to_string().len() < 8000, "the overview stays small");
 }
 
 /// The top-level keys a command prints are the ones `schema COMMAND`

@@ -140,17 +140,7 @@ fn addresses(
 /// allow (an offset its width, binning the width, the pixel format the
 /// size), so a checkpoint of one holds all of them.
 const COUPLED: [&[&str]; 2] = [
-    &[
-        "OffsetX",
-        "OffsetY",
-        "Width",
-        "Height",
-        "BinningHorizontal",
-        "BinningVertical",
-        "DecimationHorizontal",
-        "DecimationVertical",
-        "PixelFormat",
-    ],
+    &crate::controls::GEOMETRY,
     &[
         "AcquisitionFrameRate",
         "AcquisitionFrameRateEnable",

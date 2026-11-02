@@ -821,9 +821,11 @@ fn roi(camera: &mut Camera, value: &str) -> Result<Vec<(&'static str, String)>> 
     Ok(writes)
 }
 
-/// Features whose bounds another write of the same change can move: the
-/// image geometry.
-const COUPLED: [&str; 9] = [
+/// The image geometry: features whose bounds another write of the same
+/// change can move, and whose values it can clamp or rescale (a binning
+/// scales the size and offsets, a width bounds its offset), so a change
+/// checkpoints them as a group.
+pub(crate) const GEOMETRY: [&str; 9] = [
     "Width",
     "Height",
     "OffsetX",
@@ -1123,7 +1125,7 @@ fn range_moved(feature: &str, earlier: &[Write]) -> bool {
             .iter()
             .any(|other| names.contains(&other.target.feature.as_str()))
     };
-    (COUPLED.contains(&feature) && any(&COUPLED))
+    (GEOMETRY.contains(&feature) && any(&GEOMETRY))
         || (EXPOSURE.contains(&feature) && any(&FRAME_RATE))
         || (FRAME_RATE.contains(&feature) && any(&EXPOSURE))
 }
@@ -1331,7 +1333,8 @@ impl SetResult {
 
 /// Plan and, unless `dry_run`, apply `values` as one change: on any
 /// failure every value written is restored in reverse order at its bank,
-/// and the error's details say what the rollback did.
+/// then the rest of the image geometry a write touched, and the error's
+/// details say what the rollback did.
 pub(crate) fn set(camera: &mut Camera, values: &[Assignment], dry_run: bool) -> Result<SetResult> {
     let writes = plan(camera, values)?;
     let streaming = camera.is_streaming();
@@ -1369,6 +1372,7 @@ pub(crate) fn set(camera: &mut Camera, values: &[Assignment], dry_run: bool) -> 
             warnings,
         });
     }
+    let geometry = geometry_checkpoint(camera, &pending);
     let mut written: Vec<(Target, Value)> = Vec::new();
     for write in &pending {
         let from = write.target.read(camera);
@@ -1382,7 +1386,7 @@ pub(crate) fn set(camera: &mut Camera, values: &[Assignment], dry_run: bool) -> 
             Ok(from) => written.push((write.target.clone(), from)),
             Err(error) => {
                 let error = with_unit(camera, &write.target.feature, error);
-                return Err(rollback(camera, written, error));
+                return Err(rollback(camera, written, &geometry, error));
             }
         }
     }
@@ -1409,10 +1413,39 @@ pub(crate) fn set(camera: &mut Camera, values: &[Assignment], dry_run: bool) -> 
     })
 }
 
-/// Restore `written` in reverse order and report it in `error`'s details.
+/// The image geometry a change's writes can clamp or rescale, read before
+/// any is made: every geometry feature the camera has, when the change
+/// writes one. Values that cannot be read or are locked (an auto drives
+/// them) are left out.
+fn geometry_checkpoint(camera: &mut Camera, writes: &[Write]) -> Vec<(String, Value)> {
+    if !writes
+        .iter()
+        .any(|write| GEOMETRY.contains(&write.target.feature.as_str()))
+    {
+        return Vec::new();
+    }
+    let mut values = Vec::new();
+    for feature in GEOMETRY {
+        if !camera.has(feature) || !camera.is_configuration_value(feature) {
+            continue;
+        }
+        if camera.is_locked(feature) {
+            continue;
+        }
+        if let Ok(value) = camera.get(feature) {
+            values.push((feature.to_owned(), value));
+        }
+    }
+    values
+}
+
+/// Restore `written` in reverse order, then any value of the `geometry`
+/// checkpoint that a write moved (a binning rescales the size and offsets,
+/// and scaling back can round them), and report it in `error`'s details.
 fn rollback(
     camera: &mut Camera,
     written: Vec<(Target, Value)>,
+    geometry: &[(String, Value)],
     error: anyhow::Error,
 ) -> anyhow::Error {
     let mut restored = Vec::new();
@@ -1426,6 +1459,45 @@ fn rollback(
             Ok(()) => restored.push(name),
             Err(error) => failed.push(json!({"name": name, "error": format!("{error:#}")})),
         }
+    }
+    // One geometry value can bound another (an offset the width), so
+    // values that do not take in one order are written again in later
+    // passes, until all hold or a pass changes nothing.
+    let differs = |camera: &mut Camera, (feature, value): &(String, Value)| {
+        camera.get(feature).ok().as_ref() != Some(value)
+    };
+    let mut left = geometry
+        .iter()
+        .filter(|entry| differs(camera, entry))
+        .collect::<Vec<_>>();
+    let mut errors = std::collections::BTreeMap::new();
+    while !left.is_empty() {
+        for (feature, value) in &left {
+            match camera.set(feature, &text(value)) {
+                Ok(()) => errors.remove(feature),
+                Err(error) => errors.insert(feature.clone(), format!("{error:#}")),
+            };
+        }
+        let before = left.len();
+        let (still, done): (Vec<_>, Vec<_>) =
+            left.into_iter().partition(|entry| differs(camera, entry));
+        for (feature, _) in done {
+            failed.retain(|failure| failure["name"] != feature.as_str());
+            if !restored.contains(feature) {
+                restored.push(feature.clone());
+            }
+        }
+        left = still;
+        if left.len() == before {
+            break;
+        }
+    }
+    for (feature, value) in left {
+        failed.retain(|failure| failure["name"] != feature.as_str());
+        let error = errors
+            .remove(feature)
+            .unwrap_or_else(|| format!("did not return to {}", text(value)));
+        failed.push(json!({"name": feature, "error": error}));
     }
     let classified = crate::types::classify(&error);
     let mut details = classified.details.unwrap_or_else(|| json!({}));
@@ -2301,12 +2373,12 @@ mod tests {
     /// Width with a fixed maximum, and Height whose maximum a register
     /// the XML does not name sets, as on cameras where it follows other
     /// settings.
-    const GEOMETRY: &str = r#"<Integer Name="Width"><pValue>WidthReg</pValue><Min>16</Min><Max>1920</Max></Integer><IntReg Name="WidthReg"><Address>0x64</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Integer Name="Height"><pValue>HeightReg</pValue><Min>16</Min><pMax>HeightLimit</pMax></Integer><IntReg Name="HeightReg"><Address>0x68</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><IntReg Name="HeightLimit"><Address>0x6c</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
+    const GEOMETRY_XML: &str = r#"<Integer Name="Width"><pValue>WidthReg</pValue><Min>16</Min><Max>1920</Max></Integer><IntReg Name="WidthReg"><Address>0x64</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><Integer Name="Height"><pValue>HeightReg</pValue><Min>16</Min><pMax>HeightLimit</pMax></Integer><IntReg Name="HeightReg"><Address>0x68</Address><Length>4</Length><AccessMode>RW</AccessMode><Endianess>LittleEndian</Endianess></IntReg><IntReg Name="HeightLimit"><Address>0x6c</Address><Length>4</Length><AccessMode>RO</AccessMode><Endianess>LittleEndian</Endianess></IntReg>"#;
 
     #[test]
     fn a_value_only_the_writes_can_check_is_a_warning_then_rolled_back() {
         use crate::camera::tests::{Device, device_camera};
-        let device = Device::new(GEOMETRY)
+        let device = Device::new(GEOMETRY_XML)
             .with(0x64, 640)
             .with(0x68, 480)
             .with(0x6c, 480);
@@ -2482,6 +2554,54 @@ mod tests {
         }
     }
 
+    /// A binning written and rolled back scales the width and offset
+    /// twice, rounding them: the rollback puts the geometry back as a
+    /// group, within the simulator's dynamic bounds (OffsetX at most
+    /// WidthMax - Width).
+    #[test]
+    fn a_failed_change_restores_the_geometry_a_write_rescaled() {
+        let mut camera = sim();
+        set(
+            &mut camera,
+            &[assign("Width=639"), assign("OffsetX=1281")],
+            false,
+        )
+        .unwrap();
+        let values = [assign("BinningHorizontal=4"), assign("Width=1000")];
+        // The binning moves Width's bounds, so only the write can check it.
+        let plan = set(&mut camera, &values, true).unwrap();
+        assert_eq!(plan.warnings.len(), 1, "{:?}", plan.warnings);
+        let error = set(&mut camera, &values, false).unwrap_err();
+        let classified = crate::types::classify(&error);
+        assert_eq!(classified.kind, ErrorKind::OutOfRange, "{error:#}");
+        assert!(
+            format!("{error:#}").contains("every value written was restored"),
+            "{error:#}"
+        );
+        // Restoring BinningHorizontal alone leaves Width 636 and OffsetX
+        // 1280, each scaled down by 4 and back up.
+        assert_eq!(
+            classified.details.unwrap()["rollback"],
+            json!({"restored":["BinningHorizontal","Width","OffsetX"],"failed":[]})
+        );
+        for (feature, value) in [
+            ("BinningHorizontal", 1),
+            ("Width", 639),
+            ("OffsetX", 1281),
+            ("WidthMax", 1920),
+        ] {
+            assert_eq!(camera.get(feature).unwrap(), value, "{feature}");
+        }
+        // A change that writes no geometry checkpoints none.
+        let error = set(
+            &mut camera,
+            &[assign("ExposureTime=4000"), assign("Gain=99")],
+            false,
+        )
+        .unwrap_err();
+        assert!(crate::types::classify(&error).details.unwrap()["rollback"].is_null());
+    }
+
     #[test]
     fn rollback_reports_what_it_restored() {
         let mut camera = sim();
@@ -2491,6 +2611,7 @@ mod tests {
         let error = rollback(
             &mut camera,
             written,
+            &[],
             Categorized::error(ErrorKind::OutOfRange, "Width is too large"),
         );
         let classified = crate::types::classify(&error);
