@@ -124,7 +124,9 @@ say "Checksum OK: $expected"
 stem=${name%.tar.gz}
 mkdir "$work/x"
 tar -xzf "$work/$name" -C "$work/x" || fail "cannot extract $name"
-[ -f "$work/x/$stem/capturefab" ] && [ -x "$work/x/$stem/capturefab" ] || fail "$name has no capturefab executable"
+if [ ! -f "$work/x/$stem/capturefab" ] || [ ! -x "$work/x/$stem/capturefab" ]; then
+    fail "$name has no capturefab executable"
+fi
 base=${prefix:-${XDG_DATA_HOME:-$HOME/.local/share}/capturefab}
 dest="$base/$VERSION"
 mkdir -p "$base"
