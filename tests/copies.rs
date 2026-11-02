@@ -555,7 +555,16 @@ fn recordings_pipe_the_frame_or_unpack_it_once() {
             );
             assert_eq!(site(&report, "pipe_write"), narrowed, "{format}: {report}");
         }
-        assert_eq!(calls(&report, "pipe_write"), written, "{format}: {report}");
+        // On Linux a frame's own bytes are spliced into the pipe, not
+        // written: no copy on this side.
+        let piped = calls(&report, "pipe_write") + calls(&report, "pipe_splice");
+        assert_eq!(piped, written, "{format}: {report}");
+        let spliced = calls(&report, "pipe_splice") > 0;
+        assert_eq!(
+            spliced,
+            cfg!(target_os = "linux") && !converted,
+            "{format}: {report}"
+        );
     }
 }
 

@@ -8,6 +8,8 @@ pub(crate) mod hwdec;
 #[cfg(feature = "jpeg")]
 mod mjpeg;
 mod native;
+#[cfg(target_os = "linux")]
+mod pipes;
 #[cfg(any(test, target_os = "linux"))]
 mod v4l2;
 
@@ -1343,6 +1345,11 @@ impl Decoder {
         let shared = queue.clone();
         let described = log.clone();
         let live = scheme(source).is_some_and(|s| s != "file");
+        #[cfg(target_os = "linux")]
+        let mut enlarge = Some({
+            use std::os::fd::AsRawFd;
+            stdout.as_raw_fd()
+        });
         let thread = thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             // Raw video is read at the size and format FFmpeg described.
@@ -1402,6 +1409,11 @@ impl Decoder {
                     frame.wall_ms = crate::scheduling::now_ms();
                     frame
                 });
+                // The pipe holds a frame like this one in one go.
+                #[cfg(target_os = "linux")]
+                if let (Ok(frame), Some(fd)) = (&result, enlarge.take()) {
+                    pipes::enlarge(fd, frame.jpeg.as_ref().unwrap_or(&frame.data).len());
+                }
                 let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                 match result {
                     Ok(frame) => {
@@ -3828,6 +3840,12 @@ impl WriterQueue {
             .get_or_insert(error);
     }
 }
+/// Hands a frame's own bytes to the encoder's pipe without copying them.
+#[cfg(target_os = "linux")]
+use pipes::Splicer;
+/// Elsewhere every frame is written into the pipe.
+#[cfg(not(target_os = "linux"))]
+enum Splicer {}
 /// When a writer sends the last frame again on a slot without a new one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Repeat {
@@ -3852,7 +3870,7 @@ const KEEP_ALIVE: Duration = Duration::from_millis(500);
 /// at most once.
 fn write_frames(
     shared: &WriterQueue,
-    input: &mut impl Write,
+    (input, mut splicer): (&mut impl Write, Option<&mut Splicer>),
     (raw, jetson): (RawInput, Option<JetsonInput>),
     interval: Duration,
     repeat: Repeat,
@@ -3894,8 +3912,20 @@ fn write_frames(
             None => raw.payload(frame, &scratch.bytes),
         };
         shared.busy.store(true, Ordering::Relaxed);
-        crate::copies::record(crate::copies::Site::PipeWrite, payload.len());
-        let written = payload.write_to(input);
+        let written = match (splicer.as_deref_mut(), payload) {
+            // The frame's own bytes: their pages go into the pipe.
+            #[cfg(target_os = "linux")]
+            (Some(splicer), Payload::Slice(bytes)) if !raw.converts() && jetson.is_none() => {
+                crate::copies::record(crate::copies::Site::PipeSplice, bytes.len());
+                splicer.send(frame, bytes)
+            }
+            #[cfg(not(target_os = "linux"))]
+            (Some(never), _) => match *never {},
+            _ => {
+                crate::copies::record(crate::copies::Site::PipeWrite, payload.len());
+                payload.write_to(input)
+            }
+        };
         shared.busy.store(false, Ordering::Relaxed);
         if let Err(e) = written {
             shared.fail(format!("FFmpeg input failed: {e}"));
@@ -3958,7 +3988,9 @@ enum Input {
 }
 struct EncoderProcess {
     child: Child,
-    writer: Option<JoinHandle<()>>,
+    /// The frame writer: it ends with the frames whose pages may still be
+    /// in the pipe (`pipes::Splicer`), which live until FFmpeg has exited.
+    writer: Option<JoinHandle<Vec<Frame>>>,
     output_thread: Option<JoinHandle<EncodedOutput>>,
     log_thread: Option<JoinHandle<()>>,
     queue: Arc<WriterQueue>,
@@ -4623,6 +4655,14 @@ impl JetsonInput {
         match self {
             Self::I420 => "i420",
             Self::Rgba => "rgba",
+        }
+    }
+    /// The bytes of each frame GStreamer reads.
+    fn frame_bytes(self, width: u32, height: u32) -> usize {
+        let (width, height) = (width as usize, height as usize);
+        match self {
+            Self::I420 => width * height + 2 * width.div_ceil(2) * height.div_ceil(2),
+            Self::Rgba => width * height * 4,
         }
     }
     /// Convert `frame` into `scratch` for `payload`, in one pass: RGBA, or
@@ -5465,6 +5505,8 @@ impl Forwarder {
                 "-q",
                 "fdsrc",
                 "fd=0",
+                // A frame a read, rather than 4 KiB.
+                &format!("blocksize={}", input.frame_bytes(width, height)),
                 "!",
                 "rawvideoparse",
                 &format!("width={width}"),
@@ -5694,8 +5736,17 @@ impl Forwarder {
             Input::Frames(raw, jetson) => (Some(*raw), *jetson, None),
             Input::Copied(tap, feed) => (None, None, Some((tap.clone(), feed.clone()))),
         };
+        if let Input::Frames(raw, None) = &input {
+            #[cfg(target_os = "linux")]
+            {
+                use std::os::fd::AsRawFd;
+                pipes::enlarge(input_pipe.as_raw_fd(), raw.pipe_len(width, height)?);
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = raw;
+        }
         let writer = thread::spawn(move || {
-            match input {
+            let held = match input {
                 Input::Frames(raw, jetson) => {
                     // Each new frame once, at most one per slot.
                     let repeat = match (jetson, local) {
@@ -5703,18 +5754,40 @@ impl Forwarder {
                         (None, true) => Repeat::Never,
                         (None, false) => Repeat::AfterSilence,
                     };
-                    write_frames(&shared, &mut input_pipe, (raw, jetson), interval, repeat);
+                    // FFmpeg reads a frame's own bytes straight from its
+                    // pages, which stay as they are until it has.
+                    #[cfg(target_os = "linux")]
+                    let mut splicer = (jetson.is_none() && !raw.converts()).then(|| {
+                        use std::os::fd::AsRawFd;
+                        Splicer::new(input_pipe.as_raw_fd())
+                    });
+                    #[cfg(not(target_os = "linux"))]
+                    let mut splicer: Option<Splicer> = None;
+                    write_frames(
+                        &shared,
+                        (&mut input_pipe, splicer.as_mut()),
+                        (raw, jetson),
+                        interval,
+                        repeat,
+                    );
+                    #[cfg(target_os = "linux")]
+                    let held = splicer.map(Splicer::into_held).unwrap_or_default();
+                    #[cfg(not(target_os = "linux"))]
+                    let held = Vec::new();
+                    held
                 }
                 Input::Copied(tap, feed) => {
                     tap.attach(feed.clone());
                     write_copied(&shared, &feed, &mut input_pipe);
                     tap.detach(&feed);
+                    Vec::new()
                 }
-            }
+            };
             // Closing stdin lets FFmpeg flush its muxer and finalize files.
             drop(input_pipe);
             shared.running.store(false, Ordering::Release);
             shared.changed.notify_all();
+            held
         });
         self.process = Some(EncoderProcess {
             child,
@@ -6078,12 +6151,17 @@ fn finish(process: &mut EncoderProcess) -> Finished {
     if let Some(thread) = process.stage_log.take() {
         let _ = thread.join();
     }
-    if let Some(thread) = process.writer.take()
-        && thread.join().is_err()
-    {
-        shutdown_error
-            .get_or_insert_with(|| "FFmpeg input writer terminated unexpectedly".to_owned());
-    }
+    // Frames FFmpeg may not have read out of the pipe live until here,
+    // where it has exited.
+    let _held = match process.writer.take().map(JoinHandle::join) {
+        Some(Ok(held)) => held,
+        Some(Err(_)) => {
+            shutdown_error
+                .get_or_insert_with(|| "FFmpeg input writer terminated unexpectedly".to_owned());
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
     let mut recording = None;
     if let Some(thread) = process.output_thread.take() {
         match thread.join() {
@@ -7696,9 +7774,11 @@ esac"#
         // Luma plane, then 2x2 U and V planes for odd dimensions.
         let i420 = JetsonInput::I420.bytes(&gray).unwrap();
         assert_eq!(i420.len(), 9 + 2 * 4);
+        assert_eq!(i420.len(), JetsonInput::I420.frame_bytes(3, 3));
         assert_eq!((&i420[..9], &i420[9..]), (&gray.data[..], &[128; 8][..]));
         let rgba = JetsonInput::Rgba.bytes(&gray).unwrap();
         assert_eq!(&rgba[..8], [1, 1, 1, 255, 2, 2, 2, 255]);
+        assert_eq!(rgba.len(), JetsonInput::Rgba.frame_bytes(3, 3));
         // The luma plane of a Mono8 frame is the frame's own buffer.
         let mut scratch = Scratch::default();
         JetsonInput::I420.prepare(&gray, &mut scratch).unwrap();
@@ -8145,7 +8225,8 @@ esac"#
                     } else {
                         Repeat::Never
                     };
-                    let taken = write_frames(&queue, &mut pipe, (raw, None), interval, repeat);
+                    let taken =
+                        write_frames(&queue, (&mut pipe, None), (raw, None), interval, repeat);
                     (pipe.bytes, taken)
                 }
             });
@@ -9007,6 +9088,7 @@ esac"#
     /// A stream from a camera slower than its rate gets each frame once and
     /// still carries the rate asked for: FFmpeg repeats the frames.
     #[test]
+    #[cfg(unix)]
     #[ignore = "requires a bundled FFmpeg or CAPTUREFAB_FFMPEG executable"]
     fn ffmpeg_streams_keep_their_rate_from_slower_cameras() {
         let exe = executable().unwrap();

@@ -9,7 +9,7 @@ mod rows;
 mod view;
 pub(crate) use encoded::write_all_vectored;
 pub use encoded::{Body, Encoded};
-#[cfg(all(test, feature = "jpeg"))]
+#[cfg(test)]
 pub(crate) use rows::tests::noise_frame;
 pub(crate) use rows::{Channels, RowReader};
 #[cfg(feature = "jpeg")]

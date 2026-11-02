@@ -27,6 +27,9 @@ pub(crate) enum Site {
     PipeRead,
     /// A frame written into an encoder's input pipe.
     PipeWrite,
+    /// A frame's own pages handed to an encoder's input pipe (`vmsplice`,
+    /// Linux): no copy here; the encoder's read is the only one.
+    PipeSplice,
     /// An encoded file written to disk.
     FileWrite,
     /// An image written to the capture command's standard output.
@@ -84,10 +87,11 @@ pub(crate) enum Class {
 }
 
 impl Site {
-    pub(crate) const ALL: [Site; 23] = [
+    pub(crate) const ALL: [Site; 24] = [
         Site::GvspReceive,
         Site::PipeRead,
         Site::PipeWrite,
+        Site::PipeSplice,
         Site::FileWrite,
         Site::StdoutWrite,
         Site::StreamCopy,
@@ -114,6 +118,7 @@ impl Site {
             Site::GvspReceive => "gvsp_receive",
             Site::PipeRead => "pipe_read",
             Site::PipeWrite => "pipe_write",
+            Site::PipeSplice => "pipe_splice",
             Site::FileWrite => "file_write",
             Site::StdoutWrite => "stdout_write",
             Site::StreamCopy => "stream_copy",
@@ -141,6 +146,7 @@ impl Site {
             Site::GvspReceive
             | Site::PipeRead
             | Site::PipeWrite
+            | Site::PipeSplice
             | Site::FileWrite
             | Site::StdoutWrite
             | Site::StreamCopy => Class::Boundary,
