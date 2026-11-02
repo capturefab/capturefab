@@ -62,7 +62,7 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
     let Ok(mut file) = options.open(&path) else {
         return Ok(None);
     };
-    if fs2::FileExt::try_lock_exclusive(&file).is_err() {
+    if !try_lock(&file) {
         let mut owner = String::new();
         let _ = file.read_to_string(&mut owner);
         return Err(busy(info, serde_json::from_str(&owner).unwrap_or_default()));
@@ -73,6 +73,40 @@ pub(crate) fn acquire(info: &CameraInfo, session: &str) -> Result<Option<CameraL
     let _ = file.write_all(owner.to_string().as_bytes());
     let _ = file.flush();
     Ok(Some(CameraLock { _file: file }))
+}
+
+/// Take `file`'s lock for this process: false when another holds it. The
+/// lock lasts until the file is closed, as the process that holds it exits.
+#[cfg(not(windows))]
+fn try_lock(file: &std::fs::File) -> bool {
+    fs2::FileExt::try_lock_exclusive(file).is_ok()
+}
+/// Windows keeps what a lock covers from being read through any other
+/// handle, so the lock covers one byte far past the owner written at the
+/// start, which a process asking for the camera reads. A lock on the whole
+/// file, as an older Capturefab takes, overlaps it all the same.
+#[cfg(windows)]
+fn try_lock(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::{
+        Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx},
+        System::IO::OVERLAPPED,
+    };
+    let mut at = OVERLAPPED::default();
+    // Byte 4 GiB: no owner is that long.
+    at.Anonymous.Anonymous.OffsetHigh = 1;
+    // SAFETY: the handle is the open file's, and `at` outlives the call,
+    // which with LOCKFILE_FAIL_IMMEDIATELY returns at once.
+    unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut at,
+        ) != 0
+    }
 }
 
 /// `camera_busy` for the camera `info` names, which the worker `owner`
@@ -184,13 +218,9 @@ mod tests {
         // A second owner, in this process or another, is refused.
         let error = acquire(&info, "other").err().unwrap();
         assert_eq!(crate::cli::error_code(&error), ("camera_busy", 3));
-        // Windows keeps a locked file unreadable, so only the refusal shows.
-        #[cfg(unix)]
-        {
-            let details = crate::types::classify(&error).details.unwrap();
-            assert_eq!(details["held_by"]["pid"], std::process::id());
-            assert_eq!(details["held_by"]["session"], "bench");
-        }
+        let details = crate::types::classify(&error).details.unwrap();
+        assert_eq!(details["held_by"]["pid"], std::process::id());
+        assert_eq!(details["held_by"]["session"], "bench");
         drop(held);
         assert!(acquire(&info, "other").unwrap().is_some());
     }

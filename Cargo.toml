@@ -70,7 +70,7 @@ rustyline = { version = "18", optional = true, default-features = false, feature
 # a worker's private protocol handle, publishing a capture without
 # replacing a file (MoveFileExW), and the memory left (GlobalMemoryStatusEx).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 # Ctrl-C, Ctrl-Break and a closed console where there are no Unix signals,
 # which go through libc.
