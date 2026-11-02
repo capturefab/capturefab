@@ -6355,10 +6355,20 @@ for i in 1 2; do printf 'P6\n2 2\n255\n'; head -c 12 /dev/zero; done"#,
         ] {
             let mut camera = open_url(url, Duration::from_secs(2)).unwrap();
             camera.start(12).unwrap();
-            for _ in 0..2 {
-                camera.next_frame(Duration::from_secs(2)).unwrap();
+            // A file gives each of its two frames; a live stream its newest,
+            // which can be the second by the time the first is asked for.
+            let mut frames = 0;
+            let ended = loop {
+                match camera.next_frame(Duration::from_secs(2)) {
+                    Ok(_) => frames += 1,
+                    Err(error) => break error,
+                }
+                assert!(frames <= 2, "{url}: a third frame");
+            };
+            match end {
+                StreamEnd::Finished => assert_eq!(frames, 2, "{url}"),
+                _ => assert!(frames >= 1, "{url}: no frame"),
             }
-            let ended = camera.next_frame(Duration::from_secs(2)).unwrap_err();
             assert_eq!(stream_end(&ended), Some(end), "{url}: {ended:#}");
             if end == StreamEnd::Finished {
                 assert_eq!(
