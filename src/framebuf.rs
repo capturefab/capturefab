@@ -41,6 +41,18 @@ pub fn pool() -> &'static FramePool {
     POOL.get_or_init(|| FramePool::new(crate::host::memory_budget))
 }
 
+/// The process's pool for the images frames are converted into for an
+/// encoder that cannot read them as they are (the RGB image of a Bayer
+/// frame a JPEG is compressed from). It is not the frame pool, so encoding
+/// never pushes a camera's buffers out of that, and it keeps one buffer
+/// idle for each encoder thread, within the same share of memory.
+pub fn transforms() -> &'static FramePool {
+    static POOL: OnceLock<FramePool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        FramePool::with_idle(crate::host::threads(usize::MAX), crate::host::memory_budget)
+    })
+}
+
 /// Frame-sized buffers waiting to be used again.
 pub struct FramePool {
     shared: Arc<Shared>,
@@ -48,6 +60,8 @@ pub struct FramePool {
 
 struct Shared {
     idle: Mutex<Vec<Vec<u8>>>,
+    /// The most buffers kept idle.
+    max_idle: usize,
     /// The memory the process may still use, when known.
     budget: Box<dyn Fn() -> Option<u64> + Send + Sync>,
     allocations: AtomicU64,
@@ -68,9 +82,17 @@ pub struct PoolStats {
 
 impl FramePool {
     pub(crate) fn new(budget: impl Fn() -> Option<u64> + Send + Sync + 'static) -> Self {
+        Self::with_idle(MAX_IDLE, budget)
+    }
+    /// A pool that keeps up to `max_idle` buffers idle.
+    pub(crate) fn with_idle(
+        max_idle: usize,
+        budget: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    ) -> Self {
         Self {
             shared: Arc::new(Shared {
                 idle: Mutex::new(Vec::new()),
+                max_idle: max_idle.max(1),
                 budget: Box::new(budget),
                 allocations: AtomicU64::new(0),
                 reuses: AtomicU64::new(0),
@@ -99,6 +121,9 @@ impl FramePool {
     }
     /// An empty buffer that can grow to `capacity` bytes without moving, for
     /// a producer that appends.
+    // USB3 Vision assembles frames by appending and hands transfers
+    // their buffers.
+    #[cfg_attr(not(feature = "usb"), allow(dead_code))]
     pub(crate) fn take_empty(&self, capacity: usize) -> PoolVec {
         let vec = self.reuse(capacity).unwrap_or_else(|| {
             self.shared.allocations.fetch_add(1, Ordering::Relaxed);
@@ -154,7 +179,7 @@ impl Shared {
             let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
             idle.push(vec);
             let mut bytes: usize = idle.iter().map(Vec::capacity).sum();
-            while idle.len() > MAX_IDLE || bytes > limit {
+            while idle.len() > self.max_idle || bytes > limit {
                 let oldest = idle.remove(0);
                 bytes -= oldest.capacity();
                 freed.push(oldest);
@@ -186,6 +211,9 @@ impl PoolVec {
     pub fn capacity(&self) -> usize {
         self.vec.capacity()
     }
+    // USB3 Vision assembles frames by appending and hands transfers
+    // their buffers.
+    #[cfg_attr(not(feature = "usb"), allow(dead_code))]
     pub(crate) fn extend_from_slice(&mut self, bytes: &[u8]) {
         let end = self.len + bytes.len();
         if end <= self.vec.len() {
@@ -222,6 +250,9 @@ impl PoolVec {
     }
     /// The vector itself, at its length, for an API that takes ownership of
     /// it and gives it back (`FramePool::adopt`): a USB transfer.
+    // USB3 Vision assembles frames by appending and hands transfers
+    // their buffers.
+    #[cfg_attr(not(feature = "usb"), allow(dead_code))]
     pub(crate) fn into_vec(mut self) -> Vec<u8> {
         let mut vec = std::mem::take(&mut self.vec);
         vec.truncate(self.len);
@@ -289,6 +320,7 @@ impl FrameBuf {
     }
     /// The buffer itself, to write to: this one when nothing else shares
     /// it, else a copy from the pool, which is counted.
+    #[cfg(test)]
     pub(crate) fn into_pool_vec(self) -> PoolVec {
         match Arc::try_unwrap(self.0) {
             Ok(Backing::Pool(vec)) => vec,
@@ -303,6 +335,7 @@ impl FrameBuf {
 }
 
 /// A copy of a shared buffer's bytes in a pooled buffer of its own.
+#[cfg(test)]
 fn owned_copy(bytes: &[u8]) -> PoolVec {
     crate::copies::record(crate::copies::Site::FrameCow, bytes.len());
     let mut copy = pool().take_empty(bytes.len());

@@ -1,7 +1,9 @@
 #[cfg(feature = "jpeg")]
 use capturefab::testing::jpeg;
 use capturefab::testing::{
-    auto, frame,
+    auto,
+    camera_profile::CameraKind,
+    frame,
     session::{SessionCommand, SessionHandle},
     storage::{self, SyncMode},
     types::{Frame, MONO8, RGB8},
@@ -449,6 +451,43 @@ fn main() {
                 },
             );
         }
+    }
+    // Converted 12 MP stills, inspections and metering: packed Bayer read in
+    // place, unpacked and demosaicked once into what each consumer reads.
+    for (name, format) in [("BayerRG12p", 0x010c_0059), ("BayerRG8", 0x0108_0009)] {
+        let suffix = format!("{name}/4096x3000");
+        if !["encode/jpeg/", "encode/png/", "inspect/", "auto/meter/"]
+            .iter()
+            .any(|prefix| b.selected(&format!("{prefix}{suffix}")))
+        {
+            continue;
+        }
+        let f = frame(4096, 3000, format);
+        #[cfg(feature = "jpeg")]
+        b.run(&format!("encode/jpeg/{suffix}"), f.data.len(), || {
+            capturefab::testing::frame::encode_parts(&f, "jpeg", None, Some(&meta)).unwrap()
+        });
+        b.run(&format!("encode/png/{suffix}"), f.data.len(), || {
+            capturefab::testing::frame::encode_parts(&f, "png", None, Some(&meta)).unwrap()
+        });
+        for (label, region) in [
+            ("inspect", None),
+            ("inspect/region", Some([0.25, 0.25, 0.5, 0.5])),
+        ] {
+            b.run(&format!("{label}/{suffix}"), f.data.len(), || {
+                capturefab::testing::inspect::inspect(
+                    &f,
+                    CameraKind::AreaScan,
+                    region,
+                    1024,
+                    capturefab::testing::inspect::PreviewFormat::Auto,
+                )
+                .unwrap()
+            });
+        }
+        b.run(&format!("auto/meter/{suffix}"), f.data.len(), || {
+            auto::meter(&f).unwrap()
+        });
     }
     // A frame-sized buffer, as a camera's receive loop takes one per frame.
     b.run("pool/vec-zeroed/12MB", 12 << 20, || vec![0u8; 12 << 20]);

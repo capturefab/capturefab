@@ -2,13 +2,12 @@
 //! feature). Frames libjpeg-turbo reads (RGB8, BGR8, Mono8) are encoded in
 //! place, and the JPEG stays in the buffer libjpeg-turbo wrote it to.
 use crate::{
-    frame::Body,
+    frame::{Body, Samples},
     types::{Frame, MONO8},
 };
 use anyhow::Result;
 #[cfg(not(feature = "jpeg"))]
 use anyhow::bail;
-use std::borrow::Cow;
 
 /// Fixed quality and 4:2:0 chroma (gray for monochrome), so the same frame
 /// produces comparable files wherever it is encoded.
@@ -22,38 +21,43 @@ pub(crate) fn monochrome(pixel_format: u32) -> bool {
 }
 
 /// 8-bit pixels ready for compression: one gray channel or interleaved RGB,
-/// borrowed where the frame already holds them.
+/// borrowed where the frame already holds them, else converted once into a
+/// pooled buffer.
 pub struct Raster<'a> {
     pub width: u32,
     pub height: u32,
     pub channels: usize,
-    pub data: Cow<'a, [u8]>,
+    pub data: Samples<'a>,
 }
 
 impl<'a> Raster<'a> {
     pub fn new(frame: &'a Frame) -> Result<Self> {
-        let (channels, data) = if frame.pixel_format == MONO8 {
-            let pixels = crate::frame::checked_pixels(frame)?;
-            anyhow::ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
-            (1, Cow::Borrowed(&frame.data[..pixels]))
-        } else if monochrome(frame.pixel_format) {
+        let (channels, data) = if monochrome(frame.pixel_format) {
             // One pass straight to 8-bit gray; no RGB triplication.
-            let gray = crate::frame::convert(frame, |[gray, _, _]| gray)?;
-            crate::copies::record(crate::copies::Site::StillTransform, gray.len());
-            (1, Cow::Owned(gray))
+            let gray = crate::frame::gray8_samples(frame)?
+                .ok_or_else(|| anyhow::anyhow!("monochrome frame has no gray conversion"))?;
+            (1, gray)
         } else {
-            let rgb = crate::frame::rgb_samples(frame)?;
-            if let Cow::Owned(rgb) = &rgb {
-                crate::copies::record(crate::copies::Site::StillTransform, rgb.len());
-            }
-            (3, rgb)
+            (3, crate::frame::rgb_samples(frame)?)
         };
+        if data.converted() {
+            crate::copies::record(crate::copies::Site::StillTransform, data.len());
+        }
         Ok(Self {
             width: frame.width,
             height: frame.height,
             channels,
             data,
         })
+    }
+    /// A raster of samples already in hand, such as a preview.
+    pub(crate) fn of(width: u32, height: u32, channels: usize, data: &'a [u8]) -> Self {
+        Self {
+            width,
+            height,
+            channels,
+            data: Samples::Borrowed(data),
+        }
     }
 }
 
@@ -309,16 +313,12 @@ mod tests {
         for (format, bytes) in [(RGB8, 3), (0x0218_0015, 3), (MONO8, 1)] {
             let frame = frame(format, 97, 61, bytes);
             // Converted to RGB, or copied, as every frame once was.
-            let copied = Raster {
-                width: 97,
-                height: 61,
-                channels: bytes,
-                data: Cow::Owned(if format == MONO8 {
-                    frame.data.to_vec()
-                } else {
-                    crate::frame::rgb(&frame).unwrap()
-                }),
+            let samples = if format == MONO8 {
+                frame.data.to_vec()
+            } else {
+                crate::frame::rgb(&frame).unwrap()
             };
+            let copied = Raster::of(97, 61, bytes, &samples);
             for quality in [QUALITY, 75, 100] {
                 assert_eq!(
                     encode(&frame, quality).unwrap(),

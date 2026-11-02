@@ -7,14 +7,26 @@
 use std::io::{IoSlice, Write};
 
 /// The bulk of an encoded image.
-#[derive(Clone)]
 pub enum Body<'a> {
     /// The frame's own bytes.
     Borrowed(&'a [u8]),
     Vec(Vec<u8>),
+    /// A conversion of the frame, in a buffer that goes back to its pool.
+    Pooled(crate::framebuf::PoolVec),
     /// libjpeg-turbo's output, in the buffer it allocated.
     #[cfg(feature = "jpeg")]
     Jpeg(crate::jpeg::Jpeg),
+}
+
+impl Clone for Body<'_> {
+    fn clone(&self) -> Self {
+        match self {
+            Body::Borrowed(bytes) => Body::Borrowed(bytes),
+            #[cfg(feature = "jpeg")]
+            Body::Jpeg(jpeg) => Body::Jpeg(jpeg.clone()),
+            other => Body::Vec(other.to_vec()),
+        }
+    }
 }
 
 impl std::ops::Deref for Body<'_> {
@@ -23,6 +35,7 @@ impl std::ops::Deref for Body<'_> {
         match self {
             Body::Borrowed(bytes) => bytes,
             Body::Vec(bytes) => bytes,
+            Body::Pooled(bytes) => bytes,
             #[cfg(feature = "jpeg")]
             Body::Jpeg(bytes) => bytes,
         }

@@ -5,8 +5,12 @@ use std::borrow::Cow;
 
 mod encoded;
 mod formats;
+mod rows;
+mod view;
 pub(crate) use encoded::write_all_vectored;
 pub use encoded::{Body, Encoded};
+pub(crate) use rows::{Channels, RowReader};
+pub use view::FrameRef;
 
 pub fn pixel_format_name(format: u32) -> &'static str {
     match format {
@@ -363,7 +367,7 @@ fn bayer8(pixel_format: u32) -> Option<u32> {
         v => wide_bayer(v).map(|(bayer8, _)| bayer8),
     }
 }
-/// The 8-bit format `eight_bit` reduces `pixel_format` to, and the shift
+/// The 8-bit format a row reader reduces `pixel_format` to, and the shift
 /// that brings its samples there: Bayer8 for a 10- to 16-bit mosaic, packed
 /// or not, and Mono8 for packed monochrome. None for every other format.
 fn reduced(pixel_format: u32) -> Option<(u32, u32)> {
@@ -374,50 +378,14 @@ fn reduced(pixel_format: u32) -> Option<(u32, u32)> {
             .map(|shift| (MONO8, shift))
     })
 }
-/// The format `eight_bit` turns `pixel_format` into.
+/// The 8-bit format whose samples a row reader decodes `pixel_format`'s
+/// into.
 fn eight_bit_format(pixel_format: u32) -> u32 {
     reduced(pixel_format).map_or_else(|| unpacked_format(pixel_format), |(format, _)| format)
 }
-/// `frame` in a format the converters read directly: `unpacked`, except
-/// that packed monochrome becomes Mono8 and a 10- to 16-bit Bayer mosaic
-/// Bayer8, with the bits `sample8` keeps. Packed rows are unpacked a group
-/// at a time into one reused row, so no 16-bit image is built.
-fn eight_bit(frame: &Frame) -> Result<Cow<'_, Frame>> {
-    let format = frame.pixel_format;
-    let Some((pixel_format, shift)) = reduced(format) else {
-        return unpacked(frame);
-    };
-    validate_source(frame)?;
-    let pixels = checked_pixels(frame)?;
-    let (width, height) = (frame.width as usize, frame.height as usize);
-    let stride = row_bytes(frame.width, format);
-    let packed = packing(format);
-    let mut row = vec![[0; 2]; if packed.is_some() { width } else { 0 }];
-    let mut data = vec![0; pixels];
-    let lines = frame.data[..stride * height].chunks_exact(stride);
-    for (line, out) in lines.zip(data.chunks_exact_mut(width)) {
-        let samples = match packed {
-            Some((_, bits, packing)) => {
-                unpack_row(line, bits, packing, &mut row);
-                &row[..]
-            }
-            None => line.as_chunks::<2>().0,
-        };
-        for (value, sample) in out.iter_mut().zip(samples) {
-            *value = (u16::from_le_bytes(*sample) >> shift).min(255) as u8;
-        }
-    }
-    crate::copies::record(crate::copies::Site::Intermediate, data.len());
-    Ok(Cow::Owned(Frame {
-        pixel_format,
-        data: data.into(),
-        ..*frame
-    }))
-}
-/// Formats converted pixel by pixel straight into the caller's storage: the
-/// `formats` layouts, alpha-padded RGB and YUV 4:2:2. Packed monochrome and
-/// Bayer go through `eight_bit`, whose group-wise unpacking is many times
-/// faster than reading each sample on its own.
+/// Formats decoded a pixel at a time: the `formats` layouts, alpha-padded
+/// RGB and YUV 4:2:2. Packed monochrome and Bayer are unpacked a row at a
+/// time, which is many times faster than reading each sample on its own.
 fn streamed(pixel_format: u32) -> bool {
     packing(pixel_format).is_none()
         && !is_bayer(pixel_format)
@@ -430,77 +398,85 @@ pub(crate) fn monochrome(pixel_format: u32) -> bool {
     matches!(pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6)
         || unpacked_shift(pixel_format).is_some()
 }
-fn gray(out: &mut [u8], value: impl Fn(usize) -> u8) {
-    for i in 0..out.len() / 3 {
-        let v = value(i);
-        (out[3 * i], out[3 * i + 1], out[3 * i + 2]) = (v, v, v);
-    }
-}
+/// The frame as 8-bit RGB, three bytes a pixel.
 pub fn rgb(frame: &Frame) -> Result<Vec<u8>> {
     validate_source(frame)?;
-    // Bayer conversion owns its output; avoid allocating an unused RGB image
-    // before dispatching to the demosaic.
-    if is_bayer(frame.pixel_format) || streamed(frame.pixel_format) {
-        return Ok(convert(frame, |p| p)?.into_flattened());
+    let view = FrameRef::whole(frame);
+    let mut out = vec![0; view.pixels() * 3];
+    rows::decode(view, Channels::Rgb, &mut out);
+    Ok(out)
+}
+/// The frame decoded as `channels` into `out`, which is resized to fit and
+/// every byte of which is written: a reused buffer needs no clearing.
+pub(crate) fn decode_into(frame: &Frame, channels: Channels, out: &mut Vec<u8>) -> Result<()> {
+    validate_source(frame)?;
+    let view = FrameRef::whole(frame);
+    out.resize(view.pixels() * channels.bytes(), 0);
+    rows::decode(view, channels, out);
+    Ok(())
+}
+
+/// Samples an encoder reads: the frame's own bytes where they already are
+/// what it reads, else a conversion written once into a buffer from the
+/// transform pool (`framebuf::transforms`), to which it goes back.
+pub enum Samples<'a> {
+    Borrowed(&'a [u8]),
+    Converted(crate::framebuf::PoolVec),
+}
+impl std::ops::Deref for Samples<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Samples::Borrowed(samples) => samples,
+            Samples::Converted(samples) => samples,
+        }
     }
-    let frame = &*eight_bit(frame)?;
-    let pixels = checked_pixels(frame)?;
-    // Flat byte stores vectorize as interleaved 3-byte stores, which `[u8; 3]`
-    // elements from the generic converter do not; only Bayer is shared.
-    let mut out = vec![0; pixels * 3];
-    match frame.pixel_format {
-        MONO8 | 0x0108_00b1 | 0x0108_00c6 => {
-            ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
-            let data = &frame.data[..pixels];
-            gray(&mut out, |i| data[i]);
-        }
-        RGB8 => {
-            ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
-            crate::copies::record(crate::copies::Site::Intermediate, pixels * 3);
-            out.copy_from_slice(&frame.data[..pixels * 3]);
-        }
-        0x0218_0015 => {
-            ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
-            let bgr = frame.data.as_chunks::<3>().0;
-            for (dst, p) in out.as_chunks_mut::<3>().0.iter_mut().zip(bgr) {
-                *dst = [p[2], p[1], p[0]];
+}
+impl<'a> Samples<'a> {
+    pub(crate) fn converted(&self) -> bool {
+        matches!(self, Samples::Converted(_))
+    }
+    /// The samples as an encoded body, a conversion counted as `site`.
+    pub(crate) fn into_body(self, site: crate::copies::Site) -> Body<'a> {
+        match self {
+            Samples::Borrowed(samples) => Body::Borrowed(samples),
+            Samples::Converted(samples) => {
+                crate::copies::record(site, samples.len());
+                Body::Pooled(samples)
             }
         }
-        0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
-            ensure!(
-                frame.data.len() >= pixels * 2,
-                "truncated unpacked monochrome frame"
-            );
-            let shift = unpacked_shift(frame.pixel_format).unwrap_or(8);
-            let data = &frame.data[..pixels * 2];
-            gray(&mut out, |i| {
-                (u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) >> shift).min(255) as u8
-            });
-        }
-        _ => return Ok(convert(frame, |p| p)?.into_flattened()),
     }
-    Ok(out)
+}
+
+/// `view`'s 8-bit samples as `channels`: borrowed where the frame holds
+/// exactly them in whole rows, else decoded once into a pooled buffer.
+pub(crate) fn samples(view: FrameRef<'_>, channels: Channels) -> Result<Samples<'_>> {
+    validate_source(view.frame)?;
+    let line = view.width * channels.bytes();
+    if RowReader::new(view).borrows(channels) && view.width == view.frame.width as usize {
+        let at = view.y0 * line;
+        return Ok(Samples::Borrowed(
+            &view.frame.data[at..at + line * view.height],
+        ));
+    }
+    let mut out = crate::framebuf::transforms().take_stale(line * view.height);
+    rows::decode(view, channels, &mut out);
+    Ok(Samples::Converted(out))
 }
 /// The frame's RGB samples, as `rgb` gives them: an RGB8 frame's own bytes,
 /// else a conversion.
-pub(crate) fn rgb_samples(frame: &Frame) -> Result<Cow<'_, [u8]>> {
-    if frame.pixel_format == RGB8 {
-        let length = checked_pixels(frame)? * 3;
-        ensure!(frame.data.len() >= length, "truncated RGB frame");
-        return Ok(Cow::Borrowed(&frame.data[..length]));
-    }
-    rgb(frame).map(Cow::Owned)
+pub(crate) fn rgb_samples(frame: &Frame) -> Result<Samples<'_>> {
+    samples(FrameRef::whole(frame), Channels::Rgb)
 }
 /// The frame's 8-bit gray samples, as `gray8` gives them: the frame's own
 /// bytes for the 8-bit monochrome formats, else a conversion; None for
 /// color formats.
-pub(crate) fn gray8_samples(frame: &Frame) -> Result<Option<Cow<'_, [u8]>>> {
-    if matches!(frame.pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6) {
-        let pixels = checked_pixels(frame)?;
-        ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
-        return Ok(Some(Cow::Borrowed(&frame.data[..pixels])));
+pub(crate) fn gray8_samples(frame: &Frame) -> Result<Option<Samples<'_>>> {
+    checked_pixels(frame)?;
+    if !monochrome(frame.pixel_format) {
+        return Ok(None);
     }
-    Ok(gray8(frame)?.map(Cow::Owned))
+    samples(FrameRef::whole(frame), Channels::Gray).map(Some)
 }
 /// How far an unpacked 16-bit monochrome sample shifts right to its top 8
 /// bits: Mono10 keeps bits 9-2, Mono12 bits 11-4, Mono14 bits 13-6, and the
@@ -518,48 +494,15 @@ fn unpacked_shift(format: u32) -> Option<u32> {
 /// unpacked first, with the same bit choice as [`rgb`]; None for color,
 /// Bayer, YUV and RGBa formats, which stay RGB.
 pub fn gray8(frame: &Frame) -> Result<Option<Vec<u8>>> {
-    let pixels = checked_pixels(frame)?;
+    checked_pixels(frame)?;
     if !monochrome(frame.pixel_format) {
         return Ok(None);
     }
-    if streamed(frame.pixel_format) {
-        validate_source(frame)?;
-        let width = frame.width as usize;
-        return Ok(Some(
-            (0..pixels)
-                .map(|i| pixel_at(frame, i % width, i / width)[0])
-                .collect(),
-        ));
-    }
-    let frame = eight_bit(frame)?;
-    if matches!(frame.pixel_format, MONO8 | 0x0108_00b1 | 0x0108_00c6) {
-        ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
-        return Ok(Some(match frame {
-            Cow::Owned(Frame { data, .. }) => {
-                let mut data = data.into_pool_vec().into_vec();
-                data.truncate(pixels);
-                data
-            }
-            Cow::Borrowed(frame) => {
-                crate::copies::record(crate::copies::Site::Intermediate, pixels);
-                frame.data[..pixels].to_vec()
-            }
-        }));
-    }
-    let Some(shift) = unpacked_shift(frame.pixel_format) else {
-        return Ok(None);
-    };
-    ensure!(
-        frame.data.len() >= pixels * 2,
-        "truncated unpacked monochrome frame"
-    );
-    let samples = frame.data[..pixels * 2].as_chunks::<2>().0;
-    Ok(Some(
-        samples
-            .iter()
-            .map(|p| (u16::from_le_bytes(*p) >> shift).min(255) as u8)
-            .collect(),
-    ))
+    validate_source(frame)?;
+    let view = FrameRef::whole(frame);
+    let mut out = vec![0; view.pixels()];
+    rows::decode(view, Channels::Gray, &mut out);
+    Ok(Some(out))
 }
 /// The significant bits of each sample of `pixel_format`, from its PFNC
 /// name: 12 for Mono12, Mono12p and BayerRG12, 8 for RGB8, 10 for RGB10p32.
@@ -614,27 +557,34 @@ fn wide_gray_bits(pixel_format: u32) -> Option<u32> {
     }
 }
 /// A monochrome frame of more than 8 bits, packed or not, as big-endian
-/// 16-bit PNG samples with the significant bits at the top, and how many
-/// bits are significant; None for any other format.
-fn gray16(frame: &Frame) -> Result<Option<(Vec<u8>, u32)>> {
+/// 16-bit PNG samples with the significant bits at the top, written once
+/// into a pooled buffer a row at a time, and how many bits are
+/// significant; None for any other format.
+fn gray16(frame: &Frame) -> Result<Option<(crate::framebuf::PoolVec, u32)>> {
     let Some(bits) = wide_gray_bits(unpacked_format(frame.pixel_format)) else {
         return Ok(None);
     };
-    let pixels = checked_pixels(frame)?;
-    let frame = &*unpacked(frame)?;
-    ensure!(
-        frame.data.len() >= pixels * 2,
-        "truncated {} frame",
-        pixel_format_name(frame.pixel_format)
-    );
+    validate_source(frame)?;
+    let (width, height) = (frame.width as usize, frame.height as usize);
+    let stride = row_bytes(frame.width, frame.pixel_format);
+    let packed = packing(frame.pixel_format);
+    let mut unpack = vec![[0; 2]; if packed.is_some() { width } else { 0 }];
+    let mut out = crate::framebuf::transforms().take_stale(width * height * 2);
     let mask = u16::MAX >> (16 - bits);
-    let samples = frame.data[..pixels * 2]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .flat_map(|sample| ((u16::from_le_bytes(*sample) & mask) << (16 - bits)).to_be_bytes())
-        .collect();
-    Ok(Some((samples, bits)))
+    let lines = frame.data[..stride * height].chunks_exact(stride);
+    for (line, out) in lines.zip(out.chunks_exact_mut(width * 2)) {
+        let samples = match packed {
+            Some((_, bits, packing)) => {
+                unpack_row(line, bits, packing, &mut unpack);
+                &unpack[..]
+            }
+            None => line.as_chunks::<2>().0,
+        };
+        for (out, sample) in out.as_chunks_mut::<2>().0.iter_mut().zip(samples) {
+            *out = ((u16::from_le_bytes(*sample) & mask) << (16 - bits)).to_be_bytes();
+        }
+    }
+    Ok(Some((out, bits)))
 }
 /// Opaque RGBA bytes, converted in one pass without an intermediate RGB image.
 pub fn rgba(frame: &Frame) -> Result<Vec<u8>> {
@@ -661,142 +611,23 @@ pub fn convert<P: Copy + Default + Send>(
     Ok(out)
 }
 /// `convert` into a reused buffer, which is replaced by the converted image;
-/// repeated conversions of one frame size then allocate nothing.
+/// repeated conversions of one frame size then allocate nothing, and
+/// write every element without clearing it first.
 pub fn convert_into<P: Copy + Default + Send>(
     frame: &Frame,
     out: &mut Vec<P>,
     pixel: impl Fn([u8; 3]) -> P + Sync,
 ) -> Result<()> {
-    out.clear();
-    convert_to(frame, out, pixel)
-}
-/// Where `convert_to` writes: an empty growable buffer.
-trait Sink<'a, P: 'a> {
-    /// Pixels in order.
-    fn stream(self, pixels: impl Iterator<Item = P>);
-    /// Storage for `len` pixels written out of order.
-    fn prefilled(self, len: usize) -> &'a mut [P];
-}
-impl<'a, P: Copy + Default + 'a> Sink<'a, P> for &'a mut Vec<P> {
-    // Extending from a slice iterator knows its exact length, so it neither
-    // pre-fills nor bounds-checks.
-    fn stream(self, pixels: impl Iterator<Item = P>) {
-        self.extend(pixels);
+    if let Err(error) = validate_source(frame) {
+        out.clear();
+        return Err(error);
     }
-    fn prefilled(self, len: usize) -> &'a mut [P] {
-        self.resize(len, P::default());
-        self
+    let view = FrameRef::whole(frame);
+    if out.len() != view.pixels() {
+        out.clear();
+        out.resize(view.pixels(), P::default());
     }
-}
-fn convert_to<'a, P: Copy + Default + Send + 'a>(
-    frame: &Frame,
-    out: impl Sink<'a, P>,
-    pixel: impl Fn([u8; 3]) -> P + Sync,
-) -> Result<()> {
-    // The `formats` layouts, alpha-padded RGB and YUV stream straight to
-    // the caller's storage. Reused conversion buffers need no temporary image.
-    if streamed(frame.pixel_format) {
-        validate_source(frame)?;
-        let width = frame.width as usize;
-        out.stream(
-            (0..checked_pixels(frame)?).map(|i| pixel(pixel_at(frame, i % width, i / width))),
-        );
-        return Ok(());
-    }
-    let frame = &*eight_bit(frame)?;
-    let pixels = checked_pixels(frame)?;
-    // Streaming formats map source to output in order.
-    match frame.pixel_format {
-        MONO8 | 0x0108_00b1 | 0x0108_00c6 => {
-            ensure!(frame.data.len() >= pixels, "truncated Mono8 frame");
-            out.stream(frame.data[..pixels].iter().map(|&v| pixel([v, v, v])));
-        }
-        RGB8 => {
-            ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
-            let source = frame.data[..pixels * 3].as_chunks::<3>().0;
-            out.stream(source.iter().map(|p| pixel([p[0], p[1], p[2]])));
-        }
-        0x0218_0015 => {
-            ensure!(frame.data.len() >= pixels * 3, "truncated RGB frame");
-            let source = frame.data[..pixels * 3].as_chunks::<3>().0;
-            out.stream(source.iter().map(|p| pixel([p[2], p[1], p[0]])));
-        }
-        0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
-            ensure!(
-                frame.data.len() >= pixels * 2,
-                "truncated unpacked monochrome frame"
-            );
-            let shift = unpacked_shift(frame.pixel_format).unwrap_or(8);
-            let source = frame.data[..pixels * 2].as_chunks::<2>().0;
-            out.stream(source.iter().map(|&p| {
-                let v = (u16::from_le_bytes(p) >> shift).min(255) as u8;
-                pixel([v, v, v])
-            }));
-        }
-        0x0108_0008..=0x0108_000b => {
-            ensure!(frame.data.len() >= pixels, "truncated Bayer8 frame");
-            // Interpolation writes edges and interiors out of order.
-            let out = out.prefilled(pixels);
-            let pattern = bayer_pattern(frame.pixel_format);
-            let (w, h, data) = (frame.width as usize, frame.height as usize, &frame.data);
-            let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
-            let bounded = |x: usize, y: usize| pixel(bayer_bounded(frame, pattern, x, y));
-            let demosaic_row = |y: usize, line: &mut [P]| {
-                if y == 0 || y + 1 == h || w < 3 {
-                    for (x, px) in line.iter_mut().enumerate() {
-                        *px = bounded(x, y);
-                    }
-                    return;
-                }
-                (line[0], line[w - 1]) = (bounded(0, y), bounded(w - 1, y));
-                let chroma = color(0, y) + color(1, y) - 1;
-                let rows = |dy: usize| data[(y + dy - 1) * w..(y + dy) * w].windows(3);
-                for (x, ((up, row), down)) in rows(0).zip(rows(1)).zip(rows(2)).enumerate() {
-                    let horizontal = row[0] as u16 + row[2] as u16;
-                    let vertical = up[1] as u16 + down[1] as u16;
-                    let (near, green, far) = if color(x + 1, y) == 1 {
-                        ((horizontal >> 1) as u8, row[1], (vertical >> 1) as u8)
-                    } else {
-                        let diagonal =
-                            up[0] as u16 + up[2] as u16 + down[0] as u16 + down[2] as u16;
-                        (
-                            row[1],
-                            ((horizontal + vertical) >> 2) as u8,
-                            (diagonal >> 2) as u8,
-                        )
-                    };
-                    line[x + 1] = pixel(if chroma == 0 {
-                        [near, green, far]
-                    } else {
-                        [far, green, near]
-                    });
-                }
-            };
-            // Rows are independent (each reads three input rows), so large
-            // frames are split into row blocks across cores.
-            let threads = worker_threads(pixels);
-            let block = h.div_ceil(threads).max(1) * w;
-            if threads > 1 {
-                std::thread::scope(|scope| {
-                    for (i, rows) in out.chunks_mut(block).enumerate() {
-                        let demosaic_row = &demosaic_row;
-                        scope.spawn(move || {
-                            for (j, line) in rows.chunks_exact_mut(w).enumerate() {
-                                demosaic_row(i * block / w + j, line);
-                            }
-                        });
-                    }
-                });
-            } else {
-                for (y, line) in out.chunks_exact_mut(w).enumerate() {
-                    demosaic_row(y, line);
-                }
-            }
-        }
-        v => {
-            bail!("unsupported PFNC format 0x{v:08x}; capture with --format raw to preserve bytes")
-        }
-    }
+    rows::map(view, out, &pixel);
     Ok(())
 }
 
@@ -821,7 +652,7 @@ pub(crate) fn is_bayer(pixel_format: u32) -> bool {
 /// both greens, blue. As good as a demosaic for statistics over many samples
 /// and several times cheaper.
 struct Quads<'a> {
-    frame: &'a Frame,
+    view: FrameRef<'a>,
     /// See `quad_order`.
     order: [usize; 4],
     columns: usize,
@@ -829,22 +660,22 @@ struct Quads<'a> {
 }
 impl<'a> Quads<'a> {
     /// None for other formats, or a mosaic without a whole quad. The frame
-    /// must have passed `validated_bytes_per_pixel`.
-    fn of(frame: &'a Frame) -> Option<Self> {
-        let (width, height) = (frame.width as usize, frame.height as usize);
-        (is_bayer(frame.pixel_format) && width >= 2 && height >= 2).then(|| Self {
-            frame,
-            order: quad_order(bayer_pattern(frame.pixel_format)),
-            columns: width / 2,
-            rows: height / 2,
+    /// must have passed `validate_source`.
+    fn of(view: FrameRef<'a>) -> Option<Self> {
+        (is_bayer(view.pixel_format()) && view.width >= 2 && view.height >= 2).then(|| Self {
+            view,
+            order: quad_order(bayer_pattern(view.pixel_format())),
+            columns: view.width / 2,
+            rows: view.height / 2,
         })
     }
     fn color(&self, x: usize, y: usize) -> [u8; 3] {
+        let (frame, x, y) = (self.view.frame, self.view.x0 + 2 * x, self.view.y0 + 2 * y);
         let quad = [
-            sample8(self.frame, 2 * x, 2 * y),
-            sample8(self.frame, 2 * x + 1, 2 * y),
-            sample8(self.frame, 2 * x, 2 * y + 1),
-            sample8(self.frame, 2 * x + 1, 2 * y + 1),
+            sample8(frame, x, y),
+            sample8(frame, x + 1, y),
+            sample8(frame, x, y + 1),
+            sample8(frame, x + 1, y + 1),
         ];
         let [red, green, other, blue] = self.order;
         let greens = u16::from(quad[green]) + u16::from(quad[other]);
@@ -870,30 +701,31 @@ pub fn bayer_pattern(pixel_format: u32) -> [usize; 4] {
         _ => [2, 1, 1, 0],
     }
 }
-/// Bilinear demosaic of one pixel using only in-bounds neighbors of each
-/// missing color; the reference rule the vectorized interior must match.
-fn bayer_bounded(frame: &Frame, pattern: [usize; 4], x: usize, y: usize) -> [u8; 3] {
-    let (w, h) = (frame.width as usize, frame.height as usize);
+/// Bilinear demosaic of one pixel of a view using only its in-bounds
+/// neighbors of each missing color, as `rows::demosaic_row` computes it.
+fn bayer_bounded(view: FrameRef<'_>, pattern: [usize; 4], x: usize, y: usize) -> [u8; 3] {
+    let (w, h) = (view.width, view.height);
+    let sample = |x: usize, y: usize| sample8(view.frame, view.x0 + x, view.y0 + y);
     let color = |x: usize, y: usize| pattern[(y & 1) * 2 + (x & 1)];
     std::array::from_fn(|c| {
         if color(x, y) == c {
-            return sample8(frame, x, y);
+            return sample(x, y);
         }
         let (mut sum, mut n) = (0u32, 0u32);
         for yy in y.saturating_sub(1)..(y + 2).min(h) {
             for xx in x.saturating_sub(1)..(x + 2).min(w) {
                 if color(xx, yy) == c {
-                    sum += u32::from(sample8(frame, xx, yy));
+                    sum += u32::from(sample(xx, yy));
                     n += 1;
                 }
             }
         }
-        sum.checked_div(n)
-            .map_or_else(|| sample8(frame, x, y), |v| v as u8)
+        sum.checked_div(n).map_or_else(|| sample(x, y), |v| v as u8)
     })
 }
 /// Bytes per pixel of a convertible format, after validating dimensions and
 /// that the frame holds a complete image.
+#[cfg(test)]
 pub(crate) fn validated_bytes_per_pixel(frame: &Frame) -> Result<usize> {
     let pixels = checked_pixels(frame)?;
     let (bytes, name) = match frame.pixel_format {
@@ -929,14 +761,15 @@ pub fn convertible(pixel_format: u32) -> bool {
             | 0x0108_0008..=0x0108_000b
     )
 }
-/// One pixel exactly as `convert` would produce it; for sparse sampling when
-/// the full image is converted elsewhere (for example on the GPU).
-/// The frame must have passed `validated_bytes_per_pixel`.
-fn pixel_at(frame: &Frame, x: usize, y: usize) -> [u8; 3] {
-    if let Some(rgb) = formats::pixel_at(frame, x, y) {
+/// One pixel of a view exactly as `convert` would produce it, for sparse
+/// sampling. The frame must have passed `validate_source`.
+pub(crate) fn pixel_at(view: FrameRef<'_>, x: usize, y: usize) -> [u8; 3] {
+    let frame = view.frame;
+    let (fx, fy) = (view.x0 + x, view.y0 + y);
+    if let Some(rgb) = formats::pixel_at(frame, fx, fy) {
         return rgb;
     }
-    let i = y * frame.width as usize + x;
+    let i = fy * frame.width as usize + fx;
     let data = &frame.data;
     match frame.pixel_format {
         MONO8 | 0x0108_00b1 | 0x0108_00c6 => [data[i]; 3],
@@ -947,17 +780,17 @@ fn pixel_at(frame: &Frame, x: usize, y: usize) -> [u8; 3] {
         v if yuv422(v).is_some() => {
             let [y0, cb, y1, cr] = yuv422(v).unwrap();
             let stride = row_bytes(frame.width, v);
-            let line = &data[y * stride..(y + 1) * stride];
-            let at = x / 2 * 4;
-            let luma = line[at + if x.is_multiple_of(2) { y0 } else { y1 }];
+            let line = &data[fy * stride..(fy + 1) * stride];
+            let at = fx / 2 * 4;
+            let luma = line[at + if fx.is_multiple_of(2) { y0 } else { y1 }];
             ycbcr(luma, line[at + cb], *line.get(at + cr).unwrap_or(&128))
         }
-        v if packing(v).is_some() && !is_bayer(v) => [sample8(frame, x, y); 3],
+        v if packing(v).is_some() && !is_bayer(v) => [sample8(frame, fx, fy); 3],
         0x0110_0003 | 0x0110_0005 | 0x0110_0025 | 0x0110_0007 | 0x0110_00b8 | 0x0110_00c7 => {
             let shift = unpacked_shift(frame.pixel_format).unwrap_or(8);
             [(u16::from_le_bytes([data[2 * i], data[2 * i + 1]]) >> shift).min(255) as u8; 3]
         }
-        _ => bayer_bounded(frame, bayer_pattern(frame.pixel_format), x, y),
+        _ => bayer_bounded(view, bayer_pattern(frame.pixel_format), x, y),
     }
 }
 /// 8-bit luminance of an RGB pixel, with the weights the histograms use.
@@ -1004,9 +837,14 @@ pub struct Exposure {
 }
 
 pub fn exposure(frame: &Frame) -> Result<Exposure> {
-    validate_source(frame)?;
-    let (w, pixels) = (frame.width as usize, checked_pixels(frame)?);
-    let mono = monochrome(frame.pixel_format);
+    exposure_in(FrameRef::whole(frame))
+}
+
+/// `exposure` of a view, read where it lies.
+pub(crate) fn exposure_in(view: FrameRef<'_>) -> Result<Exposure> {
+    validate_source(view.frame)?;
+    let (w, pixels) = (view.width, view.pixels());
+    let mono = monochrome(view.pixel_format());
     let (mut luma_bins, mut channels) = ([0; 64], [[0; 64]; 3]);
     let (mut sum, mut samples, mut shadows, mut highlights) = (0u64, 0u32, 0u32, 0u32);
     let mut add = |rgb: [u8; 3]| {
@@ -1020,7 +858,7 @@ pub fn exposure(frame: &Frame) -> Result<Exposure> {
         shadows += u32::from(rgb.iter().all(|&v| v <= CRUSHED));
         highlights += u32::from(rgb.iter().any(|&v| v >= BLOWN));
     };
-    match Quads::of(frame) {
+    match Quads::of(view) {
         Some(quads) => {
             let count = quads.columns * quads.rows;
             for i in sample_indices(count, 65_536) {
@@ -1029,7 +867,7 @@ pub fn exposure(frame: &Frame) -> Result<Exposure> {
         }
         None => {
             for i in sample_indices(pixels, 65_536) {
-                add(pixel_at(frame, i % w, i / w));
+                add(pixel_at(view, i % w, i / w));
             }
         }
     }
@@ -1062,90 +900,155 @@ pub struct Clipping {
 /// component, each Bayer sample on its own. Packed samples and wide color
 /// components are read where they lie, without unpacking the frame.
 pub fn clipping(frame: &Frame) -> Result<Clipping> {
-    let pixels = checked_pixels(frame)?;
-    let width = frame.width as usize;
+    clipping_in(FrameRef::whole(frame))
+}
+
+/// `clipping` of a view, a row at a time: packed rows are unpacked into one
+/// reused row, other layouts read in place. Large views are counted in row
+/// blocks across cores.
+pub(crate) fn clipping_in(view: FrameRef<'_>) -> Result<Clipping> {
+    let frame = view.frame;
+    checked_pixels(frame)?;
+    let format = frame.pixel_format;
+    let (x0, y0, width) = (view.x0, view.y0, view.width);
+    let pixels = view.pixels();
     // Wide, packed, planar and padded color: each pixel's brightest component.
-    if let Some(bits) = formats::color_bits(frame.pixel_format) {
+    if let Some(bits) = formats::color_bits(format) {
         validate_source(frame)?;
         let full = (1u32 << bits) - 1;
-        let brightest = (0..pixels).map(|i| {
-            let (rgb, _) = formats::native_color(frame, i % width, i / width)
-                .expect("a validated color layout");
-            // Bits above the format's are not part of the sample.
-            rgb.into_iter()
-                .map(|v| u32::from(v) & full)
-                .max()
-                .unwrap_or(0)
+        let tally = Tally::rows(view, |tally, y| {
+            for x in x0..x0 + width {
+                let (rgb, _) =
+                    formats::native_color(frame, x, y).expect("a validated color layout");
+                // Bits above the format's are not part of the sample.
+                tally.add(
+                    rgb.into_iter()
+                        .map(|v| u32::from(v) & full)
+                        .max()
+                        .unwrap_or(0),
+                    full,
+                );
+            }
         });
-        return Ok(tally(brightest, full, pixels));
+        return Ok(tally.finish(full, pixels));
     }
     // Packed monochrome and Bayer samples, each at its own depth.
-    if let Some((_, bits, _)) = packing(frame.pixel_format) {
+    if let Some((_, bits, packing)) = packing(format) {
         validate_source(frame)?;
-        let samples = (0..pixels).map(|i| u32::from(native_sample(frame, i % width, i / width)));
-        return Ok(tally(samples, (1u32 << bits) - 1, pixels));
+        let full = (1u32 << bits) - 1;
+        let stride = row_bytes(frame.width, format);
+        let mut samples = Vec::new();
+        let tally = Tally::rows(view, move |tally, y| {
+            samples.resize(frame.width as usize, [0; 2]);
+            unpack_row(
+                &frame.data[y * stride..][..stride],
+                bits,
+                packing,
+                &mut samples,
+            );
+            for sample in &samples[x0..x0 + width] {
+                tally.add(u32::from(u16::from_le_bytes(*sample)), full);
+            }
+        });
+        return Ok(tally.finish(full, pixels));
     }
-    let frame = &*unpacked(frame)?;
-    let format = frame.pixel_format;
+    if !convertible(format) {
+        bail!("cannot count clipping in {}", pixel_format_name(format));
+    }
+    validate_source(frame)?;
     let wide = wide_gray_bits(format).or_else(|| wide_bayer(format).map(|(_, shift)| 8 + shift));
-    let (channels, bits) = match format {
+    let (bytes, bits) = match format {
         MONO8 | 0x0108_00b1 | 0x0108_00c6 | 0x0108_0008..=0x0108_000b => (1, 8),
         RGB8 | 0x0218_0015 => (3, 8),
         _ => match wide {
-            Some(bits) => (1, bits),
-            None => bail!("cannot count clipping in {}", pixel_format_name(format)),
+            Some(bits) => (2, bits),
+            // Every other layout as its 8-bit conversion.
+            None => {
+                let tally = Tally::rows(view, |tally, y| {
+                    for x in 0..width {
+                        let rgb = pixel_at(view, x, y - y0);
+                        tally.add(u32::from(rgb[0].max(rgb[1]).max(rgb[2])), 255);
+                    }
+                });
+                return Ok(tally.finish(255, pixels));
+            }
         },
     };
     let full = (1u32 << bits) - 1;
-    let (mut high, mut low, mut top) = (0u64, 0u64, 0u32);
-    let truncated = || format!("truncated {} frame", pixel_format_name(format));
-    if bits > 8 {
-        ensure!(frame.data.len() >= pixels * 2, truncated());
-        for sample in frame.data[..pixels * 2].as_chunks::<2>().0 {
+    let stride = frame.width as usize * bytes;
+    let tally = Tally::rows(view, |tally, y| {
+        let line = &frame.data[y * stride..][x0 * bytes..(x0 + width) * bytes];
+        match bytes {
+            1 => line.iter().for_each(|&v| tally.add(u32::from(v), full)),
             // Bits above the format's are not part of the sample.
-            let sample = u32::from(u16::from_le_bytes(*sample)) & full;
-            top = top.max(sample);
-            high += u64::from(sample == full);
-            low += u64::from(sample == 0);
+            2 => line.as_chunks::<2>().0.iter().for_each(|sample| {
+                tally.add(u32::from(u16::from_le_bytes(*sample)) & full, full);
+            }),
+            _ => line.as_chunks::<3>().0.iter().for_each(|pixel| {
+                tally.add(u32::from(pixel[0].max(pixel[1]).max(pixel[2])), full);
+            }),
         }
-    } else if channels == 1 {
-        ensure!(frame.data.len() >= pixels, truncated());
-        for &sample in &frame.data[..pixels] {
-            top = top.max(u32::from(sample));
-            high += u64::from(sample == 255);
-            low += u64::from(sample == 0);
-        }
-    } else {
-        ensure!(frame.data.len() >= pixels * 3, truncated());
-        for pixel in frame.data[..pixels * 3].as_chunks::<3>().0 {
-            let brightest = pixel[0].max(pixel[1]).max(pixel[2]);
-            top = top.max(u32::from(brightest));
-            high += u64::from(brightest == 255);
-            low += u64::from(brightest == 0);
-        }
-    }
-    Ok(Clipping {
-        high_px: high,
-        low_px: low,
-        pixels: pixels as u64,
-        max: f64::from(top) / f64::from(full),
-    })
+    });
+    Ok(tally.finish(full, pixels))
 }
 
-/// `Clipping` of `pixels` pixels from each one's brightest sample, of
-/// which `full` is full scale.
-fn tally(brightest: impl Iterator<Item = u32>, full: u32, pixels: usize) -> Clipping {
-    let (mut high, mut low, mut top) = (0u64, 0u64, 0u32);
-    for value in brightest {
-        top = top.max(value);
-        high += u64::from(value == full);
-        low += u64::from(value == 0);
+/// Clipped samples counted one pixel's brightest sample at a time.
+#[derive(Default)]
+struct Tally {
+    high: u64,
+    low: u64,
+    top: u32,
+}
+
+impl Tally {
+    /// Every frame row of `view` counted by `count`, in blocks of rows
+    /// across cores for a large view, each block with its own `count`.
+    fn rows(view: FrameRef<'_>, count: impl FnMut(&mut Tally, usize) + Clone + Send) -> Self {
+        let rows = view.y0..view.y0 + view.height;
+        let threads = worker_threads(view.pixels());
+        let block = view.height.div_ceil(threads).max(1);
+        fn run(rows: std::ops::Range<usize>, mut count: impl FnMut(&mut Tally, usize)) -> Tally {
+            let mut tally = Tally::default();
+            for y in rows {
+                count(&mut tally, y);
+            }
+            tally
+        }
+        if threads == 1 {
+            return run(rows, count);
+        }
+        std::thread::scope(|scope| {
+            let blocks: Vec<_> = rows
+                .step_by(block)
+                .map(|start| {
+                    let count = count.clone();
+                    let end = (start + block).min(view.y0 + view.height);
+                    scope.spawn(move || run(start..end, count))
+                })
+                .collect();
+            blocks
+                .into_iter()
+                .map(|block| block.join().expect("a clipping count panicked"))
+                .fold(Tally::default(), |total, block| Tally {
+                    high: total.high + block.high,
+                    low: total.low + block.low,
+                    top: total.top.max(block.top),
+                })
+        })
     }
-    Clipping {
-        high_px: high,
-        low_px: low,
-        pixels: pixels as u64,
-        max: f64::from(top) / f64::from(full),
+    fn add(&mut self, value: u32, full: u32) {
+        self.top = self.top.max(value);
+        self.high += u64::from(value == full);
+        self.low += u64::from(value == 0);
+    }
+    /// The `Clipping` of `pixels` pixels, of which `full` is full scale.
+    fn finish(self, full: u32, pixels: usize) -> Clipping {
+        Clipping {
+            high_px: self.high,
+            low_px: self.low,
+            pixels: pixels as u64,
+            max: f64::from(self.top) / f64::from(full),
+        }
     }
 }
 
@@ -1171,7 +1074,8 @@ pub struct Sharpness {
 pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
     validate_source(frame)?;
     checked_pixels(frame)?;
-    if let Some(quads) = Quads::of(frame).filter(|q| q.columns >= 3 && q.rows >= 3) {
+    if let Some(quads) = Quads::of(FrameRef::whole(frame)).filter(|q| q.columns >= 3 && q.rows >= 3)
+    {
         let [x, y, w, h] = region;
         let region = [
             x / 2,
@@ -1188,7 +1092,7 @@ pub fn sharpness(frame: &Frame, region: [u32; 4]) -> Result<Sharpness> {
     let (w, h) = (frame.width as usize, frame.height as usize);
     ensure!(w >= 3 && h >= 3, "frame is too small to measure sharpness");
     Ok(sharpness_over((w, h), region, |x, y| {
-        luma(pixel_at(frame, x, y)) as f64
+        luma(pixel_at(FrameRef::whole(frame), x, y)) as f64
     }))
 }
 /// `sharpness` of a region of a `w` × `h` grid, at least 3 × 3, whose
@@ -1307,7 +1211,7 @@ pub fn encode_parts<'a>(
                 Some((samples, bits)) => (
                     png::ColorType::Grayscale,
                     png::BitDepth::Sixteen,
-                    Cow::Owned(samples),
+                    Samples::Converted(samples),
                     Some(bits),
                 ),
                 None => match gray8_samples(frame)? {
@@ -1320,7 +1224,7 @@ pub fn encode_parts<'a>(
                     ),
                 },
             };
-            if let Cow::Owned(samples) = &samples {
+            if samples.converted() {
                 crate::copies::record(crate::copies::Site::StillTransform, samples.len());
             }
             // Room for camera images compressed fast, so the output is
@@ -1352,7 +1256,7 @@ pub fn encode_parts<'a>(
             Ok(Encoded::new(Body::Vec(bytes)))
         }
         "ppm" => Ok(Encoded::with_insert(
-            body(rgb_samples(frame)?),
+            rgb_samples(frame)?.into_body(crate::copies::Site::StillTransform),
             0,
             header("P6").into_bytes(),
         )),
@@ -1360,23 +1264,12 @@ pub fn encode_parts<'a>(
             let gray =
                 gray8_samples(frame)?.context("PGM requires a monochrome image; use PNG or PPM")?;
             Ok(Encoded::with_insert(
-                body(gray),
+                gray.into_body(crate::copies::Site::StillTransform),
                 0,
                 header("P5").into_bytes(),
             ))
         }
         _ => bail!("unknown image format {format}; use png, jpeg, raw, pgm or ppm"),
-    }
-}
-
-/// A body of samples: the frame's own, or a conversion, counted.
-fn body(samples: Cow<'_, [u8]>) -> Body<'_> {
-    match samples {
-        Cow::Borrowed(samples) => Body::Borrowed(samples),
-        Cow::Owned(samples) => {
-            crate::copies::record(crate::copies::Site::StillTransform, samples.len());
-            Body::Vec(samples)
-        }
     }
 }
 
@@ -1790,7 +1683,7 @@ mod tests {
                 };
                 let reference = (0..height as usize)
                     .flat_map(|y| (0..width as usize).map(move |x| (x, y)))
-                    .flat_map(|(x, y)| pixel_at(&frame, x, y))
+                    .flat_map(|(x, y)| pixel_at(FrameRef::whole(&frame), x, y))
                     .collect::<Vec<_>>();
                 assert_eq!(
                     rgb(&frame).unwrap(),
@@ -1845,7 +1738,11 @@ mod tests {
                 for y in 0..height as usize {
                     for x in 0..width as usize {
                         let i = (y * width as usize + x) * 3;
-                        assert_eq!(pixel_at(&frame, x, y), full[i..i + 3], "{format:x} {x},{y}");
+                        assert_eq!(
+                            pixel_at(FrameRef::whole(&frame), x, y),
+                            full[i..i + 3],
+                            "{format:x} {x},{y}"
+                        );
                     }
                 }
                 // Bayer exposure reads whole quads; see quad_scopes_agree_with_the_demosaic.

@@ -4423,11 +4423,12 @@ impl RawInput {
         }
         let length = self.frame_len(frame.width, frame.height)?;
         if self.convert {
-            *scratch = if self.color {
-                crate::frame::rgb(frame)?
+            let channels = if self.color {
+                crate::frame::Channels::Rgb
             } else {
-                crate::frame::gray8(frame)?.context("monochrome frame has no gray conversion")?
+                crate::frame::Channels::Gray
             };
+            crate::frame::decode_into(frame, channels, scratch)?;
         } else {
             scratch.resize(length, 0);
             let widened = |sample: [u8; 2]| {

@@ -4,11 +4,11 @@
 //! command answers with these for agents, scripts and remote clients.
 use crate::{
     camera_profile::CameraKind,
-    frame::{self, Clipping},
+    frame::{self, Clipping, FrameRef, RowReader},
     jpeg::Raster,
     types::Frame,
 };
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{borrow::Cow, ops::RangeInclusive};
 
@@ -143,6 +143,8 @@ pub fn crop_rect(frame: &Frame, px: [u32; 4]) -> [u32; 4] {
 /// The `crop_rect` of `px` as a frame of its own, with the original's
 /// identity and timestamp. Wide color components retain their native depth
 /// as interleaved RGB; other formats use `frame::unpacked`'s representation.
+/// What a region measured in place must match.
+#[cfg(test)]
 pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
     frame::validate_source(frame)?;
     if let Some((_, bits)) = frame::native_color(frame, 0, 0) {
@@ -205,13 +207,14 @@ pub fn crop(frame: &Frame, px: [u32; 4]) -> Result<Frame> {
     })
 }
 
-/// The frame itself when `rect` covers it all, else its crop.
-fn view(frame: &Frame, rect: [u32; 4]) -> Result<Cow<'_, Frame>> {
-    if rect == [0, 0, frame.width, frame.height] || !frame::convertible(frame.pixel_format) {
-        Ok(Cow::Borrowed(frame))
-    } else {
-        crop(frame, rect).map(Cow::Owned)
+/// The `rect` of `frame`, read in place. A region of a frame that cannot
+/// hold it is an error, as a crop of it would be.
+fn view(frame: &Frame, rect: [u32; 4]) -> Result<FrameRef<'_>> {
+    let view = FrameRef::region(frame, rect);
+    if !view.is_whole() && frame::convertible(frame.pixel_format) {
+        frame::validate_source(frame)?;
     }
+    Ok(view)
 }
 
 fn round4(value: f64) -> f64 {
@@ -335,7 +338,7 @@ pub struct Measurements {
 pub fn measure(frame: &Frame, kind: CameraKind, region_px: [u32; 4]) -> Measurements {
     let rect = crop_rect(frame, region_px);
     match view(frame, rect) {
-        Ok(view) => measure_view(frame, &view, kind, rect),
+        Ok(view) => measure_view(frame, view, kind, rect),
         Err(error) => Measurements {
             notes: vec![format!("not measured: {error:#}")],
             ..Measurements::default()
@@ -343,7 +346,12 @@ pub fn measure(frame: &Frame, kind: CameraKind, region_px: [u32; 4]) -> Measurem
     }
 }
 
-fn measure_view(frame: &Frame, view: &Frame, kind: CameraKind, rect: [u32; 4]) -> Measurements {
+fn measure_view(
+    frame: &Frame,
+    view: FrameRef<'_>,
+    kind: CameraKind,
+    rect: [u32; 4],
+) -> Measurements {
     let mut measured = Measurements::default();
     let scalar = match kind {
         CameraKind::Depth => Some("Depth images hold distances, not brightness"),
@@ -364,13 +372,13 @@ fn measure_view(frame: &Frame, view: &Frame, kind: CameraKind, rect: [u32; 4]) -
         ));
         return measured;
     }
-    match frame::exposure(view) {
+    match frame::exposure_in(view) {
         Ok(exposure) => measured.exposure = Some((&exposure).into()),
         Err(error) => measured
             .notes
             .push(format!("exposure not measured: {error:#}")),
     }
-    match frame::clipping(view) {
+    match frame::clipping_in(view) {
         Ok(clipping) => {
             measured.clipping = Some(Clipping {
                 max: round4(clipping.max),
@@ -381,7 +389,7 @@ fn measure_view(frame: &Frame, view: &Frame, kind: CameraKind, rect: [u32; 4]) -
             .notes
             .push(format!("clipping not counted: {error:#}")),
     }
-    measured.auto_meter = crate::auto::meter(view).map(|meter| crate::auto::Meter {
+    measured.auto_meter = crate::auto::meter_in(view).map(|meter| crate::auto::Meter {
         mean: round4(meter.mean),
         p99: round4(meter.p99),
     });
@@ -475,34 +483,13 @@ fn jpeg_preview(format: PreviewFormat, jpeg_available: bool) -> Result<bool> {
     })
 }
 
-/// The channels and samples a preview of `frame` is shrunk from: the
-/// frame's own bytes for the 8-bit monochrome formats and RGB8, else a
-/// conversion.
-fn preview_samples(frame: &Frame) -> Result<(usize, Cow<'_, [u8]>)> {
-    let (channels, pixels) = if matches!(
-        frame.pixel_format,
-        crate::types::MONO8 | 0x0108_00b1 | 0x0108_00c6
-    ) {
-        let gray = frame::gray8_samples(frame)?;
-        (1, gray.context("8-bit monochrome is gray")?)
-    } else if frame::monochrome(frame.pixel_format) {
-        (1, Cow::Owned(frame::convert(frame, |[value, _, _]| value)?))
-    } else {
-        (3, frame::rgb_samples(frame)?)
-    };
-    if let Cow::Owned(pixels) = &pixels {
-        crate::copies::record(crate::copies::Site::PreviewTransform, pixels.len());
-    }
-    Ok((channels, pixels))
-}
-
-/// A preview of `frame` whose longest edge is at most `max_dimension`, or
+/// A preview of `view` whose longest edge is at most `max_dimension`, or
 /// None for 0 and for formats that cannot be decoded. Pixels are averaged
 /// over each output pixel's area, so detail blends instead of aliasing.
 /// Monochrome stays gray. A preview larger than `limit` is encoded again at
 /// lower JPEG quality, then smaller, before giving up.
 fn render_within(
-    frame: &Frame,
+    view: FrameRef<'_>,
     max_dimension: u32,
     format: PreviewFormat,
     jpeg_available: bool,
@@ -510,32 +497,28 @@ fn render_within(
     cropped: bool,
 ) -> Result<Option<EncodedImage>> {
     if max_dimension == 0
-        || frame.width == 0
-        || frame.height == 0
-        || !frame::convertible(frame.pixel_format)
+        || view.width == 0
+        || view.height == 0
+        || !frame::convertible(view.pixel_format())
     {
         return Ok(None);
     }
     let jpeg = jpeg_preview(format, jpeg_available)?;
-    let (channels, pixels) = preview_samples(frame)?;
-    let (width, height) = fit(frame.width, frame.height, max_dimension);
-    let first = first_quality(cropped, frame.width, frame.height);
+    frame::validate_source(view.frame)?;
+    let channels = if frame::monochrome(view.pixel_format()) {
+        frame::Channels::Gray
+    } else {
+        frame::Channels::Rgb
+    };
+    let (source_width, source_height) = (view.width as u32, view.height as u32);
+    let (width, height) = fit(source_width, source_height, max_dimension);
+    let first = first_quality(cropped, source_width, source_height);
     let lowest = QUALITIES[QUALITIES.len() - 1];
     for step in 0..=SCALE_STEPS {
         let shrink = |side: u32| ((f64::from(side) * SCALE.powi(step)).round() as u32).max(1);
-        let raster = Raster {
-            width: shrink(width),
-            height: shrink(height),
-            channels,
-            data: area_average(
-                &pixels,
-                frame.width,
-                frame.height,
-                channels,
-                shrink(width),
-                shrink(height),
-            ),
-        };
+        let (out_width, out_height) = (shrink(width), shrink(height));
+        let pixels = shrunk(view, channels, out_width, out_height);
+        let raster = Raster::of(out_width, out_height, channels.bytes(), &pixels);
         let qualities: Vec<i32> = if step == 0 {
             std::iter::once(first)
                 .chain(QUALITIES.into_iter().filter(|&quality| quality < first))
@@ -578,9 +561,136 @@ fn fit(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
     (scale(width), scale(height))
 }
 
+/// `view` as `channels` samples, box-filtered down to `out_width` ×
+/// `out_height` (see `area_average`) as its rows are decoded, so no
+/// full-size converted image is built. Output rows are independent, so
+/// large views are split into bands of them across cores. A view that is
+/// not scaled is borrowed where the frame holds its samples.
+fn shrunk(
+    view: FrameRef<'_>,
+    channels: frame::Channels,
+    out_width: u32,
+    out_height: u32,
+) -> Cow<'_, [u8]> {
+    let (w, h) = (view.width, view.height);
+    let (ow, oh) = (out_width as usize, out_height as usize);
+    debug_assert!((1..=w).contains(&ow) && (1..=h).contains(&oh));
+    let bytes = channels.bytes();
+    let borrows = RowReader::new(view).borrows(channels);
+    if !borrows {
+        crate::copies::record(crate::copies::Site::PreviewTransform, w * h * bytes);
+    }
+    if (ow, oh) == (w, h) {
+        return match frame::samples(view, channels) {
+            Ok(frame::Samples::Borrowed(samples)) => Cow::Borrowed(samples),
+            _ => {
+                let mut out = vec![0; w * h * bytes];
+                let mut reader = RowReader::new(view);
+                for (y, out) in out.chunks_exact_mut(w * bytes).enumerate() {
+                    reader.read(y, channels, out);
+                }
+                Cow::Owned(out)
+            }
+        };
+    }
+    let mut out = vec![0; ow * oh * bytes];
+    let threads = frame::worker_threads(view.pixels()).min(oh);
+    let band = oh.div_ceil(threads);
+    // The first source row of output row `row`.
+    let first = |row: usize| (row * h).div_ceil(oh);
+    let shrink_band = |rows: std::ops::Range<usize>, out: &mut [u8]| {
+        let mut shrink = AreaAverage::new(w, channels, ow, oh, h);
+        let mut reader = RowReader::new(view);
+        for y in first(rows.start)..first(rows.end) {
+            shrink.push(y, reader.row(y, channels), out);
+        }
+    };
+    if threads > 1 {
+        std::thread::scope(|scope| {
+            for (i, out) in out.chunks_mut(band * ow * bytes).enumerate() {
+                let shrink_band = &shrink_band;
+                let rows = i * band..((i + 1) * band).min(oh);
+                scope.spawn(move || shrink_band(rows, out));
+            }
+        });
+    } else {
+        shrink_band(0..oh, &mut out);
+    }
+    Cow::Owned(out)
+}
+
+/// A box filter fed one source row at a time: each source pixel belongs to
+/// exactly one output pixel, which is the rounded mean of its source pixels.
+struct AreaAverage {
+    channels: usize,
+    out_height: usize,
+    height: usize,
+    /// The output column of each source column.
+    columns: Vec<usize>,
+    /// Source columns in each output column.
+    widths: Vec<u64>,
+    sums: Vec<u64>,
+    /// Source rows summed into the current output row.
+    rows: u64,
+    /// Output rows written so far into the caller's band.
+    written: usize,
+}
+
+impl AreaAverage {
+    fn new(
+        width: usize,
+        channels: frame::Channels,
+        out_width: usize,
+        out_height: usize,
+        height: usize,
+    ) -> Self {
+        let columns: Vec<usize> = (0..width).map(|x| x * out_width / width).collect();
+        let mut widths = vec![0u64; out_width];
+        for &column in &columns {
+            widths[column] += 1;
+        }
+        Self {
+            channels: channels.bytes(),
+            out_height,
+            height,
+            columns,
+            widths,
+            sums: vec![0; out_width * channels.bytes()],
+            rows: 0,
+            written: 0,
+        }
+    }
+    /// Add source row `y`; when it ends an output row, write that row to
+    /// the next row of `out`.
+    fn push(&mut self, y: usize, line: &[u8], out: &mut [u8]) {
+        let channels = self.channels;
+        for (pixel, &column) in line.chunks_exact(channels).zip(&self.columns) {
+            for (sum, &value) in self.sums[column * channels..][..channels]
+                .iter_mut()
+                .zip(pixel)
+            {
+                *sum += u64::from(value);
+            }
+        }
+        self.rows += 1;
+        let (h, oh) = (self.height, self.out_height);
+        // The next source row starts another output row, or there is none.
+        if y + 1 == h || (y + 1) * oh / h != y * oh / h {
+            let row = &mut out[self.written * self.sums.len()..][..self.sums.len()];
+            for (i, (sum, out)) in self.sums.iter_mut().zip(row).enumerate() {
+                let count = self.rows * self.widths[i / channels];
+                *out = ((*sum + count / 2) / count) as u8;
+                *sum = 0;
+            }
+            self.rows = 0;
+            self.written += 1;
+        }
+    }
+}
+
 /// Box-filter `source` (`width` × `height` pixels of `channels` bytes) down
-/// to `out_width` × `out_height`: each source pixel belongs to exactly one
-/// output pixel, which is the rounded mean of its source pixels.
+/// to `out_width` × `out_height` at once: what `shrunk` streams.
+#[cfg(test)]
 fn area_average(
     source: &[u8],
     width: u32,
@@ -591,34 +701,18 @@ fn area_average(
 ) -> Cow<'_, [u8]> {
     let (w, h) = (width as usize, height as usize);
     let (ow, oh) = (out_width as usize, out_height as usize);
-    debug_assert!((1..=w).contains(&ow) && (1..=h).contains(&oh));
     if (ow, oh) == (w, h) {
         return Cow::Borrowed(&source[..w * h * channels]);
     }
-    let columns: Vec<usize> = (0..w).map(|x| x * ow / w).collect();
-    let mut widths = vec![0u64; ow];
-    for &column in &columns {
-        widths[column] += 1;
-    }
-    let mut out = Vec::with_capacity(ow * oh * channels);
-    let mut sums = vec![0u64; ow * channels];
-    let mut rows = 0u64;
+    let gray = if channels == 1 {
+        frame::Channels::Gray
+    } else {
+        frame::Channels::Rgb
+    };
+    let mut shrink = AreaAverage::new(w, gray, ow, oh, h);
+    let mut out = vec![0; ow * oh * channels];
     for (y, line) in source.chunks_exact(w * channels).take(h).enumerate() {
-        for (pixel, &column) in line.chunks_exact(channels).zip(&columns) {
-            for (sum, &value) in sums[column * channels..][..channels].iter_mut().zip(pixel) {
-                *sum += u64::from(value);
-            }
-        }
-        rows += 1;
-        // The next source row starts another output row, or there is none.
-        if y + 1 == h || (y + 1) * oh / h != y * oh / h {
-            for (i, sum) in sums.iter_mut().enumerate() {
-                let count = rows * widths[i / channels];
-                out.push(((*sum + count / 2) / count) as u8);
-                *sum = 0;
-            }
-            rows = 0;
-        }
+        shrink.push(y, line, &mut out);
     }
     Cow::Owned(out)
 }
@@ -671,14 +765,14 @@ pub fn inspect(
     });
     let rect = crop_rect(frame, requested);
     let view = view(frame, rect)?;
-    let measurements = measure_view(frame, &view, kind, rect);
+    let measurements = measure_view(frame, view, kind, rect);
     let image = render_within(
-        &view,
+        view,
         max_dimension,
         format,
         cfg!(feature = "jpeg"),
         MAX_IMAGE_BYTES,
-        matches!(view, Cow::Owned(_)),
+        !view.is_whole() && frame::convertible(frame.pixel_format),
     )?;
     let [x, y, width, height] = rect;
     let share = |part: u32, whole: u32| round4(f64::from(part) / f64::from(whole.max(1)));
@@ -716,7 +810,7 @@ mod tests {
         format: PreviewFormat,
     ) -> Result<Option<EncodedImage>> {
         render_within(
-            frame,
+            FrameRef::whole(frame),
             max_dimension,
             format,
             cfg!(feature = "jpeg"),
@@ -1195,21 +1289,22 @@ mod tests {
         // Coord3D_C8 and Confidence8 are their own gray samples, as Mono8 is.
         for format in [MONO8, 0x0108_00b1, 0x0108_00c6] {
             let source = frame(format, 64, 48, gray.clone());
-            let (channels, pixels) = preview_samples(&source).unwrap();
-            assert_eq!(channels, 1, "{format:x}");
+            let view = FrameRef::whole(&source);
+            assert!(frame::monochrome(format), "{format:x}");
+            let pixels = shrunk(view, frame::Channels::Gray, 64, 48);
             assert!(matches!(pixels, Cow::Borrowed(_)), "{format:x}");
             let image = render(&source, 32, PreviewFormat::Png).unwrap().unwrap();
             assert_eq!(image.bytes, mono.bytes, "{format:x}");
         }
         let rgb = frame(RGB8, 4, 3, (0..36).collect());
         assert!(matches!(
-            preview_samples(&rgb).unwrap(),
-            (3, Cow::Borrowed(_))
+            shrunk(FrameRef::whole(&rgb), frame::Channels::Rgb, 4, 3),
+            Cow::Borrowed(_)
         ));
         let wide = frame(MONO12, 4, 3, vec![0; 24]);
         assert!(matches!(
-            preview_samples(&wide).unwrap(),
-            (1, Cow::Owned(_))
+            shrunk(FrameRef::whole(&wide), frame::Channels::Gray, 4, 3),
+            Cow::Owned(_)
         ));
     }
 
@@ -1222,7 +1317,7 @@ mod tests {
         assert_eq!(crate::cli::error_code(&refused).1, 5, "{refused}");
         let mono = frame(MONO8, 64, 64, ramp(64, 64));
         let image = render_within(
-            &mono,
+            FrameRef::whole(&mono),
             64,
             PreviewFormat::Auto,
             false,
@@ -1257,11 +1352,18 @@ mod tests {
         );
         // Noise defeats compression, so a tight limit steps quality, then size.
         let noisy = frame(RGB8, 256, 256, noise(256 * 256 * 3));
-        let full = render_within(&noisy, 256, PreviewFormat::Jpeg, true, usize::MAX, false)
-            .unwrap()
-            .unwrap();
+        let full = render_within(
+            FrameRef::whole(&noisy),
+            256,
+            PreviewFormat::Jpeg,
+            true,
+            usize::MAX,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         let lower = render_within(
-            &noisy,
+            FrameRef::whole(&noisy),
             256,
             PreviewFormat::Jpeg,
             true,
@@ -1277,7 +1379,7 @@ mod tests {
         );
         assert!(lower.bytes.len() < full.bytes.len());
         let smaller = render_within(
-            &noisy,
+            FrameRef::whole(&noisy),
             256,
             PreviewFormat::Jpeg,
             true,
@@ -1297,7 +1399,15 @@ mod tests {
             smaller.width,
             smaller.height
         ));
-        let error = render_within(&noisy, 256, PreviewFormat::Jpeg, true, 100, false).unwrap_err();
+        let error = render_within(
+            FrameRef::whole(&noisy),
+            256,
+            PreviewFormat::Jpeg,
+            true,
+            100,
+            false,
+        )
+        .unwrap_err();
         assert_eq!(
             error.to_string(),
             "preview image exceeds the size limit; request a smaller max_dimension"
@@ -1307,11 +1417,18 @@ mod tests {
     #[test]
     fn png_previews_shrink_to_fit_the_size_limit() {
         let noisy = frame(MONO8, 200, 200, noise(200 * 200));
-        let full = render_within(&noisy, 200, PreviewFormat::Png, true, usize::MAX, false)
-            .unwrap()
-            .unwrap();
+        let full = render_within(
+            FrameRef::whole(&noisy),
+            200,
+            PreviewFormat::Png,
+            true,
+            usize::MAX,
+            false,
+        )
+        .unwrap()
+        .unwrap();
         let smaller = render_within(
-            &noisy,
+            FrameRef::whole(&noisy),
             200,
             PreviewFormat::Png,
             true,
@@ -1321,7 +1438,17 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!((smaller.width, smaller.height), (160, 160));
-        assert!(render_within(&noisy, 200, PreviewFormat::Png, true, 64, false).is_err());
+        assert!(
+            render_within(
+                FrameRef::whole(&noisy),
+                200,
+                PreviewFormat::Png,
+                true,
+                64,
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1415,22 +1542,16 @@ mod tests {
         let noisy = frame(RGB8, 1024, 512, noise(1024 * 512 * 3));
         let encoded = |source: &Frame, quality| {
             let (width, height) = (256, 128);
-            let raster = Raster {
+            let pixels = area_average(
+                &frame::rgb(source).unwrap(),
+                source.width,
+                source.height,
+                3,
                 width,
                 height,
-                channels: 3,
-                data: area_average(
-                    &frame::rgb(source).unwrap(),
-                    source.width,
-                    source.height,
-                    3,
-                    width,
-                    height,
-                )
-                .into_owned()
-                .into(),
-            };
-            crate::jpeg::software_quality(&raster, quality).unwrap()
+            )
+            .into_owned();
+            crate::jpeg::software_quality(&Raster::of(width, height, 3, &pixels), quality).unwrap()
         };
         // A whole frame previewed at 256 px is downscaled, not cropped.
         let whole = inspect(&noisy, CameraKind::AreaScan, None, 256, PreviewFormat::Jpeg)
@@ -1452,5 +1573,61 @@ mod tests {
         .unwrap();
         let view = super::crop(&noisy, region_pixels(region, 1024, 512)).unwrap();
         assert_eq!(crop.bytes, encoded(&view, 92));
+    }
+
+    /// Regions are measured and previewed in place exactly as their crops
+    /// were, also at sizes where previews are shrunk in parallel bands.
+    #[test]
+    fn regions_read_in_place_measure_and_preview_as_their_crops() {
+        for format in [
+            0x010c_0059,
+            0x0108_0009,
+            0x0110_0011,
+            0x010c_0047,
+            RGB8,
+            MONO12,
+        ] {
+            let (width, height) = (1600, 1100);
+            let source = frame(
+                format,
+                width,
+                height,
+                noise(frame::row_bytes(width, format) * height as usize),
+            );
+            for region in [
+                [0, 0, width, height],
+                [3, 5, 1400, 900],
+                [801, 1, 799, 1099],
+            ] {
+                let rect = crop_rect(&source, region);
+                let view = FrameRef::region(&source, rect);
+                let crop = super::crop(&source, rect).unwrap();
+                let whole = FrameRef::whole(&crop);
+                let label = format!("{format:08x} {rect:?}");
+                assert_eq!(
+                    frame::exposure_in(view).unwrap(),
+                    frame::exposure(&crop).unwrap(),
+                    "{label}"
+                );
+                assert_eq!(
+                    frame::clipping_in(view).unwrap(),
+                    frame::clipping(&crop).unwrap(),
+                    "{label}"
+                );
+                assert_eq!(
+                    crate::auto::meter_in(view),
+                    crate::auto::meter(&crop),
+                    "{label}"
+                );
+                for edge in [1024, 256] {
+                    let preview = |view| {
+                        render_within(view, edge, PreviewFormat::Png, true, usize::MAX, true)
+                            .unwrap()
+                            .unwrap()
+                    };
+                    assert_eq!(preview(view).bytes, preview(whole).bytes, "{label} {edge}");
+                }
+            }
+        }
     }
 }

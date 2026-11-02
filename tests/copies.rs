@@ -282,9 +282,10 @@ fn counting_session(home: &Home, name: &str, folder: &Path) -> support::cli::Ses
 
 /// What `inspections` more inspections of a session camera in `format`
 /// cost, after the first started its stream.
-fn inspect_delta(home: &Home, format: &str, inspections: i64) -> Value {
-    let folder = home.root.join(format!("report-{format}"));
-    let name = format!("copies-{format}");
+fn inspect_delta(home: &Home, format: &str, region: Option<&str>, inspections: i64) -> Value {
+    let tag = format!("{format}-{}", region.map_or(0, |_| 1));
+    let folder = home.root.join(format!("report-{tag}"));
+    let name = format!("copies-{tag}");
     let session = counting_session(home, &name, &folder);
     let settings = settings(format);
     let values: Vec<&str> = settings
@@ -294,7 +295,13 @@ fn inspect_delta(home: &Home, format: &str, inspections: i64) -> Value {
         .map(String::as_str)
         .collect();
     home.ok(&[&["--session", &name, "set", "-c", "sim:0"][..], &values].concat());
-    let inspect = || home.ok(&["--session", &name, "inspect", "-c", "sim:0"]);
+    let inspect = || {
+        let mut args = vec!["--session", &name, "inspect", "-c", "sim:0"];
+        if let Some(region) = region {
+            args.extend(["--region", region]);
+        }
+        home.ok(&args)
+    };
     inspect();
     let first = counts(&folder);
     for _ in 0..inspections {
@@ -310,7 +317,7 @@ fn inspect_delta(home: &Home, format: &str, inspections: i64) -> Value {
 fn inspections_shrink_the_frame_in_place() {
     let home = Home::new("copies-inspect");
     for (format, channels) in [("Mono8", 1), ("RGB8", 3)] {
-        let delta = inspect_delta(&home, format, 4);
+        let delta = inspect_delta(&home, format, None, 4);
         show(&format!("inspect {format}"), &delta, 4);
         assert_eq!(class_bytes(&delta, "avoidable"), 0, "{format}: {delta}");
         // Nothing as large as the frame: the preview raster, a quarter of
@@ -327,31 +334,118 @@ fn inspections_shrink_the_frame_in_place() {
     }
 }
 
-/// Formats that are converted for their stills and previews still build
-/// whole-frame intermediates: the numbers the next stage starts from. What
-/// this stage removed stays removed.
+/// The simulator's sensor formats: every one converted for a still or a
+/// preview is decoded once, straight into the consumer's input.
+const FORMATS: [&str; 8] = [
+    "Mono8",
+    "RGB8",
+    "Mono12",
+    "Mono12p",
+    "Mono16",
+    "BayerRG8",
+    "BayerRG12",
+    "BayerRG12p",
+];
+
+/// Copies of a frame no path makes: whole-frame intermediates, crops,
+/// clones, copies on write, zero fills and copied output.
+fn assert_no_avoidable(name: &str, delta: &Value) {
+    assert_eq!(class_bytes(delta, "avoidable"), 0, "{name}: {delta}");
+    for site in [
+        "intermediate",
+        "crop",
+        "frame_clone",
+        "frame_cow",
+        "zero_fill",
+    ] {
+        assert_eq!(calls(delta, site), 0, "{name} {site}: {delta}");
+    }
+}
+
+/// Stills of every format: converted formats are decoded once, into a
+/// pooled buffer, so they allocate nothing large once warm.
 #[test]
-fn converted_formats_copy_only_to_convert() {
+fn every_format_converts_once_into_its_encoder() {
     let home = Home::new("copies-converted");
-    for format in ["BayerRG8", "BayerRG12p", "Mono12p"] {
-        for (name, extra) in [("jpg", &["-f", "jpg"][..]), ("png", &["-f", "png"][..])] {
-            let (delta, _) = capture_delta(&home, format, extra, 5);
-            show(&format!("capture -f {name} {format}"), &delta, 5);
-            for removed in [
-                "frame_clone",
-                "frame_cow",
-                "zero_fill",
-                "still_copy",
-                "output_copy",
-            ] {
-                assert_eq!(site(&delta, removed), 0, "{format} {name} {removed}");
+    for format in FORMATS {
+        for (name, extra) in [
+            ("raw", &["-f", "raw"][..]),
+            ("jpg", &["-f", "jpg"][..]),
+            ("png", &["-f", "png"][..]),
+        ] {
+            let (delta, files) = capture_delta(&home, format, extra, 5);
+            let label = format!("capture -f {name} {format}");
+            show(&label, &delta, 5);
+            assert_no_avoidable(&label, &delta);
+            assert_eq!(site(&delta, "file_write"), files, "{label}");
+            let per_file = large(&delta) as f64 / 5.0;
+            match name {
+                "raw" => assert_eq!(class_bytes(&delta, "transform"), 0, "{label}"),
+                // The png crate's compressed-data buffer grows by doubling
+                // beside the one output buffer (see above).
+                "png" => {
+                    let doublings = (files / 5 / (256 << 10)).max(1).ilog2() + 2;
+                    assert!(per_file <= f64::from(doublings) + 1.0, "{label}: {delta}");
+                }
+                _ => assert!(per_file <= LARGE_PER_FRAME, "{label}: {delta}"),
             }
         }
     }
-    let delta = inspect_delta(&home, "BayerRG12p", 2);
-    show("inspect BayerRG12p", &delta, 2);
-    for removed in ["frame_clone", "frame_cow", "zero_fill", "output_copy"] {
-        assert_eq!(site(&delta, removed), 0, "inspect BayerRG12p {removed}");
+}
+
+/// Whole-frame and region inspections of every format: measured where the
+/// pixels lie and previewed a row at a time, nothing larger than the
+/// preview raster is allocated.
+#[test]
+fn every_format_inspects_in_place() {
+    let home = Home::new("copies-inspect-all");
+    for format in FORMATS {
+        for region in [None, Some("0.25,0.25,0.5,0.5")] {
+            let delta = inspect_delta(&home, format, region, 2);
+            let label = format!("inspect {format} {}", region.unwrap_or("whole"));
+            show(&label, &delta, 2);
+            assert_no_avoidable(&label, &delta);
+            let preview = WIDTH * HEIGHT * 3 / 4;
+            assert!(
+                largest_class(&delta) <= preview.next_power_of_two() as i64,
+                "{label}: {delta}"
+            );
+        }
+    }
+}
+
+/// Capturefab's own auto exposure over a region meters the frames where
+/// they lie.
+#[test]
+fn auto_exposure_meters_in_place() {
+    let home = Home::new("copies-auto");
+    for format in ["Mono12p", "BayerRG12p", "RGB8"] {
+        // The simulator keeps settings between commands, as a camera does.
+        let settings = settings(format);
+        let values: Vec<&str> = settings
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .map(String::as_str)
+            .collect();
+        home.ok(&[&["set", "-c", "sim:0"][..], &values].concat());
+        let (report, _, _) = counted(
+            &home,
+            &format!("auto-{format}"),
+            &[
+                "auto",
+                "-c",
+                "sim:0",
+                "--region",
+                "0.25,0.25,0.5,0.5",
+                "--timeout",
+                "2s",
+            ],
+        );
+        let label = format!("auto --region {format}");
+        show(&label, &report, 1);
+        assert!(report["frames"].as_i64().unwrap() > 0, "{label}: {report}");
+        assert_no_avoidable(&label, &report);
     }
 }
 

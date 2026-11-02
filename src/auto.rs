@@ -81,22 +81,28 @@ pub struct Meter {
 }
 
 pub fn meter(frame: &Frame) -> Option<Meter> {
-    // A meter only reads its sampling grid. Packed mono and Bayer samples
-    // can be decoded there directly, without a full-sized temporary image.
+    meter_in(crate::frame::FrameRef::whole(frame))
+}
+
+/// `meter` of a view. A meter only reads its sampling grid: packed mono and
+/// Bayer samples, wide color components and other layouts are decoded
+/// there, where they lie, without a full-sized temporary image.
+pub(crate) fn meter_in(view: crate::frame::FrameRef<'_>) -> Option<Meter> {
+    use crate::frame::{native_color, native_sample, pixel_at};
+    let frame = view.frame;
     crate::frame::validate_source(frame).ok()?;
     let packed = crate::frame::packing(frame.pixel_format);
-    let color_bits = crate::frame::native_color(frame, 0, 0).map(|(_, bits)| bits);
-    let normalized;
-    let frame = if packed.is_some() || color_bits.is_some() {
-        frame
-    } else {
-        normalized = crate::frame::unpacked(frame).ok()?;
-        &*normalized
-    };
-    let (w, h) = (frame.width as usize, frame.height as usize);
+    let color_bits = native_color(frame, 0, 0).map(|(_, bits)| bits);
     let format = packed.map_or(frame.pixel_format, |(format, ..)| format);
+    let (w, h) = (view.width, view.height);
+    // Other layouts are read as their 8-bit conversion.
+    let decoded =
+        packed.is_none() && color_bits.is_none() && crate::frame::unpacked_format(format) != format;
     let (bytes, bits, quad) = if let Some(bits) = color_bits {
         (3, bits, false)
+    } else if decoded {
+        let mono = crate::frame::unpacked_format(format) == crate::types::MONO8;
+        (if mono { 1 } else { 3 }, 8, false)
     } else {
         match format {
             crate::types::MONO8 => (1, 8, false),
@@ -118,8 +124,14 @@ pub fn meter(frame: &Frame) -> Option<Meter> {
         return None;
     }
     let scale = ((1u32 << bits) - 1) as f64;
-    let d = &frame.data;
-    let sample = |x, y| f64::from(crate::frame::native_sample(frame, x, y));
+    let (x0, y0) = (view.x0, view.y0);
+    let sample = |x: usize, y: usize| {
+        if decoded {
+            f64::from(pixel_at(view, x, y)[0])
+        } else {
+            f64::from(native_sample(frame, x0 + x, y0 + y))
+        }
+    };
     let (mut sum, mut count, mut histogram) = (0.0, 0u32, [0u32; 256]);
     for i in crate::frame::sample_indices(gw * gh, 16_384) {
         let (x, y) = (i % gw, i / gw);
@@ -137,10 +149,12 @@ pub fn meter(frame: &Frame) -> Option<Meter> {
             )
         } else if bytes == 3 {
             let [r, g, b] = if color_bits.is_some() {
-                crate::frame::native_color(frame, x, y)?.0.map(f64::from)
+                native_color(frame, x0 + x, y0 + y)?.0.map(f64::from)
+            } else if decoded {
+                pixel_at(view, x, y).map(f64::from)
             } else {
-                let i = 3 * (y * w + x);
-                [d[i], d[i + 1], d[i + 2]].map(f64::from)
+                let i = 3 * ((y0 + y) * frame.width as usize + x0 + x);
+                [frame.data[i], frame.data[i + 1], frame.data[i + 2]].map(f64::from)
             };
             ((r + 2.0 * g + b) / 4.0, r.max(g).max(b))
         } else {
@@ -534,11 +548,15 @@ impl AutoController {
             return;
         }
         self.last_meter = Some(now);
-        let region = self.region.and_then(|region| {
-            let px = crate::inspect::region_pixels(region, frame.width, frame.height);
-            crate::inspect::crop(frame, px).ok()
-        });
-        let Some(m) = meter(region.as_ref().unwrap_or(frame)) else {
+        // A region is metered where it lies, as `inspect` measures it.
+        let view = match self.region {
+            Some(region) => {
+                let px = crate::inspect::region_pixels(region, frame.width, frame.height);
+                crate::frame::FrameRef::region(frame, crate::inspect::crop_rect(frame, px))
+            }
+            None => crate::frame::FrameRef::whole(frame),
+        };
+        let Some(m) = meter_in(view) else {
             self.unmetered = true;
             return;
         };
