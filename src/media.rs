@@ -2849,12 +2849,14 @@ impl MediaBackend {
             decoder = self.spawn()?;
             first = decoder.next(timeout);
         }
-        // A source the hardware could not open is decoded in software,
-        // and if that works the method is not used for it again.
+        // A source the hardware could not decode is decoded in software,
+        // and if that works the method is not used for it again. One that
+        // failed before FFmpeg found its video (refused, not found, a bad
+        // sign-in) is not opened again for nothing.
         if first.is_err()
             && let Some(method) = self.hwdec
+            && let input @ Some(_) = decoder.facts().0
         {
-            let input = decoder.facts().0;
             decoder.stop();
             self.software = true;
             decoder = self.spawn()?;
@@ -5710,7 +5712,7 @@ mod tests {
 case "$*" in
 *-hwaccels*) printf 'Hardware acceleration methods:\ncuda\n' ;;
 *hwdownload*) cat > /dev/null ;;
-*"-hwaccel cuda"*) echo 'Device creation failed' >&2; exit 1 ;;
+*"-hwaccel cuda"*) printf '[info]   Stream #0:0: Video: h264 (High), yuv420p, 4x2\n[error] Device creation failed\n' >&2; exit 1 ;;
 *) printf "{}" >&2; while :; do head -c 12 /dev/zero; sleep 0.05; done ;;
 esac"#,
                 describe("yuv420p")

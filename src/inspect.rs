@@ -10,7 +10,7 @@ use crate::{
 };
 use anyhow::{Result, bail, ensure};
 use serde::{Deserialize, Serialize};
-use std::{borrow::Cow, ops::RangeInclusive};
+use std::ops::RangeInclusive;
 
 /// Frames to wait for after the request by default: one, so the frame was
 /// exposed after any change ordered before the request.
@@ -517,7 +517,7 @@ fn render_within(
     for step in 0..=SCALE_STEPS {
         let shrink = |side: u32| ((f64::from(side) * SCALE.powi(step)).round() as u32).max(1);
         let (out_width, out_height) = (shrink(width), shrink(height));
-        let pixels = shrunk(view, channels, out_width, out_height);
+        let pixels = shrunk(view, channels, out_width, out_height)?;
         let raster = Raster::of(out_width, out_height, channels.bytes(), &pixels);
         let qualities: Vec<i32> = if step == 0 {
             std::iter::once(first)
@@ -571,29 +571,19 @@ fn shrunk(
     channels: frame::Channels,
     out_width: u32,
     out_height: u32,
-) -> Cow<'_, [u8]> {
+) -> Result<frame::Samples<'_>> {
     let (w, h) = (view.width, view.height);
     let (ow, oh) = (out_width as usize, out_height as usize);
     debug_assert!((1..=w).contains(&ow) && (1..=h).contains(&oh));
     let bytes = channels.bytes();
-    let borrows = RowReader::new(view).borrows(channels);
-    if !borrows {
+    if !RowReader::new(view).borrows(channels) {
         crate::copies::record(crate::copies::Site::PreviewTransform, w * h * bytes);
     }
     if (ow, oh) == (w, h) {
-        return match frame::samples(view, channels) {
-            Ok(frame::Samples::Borrowed(samples)) => Cow::Borrowed(samples),
-            _ => {
-                let mut out = vec![0; w * h * bytes];
-                let mut reader = RowReader::new(view);
-                for (y, out) in out.chunks_exact_mut(w * bytes).enumerate() {
-                    reader.read(y, channels, out);
-                }
-                Cow::Owned(out)
-            }
-        };
+        return frame::samples(view, channels);
     }
-    let mut out = vec![0; ow * oh * bytes];
+    // Every byte is an output pixel the box filter writes.
+    let mut out = crate::framebuf::transforms().take_stale(ow * oh * bytes);
     let threads = frame::worker_threads(view.pixels()).min(oh);
     let band = oh.div_ceil(threads);
     // The first source row of output row `row`.
@@ -616,7 +606,7 @@ fn shrunk(
     } else {
         shrink_band(0..oh, &mut out);
     }
-    Cow::Owned(out)
+    Ok(frame::Samples::Converted(out))
 }
 
 /// A box filter fed one source row at a time: each source pixel belongs to
@@ -698,11 +688,11 @@ fn area_average(
     channels: usize,
     out_width: u32,
     out_height: u32,
-) -> Cow<'_, [u8]> {
+) -> std::borrow::Cow<'_, [u8]> {
     let (w, h) = (width as usize, height as usize);
     let (ow, oh) = (out_width as usize, out_height as usize);
     if (ow, oh) == (w, h) {
-        return Cow::Borrowed(&source[..w * h * channels]);
+        return std::borrow::Cow::Borrowed(&source[..w * h * channels]);
     }
     let gray = if channels == 1 {
         frame::Channels::Gray
@@ -714,7 +704,7 @@ fn area_average(
     for (y, line) in source.chunks_exact(w * channels).take(h).enumerate() {
         shrink.push(y, line, &mut out);
     }
-    Cow::Owned(out)
+    std::borrow::Cow::Owned(out)
 }
 
 fn png(raster: &Raster) -> Result<Vec<u8>> {
@@ -798,6 +788,7 @@ pub fn inspect(
 mod tests {
     use super::*;
     use crate::types::{MONO8, RGB8};
+    use std::borrow::Cow;
 
     const MONO12: u32 = 0x0110_0005;
     const BAYER_RG8: u32 = 0x0108_0009;
@@ -1291,20 +1282,20 @@ mod tests {
             let source = frame(format, 64, 48, gray.clone());
             let view = FrameRef::whole(&source);
             assert!(frame::monochrome(format), "{format:x}");
-            let pixels = shrunk(view, frame::Channels::Gray, 64, 48);
-            assert!(matches!(pixels, Cow::Borrowed(_)), "{format:x}");
+            let pixels = shrunk(view, frame::Channels::Gray, 64, 48).unwrap();
+            assert!(matches!(pixels, frame::Samples::Borrowed(_)), "{format:x}");
             let image = render(&source, 32, PreviewFormat::Png).unwrap().unwrap();
             assert_eq!(image.bytes, mono.bytes, "{format:x}");
         }
         let rgb = frame(RGB8, 4, 3, (0..36).collect());
         assert!(matches!(
-            shrunk(FrameRef::whole(&rgb), frame::Channels::Rgb, 4, 3),
-            Cow::Borrowed(_)
+            shrunk(FrameRef::whole(&rgb), frame::Channels::Rgb, 4, 3).unwrap(),
+            frame::Samples::Borrowed(_)
         ));
         let wide = frame(MONO12, 4, 3, vec![0; 24]);
         assert!(matches!(
-            shrunk(FrameRef::whole(&wide), frame::Channels::Gray, 4, 3),
-            Cow::Owned(_)
+            shrunk(FrameRef::whole(&wide), frame::Channels::Gray, 4, 3).unwrap(),
+            frame::Samples::Converted(_)
         ));
     }
 

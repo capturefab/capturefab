@@ -325,7 +325,7 @@ impl Engine {
             Some(Verdict::Rejected(reason)) if named => Err(unavailable(&reason)),
             Some(_) => cpu(frame, quality),
             None => {
-                let (verdict, body) = self.verify(frame, quality);
+                let (verdict, body) = self.verify(frame, quality, named);
                 let reason = match &verdict {
                     Verdict::Rejected(reason) => Some(reason.clone()),
                     Verdict::Accurate { .. } => None,
@@ -345,8 +345,9 @@ impl Engine {
 
     /// Check the engine on its first frame of a size and format: encoded on
     /// the engine and the CPU, both decoded and compared with the frame.
-    /// The verdict, and the output to keep when the engine is used for it.
-    fn verify(&self, frame: &Frame, quality: i32) -> (Verdict, Option<Body<'static>>) {
+    /// The verdict, and the output to keep: the engine's when it is named
+    /// or faster and accurate, else the CPU's.
+    fn verify(&self, frame: &Frame, quality: i32, named: bool) -> (Verdict, Option<Body<'static>>) {
         // The first encode of a size may open a session; it is checked, and
         // a second one timed.
         if let Err(reason) = self.engine_encode(frame, quality) {
@@ -368,7 +369,7 @@ impl Engine {
         match accurate(frame, &engine, &reference) {
             Ok(()) => {
                 let faster = engine_time < cpu_time;
-                let keep = if faster { engine } else { reference };
+                let keep = if faster || named { engine } else { reference };
                 (Verdict::Accurate { faster }, Some(keep))
             }
             Err(reason) => (Verdict::Rejected(reason), Some(reference)),
@@ -393,7 +394,7 @@ impl Engine {
     /// size would be: for `doctor`.
     pub(crate) fn self_test(&self) -> Result<(), String> {
         let frame = gradient(1280, 720);
-        let (verdict, _) = self.verify(&frame, QUALITY);
+        let (verdict, _) = self.verify(&frame, QUALITY, false);
         self.verdicts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

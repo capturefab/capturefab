@@ -668,6 +668,8 @@ struct Quads<'a> {
     order: [usize; 4],
     columns: usize,
     rows: usize,
+    /// An 8-bit mosaic, whose samples are read as they lie.
+    eight: bool,
 }
 impl<'a> Quads<'a> {
     /// None for other formats, or a mosaic without a whole quad. The frame
@@ -678,16 +680,29 @@ impl<'a> Quads<'a> {
             order: quad_order(bayer_pattern(view.pixel_format())),
             columns: view.width / 2,
             rows: view.height / 2,
+            eight: matches!(view.pixel_format(), 0x0108_0008..=0x0108_000b),
         })
     }
     fn color(&self, x: usize, y: usize) -> [u8; 3] {
         let (frame, x, y) = (self.view.frame, self.view.x0 + 2 * x, self.view.y0 + 2 * y);
-        let quad = [
-            sample8(frame, x, y),
-            sample8(frame, x + 1, y),
-            sample8(frame, x, y + 1),
-            sample8(frame, x + 1, y + 1),
-        ];
+        let quad = if self.eight {
+            let width = frame.width as usize;
+            let at = y * width + x;
+            let data = &frame.data;
+            [
+                data[at],
+                data[at + 1],
+                data[at + width],
+                data[at + width + 1],
+            ]
+        } else {
+            [
+                sample8(frame, x, y),
+                sample8(frame, x + 1, y),
+                sample8(frame, x, y + 1),
+                sample8(frame, x + 1, y + 1),
+            ]
+        };
         let [red, green, other, blue] = self.order;
         let greens = u16::from(quad[green]) + u16::from(quad[other]);
         [quad[red], ((greens + 1) >> 1) as u8, quad[blue]]

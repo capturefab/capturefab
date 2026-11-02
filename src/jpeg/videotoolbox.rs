@@ -659,4 +659,33 @@ mod tests {
             assert!(encoder.sessions.len() <= SESSIONS);
         }
     }
+
+    /// A 200-frame burst through the engine leaves nothing behind: `leaks`
+    /// finds no leaked CoreFoundation or Rust memory in this process.
+    #[test]
+    #[ignore = "runs macOS leaks on the test process; about 10 s"]
+    fn a_burst_through_the_engine_leaks_nothing() {
+        let Some(engine) = engine() else { return };
+        let frame = scene(0x0108_0009, 1920, 1080);
+        for _ in 0..200 {
+            let jpeg = engine.encode(&frame, QUALITY, true).unwrap();
+            assert!(super::super::well_formed(&jpeg, 1920, 1080));
+        }
+        drop(engine);
+        let output = std::process::Command::new("/usr/bin/leaks")
+            .arg(std::process::id().to_string())
+            .output()
+            .unwrap();
+        let report = String::from_utf8_lossy(&output.stdout);
+        let summary = report
+            .lines()
+            .find(|line| line.contains("leaks for"))
+            .unwrap_or_default()
+            .to_owned();
+        eprintln!("{summary}");
+        assert!(
+            summary.contains(" 0 leaks for 0 total leaked bytes"),
+            "{report}"
+        );
+    }
 }

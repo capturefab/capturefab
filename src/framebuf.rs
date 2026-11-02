@@ -17,6 +17,10 @@
 //!
 //! Recycled buffers keep their old bytes ("stale"): only a producer that
 //! writes every byte it delivers may take one with [`FramePool::take_stale`].
+//!
+//! The images frames are converted into for an encoder (a Bayer frame's
+//! Y'CbCr planes for a JPEG) come from a second pool, [`transforms`], so
+//! they never push a camera's frames out of this one.
 use std::{
     fmt,
     ops::{Deref, DerefMut},

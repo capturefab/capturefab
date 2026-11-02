@@ -1542,7 +1542,7 @@ fn a_file_describes_itself_as_a_file() {
             "-i",
             "testsrc=size=64x48:rate=5",
         ])
-        .args(["-frames:v", "3"])
+        .args(["-frames:v", "3", "-c:v", "libx264", "-pix_fmt", "yuv420p"])
         .arg(&clip)
         .output()
         .unwrap();
@@ -1551,13 +1551,17 @@ fn a_file_describes_itself_as_a_file() {
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
+    // Frames are as FFmpeg decodes them: video-level BT.601 4:2:0.
     let info = home.ok(&["--no-session", "info", "-c", "clip.mkv"]);
     assert_eq!(info["kind"], "file", "{info}");
-    assert_eq!(info["pixel_format"], "RGB8", "{info}");
+    assert_eq!(info["pixel_format"], "YCbCr601_420_8_Planar", "{info}");
     assert_eq!(info["bits"], 8, "{info}");
-    assert_eq!(info["controls"]["format"]["value"], "RGB8", "{info}");
+    assert_eq!(
+        info["controls"]["format"]["value"], "YCbCr601_420_8_Planar",
+        "{info}"
+    );
     let values = home.ok(&["--no-session", "get", "-c", "clip.mkv", "format"]);
-    assert_eq!(values["values"]["format"], "RGB8");
+    assert_eq!(values["values"]["format"], "YCbCr601_420_8_Planar");
     let error = home.fails(
         5,
         &["--no-session", "set", "-c", "clip.mkv", "exposure=5ms"],

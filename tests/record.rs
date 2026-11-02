@@ -91,11 +91,15 @@ fn a_timed_recording_ends_on_its_duration() {
 
 #[test]
 #[ignore = "requires FFmpeg; set CAPTUREFAB_FFMPEG to the executable"]
-fn lossless_recordings_keep_wide_bayer_mosaics() {
+fn lossless_recordings_keep_bayer_mosaics() {
     let home = Home::new("record-ffv1-bayer");
-    // FFV1 stores a 16-bit mosaic only in its experimental version 4; wide
-    // Bayer, packed or not, is kept as 16-bit RGB instead.
-    for format in ["BayerRG12p", "BayerRG12"] {
+    // FFV1 keeps the mosaic itself as gray samples: 16-bit for wide Bayer,
+    // packed or not, 8-bit for Bayer8.
+    for (format, gray) in [
+        ("BayerRG12p", "gray16le"),
+        ("BayerRG12", "gray16le"),
+        ("BayerRG8", "gray("),
+    ] {
         let output = format!("{format}.mkv");
         let setting = format!("PixelFormat={format}");
         let result = home.ok(&[
@@ -113,7 +117,7 @@ fn lossless_recordings_keep_wide_bayer_mosaics() {
             .unwrap();
         let described = String::from_utf8_lossy(&probe.stderr);
         assert!(
-            described.contains("ffv1") && described.contains("gbrp16le"),
+            described.contains("ffv1") && described.contains(gray),
             "{described}"
         );
     }

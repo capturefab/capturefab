@@ -225,20 +225,23 @@ fn still_captures_encode_from_the_frame_in_place() {
             ("jpg q75", &["-f", "jpg", "--quality", "75"][..]),
             ("png", &["-f", "png"][..]),
         ] {
-            let (delta, files) = capture_delta(&home, format, extra, 10);
-            show(&format!("capture -f {name} {format}"), &delta, 10);
+            // Enough frames that one more frame buffer, for a burst whose
+            // encoder fell behind on a busy host, stays within the budget.
+            let n = if name == "png" { 10 } else { 20 };
+            let (delta, files) = capture_delta(&home, format, extra, n);
+            show(&format!("capture -f {name} {format}"), &delta, n as i64);
             assert_eq!(
                 class_bytes(&delta, "avoidable"),
                 0,
                 "{format} {name}: {delta}"
             );
             assert_eq!(site(&delta, "file_write"), files, "{format} {name}");
-            let per_file = large(&delta) as f64 / 10.0;
+            let per_file = large(&delta) as f64 / n as f64;
             if name == "png" {
                 // The PNG encoder's own compressed-data buffer grows by
                 // doubling inside the png crate, beside the one output
                 // buffer: one allocation per doubling past 256 KiB.
-                let doublings = (files / 10 / (256 << 10)).max(1).ilog2() + 2;
+                let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
                 assert!(per_file <= f64::from(doublings) + 1.0, "{format}: {delta}");
             } else {
                 // libjpeg-turbo writes into its own (C) buffer.
@@ -458,7 +461,7 @@ fn auto_exposure_meters_in_place() {
 #[ignore = "needs FFmpeg"]
 fn recordings_pipe_the_frame_or_unpack_it_once() {
     let home = Home::new("copies-record");
-    for format in ["Mono8", "BayerRG8", "BayerRG12p"] {
+    for format in FORMATS {
         let out = format!("{format}.mkv");
         let settings = settings(format);
         let settings: Vec<&str> = settings.iter().map(String::as_str).collect();
@@ -473,10 +476,11 @@ fn recordings_pipe_the_frame_or_unpack_it_once() {
         );
         let written = result["frames"].as_i64().unwrap();
         show(&format!("record {format}"), &report, written.max(1));
-        assert_eq!(class_bytes(&report, "avoidable"), 0, "{format}: {report}");
-        // Frames are unpacked on the writer thread, once per frame written;
-        // 8-bit frames go to FFmpeg as they are.
-        let unpacked = if format == "BayerRG12p" { written } else { 0 };
+        assert_no_avoidable(&format!("record {format}"), &report);
+        // Packed and widened frames are converted on the writer thread,
+        // once per frame written; the rest go to FFmpeg as they are.
+        let converted = matches!(format, "Mono12p" | "BayerRG12" | "BayerRG12p");
+        let unpacked = if converted { written } else { 0 };
         assert_eq!(
             calls(&report, "ffmpeg_unpack"),
             unpacked,
