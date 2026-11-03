@@ -96,10 +96,19 @@ fn large_beside_pool(report: &Value) -> i64 {
 /// frame pool, reused or new.
 fn assert_pooled(label: &str, delta: &Value) {
     let pool = &delta["pool"];
+    let count = |key: &str| pool[key].as_i64().unwrap();
     assert_eq!(
-        pool["allocations"].as_i64().unwrap() + pool["reuses"].as_i64().unwrap(),
+        count("allocations") + count("reuses"),
         delta["frames"].as_i64().unwrap(),
         "{label}: {delta}"
+    );
+    // Every buffer comes back: it is taken again, or freed over the idle
+    // bounds, except the few the pool still keeps idle. A save path that
+    // kept frames or turned them into owned buffers would return none, so
+    // this fails however many the pool had to make while saves fell behind.
+    assert!(
+        count("reuses") + count("freed") + 2 >= count("allocations"),
+        "{label}: frame buffers did not return to the pool: {delta}"
     );
 }
 /// The largest allocation size class with any allocations in `report`.

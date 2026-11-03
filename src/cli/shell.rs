@@ -363,11 +363,31 @@ impl Shared {
             });
         }
         let shared = self.clone();
+        let thread_selector = selector.clone();
         let spawned = std::thread::Builder::new()
             .name("capturefab-connect".into())
-            .spawn(move || shared.connected(&selector));
+            .spawn(move || {
+                // A connect that panics must not leave the camera connecting
+                // for ever: script lines wait for every connect to end.
+                let run = std::panic::AssertUnwindSafe(|| shared.connected(&thread_selector));
+                if std::panic::catch_unwind(run).is_err() {
+                    shared.fail(
+                        &thread_selector,
+                        "the connection attempt failed unexpectedly",
+                    );
+                }
+            });
         if let Err(error) = spawned {
             crate::eprintln!("capturefab: cannot connect in the background: {error}");
+            self.fail(&selector, &format!("cannot start connecting: {error}"));
+        }
+    }
+    /// Mark `selector`, still connecting, as failed with `message`.
+    fn fail(&self, selector: &str, message: &str) {
+        if let Some(held) = self.known().held(selector)
+            && matches!(held.state, Connection::Connecting)
+        {
+            held.state = Connection::Failed(message.into());
         }
     }
     fn connected(self: &Arc<Self>, selector: &str) {
