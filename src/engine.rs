@@ -4991,15 +4991,26 @@ mod tests {
     }
     #[test]
     fn a_burst_is_encoded_in_parallel_and_reported_in_frame_order() {
-        // The first frames take longest, so later ones finish first.
+        // Encoders wait until every frame was offered, then the first
+        // frames take longest, so later ones finish first.
+        static GATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         fn uneven(
             _: &WorkerHandle,
             shot: &saver::Shot,
             save: &saver::Save,
         ) -> Result<saver::Written> {
+            while !GATE.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
             std::thread::sleep(Duration::from_millis(60 / shot.frame.id));
             Ok(written(shot, save))
         }
+        // Opens the gate if offering waited for encoding, so that fails
+        // the test below instead of hanging it.
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(10));
+            GATE.store(true, std::sync::atomic::Ordering::Release);
+        });
         let h = WorkerHandle::new();
         let mut saver = saver::Saver::with(h.clone(), uneven, saver::QUEUE_BYTES);
         let dir = temp_dir("ordered-burst");
@@ -5012,9 +5023,11 @@ mod tests {
             jobs[0].deadline = Some(Instant::now() + Duration::from_secs(10));
             assert!(offer(&h, &mut saver, &mut jobs, small_frame(id)));
         }
-        // Every frame was taken while the earlier ones were still encoding.
-        assert!(started.elapsed() < Duration::from_millis(60));
+        // Every frame was taken while the earlier ones still waited to be
+        // encoded: offering never waits for an encoder.
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(jobs[0].saving, 6);
+        GATE.store(true, std::sync::atomic::Ordering::Release);
         drain(&h, &saver, &mut jobs);
         let info = &jobs[0].info;
         assert_eq!(info.status, CaptureStatus::Done);
