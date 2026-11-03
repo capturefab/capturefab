@@ -1270,13 +1270,32 @@ mod tests {
         request.extend(block.to_be_bytes());
         request.extend(1u32.to_be_bytes());
         request.extend(1u32.to_be_bytes());
-        receiver.send_to(&request, camera).unwrap();
-        let length = receiver.recv(&mut buffer).unwrap();
+        // UDP may drop a datagram on a loaded host; like a GVSP client, ask
+        // again when no answer comes.
+        let ask = |request: &[u8], buffer: &mut [u8]| {
+            for attempt in 1..=3 {
+                receiver.send_to(request, camera).unwrap();
+                match receiver.recv(buffer) {
+                    Ok(length) => return length,
+                    Err(error) if attempt < 3 => drop(error),
+                    Err(error) => panic!("no answer to a resend request: {error}"),
+                }
+            }
+            unreachable!()
+        };
+        let length = ask(&request, &mut buffer);
         assert_eq!(buffer[..length], packets[&(block, 1)]);
+        // An answer to a repeated request may still arrive; drop it.
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        while receiver.recv(&mut buffer).is_ok() {}
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         // A block that left the resend cache is reported unavailable.
         request[10..12].copy_from_slice(&block.wrapping_add(0x7000).to_be_bytes());
-        receiver.send_to(&request, camera).unwrap();
-        let length = receiver.recv(&mut buffer).unwrap();
+        let length = ask(&request, &mut buffer);
         let mut unavailable = vec![0x80, 0x0c];
         unavailable.extend(block.wrapping_add(0x7000).to_be_bytes());
         unavailable.extend([3, 0, 0, 1]);
