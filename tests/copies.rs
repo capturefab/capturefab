@@ -445,11 +445,21 @@ fn every_format_converts_once_into_its_encoder() {
                     let doublings = (files / n as i64 / (256 << 10)).max(1).ilog2() + 2;
                     assert!(per_file <= f64::from(doublings) + 1.0, "{label}: {delta}");
                 }
-                _ => assert!(per_file <= LARGE_PER_FRAME, "{label}: {delta}"),
+                // Converted formats also take a transform buffer per encoder
+                // thread at work (at most 8), however many frames the job
+                // has; a buffer per frame would far exceed that.
+                _ => assert!(
+                    large_beside_pool(&delta) <= TRANSFORM_BUFFERS,
+                    "{label}: {delta}"
+                ),
             }
         }
     }
 }
+
+/// The most transform buffers a job can hold at once: one per encoder
+/// thread, which `CAPTUREFAB_THREADS` and the core count cap at 8.
+const TRANSFORM_BUFFERS: i64 = 8;
 
 /// Apple's JPEG engine, named: color stills are written from the frame's
 /// rows straight into the engine's surface (`still_transform`) and kept in
