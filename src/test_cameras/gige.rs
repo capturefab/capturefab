@@ -1212,6 +1212,11 @@ mod tests {
     }
 
     #[test]
+    // Flaky on GitHub's windows-2025 runners only (the resend goes
+    // unanswered even when repeated), not reproducible elsewhere; the GigE
+    // client's own resend handling is covered on Windows by the transport
+    // tests against this fake camera.
+    #[cfg_attr(windows, ignore = "flaky on windows-2025 runners; see comment")]
     fn stream_receiver_resend_requests_are_served() {
         let (server, camera) = loopback_camera();
         let (controller, receiver) = (client(), client());

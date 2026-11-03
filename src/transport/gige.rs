@@ -4815,7 +4815,12 @@ mod tests {
         heartbeat.check().unwrap();
         let reads = || fake.camera.lock().unwrap().register_reads.len();
         let before = reads();
-        thread::sleep(Duration::from_millis(200));
+        // Each unanswered read waits out its control timeout, which a slow
+        // host stretches, so wait for the repeats rather than a fixed time.
+        let deadline = Instant::now() + Duration::from_millis(900);
+        while reads() <= before + 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
         assert!(
             reads() > before + 1,
             "an unanswered heartbeat is sent again"
