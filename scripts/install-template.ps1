@@ -124,7 +124,7 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun, [bool]$Upgrade, [boo
     $archive = Join-Path $work $asset.Name
     "Downloading $($asset.Name)"
     Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive
-    $actual = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
+    $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
     if ($actual -ne $asset.Sha256) { Fail "checksum mismatch for $($asset.Name): expected $($asset.Sha256), got $actual. Nothing was installed." }
     "Checksum OK: $actual"
     Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $work 'x')

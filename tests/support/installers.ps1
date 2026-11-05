@@ -65,7 +65,13 @@ try {
   Assert ((RawPath) -split ';' -contains $tools) 'uninstall removed an unrelated PATH entry'
   & $new -Prefix $base -Uninstall
   Assert ((RawPath) -split ';' -contains $extra) 'repeat uninstall changed PATH'
+} catch {
+  Write-Output ("Installer test failure: " + ($_ | Out-String))
+  throw
 } finally {
   if ($null -eq $savedPath) { Remove-ItemProperty 'HKCU:\Environment' -Name Path -ErrorAction SilentlyContinue }
-  else { (Get-Item 'HKCU:\Environment').SetValue('Path', $savedPath, $savedKind) }
+  else {
+    $writable = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    try { $writable.SetValue('Path', $savedPath, $savedKind) } finally { $writable.Dispose() }
+  }
 }
