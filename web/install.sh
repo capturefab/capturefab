@@ -196,7 +196,9 @@ if [ -e "$dest" ] || [ -L "$dest" ]; then
   managed_release "$dest" || fail "refusing to replace an unrecognized release folder: $dest"
 fi
 if [ -e "$bin_dir/capturefab" ] || [ -L "$bin_dir/capturefab" ]; then
-  [ -L "$bin_dir/capturefab" ] && [ ! -d "$bin_dir/capturefab" ] || fail "refusing to replace a file or directory at $bin_dir/capturefab; move it aside first"
+  if [ ! -L "$bin_dir/capturefab" ] || [ -d "$bin_dir/capturefab" ]; then
+    fail "refusing to replace a file or directory at $bin_dir/capturefab; move it aside first"
+  fi
 fi
 # Stage on the destination volume, so publishing the directory is a rename.
 stage=$(mktemp -d "$base/.install.XXXXXX")
@@ -207,7 +209,7 @@ target="$dest/capturefab"
 ln -s "$target" "$link_work/capturefab"
 if [ -e "$dest" ]; then
   backup="$dest.previous-$$"
-  [ ! -e "$backup" ] && [ ! -L "$backup" ] || fail "backup already exists: $backup"
+  if [ -e "$backup" ] || [ -L "$backup" ]; then fail "backup already exists: $backup"; fi
   mv "$dest" "$backup"
 fi
 mv "$stage/release" "$dest"
