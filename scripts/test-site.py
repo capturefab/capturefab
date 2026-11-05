@@ -373,7 +373,13 @@ def fixture_archive(directory, system, arch, kind=None, version="9.9.9", broken=
         path = directory / f"{stem}.dmg"
         path.write_bytes(b"not a disk image")
         return path
-    stub = b"#!/bin/sh\nexit 1\n" if broken else f"#!/bin/sh\necho 'capturefab {version}'\n".encode()
+    stub = b"#!/bin/sh\nexit 1\n" if broken else (
+        "#!/bin/sh\n"
+        # The system temp directory may be noexec. Probe the staged binary
+        # on its destination volume, never the extraction under TMPDIR.
+        'case "$0" in */capturefab-install.*/x/*) exit 23 ;; esac\n'
+        f"echo 'capturefab {version}'\n"
+    ).encode()
     path = directory / f"{stem}.tar.gz"
     with tarfile.open(path, "w:gz") as archive:
         for name, data, mode in ((f"{stem}/capturefab", stub, 0o755), (f"{stem}/README.txt", f"Capturefab {version}\n".encode(), 0o644)):

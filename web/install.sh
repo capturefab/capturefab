@@ -186,11 +186,10 @@ say "Checksum OK: $expected"
 stem=${name%.tar.gz}
 mkdir "$work/x"
 tar -xzf "$work/$name" -C "$work/x" || fail "cannot extract $name"
-if [ ! -f "$work/x/$stem/capturefab" ] || [ ! -x "$work/x/$stem/capturefab" ]; then
+if [ ! -f "$work/x/$stem/capturefab" ]; then
     fail "$name has no capturefab executable"
 fi
 dest="$base/$VERSION"
-"$work/x/$stem/capturefab" --version || fail "the downloaded capturefab did not start; the current install is unchanged"
 mkdir -p "$base" "$bin_dir"
 if [ -e "$dest" ] || [ -L "$dest" ]; then
   managed_release "$dest" || fail "refusing to replace an unrecognized release folder: $dest"
@@ -203,6 +202,7 @@ fi
 # Stage on the destination volume, so publishing the directory is a rename.
 stage=$(mktemp -d "$base/.install.XXXXXX")
 mv "$work/x/$stem" "$stage/release"
+"$stage/release/capturefab" --version || fail "the downloaded capturefab did not start; the current install is unchanged"
 printf '%s\n' capturefab-installer-v1 > "$stage/release/.capturefab-install"
 link_work=$(mktemp -d "$bin_dir/.capturefab-link.XXXXXX")
 target="$dest/capturefab"

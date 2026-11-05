@@ -170,8 +170,8 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun, [bool]$Upgrade, [boo
   # Earlier releases (0.5 and before) added a Start menu shortcut to the
   # desktop app; this release is the command-line tool only.
   $menu = Join-Path ([Environment]::GetFolderPath('Programs')) 'Capturefab.lnk'
-  if (Test-Path $menu) {
-    Remove-Item -Force $menu -ErrorAction SilentlyContinue
+  if (-not $Prefix -and (Test-Path -LiteralPath $menu)) {
+    Remove-Item -LiteralPath $menu -Force -ErrorAction SilentlyContinue
     "Removed the Start menu shortcut an earlier Capturefab install added."
   }
 

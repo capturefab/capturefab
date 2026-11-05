@@ -10,7 +10,6 @@ $savedKind = if ($null -ne $savedPath) { $key.GetValueKind('Path') } else { $nul
 function Assert($condition, $message) { if (-not $condition) { throw $message } }
 function RawPath { (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames') }
 try {
-  $env:LOCALAPPDATA = Join-Path $root 'local'
   $old = Join-Path $root 'old.ps1'
   $new = Join-Path $root 'new.ps1'
   $tools = Join-Path $base 'tools'
