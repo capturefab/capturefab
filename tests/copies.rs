@@ -102,14 +102,29 @@ fn assert_pooled(label: &str, delta: &Value) {
         delta["frames"].as_i64().unwrap(),
         "{label}: {delta}"
     );
-    // Every buffer comes back: it is taken again, or freed over the idle
-    // bounds, except the few the pool still keeps idle. A save path that
-    // kept frames or turned them into owned buffers would return none, so
-    // this fails however many the pool had to make while saves fell behind.
+    // Each allocation is either freed or still idle (at most two). Reuses
+    // count additional takes of the same buffers, not returned allocations.
+    // In a difference of independent runs reuses can even be negative when
+    // the larger burst's disk falls further behind its camera.
     assert!(
-        count("reuses") + count("freed") + 2 >= count("allocations"),
+        count("freed") + 2 >= count("allocations"),
         "{label}: frame buffers did not return to the pool: {delta}"
     );
+}
+
+#[test]
+fn pool_accounting_handles_independent_burst_schedules() {
+    let first = json!({"frames":20,"pool":{"allocations":13,"reuses":7,"freed":11}});
+    let second = json!({"frames":40,"pool":{"allocations":40,"reuses":0,"freed":38}});
+    assert_pooled("first", &first);
+    assert_pooled("second", &second);
+    let mut delta = second;
+    add(&mut delta, &first, -1);
+    assert_eq!(delta["pool"]["reuses"], -7);
+    assert_pooled("difference", &delta);
+    // Repeated reuse must not hide leaked allocations.
+    let leaked = json!({"frames":110,"pool":{"allocations":10,"reuses":100,"freed":0}});
+    assert!(std::panic::catch_unwind(|| assert_pooled("leaked", &leaked)).is_err());
 }
 /// The largest allocation size class with any allocations in `report`.
 fn largest_class(report: &Value) -> i64 {
@@ -192,7 +207,11 @@ fn capture_delta_env(
             &settings,
         ]
         .concat();
-        runs.push(counted_env(home, env, &out, &args));
+        let run = counted_env(home, env, &out, &args);
+        // Check each whole run too: a constant leak could cancel out of
+        // the N-versus-2N difference.
+        assert_pooled(&format!("{format} -n {count}"), &run.0);
+        runs.push(run);
     }
     let mut delta = runs[1].0.clone();
     add(&mut delta, &runs[0].0, -1);
