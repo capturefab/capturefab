@@ -125,7 +125,13 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun, [bool]$Upgrade, [boo
   try {
     $archive = Join-Path $work $asset.Name
     "Downloading $($asset.Name)"
-    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive
+    # Windows PowerShell 5.1 treats Invoke-WebRequest -OutFile as a wildcard
+    # path. DownloadFile writes a literal filename, including [ and ].
+    $download = New-Object Net.WebClient
+    try {
+      $download.Headers['User-Agent'] = 'Capturefab-Installer/1.0'
+      $download.DownloadFile($url, $archive)
+    } finally { $download.Dispose() }
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $archive).Hash.ToLowerInvariant()
     if ($actual -ne $asset.Sha256) { Fail "checksum mismatch for $($asset.Name): expected $($asset.Sha256), got $actual. Nothing was installed." }
     "Checksum OK: $actual"
