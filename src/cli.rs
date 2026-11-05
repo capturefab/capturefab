@@ -24,6 +24,9 @@ pub(crate) mod term;
 mod watch;
 
 #[cfg(test)]
+mod fuzz;
+
+#[cfg(test)]
 pub(crate) use output::error_code;
 
 use crate::{

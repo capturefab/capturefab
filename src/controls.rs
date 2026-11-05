@@ -2107,18 +2107,33 @@ fn matches_pattern(pattern: &str, name: &str) -> bool {
     if !pattern.contains(['*', '?']) {
         return name.contains(&pattern);
     }
-    fn glob(pattern: &[u8], name: &[u8]) -> bool {
-        match (pattern.first(), name.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => {
-                glob(&pattern[1..], name) || (!name.is_empty() && glob(pattern, &name[1..]))
-            }
-            (Some(b'?'), Some(_)) => glob(&pattern[1..], &name[1..]),
-            (Some(a), Some(b)) if a == b => glob(&pattern[1..], &name[1..]),
-            _ => false,
+    // Remember the last star and extend its match on a mismatch. Recursive
+    // alternatives take exponential time for patterns such as *a*a*...b.
+    let (pattern, name) = (pattern.as_bytes(), name.as_bytes());
+    let (mut p, mut n) = (0, 0);
+    let mut star = None;
+    let mut retry = 0;
+    while n < name.len() {
+        if p < pattern.len() && pattern[p] != b'*' && (pattern[p] == b'?' || pattern[p] == name[n])
+        {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = n;
+        } else if let Some(last) = star {
+            retry += 1;
+            n = retry;
+            p = last + 1;
+        } else {
+            return false;
         }
     }
-    glob(pattern.as_bytes(), name.as_bytes())
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// One `features` row.
@@ -2269,6 +2284,60 @@ mod tests {
     }
     fn assign(text: &str) -> Assignment {
         Assignment::parse(text).unwrap()
+    }
+
+    #[test]
+    fn fuzz_feature_globs() {
+        // Small exhaustive reference comparisons, followed by inputs whose
+        // recursive search used to grow exponentially.
+        fn reference(p: &[u8], n: &[u8]) -> bool {
+            match (p.first(), n.first()) {
+                (None, None) => true,
+                (Some(b'*'), _) => {
+                    reference(&p[1..], n) || (!n.is_empty() && reference(p, &n[1..]))
+                }
+                (Some(b'?'), Some(_)) => reference(&p[1..], &n[1..]),
+                (Some(a), Some(b)) if a == b => reference(&p[1..], &n[1..]),
+                _ => false,
+            }
+        }
+        for code in 0..4096usize {
+            let mut code = code;
+            let pattern: String = (0..6)
+                .map(|_| {
+                    let c = b"ab*?"[code % 4];
+                    code /= 4;
+                    c as char
+                })
+                .collect();
+            for bits in 0..32usize {
+                let name: String = (0..5)
+                    .map(|i| if bits & (1 << i) == 0 { 'a' } else { 'b' })
+                    .collect();
+                let expected = if pattern.contains(['*', '?']) {
+                    reference(pattern.as_bytes(), name.as_bytes())
+                } else {
+                    name.contains(&pattern)
+                };
+                assert_eq!(
+                    matches_pattern(&pattern, &name),
+                    expected,
+                    "{pattern} {name}"
+                );
+            }
+        }
+        let pattern = format!("{}b", "*a".repeat(100));
+        for (pattern, name) in [("*a", "*ba"), ("*?", "*"), ("?*?", "a?b")] {
+            assert_eq!(
+                matches_pattern(pattern, name),
+                reference(pattern.as_bytes(), name.as_bytes())
+            );
+        }
+        assert!(!matches_pattern(&pattern, &"a".repeat(200)));
+        assert!(matches_pattern(
+            &format!("{}*", "*a".repeat(100)),
+            &"a".repeat(200)
+        ));
     }
 
     #[test]

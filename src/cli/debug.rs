@@ -67,7 +67,7 @@ fn parse_address(s: &str) -> std::result::Result<u64, String> {
     .map_err(|e| e.to_string())
 }
 
-fn hex(s: &str) -> Result<Vec<u8>> {
+pub(super) fn hex(s: &str) -> Result<Vec<u8>> {
     if s.is_empty() || !s.len().is_multiple_of(2) || !s.is_ascii() {
         return Err(Usage("hex data needs an even number of ASCII digits".into()).into());
     }

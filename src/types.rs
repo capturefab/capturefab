@@ -683,7 +683,8 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
         )));
     }
     let mut rest = text;
-    let mut nanos = 0f64;
+    let mut nanos = 0u128;
+    let mut subnanos = 0f64;
     while !rest.is_empty() {
         let number_end = rest
             .find(|c: char| !c.is_ascii_digit() && c != '.')
@@ -693,17 +694,23 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
             .find(|c: char| c.is_ascii_digit() || c == '.')
             .unwrap_or(after.len());
         let (unit, after) = after.split_at(unit_end);
-        let value = number
-            .parse::<f64>()
-            .ok()
-            .filter(|v| v.is_finite() && !number.is_empty())
-            .ok_or_else(|| invalid(format!("'{text}' is not a duration")))?;
+        let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+        if number.is_empty() || number == "." || fraction.contains('.') {
+            return Err(invalid(format!("'{text}' is not a duration")));
+        }
+        let whole = if whole.is_empty() {
+            0
+        } else {
+            whole
+                .parse::<u128>()
+                .map_err(|_| invalid(format!("'{text}' is longer than ten years")))?
+        };
         let scale = match unit {
-            "h" => 3.6e12,
-            "m" => 6e10,
-            "s" => 1e9,
-            "ms" => 1e6,
-            "us" | "µs" | "μs" => 1e3,
+            "h" => 3_600_000_000_000u128,
+            "m" => 60_000_000_000,
+            "s" => 1_000_000_000,
+            "ms" => 1_000_000,
+            "us" | "µs" | "μs" => 1_000,
             "" => return Err(invalid(format!("'{text}' needs a unit after {number}"))),
             other => {
                 return Err(invalid(format!(
@@ -711,13 +718,30 @@ pub fn parse_duration(text: &str) -> anyhow::Result<Duration> {
                 )));
             }
         };
-        nanos += value * scale;
+        nanos = whole
+            .checked_mul(scale)
+            .and_then(|part| nanos.checked_add(part))
+            .filter(|total| *total <= MAX_DURATION.as_nanos())
+            .ok_or_else(|| invalid(format!("'{text}' is longer than ten years")))?;
+        // Scale only the fractional component in floating point. Adding it to
+        // a long duration as f64 loses nanoseconds beyond 2^53.
+        let part = if fraction.is_empty() {
+            0.0
+        } else {
+            format!("0.{fraction}")
+                .parse::<f64>()
+                .map_err(|_| invalid(format!("'{text}' is not a duration")))?
+                * scale as f64
+        };
+        nanos += part.floor() as u128;
+        subnanos += part.fract();
         rest = after;
     }
-    if !(0.0..=MAX_DURATION.as_nanos() as f64).contains(&nanos) {
+    nanos += subnanos.round() as u128;
+    if nanos > MAX_DURATION.as_nanos() {
         return Err(invalid(format!("'{text}' is longer than ten years")));
     }
-    Ok(Duration::from_nanos(nanos.round() as u64))
+    Ok(Duration::from_nanos(nanos as u64))
 }
 
 /// A duration as [`parse_duration`] reads it back, exactly: `1h30m`, `2s`,
@@ -926,6 +950,22 @@ mod tests {
             let duration = ns(nanos);
             assert_eq!(parse_duration(&duration_text(duration)).unwrap(), duration);
         }
+    }
+
+    #[test]
+    fn durations_keep_nanoseconds_at_the_limit() {
+        for duration in [
+            Duration::from_nanos(47_792_411_873_516_365),
+            MAX_DURATION - Duration::from_nanos(1),
+            MAX_DURATION,
+        ] {
+            assert_eq!(parse_duration(&duration_text(duration)).unwrap(), duration);
+        }
+        assert!(parse_duration("315576000.000000001s").is_err());
+        assert_eq!(
+            parse_duration("0.0005us0.0005us").unwrap(),
+            Duration::from_nanos(1)
+        );
     }
 
     #[test]
