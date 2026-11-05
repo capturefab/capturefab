@@ -137,6 +137,14 @@ fn normalize(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => up(&mut normal),
+            #[cfg(windows)]
+            Component::Normal(name) if !normal.as_os_str().is_empty() => {
+                // PathBuf::push reparses its argument: a later component
+                // like x:note would replace the original drive and root.
+                // Append an opaque component after a separator instead.
+                normal.push("");
+                normal.as_mut_os_string().push(name);
+            }
             component => normal.push(component),
         }
     }
@@ -174,6 +182,22 @@ fn up(normal: &mut PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn a_later_component_cannot_replace_the_drive_and_root() {
+        let base = Path::new(r"C:\base");
+        for (input, expected) in [
+            (r"sub\x:note\shot.png", r"C:\base\sub\x:note\shot.png"),
+            (r"sub\..\x:note", r"C:\base\x:note"),
+        ] {
+            let mut output = input.to_owned();
+            resolve_path(&mut output, base).unwrap();
+            assert_eq!(output, expected);
+            resolve_path(&mut output, base).unwrap();
+            assert_eq!(output, expected);
+        }
+    }
 
     #[test]
     fn resolves_relative_sources_without_rewriting_network_or_device_locators() {
