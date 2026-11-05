@@ -21,7 +21,7 @@ try {
   Set-Content -LiteralPath (Join-Path $foreign 'capturefab.exe') -Value 'another program'
   Set-Content -LiteralPath (Join-Path $foreign 'README.txt') -Value 'Other software'
   $extra = '%SystemRoot%\unrelated-fixture'
-  New-ItemProperty 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Value "$savedPath;$tools;$extra" -Force | Out-Null
+  New-ItemProperty 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Value ";$savedPath;;$tools;$extra;" -Force | Out-Null
   & $old -Prefix $prefix
   $first = (Get-Item -LiteralPath (Join-Path $base '9.9.8')).FullName
   Assert (Test-Path -LiteralPath (Join-Path $first 'capturefab.exe')) 'initial install failed'

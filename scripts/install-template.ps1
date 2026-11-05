@@ -33,7 +33,8 @@ function Get-CapturefabReleaseVersion([string]$Directory) {
 }
 
 function Convert-CapturefabPath([string]$Value) {
-  $expanded = [Environment]::ExpandEnvironmentVariables($Value).TrimEnd('\', '/')
+  if ([string]::IsNullOrEmpty($Value)) { return '' }
+  $expanded = [Environment]::ExpandEnvironmentVariables($Value)
   if (Test-Path -LiteralPath $expanded -PathType Container) {
     $item = Get-Item -LiteralPath $expanded
     if ($item -is [IO.DirectoryInfo]) { return $item.FullName.TrimEnd('\', '/') }
