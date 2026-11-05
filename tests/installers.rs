@@ -104,6 +104,9 @@ mod windows {
             ))
             .env("CAPTUREFAB_INSTALL_FIXTURE", &home.root)
             .env_remove("CAPTUREFAB_INSTALL_BASE_URL")
+            // CI itself runs under PowerShell 7. Let Windows PowerShell
+            // 5.1 discover its own compatible built-in modules.
+            .env_remove("PSModulePath")
             .env("CAPTUREFAB_SESSION_DIR", home.root.join("sessions"))
             .env("CAPTUREFAB_CACHE_DIR", home.root.join("cache"))
             .output();
