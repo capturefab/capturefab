@@ -363,20 +363,20 @@ def check_installers(root, errors):
         errors.append("install.sh: must never run sudo")
 
 
-def fixture_archive(directory, system, arch, kind=None):
+def fixture_archive(directory, system, arch, kind=None, version="9.9.9", broken=False):
     """A release archive whose capturefab prints a version, laid out like scripts/release.py's.
 
     kind "dmg" is a macOS disk image as releases up to 0.5.0 shipped; the
     installer must refuse it before downloading anything."""
-    stem = f"capturefab-9.9.9-{system}-{arch}"
+    stem = f"capturefab-{version}-{system}-{arch}"
     if kind == "dmg":
         path = directory / f"{stem}.dmg"
         path.write_bytes(b"not a disk image")
         return path
-    stub = b"#!/bin/sh\necho 'capturefab 9.9.9'\n"
+    stub = b"#!/bin/sh\nexit 1\n" if broken else f"#!/bin/sh\necho 'capturefab {version}'\n".encode()
     path = directory / f"{stem}.tar.gz"
     with tarfile.open(path, "w:gz") as archive:
-        for name, data, mode in ((f"{stem}/capturefab", stub, 0o755), (f"{stem}/README.txt", b"Capturefab 9.9.9\n", 0o644)):
+        for name, data, mode in ((f"{stem}/capturefab", stub, 0o755), (f"{stem}/README.txt", f"Capturefab {version}\n".encode(), 0o644)):
             info = tarfile.TarInfo(name)
             info.size, info.mode = len(data), mode
             archive.addfile(info, io.BytesIO(data))
@@ -392,12 +392,12 @@ def check_installer_runs(errors):
     check_installer_run(errors, system)
 
 
-def installer(site, temp, system, kind=None, version="9.9.9"):
+def installer(site, temp, system, kind=None, version="9.9.9", broken=False):
     served = temp / "served"
     served.mkdir(exist_ok=True)
     assets = []
     for arch in ("x86_64", "aarch64"):
-        path = fixture_archive(served, system, arch, kind)
+        path = fixture_archive(served, system, arch, kind, version, broken)
         assets.append(dict(name=path.name, os=system, arch=arch, available=True, size=path.stat().st_size,
                            sha256=hashlib.sha256(path.read_bytes()).hexdigest(), url=f"https://example.invalid/{path.name}"))
     manifest = dict(schema_version=1, latest=version, releases=[dict(version=version, date="2026-01-01", assets=assets)])
@@ -438,6 +438,59 @@ def check_installer_run(errors, system):
                 errors.append(f"{label}: did not run the installed capturefab --version")
             elif command.resolve() != (home / "apps/9.9.9/capturefab").resolve():
                 errors.append(f"{label}: the command must link to the release's executable, not {os.readlink(command)}")
+
+            _, older = installer(site, temp, system, version="9.9.8")
+            home, result = install("cli-upgrade", "apps [fixture]", script=older)
+            base, command = home / "apps [fixture]", home / "bin/capturefab"
+            if result.returncode:
+                errors.append(f"{label}: earlier CLI fixture failed: {result.stderr}")
+            else:
+                # 0.6.1 and earlier have the package README, without a marker.
+                (base / "9.9.8/.capturefab-install").unlink()
+                env = dict(os.environ, HOME=str(home), TMPDIR=str(home / "tmp"), XDG_DATA_HOME=str(home / "share"),
+                           CAPTUREFAB_INSTALL_BASE_URL=f"http://127.0.0.1:{server.server_port}")
+                def rerun(selected=script, *options, offline=False):
+                    run_env = dict(env, CAPTUREFAB_INSTALL_BASE_URL="http://127.0.0.1:1") if offline else env
+                    return subprocess.run(["sh", str(selected), "--prefix", "apps [fixture]", "--bin-dir", str(home / "bin"), *options],
+                                          capture_output=True, text=True, env=run_env, timeout=120, cwd=home)
+                for _ in range(2):
+                    upgraded = rerun(script, "--upgrade")
+                    if upgraded.returncode or command.resolve() != (base / "9.9.9/capturefab").resolve():
+                        errors.append(f"{label}: CLI upgrade/reinstall failed: {upgraded.stderr}")
+                before = os.readlink(command), command.read_bytes()
+                corrupt = temp / "corrupt-upgrade.sh"
+                corrupt.write_text(re.sub(r"expected='[0-9a-f]{64}'", "expected='" + "0" * 64 + "'", script.read_text()), encoding="utf-8")
+                _, broken = installer(site, temp, system, version="9.9.10", broken=True)
+                for selected in [corrupt, broken]:
+                    failed = rerun(selected, "--upgrade")
+                    if not failed.returncode or (os.readlink(command), command.read_bytes()) != before:
+                        errors.append(f"{label}: failed upgrade did not preserve the current command ({selected.name})")
+                foreign = base / "8.8.8"
+                foreign.mkdir()
+                (foreign / "capturefab").write_text("unrelated")
+                (foreign / "README.txt").write_text("Other software")
+                data = home / "saved-data"
+                data.mkdir()
+                (data / "keep.txt").write_text("user data")
+                (base / "7.7.7").symlink_to(data, target_is_directory=True)
+                (base / "keep.txt").write_text("unrelated file")
+                dry = rerun(script, "--uninstall", "--dry-run", offline=True)
+                if dry.returncode or not command.exists() or not (base / "9.9.8").exists():
+                    errors.append(f"{label}: uninstall dry-run changed the install or tried to download")
+                for _ in range(2):
+                    removed = rerun(script, "--uninstall", offline=True)
+                    if removed.returncode:
+                        errors.append(f"{label}: uninstall/repeat uninstall failed: {removed.stderr}")
+                if command.is_symlink() or (base / "9.9.8").exists() or (base / "9.9.9").exists():
+                    errors.append(f"{label}: uninstall left an installed release or command link")
+                if not all(p.exists() for p in [foreign / "capturefab", data / "keep.txt", base / "keep.txt"]) or not (base / "7.7.7").is_symlink():
+                    errors.append(f"{label}: uninstall removed unrelated files or followed a symlink")
+                if any((home / "tmp").iterdir()) or list(base.glob(".install.*")) or list((home / "bin").glob(".capturefab-link.*")):
+                    errors.append(f"{label}: upgrade/uninstall left temporary files")
+
+            home, result = install("foreign-command", setup=lambda h: ((h / "bin").mkdir(), (h / "bin/capturefab").write_text("unrelated command")))
+            if not result.returncode or (home / "bin/capturefab").read_text() != "unrelated command":
+                errors.append(f"{label}: installation replaced an unrelated regular command")
 
             def desktop_install(home):
                 # What 0.5 and earlier left: a command link into the app and a Linux launcher entry.

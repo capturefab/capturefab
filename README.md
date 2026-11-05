@@ -27,6 +27,32 @@ On macOS the first camera or network command asks for Camera and Local Network a
 app you run it from, such as Terminal. On Linux, USB3 Vision cameras need the udev rule in the
 archive (`INSTALL-USB.txt`).
 
+Download the current installer again to upgrade, or use its uninstall mode:
+
+```sh
+curl -fsSL https://capturefab.com/install.sh | sh -s -- --upgrade
+curl -fsSL https://capturefab.com/install.sh | sh -s -- --uninstall
+```
+
+On Windows, download `install.ps1` and run it with `-Upgrade` or `-Uninstall`.
+Use the same `--prefix` and `--bin-dir` (`-Prefix` on Windows) for a custom install.
+Uninstall removes recognized release folders and their command link or PATH entries;
+presets, sign-ins, caches and files outside those folders stay. `--dry-run` (`-DryRun`)
+previews either operation. Close running commands and sessions before uninstalling.
+
+Copy this into an AI agent, or use the copy button on the
+[downloads page](https://capturefab.com/downloads.html#install-cli):
+
+```text
+Install or upgrade Capturefab for my user account from https://capturefab.com.
+Download and inspect install.sh (macOS/Linux) or install.ps1 (Windows) from that site.
+Run it with --upgrade (PowerShell: -Upgrade), without administrator rights.
+Preserve captures, presets and saved sign-ins. Make capturefab available in this terminal.
+Verify capturefab --version and capturefab --json doctor, then read
+https://capturefab.com/agents.md and capturefab schema before using camera commands.
+Report the installed version, path and any setup fixes needed.
+```
+
 ## Quick start
 
 `sim:0` is a built-in pattern camera, so every command below works without hardware.

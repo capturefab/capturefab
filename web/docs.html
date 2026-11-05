@@ -131,6 +131,9 @@ New-Item -ItemType Directory -Force $dir | Out-Null; Copy-Item -Recurse -Force .
 $path = (Get-Item HKCU:\Environment).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
 New-ItemProperty HKCU:\Environment Path -PropertyType ExpandString -Value "$path;$dir" -Force | Out-Null</code></pre><button class="copy-button" type="button" aria-label="Copy the PATH setup commands">Copy</button></div>
           <p>Open a new terminal and run <code>capturefab --version</code>. If it is not found on macOS or Linux, add <code>export PATH="$HOME/.local/bin:$PATH"</code> to <code>~/.zshrc</code> or <code>~/.profile</code>.</p>
+          <h3 id="upgrade-uninstall">Upgrade or uninstall</h3>
+          <p>Download the current installer again to upgrade. On macOS/Linux pass <code>--upgrade</code> or <code>--uninstall</code>; on Windows save <code>install.ps1</code> and run it with <code>-Upgrade</code> or <code>-Uninstall</code>. Add <code>--dry-run</code> (<code>-DryRun</code>) to preview. Custom installs need the same <code>--prefix</code> and <code>--bin-dir</code> (<code>-Prefix</code> on Windows). Close running commands and sessions before uninstalling.</p>
+          <p>Uninstall removes recognized release folders and their command link or PATH entries. Presets, saved sign-ins, caches and files outside those release folders stay. See the <a href="downloads.html#install-cli">copyable upgrade/uninstall commands and agent installation instructions</a>. A saved installer can uninstall offline; download a fresh script to install the latest version.</p>
           <h3 id="first-launch">First use: system prompts</h3>
           <p>The first camera or network command can make your system ask for permission. These answers decide whether cameras appear.</p>
           <div class="table-scroll"><table><caption>Prompts on first use</caption><thead><tr><th scope="col">System</th><th scope="col">What to expect</th></tr></thead><tbody>

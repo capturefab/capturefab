@@ -13,6 +13,8 @@
 #   --prefix DIR    where releases go (default ${XDG_DATA_HOME:-~/.local/share}/capturefab)
 #   --bin-dir DIR   where the capturefab command goes (default ~/.local/bin)
 #   --dry-run       print the selected file, URL and checksum, then exit
+#   --upgrade       install this release over an earlier install
+#   --uninstall     remove installed releases and their command link; keep user data
 set -eu
 
 VERSION='0.6.1'
@@ -35,6 +37,7 @@ fail() { printf 'capturefab install: %s\n' "$*" >&2; exit 1; }
 prefix=''
 bin_dir="${HOME:?HOME is not set}/.local/bin"
 dry_run=0
+action=install
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) [ $# -ge 2 ] || fail "--prefix needs a directory"; prefix=$2; shift 2 ;;
@@ -42,13 +45,61 @@ while [ $# -gt 0 ]; do
     --bin-dir) [ $# -ge 2 ] || fail "--bin-dir needs a directory"; bin_dir=$2; shift 2 ;;
     --bin-dir=*) bin_dir=${1#*=}; shift ;;
     --dry-run) dry_run=1; shift ;;
-    -h|--help) say "Usage: sh install.sh [--prefix DIR] [--bin-dir DIR] [--dry-run]"; exit 0 ;;
-    *) fail "unknown option: $1 (use --prefix DIR, --bin-dir DIR or --dry-run)" ;;
+    --upgrade|--uninstall)
+      [ "$action" = install ] || fail "choose only one of --upgrade and --uninstall"
+      action=${1#--}; shift ;;
+    -h|--help) say "Usage: sh install.sh [--upgrade | --uninstall] [--prefix DIR] [--bin-dir DIR] [--dry-run]"; exit 0 ;;
+    *) fail "unknown option: $1 (use --help)" ;;
   esac
 done
 # The command symlink must name an absolute target: a relative one would
 # resolve against the bin directory, not the directory the user ran this in.
 case "$prefix" in ''|/*) ;; *) prefix="$PWD/$prefix" ;; esac
+case "$bin_dir" in '' ) fail "--bin-dir needs a nonempty directory" ;; /*) ;; *) bin_dir="$PWD/$bin_dir" ;; esac
+base=${prefix:-${XDG_DATA_HOME:-$HOME/.local/share}/capturefab}
+case "$base" in /*) ;; *) base="$PWD/$base" ;; esac
+[ "$base" != / ] || fail "the install prefix cannot be the filesystem root"
+[ ! -L "$base" ] || fail "the install prefix must not be a symbolic link: $base"
+
+# Recognize our versioned releases, including installs made before markers
+# were added. Never remove arbitrary children of a custom prefix or follow
+# symlinks out of it. README.txt is part of every official CLI package.
+managed_release() {
+  release_leaf=${1##*/}
+  printf '%s\n' "$release_leaf" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.previous(-[0-9]+)?)?$' || return 1
+  release_version=${release_leaf%%.previous*}
+  [ -d "$1" ] && [ ! -L "$1" ] || return 1
+  if [ -f "$1/.capturefab-install" ] && [ "$(cat "$1/.capturefab-install")" = capturefab-installer-v1 ]; then return 0; fi
+  [ -f "$1/capturefab" ] && [ -f "$1/README.txt" ] || return 1
+  readme=$(head -n 1 "$1/README.txt")
+  case "$readme" in "Capturefab $release_version"|"Capturefab $release_version ("*) return 0 ;; *) return 1 ;; esac
+}
+
+if [ "$action" = uninstall ]; then
+  removed=0
+  previous=''
+  if [ -L "$bin_dir/capturefab" ]; then previous=$(readlink "$bin_dir/capturefab"); fi
+  previous_dir=''
+  if [ -n "$previous" ] && [ "${previous##*/}" = capturefab ]; then
+    case "$previous" in /*) ;; *) previous="$bin_dir/$previous" ;; esac
+    previous_dir=$(cd -P "${previous%/*}" 2>/dev/null && pwd -P) || previous_dir=''
+  fi
+  for old in "$base"/*; do
+    managed_release "$old" || continue
+    old_dir=$(cd -P "$old" && pwd -P)
+    if [ "$previous_dir" = "$old_dir" ]; then
+      say "Remove command: $bin_dir/capturefab"
+      if [ "$dry_run" = 0 ]; then rm -f "$bin_dir/capturefab"; fi
+    fi
+    say "Remove release: $old"
+    if [ "$dry_run" = 0 ]; then rm -rf "$old"; fi
+    removed=1
+  done
+  if [ "$dry_run" = 0 ] && [ "$removed" = 1 ]; then rmdir "$base" 2>/dev/null || true; fi
+  if [ "$removed" = 0 ]; then say "No installer-managed Capturefab releases found in $base."; fi
+  say "Presets, saved sign-ins, caches and files outside the release folders are unchanged."
+  exit 0
+fi
 
 # Empty until a command-line release is published: releases up to 0.5.0 were
 # the desktop app, which this script does not install.
@@ -100,7 +151,14 @@ if [ "$dry_run" = 1 ]; then
 fi
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/capturefab-install.XXXXXX")
-trap 'rm -rf "$work"' EXIT
+stage='' backup='' link_work=''
+cleanup() {
+  rm -rf "$work"
+  if [ -n "$stage" ]; then rm -rf "$stage"; fi
+  if [ -n "$link_work" ]; then rm -rf "$link_work"; fi
+  if [ -n "$backup" ] && [ ! -e "$dest" ]; then mv "$backup" "$dest"; fi
+}
+trap cleanup EXIT
 trap 'exit 130' INT TERM
 
 say "Downloading $name"
@@ -131,21 +189,38 @@ tar -xzf "$work/$name" -C "$work/x" || fail "cannot extract $name"
 if [ ! -f "$work/x/$stem/capturefab" ] || [ ! -x "$work/x/$stem/capturefab" ]; then
     fail "$name has no capturefab executable"
 fi
-base=${prefix:-${XDG_DATA_HOME:-$HOME/.local/share}/capturefab}
 dest="$base/$VERSION"
-mkdir -p "$base"
-rm -rf "$dest.previous"
-if [ -e "$dest" ]; then mv "$dest" "$dest.previous"; fi
-mv "$work/x/$stem" "$dest"
-rm -rf "$dest.previous"
+"$work/x/$stem/capturefab" --version || fail "the downloaded capturefab did not start; the current install is unchanged"
+mkdir -p "$base" "$bin_dir"
+if [ -e "$dest" ] || [ -L "$dest" ]; then
+  managed_release "$dest" || fail "refusing to replace an unrecognized release folder: $dest"
+fi
+if [ -e "$bin_dir/capturefab" ] || [ -L "$bin_dir/capturefab" ]; then
+  [ -L "$bin_dir/capturefab" ] && [ ! -d "$bin_dir/capturefab" ] || fail "refusing to replace a file or directory at $bin_dir/capturefab; move it aside first"
+fi
+# Stage on the destination volume, so publishing the directory is a rename.
+stage=$(mktemp -d "$base/.install.XXXXXX")
+mv "$work/x/$stem" "$stage/release"
+printf '%s\n' capturefab-installer-v1 > "$stage/release/.capturefab-install"
+link_work=$(mktemp -d "$bin_dir/.capturefab-link.XXXXXX")
 target="$dest/capturefab"
+ln -s "$target" "$link_work/capturefab"
+if [ -e "$dest" ]; then
+  backup="$dest.previous-$$"
+  [ ! -e "$backup" ] && [ ! -L "$backup" ] || fail "backup already exists: $backup"
+  mv "$dest" "$backup"
+fi
+mv "$stage/release" "$dest"
 
 # What an earlier desktop release (0.5 and before) installed: the command
 # link pointed into Capturefab.app on macOS, and Linux had a launcher entry.
 previous=''
 if [ -L "$bin_dir/capturefab" ]; then previous=$(readlink "$bin_dir/capturefab" || true); fi
-mkdir -p "$bin_dir"
-ln -sfn "$target" "$bin_dir/capturefab"
+if ! mv -f "$link_work/capturefab" "$bin_dir/capturefab"; then
+  rm -rf "$dest"
+  fail "could not publish the command link; the earlier release will be restored"
+fi
+if [ -n "$backup" ]; then rm -rf "$backup"; backup=''; fi
 
 say "Installed Capturefab $VERSION in $dest"
 say "Command: $bin_dir/capturefab -> $target"

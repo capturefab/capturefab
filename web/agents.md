@@ -13,6 +13,32 @@ user without sudo. `capturefab --version` and `capturefab --json doctor` confirm
 page describes the command-line releases after 0.5.0; version 0.5.0 and earlier are the desktop
 app, whose commands and JSON differ, so update a `capturefab` that reports one of them.
 
+## Install, upgrade or uninstall
+
+Copy this task into an agent:
+
+```text
+Install or upgrade Capturefab for my user account from https://capturefab.com.
+Download and inspect install.sh (macOS/Linux) or install.ps1 (Windows) from that site.
+Run the installer with --upgrade (PowerShell: -Upgrade), without administrator rights.
+Use my custom prefix/bin directory if supplied; otherwise use the per-user defaults.
+Preserve captures, presets and saved sign-ins. Make capturefab available in this terminal.
+Verify capturefab --version and capturefab --json doctor. Read this agent guide and
+capturefab schema before using camera commands. Report the version, path and setup fixes.
+If I ask to uninstall, use --uninstall (PowerShell: -Uninstall) with the same custom paths.
+```
+
+On macOS/Linux, download the current script again and run
+`curl -fsSL https://capturefab.com/install.sh | sh -s -- --upgrade`.
+For removal use `--uninstall`; add `--dry-run` to preview. On Windows, save
+`https://capturefab.com/install.ps1` and run it with `-Upgrade`, `-Uninstall` or
+`-Uninstall -DryRun`. Custom installs need the same `--prefix` and `--bin-dir`
+(`-Prefix` on Windows). Close running commands and sessions before uninstalling.
+Removal keeps user data outside the release folders, including presets, saved
+sign-ins, caches and captures. A saved install script supports uninstall without
+a network connection; install/upgrade uses the version pinned in that script,
+so download a fresh script to get the latest release.
+
 ## Rules
 
 1. **Always pass `--json`.** Parse stdout as one JSON document. Exit 0 means it is the result;

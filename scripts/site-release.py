@@ -79,6 +79,24 @@ INSTALL = '''      <section class="section install-cli" id="install-cli" aria-la
           <div><h3>Windows PowerShell</h3><div class="code-wrap"><pre><code>irm {site}install.ps1 | iex</code></pre><button class="copy-button" type="button" aria-label="Copy the Windows install command">Copy</button></div><p>Installs in <code>%LOCALAPPDATA%\\Programs\\Capturefab</code> and adds it to your user <code>PATH</code>.</p></div>
         </div>
         <p class="install-read-first">To read a script before it runs: <code>curl -fsSLO {site}install.sh; less install.sh; sh install.sh</code>. Add <code>--dry-run</code> (<code>-DryRun</code> for install.ps1) to print the file, URL and checksum it would use. Read <a href="install.sh">install.sh</a> or <a href="install.ps1">install.ps1</a>.</p>
+        <h3>Upgrade or uninstall</h3>
+        <p>Download the current installer again to upgrade. Uninstall removes recognized release folders and the command link or PATH entries; it keeps presets, sign-ins, caches and files outside those release folders. For a custom install, pass the same prefix and, on macOS/Linux, bin directory. Close running Capturefab commands and sessions before uninstalling.</p>
+        <div class="code-wrap"><pre><code># macOS and Linux
+curl -fsSL {site}install.sh | sh -s -- --upgrade
+curl -fsSL {site}install.sh | sh -s -- --uninstall
+# Windows PowerShell
+irm {site}install.ps1 -OutFile install.ps1
+powershell -ExecutionPolicy Bypass -File .\\install.ps1 -Upgrade
+powershell -ExecutionPolicy Bypass -File .\\install.ps1 -Uninstall</code></pre><button class="copy-button" type="button" aria-label="Copy upgrade and uninstall commands">Copy</button></div>
+        <h3>For an AI agent</h3>
+        <p>Copy this instruction into your agent. The <a href="agents.md">agent guide</a> covers camera commands after installation.</p>
+        <div class="code-wrap"><pre><code>Install or upgrade Capturefab for my user account from {site}.
+Download and inspect {site}install.sh on macOS/Linux, or {site}install.ps1 on Windows.
+Run that installer with --upgrade (PowerShell: -Upgrade), without sudo or administrator rights.
+Use the default per-user location unless I specify a custom prefix; preserve captures, presets and saved sign-ins.
+Make capturefab available in this terminal, then verify capturefab --version and capturefab --json doctor.
+Read {site}agents.md and capturefab schema before using camera commands. Report the installed version, path and any setup fixes needed.
+If I ask to uninstall, run the installer with --uninstall (PowerShell: -Uninstall), using the same custom paths, and preserve user data outside the release folders.</code></pre><button class="copy-button" type="button" aria-label="Copy Capturefab installation instructions for an AI agent">Copy agent instructions</button></div>
       </section>
 '''
 EMPTY = '''      <section class="section" aria-labelledby="none-title">

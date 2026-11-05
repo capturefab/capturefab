@@ -9,7 +9,7 @@
 #
 # To read it first: irm https://capturefab.com/install.ps1 -OutFile install.ps1; notepad install.ps1
 # then: powershell -ExecutionPolicy Bypass -File .\install.ps1 [-DryRun] [-Prefix DIR]
-param([string]$Prefix = '', [switch]$DryRun)
+param([string]$Prefix = '', [switch]$DryRun, [switch]$Upgrade, [switch]$Uninstall)
 
 $Version = '@VERSION@'
 $Site = '@SITE@'
@@ -18,10 +18,82 @@ $Assets = @{
 
 function Fail([string]$Message) { throw "capturefab install: $Message" }
 
+function Get-CapturefabReleaseVersion([string]$Directory) {
+  $leaf = Split-Path $Directory -Leaf
+  if ($leaf -notmatch '^(\d+\.\d+\.\d+)(?:\.previous(?:-[0-9a-f]+)?)?$') { return $null }
+  $releaseVersion = $Matches[1]
+  if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { return $null }
+  if ((Get-Item -LiteralPath $Directory).Attributes -band [IO.FileAttributes]::ReparsePoint) { return $null }
+  $marker = Join-Path $Directory '.capturefab-install'
+  if ((Test-Path -LiteralPath $marker -PathType Leaf) -and (Get-Content -LiteralPath $marker -Raw).Trim() -eq 'capturefab-installer-v1') { return $releaseVersion }
+  if (-not (Test-Path -LiteralPath (Join-Path $Directory 'capturefab.exe') -PathType Leaf)) { return $null }
+  $readme = Join-Path $Directory 'README.txt'
+  if ((Test-Path -LiteralPath $readme -PathType Leaf) -and (Get-Content -LiteralPath $readme -TotalCount 1) -match ('^Capturefab ' + [regex]::Escape($releaseVersion) + '(?:\s|$)')) { return $releaseVersion }
+  return $null
+}
+
+function Update-CapturefabPath([string[]]$Remove, [string]$Add = '') {
+  $envKey = 'HKCU:\Environment'
+  $userPath = (Get-Item $envKey).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+  $filter = {
+    param($Value)
+    @($Value -split ';' | Where-Object {
+      $entry = [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\', '/')
+      $_ -and $Remove -notcontains $entry -and $entry -ne $Add
+    })
+  }
+  $entries = @(& $filter $userPath)
+  if ($Add) { $entries = @($Add) + $entries }
+  $updated = $entries -join ';'
+  if ($updated -cne $userPath) {
+    New-ItemProperty -Path $envKey -Name 'Path' -PropertyType ExpandString -Value $updated -Force | Out-Null
+    try {
+      if (-not ('Capturefab.Env' -as [type])) {
+        Add-Type -Namespace Capturefab -Name Env -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+      }
+      $result = [UIntPtr]::Zero
+      [void][Capturefab.Env]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
+    } catch {}
+  }
+  $current = @(& $filter $env:Path)
+  if ($Add) { $current = @($Add) + $current }
+  $env:Path = $current -join ';'
+}
+
 # A function keeps these preferences out of the caller's session under iex.
-function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
+function Install-Capturefab([string]$Prefix, [bool]$DryRun, [bool]$Upgrade, [bool]$Uninstall) {
   $ErrorActionPreference = 'Stop'
   $ProgressPreference = 'SilentlyContinue'
+  if ($Upgrade -and $Uninstall) { Fail 'choose only one of -Upgrade and -Uninstall' }
+  $base = if ($Prefix) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Prefix) } else { Join-Path $env:LOCALAPPDATA 'Programs\Capturefab' }
+  $base = [IO.Path]::GetFullPath($base).TrimEnd('\', '/')
+  if (-not $base -or $base -eq [IO.Path]::GetPathRoot($base).TrimEnd('\', '/')) { Fail 'the install prefix cannot be the filesystem root' }
+  if ((Test-Path -LiteralPath $base) -and ((Get-Item -LiteralPath $base).Attributes -band [IO.FileAttributes]::ReparsePoint)) { Fail "the install prefix must not be a link: $base" }
+  $managed = @()
+  if (Test-Path -LiteralPath $base -PathType Container) {
+    $managed = @(Get-ChildItem -LiteralPath $base -Directory | Where-Object { Get-CapturefabReleaseVersion $_.FullName } | ForEach-Object { $_.FullName })
+  }
+  if ($Uninstall) {
+    if ($managed.Count) { 'Remove PATH entries for these recognized release folders:' }
+    foreach ($directory in $managed) {
+      "Remove release: $directory"
+      if (-not $DryRun) {
+        try { Remove-Item -LiteralPath $directory -Recurse -Force }
+        catch {
+          # Preserve ownership if a locked executable prevented full removal.
+          if (Test-Path -LiteralPath $directory) { Set-Content -LiteralPath (Join-Path $directory '.capturefab-install') -Value 'capturefab-installer-v1' -ErrorAction SilentlyContinue }
+          Fail "could not remove $directory; close running Capturefab commands and sessions, then retry. ($($_.Exception.Message))"
+        }
+      }
+    }
+    if (-not $DryRun) {
+      if ($managed.Count) { Update-CapturefabPath -Remove $managed }
+      if ($managed.Count -and (Test-Path -LiteralPath $base) -and -not (Get-ChildItem -LiteralPath $base -Force | Select-Object -First 1)) { Remove-Item -LiteralPath $base }
+    }
+    if (-not $managed.Count) { "No installer-managed Capturefab releases found in $base." }
+    'Presets, saved sign-ins, caches and files outside the release folders are unchanged.'
+    return
+  }
   # Empty until a command-line release is published: releases up to 0.5.0
   # were the desktop app, which this script does not install.
   if (-not $Version) { Fail "no command-line release is published yet (0.5.0 and earlier are the desktop app); see ${Site}downloads.html or build from source" }
@@ -44,7 +116,6 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
     return
   }
 
-  $base = if ($Prefix) { $Prefix } else { Join-Path $env:LOCALAPPDATA 'Programs\Capturefab' }
   New-Item -ItemType Directory -Force -Path $base | Out-Null
   # Stage beside the install so the final move stays on one volume.
   $work = Join-Path $base (".install-" + [Guid]::NewGuid().ToString('N'))
@@ -56,48 +127,37 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
     $actual = (Get-FileHash -Algorithm SHA256 -Path $archive).Hash.ToLowerInvariant()
     if ($actual -ne $asset.Sha256) { Fail "checksum mismatch for $($asset.Name): expected $($asset.Sha256), got $actual. Nothing was installed." }
     "Checksum OK: $actual"
-    Expand-Archive -Path $archive -DestinationPath (Join-Path $work 'x')
+    Expand-Archive -LiteralPath $archive -DestinationPath (Join-Path $work 'x')
     $stem = [IO.Path]::GetFileNameWithoutExtension($asset.Name)
     $source = Join-Path $work "x\$stem"
-    if (-not (Test-Path (Join-Path $source 'capturefab.exe'))) { Fail "$($asset.Name) has no capturefab.exe" }
+    if (-not (Test-Path -LiteralPath (Join-Path $source 'capturefab.exe'))) { Fail "$($asset.Name) has no capturefab.exe" }
+    & (Join-Path $source 'capturefab.exe') --version
+    if ($LASTEXITCODE) { Fail 'the downloaded capturefab.exe did not start; the current install is unchanged' }
+    Set-Content -LiteralPath (Join-Path $source '.capturefab-install') -Value 'capturefab-installer-v1'
     $dest = Join-Path $base $Version
     # Rename a same-version install aside first: the rename fails cleanly
     # while its capturefab.exe is running, leaving that install intact.
-    $previous = "$dest.previous"
-    if (Test-Path $previous) { Remove-Item -Recurse -Force $previous }
-    if (Test-Path $dest) {
-      try { Rename-Item -Path $dest -NewName (Split-Path $previous -Leaf) }
+    $previous = "$dest.previous-" + [Guid]::NewGuid().ToString('N')
+    if (Get-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue) {
+      if (-not (Get-CapturefabReleaseVersion $dest)) { Fail "refusing to replace an unrecognized release folder: $dest" }
+      try { Rename-Item -LiteralPath $dest -NewName (Split-Path $previous -Leaf) }
       catch { Fail "could not replace $dest; close any running Capturefab and try again. ($($_.Exception.Message))" }
     }
-    try { Move-Item $source $dest }
+    try { Move-Item -LiteralPath $source -Destination $dest }
     catch {
-      if (Test-Path $previous) { Rename-Item -Path $previous -NewName (Split-Path $dest -Leaf) -ErrorAction SilentlyContinue }
+      if (Test-Path -LiteralPath $previous) { Rename-Item -LiteralPath $previous -NewName (Split-Path $dest -Leaf) -ErrorAction SilentlyContinue }
       throw
     }
-    if (Test-Path $previous) { Remove-Item -Recurse -Force $previous -ErrorAction SilentlyContinue }
+    if (Test-Path -LiteralPath $previous) { Remove-Item -LiteralPath $previous -Recurse -Force -ErrorAction SilentlyContinue }
   } finally {
-    Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
   }
   $exe = Join-Path $dest 'capturefab.exe'
 
-  # The user PATH only, and only when the folder is missing from it. Read and
-  # write the registry value unexpanded so %VAR% entries stay as they are.
-  $envKey = 'HKCU:\Environment'
-  $userPath = (Get-Item $envKey).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
-  $entries = @($userPath -split ';' | Where-Object { $_ })
-  $stale = @($entries | Where-Object { $_ -like (Join-Path $base '*') -and $_ -ne $dest })
-  if ($entries -notcontains $dest -or $stale) {
-    $kept = @($entries | Where-Object { $stale -notcontains $_ -and $_ -ne $dest }) + $dest
-    New-ItemProperty -Path $envKey -Name 'Path' -PropertyType ExpandString -Value ($kept -join ';') -Force | Out-Null
-    # Tell Explorer the environment changed, so terminals it starts see the new PATH.
-    try {
-      Add-Type -Namespace Capturefab -Name Env -MemberDefinition '[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
-      $result = [UIntPtr]::Zero
-      [void][Capturefab.Env]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
-    } catch {}
-    "Added $dest to your user PATH. Open a new terminal to use capturefab."
-  }
-  if (($env:Path -split ';') -notcontains $dest) { $env:Path = "$dest;$env:Path" }
+  # Remove only recognized release folders, preserving unrelated PATH entries
+  # even when they happen to be inside a custom install prefix.
+  Update-CapturefabPath -Remove $managed -Add $dest
+  "Added $dest to your user PATH. Open a new terminal to use capturefab."
 
   # Earlier releases (0.5 and before) added a Start menu shortcut to the
   # desktop app; this release is the command-line tool only.
@@ -117,4 +177,4 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun) {
   'When Windows Defender Firewall asks, allow Capturefab on Private networks so GigE Vision streams arrive.'
 }
 
-Install-Capturefab -Prefix $Prefix -DryRun $DryRun.IsPresent
+Install-Capturefab -Prefix $Prefix -DryRun $DryRun.IsPresent -Upgrade $Upgrade.IsPresent -Uninstall $Uninstall.IsPresent
