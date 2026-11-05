@@ -32,13 +32,21 @@ function Get-CapturefabReleaseVersion([string]$Directory) {
   return $null
 }
 
+function Convert-CapturefabPath([string]$Value) {
+  $expanded = [Environment]::ExpandEnvironmentVariables($Value).TrimEnd('\', '/')
+  try { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($expanded).TrimEnd('\', '/') }
+  catch { $expanded }
+}
+
 function Update-CapturefabPath([string[]]$Remove, [string]$Add = '') {
+  $Remove = @($Remove | ForEach-Object { Convert-CapturefabPath $_ })
+  if ($Add) { $Add = Convert-CapturefabPath $Add }
   $envKey = 'HKCU:\Environment'
   $userPath = (Get-Item $envKey).GetValue('Path', '', 'DoNotExpandEnvironmentNames')
   $filter = {
     param($Value)
     @($Value -split ';' | Where-Object {
-      $entry = [Environment]::ExpandEnvironmentVariables($_).TrimEnd('\', '/')
+      $entry = Convert-CapturefabPath $_
       $_ -and $Remove -notcontains $entry -and $entry -ne $Add
     })
   }

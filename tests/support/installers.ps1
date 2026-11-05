@@ -3,7 +3,8 @@
 $ErrorActionPreference = 'Stop'
 $root = $env:CAPTUREFAB_INSTALL_FIXTURE
 if (-not $root) { throw 'CAPTUREFAB_INSTALL_FIXTURE is required' }
-$base = Join-Path $root 'apps [fixture] with spaces'
+$prefix = Join-Path $root 'apps [fixture] with spaces'
+$base = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($prefix)
 $key = Get-Item 'HKCU:\Environment'
 $savedPath = $key.GetValue('Path', $null, 'DoNotExpandEnvironmentNames')
 $savedKind = if ($null -ne $savedPath) { $key.GetValueKind('Path') } else { $null }
@@ -21,17 +22,19 @@ try {
   Set-Content -LiteralPath (Join-Path $foreign 'README.txt') -Value 'Other software'
   $extra = '%SystemRoot%\unrelated-fixture'
   New-ItemProperty 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Value "$savedPath;$tools;$extra" -Force | Out-Null
-  & $old -Prefix $base
+  & $old -Prefix $prefix
   $first = Join-Path $base '9.9.8'
   $second = Join-Path $base '9.9.9'
   Assert (Test-Path -LiteralPath (Join-Path $first 'capturefab.exe')) 'initial install failed'
   # Existing 0.6.1 installs have a package README but no ownership marker.
   Remove-Item -LiteralPath (Join-Path $first '.capturefab-install')
-  & $new -Prefix $base -Upgrade
-  & $new -Prefix $base -Upgrade
+  & $new -Prefix $prefix -Upgrade
+  & $new -Prefix $prefix -Upgrade
   $entries = @((RawPath) -split ';')
   Assert ($entries -notcontains $first) 'upgrade kept the old PATH entry'
-  Assert (@($entries | Where-Object { $_ -eq $second }).Count -eq 1) 'upgrade duplicated PATH'
+  $entryCount = @($entries | Where-Object { $_ -eq $second }).Count
+  $fixtureEntries = @($entries | Where-Object { $_ -like '*capturefab-installers*' }) -join ';'
+  Assert ($entryCount -eq 1) "upgrade PATH count $entryCount for $second; fixture entries: $fixtureEntries"
   Assert ($entries -contains $tools -and $entries -contains $extra) 'upgrade changed unrelated PATH entries'
   Assert (($env:Path -split ';') -notcontains $first) 'upgrade kept the old process PATH entry'
   $before = RawPath
@@ -40,29 +43,29 @@ try {
   $script = (Get-Content -LiteralPath $new -Raw) -replace "Sha256 = '[0-9a-f]{64}'", ("Sha256 = '" + ('0' * 64) + "'")
   Set-Content -LiteralPath $corrupt -Value $script -Encoding UTF8
   $failed = $false
-  try { & $corrupt -Prefix $base -Upgrade } catch { $failed = $true }
+  try { & $corrupt -Prefix $prefix -Upgrade } catch { $failed = $true }
   Assert $failed 'corrupt upgrade succeeded'
   $failed = $false
-  try { & (Join-Path $root 'broken.ps1') -Prefix $base -Upgrade } catch { $failed = $true }
+  try { & (Join-Path $root 'broken.ps1') -Prefix $prefix -Upgrade } catch { $failed = $true }
   Assert $failed 'non-executable upgrade succeeded'
   Assert ((RawPath) -ceq $before) 'failed upgrade changed PATH'
   Assert ((Get-FileHash -LiteralPath (Join-Path $second 'capturefab.exe')).Hash -eq $hash) 'failed upgrade changed the executable'
   $env:CAPTUREFAB_INSTALL_BASE_URL = 'http://127.0.0.1:1'
-  & $new -Prefix $base -Uninstall -DryRun
+  & $new -Prefix $prefix -Uninstall -DryRun
   Assert (Test-Path -LiteralPath (Join-Path $second 'capturefab.exe')) 'dry-run removed the executable'
   Assert ((RawPath) -ceq $before) 'dry-run changed PATH'
   $locked = [IO.File]::Open((Join-Path $second 'capturefab.exe'), 'Open', 'Read', 'Read')
   $failed = $false
-  try { & $new -Prefix $base -Uninstall } catch { $failed = $true } finally { $locked.Dispose() }
+  try { & $new -Prefix $prefix -Uninstall } catch { $failed = $true } finally { $locked.Dispose() }
   Assert $failed 'uninstall did not report a locked executable'
   Assert ((RawPath) -ceq $before) 'failed uninstall changed PATH'
-  & $new -Prefix $base -Uninstall
+  & $new -Prefix $prefix -Uninstall
   Assert (-not (Test-Path -LiteralPath $first) -and -not (Test-Path -LiteralPath $second)) 'uninstall left a release'
   Assert (Test-Path -LiteralPath $foreign) 'uninstall removed an unrecognized directory'
   Assert (Test-Path -LiteralPath (Join-Path $base 'keep.txt')) 'uninstall removed unrelated files'
   Assert ((RawPath) -split ';' -notcontains $second) 'uninstall kept its PATH entry'
   Assert ((RawPath) -split ';' -contains $tools) 'uninstall removed an unrelated PATH entry'
-  & $new -Prefix $base -Uninstall
+  & $new -Prefix $prefix -Uninstall
   Assert ((RawPath) -split ';' -contains $extra) 'repeat uninstall changed PATH'
 } catch {
   Write-Output ("Installer test failure: " + ($_ | Out-String))
