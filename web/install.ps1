@@ -36,8 +36,22 @@ function Get-CapturefabReleaseVersion([string]$Directory) {
 
 function Convert-CapturefabPath([string]$Value) {
   $expanded = [Environment]::ExpandEnvironmentVariables($Value).TrimEnd('\', '/')
+  if (Test-Path -LiteralPath $expanded -PathType Container) {
+    $item = Get-Item -LiteralPath $expanded
+    if ($item -is [IO.DirectoryInfo]) { return $item.FullName.TrimEnd('\', '/') }
+  }
   try { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($expanded).TrimEnd('\', '/') }
   catch { $expanded }
+}
+
+function Get-CapturefabPathRemovals([string[]]$Directories) {
+  $canonical = @($Directories | ForEach-Object { Convert-CapturefabPath $_ })
+  $remove = @($Directories)
+  $userPath = (Get-Item 'HKCU:\Environment').GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+  foreach ($entry in @($userPath -split ';') + @($env:Path -split ';')) {
+    if ($entry -and $canonical -contains (Convert-CapturefabPath $entry)) { $remove += $entry }
+  }
+  $remove
 }
 
 function Update-CapturefabPath([string[]]$Remove, [string]$Add = '') {
@@ -84,6 +98,9 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun, [bool]$Upgrade, [boo
     $managed = @(Get-ChildItem -LiteralPath $base -Directory | Where-Object { Get-CapturefabReleaseVersion $_.FullName } | ForEach-Object { $_.FullName })
   }
   if ($Uninstall) {
+    # Capture short-name aliases while folders still exist: after removal
+    # the filesystem can no longer resolve them to their long names.
+    $pathRemovals = @(Get-CapturefabPathRemovals $managed)
     if ($managed.Count) { 'Remove PATH entries for these recognized release folders:' }
     foreach ($directory in $managed) {
       "Remove release: $directory"
@@ -97,7 +114,7 @@ function Install-Capturefab([string]$Prefix, [bool]$DryRun, [bool]$Upgrade, [boo
       }
     }
     if (-not $DryRun) {
-      if ($managed.Count) { Update-CapturefabPath -Remove $managed }
+      if ($managed.Count) { Update-CapturefabPath -Remove $pathRemovals }
       if ($managed.Count -and (Test-Path -LiteralPath $base) -and -not (Get-ChildItem -LiteralPath $base -Force | Select-Object -First 1)) { Remove-Item -LiteralPath $base }
     }
     if (-not $managed.Count) { "No installer-managed Capturefab releases found in $base." }

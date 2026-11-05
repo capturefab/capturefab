@@ -23,15 +23,22 @@ try {
   $extra = '%SystemRoot%\unrelated-fixture'
   New-ItemProperty 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Value "$savedPath;$tools;$extra" -Force | Out-Null
   & $old -Prefix $prefix
-  $first = Join-Path $base '9.9.8'
-  $second = Join-Path $base '9.9.9'
+  $first = (Get-Item -LiteralPath (Join-Path $base '9.9.8')).FullName
   Assert (Test-Path -LiteralPath (Join-Path $first 'capturefab.exe')) 'initial install failed'
   # Existing 0.6.1 installs have a package README but no ownership marker.
   Remove-Item -LiteralPath (Join-Path $first '.capturefab-install')
+  $legacyEntry = $prefix.TrimEnd('\', '/') + '\9.9.8'
+  New-ItemProperty 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Value ((RawPath).Replace($first, $legacyEntry)) -Force | Out-Null
+  $env:Path = $env:Path.Replace($first, $legacyEntry)
   & $new -Prefix $prefix -Upgrade
+  $second = (Get-Item -LiteralPath (Join-Path $base '9.9.9')).FullName
+  $secondAlias = $prefix.TrimEnd('\', '/') + '\9.9.9'
+  New-ItemProperty 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Value ((RawPath).Replace($second, $secondAlias)) -Force | Out-Null
+  $env:Path = $env:Path.Replace($second, $secondAlias)
   & $new -Prefix $prefix -Upgrade
   $entries = @((RawPath) -split ';')
   Assert ($entries -notcontains $first) 'upgrade kept the old PATH entry'
+  Assert ($entries -notcontains $legacyEntry) 'upgrade kept the legacy short-path entry'
   $entryCount = @($entries | Where-Object { $_ -eq $second }).Count
   $fixtureEntries = @($entries | Where-Object { $_ -like '*capturefab-installers*' }) -join ';'
   Assert ($entryCount -eq 1) "upgrade PATH count $entryCount for $second; fixture entries: $fixtureEntries"
@@ -50,6 +57,8 @@ try {
   Assert $failed 'non-executable upgrade succeeded'
   Assert ((RawPath) -ceq $before) 'failed upgrade changed PATH'
   Assert ((Get-FileHash -LiteralPath (Join-Path $second 'capturefab.exe')).Hash -eq $hash) 'failed upgrade changed the executable'
+  New-ItemProperty 'HKCU:\Environment' -Name Path -PropertyType ExpandString -Value ((RawPath).Replace($second, $secondAlias)) -Force | Out-Null
+  $before = RawPath
   $env:CAPTUREFAB_INSTALL_BASE_URL = 'http://127.0.0.1:1'
   & $new -Prefix $prefix -Uninstall -DryRun
   Assert (Test-Path -LiteralPath (Join-Path $second 'capturefab.exe')) 'dry-run removed the executable'
@@ -64,6 +73,7 @@ try {
   Assert (Test-Path -LiteralPath $foreign) 'uninstall removed an unrecognized directory'
   Assert (Test-Path -LiteralPath (Join-Path $base 'keep.txt')) 'uninstall removed unrelated files'
   Assert ((RawPath) -split ';' -notcontains $second) 'uninstall kept its PATH entry'
+  Assert ((RawPath) -split ';' -notcontains $secondAlias) 'uninstall kept its short-path alias'
   Assert ((RawPath) -split ';' -contains $tools) 'uninstall removed an unrelated PATH entry'
   & $new -Prefix $prefix -Uninstall
   Assert ((RawPath) -split ';' -contains $extra) 'repeat uninstall changed PATH'
